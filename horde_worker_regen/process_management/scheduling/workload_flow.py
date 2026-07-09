@@ -46,12 +46,24 @@ POST_PROCESS_RESERVE_FLOW = "image_post_processing"
 
 
 PRELOAD_ADMISSION_FLOW = "preload_admission"
-"""Committed-reserve ledger flow name for the *planned* (admitted, not-yet-materialised) VRAM of preloads.
+"""Reservation-ledger flow name for the admitted-but-not-yet-materialised VRAM of preloads.
 
-Each admitted preload registers its charged candidate delta as a planned entry under this flow keyed by the
-loading process id, so a second admission in the same window sees the first's charge before its VRAM lands in
-the measured floor. The entries are pruned each scheduling cycle from live loading state (see
-``InferenceScheduler._in_flight_admitted_planned_units``); this flow name is that overlay's namespace."""
+Each admitted preload registers its charged candidate delta as a reservation under this flow keyed by the
+loading process id, so a second admission in the same window sees the first's reservation before its VRAM
+lands in the device-free reading. The entries are pruned each scheduling cycle from live loading state (see
+``InferenceScheduler._in_flight_admitted_planned_units``); this flow name is that reservation's namespace."""
+
+
+DISPATCH_ADMISSION_FLOW = "dispatch_admission"
+"""Reservation-ledger flow name for the admitted-but-not-yet-materialised VRAM of monolithic dispatches.
+
+A dispatch is admitted when its already-resident model is sent inference; its activation-inclusive peak (net
+of the resident-weight credit) materialises over the sampling window the device-free reading does not yet
+reflect. Each admitted dispatch registers that peak as a reservation under this flow keyed by the job id and
+targeting the sampling process, so a second admission in the same window sees it and cannot over-admit into
+the same physical room. The entries are pruned each scheduling cycle from the in-progress job set (see
+``InferenceScheduler._in_flight_dispatch_units``): a finalized, faulted, or process-dead job leaves that set
+and its reservation drops by omission; the job-finalize hook tightens that latency."""
 
 
 _WORKLOAD_CAPABILITIES: dict[WorkloadKind, WorkerCapability] = {

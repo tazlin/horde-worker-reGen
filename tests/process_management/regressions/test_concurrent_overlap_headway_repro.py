@@ -66,7 +66,7 @@ def _make_scheduler(
     """Build a scheduler with mostly-mocked dependencies and an optional model reference."""
     bridge_data = make_mock_bridge_data()
     bridge_data.max_threads = max_concurrent
-    return InferenceScheduler(
+    scheduler = InferenceScheduler(
         state=WorkerState(),
         process_map=process_map if process_map is not None else ProcessMap({}),
         horde_model_map=HordeModelMap(root={}),
@@ -82,6 +82,10 @@ def _make_scheduler(
         max_inference_processes=2,
         lru=LRUCache(2),
     )
+    # An ample truthful device-free reading: these scenarios isolate the progress/size headway gate, so the
+    # measured-truth admission identity must not withhold the overlap on a missing reading.
+    scheduler.set_device_free_mb_provider(lambda _device_index: 24000.0)
+    return scheduler
 
 
 async def _make_overlap_scenario(

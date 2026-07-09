@@ -45,24 +45,26 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 
 
 def _fitting_state() -> DeviceVramState:
-    """A device state with ample capacity, so a staged dispatch fits without reclaim."""
+    """A device state with ample measured free room, so a staged dispatch fits without reclaim."""
     return DeviceVramState(
         total_vram_mb=24000.0,
         baseline_mb=1000.0,
         committed_vram_mb=2000.0,
         planned_unmaterialized_mb=0.0,
         committed_is_stale=False,
+        device_free_mb=21000.0,
     )
 
 
 def _over_committed_state() -> DeviceVramState:
-    """A device state whose committed floor already sits over capacity (idle residents hold the card)."""
+    """A device state whose measured free room is exhausted (idle residents physically hold the card)."""
     return DeviceVramState(
         total_vram_mb=16000.0,
         baseline_mb=0.0,
         committed_vram_mb=16000.0,
         planned_unmaterialized_mb=0.0,
         committed_is_stale=False,
+        device_free_mb=200.0,
     )
 
 
@@ -199,12 +201,10 @@ class TestLineSkipDispatchHeadTruth:
     def _fits_verdict(self) -> VramVerdict:
         """A FITS verdict on the predictive path, so the gate releases and only the request truth is asserted."""
         measured = evaluate_admission(
-            measured_committed_mb=0.0,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=0.0,
-            total_vram_mb=None,
-            baseline_mb=0.0,
-            committed_is_stale=False,
+            candidate_outstanding_mb=0.0,
+            device_free_mb=21000.0,
+            outstanding_reservations_mb=0.0,
+            total_vram_mb=24000.0,
         )
         return VramVerdict(
             disposition=VramDisposition.FITS,
@@ -241,12 +241,10 @@ class TestStarvedDispatchHeadSignals:
     def _fits_verdict(self) -> VramVerdict:
         """A cold-path FITS so the gate releases and only the request signals are asserted."""
         measured = evaluate_admission(
-            measured_committed_mb=0.0,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=0.0,
-            total_vram_mb=None,
-            baseline_mb=0.0,
-            committed_is_stale=False,
+            candidate_outstanding_mb=0.0,
+            device_free_mb=21000.0,
+            outstanding_reservations_mb=0.0,
+            total_vram_mb=24000.0,
         )
         return VramVerdict(
             disposition=VramDisposition.FITS,

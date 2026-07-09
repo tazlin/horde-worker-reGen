@@ -65,8 +65,12 @@ behaviors keep an unfittable chain from parking the queue:
 - **Aging escape**: a job that stays unfittable past the admission-patience window is submitted as a no-image
   fault, so the horde reissues it to another worker rather than letting it park forever. This feeds the
   circuit breaker because the worker accepted post-processing work it could not host.
-- **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation episode,
-  not once per scheduling tick, so deferral does not churn idle inference residency in a loop.
+- **Bounded reclaim**: an unfittable job executes each newly available arbiter reclaim plan once per starvation
+  episode through the shared reclaim owner, rather than issuing an unrelated model-only sweep every scheduling
+  tick. The plan can release idle caches, evict idle weights, and move safety off-GPU when the operator permits
+  it. If safety is initially busy, its off-GPU action may join and run after the safety backlog clears. This
+  gives accepted lane work a path to the measured room its verdict requires without repeatedly churning
+  inference residency.
 
 Pending post-processing work also owns lane liveness. If the queue is non-empty and no `POST_PROCESS` process
 exists, the orchestrator asks lifecycle to start the lane; lifecycle still owns the actual admission checks
@@ -76,6 +80,10 @@ absent after that request, the same admission-patience clock runs so the job can
 to restore itself when the resident model releases the card, so the patience clock stays unarmed while residency
 is still active. If a whole-card pause is left behind after residency and inference work have drained, pending
 post-processing restores that owner-scoped pause and then re-enters the normal lane-start path.
+When a whole-card lease itself releases, accepted post-processing keeps safety off-GPU until the lane queue
+drains; restoring safety first would consume the room the downstream job is waiting for. A drained lease's
+speculative cooldown also yields immediately to a ready different-model inference head on the same card, so
+the cooldown cannot park useful resident work.
 
 The overlap gate is keyed to active sampling on the lane's card, not to every job in the inference
 `IN_PROGRESS` stage. A job that is only blocked in `DOWNLOADING_AUX_MODEL` holds an in-flight slot but is not

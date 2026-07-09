@@ -1248,11 +1248,14 @@ class HordeWorkerProcessManager:
         # Attribute between-jobs reload/respawn churn (model swaps, VRAM evictions, process cycles) into
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)
-        # The ledger-driven admission identity's baseline term is the reconciler's measured shared-device
-        # baseline, captured in the drift cadence on the manager. Feed it to the scheduler so its measured
-        # admission overlay sizes real capacity as ``total - baseline - noise`` per card.
+        # The sampling-headroom arithmetic's baseline term is the reconciler's measured shared-device
+        # baseline, captured in the drift cadence on the manager. Feed it to the scheduler so the
+        # concurrent-sampling gate sizes real capacity per card.
         self._inference_scheduler.set_admission_baseline_provider(self.latest_baseline_estimate_mb)
         self._inference_scheduler.set_vram_arbiter(self._vram_arbiter)
+        # The measured-truth identity's primary input for any snapshot the scheduler self-primes outside the
+        # manager-driven cycle; the per-tick cycle passes the same readings map explicitly.
+        self._inference_scheduler.set_device_free_mb_provider(self._last_device_free_mb_by_device.get)
         # Share the single learned-footprint store (the dispatcher observes into it, the scheduler prices
         # admission sampling peaks from it) so every observed peak and every priced estimate reference the same
         # watermarks.
@@ -1271,6 +1274,7 @@ class HordeWorkerProcessManager:
                 under_pressure=True,
                 device_index=device_index,
             ),
+            vram_actuator=self._inference_scheduler,
             sampling_coresidency_check=(
                 lambda pp_reserve_mb: self._inference_scheduler.pp_sampling_coresidency_affordable(
                     sampling_peak_mb=self._inference_scheduler.max_in_progress_sampling_peak_mb(),
@@ -3132,9 +3136,14 @@ class HordeWorkerProcessManager:
         self._performance_model.on_job_metrics(message)
 
     def _on_job_finalized(self, tracked: TrackedJob, completed_job_info: HordeJobInfo) -> None:
-        """Fan a finalized job out to the run metrics (stage latencies) and the performance model (calibration)."""
+        """Fan a finalized job out to the run metrics (stage latencies) and the performance model (calibration).
+
+        Also releases the job's dispatch VRAM reservation explicitly, tightening the latency between completion
+        and the reservation clearing; reconcile-by-omission is still the correctness guarantee.
+        """
         self._run_metrics.on_job_finalized(tracked, completed_job_info)
         self._performance_model.on_job_finalized(tracked, completed_job_info)
+        self._inference_scheduler.release_dispatch_reservation(tracked.sdk_api_job_info)
 
     def _record_process_crash(self, process_info: HordeProcessInfo, reason: str) -> None:
         """Forward a process recovery event to the run-metrics aggregator."""

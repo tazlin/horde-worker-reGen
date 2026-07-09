@@ -1,13 +1,14 @@
-"""RAM-cache preservation around a foreign-pressure over-budget admit.
+"""RAM-cache preservation around a VRAM-admitted preload whose RAM picture differs.
 
-A foreign-pressure admit can tag a job over budget while it still physically fits the truthful device-free
-reading. On a host with ample RAM headroom, evicting an idle resident model from system RAM buys nothing:
-the incoming load fits without it, and the only effect is destroying a sibling's warm RAM cache so the next
-job for that model reloads its checkpoint from disk.
+A preload can fit the truthful device-free reading while the predictive VRAM budget disagrees. On a host
+with ample RAM headroom, evicting an idle resident model from system RAM buys nothing: the incoming load
+fits without it, and the only effect is destroying a sibling's warm RAM cache so the next job for that
+model reloads its checkpoint from disk.
 
-The contract pinned here: the over-budget path consults the RAM budget and reclaims idle RAM residents
-only when the incoming load does not fit measured available memory. The pressure paths (the RAM
-verdict's own reclaim, and the RAM governor's eviction under the danger floor) are unchanged.
+The contract pinned here: a VRAM-admitted preload consults the RAM budget and reclaims idle RAM residents
+only when the incoming load does not fit measured available memory; reclaim progress defers the preload to
+a later cycle rather than admitting into RAM it does not have. The pressure paths (the RAM verdict's own
+reclaim, and the RAM governor's eviction under the danger floor) are unchanged.
 
 A second contract on the reclaim itself: when an idle RAM resident must be sacrificed, the victim is
 the cheapest cache to rebuild (the smallest size tier), never a card-dominating checkpoint whose disk
@@ -80,23 +81,21 @@ async def _overbudget_admit_setup():  # noqa: ANN202
 
 
 def _drive_overbudget_admit(scheduler, job) -> bool:  # noqa: ANN001
-    """Admit the idle-device head through the over-budget path and return the admission outcome.
+    """Admit the idle-device head through the preload gate and return the admission outcome.
 
     The whole-card state machine is short-circuited to the ordinary path, and the arbiter cycle is crafted
-    so the worker's own committed load fits capacity while the candidate also physically fits measured
-    device-free VRAM net of the noise buffer. That is the foreign-pressure path whose RAM-reclaim gating is
-    under test.
+    so the candidate physically fits the truthful device-free reading net of the noise buffer while the
+    predictive budget disagrees: measured truth admits, so the RAM verdict is the only gate left, and its
+    reclaim gating is what is under test.
     """
     available = scheduler._process_map[1]
     scheduler._decide_whole_card_demand = Mock(return_value=_WholeCardDemandOutcome.FALL_THROUGH)
     scheduler._vram_budget.check_job = Mock(
         return_value=BudgetVerdict(fits=False, predicted_mb=5000.0, available_mb=5000.0, reserve_mb=2048.0),
     )
-    # committed 16000 fits capacity ((24000 - 1000 - 512) = 22488), so the shortfall is foreign; the candidate
-    # (~8315 MB for this SDXL head) physically fits the truthful device-free reading net of the noise buffer
-    # (9500 - 512 = 8988), so the admit takes the foreign-pressure fit-into-reality path. committed 16000
-    # stays within the phantom tolerance of device-used 14500, so the ledger is honest and the admit
-    # exercises the foreign-pressure branch rather than the phantom-truth bypass.
+    # The candidate physically fits the truthful device-free reading net of the proportional noise buffer
+    # (9500 - 1200 = 8300 MB available), so the identity admits it; the committed figure is carried for
+    # diagnostics only and plays no part in the verdict.
     state = DeviceVramState(
         total_vram_mb=24000.0,
         baseline_mb=1000.0,
@@ -125,14 +124,18 @@ class TestOverbudgetAdmitRamPurgeGating:
         assert sibling.loaded_horde_model_name == _SIBLING_MODEL
         assert sibling.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
 
-    async def test_admit_without_ram_headroom_still_reclaims(self) -> None:
-        """CONTROL: when the head's RAM cost does not fit, the admit reclaims the idle resident copy."""
+    async def test_admit_without_ram_headroom_defers_and_reclaims(self) -> None:
+        """CONTROL: when the head's RAM cost does not fit, the preload defers and reclaims the idle RAM copy.
+
+        Reclaim progress is worth waiting for: the preload returns deferred (never admitting into RAM it
+        does not have) while the idle resident's RAM copy is evicted so a later cycle can seat the head.
+        """
         scheduler, job, sibling = await _overbudget_admit_setup()
         scheduler._ram_budget.check_job = Mock(
             return_value=BudgetVerdict(fits=False, predicted_mb=8000.0, available_mb=3000.0, reserve_mb=4096.0),
         )
 
-        assert _drive_overbudget_admit(scheduler, job) is True
+        assert _drive_overbudget_admit(scheduler, job) is False
         assert sibling.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM
 
 

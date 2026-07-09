@@ -39,24 +39,26 @@ _EXTRA_LARGE = "flux_like"
 
 
 def _fitting_state() -> DeviceVramState:
-    """A device state with ample capacity, so the arbiter admits any candidate's memory demand."""
+    """A device state with ample measured free room, so the arbiter admits any candidate's memory demand."""
     return DeviceVramState(
         total_vram_mb=100000.0,
         baseline_mb=0.0,
         committed_vram_mb=0.0,
         planned_unmaterialized_mb=0.0,
         committed_is_stale=False,
+        device_free_mb=100000.0,
     )
 
 
 def _over_committed_state() -> DeviceVramState:
-    """A device state whose committed floor already fills the card, so the arbiter withholds any candidate."""
+    """A device state whose measured free room is exhausted, so the arbiter withholds any candidate."""
     return DeviceVramState(
         total_vram_mb=16000.0,
         baseline_mb=0.0,
         committed_vram_mb=16000.0,
         planned_unmaterialized_mb=0.0,
         committed_is_stale=False,
+        device_free_mb=100.0,
     )
 
 

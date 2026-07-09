@@ -92,11 +92,12 @@ def test_give_up_held_off_while_pool_not_ready() -> None:
         clock.advance(2)
         assert supervisor.evaluate(is_wedged=True, pool_ready=False) is RecoveryAction.NONE
 
-    # Children reach an accepting state and the wedge clears simultaneously; recovery, not give-up.
+    # Children reach an accepting state, the wedge clears, and the pool resumes serving work (progress):
+    # a genuine recovery, not give-up. The progress is what lets the streak close the post-reset episode.
     clock.advance(1)
-    assert supervisor.evaluate(is_wedged=False, pool_ready=True) is RecoveryAction.NONE
+    assert supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=True) is RecoveryAction.NONE
     clock.advance(5)
-    assert supervisor.evaluate(is_wedged=False, pool_ready=True) is RecoveryAction.NONE
+    assert supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=True) is RecoveryAction.NONE
     assert not supervisor.is_in_episode
 
 
@@ -117,21 +118,45 @@ def test_give_up_survives_flapping() -> None:
     assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.GIVE_UP
 
 
-def test_sustained_recovery_closes_episode() -> None:
-    """A sustained clean streak ends the episode and resets the limp-by level before give-up is due."""
+def test_progress_backed_recovery_closes_episode() -> None:
+    """A clean streak backed by real forward progress ends the episode and resets the limp-by level."""
     supervisor, clock = _make(clean_streak_seconds=3)
     supervisor.evaluate(is_wedged=True, pool_ready=True)
     clock.advance(2)
-    supervisor.evaluate(is_wedged=True, pool_ready=True)  # SOFT_RESET, limp_by_level == 1
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
     assert supervisor.limp_by_level == 1
 
     clock.advance(1)
-    supervisor.evaluate(is_wedged=False, pool_ready=True)  # clean streak starts
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=True)  # clean streak starts
     clock.advance(3)
-    supervisor.evaluate(is_wedged=False, pool_ready=True)  # clean streak satisfied -> episode closes
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=True)  # streak + progress -> closes
 
     assert not supervisor.is_in_episode
     assert supervisor.limp_by_level == 0
+
+
+def test_clean_streak_without_progress_holds_the_counter() -> None:
+    """A quiet wedge signal with no forward progress must not reset the escalation after a soft reset.
+
+    A rebuilt pool reads as not-wedged while it boots. If the clean streak alone reset the counter, that
+    transient window would re-open a fresh episode every reset, so a doomed pool would log every reset as the
+    first and never reach the give-up backstop. Absent real progress the counter must be held so the next
+    wedge escalates rather than restarting.
+    """
+    supervisor, clock = _make(clean_streak_seconds=3)
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+    assert supervisor.limp_by_level == 1
+
+    # The transient not-wedged rebuild window elapses well past the clean streak, but no work moved forward.
+    clock.advance(1)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+    clock.advance(20)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+
+    assert supervisor.is_in_episode  # the transient window did not count as a recovery
+    assert supervisor.limp_by_level == 1  # counter held: the next wedge escalates, it does not restart
 
 
 def test_multiple_soft_resets_before_give_up() -> None:
@@ -218,3 +243,74 @@ def test_continuation_then_terminal_over_ready_pool() -> None:
 
     assert soft_resets == 2
     assert give_ups == [False, True]
+
+
+def test_zero_progress_reset_cycles_escalate_to_give_up() -> None:
+    """Hostile: rebuild-clear-rewedge cycles with no progress climb #1 -> #2 -> #3, then give up.
+
+    Each soft reset is followed by the transient not-wedged rebuild window (here longer than the clean streak)
+    and then a fresh wedge, with no work ever moving forward. The escalation counter must not reset on those
+    windows: it climbs to the reset budget and the readiness-gated give-up ends the cycle instead of the reset
+    re-logging as the first indefinitely.
+    """
+    supervisor, clock = _make(
+        wedge_grace_seconds=2,
+        reset_interval_seconds=2,
+        max_soft_resets=3,
+        pool_ready_grace_seconds=3,
+        clean_streak_seconds=3,
+        boot_allowance_seconds=1000,
+    )
+
+    levels_at_reset: list[int] = []
+    for _ in range(3):
+        # Wedge, ride out the grace, take the soft reset.
+        assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.NONE
+        clock.advance(2)
+        assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+        levels_at_reset.append(supervisor.limp_by_level)
+        # The transient not-wedged rebuild window, with no progress, outlasts the clean streak: it must not
+        # reset the counter, so the episode stays open and the next wedge escalates rather than restarting.
+        clock.advance(1)
+        supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+        clock.advance(4)
+        supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+        assert supervisor.is_in_episode
+        clock.advance(1)
+
+    assert levels_at_reset == [1, 2, 3]
+
+    # Budget spent; the wedge persists over a ready pool and the readiness grace elapses -> give-up.
+    saw_give_up = False
+    for _ in range(6):
+        clock.advance(2)
+        if supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.GIVE_UP:
+            saw_give_up = True
+            break
+    assert saw_give_up
+    assert supervisor.limp_by_level == 3
+
+
+def test_progress_after_reset_resets_then_next_wedge_starts_at_one() -> None:
+    """Healthy counterpart: a reset followed by progress closes the episode; a later wedge starts at #1."""
+    supervisor, clock = _make(clean_streak_seconds=3)
+
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+    assert supervisor.limp_by_level == 1
+
+    # The rebuilt pool serves work: the clean streak, corroborated by progress, closes the episode.
+    clock.advance(1)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=True)
+    clock.advance(3)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=True)
+    assert not supervisor.is_in_episode
+    assert supervisor.limp_by_level == 0
+
+    # A later, independent wedge opens a fresh episode; its first reset is #1 again, not a continuation of #1.
+    clock.advance(50)
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+    assert supervisor.limp_by_level == 1

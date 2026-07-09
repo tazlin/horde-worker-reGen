@@ -586,9 +586,9 @@ away frees nothing and is skipped immediately. When the whole ladder is exhauste
 SATURATED, the episode is marked **unresolved**: nothing the worker can give back relieved the card, the
 signal a later, harder rung reads. The rung count, cumulative verified frees, and shortfall count are
 surfaced on the run-metrics snapshot (`ladder_rungs_issued`, `ladder_verified_frees_mb`,
-`ladder_verification_shortfalls`). The arbiter's deferred actuations, both the preload path's and the
-dispatch-reconciliation gate's, run through this same engine, so the governor's SATURATED ladder and the
-arbiter's per-cycle DEFER ladder share one reclaim execution surface. The dispatch gate's own activity is
+`ladder_verification_shortfalls`). The arbiter's deferred actuations from preload admission, dispatch
+reconciliation, and post-processing lane admission run through this same engine, so the governor's SATURATED
+ladder and every per-cycle DEFER path share one reclaim execution surface. The dispatch gate's own activity is
 surfaced separately (`dispatch_reconciliation_holds`, `dispatch_reconciliation_conflicts`,
 `dispatch_reconciliation_hold_seconds`, and the reclaim-versus-natural-free release split) so a soak can
 attribute the re-transfer cost of holding a dispatch to reconcile co-resident weights.
@@ -620,9 +620,16 @@ it) rather than sitting in `PENDING_POST_PROCESSING` forever and wedging the dra
 The post-processing drain uses a fresh arbiter snapshot. The control loop refreshes the frozen device picture
 immediately before asking the lane admission gate to run, then refreshes it again before the normal governance
 and inference-scheduling pass. When the scheduler is holding sampling so a pending chain can drain, that chain
-is the head of the drain queue; its arbiter request therefore carries head-of-queue priority for the
-foreign-pressure or phantom-ledger reality admit after reclaim is exhausted. Without that priority, dispatch can
-wait for the lane while the lane waits behind a generic non-head denial.
+is the head of the drain queue. A non-fitting verdict retains its complete reclaim plan and executes it through
+the shared reclaim owner; when policy permits, safety off-GPU is the final lane-specific action after idle
+caches and weights. The chain then re-asks against the next measured device-free reading rather than waiting
+behind a model-only reclaim that cannot produce the room its verdict requires.
+
+Whole-card release ordering preserves that priority. Accepted post-processing prevents a residency completion
+from restoring safety onto the GPU until the lane drains. Separately, once the residency model has no pending
+or active inference, a ready different-model queue head already resident on the same card preempts the
+speculative residency cooldown. The cooldown still batches an imminent repeat of the heavy model, but it never
+turns a ready resident head into idle-card time.
 
 ### The per-step floor: fast crawl detection
 

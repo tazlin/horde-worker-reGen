@@ -473,8 +473,22 @@ class WorkerRecoveryCoordinator:
             or self.orphan_wedge_active()
         )
 
+    def _capture_progress_baseline(self) -> None:
+        """Snapshot the progress counters as the reference for :meth:`made_progress_since_episode`.
+
+        Taken when a wedge episode opens and re-taken on every soft reset, so ``made_progress`` measures
+        forward motion since the most recent recovery attempt rather than since the episode began.
+        """
+        self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
+        self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
+        self.episode_post_processing_progress_baseline = self._job_tracker.total_num_post_processing_progress
+
     def made_progress_since_episode(self) -> bool:
-        """Return whether accepted work moved forward since the current wedge episode opened."""
+        """Return whether accepted work moved forward since the most recent recovery baseline.
+
+        The baseline is captured when the episode opens and re-captured on each soft reset, so this reports
+        progress since the latest soft reset once one has been attempted.
+        """
         if (
             self.episode_progress_baseline is None
             or self.episode_inference_start_baseline is None
@@ -532,22 +546,22 @@ class WorkerRecoveryCoordinator:
             return
         self.maybe_reset_stuck_governance_hold()
         is_wedged = self.assess_wedge()
+        made_progress = self.made_progress_since_episode()
         if self.is_inference_pool_unrecoverable() or self.is_safety_pool_unrecoverable():
             self.episode_saw_unrecoverable_pool = True
         if self.episode_saw_unrecoverable_pool:
-            if self.made_progress_since_episode():
+            if made_progress:
                 self.episode_saw_unrecoverable_pool = False
             else:
                 is_wedged = True
         action = self.recovery_supervisor.evaluate(
             is_wedged=is_wedged,
             pool_ready=self.is_inference_pool_ready(),
+            made_progress=made_progress,
         )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:
-                self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
-                self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
-                self.episode_post_processing_progress_baseline = self._job_tracker.total_num_post_processing_progress
+                self._capture_progress_baseline()
         else:
             self.episode_progress_baseline = None
             self.episode_inference_start_baseline = None
@@ -555,6 +569,9 @@ class WorkerRecoveryCoordinator:
             self.episode_saw_unrecoverable_pool = False
         if action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()
+            # Re-anchor the progress baseline to the reset: the episode may close only when work moves forward
+            # from here, so a rebuild that never serves cannot look like a recovery and reset the escalation.
+            self._capture_progress_baseline()
             self.limp_by_active = True
         elif action is RecoveryAction.GIVE_UP:
             self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)

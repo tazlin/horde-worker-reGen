@@ -1,32 +1,33 @@
 """The liveness contract of the VRAM admission system, tested as a property rather than by anecdote.
 
 A worker that is alive but cannot admit its head-of-queue job is wedged: the process pool is healthy and
-idle, yet no work flows. Two production incidents wedged exactly this way, both by the admission identity
-counting the head's own footprint more than once and then blaming the resulting over-count on "the worker's
-own committed load holds the card":
+idle, yet no work flows. Admission reasons from the truthful device-free reading net of the outstanding
+reservations that reading does not yet reflect and the one noise buffer. The device-free reading already
+contains every materialised worker load, so the only way a request can wedge on its own footprint is a
+reservation the reading double-counts: an admitted-but-unmaterialised charge the request itself booked that is
+not netted back out of its own available room.
 
-- A 24GB card, a flux head needing exclusive residency: its preload was admitted, recorded a planned charge,
-  and had its target reclaimed before the load materialised. The stale planned charge never decayed (a dead
-  target's reservation never grows) and never reconciled away, so the head's re-ask counted the load once as
-  the lingering plan and once as the candidate delta and deferred forever on its own footprint.
+- A 24GB card, a flux head needing exclusive residency: its preload was admitted, recorded a reservation, and
+  had its target reclaimed before the load materialised. The stale reservation never decayed (a dead target's
+  reservation never grows) and never reconciled away, so the head's re-ask subtracted its own booked charge
+  from its own available room and deferred forever on its own footprint.
 - An 8GB card, an SD1.5 model already resident and idle on the target process: dispatching it moved nothing,
-  yet its resident weights were charged in the committed floor, a stale planned charge persisted, AND the
-  candidate delta re-charged the weights the resident-credit contract says it must net out: a triple count
-  that put the no-op dispatch over capacity.
+  yet its resident weights sit inside the device-free reading AND a stale reservation persisted, so pricing the
+  activation against the (now tight) reading withheld a no-op dispatch that needed no memory.
 
 This module encodes the invariant those incidents violated: **no permanent DEFER may be reachable from a
-request's own footprint alone.** The self-count hostile tests prove the permanent-DEFER branches (the
-own-committed-shortfall branch first) cannot be composed purely from the request's own resident weights, its
-own not-yet-materialised plan, and its own candidate delta. The progress-property matrix drives the
-evaluate/actuate loop across a varied grid of circumstances and asserts that any head whose candidate can
-physically fit the card, once the reclaim machinery it is entitled to has run, is admitted within a bounded
-number of cycles.
+request's own footprint alone.** The self-count hostile tests prove the DEFER branches cannot be composed
+purely from the request's own resident weights, its own not-yet-materialised reservation, and its own
+candidate delta: the own-reservation net and the resident no-op admit collapse the double count. The
+progress-property matrix drives the evaluate/actuate loop across a varied grid of circumstances and asserts
+that any head whose candidate can physically fit the card, once the reclaim machinery it is entitled to has
+run, is admitted within a bounded number of cycles.
 
-Scope of the grid is stated precisely in :data:`_SCENARIOS` and the parametrised ids so nothing is claimed
-beyond what is driven here. What it does NOT cover: the scheduler's assembly of the measured snapshot from
-live process state (exercised in the scheduler suites), the governor's verified-reclaim ladder timing, and
-multi-card routing. The two incident repros are kept as named regressions at the foot of the module; the
-scheduler-side wiring that feeds these arbiter verdicts is proved in
+Scope of the grid is stated precisely in the scenarios and the parametrised ids so nothing is claimed beyond
+what is driven here. What it does NOT cover: the scheduler's assembly of the measured snapshot from live
+process state (exercised in the scheduler suites), the reclaim ladder's verification timing, and multi-card
+routing. The two incident repros are kept as named regressions at the foot of the module; the scheduler-side
+wiring that feeds these arbiter verdicts is proved in
 ``tests/process_management/regressions/test_admission_self_count_wedge.py``.
 """
 
@@ -85,10 +86,9 @@ class _CardModel:
     device_free_override_mb: float | None = None
     """The truthful NVML device-free reading (MB) when it must diverge from ``total - baseline - committed``.
 
-    The committed ledger and the device-free reading are independent measurements that disagree under WDDM: the
-    foreign-pressure branch admits only when the truthful reading shows physical room the ledger does not. Most
-    scenarios leave this None (device-free tracks the decomposition honestly); a foreign-pressure scenario sets
-    it to model the truthful reading holding room the ledger prices as over-committed."""
+    Most scenarios leave this None so the device-free reading tracks the decomposition honestly. A scenario with
+    load the worker cannot attribute to its own contributors (foreign occupancy the reading already includes)
+    sets it to model the reading holding the room the head must fit into."""
     committed_is_stale: bool = False
     candidate_resident: bool = False
 
@@ -112,10 +112,6 @@ class _CardModel:
             return self.device_free_override_mb
         return max(0.0, self.total_vram_mb - self.baseline_mb - self.committed_mb())
 
-    def capacity_mb(self) -> float:
-        """The admission capacity ``(total - baseline) - noise`` the identity tests demand against."""
-        return (self.total_vram_mb - self.baseline_mb) - admission_noise_buffer_mb(self.total_vram_mb)
-
     def to_state(self) -> DeviceVramState:
         """Freeze this model into the per-device measurement the arbiter prices a request against."""
         return DeviceVramState(
@@ -129,7 +125,14 @@ class _CardModel:
             device_free_mb=self.device_free_mb(),
         )
 
-    def request(self, *, kind: VramRequestKind, is_head: bool, starved_seconds: float) -> VramRequest:
+    def request(
+        self,
+        *,
+        kind: VramRequestKind,
+        is_head: bool,
+        starved_seconds: float,
+        head_outstanding_mb: float | None = None,
+    ) -> VramRequest:
         """Build the request this card's head presents, wired with the self-net and residency the model implies."""
         return VramRequest(
             kind=kind,
@@ -141,6 +144,7 @@ class _CardModel:
             candidate_already_resident=self.candidate_resident,
             own_planned_unmaterialized_mb=self.own_stale_plan_mb,
             is_head_of_queue=is_head,
+            head_outstanding_mb=head_outstanding_mb,
             starved_seconds=starved_seconds,
             has_reclaimable_idle_model=self.idle_model_mb > 0.0,
             idle_contexts_teardownable=is_head and kind is VramRequestKind.PRELOAD and bool(self.idle_context_mb),
@@ -255,7 +259,7 @@ class TestSelfCountNeverWedges:
             card.request(kind=VramRequestKind.PRELOAD, is_head=True, starved_seconds=0.0),
         )
         assert verdict.disposition is VramDisposition.FITS
-        assert "own committed load holds the card" not in verdict.reason
+        assert verdict.admits is True
 
     @pytest.mark.parametrize("case", _SELF_COUNT_CASES, ids=lambda c: c.label)
     def test_pure_self_footprint_never_reaches_own_shortfall_defer(self, case: _SelfCountCase) -> None:
@@ -274,15 +278,15 @@ class TestSelfCountNeverWedges:
 
 
 class TestOwnShortfallRequiresGenuinelyOtherLoad:
-    """The own-committed-shortfall permanent DEFER may only fire on load that is not the request's own.
+    """A non-fitting DEFER may only fire on load that is not the request's own reservation.
 
-    This is the hostile test on the first permanent-DEFER branch. It proves the branch keys on genuinely-other
-    committed load (a live sibling holding the card), not on any composition of the request's own resident
-    weights, own stale plan, or own candidate.
+    This is the hostile test on the DEFER branch. It proves the head defers on genuinely-other load holding the
+    card (a live sibling physically occupying it, reflected in the device-free reading), not on any composition
+    of the request's own resident weights, own reservation, or own candidate.
     """
 
-    def test_live_sibling_over_capacity_still_defers_on_own_shortfall(self) -> None:
-        """A live sibling whose weights alone exceed capacity legitimately holds the card: the head waits."""
+    def test_live_sibling_holding_the_card_defers_the_head(self) -> None:
+        """A live sibling whose weights fill the card legitimately holds it: the head waits."""
         card = _CardModel(
             total_vram_mb=8192.0,
             baseline_mb=700.0,
@@ -293,15 +297,14 @@ class TestOwnShortfallRequiresGenuinelyOtherLoad:
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: card.to_state()}))
         verdict = arbiter.evaluate(card.request(kind=VramRequestKind.PRELOAD, is_head=True, starved_seconds=0.0))
         assert verdict.disposition is VramDisposition.DEFER
-        assert "own committed load holds the card" in verdict.reason
 
-    def test_swapping_sibling_load_for_own_plan_removes_the_defer(self) -> None:
-        """Moving the over-capacity mass from a live sibling to the head's own stale plan admits instead.
+    def test_swapping_sibling_load_for_own_reservation_removes_the_defer(self) -> None:
+        """Moving the card-filling mass from a live sibling to the head's own reservation admits instead.
 
-        The raw demand is identical (a small candidate atop a 7300 MB mass that tops capacity), but in one case
-        the mass is a genuinely-other live sibling and in the other it is the request's own not-yet-materialised
-        plan. The self-net removes the latter, so the branch that legitimately fired for the sibling cannot fire
-        for the request's own footprint.
+        The raw demand is identical (a small candidate atop a 7300 MB mass that fills the card), but in one case
+        the mass is a genuinely-other live sibling physically occupying the card and in the other it is the
+        request's own not-yet-materialised reservation. The self-net removes the latter, so the DEFER that
+        legitimately fired for the sibling cannot fire for the request's own footprint.
         """
         capacity_topping_mb = 7300.0
         sibling_card = _CardModel(
@@ -468,12 +471,12 @@ def _progress_scenarios() -> list[_ProgressScenario]:
         ),
     )
 
-    # Foreign load the worker cannot reclaim, but the candidate physically fits the truthful device-free
-    # reading: the head admits into reality. The ledger prices the card over-committed (own load fits capacity,
-    # the candidate tips it over) while the truthful device-free reading independently shows physical room.
+    # Load the worker cannot attribute to its own contributors (foreign occupancy the device-free reading
+    # already includes), but the candidate physically fits that reading: the head admits at once. The reading
+    # holds 8000 MB of room the head's 5000 MB candidate fits into net of the noise buffer.
     scenarios.append(
         _ProgressScenario(
-            "foreign_pressure_head_admits_into_reality",
+            "device_free_room_admits_the_head",
             _CardModel(
                 total_vram_mb=24576.0,
                 baseline_mb=1200.0,
@@ -488,26 +491,7 @@ def _progress_scenarios() -> list[_ProgressScenario]:
         ),
     )
 
-    # A stale committed ledger drops the measured floor: a fitting candidate is admitted on the planned-only
-    # identity, never wedged by however large the stale floor reads.
-    scenarios.append(
-        _ProgressScenario(
-            "stale_floor_admits_fitting_candidate",
-            _CardModel(
-                total_vram_mb=24576.0,
-                baseline_mb=1200.0,
-                candidate_delta_mb=8229.0,
-                live_sibling_mb=30000.0,
-                committed_is_stale=True,
-            ),
-            VramRequestKind.PRELOAD,
-            True,
-            "admitted",
-            max_cycles=2,
-        ),
-    )
-
-    # The self-inflicted state carried alongside genuinely-other reclaimable load: the head's own stale plan is
+    # The self-inflicted state carried alongside genuinely-other reclaimable load: the head's own reservation is
     # netted AND the idle cache is reclaimed, so it still admits. Proves the self-net does not disable reclaim.
     scenarios.append(
         _ProgressScenario(
@@ -549,11 +533,12 @@ class TestProgressProperty:
         assert outcome == scenario.expected, f"{scenario.label}: expected {scenario.expected}, got {outcome}"
 
     def test_non_head_is_held_behind_the_head_but_the_head_still_progresses(self) -> None:
-        """A non-head (line-skip) request forfeits the over-budget admit, but its presence never wedges the head.
+        """A non-head (line-skip) request may not consume the head's room, but its presence never wedges the head.
 
-        A non-head request that would physically fit foreign-pressure room is denied that room (it belongs to
-        the head), so it defers. The same card presented to the true head admits it into reality. This proves
-        the head-only reservation does not itself become a wedge for the head it protects.
+        Head protection is priced: a fitting non-head request is withheld exactly when admitting it would
+        leave less room than the head's own known demand, so the physical space stays claimable by the head
+        it skipped. The same card presented to the true head admits it. This proves the head protection does
+        not itself become a wedge for the head it protects.
         """
         card = _CardModel(
             total_vram_mb=24576.0,
@@ -564,8 +549,19 @@ class TestProgressProperty:
         )
         arbiter = VramArbiter()
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: card.to_state()}))
-        non_head = arbiter.evaluate(card.request(kind=VramRequestKind.PRELOAD, is_head=False, starved_seconds=0.0))
+        # Available room is device-free 8000 minus the proportional noise buffer (~1229): about 6771 MB. The
+        # 5000 MB line-skipper fits it, but admitting would leave ~1771 MB, short of the head's own 5000 MB
+        # demand, so head protection holds the skipper.
+        non_head = arbiter.evaluate(
+            card.request(
+                kind=VramRequestKind.PRELOAD,
+                is_head=False,
+                starved_seconds=0.0,
+                head_outstanding_mb=5000.0,
+            ),
+        )
         assert non_head.disposition is VramDisposition.DEFER
+        assert not non_head.required_actuations  # queue priority, not a memory shortfall: no reclaim is spent
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: card.to_state()}))
         head = arbiter.evaluate(card.request(kind=VramRequestKind.PRELOAD, is_head=True, starved_seconds=0.0))
         assert head.disposition is VramDisposition.FITS

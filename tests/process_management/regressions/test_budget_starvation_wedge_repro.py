@@ -66,11 +66,14 @@ def _wedge_bridge_data() -> Mock:
 
 def _build_wedged_scheduler(
     free_vram_mb: float,
+    device_free_mb: float | None = None,
 ) -> tuple[InferenceScheduler, ProcessMap, JobTracker, HordeProcessInfo, HordeProcessInfo]:
     """Two idle inference processes, each resident with a *different* model than the head needs.
 
     The head-of-queue job needs a third model that is resident on neither process; the device
-    reports ``free_vram_mb`` free. Mirrors the observed idle-pool-with-evicted-head state.
+    reports ``free_vram_mb`` free to the predictive budget. ``device_free_mb`` is the truthful
+    reading the admission identity prices against (defaulting to ``free_vram_mb``). Mirrors the
+    observed idle-pool-with-evicted-head state.
     """
     proc_sd15 = make_mock_process_info(1, model_name=_RESIDENT_SD15, state=HordeProcessState.WAITING_FOR_JOB)
     proc_sdxl = make_mock_process_info(2, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
@@ -87,6 +90,7 @@ def _build_wedged_scheduler(
         bridge_data=_wedge_bridge_data(),
         max_concurrent=1,
         max_inference=2,
+        device_free_mb=device_free_mb if device_free_mb is not None else free_vram_mb,
     )
     return scheduler, process_map, job_tracker, proc_sd15, proc_sdxl
 
@@ -100,52 +104,66 @@ async def _enqueue_head_jobs(job_tracker: JobTracker, count: int = 2) -> None:
 class TestBudgetStarvationWedge:
     """The active variable is the VRAM budget verdict for the head job; everything else is held fixed."""
 
-    async def test_unfittable_head_defers_after_reclaim_is_exhausted(
+    async def test_physically_held_head_defers_with_reclaim_then_admits_once_room_frees(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A head the measured floor cannot seat stays queued after reclaim is exhausted.
+        """A head the card physically cannot seat defers with reclaim described, and admits once room frees.
 
-        The arbiter first describes reclamation, evicting the idle residents. Once the ladder is exhausted and
-        the arithmetic still does not fit, the preload continues to defer instead of loading into proven
-        over-commit. The structural queue-deadlock detector below is the reroute mechanism for that wedged
-        state.
+        While the idle residents physically hold the card (a truthful device-free reading far below the
+        head's peak), the preload defers and the arbiter describes evicting them: never idling, never
+        loading into proven over-commit. Once the eviction lands and the truthful reading recovers to the
+        achievable floor, the head's weights physically fit and the preload proceeds. The operator reserve
+        is the sampling gate's activation margin, not a load-feasibility floor, so it never converts a
+        physically-fitting load into a permanent deferral.
         """
         monkeypatch.setattr(
             resource_budget,
             "predict_job_sampling_vram_mb",
             lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB,
         )
+        monkeypatch.setattr(
+            _sched_mod, "predict_job_sampling_vram_mb", lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB
+        )
         # RAM is irrelevant to this VRAM-bound case; pin a fittable RAM picture so the test is unambiguous.
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
 
+        # The residents physically hold the card: the truthful reading is a sliver, far under the head's peak.
         scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_wedged_scheduler(
             free_vram_mb=_ACHIEVABLE_FREE_VRAM_MB,
+            device_free_mb=500.0,
         )
-        # The two idle residents commit a fresh allocator reservation that over-commits the card, so the
-        # measured floor denies the head and describes evicting them. Once both are unloading, the ladder is
-        # empty and the head still defers because the arithmetic still does not fit.
         for proc in (proc_sd15, proc_sdxl):
             proc.process_reserved_mb = 8500
             proc.report_sampled_at = time.time()
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 64000.0)
         await _enqueue_head_jobs(job_tracker)
 
-        # Sanity: the threshold is genuinely unreachable on this device.
-        assert _HEAVY_SDXL_PREDICTED_VRAM_MB + _VRAM_RESERVE_MB > _ACHIEVABLE_FREE_VRAM_MB
-
         reclaimed_first = False
         for _ in range(20):
             assert scheduler.preload_models() is False
-            # Until the head is rerouted, the budget should be attempting reclamation, not idling.
+            # Until the room frees, the arbiter should be attempting reclamation, not idling.
             if HordeControlFlag.UNLOAD_MODELS_FROM_VRAM in {
                 proc_sd15.last_control_flag,
                 proc_sdxl.last_control_flag,
             }:
                 reclaimed_first = True
 
-        assert reclaimed_first is True, "the budget should attempt to reclaim idle VRAM before continued deferral"
+        assert reclaimed_first is True, "the arbiter should attempt to reclaim idle VRAM before continued deferral"
         assert HordeControlFlag.PRELOAD_MODEL not in {
+            proc_sd15.last_control_flag,
+            proc_sdxl.last_control_flag,
+        }
+        assert all(job_tracker.is_admitted_over_budget(job) is False for job in job_tracker.jobs_pending_inference)
+
+        # The eviction lands: the truthful reading recovers to the achievable floor and the next cycle
+        # (mirroring the manager's per-tick refreeze) prices the head against it. The weights physically fit,
+        # so the head admits rather than starving behind a reserve that is not a load-feasibility floor.
+        scheduler.set_device_free_mb_provider(lambda _device_index: _ACHIEVABLE_FREE_VRAM_MB)
+        assert scheduler._vram_arbiter is not None
+        scheduler._vram_arbiter.begin_cycle(scheduler.build_vram_arbiter_snapshot())
+        assert scheduler.preload_models() is True
+        assert HordeControlFlag.PRELOAD_MODEL in {
             proc_sd15.last_control_flag,
             proc_sdxl.last_control_flag,
         }

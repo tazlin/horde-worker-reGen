@@ -19,14 +19,18 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     predict_job_post_processing_vram_mb,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    VramActuator,
     VramArbiter,
     VramRequest,
     VramRequestKind,
+    VramVerdict,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
@@ -59,6 +63,8 @@ class _DeferralRecord:
     first_deferred_at: float
     last_logged_at: float
     reclaim_requested: bool = False
+    applied_actuations: tuple[ActuatorCommand, ...] = ()
+    """Most recent arbiter plan executed for this episode; a newly available plan may run once later."""
 
 
 class PostProcessOrchestrator:
@@ -72,6 +78,7 @@ class PostProcessOrchestrator:
     _model_metadata: ModelMetadata
     _reserve_ledger: CommittedReserveLedger
     _request_vram_reclaim: Callable[[HordeProcessInfo, int], bool]
+    _vram_actuator: VramActuator | None
     _clock: Callable[[], float]
 
     def __init__(
@@ -85,6 +92,7 @@ class PostProcessOrchestrator:
         model_metadata: ModelMetadata,
         reserve_ledger: CommittedReserveLedger,
         request_vram_reclaim: Callable[[HordeProcessInfo, int], bool],
+        vram_actuator: VramActuator | None = None,
         sampling_coresidency_check: Callable[[float], bool] | None = None,
         whole_card_residency_active: Callable[[], bool] = lambda: False,
     ) -> None:
@@ -101,6 +109,7 @@ class PostProcessOrchestrator:
             model_metadata: Provides the baseline needed for post-processing VRAM estimates.
             reserve_ledger: Shared committed-resource ledger used by every workload flow.
             request_vram_reclaim: Callback that asks the scheduler to evict idle VRAM on the lane's card.
+            vram_actuator: Optional shared actuator used to execute the arbiter's complete reclaim plan.
             sampling_coresidency_check: Given a chain's estimated peak (MB), whether the card can run it
                 alongside the sampling currently in progress. None (unit tests) allows co-running always.
             whole_card_residency_active: Whether a whole-card residency still owns the lane pause.
@@ -113,6 +122,7 @@ class PostProcessOrchestrator:
         self._model_metadata = model_metadata
         self._reserve_ledger = reserve_ledger
         self._request_vram_reclaim = request_vram_reclaim
+        self._vram_actuator = vram_actuator
         self._sampling_coresidency_check = sampling_coresidency_check
         self._whole_card_residency_active = whole_card_residency_active
         # Overridable so the load simulator can drive the aging window off its virtual clock; monotonic
@@ -134,11 +144,11 @@ class PostProcessOrchestrator:
         completed_job_info: HordeJobInfo,
         post_process_process: HordeProcessInfo,
         reserve_vram_mb: float,
-    ) -> bool:
-        """Whether the lane can start this chain without over-committing its card, the VRAM arbiter deciding.
+    ) -> VramVerdict | None:
+        """Return the lane's arbiter verdict, or None when admission is intentionally bypassed.
 
-        A pure predicate over the frozen cycle measurement: the chain's estimated peak is charged against the
-        card's measured admission floor, so a FITS verdict admits and a DEFER or DENY withholds. The
+        The chain's estimated peak is charged against the frozen cycle measurement, so a FITS verdict admits
+        and a DEFER or DENY carries the reclaim plan the caller must execute. The
         reserve bypass is preserved (a disabled VRAM budget or a zero-peak chain always admits), and a cold or
         unwired arbiter admits, matching the every-gate-admits-on-missing-telemetry contract. The deferral
         bookkeeping (reclaim request, throttled warning, aging) is the caller's, so this stays side-effect free
@@ -146,11 +156,11 @@ class PostProcessOrchestrator:
         """
         bridge_data = self._runtime_config.bridge_data
         if not bridge_data.enable_vram_budget or reserve_vram_mb <= 0:
-            return True
+            return None
         arbiter = self._vram_arbiter
         if arbiter is None or not arbiter.has_cycle:
-            return True
-        verdict = arbiter.evaluate(
+            return None
+        return arbiter.evaluate(
             VramRequest(
                 kind=VramRequestKind.PP_JOB,
                 job_label=f"post_process:{completed_job_info.sdk_api_job_info.id_}",
@@ -161,7 +171,6 @@ class PostProcessOrchestrator:
                 is_head_of_queue=True,
             ),
         )
-        return verdict.admits
 
     def _estimate_post_processing_vram_mb(self, completed_job_info: HordeJobInfo) -> float:
         """Return the committed VRAM reserve for this post-processing unit."""
@@ -220,6 +229,7 @@ class PostProcessOrchestrator:
         job_id: object,
         post_process_process: HordeProcessInfo,
         reserve_vram_mb: float,
+        required_actuations: tuple[ActuatorCommand, ...],
         now: float,
     ) -> None:
         """Record that a job could not be admitted this tick, requesting reclaim once and logging thriftily.
@@ -237,9 +247,27 @@ class PostProcessOrchestrator:
             self._deferrals[key] = record
 
         issued_reclaim = False
-        reclaim_found_idle = False
-        if not record.reclaim_requested:
-            reclaim_found_idle = self._request_vram_reclaim(post_process_process, post_process_process.device_index)
+        reclaim_action_available = False
+        if (
+            required_actuations
+            and self._vram_actuator is not None
+            and required_actuations != record.applied_actuations
+        ):
+            VerifiedReclaimLadder.execute_arbiter_commands(
+                required_actuations,
+                self._vram_actuator,
+                device_index=post_process_process.device_index,
+                for_head_of_queue=True,
+            )
+            record.applied_actuations = required_actuations
+            record.reclaim_requested = True
+            reclaim_action_available = True
+            issued_reclaim = True
+        elif not record.reclaim_requested:
+            reclaim_action_available = self._request_vram_reclaim(
+                post_process_process,
+                post_process_process.device_index,
+            )
             record.reclaim_requested = True
             issued_reclaim = True
 
@@ -252,7 +280,9 @@ class PostProcessOrchestrator:
             )
             if issued_reclaim:
                 reclaim_note = (
-                    "Issued idle VRAM reclaim first." if reclaim_found_idle else "No idle VRAM reclaim was available."
+                    "Issued the available VRAM reclaim actions."
+                    if reclaim_action_available
+                    else "No VRAM reclaim action was available."
                 )
             else:
                 reclaim_note = "Idle VRAM reclaim already requested this episode."
@@ -403,11 +433,12 @@ class PostProcessOrchestrator:
                     )
                 continue
 
-            if self._arbiter_admits_post_processing(
+            verdict = self._arbiter_admits_post_processing(
                 completed_job_info=completed_job_info,
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
-            ):
+            )
+            if verdict is None or verdict.admits:
                 self._deferrals.pop(str(completed_job_info.sdk_api_job_info.id_), None)
                 return await self._dispatch(
                     completed_job_info=completed_job_info,
@@ -419,6 +450,7 @@ class PostProcessOrchestrator:
                 job_id=completed_job_info.sdk_api_job_info.id_,
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
+                required_actuations=verdict.required_actuations,
                 now=now,
             )
         return False

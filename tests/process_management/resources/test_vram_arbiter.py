@@ -1,14 +1,18 @@
-"""Unit tests for the single VRAM arbiter's decision surface and observability counters."""
+"""Unit tests for the single VRAM arbiter's decision surface and observability counters.
+
+The arbiter reasons from measured truth: a request fits iff its candidate outstanding cost fits the frozen
+device-free reading net of the outstanding reservations that reading does not yet reflect and the one noise
+buffer. There is no committed floor, no baseline term, and no foreign-pressure concept in the admission path:
+those quantities are physically inside the device-free reading.
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from horde_worker_regen.process_management.resources.admission_identity import (
-    _ADMISSION_NOISE_BUFFER_MB,
     admission_noise_buffer_mb,
 )
-from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     _STARVATION_DIAGNOSTIC_SECONDS,
@@ -28,13 +32,19 @@ def _snapshot(state: DeviceVramState, *, device_index: int = 0) -> MeasuredVramS
 
 
 def _roomy_state(**overrides: object) -> DeviceVramState:
-    """A card with ample capacity and a small committed floor, so an ordinary candidate fits."""
+    """A card with an ample device-free reading and no outstanding reservations, so an ordinary candidate fits.
+
+    The floor noise buffer (512 MB) is left as the default so the admission arithmetic reads cleanly:
+    available = device_free - reservations - 512. To simulate pressure a test lowers ``device_free_mb``; to
+    stack admitted-but-unmaterialised demand it raises ``planned_unmaterialized_mb``.
+    """
     defaults: dict[str, object] = {
         "total_vram_mb": 24000.0,
         "baseline_mb": 1000.0,
         "committed_vram_mb": 2000.0,
         "planned_unmaterialized_mb": 0.0,
         "committed_is_stale": False,
+        "device_free_mb": 21000.0,
     }
     defaults.update(overrides)
     return DeviceVramState(**defaults)  # type: ignore[arg-type]
@@ -54,24 +64,22 @@ def _preload(**overrides: object) -> VramRequest:
 
 
 class TestAdmissionPath:
-    """The ledger-driven admission identity's dispositions and the escalation ladder."""
+    """The measured-truth admission identity's dispositions and the escalation ladder."""
 
-    def test_fits_when_demand_within_capacity(self) -> None:
-        """A candidate whose demand is within capacity fits on the measured floor."""
+    def test_fits_when_candidate_fits_available_room(self) -> None:
+        """A candidate whose cost fits the device-free reading net of the noise buffer admits."""
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(_roomy_state()))
         verdict = arbiter.evaluate(_preload(candidate_delta_mb=6000.0))
         assert verdict.disposition == VramDisposition.FITS
         assert verdict.admits is True
-        assert verdict.measured.used_measured_floor is True
+        assert verdict.measured.available_known is True
 
     def test_defer_emits_ladder_commands_in_order(self) -> None:
-        """A non-fitting demand defers with the ladder described in escalation order."""
+        """A candidate that overflows the device-free room defers with the ladder in escalation order."""
         arbiter = VramArbiter()
-        state = _roomy_state(
-            committed_vram_mb=20000.0,
-            idle_process_ids=frozenset({7, 3}),
-        )
+        # available = 5000 - 512 = 4488; a 5000 candidate does not fit, so the ladder is described.
+        state = _roomy_state(device_free_mb=5000.0, idle_process_ids=frozenset({7, 3}))
         arbiter.begin_cycle(_snapshot(state))
         verdict = arbiter.evaluate(
             _preload(
@@ -96,7 +104,7 @@ class TestAdmissionPath:
     def test_ladder_omits_commands_that_could_free_nothing(self) -> None:
         """EVICT and REDUCE are emitted only when the request signals they could still free memory."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, idle_process_ids=frozenset({2}))
+        state = _roomy_state(device_free_mb=5000.0, idle_process_ids=frozenset({2}))
         arbiter.begin_cycle(_snapshot(state))
         verdict = arbiter.evaluate(
             _preload(
@@ -112,7 +120,7 @@ class TestAdmissionPath:
     def test_release_cache_never_targets_the_requesting_slot(self) -> None:
         """The request's own target slot is never asked to release the cache it is about to load into."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, idle_process_ids=frozenset({4, 9}))
+        state = _roomy_state(device_free_mb=5000.0, idle_process_ids=frozenset({4, 9}))
         arbiter.begin_cycle(_snapshot(state))
         verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, target_process_id=4))
         release_targets = {
@@ -124,7 +132,7 @@ class TestAdmissionPath:
         """A busy lane is never a RELEASE_CACHE target even when listed idle by another key."""
         arbiter = VramArbiter()
         state = _roomy_state(
-            committed_vram_mb=20000.0,
+            device_free_mb=5000.0,
             idle_process_ids=frozenset({4, 5}),
             busy_process_ids=frozenset({5}),
         )
@@ -137,23 +145,41 @@ class TestAdmissionPath:
         assert release_targets == {4}
 
     def test_deny_when_candidate_cannot_fit_an_empty_card(self) -> None:
-        """A candidate larger than the whole capacity denies (no escalation could seat it)."""
+        """A candidate larger than an emptied card's room denies (no escalation could seat it)."""
         arbiter = VramArbiter()
-        # Capacity is (24000 - 1000) - 512 = 22488; a candidate above that can never seat.
-        arbiter.begin_cycle(_snapshot(_roomy_state()))
+        # An empty card offers total - noise = 24000 - 512 = 23488; a candidate above that can never seat.
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=1000.0)))
         verdict = arbiter.evaluate(_preload(candidate_delta_mb=30000.0))
         assert verdict.disposition == VramDisposition.DENY
+
+    def test_candidate_already_resident_admits_as_a_no_op(self) -> None:
+        """A dispatch onto already-resident weights admits even when the device-free reading has no room.
+
+        The resident weights are physically inside the device-free reading already, so the dispatch
+        materialises nothing; pricing its activation against the (now tight) reading would withhold a slot that
+        is already open.
+        """
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=100.0)))
+        verdict = arbiter.evaluate(
+            _preload(
+                kind=VramRequestKind.MONOLITHIC_DISPATCH, candidate_delta_mb=6000.0, candidate_already_resident=True
+            ),
+        )
+        assert verdict.disposition == VramDisposition.FITS
+        assert "already resident" in verdict.reason
+        assert verdict.measured.fits is False
 
 
 class TestProportionalNoiseBuffer:
     """A device state's per-card noise buffer flows through the measured verdict it is priced against."""
 
     def test_verdict_uses_the_device_states_derived_buffer(self) -> None:
-        """A 16375MB card assembled with the derived buffer prices capacity against 818.75, not the floor."""
+        """A 16375MB card assembled with the derived buffer prices room against 818.75, not the floor."""
         total = 16375.0
         state = _roomy_state(
             total_vram_mb=total,
-            baseline_mb=1700.0,
+            device_free_mb=12000.0,
             noise_buffer_mb=admission_noise_buffer_mb(total),
         )
         arbiter = VramArbiter()
@@ -162,174 +188,191 @@ class TestProportionalNoiseBuffer:
         assert verdict.measured.noise_buffer_mb == pytest.approx(818.75)
 
     def test_derived_buffer_denies_a_demand_the_floor_would_admit(self) -> None:
-        """The larger derived buffer flips an otherwise-fitting demand that the floor buffer would seat."""
-        total, baseline = 16375.0, 1700.0
-        floor_capacity = (total - baseline) - _ADMISSION_NOISE_BUFFER_MB
-        committed = floor_capacity - 100.0
-        floor_state = _roomy_state(total_vram_mb=total, baseline_mb=baseline, committed_vram_mb=committed)
+        """The larger derived buffer flips an otherwise-fitting demand that the floor buffer would seat.
+
+        With device-free 700 and a 100 MB candidate: the floor buffer leaves 188 MB of room (fits), the
+        derived buffer (818.75) leaves negative room (does not fit).
+        """
+        total = 16375.0
+        floor_state = _roomy_state(total_vram_mb=total, device_free_mb=700.0)
         derived_state = _roomy_state(
             total_vram_mb=total,
-            baseline_mb=baseline,
-            committed_vram_mb=committed,
+            device_free_mb=700.0,
             noise_buffer_mb=admission_noise_buffer_mb(total),
         )
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(floor_state))
-        assert arbiter.evaluate(_preload(candidate_delta_mb=0.0)).disposition == VramDisposition.FITS
+        assert arbiter.evaluate(_preload(candidate_delta_mb=100.0)).disposition == VramDisposition.FITS
         arbiter.begin_cycle(_snapshot(derived_state))
-        assert arbiter.evaluate(_preload(candidate_delta_mb=0.0)).disposition == VramDisposition.DEFER
+        assert arbiter.evaluate(_preload(candidate_delta_mb=100.0)).disposition == VramDisposition.DEFER
 
 
-class TestStalenessAndColdStart:
-    """Degraded modes relax to FITS and never deny."""
-
-    def test_stale_ledger_relaxes_to_fits(self) -> None:
-        """A stale committed ledger relaxes an over-demand to admit on the predictive path."""
-        arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=30000.0, committed_is_stale=True)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=6000.0))
-        assert verdict.disposition == VramDisposition.FITS
-        assert verdict.measured.used_measured_floor is False
-
-    def test_cold_start_no_total_relaxes_to_fits(self) -> None:
-        """An unknown device total (cold start) relaxes an over-demand to admit."""
-        arbiter = VramArbiter()
-        state = _roomy_state(total_vram_mb=None, committed_vram_mb=30000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=6000.0))
-        assert verdict.disposition == VramDisposition.FITS
-        assert verdict.measured.used_measured_floor is False
+class TestRelaxationAndMissingReading:
+    """No cycle relaxes to the predictive path; a present card with no device-free reading defers, never denies."""
 
     def test_missing_snapshot_relaxes_to_fits(self) -> None:
-        """Evaluating before a cycle is installed relaxes to admit."""
+        """Evaluating before a cycle is installed relaxes to admit on the predictive path."""
         arbiter = VramArbiter()
         verdict = arbiter.evaluate(_preload())
         assert verdict.disposition == VramDisposition.FITS
 
     def test_missing_device_relaxes_to_fits(self) -> None:
-        """A request for a card absent from the snapshot relaxes to admit."""
+        """A request for a card absent from the snapshot relaxes to admit on the predictive path."""
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(_roomy_state(), device_index=1))
         verdict = arbiter.evaluate(_preload(device_index=0))
         assert verdict.disposition == VramDisposition.FITS
 
-
-class TestReclaimStillPossibleAlwaysDefers:
-    """While reclaim can still free space, a non-fitting demand never admits: it defers behind the ladder."""
-
-    def test_ladder_in_progress_defers_an_oversized_candidate(self) -> None:
-        """A non-fitting demand with a non-empty escalation ladder defers, whatever the device-free reading.
-
-        Even a candidate that would physically fit the truthful device-free reading defers while any rung
-        remains: the ladder can still relieve the over-commit, so the request re-asks next cycle after the
-        caller runs the rung rather than admitting into a state reclaim could have cleared.
-        """
+    def test_present_card_without_device_free_defers_and_counts(self) -> None:
+        """A present card with no device-free reading defers (never denies) and advances the missing counter."""
         arbiter = VramArbiter()
-        # device_free is roomy (would foreign-fit a 5000MB candidate) but an idle lane cache remains to release.
-        # committed 18000 vs device-used 16000 stays within the phantom tolerance: the ledger is honest here.
-        state = _roomy_state(committed_vram_mb=18000.0, idle_process_ids=frozenset({6}), device_free_mb=8000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=None)))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=6000.0, is_head_of_queue=True))
         assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.foreign_pressure_admit is False
-        assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.RELEASE_CACHE]
+        assert verdict.measured.available_known is False
+        assert arbiter.device_free_missing_defers == 1
 
-    def test_saturated_verified_ladder_unfinished_defers_even_with_an_empty_arbiter_ladder(self) -> None:
-        """A SATURATED card whose verified ladder is not yet proven unrelievable defers a non-fitting demand.
-
-        The arbiter's own per-cycle ladder is empty (no idle lane, no reclaimable model), but the governor's
-        verified reclaim ladder is still running (lane pauses, safety off-GPU are rungs the arbiter does not
-        describe), so a candidate that would otherwise foreign-fit still defers until reclaim resolves.
-        """
+    def test_missing_device_free_diagnostic_throttled_per_cycle(self) -> None:
+        """Two evaluations in one frozen cycle count each defer but warn at most once per card."""
         arbiter = VramArbiter()
-        state = _roomy_state(
-            committed_vram_mb=20000.0,
-            device_free_mb=8000.0,
-            governor_state=GovernorState.SATURATED,
-            reclaim_unresolved=False,
-        )
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.foreign_pressure_admit is False
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=None)))
+        arbiter.evaluate(_preload())
+        arbiter.evaluate(_preload())
+        assert arbiter.device_free_missing_defers == 2
 
 
-class TestExhaustedReclaimShortfall:
-    """Once reclaim is exhausted, the verdict follows the shortfall's cause: own load, foreign fit, or deny."""
+class TestReservationsReduceAvailable:
+    """Outstanding reservations are subtracted from the device-free reading and can flip a verdict."""
 
-    def test_own_committed_load_over_capacity_defers(self) -> None:
-        """When the worker's own committed load exceeds capacity after full reclaim, the head defers."""
+    def test_reservations_reduce_the_available_room(self) -> None:
+        """A candidate that fits the bare reading defers once outstanding reservations claim the room."""
         arbiter = VramArbiter()
-        # capacity = (24000 - 1000) - 512 = 22488; committed 23000 alone already exceeds it. device-used
-        # 23000 corroborates the ledger (no phantom): the card genuinely holds the worker's own load.
-        state = _roomy_state(committed_vram_mb=23000.0, device_free_mb=1000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=100.0, is_head_of_queue=True))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.foreign_pressure_admit is False
-        assert "own committed load" in verdict.reason
+        # available without reservations = 10000 - 512 = 9488 (fits 5000); with 6000 reserved = 3488 (does not).
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=10000.0)))
+        assert arbiter.evaluate(_preload(candidate_delta_mb=5000.0)).disposition == VramDisposition.FITS
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=10000.0, planned_unmaterialized_mb=6000.0)))
+        assert arbiter.evaluate(_preload(candidate_delta_mb=5000.0)).disposition == VramDisposition.DEFER
 
-    def test_foreign_shortfall_admits_into_reality_when_the_candidate_physically_fits(self) -> None:
-        """The worker's own load fits capacity; the candidate physically fits device-free, so admit into reality.
-
-        This is the one legitimate remnant of best-effort: the ledger says the card is over-committed only
-        because foreign load consumes it, yet the truthful device-free reading has physical room for the
-        candidate right now, so it admits (flagged for the heavy-head load grace) rather than deferring forever.
-        """
+    def test_own_reservation_is_netted_so_a_reask_never_blocks_on_itself(self) -> None:
+        """A re-ask nets its own outstanding reservation out, so its own admitted plan cannot deny it."""
         arbiter = VramArbiter()
-        # own committed 18000 <= capacity 22488, candidate 5000 tips the ledger over; device-free has room.
-        # committed stays within the phantom tolerance of device-used 16000: genuine foreign pressure.
-        state = _roomy_state(committed_vram_mb=18000.0, device_free_mb=8000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        # 6000 reserved would defer a 5000 candidate, but if that reservation is the request's own it nets out.
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=10000.0, planned_unmaterialized_mb=6000.0)))
+        blocked = arbiter.evaluate(_preload(candidate_delta_mb=5000.0))
+        assert blocked.disposition == VramDisposition.DEFER
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=10000.0, planned_unmaterialized_mb=6000.0)))
+        self_owned = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, own_planned_unmaterialized_mb=6000.0))
+        assert self_owned.disposition == VramDisposition.FITS
+
+    def test_stacked_reservations_deny_a_second_admission_in_one_window(self) -> None:
+        """A reservation booked earlier in the window is seen, so the room is not admitted against twice."""
+        arbiter = VramArbiter()
+        device_free = 13000.0
+        candidate = 6158.0
+        dispositions: list[VramDisposition] = []
+        planned_mb = 0.0
+        for _cycle in range(3):
+            arbiter.begin_cycle(
+                _snapshot(_roomy_state(device_free_mb=device_free, planned_unmaterialized_mb=planned_mb))
+            )
+            verdict = arbiter.evaluate(_preload(candidate_delta_mb=candidate))
+            dispositions.append(verdict.disposition)
+            if verdict.disposition == VramDisposition.FITS:
+                planned_mb += candidate
+        # available: cycle0 12488 (fits), cycle1 6330 (fits), cycle2 172 (does not: the stacked reservations win).
+        assert dispositions[0] == VramDisposition.FITS
+        assert dispositions[1] == VramDisposition.FITS
+        assert dispositions[2] != VramDisposition.FITS
+
+
+class TestHeadProtection:
+    """A fitting non-head request is withheld when admitting it would leave the head unable to fit.
+
+    On the db0 4090 wedge a non-head job took physical room the head-of-queue job needed, starving the head
+    while line-skippers consumed the card. The room the truthful device-free reading shows belongs to the head:
+    a non-head request that would leave less than the head's priced demand defers, holding the room for the head.
+    """
+
+    def test_head_admits_into_the_room_the_reading_shows(self) -> None:
+        """The true head admits when the device-free reading has physical room for it."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=8000.0)))
         verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
         assert verdict.disposition == VramDisposition.FITS
-        assert verdict.admits is True
-        assert verdict.foreign_pressure_admit is True
-        assert verdict.measured.fits is False
 
-    def test_foreign_shortfall_defers_when_the_candidate_does_not_physically_fit(self) -> None:
-        """Foreign pressure but the candidate does not fit device-free minus the buffer: defer, count it."""
+    def test_non_head_is_held_when_admitting_it_would_starve_the_head(self) -> None:
+        """A non-head request that fits defers when the head could not fit the room it would leave behind."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
+        # available = 8000 - 512 = 7488; the non-head's 5000 leaves 2488, below the head's 5000 demand.
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=8000.0)))
+        verdict = arbiter.evaluate(
+            _preload(candidate_delta_mb=5000.0, is_head_of_queue=False, head_outstanding_mb=5000.0),
+        )
         assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.foreign_pressure_admit is False
+        assert "held for the head" in verdict.reason
         assert arbiter.admission_foreign_pressure_defers == 1
 
-    def test_foreign_shortfall_defers_when_device_free_unknown(self) -> None:
-        """With no truthful device-free reading the candidate cannot be shown to physically fit, so it defers."""
+    def test_non_head_admits_when_room_remains_for_the_head(self) -> None:
+        """A non-head request admits when the room it leaves still covers the head's demand."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=None)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert arbiter.admission_foreign_pressure_defers == 1
+        # available = 20000 - 512 = 19488; the non-head's 5000 leaves 14488, above the head's 5000 demand.
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=20000.0)))
+        verdict = arbiter.evaluate(
+            _preload(candidate_delta_mb=5000.0, is_head_of_queue=False, head_outstanding_mb=5000.0),
+        )
+        assert verdict.disposition == VramDisposition.FITS
+        assert arbiter.admission_foreign_pressure_defers == 0
+
+    def test_non_head_without_a_known_head_demand_admits(self) -> None:
+        """With the head's demand unknown at this seam, head protection is skipped and the non-head admits."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=8000.0)))
+        verdict = arbiter.evaluate(
+            _preload(candidate_delta_mb=5000.0, is_head_of_queue=False, head_outstanding_mb=None),
+        )
+        assert verdict.disposition == VramDisposition.FITS
+
+
+class TestReserveDecoupling:
+    """The operator's ``vram_reserve_mb`` never contributes to a load-feasibility denial (flux-wedge guard)."""
 
     def test_reserve_is_never_a_preload_denial_term(self) -> None:
-        """The operator's ``vram_reserve_mb`` never contributes to a PRELOAD denial (flux-wedge guard)."""
+        """A large operator reserve does not tip an otherwise-fitting preload into a denial."""
         arbiter = VramArbiter()
-        # A large reserve plus a candidate that exactly saturates capacity: the reserve must not tip it over.
-        # capacity = (24000 - 1000) - 512 = 22488; committed 2000 + candidate 20488 == capacity, so it fits.
+        # available = 21000 - 512 = 20488; the candidate exactly fits, and the 8192 reserve must not tip it over.
         state = _roomy_state(vram_reserve_mb=8192.0)
         arbiter.begin_cycle(_snapshot(state))
         verdict = arbiter.evaluate(_preload(candidate_delta_mb=20488.0, is_head_of_queue=True))
         assert verdict.disposition == VramDisposition.FITS
 
 
+class TestUnpriceableCandidate:
+    """An unpriceable candidate is charged nothing, so it never denies on an unknown cost."""
+
+    def test_unpriceable_candidate_is_charged_nothing(self) -> None:
+        """A None candidate delta is charged zero and admits within any non-negative room."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=5000.0)))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=None))
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured.candidate_outstanding_mb == pytest.approx(0.0)
+
+
 class TestStarvationDiagnostic:
-    """A head deferred past the diagnostic horizon with reclaim exhausted warns and counts, never admits."""
+    """A head deferred past the diagnostic horizon warns and counts, but still defers (never admits)."""
 
     def _wedged_head(self, starved_seconds: float) -> VramRequest:
-        """A head over budget on a card its own committed load holds, deferred for ``starved_seconds``."""
+        """A head whose candidate does not fit the device-free room, deferred for ``starved_seconds``."""
         return _preload(candidate_delta_mb=100.0, is_head_of_queue=True, starved_seconds=starved_seconds)
 
+    def _wedged_state(self) -> DeviceVramState:
+        """A card whose device-free room cannot hold even a 100 MB candidate net of the noise buffer."""
+        return _roomy_state(device_free_mb=400.0)
+
     def test_diagnostic_emitted_past_the_horizon_without_admitting(self) -> None:
-        """Past the horizon with reclaim exhausted, the diagnostic counter advances but the head still defers."""
+        """Past the horizon the diagnostic counter advances but the head still defers."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=23000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        arbiter.begin_cycle(_snapshot(self._wedged_state()))
         verdict = arbiter.evaluate(self._wedged_head(_STARVATION_DIAGNOSTIC_SECONDS + 5.0))
         assert verdict.disposition == VramDisposition.DEFER
         assert arbiter.starvation_diagnostics == 1
@@ -337,7 +380,7 @@ class TestStarvationDiagnostic:
     def test_diagnostic_throttled_to_once_per_cycle_per_device(self) -> None:
         """Two evaluations within one frozen cycle advance the diagnostic counter at most once."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=23000.0)))
+        arbiter.begin_cycle(_snapshot(self._wedged_state()))
         arbiter.evaluate(self._wedged_head(_STARVATION_DIAGNOSTIC_SECONDS + 5.0))
         arbiter.evaluate(self._wedged_head(_STARVATION_DIAGNOSTIC_SECONDS + 5.0))
         assert arbiter.starvation_diagnostics == 1
@@ -345,52 +388,23 @@ class TestStarvationDiagnostic:
     def test_head_below_the_horizon_emits_no_diagnostic(self) -> None:
         """A head deferred below the diagnostic horizon defers silently (no counter movement)."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=23000.0)))
+        arbiter.begin_cycle(_snapshot(self._wedged_state()))
         verdict = arbiter.evaluate(self._wedged_head(5.0))
         assert verdict.disposition == VramDisposition.DEFER
         assert arbiter.starvation_diagnostics == 0
 
 
-class TestHeadOnlyOverBudgetAdmit:
-    """The best-effort over-budget (foreign-pressure) admit is reserved for the true head of queue.
-
-    On the db0 4090 wedge a non-head job took the over-budget admit and materialised the VRAM the head-of-queue
-    job needed, starving the head while line-skippers consumed the card. The physical room the truthful
-    device-free reading shows belongs to the head; a non-head request defers even when it would physically fit.
-    """
-
-    def test_head_admits_into_reality_when_candidate_physically_fits(self) -> None:
-        """The true head still takes the over-budget admit when the card physically has room for it."""
-        arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=18000.0, device_free_mb=8000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
-        assert verdict.disposition == VramDisposition.FITS
-        assert verdict.foreign_pressure_admit is True
-
-    def test_non_head_is_denied_the_over_budget_admit_and_defers(self) -> None:
-        """A non-head request that would physically fit defers instead of taking the head's room."""
-        arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=18000.0, device_free_mb=8000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=False))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.foreign_pressure_admit is False
-        assert "reserved for the head of queue" in verdict.reason
-        assert arbiter.admission_foreign_pressure_defers == 1
-
-
 class TestStarvationContextTeardown:
-    """A head starved past the threshold whose deficit is held by idle sibling contexts escalates to teardown.
+    """A head starved past the grace whose deficit is held by idle sibling contexts escalates to teardown.
 
     Idle sibling inference contexts hold a bare CUDA baseline that weight eviction cannot reclaim (a context is
     freed only when its process exits). On the db0 flux wedge the built ladder had no rung that could free that
-    baseline, so an exclusive head starved indefinitely. Past the starvation threshold the arbiter escalates to
-    a REDUCE_LIVE_CONTEXTS actuation that tears the idle contexts down, then admits once the room verifies.
+    baseline, so an exclusive head starved indefinitely. Past the grace the arbiter escalates to a
+    REDUCE_LIVE_CONTEXTS actuation that tears the idle contexts down, then admits once the room verifies.
     """
 
     def _starved_head(self, **overrides: object) -> VramRequest:
-        """An over-budget head starved past the diagnostic horizon with idle contexts to tear down."""
+        """A head whose candidate does not fit, starved past the grace, with idle contexts to tear down."""
         defaults: dict[str, object] = {
             "candidate_delta_mb": 5000.0,
             "is_head_of_queue": True,
@@ -403,29 +417,27 @@ class TestStarvationContextTeardown:
     def test_starved_head_escalates_to_context_teardown(self) -> None:
         """The escalation defers with a single REDUCE_LIVE_CONTEXTS command and advances the teardown counter."""
         arbiter = VramArbiter()
-        # committed 20000 <= capacity 22488 (own load fits); candidate 5000 tips it over; no device-free room.
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        # available = 4000 - 512 = 3488; the 5000 candidate does not fit and the deficit is the idle contexts.
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         verdict = arbiter.evaluate(self._starved_head())
         assert verdict.disposition == VramDisposition.DEFER
         assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.REDUCE_LIVE_CONTEXTS]
-        assert verdict.foreign_pressure_admit is False
         assert arbiter.starvation_context_teardowns == 1
 
     def test_teardown_then_admits_after_the_contexts_are_reduced(self) -> None:
-        """Once the torn-down contexts drop the committed floor, the head's re-ask admits (never force-admitted)."""
+        """Once the torn-down contexts free device room, the head's re-ask admits (never force-admitted)."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         assert arbiter.evaluate(self._starved_head()).disposition == VramDisposition.DEFER
-        # The idle contexts exited, so the committed floor dropped well under capacity: the re-ask fits.
-        arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=12000.0, device_free_mb=10000.0)))
+        # The idle contexts exited, so the device-free reading recovered: the re-ask fits.
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=10000.0)))
         readmitted = arbiter.evaluate(self._starved_head())
         assert readmitted.disposition == VramDisposition.FITS
 
-    def test_below_threshold_does_not_tear_down_contexts(self) -> None:
-        """A head starved below the escalation threshold defers without a teardown command."""
+    def test_below_grace_defers_without_teardown(self) -> None:
+        """A head starved below the escalation grace defers without a teardown command."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         verdict = arbiter.evaluate(self._starved_head(starved_seconds=5.0))
         assert verdict.disposition == VramDisposition.DEFER
         assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in [c.kind for c in verdict.required_actuations]
@@ -434,21 +446,16 @@ class TestStarvationContextTeardown:
     def test_no_teardownable_contexts_no_escalation(self) -> None:
         """Without idle contexts to reclaim, a starved head defers via the ordinary shortfall path."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         verdict = arbiter.evaluate(self._starved_head(idle_contexts_teardownable=False))
         assert verdict.disposition == VramDisposition.DEFER
         assert verdict.required_actuations == ()
         assert arbiter.starvation_context_teardowns == 0
 
     def test_unstarved_dispatch_never_tears_a_context_down(self) -> None:
-        """An ordinary (un-starved) MONOLITHIC_DISPATCH request never escalates to context teardown.
-
-        The dispatch gate reconciles a staged job onto the card; below the teardown grace it evicts idle
-        residents but never collapses the context pool. Only a starved head escalates.
-        """
+        """An ordinary (un-starved) MONOLITHIC_DISPATCH request never escalates to context teardown."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         dispatch = VramRequest(
             kind=VramRequestKind.MONOLITHIC_DISPATCH,
             job_label="model_a",
@@ -465,17 +472,14 @@ class TestStarvationContextTeardown:
         assert arbiter.starvation_context_teardowns == 0
 
     def test_starved_dispatch_head_escalates_to_context_teardown(self) -> None:
-        """A starved MONOLITHIC_DISPATCH head with no reality room tears its own idle contexts down.
+        """A starved MONOLITHIC_DISPATCH head with no device-free room tears its own idle contexts down.
 
-        Parity with the preload seam: once the reality admit is ruled out (the candidate does not fit device-free
-        net of the hard floor) and the deficit is held by the head's own idle sibling contexts, the dispatch head
-        escalates to the same verified teardown past the grace.
+        Parity with the preload seam: once the candidate does not fit the device-free reading and the deficit is
+        held by the head's own idle sibling contexts, the dispatch head escalates to the same teardown past the
+        grace.
         """
         arbiter = VramArbiter()
-        # device_free 4000 cannot hold candidate 5000 even net of the hard floor, so the reality admit is ruled
-        # out and the deficit is the idle sibling contexts.
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         dispatch = VramRequest(
             kind=VramRequestKind.MONOLITHIC_DISPATCH,
             job_label="model_a",
@@ -492,13 +496,12 @@ class TestStarvationContextTeardown:
         assert arbiter.starvation_context_teardowns == 1
 
 
-class TestFirstPartyContextPressureClassification:
-    """A starved head's own idle sibling contexts are reclaimable first-party residency, never foreign pressure.
+class TestFirstPartyContextDefer:
+    """A starved head's own idle sibling contexts are a reclaimable first-party deficit awaiting the grace.
 
-    The ordinary ladder cannot describe a bare-context teardown, so a head whose deficit is exactly its own idle
-    sibling contexts reaches the post-ladder analysis with an empty ladder. It must be classified as a
-    first-party reclaim awaiting the starvation threshold, not blamed on foreign pressure and rerouted to the
-    structural-wedge recovery supervisor.
+    Before the teardown grace elapses, a head whose only unreclaimed deficit is its own teardownable idle
+    contexts defers as a first-party reclaim (counted distinctly), not blamed on head-protection or diagnosed as
+    a foreign wedge. Past the grace it escalates to the teardown.
     """
 
     def _first_party_head(self, **overrides: object) -> VramRequest:
@@ -513,27 +516,21 @@ class TestFirstPartyContextPressureClassification:
         defaults.update(overrides)
         return _preload(**defaults)
 
-    def test_below_threshold_defers_as_first_party_not_foreign(self) -> None:
-        """Before the escalation threshold the head defers on its own contexts, not as foreign pressure."""
+    def test_below_grace_defers_as_first_party(self) -> None:
+        """Before the teardown grace the head defers on its own contexts, counted as a first-party defer."""
         arbiter = VramArbiter()
-        # committed 20000 <= capacity (own load fits); candidate 5000 tips it over; device-free has no room.
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         verdict = arbiter.evaluate(self._first_party_head(starved_seconds=5.0))
         assert verdict.disposition == VramDisposition.DEFER
         assert verdict.required_actuations == ()
-        assert verdict.foreign_pressure_admit is False
-        assert "idle sibling contexts" in verdict.reason
         assert arbiter.first_party_context_defers == 1
         assert arbiter.admission_foreign_pressure_defers == 0
-        assert arbiter.starvation_diagnostics == 0
         assert arbiter.starvation_context_teardowns == 0
 
-    def test_without_first_party_contexts_the_foreign_defer_still_classifies_as_foreign(self) -> None:
-        """A starved head with no teardownable contexts is genuinely foreign-pressured and diagnosed as such."""
+    def test_head_with_no_teardownable_contexts_is_not_a_first_party_defer(self) -> None:
+        """A starved head with no teardownable contexts defers via the ordinary path, not as first-party."""
         arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
-        arbiter.begin_cycle(_snapshot(state))
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         verdict = arbiter.evaluate(
             self._first_party_head(
                 idle_contexts_teardownable=False,
@@ -542,89 +539,7 @@ class TestFirstPartyContextPressureClassification:
         )
         assert verdict.disposition == VramDisposition.DEFER
         assert arbiter.first_party_context_defers == 0
-        assert arbiter.admission_foreign_pressure_defers == 1
         assert arbiter.starvation_diagnostics == 1
-
-
-class TestDispatchStarvedRealityAdmit:
-    """A starved monolithic-dispatch head admits against device truth net of the governor hard floor.
-
-    The dispatch candidate is an activation-inclusive learned high-watermark peak, so stacking the full noise
-    buffer on top of it double-counts the margin. Past the grace, a head that physically fits device-free net of
-    the tighter governor hard floor admits into reality rather than parking on a ledger fiction.
-    """
-
-    _TOTAL_MB = 16375.0
-    _BASELINE_MB = 2055.0
-
-    def _state(self, *, committed_mb: float, device_free_mb: float) -> DeviceVramState:
-        """The incident card: 16375MB total, committed the worker's own bare idle contexts."""
-        return DeviceVramState(
-            total_vram_mb=self._TOTAL_MB,
-            baseline_mb=self._BASELINE_MB,
-            committed_vram_mb=committed_mb,
-            planned_unmaterialized_mb=0.0,
-            committed_is_stale=False,
-            noise_buffer_mb=admission_noise_buffer_mb(self._TOTAL_MB),
-            device_free_mb=device_free_mb,
-        )
-
-    def _dispatch(self, *, candidate_delta_mb: float, starved_seconds: float, **overrides: object) -> VramRequest:
-        """A monolithic-dispatch head starved for the given duration."""
-        defaults: dict[str, object] = {
-            "kind": VramRequestKind.MONOLITHIC_DISPATCH,
-            "job_label": "WAI-SDXL",
-            "baseline": "stable_diffusion_xl",
-            "device_index": 0,
-            "candidate_delta_mb": candidate_delta_mb,
-            "is_head_of_queue": True,
-            "starved_seconds": starved_seconds,
-        }
-        defaults.update(overrides)
-        return VramRequest(**defaults)  # type: ignore[arg-type]
-
-    def test_incident_geometry_admits_into_reality(self) -> None:
-        """The 141s incident: candidate 9517 fits device-free 9938 net of the ~409 hard floor by 421MB."""
-        arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
-        verdict = arbiter.evaluate(
-            self._dispatch(candidate_delta_mb=9517.0, starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0),
-        )
-        assert verdict.disposition == VramDisposition.FITS
-        assert arbiter.dispatch_reality_admits == 1
-        assert "admit into reality" in verdict.reason
-
-    def test_just_below_the_hard_floor_stays_held(self) -> None:
-        """A candidate that overshoots device-free net of the hard floor does not take the reality admit."""
-        arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
-        # 9938 - 9600 = 338 MB spare, below the ~409 MB hard floor: held.
-        verdict = arbiter.evaluate(
-            self._dispatch(candidate_delta_mb=9600.0, starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0),
-        )
-        assert verdict.disposition == VramDisposition.DEFER
-        assert arbiter.dispatch_reality_admits == 0
-
-    def test_unstarved_head_does_not_take_the_reality_admit(self) -> None:
-        """Below the grace the ordinary identity stands: no reality admit even when the hard floor would fit."""
-        arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
-        verdict = arbiter.evaluate(self._dispatch(candidate_delta_mb=9517.0, starved_seconds=1.0))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert arbiter.dispatch_reality_admits == 0
-
-    def test_preload_head_does_not_take_the_dispatch_reality_admit(self) -> None:
-        """The hard-floor reality admit is dispatch-only: a preload head keeps the noise-buffer admission."""
-        arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
-        arbiter.evaluate(
-            _preload(
-                candidate_delta_mb=9517.0,
-                is_head_of_queue=True,
-                starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0,
-            ),
-        )
-        assert arbiter.dispatch_reality_admits == 0
 
 
 class TestFirstPartyTeardownGraceTiming:
@@ -637,8 +552,8 @@ class TestFirstPartyTeardownGraceTiming:
     """
 
     def _state(self) -> DeviceVramState:
-        """Committed 20000 (own load fits capacity); candidate tips it over; no device-free room to admit into."""
-        return _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
+        """A card whose device-free room cannot hold the candidate: the deficit is the idle contexts."""
+        return _roomy_state(device_free_mb=4000.0)
 
     def _first_party_head(self, starved_seconds: float) -> VramRequest:
         """A head whose deficit is its own teardownable idle contexts, starved for the given duration."""
@@ -680,7 +595,7 @@ class TestFirstPartyTeardownGraceTiming:
         assert arbiter.starvation_diagnostics == 0
 
     def test_foreign_geometry_keeps_the_60s_diagnostic_timing(self) -> None:
-        """A genuinely-foreign starved head (no first-party contexts) still warns at 60s, not the short grace."""
+        """A starved head with no first-party contexts still warns at 60s, not the short grace."""
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(self._state()))
         past_grace = _preload(
@@ -706,12 +621,12 @@ class TestFirstPartyTeardownGraceTiming:
 class TestFlagIndependentStarvationLivenessRegression:
     """The 4090 flag-off wedge: a weight-dominant head starved behind its own idle sibling contexts.
 
-    A 24GB card with ``whole_card_exclusive_residency`` off held two idle sibling inference contexts (5036 MB
-    committed, the worker's own) when a Flux fp8 head (16097 MB) reached the queue. The head fit capacity once
-    those contexts were torn down, but the deferral was misattributed to foreign pressure and rerouted to the
-    structural-wedge recovery supervisor, which destroyed the pool. The arbiter now escalates to a verified
-    context teardown regardless of the config flag (the scheduler feeds ``idle_contexts_teardownable`` true on
-    the emergency-liveness seam even with the flag off), and the head admits once the contexts exit.
+    A 24GB card with ``whole_card_exclusive_residency`` off held two idle sibling inference contexts (5036 MB,
+    the worker's own) when a Flux fp8 head (16097 MB) reached the queue. The head fit the card once those
+    contexts were torn down, but the deferral was misattributed and rerouted to the structural-wedge recovery
+    supervisor, which destroyed the pool. The arbiter now escalates to a verified context teardown regardless of
+    the config flag (the scheduler feeds ``idle_contexts_teardownable`` true on the emergency-liveness seam even
+    with the flag off), and the head admits once the contexts exit.
     """
 
     _TOTAL_MB = 24074.0
@@ -745,24 +660,23 @@ class TestFlagIndependentStarvationLivenessRegression:
         )
 
     def test_escalates_to_teardown_instead_of_rerouting_to_the_supervisor(self) -> None:
-        """The head tears its own idle contexts down rather than being deferred as foreign and rerouted."""
+        """The head tears its own idle contexts down rather than being deferred and rerouted."""
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(self._state(committed_mb=5036.0)))
         verdict = arbiter.evaluate(self._head())
         assert verdict.disposition == VramDisposition.DEFER
         assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.REDUCE_LIVE_CONTEXTS]
-        assert verdict.foreign_pressure_admit is False
         assert arbiter.starvation_context_teardowns == 1
-        # The foreign-pressure reroute path (the permanent-DEFER branch) is no longer reachable in this geometry.
+        # The teardown fires before the starvation diagnostic path is reached.
         assert arbiter.admission_foreign_pressure_defers == 0
         assert arbiter.starvation_diagnostics == 0
 
     def test_reask_admits_once_the_idle_contexts_exit(self) -> None:
-        """After the torn-down contexts drop the committed floor, the head's re-ask fits capacity."""
+        """After the torn-down contexts free device room, the head's re-ask fits the card."""
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(self._state(committed_mb=5036.0)))
         assert arbiter.evaluate(self._head()).disposition == VramDisposition.DEFER
-        # Both idle sibling contexts exited: the committed floor drops to a single retained context.
+        # Both idle sibling contexts exited: the device-free reading recovered to a single retained context.
         arbiter.begin_cycle(_snapshot(self._state(committed_mb=2518.0)))
         assert arbiter.evaluate(self._head()).disposition == VramDisposition.FITS
 
@@ -862,15 +776,16 @@ class TestStageDispatchNeverWithheld:
     _TOTAL_MB = 16375.0
     _DECODE_SPIKE_MB = 2500.0
 
-    def _state(self, *, committed_mb: float) -> DeviceVramState:
-        """A card holding a committed floor, with the proportional noise buffer the scheduler assembles."""
+    def _state(self, *, device_free_mb: float | None) -> DeviceVramState:
+        """A card whose device-free reading is tight enough that the admission identity would itself withhold."""
         return DeviceVramState(
             total_vram_mb=self._TOTAL_MB,
             baseline_mb=0.0,
-            committed_vram_mb=committed_mb,
+            committed_vram_mb=0.0,
             planned_unmaterialized_mb=0.0,
             committed_is_stale=False,
             noise_buffer_mb=admission_noise_buffer_mb(self._TOTAL_MB),
+            device_free_mb=device_free_mb,
         )
 
     def _stage_request(self, kind: VramRequestKind, *, candidate_delta_mb: float | None) -> VramRequest:
@@ -883,51 +798,40 @@ class TestStageDispatchNeverWithheld:
             candidate_delta_mb=candidate_delta_mb,
         )
 
-    def test_encode_fits_while_committed_exceeds_admission_capacity(self) -> None:
-        """During sampling the committed floor overshoots the admission ceiling, yet the encode still fits.
-
-        The overlap case: committed 15600 exceeds ``(total - baseline) - noise`` (roughly 15556 here) so the
-        admission identity would deny, but the stage dispatch proceeds and the pipeline overlap is preserved.
-        """
+    def test_encode_fits_though_the_identity_would_withhold(self) -> None:
+        """A tight device-free reading would deny under the identity, yet the encode stage still proceeds."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(self._state(committed_mb=15600.0)))
+        arbiter.begin_cycle(_snapshot(self._state(device_free_mb=100.0)))
         verdict = arbiter.evaluate(self._stage_request(VramRequestKind.DISAGG_ENCODE, candidate_delta_mb=None))
         assert verdict.disposition == VramDisposition.FITS
         assert verdict.admits is True
-        # The admission identity is attached for observability and would itself have denied here.
+        # The admission identity is attached for observability and would itself have withheld here.
         assert verdict.measured.fits is False
 
-    def test_decode_fits_even_beyond_the_physical_total(self) -> None:
-        """A decode proceeds even when committed-plus-spike tops the physical total: draining ends pressure."""
+    def test_decode_fits_even_with_no_device_free_room(self) -> None:
+        """A decode proceeds even when the device-free reading has no room: draining ends the pressure."""
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(self._state(committed_mb=self._TOTAL_MB - 1.0)))
+        arbiter.begin_cycle(_snapshot(self._state(device_free_mb=1.0)))
         verdict = arbiter.evaluate(
             self._stage_request(VramRequestKind.DISAGG_DECODE, candidate_delta_mb=self._DECODE_SPIKE_MB),
         )
         assert verdict.disposition == VramDisposition.FITS
 
-    def test_unknown_total_fits(self) -> None:
-        """A cold-start card with no known total admits the stage on the predictive path."""
+    def test_unknown_reading_fits(self) -> None:
+        """A card with no device-free reading admits the stage rather than wedging the pipeline."""
         arbiter = VramArbiter()
-        state = DeviceVramState(
-            total_vram_mb=None,
-            baseline_mb=0.0,
-            committed_vram_mb=0.0,
-            planned_unmaterialized_mb=0.0,
-            committed_is_stale=False,
-        )
-        arbiter.begin_cycle(_snapshot(state))
+        arbiter.begin_cycle(_snapshot(self._state(device_free_mb=None)))
         verdict = arbiter.evaluate(self._stage_request(VramRequestKind.DISAGG_DECODE, candidate_delta_mb=99999.0))
         assert verdict.disposition == VramDisposition.FITS
 
 
-class TestTwoSamplerReclaimTripwire:
-    """The proven two-sampler figures: the second preload defers, reclaims, then the re-ask admits.
+class TestReclaimTripwire:
+    """A preload over the device-free room defers with a reclaim command, then admits once the room frees.
 
-    16375 MB total, 1878 baseline, 512 noise -> capacity 13985. With the first 6158 sampler resident and
-    the lane holding its 2500 MB decode cache (committed 8658), the second 6158 preload demands 14816: over
-    capacity by 831 MB. It must defer with a reclaim command, not perpetually defer while reclaimable memory
-    exists; once the lane releases its cache the committed floor drops and the re-ask admits.
+    16375 MB card, 1878 baseline. With the first 6158 sampler resident and the lane holding its 2500 MB decode
+    cache, the device-free reading is 5839 MB: a second 6158 sampler does not fit and must defer with a reclaim
+    command, not perpetually defer while reclaimable memory exists. Once the lane releases its cache the
+    reading recovers and the re-ask admits.
     """
 
     _TOTAL_MB = 16375.0
@@ -948,19 +852,30 @@ class TestTwoSamplerReclaimTripwire:
             has_reclaimable_idle_model=True,
         )
 
-    def test_second_sampler_defers_with_reclaim_then_admits_after_release(self) -> None:
-        """The 831 MB gap defers with a RELEASE_CACHE/EVICT command; releasing the lane cache admits the re-ask."""
-        arbiter = VramArbiter()
-        # First cycle: the first sampler is resident and the lane holds its decode cache (committed 8658).
-        pressured = DeviceVramState(
+    def _state(self, *, committed_mb: float, idle_process_ids: frozenset[int]) -> DeviceVramState:
+        """A card whose device-free reading is the total net of baseline and the committed decomposition."""
+        return DeviceVramState(
             total_vram_mb=self._TOTAL_MB,
             baseline_mb=self._BASELINE_MB,
-            committed_vram_mb=self._SAMPLER_MB + self._LANE_CACHE_MB,
+            committed_vram_mb=committed_mb,
             planned_unmaterialized_mb=0.0,
             committed_is_stale=False,
-            idle_process_ids=frozenset({self._LANE_PID}),
+            idle_process_ids=idle_process_ids,
+            device_free_mb=max(0.0, self._TOTAL_MB - self._BASELINE_MB - committed_mb),
         )
-        arbiter.begin_cycle(_snapshot(pressured))
+
+    def test_second_sampler_defers_with_reclaim_then_admits_after_release(self) -> None:
+        """The over-budget preload defers with a RELEASE_CACHE/EVICT command; releasing the cache admits the re-ask."""
+        arbiter = VramArbiter()
+        # First cycle: the first sampler is resident and the lane holds its decode cache (committed 8658).
+        arbiter.begin_cycle(
+            _snapshot(
+                self._state(
+                    committed_mb=self._SAMPLER_MB + self._LANE_CACHE_MB,
+                    idle_process_ids=frozenset({self._LANE_PID}),
+                ),
+            ),
+        )
         deferred = arbiter.evaluate(self._second_sampler_preload())
         assert deferred.disposition == VramDisposition.DEFER
         command_kinds = {command.kind for command in deferred.required_actuations}
@@ -972,268 +887,33 @@ class TestTwoSamplerReclaimTripwire:
             for command in deferred.required_actuations
         )
 
-        # Next cycle: the lane released its 2500 MB cache, so the committed floor drops to 6158.
-        relieved = DeviceVramState(
-            total_vram_mb=self._TOTAL_MB,
-            baseline_mb=self._BASELINE_MB,
-            committed_vram_mb=self._SAMPLER_MB,
-            planned_unmaterialized_mb=0.0,
-            committed_is_stale=False,
-        )
-        arbiter.begin_cycle(_snapshot(relieved))
+        # Next cycle: the lane released its 2500 MB cache, so the device-free reading recovered.
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=self._SAMPLER_MB, idle_process_ids=frozenset())))
         readmitted = arbiter.evaluate(self._second_sampler_preload())
         assert readmitted.disposition == VramDisposition.FITS
-
-
-class TestStalenessNeverDeniesProperty:
-    """Staleness drops the measured floor but never denies on its own: only a planned overlay can deny."""
-
-    def test_stale_with_no_planned_demand_never_denies(self) -> None:
-        """With no planned demand a stale ledger always admits a fitting candidate, whatever the stale floor.
-
-        The measured committed floor is child telemetry and is dropped when stale, so however large it reads it
-        can never itself flip the verdict; a candidate within capacity therefore always fits.
-        """
-        arbiter = VramArbiter()
-        for committed in (0.0, 20000.0, 99999.0):
-            for candidate in (0.0, 6000.0):
-                state = DeviceVramState(
-                    total_vram_mb=24000.0,
-                    baseline_mb=1000.0,
-                    committed_vram_mb=committed,
-                    planned_unmaterialized_mb=0.0,
-                    committed_is_stale=True,
-                )
-                arbiter.begin_cycle(_snapshot(state))
-                verdict = arbiter.evaluate(_preload(candidate_delta_mb=candidate, is_head_of_queue=True))
-                assert verdict.disposition == VramDisposition.FITS
-                assert verdict.measured.used_measured_floor is False
-
-    def test_cold_start_no_total_always_fits(self) -> None:
-        """A cold start with no known total relaxes fully: even an oversized candidate admits, nothing knowable."""
-        arbiter = VramArbiter()
-        for committed in (0.0, 20000.0, 99999.0):
-            for candidate in (0.0, 6000.0, 40000.0):
-                state = DeviceVramState(
-                    total_vram_mb=None,
-                    baseline_mb=1000.0,
-                    committed_vram_mb=committed,
-                    planned_unmaterialized_mb=0.0,
-                    committed_is_stale=False,
-                )
-                arbiter.begin_cycle(_snapshot(state))
-                verdict = arbiter.evaluate(_preload(candidate_delta_mb=candidate, is_head_of_queue=True))
-                assert verdict.disposition == VramDisposition.FITS
-                assert verdict.measured.used_measured_floor is False
-
-    def test_stale_planned_overlay_denies_stacked_admissions(self) -> None:
-        """The startup storm at the arbiter: stale reports but stacked planned admissions still deny a preload."""
-        arbiter = VramArbiter()
-        state = DeviceVramState(
-            total_vram_mb=16375.0,
-            baseline_mb=1700.0,
-            committed_vram_mb=99999.0,
-            planned_unmaterialized_mb=12316.0,
-            committed_is_stale=True,
-            noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-        )
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=6158.0))
-        assert verdict.measured.used_measured_floor is False
-        assert verdict.measured.fits is False
-        assert verdict.disposition != VramDisposition.FITS
-
-    def test_three_sequential_stale_preloads_admit_two_then_deny(self) -> None:
-        """Startup storm: with stale reports the planned overlay accumulates, admitting two preloads then denying.
-
-        Each cycle re-freezes the snapshot with the planned overlay grown by the prior admit's 6158 MB anchor.
-        The measured floor is dropped (stale), the baseline is still 0 (no child has reported), yet the third
-        stacked candidate pushes planned + candidate past the 16375 MB card's capacity and is denied.
-        """
-        arbiter = VramArbiter()
-        candidate = 6158.0
-        dispositions: list[VramDisposition] = []
-        planned_mb = 0.0
-        for _cycle in range(3):
-            state = DeviceVramState(
-                total_vram_mb=16375.0,
-                baseline_mb=0.0,
-                committed_vram_mb=0.0,
-                planned_unmaterialized_mb=planned_mb,
-                committed_is_stale=True,
-                noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            )
-            arbiter.begin_cycle(_snapshot(state))
-            verdict = arbiter.evaluate(_preload(candidate_delta_mb=candidate))
-            dispositions.append(verdict.disposition)
-            if verdict.disposition == VramDisposition.FITS:
-                planned_mb += candidate
-        assert dispositions[0] == VramDisposition.FITS
-        assert dispositions[1] == VramDisposition.FITS
-        assert dispositions[2] != VramDisposition.FITS
 
 
 def test_every_verdict_carries_a_populated_measured_verdict() -> None:
     """Every disposition attaches the measured admission identity the verdict was reasoned from."""
     arbiter = VramArbiter()
-    # committed 18000 vs device-used 16000 stays within the phantom tolerance: this is genuine foreign
-    # pressure (the ledger is honest; the card is consumed by load the worker did not commit).
-    arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=18000.0, device_free_mb=8000.0)))
+    arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=8000.0)))
     fits = arbiter.evaluate(_preload(candidate_delta_mb=1000.0))
-    foreign_fit = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
-    arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)))
+    arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
     deferred = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
     denied = arbiter.evaluate(_preload(candidate_delta_mb=30000.0))
     assert fits.disposition == VramDisposition.FITS
-    assert foreign_fit.foreign_pressure_admit is True
     assert deferred.disposition == VramDisposition.DEFER
     assert denied.disposition == VramDisposition.DENY
-    for verdict in (fits, foreign_fit, deferred, denied):
+    for verdict in (fits, deferred, denied):
         assert verdict.measured is not None
-        assert verdict.measured.used_measured_floor is True
+        assert verdict.measured.available_known is True
 
 
-def test_unpriceable_candidate_is_charged_nothing() -> None:
-    """A None candidate delta is charged zero, so it never denies on an unpriceable cost."""
+def test_reason_line_renders_the_measured_arithmetic() -> None:
+    """A verdict's reason renders the identity physically: candidate vs (device-free - reservations - noise)."""
     arbiter = VramArbiter()
-    arbiter.begin_cycle(_snapshot(_roomy_state(committed_vram_mb=20000.0)))
-    verdict = arbiter.evaluate(_preload(candidate_delta_mb=None))
-    assert verdict.disposition == VramDisposition.FITS
-    assert verdict.measured.candidate_delta_mb == pytest.approx(0.0)
-
-
-class TestPhantomLedgerTruthAdmission:
-    """A committed ledger that over-counts the device-used truth must never drive destructive reclaim.
-
-    The phantom judgement is shared with the drift reconciler (``committed_ledger_is_phantom``): committed
-    exceeding device-used beyond the tolerance is arithmetically impossible for a truthful ledger, so the
-    rejection is bookkeeping. The head is admitted against device truth instead of being handed to the
-    reclaim ladder, and while the phantom holds only the cache-release rungs (the recalibration actuation)
-    may be described: eviction and context teardown reclaim nothing a fiction counted.
-    """
-
-    def test_phantom_rejected_head_admits_against_device_truth(self) -> None:
-        """The production geometry: a lone SDXL head on a near-empty card priced full by the ledger.
-
-        A 16375 MB card with 15087 MB truthfully free (device-used 1288 MB) whose ledger claims 15938 MB
-        committed. The ~12 GB candidate physically fits the free reading, so the head admits with the
-        phantom attribution instead of deferring into the ladder that previously escalated to whole-card
-        residency and tore down every lane.
-        """
-        arbiter = VramArbiter()
-        state = DeviceVramState(
-            total_vram_mb=16375.0,
-            baseline_mb=1614.0,
-            committed_vram_mb=15938.0,
-            planned_unmaterialized_mb=0.0,
-            committed_is_stale=False,
-            noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            device_free_mb=15087.0,
-        )
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(
-            _preload(
-                candidate_delta_mb=11913.0,
-                is_head_of_queue=True,
-                has_reclaimable_idle_model=True,
-                can_reduce_live_contexts=True,
-            ),
-        )
-        assert verdict.disposition == VramDisposition.FITS
-        assert verdict.phantom_truth_admit is True
-        assert verdict.foreign_pressure_admit is False
-        assert verdict.required_actuations == ()
-        assert arbiter.phantom_truth_admissions == 1
-
-    def test_phantom_without_truth_room_suppresses_destructive_rungs(self) -> None:
-        """When even device truth has no room, the phantom defer describes only cache-release rungs."""
-        arbiter = VramArbiter()
-        # committed 20000 vs device-used 16000: phantom; but free 8000 cannot hold a 7800 candidate with the
-        # 512 noise buffer, so the head defers. The ladder's evict/teardown rungs must be suppressed.
-        state = _roomy_state(
-            committed_vram_mb=20000.0,
-            device_free_mb=8000.0,
-            idle_process_ids=frozenset({6}),
-        )
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(
-            _preload(
-                candidate_delta_mb=7800.0,
-                is_head_of_queue=True,
-                has_reclaimable_idle_model=True,
-                can_reduce_live_contexts=True,
-            ),
-        )
-        assert verdict.disposition == VramDisposition.DEFER
-        assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.RELEASE_CACHE]
-
-    def test_phantom_suppresses_starvation_context_teardown(self) -> None:
-        """A starved head under a phantom ledger never escalates to REDUCE_LIVE_CONTEXTS."""
-        arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=8000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(
-            _preload(
-                candidate_delta_mb=7800.0,
-                is_head_of_queue=True,
-                starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 5.0,
-                idle_contexts_teardownable=True,
-            ),
-        )
-        assert verdict.disposition == VramDisposition.DEFER
-        assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in [c.kind for c in verdict.required_actuations]
-        assert arbiter.starvation_context_teardowns == 0
-
-    def test_saturated_verified_ladder_outranks_the_phantom_bypass(self) -> None:
-        """While the governor's verified ladder works a SATURATED card, a phantom-rejected head still defers.
-
-        SATURATED is a truthful device-level reading; the phantom bypass only overrides the ledger, never
-        the governor.
-        """
-        arbiter = VramArbiter()
-        state = _roomy_state(
-            committed_vram_mb=20000.0,
-            device_free_mb=8000.0,
-            governor_state=GovernorState.SATURATED,
-            reclaim_unresolved=False,
-        )
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.phantom_truth_admit is False
-
-    def test_phantom_truth_admit_is_reserved_for_the_head(self) -> None:
-        """A non-head request under a phantom ledger defers: the truthful room belongs to the head."""
-        arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=8000.0)
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=False))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.phantom_truth_admit is False
-
-    def test_no_device_truth_means_the_ledger_is_trusted(self) -> None:
-        """Without a truthful device-free reading there is no phantom judgement: the ledger stands."""
-        arbiter = VramArbiter()
-        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=None, idle_process_ids=frozenset({6}))
-        arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(
-            _preload(candidate_delta_mb=5000.0, is_head_of_queue=True, can_reduce_live_contexts=True),
-        )
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.phantom_truth_admit is False
-        kinds = [c.kind for c in verdict.required_actuations]
-        assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS in kinds
-
-    def test_phantom_charges_the_planned_overlay_against_truth(self) -> None:
-        """The truth pricing still charges other admitted-but-unmaterialized loads against the free reading."""
-        arbiter = VramArbiter()
-        state = _roomy_state(
-            committed_vram_mb=20000.0,
-            device_free_mb=8000.0,
-            planned_unmaterialized_mb=4000.0,
-        )
-        arbiter.begin_cycle(_snapshot(state))
-        # 5000 candidate + 4000 planned = 9000 > 8000 - 512: the truthful room is already spoken for.
-        verdict = arbiter.evaluate(_preload(candidate_delta_mb=5000.0, is_head_of_queue=True))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.phantom_truth_admit is False
+    arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=8000.0, planned_unmaterialized_mb=1000.0)))
+    verdict = arbiter.evaluate(_preload(candidate_delta_mb=1000.0))
+    assert "device-free" in verdict.reason
+    assert "reservations" in verdict.reason
+    assert "noise" in verdict.reason

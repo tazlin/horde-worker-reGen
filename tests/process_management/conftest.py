@@ -434,11 +434,15 @@ def make_testable_process_manager(
     stable_diffusion_reference: dict[str, Mock] | None = None,
     system_resources: SystemResources | None = None,
     mp_primitives: MultiprocessingPrimitives | None = None,
+    device_free_mb: float | None = 24000.0,
     **bridge_overrides: object,
 ) -> HordeWorkerProcessManager:
     """Build a HordeWorkerProcessManager that can be constructed without torch/psutil/network.
 
-    All external dependencies are replaced with mocks or test doubles.
+    All external dependencies are replaced with mocks or test doubles. ``device_free_mb`` seeds the
+    manager's truthful device-free reading for card 0 (the measured-truth admission identity's primary
+    input) so admission-neutral tests are not deferred on a missing reading; pass a small figure to model
+    VRAM pressure or None to model a card the parent has not read yet.
     """
     if bridge_data is None:
         bridge_data = make_mock_bridge_data(**bridge_overrides)
@@ -452,7 +456,7 @@ def make_testable_process_manager(
     mock_ctx = Mock()
     mock_model_ref_manager = Mock()
 
-    return HordeWorkerProcessManager(
+    process_manager = HordeWorkerProcessManager(
         ctx=mock_ctx,
         bridge_data=bridge_data,
         horde_model_reference_manager=mock_model_ref_manager,
@@ -462,6 +466,9 @@ def make_testable_process_manager(
         skip_api_init=True,
         stable_diffusion_reference=stable_diffusion_reference,
     )
+    if device_free_mb is not None:
+        process_manager._last_device_free_mb_by_device[0] = device_free_mb
+    return process_manager
 
 
 def make_mock_process_info(

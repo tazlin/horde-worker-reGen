@@ -25,17 +25,11 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources import resource_budget
-from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.resource_budget import (
     StreamForecast,
     effective_inference_reserve_mb,
     forecast_weight_streaming,
     predict_job_weight_mb,
-)
-from horde_worker_regen.process_management.resources.vram_arbiter import (
-    DeviceVramState,
-    MeasuredVramSnapshot,
-    VramArbiter,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
@@ -968,54 +962,6 @@ class TestWholeCardTerminalAdmit:
         assert scheduler.whole_card_residency_grace_active() is True
         # The whole-card residency establishment still marks the head exclusive, independent of the admit path.
         assert job_tracker.is_admitted_exclusive(head_job) is True
-
-    async def test_flux_admit_under_foreign_pressure_marks_over_budget_and_exclusive(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A realistic baseline makes the identity say no, but device-free holds the weights: foreign-pressure admit.
-
-        Same wedge geometry, but the arbiter cycle carries a realistic shared-device baseline that pushes the
-        committed-plus-candidate demand past the ledger capacity, while the truthful device-free reading still
-        physically holds the 11500 MB weights net of the noise buffer. The admit therefore takes the
-        foreign-pressure fit-into-reality path, which reclaims RAM ahead, opens the heavy-head grace, and marks
-        the head over-budget (and exclusive under the configured over-budget exclusive mode).
-        """
-        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
-        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
-
-        scheduler, job_tracker, proc = _sole_residency_scheduler(free_mb=15007.0)
-        head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
-        await track_popped_job_async(job_tracker, head_job)
-
-        # Freeze an arbiter cycle where the ledger identity denies while the truthful device-free reading
-        # still physically holds the priced candidate (~9774 MB for this head at sole residency): the
-        # foreign-pressure fit-into-reality path. The geometry must be honest: committed 6000 stays within
-        # the phantom tolerance of device-used 4975, because an honest ledger can only deny a candidate the
-        # free card holds when real (foreign-attributed) load is present; an inflated committed on an empty
-        # card would instead classify as a phantom and take the phantom-truth bypass, which marks nothing
-        # over-budget. Arithmetic: committed 6000 + candidate 9774 = 15774 > capacity (16375 - 1500 - 819)
-        # = 14056 (identity denies); candidate 9774 <= device-free 11400 - noise 819 (physically fits).
-        state = DeviceVramState(
-            total_vram_mb=float(_DEVICE_TOTAL_VRAM_MB),
-            baseline_mb=1500.0,
-            committed_vram_mb=6000.0,
-            planned_unmaterialized_mb=0.0,
-            committed_is_stale=False,
-            noise_buffer_mb=admission_noise_buffer_mb(float(_DEVICE_TOTAL_VRAM_MB)),
-            device_free_mb=11400.0,
-        )
-        arbiter = VramArbiter()
-        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))
-        scheduler._vram_arbiter = arbiter
-
-        admitted = any(scheduler.preload_models() for _ in range(30))
-
-        assert admitted is True
-        assert proc.last_control_flag == HordeControlFlag.PRELOAD_MODEL
-        assert job_tracker.is_admitted_over_budget(head_job) is True
-        assert job_tracker.is_admitted_exclusive(head_job) is True
-        assert scheduler.heavy_head_load_grace_active() is True
 
     async def test_undrained_card_defers_no_premature_admit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Drain guard: at target residency but the card not yet drained, the head still defers (no OOM load).

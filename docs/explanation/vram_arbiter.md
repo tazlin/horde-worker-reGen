@@ -348,9 +348,13 @@ reported by a child process, never for a parent-side verdict.
 
 **Post-processing.** The lane's memory admission is the arbiter's `PP_JOB` verdict (replacing the banned
 free-VRAM read): a `FITS` admits, a `DEFER` or `DENY` holds the chain and the lane's own deferral
-bookkeeping (one-shot idle-VRAM reclaim, throttled warning, patience age-out) is unchanged. The reserve bypass
-is preserved: a disabled VRAM budget or a zero-peak chain always admits. The lane's non-memory guards (the
-allocator-guard cap fault, the sampling co-residency hold) stay.
+bookkeeping (each newly available reclaim plan at most once, throttled warning, patience age-out) remains
+bounded. The orchestrator retains
+the verdict rather than reducing it to a boolean, and executes its reclaim commands through the same shared
+reclaim owner as preload and dispatch admission. For a post-processing head this plan may move safety off-GPU
+after idle cache/weight reclaim when `whole_card_residency_safety_off_gpu` permits it. The reserve bypass is
+preserved: a disabled VRAM budget or a zero-peak chain always admits. The lane's non-memory guards (the
+allocator-guard cap fault and sampling co-residency hold) stay.
 
 **Safety GPU load.** The recurring safety-on-GPU seam, bringing the safety process back onto the card after a
 whole-card residency freed its context, is gated on the arbiter's `SAFETY_LOAD` verdict, charging a documented
@@ -399,12 +403,11 @@ the modeled peak) and is pushed to the lifecycle manager each cycle, so both the
 re-promotion respawn land on the same chosen card. Demotion, promotion, and the current placement card (or
 `None` for CPU) are surfaced in the run metrics.
 
-Reclaim stays single-owner even though two seams drive it: the preload path and the dispatch-reconciliation
-gate both run a `DEFER` verdict's actuations, but both route them through the one reclaim engine
-(`execute_arbiter_commands`), which the governor's SATURATED verified ladder shares, so there is never a
-second mechanism evicting the same card by different rules. Every other authoritative seam (overlap,
-disaggregated sampling, post-processing, safety) ignores the actuations and simply withholds the demand, so
-that dispatch re-asks next cycle without any second party driving reclaim.
+Reclaim stays single-owner across three seams: preload, dispatch reconciliation, and post-processing all run a
+`DEFER` verdict's actuations through the one reclaim engine (`execute_arbiter_commands`), which the governor's
+SATURATED verified ladder shares. Every other authoritative seam (overlap, disaggregated sampling, safety)
+simply withholds the demand and re-asks next cycle, so no second mechanism evicts the same card by different
+rules.
 
 ### Cache reclaim is on-demand only
 

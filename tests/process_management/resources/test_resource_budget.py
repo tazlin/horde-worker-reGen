@@ -264,214 +264,176 @@ class TestAdmissionNoiseBuffer:
 
 
 class TestAdmissionIdentity:
-    """The ledger-driven admission inequality: measured floor + planned + candidate vs real capacity."""
+    """The measured-truth admission inequality: candidate vs device-free room net of reservations and noise."""
 
     def test_derived_default_buffer_denies_what_the_floor_would_admit_on_a_large_card(self) -> None:
         """With no explicit buffer a 16375MB card derives 818.75, denying a demand that fits under 512."""
-        total, baseline = 16375.0, 1700.0
-        # Demand lands between the floor ceiling and the derived ceiling, so the derived default flips it.
-        floor_capacity = (total - baseline) - _ADMISSION_NOISE_BUFFER_MB
-        committed = floor_capacity - 100.0
+        total = 16375.0
+        device_free = 1000.0
+        # The candidate lands between the derived-buffer room and the floor-buffer room, so the derived default
+        # (which the caller gets when it passes no explicit buffer) flips it to a denial.
+        candidate = 400.0
         derived = evaluate_admission(
-            measured_committed_mb=committed,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=0.0,
+            candidate_outstanding_mb=candidate,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=total,
-            baseline_mb=baseline,
-            committed_is_stale=False,
         )
         assert derived.noise_buffer_mb == pytest.approx(admission_noise_buffer_mb(total))
         assert derived.fits is False
         # The same demand fits when the floor buffer is passed explicitly (the explicit value wins).
         explicit = evaluate_admission(
-            measured_committed_mb=committed,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=0.0,
+            candidate_outstanding_mb=candidate,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=total,
-            baseline_mb=baseline,
             noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            committed_is_stale=False,
         )
         assert explicit.noise_buffer_mb == pytest.approx(_ADMISSION_NOISE_BUFFER_MB)
         assert explicit.fits is True
 
     @pytest.mark.parametrize("total_mb", [8192.0, 16375.0, 24564.0])
-    def test_inequality_admits_within_capacity_and_denies_past_it(self, total_mb: float) -> None:
-        """Across 8/16/24GB cards, demand within capacity admits and a candidate past it denies."""
-        baseline = 1700.0
-        capacity = (total_mb - baseline) - _ADMISSION_NOISE_BUFFER_MB
-        committed = capacity - 1000.0
+    def test_inequality_admits_within_room_and_denies_past_it(self, total_mb: float) -> None:
+        """Across 8/16/24GB cards, a candidate within available room admits and one past it denies.
+
+        The noise buffer is the card's derived proportional buffer, so the available room scales with the card
+        the same way the production snapshot sizes it.
+        """
+        device_free = total_mb - 2000.0
+        noise = admission_noise_buffer_mb(total_mb)
+        available = device_free - noise
         fits = evaluate_admission(
-            measured_committed_mb=committed,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=500.0,
+            candidate_outstanding_mb=available - 500.0,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=total_mb,
-            baseline_mb=baseline,
-            noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            committed_is_stale=False,
         )
-        assert fits.used_measured_floor is True
+        assert fits.available_known is True
         assert fits.fits is True
         denies = evaluate_admission(
-            measured_committed_mb=committed,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=1001.0,
+            candidate_outstanding_mb=available + 1.0,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=total_mb,
-            baseline_mb=baseline,
-            noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            committed_is_stale=False,
         )
         assert denies.fits is False
 
-    def test_resident_credit_admits_what_the_gross_candidate_would_deny(self) -> None:
-        """Netting the resident weights out of the candidate delta admits a load the gross figure denies."""
-        total, baseline = 16375.0, 1700.0
-        capacity = (total - baseline) - _ADMISSION_NOISE_BUFFER_MB
-        committed = capacity - 4000.0
-        gross_candidate = 6000.0
-        resident_credit = 4900.0
+    def test_smaller_candidate_admits_what_the_gross_candidate_would_deny(self) -> None:
+        """The resident-weight credit the caller nets out of the candidate admits a load the gross figure denies.
+
+        The identity charges only the outstanding cost, so a candidate priced net of weights already physically
+        inside the device-free reading fits where the gross figure (double-charging those weights) denies.
+        """
+        total, device_free = 16375.0, 8000.0
+        available = device_free - _ADMISSION_NOISE_BUFFER_MB
+        gross_candidate = available + 1000.0
+        resident_credit = 2000.0
         assert (
             evaluate_admission(
-                measured_committed_mb=committed,
-                planned_unmaterialized_mb=0.0,
-                candidate_delta_mb=gross_candidate,
+                candidate_outstanding_mb=gross_candidate,
+                device_free_mb=device_free,
+                outstanding_reservations_mb=0.0,
                 total_vram_mb=total,
-                baseline_mb=baseline,
                 noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-                committed_is_stale=False,
             ).fits
             is False
         )
         assert (
             evaluate_admission(
-                measured_committed_mb=committed,
-                planned_unmaterialized_mb=0.0,
-                candidate_delta_mb=gross_candidate - resident_credit,
+                candidate_outstanding_mb=gross_candidate - resident_credit,
+                device_free_mb=device_free,
+                outstanding_reservations_mb=0.0,
                 total_vram_mb=total,
-                baseline_mb=baseline,
                 noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-                committed_is_stale=False,
             ).fits
             is True
         )
 
-    def test_planned_charge_counts_toward_demand(self) -> None:
-        """A planned (not-yet-materialised) charge can flip an otherwise-fitting admission to a denial."""
-        total, baseline = 16375.0, 1700.0
-        capacity = (total - baseline) - _ADMISSION_NOISE_BUFFER_MB
-        verdict = evaluate_admission(
-            measured_committed_mb=capacity - 500.0,
-            planned_unmaterialized_mb=1000.0,
-            candidate_delta_mb=0.0,
+    def test_reservation_reduces_available_and_can_flip_a_fitting_candidate(self) -> None:
+        """An outstanding reservation (admitted but unmaterialised work) can flip an otherwise-fitting candidate."""
+        total, device_free = 16375.0, 8000.0
+        candidate = 7000.0
+        no_reservation = evaluate_admission(
+            candidate_outstanding_mb=candidate,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=total,
-            baseline_mb=baseline,
             noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            committed_is_stale=False,
         )
-        assert verdict.fits is False
+        assert no_reservation.fits is True
+        with_reservation = evaluate_admission(
+            candidate_outstanding_mb=candidate,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=1000.0,
+            total_vram_mb=total,
+            noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
+        )
+        assert with_reservation.fits is False
 
     def test_materialised_then_evicted_anchor_does_not_zombie_deny_retention(self) -> None:
-        """The observed churn loop: after materialise+evict a retention candidate fits, no zombie planned denial.
+        """After a materialise-then-evict cycle the reservation is consumed, so a retention candidate fits.
 
-        Reproduces a 16GB card whose two preloads materialised (~6158 + ~6134) and were then evicted, collapsing
-        the committed floor to ~68MB. Before monotonic consumption the anchors resurrected to ~12248MB and the
-        identity denied retention of the just-used ~6158MB model against a ~14436MB capacity. With the watermark
-        the anchors stay consumed, so the candidate fits.
+        The reservation ledger consumes each anchor monotonically: two loads materialise into their targets'
+        reservations and are then evicted, and the outstanding reservation collapses to zero rather than
+        resurrecting to full weight. With no zombie reservation charged, the just-used model's retention
+        candidate fits the recovered device-free room.
         """
-        total, baseline = 16375.0, 1700.0
+        total = 16375.0
         ledger = CommittedReserveLedger()
         ledger.set_planned("preload", "0", vram_mb=6158.0, target_process_id=0, reserved_at_admit_mb=0.0)
         ledger.set_planned("preload", "1", vram_mb=6134.0, target_process_id=1, reserved_at_admit_mb=0.0)
         # Both loads materialise into their targets' reservations.
         ledger.effective_planned_vram_mb({0: 6158.0, 1: 6134.0})
         # Eviction collapses both reservations back toward zero.
-        planned_after_evict = ledger.effective_planned_vram_mb({0: 68.0, 1: 68.0})
-        assert planned_after_evict == 0.0
+        reservations_after_evict = ledger.effective_planned_vram_mb({0: 68.0, 1: 68.0})
+        assert reservations_after_evict == 0.0
+        # Eviction returned the weights to the card, so device-free recovered to hold the retention candidate.
         verdict = evaluate_admission(
-            measured_committed_mb=68.0,
-            planned_unmaterialized_mb=planned_after_evict,
-            candidate_delta_mb=6158.0,
+            candidate_outstanding_mb=6158.0,
+            device_free_mb=14607.0,
+            outstanding_reservations_mb=reservations_after_evict,
             total_vram_mb=total,
-            baseline_mb=baseline,
-            committed_is_stale=False,
         )
-        assert verdict.used_measured_floor is True
+        assert verdict.available_known is True
         assert verdict.fits is True
 
-    def test_staleness_alone_never_denies(self) -> None:
-        """Staleness drops the measured floor: with no planned demand a fitting candidate always admits.
+    def test_stacked_reservations_deny_a_further_over_commit(self) -> None:
+        """Stacked outstanding reservations plus a fresh candidate deny a further over-commit (the double-admit guard).
 
-        However large the stale committed floor reads, it is dropped, so it can never itself flip the verdict;
-        only the parent's planned overlay (empty here) plus the candidate are tested against capacity.
+        Two preloads staged in RAM hold 12316 MB of outstanding reservations the device-free reading does not
+        yet reflect; a fresh 6158 MB candidate on top exceeds the available room, so the identity denies it
+        before either staged load has materialised.
         """
         verdict = evaluate_admission(
-            measured_committed_mb=99999.0,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=6158.0,
+            candidate_outstanding_mb=6158.0,
+            device_free_mb=14675.0,
+            outstanding_reservations_mb=12316.0,
             total_vram_mb=16375.0,
-            baseline_mb=1700.0,
-            committed_is_stale=True,
-        )
-        assert verdict.fits is True
-        assert verdict.used_measured_floor is False
-
-    def test_stale_planned_overlay_denies_stacked_admissions(self) -> None:
-        """The startup storm: stale reports but stacked planned admissions still deny a further over-commit.
-
-        The measured floor is dropped, yet the parent's own planned overlay (12316 MB of already-admitted,
-        not-yet-materialised preloads) plus a fresh 6158 MB candidate exceed a ~14781 MB capacity, so the
-        degraded identity denies even before the first child memory report lands.
-        """
-        verdict = evaluate_admission(
-            measured_committed_mb=99999.0,
-            planned_unmaterialized_mb=12316.0,
-            candidate_delta_mb=6158.0,
-            total_vram_mb=16375.0,
-            baseline_mb=1700.0,
             noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            committed_is_stale=True,
         )
-        assert verdict.used_measured_floor is False
+        assert verdict.available_known is True
         assert verdict.fits is False
-        assert verdict.capacity_mb == pytest.approx((16375.0 - 1700.0) - _ADMISSION_NOISE_BUFFER_MB)
-        # The demand drops the dropped measured floor and tests only planned + candidate.
-        assert verdict.demand_mb == pytest.approx(12316.0 + 6158.0)
+        assert verdict.available_mb == pytest.approx(14675.0 - 12316.0 - _ADMISSION_NOISE_BUFFER_MB)
 
-    def test_stale_with_unknown_total_relaxes_regardless(self) -> None:
-        """With no known total nothing is knowable, so a stale ledger relaxes fully whatever the planned demand."""
-        verdict = evaluate_admission(
-            measured_committed_mb=99999.0,
-            planned_unmaterialized_mb=12316.0,
-            candidate_delta_mb=6158.0,
-            total_vram_mb=None,
-            baseline_mb=1700.0,
-            committed_is_stale=True,
-        )
-        assert verdict.fits is True
-        assert verdict.used_measured_floor is False
+    def test_startup_storm_reservation_overlay_denies_third_stacked_preload(self) -> None:
+        """A cold-start storm admits the first two RAM-staged preloads and denies the third on their reservations.
 
-    def test_startup_storm_planned_overlay_denies_third_stacked_preload(self) -> None:
-        """Cold start, stale child reports: the planned overlay admits the first two preloads and denies the third.
-
-        No child has reported yet (committed stale, baseline still 0), so the measured floor is dropped. Each
-        admitted preload registers a planned anchor via the real ledger; against a 16375 MB card the third
-        stacked 6158 MB candidate pushes planned + candidate past capacity and the degraded identity denies it,
-        the arithmetic the observed three-process over-commit needed and the fixed relax used to skip.
+        Nothing has materialised (device-free stays at the full card), so each admitted preload registers a
+        reservation via the real ledger; against a 16375 MB card the third stacked 6158 MB candidate pushes the
+        reservations plus the candidate past the available room and the identity denies it.
         """
-        total, baseline = 16375.0, 0.0
+        total = 16375.0
         candidate = 6158.0
         ledger = CommittedReserveLedger()
         outcomes: list[bool] = []
         for index in range(3):
-            planned = ledger.effective_planned_vram_mb({})
+            reservations = ledger.effective_planned_vram_mb({})
             verdict = evaluate_admission(
-                measured_committed_mb=0.0,
-                planned_unmaterialized_mb=planned,
-                candidate_delta_mb=candidate,
+                candidate_outstanding_mb=candidate,
+                device_free_mb=total,
+                outstanding_reservations_mb=reservations,
                 total_vram_mb=total,
-                baseline_mb=baseline,
                 noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-                committed_is_stale=True,
             )
             outcomes.append(verdict.fits)
             if verdict.fits:
@@ -484,104 +446,80 @@ class TestAdmissionIdentity:
                 )
         assert outcomes == [True, True, False]
 
-    def test_cold_start_relaxes_to_predictive_path(self) -> None:
-        """An unknown total (cold start) also relaxes to the predictive path, never wedging."""
-        verdict = evaluate_admission(
-            measured_committed_mb=1000.0,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=1000.0,
-            total_vram_mb=None,
-            baseline_mb=1700.0,
-            committed_is_stale=False,
-        )
-        assert verdict.fits is True
-        assert verdict.used_measured_floor is False
+    def test_unknown_device_free_is_indeterminate_and_never_admits(self) -> None:
+        """With no device-free reading the identity is indeterminate: available is unknown and nothing fits.
 
-    def test_two_samplers_materialized_admit_on_16gb(self) -> None:
-        """Correction 1 worked example: two materialised samplers + contexts + idle VAE lane MUST admit."""
-        total, baseline = 16375.0, 1700.0
-        committed = 12700.0  # two ~4900MB samplers + their contexts + 6 idle contexts + idle VAE lane
+        The arbiter maps this to a deferral (never a denial, never a fabricated free figure); the identity
+        itself reports ``available_known=False`` and ``fits=False`` so no caller reads it as room.
+        """
         verdict = evaluate_admission(
-            measured_committed_mb=committed,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=0.0,
-            total_vram_mb=total,
-            baseline_mb=baseline,
-            committed_is_stale=False,
+            candidate_outstanding_mb=1000.0,
+            device_free_mb=None,
+            outstanding_reservations_mb=0.0,
+            total_vram_mb=16375.0,
         )
-        assert verdict.used_measured_floor is True
-        assert verdict.fits is True
-        # And the plan's denial case: a candidate that would push demand past the ceiling.
-        assert verdict.capacity_mb is not None
-        over = evaluate_admission(
-            measured_committed_mb=committed,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=verdict.capacity_mb - committed + 1.0,
+        assert verdict.available_known is False
+        assert verdict.fits is False
+        assert verdict.available_mb is None
+
+    def test_two_samplers_resident_admit_retention_and_deny_a_heavy_candidate(self) -> None:
+        """Two materialised samplers are physically inside device-free: a no-cost retention fits, a heavy load denies.
+
+        The samplers' weights are already in the device-free reading, so a retention candidate (no new
+        footprint) fits the residual room while a candidate larger than that room denies.
+        """
+        total = 16375.0
+        device_free = 1975.0  # two ~4900MB samplers plus contexts and an idle VAE lane are resident
+        verdict = evaluate_admission(
+            candidate_outstanding_mb=0.0,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=total,
-            baseline_mb=baseline,
-            committed_is_stale=False,
+        )
+        assert verdict.available_known is True
+        assert verdict.fits is True
+        assert verdict.available_mb is not None
+        over = evaluate_admission(
+            candidate_outstanding_mb=verdict.available_mb + 1.0,
+            device_free_mb=device_free,
+            outstanding_reservations_mb=0.0,
+            total_vram_mb=total,
         )
         assert over.fits is False
 
-    def test_oversized_candidate_denies_so_caller_defers(self) -> None:
-        """A wildly oversized (mis-estimated) candidate denies rather than faulting: the caller defers."""
+    def test_oversized_candidate_does_not_fit_so_caller_defers_or_denies(self) -> None:
+        """A wildly oversized (mis-estimated) candidate does not fit: the caller defers rather than faulting."""
         verdict = evaluate_admission(
-            measured_committed_mb=2000.0,
-            planned_unmaterialized_mb=0.0,
-            candidate_delta_mb=20000.0,
+            candidate_outstanding_mb=20000.0,
+            device_free_mb=14675.0,
+            outstanding_reservations_mb=0.0,
             total_vram_mb=16375.0,
-            baseline_mb=1700.0,
-            committed_is_stale=False,
         )
-        assert verdict.used_measured_floor is True
+        assert verdict.available_known is True
         assert verdict.fits is False
 
-    def test_reason_renders_full_identity(self) -> None:
+    def test_reason_renders_the_full_identity(self) -> None:
         """The verdict reason renders every term of the identity for a self-explaining log line."""
-        verdict = evaluate_admission(
-            measured_committed_mb=1000.0,
-            planned_unmaterialized_mb=100.0,
-            candidate_delta_mb=200.0,
-            total_vram_mb=16375.0,
-            baseline_mb=1700.0,
-            committed_is_stale=False,
-        )
-        rendered = verdict.reason()
-        assert "committed" in rendered
-        assert "planned" in rendered
-        assert "candidate" in rendered
-        assert "capacity" in rendered
-        # A cold-start relaxed verdict explains why the measured floor was not applied.
-        assert (
-            "predictive path"
-            in evaluate_admission(
-                measured_committed_mb=1000.0,
-                planned_unmaterialized_mb=0.0,
-                candidate_delta_mb=0.0,
-                total_vram_mb=None,
-                baseline_mb=1700.0,
-                committed_is_stale=False,
-            ).reason()
-        )
-
-    def test_degraded_stale_reason_renders_dropped_floor_and_verdict(self) -> None:
-        """A stale-with-total verdict renders the dropped floor and the planned-only inequality honestly."""
         rendered = evaluate_admission(
-            measured_committed_mb=99999.0,
-            planned_unmaterialized_mb=12316.0,
-            candidate_delta_mb=6158.0,
+            candidate_outstanding_mb=200.0,
+            device_free_mb=8000.0,
+            outstanding_reservations_mb=100.0,
             total_vram_mb=16375.0,
-            baseline_mb=1700.0,
-            noise_buffer_mb=_ADMISSION_NOISE_BUFFER_MB,
-            committed_is_stale=True,
         ).reason()
-        assert "stale" in rendered
-        assert "measured floor dropped" in rendered
-        # The stale committed figure must not be presented as a live term.
-        assert "99999" not in rendered
-        assert "planned" in rendered
         assert "candidate" in rendered
-        assert "does NOT fit" in rendered
+        assert "device-free" in rendered
+        assert "reservations" in rendered
+        assert "noise" in rendered
+        assert "available" in rendered
+        # An indeterminate (no device-free reading) verdict explains why admission is deferred.
+        deferred = evaluate_admission(
+            candidate_outstanding_mb=200.0,
+            device_free_mb=None,
+            outstanding_reservations_mb=0.0,
+            total_vram_mb=16375.0,
+        ).reason()
+        assert "unavailable" in deferred
+        assert "deferred" in deferred
 
 
 class TestRamBudgetCommittedReserve:
@@ -615,14 +553,12 @@ class TestPreloadBudgetGate:
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 8000.0)
 
         spare = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        # A second, idle process holding a different resident model: the eviction candidate. Its committed
-        # allocator reservation over-commits the card, so the arbiter's measured floor denies the incoming
-        # head and describes an eviction of this idle resident.
+        # A second, idle process holding a different resident model: the eviction candidate. Its resident
+        # weights physically fill the card (the truthful device-free reading is 1000 MB), so admission denies
+        # the incoming head and describes an eviction of this idle resident.
         resident = make_mock_process_info(1, model_name="model_b", state=HordeProcessState.WAITING_FOR_JOB)
         resident.total_vram_mb = 16000
         resident.vram_usage_mb = 15000  # 1000 MB free, well under 8000 + 2000
-        # A fresh committed report whose allocator reservation over-commits the card: the measured floor
-        # applies (not stale) and denies the incoming head, describing an eviction of this idle resident.
         resident.process_reserved_mb = 16000
         resident.report_sampled_at = time.time()
         process_map = ProcessMap({0: spare, 1: resident})
@@ -637,6 +573,7 @@ class TestPreloadBudgetGate:
             bridge_data=_budget_bridge_data(),
             max_concurrent=2,
             max_inference=2,
+            device_free_mb=1000.0,
         )
         # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
         # when system available memory is low (common in large combined test runs).
@@ -1393,97 +1330,13 @@ class TestTwoSamplersCoresidentAcceptance:
         assert forecast.fits_coresident is False
 
 
-class TestMeasuredAdmissionOverlay:
-    """The scheduler's ledger-driven measured floor denies over-commits the lying free-VRAM figure would admit."""
+class TestSchedulerReservationOverlay:
+    """The scheduler assembles the reservation overlay from grants and reconcile-by-omission.
 
-    def _scheduler_with_committed(
-        self,
-        *,
-        reserved_mb: int,
-        sampled_at: float,
-        total_mb: float,
-        baseline_mb: float,
-    ) -> object:
-        process_map = ProcessMap({})
-        info = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
-        info.process_reserved_mb = reserved_mb  # type: ignore[attr-defined]
-        info.report_sampled_at = sampled_at  # type: ignore[attr-defined]
-        process_map[0] = info  # type: ignore[index]
-        scheduler = _make_inference_scheduler(process_map=process_map)
-        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=total_mb)  # type: ignore[attr-defined]
-        scheduler.resolved_context_constant_mb = Mock(return_value=200.0)  # type: ignore[attr-defined]
-        scheduler.set_admission_baseline_provider(lambda _device_index: baseline_mb)
-        return scheduler
-
-    def test_fresh_floor_denies_oversized_candidate(self) -> None:
-        """A fresh committed floor plus an oversized candidate exceeds real capacity and denies (free lies)."""
-        scheduler = self._scheduler_with_committed(
-            reserved_mb=10000,
-            sampled_at=time.time(),
-            total_mb=16375.0,
-            baseline_mb=1700.0,
-        )
-        job = make_job_pop_response("stable_diffusion")
-        # committed 200+10000 = 10200; capacity = (16375-1700)-512 = 14163; candidate 5000 => 15200 > 14163.
-        verdict = scheduler._measured_admission_verdict(
-            job,
-            "stable_diffusion_1",
-            candidate_delta_mb=5000.0,
-            device_index=None,
-        )
-        assert verdict.used_measured_floor is True
-        assert verdict.fits is False
-
-    def test_fresh_floor_admits_within_capacity(self) -> None:
-        """A fresh committed floor with a candidate that fits real capacity admits."""
-        scheduler = self._scheduler_with_committed(
-            reserved_mb=5000,
-            sampled_at=time.time(),
-            total_mb=16375.0,
-            baseline_mb=1700.0,
-        )
-        job = make_job_pop_response("stable_diffusion")
-        verdict = scheduler._measured_admission_verdict(job, "x", candidate_delta_mb=2000.0, device_index=None)
-        assert verdict.used_measured_floor is True
-        assert verdict.fits is True
-
-    def test_stale_floor_falls_back_to_predictive(self) -> None:
-        """A stale committed report relaxes the overlay to admit, so the caller relies on its predictive gate."""
-        scheduler = self._scheduler_with_committed(
-            reserved_mb=10000,
-            sampled_at=time.time() - 100.0,
-            total_mb=16375.0,
-            baseline_mb=1700.0,
-        )
-        job = make_job_pop_response("stable_diffusion")
-        verdict = scheduler._measured_admission_verdict(
-            job,
-            "stable_diffusion_1",
-            candidate_delta_mb=5000.0,
-            device_index=None,
-        )
-        assert verdict.used_measured_floor is False
-        assert verdict.fits is True
-
-    def test_denial_increments_counter_and_relaxed_does_not(self) -> None:
-        """A measured denial counts toward the per-card denial metric; a relaxed (stale) evaluation does not."""
-        scheduler = self._scheduler_with_committed(
-            reserved_mb=10000,
-            sampled_at=time.time(),
-            total_mb=16375.0,
-            baseline_mb=1700.0,
-        )
-        job = make_job_pop_response("stable_diffusion")
-        admits = scheduler._measured_admission_admits(
-            job,
-            "stable_diffusion_1",
-            device_index=None,
-            process_id=None,
-            disaggregated=False,
-            log_context="preload",
-        )
-        assert admits is False
-        assert scheduler.latest_admission_denials(device_index=None) == 1
+    A grant registers a reservation synchronously and reconcile-by-omission drops it on materialisation or
+    death, so two admissions in one window cannot over-admit the same device-free room and a re-ask is never
+    blocked by a dead unit's stale reservation.
+    """
 
     def test_pressure_reclaim_issues_under_pressure_unload(self) -> None:
         """The no-candidate pressure reclaim issues one under-pressure idle unload via the shared path."""
@@ -1501,13 +1354,12 @@ class TestMeasuredAdmissionOverlay:
         assert scheduler.reclaim_one_idle_model_under_pressure(device_index=None) is False
 
     def _double_grant_scheduler(self, monkeypatch: pytest.MonkeyPatch, *, sampling_peak_mb: float) -> object:
-        """Build a two-process scheduler whose measured floor leaves room for exactly one fresh admission.
+        """Build a two-process scheduler whose device-free room leaves space for exactly one fresh admission.
 
-        Loader process 0 holds a 5000 MB reservation (the pre-load floor); process 1 is an idle spare with
-        no reservation yet. Capacity is ``(16375 - 1700) - 512 = 14163`` MB and the committed floor is
-        ``200 + 5000 = 5200`` MB, so a lone 8000 MB candidate fits (13200) but a second concurrent charge of
-        the same size does not. ``predict_job_sampling_vram_mb`` is pinned so a granted preload's planned
-        charge equals ``sampling_peak_mb``.
+        Loader process 0 holds a 5000 MB reservation (its admit-time baseline); process 1 is an idle spare with
+        no reservation yet. ``predict_job_sampling_vram_mb`` is pinned so a granted preload's reservation equals
+        ``sampling_peak_mb``. The tests drive the scheduler's assembled device state with a device-free reading
+        that fits one such candidate but not two once the first grant's reservation is charged.
         """
         from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 
@@ -1526,80 +1378,85 @@ class TestMeasuredAdmissionOverlay:
         scheduler.set_admission_baseline_provider(lambda _device_index: 1700.0)
         return scheduler
 
-    def test_second_same_cycle_grant_sees_first_planned_charge(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The race: a preload granted this cycle registers a planned charge the next admission must count.
+    @staticmethod
+    def _candidate_fits(state: object, *, candidate_mb: float) -> bool:
+        """Whether ``candidate_mb`` fits the assembled state's device-free room net of its reservations and noise."""
+        return evaluate_admission(
+            candidate_outstanding_mb=candidate_mb,
+            device_free_mb=state.device_free_mb,  # type: ignore[attr-defined]
+            outstanding_reservations_mb=state.planned_unmaterialized_mb,  # type: ignore[attr-defined]
+            total_vram_mb=state.total_vram_mb,  # type: ignore[attr-defined]
+            noise_buffer_mb=state.noise_buffer_mb,  # type: ignore[attr-defined]
+        ).fits
 
-        Without the first grant an 8000 MB candidate fits the measured floor; once the first preload is
-        admitted (its planned charge landing immediately, before any per-cycle reconcile), the same candidate
-        is jointly gated and denied. Proves the grant path inserts the charge synchronously so two admissions
-        in one window cannot over-commit the same free VRAM.
-        """
-        scheduler = self._double_grant_scheduler(monkeypatch, sampling_peak_mb=8000.0)
-        loader = scheduler._process_map[0]  # type: ignore[index]
-        job_b = make_job_pop_response("model_b")
-
-        # Baseline: with nothing admitted yet, the lone candidate fits real capacity.
-        before = scheduler._measured_admission_verdict(job_b, "x", candidate_delta_mb=8000.0, device_index=None)
-        assert before.used_measured_floor is True
-        assert before.fits is True
-
-        # Grant the first preload for real; the grant path registers its planned charge synchronously.
-        job_a = make_job_pop_response("model_a")
-        assert scheduler._send_preload(job_a, loader) is True
-
-        # The second admission in the same cycle now sees the first's planned charge and is denied.
-        after = scheduler._measured_admission_verdict(job_b, "x", candidate_delta_mb=8000.0, device_index=None)
-        assert after.used_measured_floor is True
-        assert after.planned_unmaterialized_mb == 8000.0
-        assert after.fits is False
-
-    def test_reconcile_keeps_planned_while_loading_and_drops_it_when_materialized(
+    def test_second_same_cycle_grant_registers_a_reservation_the_next_admission_counts(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The per-cycle seam: a planned charge is kept while the model loads and dropped once it materialises.
+        """A preload granted this cycle registers a reservation synchronously that the next admission counts.
 
-        A grant leaves the model in ``LOADING``; the reconcile inside the verdict keeps its planned charge (the
-        second candidate stays denied). When the model reaches VRAM its planned charge is dropped by the same
-        reconcile (materialisation is now in the measured floor), and the second candidate admits again, all
-        without any explicit release call.
+        Before the grant an 8000 MB candidate fits the device-free room; once the first preload is admitted its
+        reservation lands immediately (before any per-cycle reconcile), so the same candidate now sees the
+        reservation and is denied. The grant path inserts the reservation synchronously, so two admissions in
+        one window cannot over-admit the same device-free room.
         """
         scheduler = self._double_grant_scheduler(monkeypatch, sampling_peak_mb=8000.0)
         loader = scheduler._process_map[0]  # type: ignore[index]
-        job_b = make_job_pop_response("model_b")
+        device_free = 13200.0
+
+        before = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        assert before.planned_unmaterialized_mb == 0.0
+        assert self._candidate_fits(before, candidate_mb=8000.0) is True
+
+        # Grant the first preload for real; the grant path registers its reservation synchronously.
+        job_a = make_job_pop_response("model_a")
+        assert scheduler._send_preload(job_a, loader) is True
+
+        after = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        assert after.planned_unmaterialized_mb == 8000.0
+        assert self._candidate_fits(after, candidate_mb=8000.0) is False
+
+    def test_reconcile_keeps_reservation_while_loading_and_drops_it_when_materialized(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reservation is kept while the model loads and dropped once it materialises, without a release call.
+
+        A grant leaves the model in ``LOADING``; the per-cycle reconcile keeps its reservation, so a second
+        candidate over the same room stays denied. When the model reaches VRAM (physically inside the device-free
+        reading now) the same reconcile drops the reservation by omission, and with the device-free reading held
+        fixed the room the reservation was protecting is returned, so the second candidate admits again.
+        """
+        scheduler = self._double_grant_scheduler(monkeypatch, sampling_peak_mb=8000.0)
+        loader = scheduler._process_map[0]  # type: ignore[index]
+        device_free = 13200.0
 
         job_a = make_job_pop_response("model_a")
         assert scheduler._send_preload(job_a, loader) is True
-        # While model_a is LOADING, the planned charge is retained across the reconcile: B stays denied.
-        while_loading = scheduler._measured_admission_verdict(job_b, "x", candidate_delta_mb=8000.0, device_index=None)
+        while_loading = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
         assert while_loading.planned_unmaterialized_mb == 8000.0
-        assert while_loading.fits is False
+        assert self._candidate_fits(while_loading, candidate_mb=8000.0) is False
 
-        # model_a materialises into VRAM: the reconcile now omits it (no explicit release), so B admits again.
+        # model_a materialises into VRAM: the reconcile now omits it (no explicit release), so the reservation drops.
         scheduler._horde_model_map.update_entry(  # type: ignore[attr-defined]
             horde_model_name="model_a",
             load_state=ModelLoadState.LOADED_IN_VRAM,
             process_id=0,
         )
-        after_materialized = scheduler._measured_admission_verdict(
-            job_b,
-            "x",
-            candidate_delta_mb=8000.0,
-            device_index=None,
-        )
+        after_materialized = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
         assert after_materialized.planned_unmaterialized_mb == 0.0
-        assert after_materialized.fits is True
+        assert self._candidate_fits(after_materialized, candidate_mb=8000.0) is True
 
-    def test_reconcile_drops_planned_when_loading_process_dies(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A dead/idle loader's planned charge disappears via reconcile with no explicit release on the fault path."""
+    def test_reconcile_drops_reservation_when_loading_process_dies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A dead loader's reservation disappears via reconcile with no explicit release on the fault path."""
         scheduler = self._double_grant_scheduler(monkeypatch, sampling_peak_mb=8000.0)
         loader = scheduler._process_map[0]  # type: ignore[index]
+        device_free = 13200.0
         job_a = make_job_pop_response("model_a")
         assert scheduler._send_preload(job_a, loader) is True
 
         # Simulate the loader dying mid-load: its model map entry leaves the loading state (here, cleared).
         scheduler._horde_model_map.root.pop("model_a", None)  # type: ignore[attr-defined]
-        job_b = make_job_pop_response("model_b")
-        verdict = scheduler._measured_admission_verdict(job_b, "x", candidate_delta_mb=8000.0, device_index=None)
-        assert verdict.planned_unmaterialized_mb == 0.0
-        assert verdict.fits is True
+        after_death = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        assert after_death.planned_unmaterialized_mb == 0.0
+        assert self._candidate_fits(after_death, candidate_mb=8000.0) is True

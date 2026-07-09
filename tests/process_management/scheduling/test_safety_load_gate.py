@@ -21,7 +21,13 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 
 
 def _install_cycle(scheduler, *, total_mb: float, committed_mb: float) -> None:  # noqa: ANN001
-    """Freeze a crafted arbiter cycle on the scheduler with a plain committed floor on card 0."""
+    """Freeze a crafted arbiter cycle on the scheduler with a device-free reading on card 0.
+
+    The safety load is admitted against the truthful device-free reading net of the noise buffer: a card whose
+    worker-committed footprint already consumes it (``device_free = total - committed`` near zero) defers, a
+    card with real room admits. The reading is what the parent's NVML sees, so committed footprint maps to it
+    directly here.
+    """
     arbiter = VramArbiter()
     arbiter.begin_cycle(
         MeasuredVramSnapshot(
@@ -32,6 +38,7 @@ def _install_cycle(scheduler, *, total_mb: float, committed_mb: float) -> None: 
                     committed_vram_mb=committed_mb,
                     planned_unmaterialized_mb=0.0,
                     committed_is_stale=False,
+                    device_free_mb=max(0.0, total_mb - committed_mb),
                 ),
             },
         ),

@@ -244,3 +244,130 @@ async def test_persisting_wedge_over_ready_pool_escalates_to_deliberate_abort(
     assert records[0].detail["terminal"] is False
     assert records[1].detail["terminal"] is True
     assert records[0].detail["jobs_faulted"] == 1  # the first reissued the servable head
+
+
+def _install_transient_window_supervisor(pm: HordeWorkerProcessManager, clock: _FakeClock) -> RecoverySupervisor:
+    """Swap in a supervisor whose clean streak is short enough that a rebuild's not-wedged window meets it."""
+    supervisor = RecoverySupervisor(
+        clock=clock,
+        wedge_grace_seconds=1,
+        reset_interval_seconds=1,
+        max_soft_resets=1,
+        pool_ready_grace_seconds=3,
+        boot_allowance_seconds=20,
+        give_up_cooldown_seconds=5,
+        max_give_up_cycles=2,
+        clean_streak_seconds=3,
+    )
+    pm._recovery_coordinator.recovery_supervisor = supervisor
+    return supervisor
+
+
+class TestZeroProgressSoftResetDoesNotReLogAsFirst:
+    """The field signature: a rebuild's transient not-wedged window must not reset the escalation counter.
+
+    A structural queue wedge that soft-resets, momentarily reads as not-wedged while the pool rebuilds, and
+    recurs without any work moving forward must climb the escalation, not re-log every reset as the first.
+    """
+
+    async def test_clean_streak_without_progress_holds_the_escalation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A soft reset followed by a no-progress clean streak keeps the counter, then escalates to give-up."""
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        _install_transient_window_supervisor(pm, clock)
+        await _latch_structural_queue_wedge(pm)
+
+        aborted = {"called": False}
+        monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+
+        proc = pm._process_map[0]
+        dispatcher = pm._message_dispatcher
+
+        # The rebuild momentarily clears the deadlock (the transient not-wedged window) with the slot still
+        # accepting; no job is served, so this is not a real recovery.
+        def _rebuild_clears_deadlock(*, reason: str) -> None:
+            proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
+            dispatcher._in_queue_deadlock = False
+
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_inference_pool", _rebuild_clears_deadlock)
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+        # Drive to the first soft reset (which clears the deadlock via the rebuild above).
+        for _ in range(6):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+            if pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1:
+                break
+        assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1
+        assert dispatcher._in_queue_deadlock is False  # the transient not-wedged rebuild window is open
+
+        # Tick past the clean streak with the deadlock cleared and zero progress recorded.
+        for _ in range(6):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+
+        # The transient window must not have been mistaken for a recovery: the episode is still open and the
+        # escalation counter is held (without the progress requirement it would have reset to zero here).
+        assert pm._recovery_coordinator.recovery_supervisor.is_in_episode is True
+        assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1
+
+        # The wedge recurs. With the counter held at the spent budget, the worker escalates to give-up rather
+        # than taking another first soft reset.
+        dispatcher._in_queue_deadlock = True
+        dispatcher._last_queue_deadlock_detected_time = time.time() - 60
+        for _ in range(12):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+            if _abandoned_records(pm):
+                break
+        assert _abandoned_records(pm), "the held counter did not escalate: the wedge never reached give-up"
+
+    async def test_progress_after_reset_closes_episode_and_next_wedge_starts_fresh(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Healthy counterpart: real progress after the reset closes the episode; a later wedge starts at #1."""
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        _install_transient_window_supervisor(pm, clock)
+        await _latch_structural_queue_wedge(pm)
+
+        monkeypatch.setattr(pm, "_abort", lambda: None)
+
+        proc = pm._process_map[0]
+        dispatcher = pm._message_dispatcher
+
+        def _rebuild_clears_deadlock(*, reason: str) -> None:
+            proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
+            dispatcher._in_queue_deadlock = False
+
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_inference_pool", _rebuild_clears_deadlock)
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+        for _ in range(6):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+            if pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1:
+                break
+        assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1
+
+        # The rebuilt pool serves work: a completion past the post-reset baseline is real forward progress.
+        pm._job_tracker._total_num_completed_jobs += 1
+
+        for _ in range(6):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+
+        # Progress-backed clean streak closes the episode and returns the escalation counter to baseline.
+        assert pm._recovery_coordinator.recovery_supervisor.is_in_episode is False
+        assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 0
+
+        # A later, independent wedge opens a fresh episode: its first reset is #1 again, not a continuation.
+        dispatcher._in_queue_deadlock = True
+        dispatcher._last_queue_deadlock_detected_time = time.time() - 60
+        for _ in range(6):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+            if pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1:
+                break
+        assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1

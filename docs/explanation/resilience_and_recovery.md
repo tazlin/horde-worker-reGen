@@ -210,15 +210,30 @@ manager-side **actions**:
   `run_recovery_supervisor()` runs each control-loop tick and applies the
   returned action.
 
-  A wedge episode is allowed to close only after a clean streak, but the
-  supervisor still credits objective forward movement during the episode. A job
-  completion or a new inference start proves upstream accepted work is moving
-  again, so stale unrecoverable-pool state is cleared instead of carrying a past
-  queue deadlock into another soft reset. When accepted post-processing work is
-  still pending or running, though, upstream starts are not enough: only a
-  post-processing drain transition (dispatch to the lane, requeue after a lost
-  attempt, processed result moving to safety, or no-image fault) proves that the
-  downstream lane itself is making headway.
+  A wedge episode closes (and its escalation counter resets) on a clean streak
+  alone only before any soft reset has been attempted. Once a soft reset has been
+  spent, the streak must be corroborated by real forward progress since the most
+  recent soft reset: the reset requirement is belt-and-suspenders, the quiet-wedge
+  time streak **and** an objective progress signal. This is because a rebuild
+  transiently reads as not-wedged (the un-quarantine to re-quarantine window, or a
+  queue deadlock that momentarily clears while the pool boots), and that window can
+  outlast the streak. If the streak alone reset the counter, a doomed pool would
+  close its episode on the transient window, open a fresh one on the next wedge, and
+  log every soft reset as the first, so `limp_by_level` never climbs and the
+  readiness-gated give-up is never reached. Requiring progress holds the counter
+  across the transient window, so a pool that keeps rebuilding without ever serving
+  work climbs the ladder to give-up instead.
+
+  The progress signal is objective forward movement: a job completion or a new
+  inference start proves upstream accepted work is moving again, so stale
+  unrecoverable-pool state is also cleared instead of carrying a past queue deadlock
+  into another soft reset. When accepted post-processing work is still pending or
+  running, though, upstream starts are not enough: only a post-processing drain
+  transition (dispatch to the lane, requeue after a lost attempt, processed result
+  moving to safety, or no-image fault) proves that the downstream lane itself is
+  making headway. The baseline these compare against is captured when the episode
+  opens and re-captured on every soft reset, so the credit is progress since the
+  latest recovery attempt, not since the episode began.
 
 The escalation, in order:
 

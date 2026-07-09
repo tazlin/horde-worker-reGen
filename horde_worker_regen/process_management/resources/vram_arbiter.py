@@ -1,4 +1,4 @@
-"""The single VRAM arbiter: one authority that prices every device-memory request against measured state.
+"""The single VRAM arbiter: one authority that prices every device-memory request against measured truth.
 
 The worker's device VRAM is contended by several independent consumers (model preloads, monolithic
 dispatch, the disaggregated encode/sample/decode lanes, post-processing, safety, and cross-job retention).
@@ -15,7 +15,7 @@ The arbiter separates four concerns deliberately:
 - Estimation prices a candidate request's marginal device cost. The caller supplies the priced delta
   (or a stage's static spike figure); an unpriceable candidate is charged nothing, matching the
   predictive gate's admit-on-unknown-cost contract.
-- Arbitration evaluates the ledger-driven admission identity (see
+- Arbitration evaluates the measured-truth admission identity (see
   :mod:`~horde_worker_regen.process_management.resources.admission_identity`) plus the concurrent-sampling
   headroom, and resolves an actuator escalation ladder. A disaggregated encode/decode stage dispatch is the
   one demand priced by neither arithmetic: it targets a process already resident on the card and is never
@@ -24,54 +24,36 @@ The arbiter separates four concerns deliberately:
   nothing: it describes what would relieve the pressure through a :class:`VramActuator` and leaves the
   doing to that caller.
 
-Admission never admits work into a proven over-commit, because doing so triggers WDDM demotion and a
-card-wide throughput cliff that is strictly worse than waiting. The verdict for a request that does not fit
-measured capacity follows from why it does not fit:
+Admission reasons from device truth, not from a book. A request FITS iff its candidate outstanding cost fits
+the frozen device-free reading net of the outstanding reservations the reading does not yet reflect and the
+one noise buffer. Because the free reading already contains the shared baseline, every foreign allocation, and
+every materialised worker load, there is no separate committed floor, no baseline term, and no foreign-pressure
+concept: those quantities are physically inside the reading. The verdict for a request follows from why it
+does or does not fit:
 
-- While reclaim can still free space, the demand DEFERS. Reclaim can still free space when the arbiter's own
-  per-cycle escalation ladder still emits rungs, or when the governor's verified reclaim ladder is still
-  running on the card (SATURATED and not yet proven unrelievable). Because reclaim is verified, a deferred
-  demand either gets its space demonstrably freed within a bounded number of cycles or the ladder proves
-  nothing remains to reclaim. The caller runs the described rungs and the request re-asks next cycle.
-- Once reclaim is exhausted and the demand still does not fit, a head whose deficit is held by its own idle
-  sibling contexts (a bare CUDA context freed only when its process exits, so no model-unload or cache-release
-  rung reclaims it), with no physically-available VRAM to admit into, escalates to a verified context teardown
-  before the shortfall analysis (below) once it has starved past a short grace: it DEFERS with a
-  REDUCE_LIVE_CONTEXTS actuation and re-asks once the room frees. The grace is short by design, not the 60s
-  diagnostic threshold: in that geometry no alternative remedy can arrive (weight eviction cannot free a bare
-  context; a busy sibling finishing does not surrender its context), so the grace exists only to ride out state
-  churn, and waiting longer is pure idle-card loss.
-- Otherwise the verdict depends on the shortfall's cause. If the worker's own committed load exceeds capacity
-  even after full reclaim, live samplers legitimately hold the card and the head DEFERS to wait for a slot like
-  any queued job. If the shortfall is foreign (the worker's own committed load fits capacity but the card is
-  consumed by baseline/desktop load), the candidate is admitted only when it physically fits the truthful
-  device-free reading net of the noise buffer right now, and only for the true head of queue: fitting into
-  reality, never into hope, and never handing that physical room to a non-head line-skipper the head would then
-  starve behind. A head that does not physically fit but whose deficit is its own not-yet-torn-down idle sibling
-  contexts (still within the short teardown grace) DEFERS as that reclaimable first-party residency, distinct
-  from genuinely foreign pressure: reclaim is not exhausted while its own context teardown is still pending. Any
-  other non-fitting demand DEFERS as foreign pressure.
+- A candidate that fits available room is admitted, even while a reclaim episode is running on the card: the
+  episode exists to make room for demands that do NOT fit, and a fitting demand never waits on it.
+- A candidate whose weights already occupy VRAM on its target process admits directly (dispatching materialises
+  nothing new; its footprint is already physically in the free reading), the whole-card analogue of the
+  disaggregated stage dispatch a resident lane never withholds.
+- A non-head request that fits is still withheld when admitting it would leave the true head of queue unable to
+  fit its own known demand: the head took precedence, so a line-skipper may not consume the room the head
+  needs. This is queue priority, not a memory shortfall, so it defers with no reclaim.
+- A candidate that does not fit DEFERS with an actuator ladder sized to relieve the deficit, and re-asks once
+  the reclaim owner has freed the room (verified at device level). A head starved past a short grace whose
+  remaining deficit is exactly its own idle sibling contexts (a bare CUDA context weight eviction cannot
+  reclaim, freed only when the process exits) escalates to a verified context teardown: it DEFERS with a
+  REDUCE_LIVE_CONTEXTS actuation and re-asks once the room frees.
 - A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it.
+- A card with no device-free reading yet DEFERS with a throttled diagnostic: the primary admission input is
+  absent, so the arbiter neither denies nor fabricates a fictional free figure; it waits for the next reading.
 
 There is no overcommit-admit path. A head that never becomes admittable while the device is idle is caught by
 the structural-queue-wedge recovery supervisor (the deadlock detector feeding the worker recovery
 coordinator), which soft-resets the pools and, failing that, faults the wedged jobs non-retryably so the
-horde reissues them elsewhere. Before that, a head starved past the short
-:data:`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS` grace whose remaining deficit is held by its own idle sibling
-contexts (a bare CUDA context that weight eviction cannot reclaim, freed only when the process exits) escalates
-to a verified context teardown: it DEFERS with a REDUCE_LIVE_CONTEXTS actuation that reduces the live
-inference-context count, protecting the head's own target slot and every busy process, and re-asks for a
-verified FITS once the room frees. Both the preload/whole-card path and a starved monolithic-dispatch head can
-reach that escalation; an ordinary (un-starved) dispatch still never collapses the pool, and the dispatch head
-only escalates once its reality admit (below) has been ruled out. A genuinely-foreign starved head (no
-first-party context reclaim) instead emits a
-warning naming the arithmetic once past :data:`_STARVATION_DIAGNOSTIC_SECONDS` and increments
-:attr:`VramArbiter.starvation_diagnostics`, but it never admits: the job stays queued for that
-recovery machinery to reroute.
-
-Staleness and cold start relax to FITS, never deny: a stale committed ledger or an unknown device total
-means the measured floor cannot be trusted, so the identity degrades to admit exactly as
-``evaluate_admission`` does. An all-stale ledger can never block a request.
+horde reissues them elsewhere. Before that, a genuinely-parked head past :data:`_STARVATION_DIAGNOSTIC_SECONDS`
+emits a warning naming the arithmetic and increments :attr:`VramArbiter.starvation_diagnostics`, so the
+inequality is in the log for the post-mortem.
 """
 
 from __future__ import annotations
@@ -88,8 +70,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     AdmissionVerdict,
     evaluate_admission,
 )
-from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, hard_floor_mb
-from horde_worker_regen.process_management.resources.vram_attribution import committed_ledger_is_phantom
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 
 _FIRST_PARTY_TEARDOWN_GRACE_SECONDS = 10.0
 """Age (seconds) a head must be the undispatched head of an idle device before its own idle sibling contexts
@@ -105,19 +86,19 @@ remedy that cannot come. Rapid large/small model alternation is damped on the po
 ``large_model_switch_min_seconds`` and the re-entry cooldown, not by lengthening this timer."""
 
 _STARVATION_DIAGNOSTIC_SECONDS = 60.0
-"""Age (seconds) past which a head-of-queue request that keeps deferring with reclaim exhausted and no
-verified progress emits a diagnostic warning naming the full admission arithmetic. This is observability, not
-an admit path: the head stays queued. The structural-queue-wedge recovery supervisor is the mechanism that
-actually reroutes a never-admittable idle-device head (it soft-resets the pools at the wedge horizon and then
-faults the wedged jobs non-retryably for horde reissue); this warning is a slower, self-explaining backstop
-that fires if such a head is somehow still parked, so the arithmetic is in the log for the post-mortem."""
+"""Age (seconds) past which a head-of-queue request that keeps deferring with no verified progress emits a
+diagnostic warning naming the full admission arithmetic. This is observability, not an admit path: the head
+stays queued. The structural-queue-wedge recovery supervisor is the mechanism that actually reroutes a
+never-admittable idle-device head (it soft-resets the pools at the wedge horizon and then faults the wedged
+jobs non-retryably for horde reissue); this warning is a slower, self-explaining backstop that fires if such a
+head is somehow still parked, so the arithmetic is in the log for the post-mortem."""
 
 
 class VramRequestKind(StrEnum):
     """The kind of device-memory demand a request represents.
 
     The kind selects which arithmetic prices it: the disaggregated sampling gate reasons about concurrent
-    activation headroom, every other kind about the ledger-driven admission identity.
+    activation headroom, every other kind about the measured-truth admission identity.
     """
 
     PRELOAD = "preload"
@@ -140,10 +121,11 @@ class VramDisposition(StrEnum):
     """The outcome class of a verdict."""
 
     FITS = "fits"
-    """The demand is within capacity, physically fits the truthful device-free reading despite foreign load,
-    or the measured floor could not apply and relaxed to admit."""
+    """The candidate fits available room, is a no-op onto already-resident weights, or the arbiter has no
+    device state yet and relaxed to admit on the predictive path."""
     DEFER = "defer"
-    """The demand does not fit now; actuations are attached to relieve pressure and the request re-asks."""
+    """The candidate does not fit (or is withheld to protect the head, or has no device-free reading yet);
+    any actuations are attached to relieve pressure and the request re-asks."""
     DENY = "deny"
     """The demand is structurally impossible even after full escalation (it cannot fit an empty card)."""
 
@@ -202,7 +184,7 @@ class VramRequest:
 
     ``candidate_delta_mb`` is the request's marginal device cost net of any weights already resident in the
     target process. None means the caller could not price it: the arbiter then charges nothing, so an
-    unpriceable candidate is never denied by the measured overlay. ``sampling_peak_mb`` is only consulted
+    unpriceable candidate is never denied by the measured identity. ``sampling_peak_mb`` is only consulted
     for :attr:`VramRequestKind.DISAGG_SAMPLE`, where the concurrent-sampling headroom sums whole-process
     peaks rather than marginal deltas.
     """
@@ -216,28 +198,33 @@ class VramRequest:
     candidate_already_resident: bool = False
     """True when the candidate's weights are already materialised in VRAM on the target process, so admitting
     this request adds no new device footprint. A dispatch or preload onto an already-resident idle model moves
-    nothing: its weights are already in the measured committed floor and its next activation is the monolithic
-    status quo the card has already demonstrated it holds. Such a request is admitted directly, the same way a
-    disaggregated stage dispatch to a resident lane is never withheld, because the ledger identity cannot
-    express a no-op (the resident model's own reservation can legitimately sit above the noise-adjusted
-    admission ceiling, which would otherwise deny a dispatch that needs no memory). Set only when the target
-    genuinely holds the weights in VRAM; a RAM-staged load whose weights materialise on dispatch leaves it
-    False so the identity prices the materialisation."""
+    nothing: its weights are already physically inside the device-free reading and its next activation is the
+    monolithic status quo the card has already demonstrated it holds. Such a request is admitted directly, the
+    same way a disaggregated stage dispatch to a resident lane is never withheld, because a resident model's own
+    footprint can legitimately push the device-free reading below the candidate's activation cost, which would
+    otherwise deny a dispatch that needs no memory. Set only when the target genuinely holds the weights in
+    VRAM; a RAM-staged load whose weights materialise on dispatch leaves it False so the identity prices the
+    materialisation."""
     own_planned_unmaterialized_mb: float = 0.0
-    """The portion (MB) of the device's planned overlay attributable to this request's own target process, netted
-    out of the identity so a re-ask can never double-count itself. A preload that was admitted, recorded a
-    planned charge, and then had its target reclaimed or its process die before the load materialised leaves
-    that charge outstanding until the overlay reconciles; if the head re-asks the same load while the charge
-    lingers, the unnetted identity would count the load once as this planned charge and once as the candidate
-    delta and defer forever on its own footprint. Subtracting the target process's own planned charge makes the
-    request's load count at most once (as the candidate), while every other process's planned load stays fully
-    charged."""
+    """The portion (MB) of the device's outstanding reservations attributable to this request's own target,
+    netted out of the identity so a re-ask can never block on itself. A preload that was admitted, recorded a
+    reservation, and then had its target reclaimed or its process die before the load materialised leaves that
+    reservation outstanding until the overlay reconciles; if the head re-asks the same load while the reservation
+    lingers, the unnetted identity would subtract the load's own reservation from its own available room and
+    defer forever on its own footprint. Subtracting the target's own outstanding reservation makes the request's
+    load count at most once, while every other unit's reservation stays fully charged."""
     is_head_of_queue: bool = False
+    head_outstanding_mb: float | None = None
+    """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
+    when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
+    withheld when admitting it would leave less than this room, because the head took precedence and the
+    line-skipper may not consume the space the head needs. None skips the check (the head's demand is unknown at
+    this seam), degrading to admitting the non-head."""
     first_of_kind: bool = False
     starved_seconds: float = 0.0
     """Seconds this head has been the undispatched head of an idle device, used only to time the
-    starvation diagnostic; zero when a live job holds the card (the head is then queued behind live work,
-    not starved)."""
+    starvation diagnostic and the first-party context teardown grace; zero when a live job holds the card (the
+    head is then queued behind live work, not starved)."""
     sampling_peak_mb: float | None = None
     active_sampling_peaks_total_mb: float | None = None
     """The live sum (MB) of the in-flight disaggregated sampling peaks at the moment of this request, for
@@ -256,37 +243,43 @@ class VramRequest:
     would defer forever. This lets a head starved past the teardown grace escalate to a verified context
     teardown regardless of that warrant. Both a preload/whole-card head and a monolithic-dispatch head set it
     when they are the true head of queue; an ordinary (un-starved) dispatch and a line-skip never reach the
-    escalation, and a dispatch head only escalates once its reality admit has been ruled out."""
+    escalation."""
 
 
 @dataclass(frozen=True)
 class DeviceVramState:
     """The frozen per-device measurement the arbiter prices a cycle's requests against.
 
-    The fields carry exactly what the two arithmetics need. The admission identity reads the raw device
-    total, the reconciler baseline, the committed floor, the planned overlay, and per-process reservations.
-    The concurrent-sampling headroom reads the fixed per-process overhead, the marginal per-context cost,
-    the live context counts, the operator reserve, the lane decode spike, and the in-flight sampling peaks.
-    The governor state, truthful device-free reading, and verified-reclaim-exhaustion flag drive the
-    foreign-pressure branch of admission once the escalation ladder is exhausted.
+    The admission identity reads the truthful device-free reading, the outstanding reservations, the device
+    total (to size the noise buffer), and the noise buffer itself. The concurrent-sampling headroom reads the
+    device total net of baseline, the fixed per-process overhead, the marginal per-context cost, the live
+    context counts, the operator reserve, the lane decode spike, and the in-flight sampling peaks. The
+    committed-ledger fields (``committed_vram_mb``, ``committed_is_stale``) and the governor fields
+    (``governor_state``, ``reclaim_unresolved``) are retained for the sampling-headroom path, diagnostics, and
+    telemetry consumers; the admission path does not read them.
     """
 
     total_vram_mb: float | None
-    """Raw device total VRAM (MB), or None at cold start (relaxes every verdict on this card to FITS)."""
+    """Raw device total VRAM (MB), or None at cold start; used to size the noise buffer and the sampling
+    headroom, and to judge structural impossibility."""
     baseline_mb: float
-    """The reconciler's measured shared-device baseline (MB) netted out of the total to form capacity."""
+    """The reconciler's measured shared-device baseline (MB); read by the sampling-headroom path only."""
     committed_vram_mb: float
-    """The worker's committed-VRAM ledger sum (MB): per-process context plus allocator reservation."""
+    """The worker's committed-VRAM ledger sum (MB); retained for diagnostics and telemetry, not admission."""
     planned_unmaterialized_mb: float
-    """VRAM (MB) admitted for in-flight work but not yet reflected in the committed floor."""
+    """Outstanding reservations (MB): work admitted (preload staged, dispatch admitted) whose allocation the
+    device-free reading does not yet reflect, decayed per target as each materialises. Summed across every
+    admission flow; the requester's own outstanding reservation is netted out per request via
+    :attr:`VramRequest.own_planned_unmaterialized_mb`."""
     committed_is_stale: bool
-    """True when a committed-ledger contributor's report has aged past the staleness bound."""
+    """True when a committed-ledger contributor's report has aged past the staleness bound; retained for
+    diagnostics and telemetry, not admission."""
     noise_buffer_mb: float = _ADMISSION_NOISE_BUFFER_MB
-    """The admission noise slack (MB) subtracted on top of the baseline, derived per device at snapshot
+    """The admission noise margin (MB) subtracted from the device-free reading, derived per device at snapshot
     assembly from the total via :func:`admission_noise_buffer_mb` so it scales with card capacity; direct
     construction defaults to the floor."""
     per_process_reserved_mb: Mapping[int, float] = field(default_factory=dict)
-    """Live GPU processes' measured allocator reservation (MB) keyed by process id."""
+    """Live GPU processes' measured allocator reservation (MB) keyed by process id; carried for diagnostics."""
     idle_process_ids: frozenset[int] = frozenset()
     """Process ids whose lane is idle (a valid RELEASE_CACHE target)."""
     busy_process_ids: frozenset[int] = frozenset()
@@ -295,6 +288,8 @@ class DeviceVramState:
     """Inference processes holding a model on this card (drives the extra-context count)."""
     safety_context_count: int = 0
     """Number of on-GPU safety contexts on this card."""
+    safety_reclaim_allowed: bool = False
+    """Whether policy permits moving this card's safety context off-GPU to relieve admission pressure."""
     post_process_context_count: int = 0
     """Number of on-GPU post-processing contexts on this card."""
     vae_lane_context_count: int = 0
@@ -310,20 +305,15 @@ class DeviceVramState:
     active_sampling_peaks_total_mb: float = 0.0
     """Sum of the in-flight disaggregated sampling peaks (MB) already admitted on this card."""
     governor_state: GovernorState | None = None
-    """The device-free governor's committed state for this card at snapshot assembly, or None when the
-    governor has not sampled yet. Carries the truthful NVML device-level proximity-to-cliff read into the
-    arbiter: a card the governor calls SATURATED is over the paging cliff however the ledger prices it. When
-    SATURATED and not yet :attr:`reclaim_unresolved`, the verified reclaim ladder is still working the card,
-    so a non-fitting demand keeps deferring rather than consulting reality prematurely."""
+    """The device-free governor's committed state for this card, or None when it has not sampled yet; carried
+    for diagnostics and telemetry, not admission."""
     device_free_mb: float | None = None
-    """The truthful NVML device-level free VRAM (MB) for this card, or None before the first read. The one
-    figure that does not lie under WDDM: consulted only in the foreign-pressure branch, where a candidate is
-    admitted iff it physically fits ``device_free_mb - noise_buffer_mb`` despite the card being consumed by
-    load the worker did not commit."""
+    """The truthful NVML device-level free VRAM (MB) for this card, or None before the first read. The primary
+    admission input: a request FITS iff its candidate fits ``device_free_mb - outstanding_reservations -
+    noise``. None yields a throttled-diagnostic DEFER, never a denial or a fabricated figure."""
     reclaim_unresolved: bool = False
-    """True when the governor's verified reclaim ladder exhausted its rungs on this card while still
-    SATURATED (nothing the worker can give back relieved it). Signals that reclaim is finished, so admission
-    may move past the defer-behind-reclaim rule to the foreign-versus-own-load shortfall analysis."""
+    """True when the governor's verified reclaim ladder exhausted its rungs while still SATURATED; carried for
+    diagnostics and telemetry, not admission."""
 
     def sampling_headroom_mb(self) -> float | None:
         """Reproduce the concurrent-sampling headroom (MB), or None when the total is unknown.
@@ -377,17 +367,6 @@ class VramVerdict:
     reason: str
     measured: AdmissionVerdict
     required_actuations: tuple[ActuatorCommand, ...] = ()
-    foreign_pressure_admit: bool = False
-    """True on the one FITS that is not a ledger-capacity fit: the candidate does not fit the worker's own
-    admission capacity, but with reclaim exhausted and the worker's own committed load within capacity, it
-    physically fits the truthful device-free reading net of the noise buffer despite foreign load. The caller
-    loads it under the heavy-head grace (it may sample slowly while foreign load holds the card) rather than
-    as an ordinary co-resident admit."""
-    phantom_truth_admit: bool = False
-    """True on a FITS granted against device truth because the committed ledger was phantom-flagged: the
-    ledger over-counted the device-used truth beyond the phantom tolerance, so its rejection was bookkeeping,
-    not memory. Distinct from ``foreign_pressure_admit`` (real foreign load, reclaim exhausted); here the
-    pressure never existed and no reclaim was spent on it."""
 
     @property
     def admits(self) -> bool:
@@ -396,14 +375,17 @@ class VramVerdict:
 
 
 def _relaxed_verdict(request: VramRequest, device_index: int | None) -> VramVerdict:
-    """Build the degraded FITS verdict for a card with no known state (cold start or missing snapshot)."""
+    """Build the degraded FITS verdict for a card with no cycle snapshot yet (arbiter not begun this tick).
+
+    Distinct from a snapshot that exists but lacks a device-free reading (which DEFERS): here there is no
+    frozen measurement at all, so the caller falls back to its predictive gate exactly as before the arbiter
+    was wired.
+    """
     measured = evaluate_admission(
-        measured_committed_mb=0.0,
-        planned_unmaterialized_mb=0.0,
-        candidate_delta_mb=request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0,
+        candidate_outstanding_mb=request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0,
+        device_free_mb=None,
+        outstanding_reservations_mb=0.0,
         total_vram_mb=None,
-        baseline_mb=0.0,
-        committed_is_stale=False,
     )
     return VramVerdict(
         disposition=VramDisposition.FITS,
@@ -419,9 +401,9 @@ class VramArbiter:
 
     Used from the parent's single-threaded control loop only. :meth:`begin_cycle` installs the cycle's
     frozen snapshot; :meth:`evaluate` reads it to price a request and never mutates the measurement. The one
-    side effect is the starvation diagnostic: a head deferred past the diagnostic horizon with reclaim
-    exhausted emits a warning naming the arithmetic and advances :attr:`starvation_diagnostics`, throttled to
-    once per cycle per device.
+    side effect is the starvation and missing-reading diagnostics: a head deferred past the diagnostic horizon
+    with no verified progress, or a card asked to admit with no device-free reading, emits a throttled warning
+    (once per cycle per device) and advances a counter.
     """
 
     def __init__(self) -> None:
@@ -429,12 +411,12 @@ class VramArbiter:
         self._cycle: MeasuredVramSnapshot | None = None
         self._cycle_seq = 0
         self._starvation_diag_cycle: dict[int, int] = {}
+        self._device_free_missing_diag_cycle: dict[int, int] = {}
         self.admission_foreign_pressure_defers = 0
         self.first_party_context_defers = 0
         self.starvation_diagnostics = 0
         self.starvation_context_teardowns = 0
-        self.phantom_truth_admissions = 0
-        self.dispatch_reality_admits = 0
+        self.device_free_missing_defers = 0
 
     def begin_cycle(self, snapshot: MeasuredVramSnapshot) -> None:
         """Freeze the measurement this cycle's requests are priced against."""
@@ -475,31 +457,34 @@ class VramArbiter:
 
     def _measured(self, request: VramRequest, state: DeviceVramState) -> AdmissionVerdict:
         candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        # Net the request's own outstanding planned charge out of the overlay before pricing it. That charge is
-        # this same load admitted on an earlier cycle and not yet materialised; the candidate delta already
-        # represents it, so leaving it in the overlay would count the load twice and let a re-ask defer forever
-        # on its own footprint. Only the target process's own charge is removed; every other planned load stays.
-        net_planned_mb = max(0.0, state.planned_unmaterialized_mb - max(0.0, request.own_planned_unmaterialized_mb))
+        # Net the request's own outstanding reservation out of the overlay before pricing it. That reservation
+        # is this same load admitted on an earlier cycle and not yet materialised; the candidate delta already
+        # represents it, so subtracting it from the request's own available room would count the load twice and
+        # let a re-ask defer forever on its own footprint. Only the target's own reservation is removed; every
+        # other unit's stays.
+        net_reservations_mb = max(
+            0.0,
+            state.planned_unmaterialized_mb - max(0.0, request.own_planned_unmaterialized_mb),
+        )
         return evaluate_admission(
-            measured_committed_mb=state.committed_vram_mb,
-            planned_unmaterialized_mb=net_planned_mb,
-            candidate_delta_mb=candidate_delta_mb,
+            candidate_outstanding_mb=candidate_delta_mb,
+            device_free_mb=state.device_free_mb,
+            outstanding_reservations_mb=net_reservations_mb,
             total_vram_mb=state.total_vram_mb,
-            baseline_mb=state.baseline_mb,
             noise_buffer_mb=state.noise_buffer_mb,
-            committed_is_stale=state.committed_is_stale,
         )
 
     def _evaluate_admission(self, request: VramRequest, state: DeviceVramState) -> VramVerdict:
         measured = self._measured(request, state)
         if request.candidate_already_resident:
             # The candidate's weights already occupy VRAM on the target process: dispatching (or preloading) onto
-            # it materialises nothing. Its footprint is already in the measured committed floor and its next
-            # activation is the monolithic status quo the card has already served, so there is nothing to admit
-            # into. The ledger identity cannot express this no-op, because the resident model's own reservation
-            # can legitimately sit above the noise-adjusted ceiling; pricing it there would withhold a dispatch
-            # to an idle, already-loaded model and wedge the head behind a slot that is already open. This is the
-            # whole-card analogue of the disaggregated stage dispatch that a resident lane never withholds.
+            # it materialises nothing. Its footprint is already physically inside the device-free reading and its
+            # next activation is the monolithic status quo the card has already served, so there is nothing to
+            # admit into. The identity cannot express this no-op, because the resident model's own footprint can
+            # push the device-free reading below the candidate's activation cost; pricing it there would withhold
+            # a dispatch to an idle, already-loaded model and wedge the head behind a slot that is already open.
+            # This is the whole-card analogue of the disaggregated stage dispatch that a resident lane never
+            # withholds.
             return VramVerdict(
                 disposition=VramDisposition.FITS,
                 request_kind=request.kind,
@@ -507,7 +492,24 @@ class VramArbiter:
                 reason=f"candidate already resident on the target process; no new VRAM. {measured.reason()}",
                 measured=measured,
             )
+
+        if not measured.available_known:
+            # The primary admission input (the device-free reading) is absent for this card. Defer rather than
+            # deny or fabricate a figure: the next cycle's reading decides. Throttled diagnostic so a persistent
+            # gap is visible without flooding the log.
+            self._note_device_free_missing(request)
+            return VramVerdict(
+                disposition=VramDisposition.DEFER,
+                request_kind=request.kind,
+                device_index=request.device_index,
+                reason=measured.reason(),
+                measured=measured,
+            )
+
         if measured.fits:
+            head_protection_verdict = self._head_protection_defer(request, measured)
+            if head_protection_verdict is not None:
+                return head_protection_verdict
             return VramVerdict(
                 disposition=VramDisposition.FITS,
                 request_kind=request.kind,
@@ -516,40 +518,11 @@ class VramArbiter:
                 measured=measured,
             )
 
-        ledger_phantom = self._ledger_phantom(state)
-        if ledger_phantom and not self._verified_reclaim_unfinished(state):
-            # The governor's verified ladder outranks the phantom bypass: SATURATED is a truthful device-level
-            # reading, so while its ladder still works the card, even a phantom-rejected head keeps deferring.
-            phantom_verdict = self._phantom_truth_admission(request, state, measured)
-            if phantom_verdict is not None:
-                return phantom_verdict
-
-        dispatch_reality_verdict = self._dispatch_starved_reality_admit(request, state, measured)
-        if dispatch_reality_verdict is not None:
-            return dispatch_reality_verdict
-
-        actuations = self._escalation_ladder(state, request)
-        if ledger_phantom:
-            # A phantom over-commit is bookkeeping: evicting a model or tearing a context down reclaims
-            # nothing the ledger's fiction counted, so only the cache-release rungs (the recalibration
-            # actuation) survive. Destructive reclaim under a lying ledger is how a free card gets torn down.
-            actuations = tuple(command for command in actuations if command.kind is ActuatorCommandKind.RELEASE_CACHE)
-        if actuations or self._verified_reclaim_unfinished(state):
-            # Reclaim can still free space on this card: the arbiter's own per-cycle ladder still emits rungs,
-            # or the governor's verified reclaim ladder is still running (SATURATED and not proven
-            # unrelievable). Because reclaim is verified, a deferred demand either gets its space demonstrably
-            # freed within a bounded number of cycles or the ladder proves nothing remains. Never admit into an
-            # over-commit that a rung could still relieve; the caller runs the rungs and the request re-asks.
-            return VramVerdict(
-                disposition=VramDisposition.DEFER,
-                request_kind=request.kind,
-                device_index=request.device_index,
-                reason=measured.reason(),
-                measured=measured,
-                required_actuations=actuations,
-            )
-
-        if self._structurally_impossible(request, measured):
+        # The candidate does not fit available room. If it cannot fit even an empty card, no escalation on this
+        # card could ever seat it, so it DENIES. Otherwise it DEFERS: a starved head whose deficit is its own
+        # idle sibling contexts escalates to a verified teardown, every other non-fitting demand rides the
+        # per-cycle reclaim ladder and re-asks once the room frees.
+        if self._structurally_impossible(request, state):
             return VramVerdict(
                 disposition=VramDisposition.DENY,
                 request_kind=request.kind,
@@ -558,27 +531,7 @@ class VramArbiter:
                 measured=measured,
             )
 
-        # Reclaim through the ordinary ladder is exhausted and the demand still does not fit. Compute the
-        # shortfall figures and the truthful reality reading once: they decide both the foreign-pressure admit
-        # and whether a first-party context teardown is warranted.
-        capacity_mb = measured.capacity_mb
-        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        own_committed_demand_mb = measured.measured_committed_mb + measured.planned_unmaterialized_mb
-        device_free_mb = state.device_free_mb
-        physically_fits_reality = (
-            device_free_mb is not None and candidate_delta_mb <= device_free_mb - state.noise_buffer_mb
-        )
-
-        # Before the shortfall analysis, a head starved past the short teardown grace whose remaining deficit is
-        # held by its own idle sibling contexts (which weight eviction cannot reclaim, because a context's VRAM
-        # returns only when its process exits) escalates to a verified context teardown rather than deferring
-        # forever. It never fires when the head could instead admit into physically-available VRAM: the reality
-        # admit below is less disruptive than tearing the worker's own contexts down. It never force-admits
-        # either: the teardown only frees room and the head re-asks for a verified FITS next cycle. Suppressed
-        # under a phantom ledger, where destructive reclaim would tear a demonstrably free card down.
-        teardown_actuations = (
-            None if ledger_phantom or physically_fits_reality else self._starvation_context_teardown(request)
-        )
+        teardown_actuations = self._starvation_context_teardown(request)
         if teardown_actuations is not None:
             self.starvation_context_teardowns += 1
             return VramVerdict(
@@ -595,91 +548,55 @@ class VramArbiter:
                 required_actuations=teardown_actuations,
             )
 
-        # The verdict follows the shortfall's cause.
-        if capacity_mb is None or own_committed_demand_mb > capacity_mb:
-            # The worker's own committed load exceeds capacity even after full reclaim: live samplers
-            # legitimately hold the card. The head waits for a slot like any queued job.
-            self._note_starvation_diagnostic(
-                request,
-                state,
-                measured,
-                cause="the worker's own committed load holds the card after full reclaim",
-            )
-            return VramVerdict(
-                disposition=VramDisposition.DEFER,
-                request_kind=request.kind,
-                device_index=request.device_index,
-                reason=f"own committed load holds the card after full reclaim; measured: {measured.reason()}",
-                measured=measured,
-            )
-
-        # Foreign shortfall: the worker's own committed load fits capacity, so the candidate tips the ledger
-        # over only because the card is consumed by load the worker did not commit. Consult reality (computed
-        # above): admit iff the candidate physically fits the truthful device-free reading net of the noise
-        # buffer right now.
-        if physically_fits_reality and request.is_head_of_queue:
-            return VramVerdict(
-                disposition=VramDisposition.FITS,
-                request_kind=request.kind,
-                device_index=request.device_index,
-                reason=(
-                    f"foreign pressure but candidate {candidate_delta_mb:.0f} MB physically fits device-free "
-                    f"{device_free_mb:.0f} - noise {state.noise_buffer_mb:.0f} MB: admit into reality"
-                ),
-                measured=measured,
-                foreign_pressure_admit=True,
-            )
-        if not physically_fits_reality and self._has_first_party_context_reclaim(request) and not ledger_phantom:
-            # The candidate does not physically fit device-free, but the deficit is not foreign: the head's own
-            # idle sibling contexts hold it, a first-party reclaim the ordinary ladder cannot express (a bare
-            # CUDA context returns its VRAM only when its process exits, so no model-unload or cache-release rung
-            # frees it). This is reachable only within the short teardown grace, since past it the teardown above
-            # already fired; here the head simply waits out the grace for its own contexts to age into the
-            # verified teardown, never misattributed to foreign load nor rerouted to the structural-wedge recovery
-            # supervisor as if reclaim were exhausted. Suppressed under a phantom ledger, where destructive
-            # reclaim is barred.
+        if self._has_first_party_context_reclaim(request):
+            # The deficit is the head's own idle sibling contexts, still within the short teardown grace. The
+            # head simply waits out the grace for the verified teardown above rather than routing weight reclaim
+            # that frees nothing a bare context holds.
             self.first_party_context_defers += 1
-            return VramVerdict(
-                disposition=VramDisposition.DEFER,
-                request_kind=request.kind,
-                device_index=request.device_index,
-                reason=(
-                    f"candidate {candidate_delta_mb:.0f} MB does not fit device-free but the deficit is held by "
-                    f"the head's own idle sibling contexts; a verified context teardown escalates once it starves "
-                    f"past the {_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s teardown grace. measured: "
-                    f"{measured.reason()}"
-                ),
-                measured=measured,
-            )
 
-        # The best-effort over-budget admit belongs to the true head of queue alone. A non-head request (a
-        # line-skip job jumping the queue) is denied it even when the card physically has room right now,
-        # because materialising into that room starves the head it skipped: the head needs the same space and
-        # took precedence. The non-head request defers so the head keeps first claim on the reclaimed card.
-        self.admission_foreign_pressure_defers += 1
-        self._note_starvation_diagnostic(
-            request,
-            state,
-            measured,
-            cause="foreign pressure and the candidate does not physically fit measured device-free",
-        )
-        if physically_fits_reality:
-            reason = (
-                f"foreign pressure; candidate {candidate_delta_mb:.0f} MB physically fits device-free but the "
-                f"best-effort over-budget admit is reserved for the head of queue and {request.job_label} is not "
-                f"the head; measured: {measured.reason()}"
-            )
-        else:
-            free_render = f"{device_free_mb:.0f}" if device_free_mb is not None else "unknown"
-            reason = (
-                f"foreign pressure; candidate {candidate_delta_mb:.0f} MB does not fit device-free "
-                f"{free_render} - noise {state.noise_buffer_mb:.0f} MB; measured: {measured.reason()}"
-            )
+        actuations = self._escalation_ladder(state, request)
+        self._note_starvation_diagnostic(request, state, measured)
         return VramVerdict(
             disposition=VramDisposition.DEFER,
             request_kind=request.kind,
             device_index=request.device_index,
-            reason=reason,
+            reason=measured.reason(),
+            measured=measured,
+            required_actuations=actuations,
+        )
+
+    def _head_protection_defer(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+    ) -> VramVerdict | None:
+        """Withhold a fitting non-head request when admitting it would starve the true head of queue.
+
+        The candidate fits available room, but a non-head request (a line-skip job jumping the queue) may not
+        consume room the head needs: the head took precedence, and after this admission the head's own priced
+        demand must still fit. When it would not, the non-head DEFERS with no reclaim, holding the physical room
+        for the head. Returns None (admit) for the head itself, when the head's demand is unknown at this seam,
+        or when the head still fits after this admission.
+        """
+        if request.is_head_of_queue or request.head_outstanding_mb is None:
+            return None
+        available_mb = measured.available_mb
+        if available_mb is None:
+            return None
+        remaining_after_admit_mb = available_mb - measured.candidate_outstanding_mb
+        if request.head_outstanding_mb <= remaining_after_admit_mb:
+            return None
+        self.admission_foreign_pressure_defers += 1
+        return VramVerdict(
+            disposition=VramDisposition.DEFER,
+            request_kind=request.kind,
+            device_index=request.device_index,
+            reason=(
+                f"candidate {measured.candidate_outstanding_mb:.0f} MB fits available "
+                f"{available_mb:.0f} MB, but admitting it would leave {remaining_after_admit_mb:.0f} MB, "
+                f"below the head of queue's {request.head_outstanding_mb:.0f} MB demand; held for the head. "
+                f"measured: {measured.reason()}"
+            ),
             measured=measured,
         )
 
@@ -735,69 +652,6 @@ class VramArbiter:
         )
 
     @staticmethod
-    def _ledger_phantom(state: DeviceVramState) -> bool:
-        """Whether this cycle's committed ledger is contradicted by the device-used truth on this card.
-
-        Requires both the raw total and the truthful device-free reading; without them there is no truth to
-        contradict the ledger with, and the ledger must be trusted. The judgement itself is shared with the
-        drift reconciler via ``committed_ledger_is_phantom`` so the two can never disagree.
-        """
-        if state.total_vram_mb is None or state.device_free_mb is None:
-            return False
-        return committed_ledger_is_phantom(
-            committed_vram_mb=state.committed_vram_mb,
-            device_used_mb=state.total_vram_mb - state.device_free_mb,
-        )
-
-    def _phantom_truth_admission(
-        self,
-        request: VramRequest,
-        state: DeviceVramState,
-        measured: AdmissionVerdict,
-    ) -> VramVerdict | None:
-        """Admit a ledger-rejected head against device truth when the ledger is provably lying.
-
-        The committed ledger is the admission arithmetic's floor, but it is bookkeeping: when it exceeds the
-        truthful device-used reading beyond the phantom tolerance, the over-count is arithmetically
-        impossible for a truthful ledger and pricing against it withholds a card that is demonstrably free.
-        Deferring on it instead would hand the request to the reclaim ladder, whose rungs escalate to model
-        eviction and context teardown: destructive actuation spent on memory the device never held. So a
-        phantom-rejected candidate is re-priced against the truthful device-free reading, charged with the
-        planned-but-unmaterialized overlay (loads already admitted will consume that free space) net of its
-        own outstanding charge, plus the noise buffer.
-
-        Reserved for the head of the queue, the same priority rule as the foreign-pressure reality-admit: a
-        line-skip materialising into the truthful room would starve the head that needs the same space.
-        Returns None (fall through to the ordinary, rung-suppressed flow) for a non-head request or when even
-        device truth has no room; the caller only reaches here with the ledger already phantom-flagged.
-        """
-        if state.device_free_mb is None or state.total_vram_mb is None:
-            return None
-        if not request.is_head_of_queue:
-            return None
-        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        net_planned_mb = max(0.0, state.planned_unmaterialized_mb - max(0.0, request.own_planned_unmaterialized_mb))
-        truth_demand_mb = candidate_delta_mb + net_planned_mb
-        truth_room_mb = state.device_free_mb - state.noise_buffer_mb
-        if truth_demand_mb > truth_room_mb:
-            return None
-        device_used_mb = state.total_vram_mb - state.device_free_mb
-        self.phantom_truth_admissions += 1
-        return VramVerdict(
-            disposition=VramDisposition.FITS,
-            request_kind=request.kind,
-            device_index=request.device_index,
-            reason=(
-                f"committed ledger is phantom (committed {state.committed_vram_mb:.0f}MB vs device-used "
-                f"{device_used_mb:.0f}MB); admitted against device truth: candidate {candidate_delta_mb:.0f} + "
-                f"planned {net_planned_mb:.0f} = {truth_demand_mb:.0f}MB within free {state.device_free_mb:.0f} - "
-                f"noise {state.noise_buffer_mb:.0f}MB. ledger said: {measured.reason()}"
-            ),
-            measured=measured,
-            phantom_truth_admit=True,
-        )
-
-    @staticmethod
     def _escalation_ladder(state: DeviceVramState, request: VramRequest) -> tuple[ActuatorCommand, ...]:
         """Describe the pressure-relief ladder for a non-fitting demand, in escalation order.
 
@@ -824,68 +678,9 @@ class VramArbiter:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.EVICT_IDLE_MODEL, device_index=None))
         if request.can_reduce_live_contexts:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None))
+        if request.kind is VramRequestKind.PP_JOB and state.safety_context_count > 0 and state.safety_reclaim_allowed:
+            commands.append(ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None))
         return tuple(commands)
-
-    @staticmethod
-    def _verified_reclaim_unfinished(state: DeviceVramState) -> bool:
-        """Whether the governor's verified reclaim ladder is still working this card.
-
-        The verified ladder runs only while the card is SATURATED (over the paging cliff). It is unfinished
-        while the governor calls the card SATURATED and the ladder has not yet proven the card unrelievable
-        (:attr:`DeviceVramState.reclaim_unresolved`). While it is unfinished a non-fitting demand keeps
-        deferring, because rungs the arbiter's own per-cycle ladder does not describe (lane pauses, safety
-        off-GPU) may still free the needed space.
-        """
-        return state.governor_state is GovernorState.SATURATED and not state.reclaim_unresolved
-
-    def _dispatch_starved_reality_admit(
-        self,
-        request: VramRequest,
-        state: DeviceVramState,
-        measured: AdmissionVerdict,
-    ) -> VramVerdict | None:
-        """Admit a starved monolithic-dispatch head against device truth net of the governor hard floor.
-
-        A dispatch candidate is an activation-inclusive learned high-watermark peak, so it already carries its
-        own headroom. Stacking the full admission noise buffer on top of it double-counts the measurement margin
-        and prices a demonstrated-fine dispatch out of existence on a small card. When such a head has been the
-        undispatched head of an idle device past the starvation grace and the ordinary ledger identity does not
-        fit, this escape admits it iff its candidate physically fits the truthful device-free reading net of the
-        floor the governor actually defends (:func:`hard_floor_mb`), not the larger noise buffer. It is the
-        dispatch seam's parity with the preload seam's foreign-pressure reality admit, using the tighter margin
-        the high-watermark peak warrants.
-
-        Returns None for any request that is not a starved head-of-queue monolithic dispatch, or when even the
-        hard-floor reading has no room, so the caller falls through to reclaim and the context teardown
-        escalation. The ordinary (un-starved) identity is untouched: the grace gate is what confines this to a
-        head the tick-paced reclaim has already had its window to relieve.
-        """
-        if request.kind is not VramRequestKind.MONOLITHIC_DISPATCH:
-            return None
-        if not request.is_head_of_queue:
-            return None
-        if request.starved_seconds < _FIRST_PARTY_TEARDOWN_GRACE_SECONDS:
-            return None
-        device_free_mb = state.device_free_mb
-        if device_free_mb is None:
-            return None
-        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        floor_mb = hard_floor_mb(state.total_vram_mb)
-        if candidate_delta_mb > device_free_mb - floor_mb:
-            return None
-        self.dispatch_reality_admits += 1
-        return VramVerdict(
-            disposition=VramDisposition.FITS,
-            request_kind=request.kind,
-            device_index=request.device_index,
-            reason=(
-                f"starved dispatch head: candidate {candidate_delta_mb:.0f} MB physically fits device-free "
-                f"{device_free_mb:.0f} - hard floor {floor_mb:.0f} MB (the learned peak already carries its "
-                f"high-watermark margin, so the noise buffer is not stacked on top): admit into reality. "
-                f"ledger said: {measured.reason()}"
-            ),
-            measured=measured,
-        )
 
     @staticmethod
     def _has_first_party_context_reclaim(request: VramRequest) -> bool:
@@ -902,7 +697,7 @@ class VramArbiter:
         Both the preload/whole-card path and a monolithic-dispatch head reach it. Ordinary staged dispatch still
         never collapses the pool (``can_reduce_live_contexts`` stays False for a dispatch, so the ordinary
         activation-peak warrant never tears a context down); the starved-head escalation is the one exception,
-        the same as the preload seam, and only after the reality admit that needs no teardown has been ruled out.
+        the same as the preload seam.
         """
         if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
             return False
@@ -913,15 +708,14 @@ class VramArbiter:
 
         The reclaim itself (idle sibling contexts the head could free) is decided by
         :meth:`_has_first_party_context_reclaim`; this adds the timing gate. Because the caller only reaches this
-        with weight reclaim exhausted, no physically-available VRAM to admit into, and the deficit held by the
-        head's own idle sibling contexts, no other remedy can arrive: the escalation is evidence-based, not a
-        long wait. Once such a head has been the undispatched head of an idle device past
-        :data:`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS` (a short grace that rides out state churn, not the 60s
-        diagnostic threshold), it escalates to a single REDUCE_LIVE_CONTEXTS command: the caller reduces the
-        live inference-context count, tearing the idle contexts down while protecting the head's own target slot
-        and every busy process, and the freed room is verified at device level before the head is admitted (the
-        escalation never force-admits). Returns None while the head is younger than the grace or has no such
-        reclaim.
+        with the candidate not fitting available room and the deficit held by the head's own idle sibling
+        contexts, no other remedy can arrive: the escalation is evidence-based, not a long wait. Once such a head
+        has been the undispatched head of an idle device past :data:`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS` (a
+        short grace that rides out state churn, not the 60s diagnostic threshold), it escalates to a single
+        REDUCE_LIVE_CONTEXTS command: the caller reduces the live inference-context count, tearing the idle
+        contexts down while protecting the head's own target slot and every busy process, and the freed room is
+        verified at device level before the head is admitted (the escalation never force-admits). Returns None
+        while the head is younger than the grace or has no such reclaim.
         """
         if not self._has_first_party_context_reclaim(request):
             return None
@@ -929,22 +723,38 @@ class VramArbiter:
             return None
         return (ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None),)
 
+    def _note_device_free_missing(self, request: VramRequest) -> None:
+        """Emit the missing-device-free diagnostic, throttled per cycle per card, and advance its counter.
+
+        A card asked to admit with no NVML device-free reading yet cannot be priced by the primary identity, so
+        the request DEFERS. This records that gap so a persistent absence (a card the parent never reads) is
+        visible in the log and the counter without flooding either.
+        """
+        device_key = request.device_index if request.device_index is not None else 0
+        self.device_free_missing_defers += 1
+        if self._device_free_missing_diag_cycle.get(device_key) == self._cycle_seq:
+            return
+        self._device_free_missing_diag_cycle[device_key] = self._cycle_seq
+        logger.warning(
+            f"VRAM admission for {request.job_label} deferred: no device-free reading for card {device_key} "
+            "this cycle. Admission neither denies nor fabricates a free figure on a missing measurement; it "
+            "waits for the next NVML reading.",
+        )
+
     def _note_starvation_diagnostic(
         self,
         request: VramRequest,
         state: DeviceVramState,
         measured: AdmissionVerdict,
-        *,
-        cause: str,
     ) -> None:
         """Emit the starvation diagnostic for a long-deferred idle-device head, throttled per cycle per card.
 
         Fires only for a head-of-queue request that has been the undispatched head of an idle device past
-        :data:`_STARVATION_DIAGNOSTIC_SECONDS` while reclaim is exhausted and made no verified progress. It is
-        observability, not an admit: the caller still defers. The warning names the full measured arithmetic
-        so a post-mortem of a parked head reads the exact inequality; the structural-queue-wedge recovery
-        supervisor is what actually reroutes the job.
+        :data:`_STARVATION_DIAGNOSTIC_SECONDS`. It is observability, not an admit: the caller still defers. The
+        warning names the full measured arithmetic so a post-mortem of a parked head reads the exact inequality;
+        the structural-queue-wedge recovery supervisor is what actually reroutes the job.
         """
+        del state
         if not request.is_head_of_queue or request.starved_seconds < _STARVATION_DIAGNOSTIC_SECONDS:
             return
         device_key = request.device_index if request.device_index is not None else 0
@@ -954,16 +764,19 @@ class VramArbiter:
         self.starvation_diagnostics += 1
         logger.warning(
             f"Head-of-queue {request.job_label} deferred {request.starved_seconds:.0f}s "
-            f">= {_STARVATION_DIAGNOSTIC_SECONDS:.0f}s with the reclaim ladder exhausted and no verified "
-            f"progress ({cause}); it stays queued for the structural-wedge recovery supervisor to reroute. "
-            f"Measured: {measured.reason()}.",
+            f">= {_STARVATION_DIAGNOSTIC_SECONDS:.0f}s with no verified progress; it stays queued for the "
+            f"structural-wedge recovery supervisor to reroute. Measured: {measured.reason()}.",
         )
 
     @staticmethod
-    def _structurally_impossible(request: VramRequest, measured: AdmissionVerdict) -> bool:
-        """Whether the candidate alone exceeds capacity, so no escalation on this card could seat it."""
-        capacity_mb = measured.capacity_mb
-        if capacity_mb is None:
+    def _structurally_impossible(request: VramRequest, state: DeviceVramState) -> bool:
+        """Whether the candidate alone exceeds an empty card's room, so no escalation could seat it.
+
+        An empty card offers ``total - noise_buffer`` (every reservation released, every allocation freed). A
+        candidate larger than that can never fit on this card however much is reclaimed, so it DENIES rather
+        than deferring forever. Unknown total cannot prove impossibility, so it returns False.
+        """
+        if state.total_vram_mb is None:
             return False
         candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        return candidate_delta_mb > capacity_mb
+        return candidate_delta_mb > state.total_vram_mb - state.noise_buffer_mb

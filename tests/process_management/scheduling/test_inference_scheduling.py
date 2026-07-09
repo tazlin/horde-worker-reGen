@@ -59,8 +59,15 @@ def _make_inference_scheduler(
     card_runtimes: dict[int, CardRuntime] | None = None,
     model_metadata: ModelMetadata | None = None,
     post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+    device_free_mb: float | None = 24000.0,
 ) -> InferenceScheduler:
-    """Build an InferenceScheduler with mostly-mocked dependencies."""
+    """Build an InferenceScheduler with mostly-mocked dependencies.
+
+    ``device_free_mb`` models the fake card's truthful device-free reading, the measured-truth admission
+    identity's primary input: the default is an ample card so admission-neutral tests never defer on a
+    missing reading. Tests exercising VRAM pressure pass a small figure (or install a crafted arbiter
+    cycle), and tests exercising the missing-reading contract pass None.
+    """
     if state is None:
         state = WorkerState()
     if process_map is None:
@@ -75,7 +82,7 @@ def _make_inference_scheduler(
     # the fixture's max_concurrent so these tests exercise the intended concurrent-inference cap.
     bridge_data.max_threads = max_concurrent
 
-    return InferenceScheduler(
+    scheduler = InferenceScheduler(
         state=state,
         process_map=process_map,
         horde_model_map=horde_model_map,
@@ -93,6 +100,9 @@ def _make_inference_scheduler(
         post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
         card_runtimes=card_runtimes,
     )
+    if device_free_mb is not None:
+        scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
+    return scheduler
 
 
 class TestSchedulerDiagnosticThrottle:
@@ -1311,6 +1321,9 @@ class TestHeadOfQueueMakeRoom:
 
         sched._budget_active = Mock(return_value=True)  # type: ignore[method-assign]
         sched._measured_free_vram_mb = Mock(return_value=1000.0)  # type: ignore[method-assign]
+        # The truthful device-free reading models the same pressure the predictive gate reports, so admission
+        # genuinely does not fit and the head's blocker escalates to the idle-resident eviction.
+        sched.set_device_free_mb_provider(lambda _device_index: 1000.0)
         sched._vram_budget = Mock()
         sched._vram_budget.check_job.return_value = Mock(
             fits=False,

@@ -78,10 +78,14 @@ The first faults the unservable jobs so the horde reissues them; a continuation 
 cycle; a second give-up is flagged terminal so the manager abandons ship deliberately instead of by chance."""
 
 _DEFAULT_CLEAN_STREAK_SECONDS = 30.0
-"""Continuous non-wedge time that ends a wedge episode and resets the escalation counters.
+"""Continuous non-wedge time required (alongside real progress) to end a wedge episode.
 
-Set longer than a soft reset's transient un-quarantine + re-quarantine window so a doomed pool's soft
-reset does not look like a recovery and reopen a fresh (give-up-resetting) episode each time."""
+The time streak alone is insufficient once a soft reset has been attempted: a rebuild transiently reads as
+not-wedged (the un-quarantine to re-quarantine window, or a queue deadlock that momentarily clears while the
+pool boots) and that window can outlast this streak. So an episode that has already spent a soft reset closes
+only when the streak holds *and* accepted work has actually moved forward since the most recent soft reset
+(see :meth:`RecoverySupervisor.evaluate`). Without that progress requirement the counter would reset on the
+transient window and every soft reset would re-log as the first, never reaching the give-up backstop."""
 
 
 class RecoveryAction(enum.Enum):
@@ -102,10 +106,15 @@ class RecoverySupervisor:
     """Tracks how long the worker has been wedged, whether its pool is ready, and escalates.
 
     Drive it once per control-loop tick with :meth:`evaluate`, passing whether the worker is currently
-    wedged (pending work it structurally cannot make progress on) and whether its inference pool is ready
-    (a lane has reached an accepting state). The returned :class:`RecoveryAction` tells the manager what
-    to do; :attr:`limp_by_level` is the number of soft resets done in the current cycle (an escalation
-    counter, not a settings reduction); :attr:`give_up_is_terminal` marks the give-up that should abandon ship.
+    wedged (pending work it structurally cannot make progress on), whether its inference pool is ready
+    (a lane has reached an accepting state), and whether accepted work has moved forward since the most
+    recent soft reset. The returned :class:`RecoveryAction` tells the manager what to do; :attr:`limp_by_level`
+    is the number of soft resets done in the current cycle (an escalation counter, not a settings reduction);
+    :attr:`give_up_is_terminal` marks the give-up that should abandon ship.
+
+    Progress, not merely a quiet wedge signal, ends an escalation. Once a soft reset has been attempted the
+    counter resets only when the clean streak is backed by real forward progress, so a pool that keeps
+    rebuilding without ever serving work climbs the ladder to give-up instead of re-attempting the first reset.
     """
 
     def __init__(
@@ -184,7 +193,7 @@ class RecoverySupervisor:
         self._give_up_cycles = 0
         self._give_up_is_terminal = False
 
-    def evaluate(self, *, is_wedged: bool, pool_ready: bool) -> RecoveryAction:
+    def evaluate(self, *, is_wedged: bool, pool_ready: bool, made_progress: bool = False) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 
         Args:
@@ -193,6 +202,12 @@ class RecoverySupervisor:
             pool_ready: Whether the inference pool has reached an accepting state (a lane can take a job).
                 False while a just-rebuilt pool's replacement children are still booting; the give-up clock
                 does not advance until this is True or the bounded boot allowance has elapsed.
+            made_progress: Whether accepted work has moved forward (a job completed, an inference started, or
+                post-processing advanced) since the most recent soft reset. Gates the episode close once a soft
+                reset has been spent: the clean streak alone cannot reset the escalation counter, because a
+                rebuild's transient not-wedged window can satisfy the streak without any work moving. Ignored
+                before the first soft reset (a self-healing wedge that never needed a reset closes on the streak
+                alone). Defaults to False so an un-wired caller escalates rather than silently resetting.
         """
         now = self._clock()
         self._give_up_is_terminal = False
@@ -211,11 +226,16 @@ class RecoverySupervisor:
 
         # Sustained recovery closes the episode first, so a transient wedge a soft reset actually fixed
         # never reaches give-up (clean_streak is shorter than the readiness-gated give-up for this reason).
+        # Once a soft reset has been spent, the streak must be corroborated by real forward progress: a rebuild
+        # reads as not-wedged while it boots, so the streak alone would reset the counter on a pool that never
+        # actually recovered, stranding it below the give-up backstop. Before any reset there is no such
+        # transient window to guard against, so the streak alone suffices (a self-healed wedge needs no proof).
         if (
             self._episode_start is not None
             and not is_wedged
             and self._clean_since is not None
             and (now - self._clean_since) >= self._clean_streak_seconds
+            and (self._soft_resets_done == 0 or made_progress)
         ):
             self._close_episode()
             return RecoveryAction.NONE

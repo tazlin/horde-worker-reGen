@@ -13,7 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import (
@@ -172,6 +172,13 @@ class TestControlLoopTick:
             process_type=HordeProcessType.SAFETY,
         )
         process_manager._process_map.update({0: inf_proc, 10: safety_proc})
+        # The scenario is a model already resident on the free process, so the model map carries the VRAM
+        # residency: dispatch then materialises nothing new and admission treats it as the no-op it is.
+        process_manager._horde_model_map.update_entry(
+            "stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=0,
+        )
 
         job = await track_popped_job_async(process_manager._job_tracker, make_mock_job())
 
