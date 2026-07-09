@@ -214,7 +214,9 @@ peak through the shared committed-reserve ledger until its result returns. Under
 pressure, the scheduler can evict idle inference models and ask an idle
 post-processing lane to unload its modules from VRAM/RAM before starting more
 work. A pending chain that fits the card once drained gets the next drain window before a fresh sampler that
-would be unable to co-reside with it; only structurally unhostable chains become no-image faults. See
+would be unable to co-reside with it, and speculative model preloads yield to the same drain window so they
+do not recreate the pressure the lane is waiting to clear. Only structurally unhostable chains become
+no-image faults. See
 [Process lanes and job chaining](process_lanes_and_chaining.md) for the full
 picture, including how lane failures are reported as no-image faults rather than
 silently submitting raw images for jobs that requested post-processing.

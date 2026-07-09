@@ -5178,6 +5178,9 @@ class InferenceScheduler:
         self._converge_whole_card_residency()
         self._expire_stale_model_map_entries()
 
+        if self._pending_post_processing_should_hold_preload():
+            return False
+
         loaded_models = {process.loaded_horde_model_name for process in self._process_map.values()}
         loaded_models = loaded_models.union(
             model.horde_model_name
@@ -5210,6 +5213,8 @@ class InferenceScheduler:
         in_progress_jobs = self._job_tracker.jobs_in_progress
         head_job = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress_jobs), None)
         self._update_head_starvation_timer(head_job)
+        if self._resident_head_should_dispatch_before_preload(head_job):
+            return False
 
         for job in self._job_tracker.jobs_pending_inference:
             outcome = self._attempt_preload_for_job(job, head_job=head_job, loaded_models=loaded_models)
@@ -5218,6 +5223,31 @@ class InferenceScheduler:
             return outcome is _PreloadJobOutcome.PRELOAD_SENT
 
         return False
+
+    def _pending_post_processing_should_hold_preload(self) -> bool:
+        """Whether a pending post-processing chain should receive the next drain window before preloads."""
+        return self._pending_post_processing_reserve_mb(device_index=None) > 0
+
+    def _resident_head_should_dispatch_before_preload(self, head_job: ImageGenerateJobPopResponse | None) -> bool:
+        """Whether the queue head can already try dispatch, so speculative preloading should yield."""
+        if head_job is None or head_job.model is None:
+            return False
+        if self._process_lifecycle.is_model_load_quarantined(head_job.model):
+            return False
+
+        process_with_model = self._resident_process_for_job(head_job)
+        if process_with_model is None or not process_with_model.can_accept_job():
+            return False
+
+        target_card: CardRuntime | None = None
+        if self._multi_gpu_routing_active and not self._job_tracker.has_exclusive_job_in_progress():
+            target_card = self._card_runtimes.get(process_with_model.device_index)
+
+        if target_card is not None:
+            jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
+        else:
+            jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
+        return jobs_in_progress_count < self._max_jobs_in_progress_allowed(card=target_card)
 
     def _record_preload_admission(
         self,

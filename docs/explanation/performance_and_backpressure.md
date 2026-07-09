@@ -203,7 +203,10 @@ response stay live even when the queue is empty.
    stale-entry cleanup must keep that entry while the child is in early preload
    states, including the short `WAITING_FOR_JOB` first-report race and the
    `UNLOADED_MODEL_FROM_RAM` -> `DOWNLOADING_AUX_MODEL` ->
-   `DOWNLOAD_AUX_COMPLETE` aux-model download path.
+   `DOWNLOAD_AUX_COMPLETE` aux-model download path. This is opportunistic: when
+   the queue head is already resident on an idle process, dispatch is attempted
+   before later models are preloaded; when pending post-processing has an idle
+   lane and a known peak, preloads also yield so the lane gets the drain window.
 2. **Single-inference hold**: defer launch while `keep_single_inference` is
    active, such as an idle ControlNet-XL resident that must keep its slot
    exclusive. A batch is not held here; its multiplied activation peak is priced
@@ -307,7 +310,9 @@ card, not for the broader in-progress job stage, so a `DOWNLOADING_AUX_MODEL` sl
 idle. The control loop drains pending PP work first; the line-skip job is then free to use the card once the
 lane has no immediately admissible image post-processing work. When pending PP chains cannot co-run with
 sampling, the next sampler that would also be non-co-resident waits, including just after the current sampler
-finishes, so the lane gets the next drain window instead of extending the PP backlog.
+finishes, so the lane gets the next drain window instead of extending the PP backlog. Speculative preloads
+yield to that pending chain as well; otherwise a later model load can consume the very headroom the chain is
+waiting for.
 
 ### Concurrent-overlap gating
 

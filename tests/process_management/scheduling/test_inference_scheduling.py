@@ -283,6 +283,72 @@ class TestPreloadModels:
         assert result is True
         assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
 
+    async def test_resident_head_is_attempted_before_later_preload(self) -> None:
+        """A resident queue head gets the scheduling cycle before later models are preloaded."""
+        head_process = make_mock_process_info(
+            0,
+            model_name="head_model",
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        later_process = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: head_process, 1: later_process})
+        job_tracker = JobTracker()
+
+        await track_popped_job_async(job_tracker, make_job_pop_response("head_model"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("later_model"))
+
+        inference_scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            max_concurrent=1,
+            max_inference=2,
+        )
+
+        result = inference_scheduler.preload_models()
+
+        assert result is False
+        assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+    async def test_pending_post_processing_holds_speculative_preload(self, monkeypatch: object) -> None:
+        """A pending chain gets a drain window before another model is staged."""
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            _sched_mod,
+            "predict_job_post_processing_vram_mb",
+            lambda _job, _baseline_name: 4000.0,
+        )
+        inference_process = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        post_process_lane = make_mock_process_info(
+            7,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        process_map = ProcessMap({0: inference_process, 7: post_process_lane})
+        job_tracker = JobTracker()
+
+        await track_popped_job_async(job_tracker, make_job_pop_response("new_model"))
+        pp_job = make_job_pop_response("stable_diffusion", post_processing=["RealESRGAN_x4plus"])
+        pp_job_info = HordeJobInfo(
+            sdk_api_job_info=pp_job,
+            job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=time.time(),
+        )
+        await job_tracker.queue_for_post_processing(pp_job_info)
+
+        inference_scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            max_concurrent=1,
+            max_inference=1,
+        )
+
+        result = inference_scheduler.preload_models()
+
+        assert result is False
+        assert inference_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
     async def test_quarantined_model_is_not_preloaded_and_its_job_is_faulted(self) -> None:
         """A model quarantined for repeated load failures must never be preloaded; its job is faulted instead."""
         from horde_worker_regen.process_management.jobs.job_tracker import JobStage

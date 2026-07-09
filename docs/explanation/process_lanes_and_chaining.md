@@ -69,7 +69,8 @@ line-skip candidate is launched to keep the card busy during that download. If s
 pending chain cannot safely co-run with it, the orchestrator records that chain's deferral but keeps scanning
 for later pending work whose estimated peak can co-reside. If no pending chain can co-run, or if the current
 sampler has just drained and the next sampler would also be unable to co-reside, the inference scheduler holds
-that next sampler so the lane gets the next drain window instead of extending the never-idle period.
+that next sampler so the lane gets the next drain window instead of extending the never-idle period. Model
+preloading is treated as speculative work in this state and yields to the same pending chain.
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde
