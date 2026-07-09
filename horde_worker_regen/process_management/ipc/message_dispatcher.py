@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import queue
 import sys
 import time
@@ -45,7 +46,7 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap, RetiredProcessLaunch
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
@@ -73,6 +74,15 @@ _STAGE_RESULT_MESSAGE_TYPES = (
     HordeVaeDecodeResultMessage,
 )
 """The disaggregated-stage result messages routed to the orchestrator's stage-result handler."""
+
+
+class _RetiredLaunchMessageAction(enum.Enum):
+    """How the dispatcher should treat a message from an intentionally retired launch."""
+
+    NOT_RETIRED = enum.auto()
+    IGNORE = enum.auto()
+    ACCEPT_POST_PROCESS_RESULT = enum.auto()
+
 
 _INFERENCE_ACTIVE_STATES = frozenset(
     {
@@ -318,7 +328,16 @@ class MessageDispatcher:
             if not isinstance(message, HordeProcessMessage):
                 raise ValueError(f"Received a message that is not a HordeProcessMessage: {message}")
 
-            if self._should_ignore_retired_launch_message(message):
+            retired_launch_action = self._classify_retired_launch_message(message)
+            if retired_launch_action is _RetiredLaunchMessageAction.IGNORE:
+                continue
+            if retired_launch_action is _RetiredLaunchMessageAction.ACCEPT_POST_PROCESS_RESULT:
+                if isinstance(message, HordePostProcessResultMessage):
+                    await self._handle_post_process_result(message)
+                else:
+                    logger.error(
+                        f"Retired-launch classifier accepted an unexpected message type: {type(message).__name__}",
+                    )
                 continue
 
             if message.process_id not in self._process_map:
@@ -416,14 +435,14 @@ class MessageDispatcher:
                 else:
                     logger.error(f"Received {type(message).__name__} with no stage-result handler registered")
 
-    def _should_ignore_retired_launch_message(self, message: HordeProcessMessage) -> bool:
-        """Return true when a message belongs to an intentionally retired launch."""
+    def _classify_retired_launch_message(self, message: HordeProcessMessage) -> _RetiredLaunchMessageAction:
+        """Classify a message that may belong to an intentionally retired launch."""
         retired_launch = self._process_map.get_retired_launch(
             message.process_id,
             message.process_launch_identifier,
         )
         if retired_launch is None:
-            return False
+            return _RetiredLaunchMessageAction.NOT_RETIRED
 
         if isinstance(
             message,
@@ -435,6 +454,16 @@ class MessageDispatcher:
                 *_STAGE_RESULT_MESSAGE_TYPES,
             ),
         ):
+            if isinstance(message, HordePostProcessResultMessage) and self._should_accept_retired_post_process_result(
+                message,
+                retired_launch,
+            ):
+                logger.info(
+                    f"Accepting post-processing result from retired post_process process {message.process_id} "
+                    f"launch {message.process_launch_identifier} for job {message.job_id}.",
+                )
+                return _RetiredLaunchMessageAction.ACCEPT_POST_PROCESS_RESULT
+
             logger.warning(
                 f"Ignoring result message from retired {retired_launch.process_type.name.lower()} process "
                 f"{message.process_id} launch {message.process_launch_identifier} "
@@ -450,7 +479,7 @@ class MessageDispatcher:
             if isinstance(message, HordePostProcessResultMessage):
                 self._post_process_results_known_lost.add(message.job_id)
                 self._release_post_process_reserve(message.job_id)
-            return True
+            return _RetiredLaunchMessageAction.IGNORE
 
         if self._is_late_retired_liveness_message(message):
             logger.debug(
@@ -458,14 +487,30 @@ class MessageDispatcher:
                 f"{retired_launch.process_type.name.lower()} process {message.process_id} "
                 f"launch {message.process_launch_identifier} ({retired_launch.reason})",
             )
-            return True
+            return _RetiredLaunchMessageAction.IGNORE
 
         logger.warning(
             f"Ignoring unexpected {type(message).__name__} from retired "
             f"{retired_launch.process_type.name.lower()} process {message.process_id} "
             f"launch {message.process_launch_identifier} ({retired_launch.reason})",
         )
-        return True
+        return _RetiredLaunchMessageAction.IGNORE
+
+    def _should_accept_retired_post_process_result(
+        self,
+        message: HordePostProcessResultMessage,
+        retired_launch: RetiredProcessLaunch,
+    ) -> bool:
+        """Return whether a retired post-processing launch still owns the job result it produced."""
+        if retired_launch.process_type is not HordeProcessType.POST_PROCESS:
+            return False
+        if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
+            return False
+        return self._job_tracker.is_current_post_processing_attempt(
+            message.job_id,
+            process_id=message.process_id,
+            process_launch_identifier=message.process_launch_identifier,
+        )
 
     def _is_late_retired_liveness_message(self, message: HordeProcessMessage) -> bool:
         """Return true for stale terminal/liveness messages expected after intentional retirement."""

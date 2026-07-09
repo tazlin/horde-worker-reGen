@@ -228,6 +228,10 @@ class TrackedJob:
 
     Keys this model's over-budget fault streak per card so a model unservable on a small card can still be
     advertised and run on a larger one. None on single-GPU keeps the streak worker-wide, exactly as before."""
+    post_process_process_id: int | None = None
+    """The post-processing process id that owns the current post-processing attempt, if any."""
+    post_process_launch_identifier: int | None = None
+    """The process-launch identifier that owns the current post-processing attempt, if any."""
     disaggregation_declined: bool = False
     """Set when this job was pulled back out of the disaggregated pipeline to run monolithically instead.
 
@@ -971,6 +975,8 @@ class JobTracker:
             )
             return
         tracked.job_info = job_info
+        tracked.post_process_process_id = None
+        tracked.post_process_launch_identifier = None
         self.record_model_inference_success(
             job_info.sdk_api_job_info.model,
             device_index=tracked.last_dispatched_device_index,
@@ -1003,8 +1009,16 @@ class JobTracker:
             )
             return
         tracked.job_info = job_info
+        tracked.post_process_process_id = None
+        tracked.post_process_launch_identifier = None
 
-    async def begin_post_processing(self, job_info: HordeJobInfo) -> None:
+    async def begin_post_processing(
+        self,
+        job_info: HordeJobInfo,
+        *,
+        process_id: int | None = None,
+        process_launch_identifier: int | None = None,
+    ) -> None:
         """Mark a job as sent to the post-processing process."""
         tracked = self._tracked_for(job_info.sdk_api_job_info)
         if tracked is None:
@@ -1012,7 +1026,25 @@ class JobTracker:
                 f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot begin its post-processing",
             )
             return
-        self._set_stage(tracked, JobStage.POST_PROCESSING)
+        if self._set_stage(tracked, JobStage.POST_PROCESSING):
+            tracked.post_process_process_id = process_id
+            tracked.post_process_launch_identifier = process_launch_identifier
+
+    def is_current_post_processing_attempt(
+        self,
+        job_id: GenerationID,
+        *,
+        process_id: int,
+        process_launch_identifier: int,
+    ) -> bool:
+        """Return whether ``process_id``/``process_launch_identifier`` owns this job's current PP attempt."""
+        tracked = self._tracked_by_id(job_id)
+        return (
+            tracked is not None
+            and tracked.stage == JobStage.POST_PROCESSING
+            and tracked.post_process_process_id == process_id
+            and tracked.post_process_launch_identifier == process_launch_identifier
+        )
 
     async def abandon_pending_post_processing(self, job_info: HordeJobInfo) -> None:
         """Abandon a job from the pending post-processing state (it remains tracked, detached)."""
@@ -1031,7 +1063,11 @@ class JobTracker:
         tracked = self._tracked_by_id(job_id)
         if tracked is None or tracked.stage != JobStage.POST_PROCESSING:
             return False
-        return self._set_stage(tracked, JobStage.PENDING_POST_PROCESSING)
+        requeued = self._set_stage(tracked, JobStage.PENDING_POST_PROCESSING)
+        if requeued:
+            tracked.post_process_process_id = None
+            tracked.post_process_launch_identifier = None
+        return requeued
 
     async def take_being_post_processed(self, job_id: GenerationID) -> HordeJobInfo | None:
         """Take a job that is currently being post-processed by its ID, detaching it."""
@@ -1039,6 +1075,8 @@ class JobTracker:
         if tracked is None or tracked.stage != JobStage.POST_PROCESSING:
             return None
         self._set_stage(tracked, JobStage.DETACHED)
+        tracked.post_process_process_id = None
+        tracked.post_process_launch_identifier = None
         return tracked.job_info
 
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:

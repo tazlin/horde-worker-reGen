@@ -58,6 +58,13 @@ def _job_locations(process_manager: object, job_info: HordeJobInfo) -> set[str]:
     return locations
 
 
+def _deliver_one_message(process_manager: object, message: object) -> None:
+    """Feed one child message through the dispatcher's normal queue-drain path."""
+    dispatcher = process_manager._message_dispatcher  # type: ignore[attr-defined]
+    dispatcher._process_message_queue.empty.side_effect = [False, True]
+    dispatcher._process_message_queue.get.return_value = message
+
+
 class TestRequeueSurvivesLaneReplacement:
     """The full orphan-requeue-then-replace choreography, asserted for visibility at every step."""
 
@@ -174,3 +181,132 @@ class TestRequeueSurvivesLaneReplacement:
 
         assert _job_locations(process_manager, job_info) == {"pending_post_processing"}
         assert coordinator.post_process_requeue_count.get(job_info.sdk_api_job_info.id_) == 1
+
+
+class TestRetiredPostProcessLaunchResult:
+    """A completed post-processing pass should not be discarded only because its launch was retired."""
+
+    async def test_late_successful_result_from_replaced_lane_completes_in_flight_job(self) -> None:
+        """A still-tracked post-processing job adopts the images its original lane produced."""
+        process_manager = make_testable_process_manager()
+        tracker = process_manager._job_tracker
+        launch_id = 71
+        lane = make_mock_process_info(
+            _OLD_LANE_ID,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        lane.process_launch_identifier = launch_id
+        process_manager._process_map.clear()
+        process_manager._process_map.update({_OLD_LANE_ID: lane})
+
+        job_info = _make_pp_job_info()
+        await tracker.queue_for_post_processing(job_info)
+        await process_manager.start_post_processing()
+        assert _job_locations(process_manager, job_info) == {"being_post_processed"}
+
+        process_manager._process_map.retire_process(lane, "post-processing lane replacement")
+
+        processed = HordeImageResult(image_bytes=b"post-processed")
+        result = HordePostProcessResultMessage(
+            process_id=_OLD_LANE_ID,
+            process_launch_identifier=launch_id,
+            info="done",
+            time_elapsed=1.0,
+            job_id=job_info.sdk_api_job_info.id_,
+            job_image_results=[processed],
+            state=GENERATION_STATE.ok,
+        )
+        _deliver_one_message(process_manager, result)
+        await process_manager._message_dispatcher.receive_and_handle_process_messages()
+
+        assert _job_locations(process_manager, job_info) == {"pending_safety_check"}
+        assert job_info.job_image_results == [processed]
+
+    async def test_result_from_previous_attempt_does_not_override_current_attempt(self) -> None:
+        """A stale successful result is ignored after the job has been requeued to a successor lane."""
+        process_manager = make_testable_process_manager()
+        tracker = process_manager._job_tracker
+        old_launch_id = 71
+        new_launch_id = 72
+        old_lane = make_mock_process_info(
+            _OLD_LANE_ID,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        old_lane.process_launch_identifier = old_launch_id
+        process_manager._process_map.clear()
+        process_manager._process_map.update({_OLD_LANE_ID: old_lane})
+
+        job_info = _make_pp_job_info()
+        await tracker.queue_for_post_processing(job_info)
+        await process_manager.start_post_processing()
+        assert _job_locations(process_manager, job_info) == {"being_post_processed"}
+
+        process_manager._process_map.retire_process(old_lane, "post-processing lane replacement")
+        await tracker.requeue_one_being_post_processed(job_info.sdk_api_job_info.id_)
+
+        new_lane = make_mock_process_info(
+            _NEW_LANE_ID,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        new_lane.process_launch_identifier = new_launch_id
+        process_manager._process_map.update({_NEW_LANE_ID: new_lane})
+        await process_manager.start_post_processing()
+        assert _job_locations(process_manager, job_info) == {"being_post_processed"}
+
+        old_result = HordePostProcessResultMessage(
+            process_id=_OLD_LANE_ID,
+            process_launch_identifier=old_launch_id,
+            info="done",
+            time_elapsed=1.0,
+            job_id=job_info.sdk_api_job_info.id_,
+            job_image_results=[HordeImageResult(image_bytes=b"old-post-processed")],
+            state=GENERATION_STATE.ok,
+        )
+        _deliver_one_message(process_manager, old_result)
+        await process_manager._message_dispatcher.receive_and_handle_process_messages()
+
+        assert _job_locations(process_manager, job_info) == {"being_post_processed"}
+        assert job_info.job_image_results == [HordeImageResult(image_bytes=b"raw-image")]
+
+    async def test_faulted_result_from_replaced_lane_remains_known_lost(self) -> None:
+        """A fault from a retired lane re-enters bounded recovery instead of terminally faulting the job."""
+        process_manager = make_testable_process_manager()
+        tracker = process_manager._job_tracker
+        launch_id = 71
+        lane = make_mock_process_info(
+            _OLD_LANE_ID,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        lane.process_launch_identifier = launch_id
+        process_manager._process_map.clear()
+        process_manager._process_map.update({_OLD_LANE_ID: lane})
+
+        job_info = _make_pp_job_info()
+        await tracker.queue_for_post_processing(job_info)
+        await process_manager.start_post_processing()
+        process_manager._process_map.retire_process(lane, "post-processing lane replacement")
+
+        result = HordePostProcessResultMessage(
+            process_id=_OLD_LANE_ID,
+            process_launch_identifier=launch_id,
+            info="post-processing failed",
+            time_elapsed=1.0,
+            job_id=job_info.sdk_api_job_info.id_,
+            job_image_results=None,
+            state=GENERATION_STATE.faulted,
+        )
+        _deliver_one_message(process_manager, result)
+        await process_manager._message_dispatcher.receive_and_handle_process_messages()
+
+        assert _job_locations(process_manager, job_info) == {"being_post_processed"}
+        assert process_manager._message_dispatcher.take_post_process_results_known_lost() == {
+            job_info.sdk_api_job_info.id_,
+        }

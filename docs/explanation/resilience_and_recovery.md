@@ -5,6 +5,8 @@
     - [Layer 1: bounded and degraded job retry](#layer-1-bounded-and-degraded-job-retry)
     - [Layer 2: slot replacement and crash-loop quarantine](#layer-2-slot-replacement-and-crash-loop-quarantine)
     - [Stranded in-progress jobs](#stranded-in-progress-jobs)
+    - [Stranded safety-check jobs](#stranded-safety-check-jobs)
+    - [Stranded post-processing jobs](#stranded-post-processing-jobs)
     - [Layer 3: save-our-ship (SOS) escalation](#layer-3-save-our-ship-sos-escalation)
     - [The action ledger](#the-action-ledger)
     - [The owned-PID registry](#the-owned-pid-registry)
@@ -151,6 +153,32 @@ being lost is requeued only a fixed number of times before the job is dropped wi
 its images cleared (an image the safety check never cleared is **never** submitted)
 and popping is soft-paused until safety recovers. Re-checked images are always
 preserved, never submitted unchecked.
+
+## Stranded post-processing jobs
+
+Post-processing uses a dedicated GPU-bearing lane, so it can be replaced or
+temporarily stopped independently from inference. A job handed to that lane sits
+in `POST_PROCESSING` until its processed images return. If the lane is retired
+while the result is already in flight, the normal launch-identifier guard would
+otherwise discard a valid result and leave the job waiting for images that will
+never arrive.
+
+The dispatcher keeps the retired-launch guard, but makes one narrow exception:
+a successful `HordePostProcessResultMessage` from a retired post-processing
+launch is accepted only when `JobTracker` still records that exact process id and
+launch identifier as the owner of the job's current post-processing attempt. The
+result is then handled through the same path as an ordinary live-lane result,
+which adopts the processed images, releases the active post-processing reserve,
+and queues the job for safety.
+
+The ownership stamp is cleared whenever the job leaves the active
+post-processing attempt: successful completion, watchdog requeue, or explicit
+detachment. A result from an older attempt therefore cannot overwrite a newer
+attempt, and a faulted retired-lane result still enters the known-lost path. The
+watchdog requeues those known-lost jobs for a bounded number of fresh
+post-processing attempts; once the retry budget is exhausted, the job is faulted
+without images rather than submitting raw images that did not satisfy the
+requested post-processing contract.
 
 ## Layer 3: save-our-ship (SOS) escalation
 

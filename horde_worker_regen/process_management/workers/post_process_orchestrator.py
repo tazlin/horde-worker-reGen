@@ -508,5 +508,9 @@ class PostProcessOrchestrator:
             str(completed_job_info.sdk_api_job_info.id_),
             vram_mb=reserve_vram_mb,
         )
-        await self._job_tracker.begin_post_processing(completed_job_info)
+        await self._job_tracker.begin_post_processing(
+            completed_job_info,
+            process_id=post_process_process.process_id,
+            process_launch_identifier=post_process_process.process_launch_identifier,
+        )
         return True
