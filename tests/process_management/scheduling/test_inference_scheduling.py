@@ -729,6 +729,43 @@ class TestAuxDownloadLineSkip:
         assert await scheduler.start_inference() is True
         assert candidate_job in job_tracker.jobs_in_progress
 
+    async def test_ready_head_bypasses_cap_occupied_by_an_active_aux_download(self) -> None:
+        """A popped resident head runs when the nominal sampling slot is only fetching another job's LoRAs."""
+        downloading_process = make_mock_process_info(
+            0,
+            model_name="downloading_model",
+            state=HordeProcessState.DOWNLOADING_AUX_MODEL,
+        )
+        ready_process = make_mock_process_info(
+            1,
+            model_name="ready_model",
+            state=HordeProcessState.PRELOADED_MODEL,
+        )
+        job_tracker = JobTracker()
+        active_aux_job = make_job_pop_response(
+            "downloading_model",
+            loras=[LorasPayloadEntry(name="active-download")],
+        )
+        downloading_process.last_job_referenced = active_aux_job
+        await track_popped_job_async(job_tracker, active_aux_job)
+        await mark_job_in_progress_async(job_tracker, active_aux_job)
+        ready_head = make_job_pop_response("ready_model")
+        await track_popped_job_async(job_tracker, ready_head)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: downloading_process, 1: ready_process}),
+            job_tracker=job_tracker,
+            max_concurrent=1,
+            max_inference=2,
+        )
+
+        result = await scheduler.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is ready_head
+        assert result.process_with_model is ready_process
+        assert result.line_skip is not None
+        assert result.line_skip.displaced_job is active_aux_job
+
     async def test_same_model_candidate_bypasses_via_idle_sibling(self) -> None:
         """A candidate sharing the blocked head's model skips onto a different idle resident lane.
 

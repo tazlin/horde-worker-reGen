@@ -227,10 +227,10 @@ never actually relieve."""
 
 _SAFETY_GPU_LOAD_CHARGE_MB = 3044.0
 """The device VRAM (MB) charged when the safety process is loaded onto the GPU, for the arbiter's SAFETY_LOAD
-gate. A documented seed matching the measured reserved footprint of the on-GPU safety context (DeepDanbooru,
-CLIP, and the aesthetic head plus their CUDA context); the worker holds no learned safety footprint, so this
-static figure prices the safety load rather than a per-run watermark. Deliberately conservative: erring high
-keeps safety off-GPU one more cycle rather than restoring it onto a card it would over-commit."""
+gate. A documented conservative seed for the idle CLIP model plus its CUDA context. DeepDanbooru, BLIP, the
+aesthetic head, and evaluation activations are explicitly reclaimable and are not fixed safety residency. The
+worker holds no learned CLIP footprint, so this static figure prices restore rather than a per-run watermark;
+erring high keeps safety off-GPU one more cycle rather than restoring it onto a card it would over-commit."""
 
 _SAFETY_PLACEMENT_PAUSE_STREAK = 2
 """Consecutive control cycles the safety charge must fail to fit beside the largest learned solo sampling peak
@@ -5925,6 +5925,30 @@ class InferenceScheduler:
 
         return None
 
+    def _active_aux_download_blocker(
+        self,
+        *,
+        device_index: int | None,
+    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
+        """Return an in-progress job whose slot is downloading auxiliaries instead of sampling.
+
+        The ordinary concurrency cap counts a popped job as in progress as soon as START_INFERENCE is sent,
+        including the time its child spends fetching LoRAs. That work consumes no sampling slot. A different
+        model already resident on an idle process may therefore use the card without increasing denoiser
+        concurrency; this helper identifies the active download whose cap slot can be borrowed.
+        """
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.last_process_state != HordeProcessState.DOWNLOADING_AUX_MODEL:
+                continue
+            job = process_info.last_job_referenced
+            if job is not None and job in self._job_tracker.jobs_in_progress:
+                return job, process_info
+        return None
+
     async def _handle_process_missing(
         self,
         job: ImageGenerateJobPopResponse,
@@ -6097,6 +6121,25 @@ class InferenceScheduler:
                     )
                 ):
                     self._state.wants_line_skip_candidate = True
+
+            # The cap may instead be occupied by an *already in-progress* job fetching its auxiliaries. In
+            # that shape the pending head is perfectly ready on another resident process, so inspecting only
+            # the head's process misses the idle-card opportunity. Borrow the non-sampling slot using the same
+            # modest/resident/non-LoRA line-skip contract and preserve the active download as the displaced job.
+            aux_blocker = self._active_aux_download_blocker(
+                device_index=target_card.device_index if target_card is not None else None,
+            )
+            if aux_blocker is not None:
+                active_aux_job, aux_process = aux_blocker
+                bypass = self._select_line_skip_candidate(
+                    active_aux_job,
+                    next_n_jobs=next_n_jobs,
+                    candidate_job_size=candidate_job_size,
+                    displaced_process_id=aux_process.process_id,
+                )
+                if bypass is not None:
+                    self._pending_line_skip = bypass
+                    return bypass
 
             return None
 
@@ -7052,18 +7095,42 @@ class InferenceScheduler:
             for_head_of_queue=is_head_of_queue,
             device_index=device_index,
         )
+        candidate_delta_mb = self._measured_admission_candidate_delta_mb(
+            next_job,
+            baseline,
+            process_id=process_with_model.process_id,
+            disaggregated=self._is_disaggregation_class_eligible(next_job),
+        )
+        forecast = self._forecast_streaming(next_job, baseline, device_index=device_index)
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        structural_reserve_mb = (
+            effective_inference_reserve_mb(total_vram_mb, 0.0)
+            if total_vram_mb is not None
+            else forecast._effective_base_reserve  # noqa: SLF001 - same budget owner sizes teardown depth.
+        )
+        max_resident = (
+            self._max_coresident_for_peak_mb(
+                candidate_delta_mb,
+                structural_reserve_mb,
+                device_index=device_index,
+            )
+            if candidate_delta_mb is not None
+            else None
+        )
+        live_inference_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        idle_contexts_teardownable = (
+            is_head_of_queue
+            and max_resident is not None
+            and max_resident < live_inference_processes
+            and self._has_teardownable_idle_context(process_with_model, device_index=device_index)
+        )
         request = VramRequest(
             kind=VramRequestKind.MONOLITHIC_DISPATCH,
             job_label=str(next_job.model),
             baseline=baseline,
             device_index=device_index,
             target_process_id=process_with_model.process_id,
-            candidate_delta_mb=self._measured_admission_candidate_delta_mb(
-                next_job,
-                baseline,
-                process_id=process_with_model.process_id,
-                disaggregated=self._is_disaggregation_class_eligible(next_job),
-            ),
+            candidate_delta_mb=candidate_delta_mb,
             candidate_already_resident=self._candidate_weights_resident_on_process(
                 next_job.model,
                 process_with_model.process_id,
@@ -7083,8 +7150,7 @@ class InferenceScheduler:
             # no weight reclaim left: it escalates to the same verified teardown the preload seam uses, so this
             # head-only signal is reported for that path.
             can_reduce_live_contexts=False,
-            idle_contexts_teardownable=is_head_of_queue
-            and self._has_teardownable_idle_context(process_with_model, device_index=device_index),
+            idle_contexts_teardownable=idle_contexts_teardownable,
         )
         verdict = self._ensure_preload_arbiter().evaluate(request)
 
@@ -7096,12 +7162,11 @@ class InferenceScheduler:
         # owner, protecting the head's own slot, then hold. The job re-asks next pass and releases once the
         # arbiter verdicts FITS (the governor's device-free reading having verified the reclaimed room).
         actuations = verdict.required_actuations
-        forecast = self._forecast_streaming(next_job, baseline, device_index=device_index)
         self._preload_actuation = _PreloadActuation(
             job=next_job,
             available_process=process_with_model,
             forecast=forecast,
-            max_resident=None,
+            max_resident=max_resident,
         )
         try:
             self._execute_preload_actuations(

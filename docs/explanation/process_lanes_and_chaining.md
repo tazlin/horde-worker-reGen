@@ -24,6 +24,11 @@ when the safety process is CPU-only). It is controlled by `dedicated_post_proces
 - `off`: no lane, and the worker does not offer post-processing at all. The lane is the only place
   post-processing runs; there is no inline fallback inside the inference processes.
 
+When safety runs on GPU, only CLIP remains resident while the lane is idle. DeepDanbooru stages from CPU for a
+conditional anime check; BLIP captioning and the aesthetic head are also offloaded after use, and completion
+trims the allocator before `WAITING_FOR_JOB`. This bounds the lane's fixed card cost without making every
+safety evaluation pay a CLIP reload.
+
 ## Why a dedicated post-processing lane
 
 Post-processing used to run inline on the inference process that generated the images. That welded an

@@ -83,6 +83,48 @@ def resolve_safety_device(*, cpu_only: bool, cuda_available: bool) -> str:
     return "cuda"
 
 
+def _clear_safety_accelerator_cache() -> None:
+    """Return cached safety allocations to the device without importing torch in the parent."""
+    from hordelib.api import clear_accelerator_cache
+
+    clear_accelerator_cache()
+
+
+class _OnDemandDeepDanbooruModel:
+    """Keep DeepDanbooru off-GPU between anime checks while preserving its public surface.
+
+    CLIP is the safety lane's hot resident model. DeepDanbooru is consulted only after CLIP classifies an
+    image as anime, so pinning its roughly 600 MB model to the card between jobs needlessly reduces inference
+    headroom. This proxy stages the existing horde-safety model for the one call that needs it and returns it
+    to CPU immediately afterwards. Unknown attributes delegate to the wrapped model because ``NSFWChecker``
+    also reads its tag table.
+    """
+
+    def __init__(self, model: DeepDanbooruModel, *, execution_device: str) -> None:
+        self._model = model
+        self._execution_device = execution_device
+        self._resident_device = "cpu"
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._model, name)
+
+    def evaluate_tensor(self, tensor_to_evaluate: object) -> object:
+        """Stage on first use in a safety batch and evaluate on the configured device."""
+        if self._resident_device != self._execution_device:
+            self._model.to(self._execution_device)  # type: ignore[attr-defined]
+            self._model._initial_device = self._execution_device  # type: ignore[attr-defined]  # noqa: SLF001
+            self._resident_device = self._execution_device
+        return self._model.evaluate_tensor(tensor_to_evaluate)  # type: ignore[arg-type]
+
+    def offload(self) -> None:
+        """Return staged weights to CPU after the complete safety job or alchemy form."""
+        if self._resident_device == "cpu":
+            return
+        self._model.to("cpu")  # type: ignore[attr-defined]
+        self._model._initial_device = "cpu"  # type: ignore[attr-defined]  # noqa: SLF001
+        self._resident_device = "cpu"
+
+
 class CensorReason(enum.Enum):
     """The reason for censoring an image."""
 
@@ -105,7 +147,7 @@ class HordeSafetyProcess(HordeProcess):
     device-init guard keeps the VRAM read withheld (the fields stay None) and only RAM/FDs are reported."""
 
     _interrogator: Interrogator
-    _deep_danbooru_model: DeepDanbooruModel
+    _deep_danbooru_model: DeepDanbooruModel | _OnDemandDeepDanbooruModel
 
     _nsfw_checker: NSFWChecker
 
@@ -176,7 +218,14 @@ class HordeSafetyProcess(HordeProcess):
                         "whose install sentinel was not set (e.g. a manually installed CPU torch).",
                     )
                 logger.debug(f"Initialising horde_safety on device={device} (cpu_only={cpu_only})")
-                self._deep_danbooru_model = get_deep_danbooru_model(device=device)
+                # CLIP is the only safety model held on GPU while idle. DeepDanbooru is used only for images
+                # CLIP has already identified as anime, so keep its weights in host RAM and stage them through
+                # the small on-demand proxy for that conditional evaluation.
+                deep_danbooru = get_deep_danbooru_model(device="cpu" if device != "cpu" else device)
+                self._deep_danbooru_model = _OnDemandDeepDanbooruModel(
+                    deep_danbooru,
+                    execution_device=device,
+                )
                 self._interrogator = get_interrogator_no_blip(device=device)
             except Exception as e:
                 logger.error(f"Failed to initialise horde_safety: {type(e).__name__} {e}")
@@ -187,7 +236,7 @@ class HordeSafetyProcess(HordeProcess):
 
                 self._nsfw_checker = NSFWChecker(
                     self._interrogator,
-                    self._deep_danbooru_model,
+                    self._deep_danbooru_model,  # pyrefly: ignore [bad-argument-type]
                 )
             except Exception as e:
                 logger.error(f"Failed to initialise NSFWChecker: {type(e).__name__} {e}")
@@ -254,6 +303,20 @@ class HordeSafetyProcess(HordeProcess):
         self._interrogator.load_caption_model()  # type: ignore[attr-defined]
         self._caption_model_loaded = True
         self.send_memory_report_message(include_vram=False)
+
+    def _offload_transient_models(self) -> None:
+        """Return every lazily-loaded safety companion to CPU, retaining only CLIP on the GPU."""
+        if self._safety_device == "cpu":
+            return
+
+        deep_danbooru = getattr(self, "_deep_danbooru_model", None)
+        if isinstance(deep_danbooru, _OnDemandDeepDanbooruModel):
+            deep_danbooru.offload()
+        if self._caption_model_loaded and self._interrogator.caption_model is not None:  # type: ignore[attr-defined]
+            self._interrogator.caption_model = self._interrogator.caption_model.to("cpu")  # type: ignore[attr-defined]
+            self._interrogator.caption_offloaded = True  # type: ignore[attr-defined]
+        if self._aesthetic_scorer is not None:
+            self._aesthetic_scorer.to("cpu")
 
     def _get_ranking_lists(self) -> dict[str, list[str]]:
         """Load the legacy interrogation ranking lists (vendored from clipfree) once."""
@@ -399,6 +462,8 @@ class HordeSafetyProcess(HordeProcess):
                 logger.warning(f"Aesthetic scoring unavailable (could not load predictor): {type(e).__name__} {e}")
                 self._aesthetic_unavailable = True
                 return None
+        else:
+            self._aesthetic_scorer.to(self._safety_device)
 
         image_features = self._interrogator.image_to_features(image)  # type: ignore[attr-defined]
         return self._aesthetic_scorer.score(image_features)
@@ -485,6 +550,10 @@ class HordeSafetyProcess(HordeProcess):
         )
         self._send_alchemy_job_metrics(form)
 
+        # Alchemy may have staged BLIP, DeepDanbooru, the aesthetic head, or large temporary embedding
+        # tensors. Return those allocations before advertising the shared safety lane as idle.
+        self.release_allocator_cache()
+
         process_state = (
             HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
         )
@@ -496,20 +565,19 @@ class HordeSafetyProcess(HordeProcess):
 
     @logger.catch(reraise=True)
     def release_allocator_cache(self) -> None:
-        """Release the torch allocator's cached free blocks without unloading models, then report memory.
+        """Restore the safety lane's CLIP-only idle residency, then report memory.
 
-        The GPU-resident safety models are a committed-VRAM ledger tenant like any other GPU lane, so the
-        ledger's recalibration fan-out asks this process to return reserved-but-unused allocator blocks the
-        same way it asks the inference and lane processes. The resident safety models stay loaded. When the
-        safety models run on CPU there is no device allocator to trim, so only a fresh RAM report is sent.
+        CLIP stays hot because every safety check uses it. Conditional/lazy companions (DeepDanbooru, BLIP,
+        and the aesthetic head) live on CPU between calls, and cached activation blocks are returned to the
+        driver. This makes the process's idle GPU footprint a real fixed safety cost rather than the high-water
+        mark of its most recent form. When safety runs on CPU there is no device allocator to trim.
         """
         if self._safety_device == "cpu":
             self.send_memory_report_message(include_vram=False)
             return
+        self._offload_transient_models()
         gc.collect()
-        from hordelib.api import clear_accelerator_cache
-
-        clear_accelerator_cache()
+        _clear_safety_accelerator_cache()
         self.send_memory_report_message(include_vram=True)
 
     @override
@@ -644,6 +712,9 @@ class HordeSafetyProcess(HordeProcess):
                 safety_evaluations=safety_evaluations,
             ),
         )
+        # The evaluation's activation cache is reclaimable, not fixed safety residency. Trim before WAITING
+        # so the parent never sees an idle safety lane retaining the previous image's high-water allocation.
+        self.release_allocator_cache()
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
     @override

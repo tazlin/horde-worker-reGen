@@ -325,6 +325,12 @@ still exceeds the threshold, so the cap bypass and the pop bias last only as lon
 as the stall does. Set `aux_model_download_line_skip_threshold_seconds` to unset
 to disable the breaker entirely.
 
+The borrowing rule also covers an auxiliary download that has already entered the in-progress set. The
+concurrency cap normally counts that job, but `DOWNLOADING_AUX_MODEL` is not sampling; if the pending head is
+small, non-LoRA, and resident on another idle process, it dispatches immediately and records the active
+download as displaced. This avoids waiting for the threshold/pop-bias path when the usable job is already in
+the local queue.
+
 Already-popped post-processing work has priority over the line-skip dispatch while the blocked head is only
 downloading auxiliary models. The post-processing overlap gate waits for active sampling on the PP lane's
 card, not for the broader in-progress job stage, so a `DOWNLOADING_AUX_MODEL` slot does not make the PP lane
@@ -506,11 +512,12 @@ real jobs, three cooperating behaviors keep it from faulting work the card can h
 - **Crisp attribution.** A genuine overstep still becomes an out-of-memory inside the offender, on a
   path that degrades deliberately (the faulted chain is reported without images).
 
-The safety process's quota is also a runaway guard, but its floor is sized to the resident safety set
-(the safety models plus one evaluation). On roomy cards it grows to a bounded ceiling so CLIP alchemy
-forms (caption/interrogation/NSFW), which run on the same process and transiently allocate above the
-base safety models, do not fault merely because the old fixed floor was too tight. A faulted safety
-evaluation still recycles the process.
+The safety process's quota is also a runaway guard, but its **idle fixed residency is CLIP only**. The anime
+classifier (DeepDanbooru) is held in system RAM, staged onto the GPU only for the conditional anime evaluation,
+and returned immediately. Lazy BLIP caption weights and the aesthetic head are likewise returned to CPU after
+their form; every safety/form completion empties transient allocator blocks before publishing `WAITING_FOR_JOB`.
+On roomy cards the quota still grows to a bounded ceiling so those active evaluations can transiently allocate
+above CLIP without faulting. A faulted safety evaluation still recycles the process.
 
 On Windows the worker also watches the one signal the driver cannot fake: the per-process
 `GPU Process Memory` counters (the data behind Task Manager's "Shared GPU memory" column). When a worker
@@ -959,6 +966,11 @@ scheduler computes the largest live-context count that still fits the job's peak
 model and forcing a full reload storm. This is the structural remedy for the `threads > 1` co-residence
 thrash: it fires exactly when the admission verdict would otherwise reject the head every tick and route
 it into an evict-all admit.
+
+The same arithmetic guards the dispatch-time starvation escape. Finding an idle sibling is not enough to
+claim whole-card residency: the computed maximum must be lower than the number of live inference processes.
+If the target is equal to or above the live pool, inference-context pruning cannot relieve the measured
+shortfall, so dispatch does not mark the job exclusive or cycle safety through the residency machinery.
 
 Both of those teardown paths (the streaming forecast's `needs_teardown` and the verdict-driven context
 reduction) are gated on the demand being **trustworthy** before the worker engages the disruptive whole-card

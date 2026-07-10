@@ -135,6 +135,13 @@ class AestheticScorer:
         features = nn.functional.normalize(features, dim=-1)
         return round(float(self._model(features).squeeze().item()), 4)
 
+    def to(self, device: str) -> None:
+        """Move the small predictor between the safety device and CPU for bounded idle residency."""
+        if device == self._device:
+            return
+        self._model.to(device)
+        self._device = device
+
 
 def load_aesthetic_scorer(device: str = "cpu") -> AestheticScorer:
     """Ensure the weight is present, then build a scorer on *device*."""

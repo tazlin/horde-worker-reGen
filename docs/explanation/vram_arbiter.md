@@ -207,8 +207,10 @@ evidence rather than a long clock. Two timings apply, deliberately different:
   because the teardown scales to a fixed target and retires its victims from the process map synchronously, so
   a repeated command sees the count already at target and tears nothing more down (`_establish_whole_card_residency`
   only scales while the live count exceeds the target, and re-stamps the residency once). This escalation
-  belongs to the preload/whole-card path alone: a dispatch-gate hold (a `MONOLITHIC_DISPATCH` request) never
-  tears a context down, matching the `can_reduce_live_contexts` semantics that gate stays under.
+  is normally the preload/whole-card path. A starved `MONOLITHIC_DISPATCH` head may use the same escape only
+  when its candidate peak computes a maximum resident-process target below the current live pool. Merely
+  finding an idle sibling does not qualify: a target at or above the live count proves pruning that context
+  cannot address the deficit, so the dispatch stays out of whole-card residency.
 * **The genuinely-foreign starvation diagnostic keeps its 60s threshold (`_STARVATION_DIAGNOSTIC_SECONDS`).** A
   head whose shortfall is real foreign load with no first-party context reclaim has no surgical remedy the
   arbiter can apply, so its long-wait warning stays at 60s (see below); shortening it would only spam the log.
@@ -372,6 +374,12 @@ needs. The scheduler-owned **runtime safety-placement policy**
 generalises the whole-card safety-off lever to that ordinary case: it moves safety to a CPU-only process when
 its charge cannot fit, and re-promotes it to the GPU once a card proves durable room. `safety_on_gpu` remains
 the operator's maximum permission; the policy only degrades GPU to CPU and back, never beyond that grant.
+
+GPU placement treats CLIP plus its CUDA context as the lane's fixed residency, not the last evaluation's
+high-water mark. DeepDanbooru stays in host RAM until an anime check calls it; BLIP and the aesthetic head are
+offloaded after use; and transient allocator blocks are cleared before the child reports itself idle. The
+device-free reading therefore sees those allocations as reclaimable work, rather than evidence that the whole
+safety process must be replaced or that an ordinary SDXL-class dispatch needs exclusive residency.
 
 The two sides read **different signals**, which is what makes re-promotion satisfiable under sustained load.
 Demotion prices a *modeled* worst case: the charge must fail to fit beside the largest learned sampling peak

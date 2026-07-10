@@ -230,12 +230,12 @@ class TestLineSkipDispatchHeadTruth:
 
 
 class TestStarvedDispatchHeadSignals:
-    """The gate feeds the arbiter the starvation age and the teardownable-context signal for the dispatch head.
+    """The gate feeds the arbiter only evidence-backed starvation and context-reduction signals.
 
     The starved-head reality admit and the context-teardown escalation both live in the arbiter, but they can
-    only fire if this seam reports how long the head has starved and whether idle sibling contexts exist. This
-    pins that wiring: a genuine head beside an idle sibling presents a nonzero ``starved_seconds`` and
-    ``idle_contexts_teardownable=True``.
+    only fire if this seam reports how long the head has starved and whether reducing the live pool would
+    actually make room. The mere existence of an idle sibling is insufficient: a computed target at or above
+    the current pool means its context is not the deficit and must not trigger whole-card residency.
     """
 
     def _fits_verdict(self) -> VramVerdict:
@@ -254,9 +254,10 @@ class TestStarvedDispatchHeadSignals:
             measured=measured,
         )
 
-    async def test_gate_reports_starvation_age_and_teardownable_contexts(self) -> None:
-        """A starved head beside an idle sibling presents the age and the teardownable-context signal."""
+    async def test_gate_does_not_offer_teardown_when_target_already_exceeds_live_pool(self) -> None:
+        """A co-resident SDXL-class head does not claim whole-card residency merely because a sibling is idle."""
         scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        scheduler._max_coresident_for_peak_mb = Mock(return_value=4)  # type: ignore[method-assign]
         scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
             return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
         )
@@ -267,6 +268,20 @@ class TestStarvedDispatchHeadSignals:
         assert capture.last_request is not None
         assert capture.last_request.kind is VramRequestKind.MONOLITHIC_DISPATCH
         assert capture.last_request.starved_seconds == _FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0
+        assert capture.last_request.idle_contexts_teardownable is False
+
+    async def test_gate_offers_teardown_when_computed_target_is_below_live_pool(self) -> None:
+        """A head whose priced peak genuinely requires fewer contexts retains the bounded teardown remedy."""
+        scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        scheduler._max_coresident_for_peak_mb = Mock(return_value=1)  # type: ignore[method-assign]
+        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
+            return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
+        )
+        capture = _CapturingArbiter(self._fits_verdict())
+        scheduler._vram_arbiter = capture  # type: ignore[assignment]
+
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
+        assert capture.last_request is not None
         assert capture.last_request.idle_contexts_teardownable is True
 
     async def test_line_skip_dispatch_reports_no_teardownable_context(self) -> None:
