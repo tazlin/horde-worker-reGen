@@ -341,8 +341,10 @@ to disable the breaker entirely.
 The line-skip breaker above fires only when the idle cause is an *auxiliary*
 download. A card can also idle behind a main-model download or an empty queue: the
 head is parked on a device with a free sibling but its checkpoint is not yet
-resident. The head-starvation clock (which only runs while nothing is in progress,
-so it is zero in steady state) measures exactly this. Once it passes
+resident. The head-starvation clock runs while nothing is sampling or conservatively
+unclassified as in-progress. Mapped jobs that are only downloading auxiliary files
+do not suppress it because they occupy concurrency without feeding the GPU; any
+actual sampler still resets it. Once it passes
 `idle_fill_threshold_seconds` with a free inference sibling, the scheduler arms
 `WorkerState.wants_idle_fill_candidate` and the popper over-pops a small no-LoRA
 **fill** job to run in the meantime. Unlike the flat line-skip bias, the fill climbs
@@ -1203,9 +1205,11 @@ not one that itself blocks on a download) and so cannot route around a LoRA job 
   starts at 60 s and doubles per consecutive strike up to 30 min, then resets after a trouble-free
   stretch - a brief blip pauses LoRA work briefly, a sustained outage pauses it for a long time.
 - **Concurrent-LoRA cap** (`JobPopper._lora_queue_cap_reached`): independent of any stall, the popper
-  withholds LoRA support once the local queue already holds `max(1, inference_processes - 1)` LoRA
-  jobs. This guarantees at least one slot's worth of room for a non-LoRA job, which *can* line-skip past
-  a LoRA job blocked at the head - so the GPU keeps working even while one slot waits on a download.
+  withholds LoRA support once the local queue reaches
+  `min(2, max(1, inference_processes - 1))` LoRA jobs. The process-relative term preserves at least one
+  slot's worth of room for a non-LoRA job on small pools, while the absolute ceiling prevents wide pools
+  from accumulating a long serialized auxiliary-download backlog. A non-LoRA job can line-skip past a
+  LoRA job blocked at the head, so the GPU keeps working while a slot waits on a download.
 - **Child-side graceful abort (no teardown)**: the real cost of a stalled aux download was the response
   to it - the parent's watchdog tearing the whole inference process down (losing its resident model and
   paying a full hordelib re-init) just because one download was slow. Instead, the parent hands each

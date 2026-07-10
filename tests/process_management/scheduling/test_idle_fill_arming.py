@@ -1,9 +1,9 @@
 """Arming of the idle-fill breaker (``wants_idle_fill_candidate``).
 
 The scheduler arms the idle-fill breaker only when the queue head has sat on an idle device past
-``idle_fill_threshold_seconds`` (its model still loading, nothing in progress) with a free inference sibling
-to run a fill job. Because the underlying head-starvation clock is forced to zero whenever any job is in
-progress, this is inert in steady state and fires only for the "stuck doing nothing but downloading" case.
+``idle_fill_threshold_seconds`` with a free inference sibling to run a fill job. The underlying starvation
+clock is forced to zero while any sampler or conservatively unclassified in-progress job exists, but remains
+active when every mapped in-progress job is only downloading auxiliary files and the GPU is unfed.
 """
 
 from __future__ import annotations

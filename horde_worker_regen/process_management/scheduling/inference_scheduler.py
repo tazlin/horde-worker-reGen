@@ -2552,18 +2552,44 @@ class InferenceScheduler:
     def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
         """Track how long the current head-of-queue job has been stuck on an otherwise-idle device.
 
-        The clock only runs while no live job holds the device: a head waiting behind in-flight work is
-        legitimately queued, not starved. It resets whenever the head changes (a different job reached the
-        front) so the backstop measures *this* head's wait, not the queue's age.
+        The clock only runs while no live job is sampling or otherwise using an unclassified in-progress
+        slot: a head waiting behind such work is legitimately queued, not starved. Jobs whose mapped process
+        is only downloading auxiliary files do not suppress the clock because they occupy concurrency without
+        feeding the GPU. It resets whenever the head changes (a different job reached the front) so the
+        backstop measures *this* head's wait, not the queue's age.
         """
         head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
-        if head_id is None or len(self._job_tracker.jobs_in_progress) > 0:
+        in_progress_blocks_idle_fill = (
+            len(self._job_tracker.jobs_in_progress) > 0 and not self._only_aux_downloads_in_progress()
+        )
+        if head_id is None or in_progress_blocks_idle_fill:
             self._head_starvation_job_id = None
             self._head_starvation_since = 0.0
             return
         if head_id != self._head_starvation_job_id:
             self._head_starvation_job_id = head_id
             self._head_starvation_since = time.time()
+
+    def _only_aux_downloads_in_progress(self) -> bool:
+        """Return whether every in-progress job maps to a process downloading auxiliary files.
+
+        An in-progress job without a matching process reference is treated conservatively as potentially
+        GPU-active. This preserves the concurrency and memory-safety fences when IPC state is incomplete or
+        briefly stale; idle-fill is enabled only when the scheduler can positively identify every live job as
+        download-only.
+        """
+        in_progress_jobs = set(self._job_tracker.jobs_in_progress)
+        if not in_progress_jobs:
+            return False
+
+        aux_download_jobs = {
+            process_info.last_job_referenced
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
+            and process_info.last_job_referenced is not None
+        }
+        return in_progress_jobs.issubset(aux_download_jobs)
 
     def _head_starved_seconds(self, job: ImageGenerateJobPopResponse) -> float:
         """Seconds this job has been the idle-device head, or 0.0 when it is not the tracked head."""
@@ -6049,6 +6075,30 @@ class InferenceScheduler:
                 return job, process_info
         return None
 
+    def _arm_line_skip_for_stalled_aux_download(
+        self,
+        process_info: HordeProcessInfo,
+        bridge_data: reGenBridgeData,
+    ) -> None:
+        """Arm an urgent line-skip pop when an auxiliary download exceeds its configured threshold.
+
+        The process identifies the card whose non-sampling slot may be borrowed. The existing threshold is
+        retained as the patience fence, and the popper retains all protective backpressure checks; this method
+        only exposes the established urgent-pop path from both scheduler queue shapes.
+
+        Args:
+            process_info: Inference process currently downloading auxiliary files.
+            bridge_data: Active worker configuration containing the line-skip threshold.
+        """
+        threshold_seconds = bridge_data.aux_model_download_line_skip_threshold_seconds
+        if threshold_seconds is None:
+            return
+        if self._process_map.any_model_downloading_aux_more_than_threshold(
+            device_index=process_info.device_index,
+            threshold_seconds=threshold_seconds,
+        ):
+            self._state.wants_line_skip_candidate = True
+
     async def _handle_process_missing(
         self,
         job: ImageGenerateJobPopResponse,
@@ -6213,14 +6263,7 @@ class InferenceScheduler:
 
                 # So no already popped job was suitable, let's set the state accordingly so we can attempt
                 # to pop a smaller job next tick
-                if (
-                    bridge_data.aux_model_download_line_skip_threshold_seconds is not None
-                    and self._process_map.any_model_downloading_aux_more_than_threshold(
-                        device_index=process_with_model.device_index,
-                        threshold_seconds=bridge_data.aux_model_download_line_skip_threshold_seconds,
-                    )
-                ):
-                    self._state.wants_line_skip_candidate = True
+                self._arm_line_skip_for_stalled_aux_download(process_with_model, bridge_data)
 
             # The cap may instead be occupied by an *already in-progress* job fetching its auxiliaries. In
             # that shape the pending head is perfectly ready on another resident process, so inspecting only
@@ -6240,6 +6283,7 @@ class InferenceScheduler:
                 if bypass is not None:
                     self._pending_line_skip = bypass
                     return bypass
+                self._arm_line_skip_for_stalled_aux_download(aux_process, bridge_data)
 
             return None
 

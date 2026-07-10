@@ -111,6 +111,14 @@ while the single post-processing lane catches up; only the capability that would
 temporarily withheld.
 """
 
+_MAX_CONCURRENT_LORA_JOBS = 2
+"""Maximum LoRA-bearing jobs retained in the local inference queue.
+
+The process-count reserve still lowers this ceiling on small pools so at least one process-sized share of
+queue capacity remains available for non-LoRA work. Wide pools must not scale LoRA intake without bound:
+auxiliary downloads are serialized and can occupy concurrency slots without feeding the GPU.
+"""
+
 
 def _select_models_for_pop(
     bridge_data: reGenBridgeData,
@@ -835,12 +843,12 @@ class JobPopper:
 
         Each LoRA job blocks its slot on an ad-hoc download before it can sample, so letting LoRA jobs
         fill every queue slot leaves no non-LoRA job for the scheduler to slip past a blocked LoRA head
-        (the line-skip path rejects LoRA candidates). Capping concurrently-queued LoRA jobs to one fewer
-        than the inference-process count keeps at least one slot's worth of room for a skippable
-        non-LoRA job, while always allowing at least one LoRA job so single-process workers still serve
-        them.
+        (unless all of the candidate's LoRAs are already cached). The process-count reserve keeps at least
+        one slot's worth of room for a skippable non-LoRA job on small pools, while the absolute ceiling
+        prevents a wide pool from accumulating an unbounded serialized-download backlog. At least one LoRA
+        job remains allowed so single-process workers still serve them.
         """
-        cap = max(1, self._max_inference_processes - 1)
+        cap = min(_MAX_CONCURRENT_LORA_JOBS, max(1, self._max_inference_processes - 1))
         queued_lora_jobs = sum(
             1
             for job in self._job_tracker.jobs_pending_inference

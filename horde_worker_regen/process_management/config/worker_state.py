@@ -138,12 +138,13 @@ class WorkerState:
     Cleared by the line-skip cap gate as soon as no aux download exceeds the threshold."""
 
     wants_idle_fill_candidate: bool = False
-    """The queue head has sat on an idle device past the idle-fill threshold (its model still loading) while
-    a sibling inference process is free, so the popper should over-pop a small no-LoRA "fill" job up the
-    sd15->sdxl ladder to keep the GPU busy. A sibling of ``wants_line_skip_candidate``, not the same flag:
-    that one is armed and cleared purely by the aux-download-past-threshold condition and biases a flat
-    small-non-LoRA pop, whereas this drives the escalating ``idle_fill_rung`` ladder. Idle-fill yields to the
-    aux line-skip when both would apply. Armed and cleared by the scheduler around head-starvation."""
+    """The queue head has sat on an unfed device past the idle-fill threshold while a sibling inference
+    process is free, so the popper should over-pop a small no-LoRA "fill" job up the sd15->sdxl ladder. The
+    device may be waiting for a main model or have only mapped auxiliary downloads in progress; a sampler or
+    an unclassified in-progress job suppresses the arm. A sibling of ``wants_line_skip_candidate``, not the
+    same flag: that one is armed and cleared purely by the aux-download-past-threshold condition and biases a
+    flat small-non-LoRA pop, whereas this drives the escalating ``idle_fill_rung`` ladder. Idle-fill yields to
+    the aux line-skip when both would apply. Armed and cleared by the scheduler around head-starvation."""
 
     idle_fill_rung: int = 0
     """Index into the idle-fill ladder (small sd15 -> large sd15 -> small sdxl -> large sdxl), advanced by one
