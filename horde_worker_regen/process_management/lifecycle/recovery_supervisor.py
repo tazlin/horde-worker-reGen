@@ -193,6 +193,22 @@ class RecoverySupervisor:
         self._give_up_cycles = 0
         self._give_up_is_terminal = False
 
+    def yield_give_up(self) -> None:
+        """Un-count the give-up just returned because the caller deferred it to an in-flight remedy.
+
+        A caller that receives :attr:`RecoveryAction.GIVE_UP` may judge the wedge still curable (a reclaim it
+        just issued has not had time to land) and yield instead of faulting. Without this refund the yielded
+        give-up would still consume a continuation cycle, and enough yields would latch the escalation with
+        the safety valve never having actually fired: the bounded yield would decay into an unbounded park.
+        The refund keeps the cool-down (the caller may not re-ask sooner than a taken give-up could) but
+        restores the cycle and the terminal flag, so the eventual real give-up escalates exactly as if the
+        yields had never happened.
+        """
+        if not self._gave_up_latched:
+            return
+        self._give_up_cycles = max(0, self._give_up_cycles - 1)
+        self._give_up_is_terminal = False
+
     def evaluate(self, *, is_wedged: bool, pool_ready: bool, made_progress: bool = False) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 

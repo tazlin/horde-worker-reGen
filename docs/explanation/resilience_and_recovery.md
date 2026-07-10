@@ -284,6 +284,18 @@ The escalation, in order:
    second give-up is then flagged terminal and abandons ship deliberately rather
    than faulting jobs on every tick forever.
 
+   A queue-deadlock give-up over available capacity first checks for a **reachable
+   lane-reclaim remedy**: a head that does not fit only because the idle
+   post-processing lane's resident module weights hold its room is servable the
+   moment that lane unloads, so faulting its backlog would drop work the card can
+   run. The give-up drives the unload itself and yields for a bounded grace so the
+   freed VRAM can materialise and the head re-admit. A yielded give-up refunds its
+   escalation cycle (the supervisor's cool-down still applies), so the eventual
+   real give-up escalates undiminished; once the grace expires without the wedge
+   clearing, the ordinary give-up faults the backlog, keeping the safety valve
+   reachable. A broken pool's give-up never yields: no lane reclaim restores dead
+   capacity.
+
 With `exit_on_unhandled_faults` set, the worker exits instead of limping; SOS is
 the default-on alternative that prioritises continued operation.
 

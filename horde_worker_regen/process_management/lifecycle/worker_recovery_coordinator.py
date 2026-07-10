@@ -46,6 +46,16 @@ class WorkerRecoveryCoordinator:
     HEALTHY_HOLD_ESCALATION_GRACE_SECONDS = 60.0
     """How long the hold may remain re-latched after a governance-baseline reset before the watchdog escalates
     to rebuilding the (idle) inference pool."""
+    PP_RECLAIM_REMEDY_GRACE_SECONDS = 90.0
+    """How long a give-up yields to an in-flight post-processing lane reclaim before faulting the backlog.
+
+    A structural queue wedge over a healthy pool can be a head that simply does not fit beside the
+    post-processing lane's resident module weights: the remedy is to unload the idle lane's modules so the
+    head's room frees, not to fault a servable backlog. When the give-up finds that remedy reachable it issues
+    the unload and yields for this window so the freed VRAM can materialise and the head re-admit. The window
+    bounds the yield: a reclaim that never lands (the lane wedged, or the freed room still insufficient) falls
+    through to the ordinary give-up so the horde reissues the jobs rather than the worker parking forever.
+    Sized to the post-processing admission-patience window."""
 
     def __init__(
         self,
@@ -122,6 +132,10 @@ class WorkerRecoveryCoordinator:
         # no episode is open.
         self.healthy_hold_since: float | None = None
         self.governance_reset_at: float | None = None
+        # When the give-up last issued a post-processing lane reclaim for a wedged-but-servable head; None when
+        # no such remedy is in flight. Cleared when the wedge episode closes so a later episode gets its own
+        # remedy attempt.
+        self.pp_reclaim_remedy_issued_at: float | None = None
 
     @property
     def bridge_data(self) -> reGenBridgeData:
@@ -567,6 +581,7 @@ class WorkerRecoveryCoordinator:
             self.episode_inference_start_baseline = None
             self.episode_post_processing_progress_baseline = None
             self.episode_saw_unrecoverable_pool = False
+            self.pp_reclaim_remedy_issued_at = None
         if action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()
             # Re-anchor the progress baseline to the reset: the episode may close only when work moves forward
@@ -574,7 +589,12 @@ class WorkerRecoveryCoordinator:
             self._capture_progress_baseline()
             self.limp_by_active = True
         elif action is RecoveryAction.GIVE_UP:
-            self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)
+            if self._give_up_yields_to_pp_reclaim():
+                # The wedged head may be servable once the just-driven lane reclaim lands: defer this give-up
+                # (the supervisor refunds the cycle, so the eventual real give-up escalates undiminished).
+                self.recovery_supervisor.yield_give_up()
+            else:
+                self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)
         elif self.limp_by_active and not self.recovery_supervisor.is_in_episode:
             self.limp_by_active = False
             logger.info("Save-our-ship: pools recovered (soft-reset episode cleared).")
@@ -673,6 +693,41 @@ class WorkerRecoveryCoordinator:
         self._inference_scheduler.reset_governance_to_baseline("healthy-hold watchdog escalation")
         self.healthy_hold_since = None
         self.governance_reset_at = None
+
+    def _give_up_yields_to_pp_reclaim(self) -> bool:
+        """Issue or await a post-processing lane reclaim for a wedged head; True while it deserves to land.
+
+        The reachable-remedy guard for the healthy-pool structural queue wedge: a head parked only because
+        the post-processing lane's resident module weights hold its room is servable the moment that idle
+        lane unloads, so the give-up must drive the unload and yield rather than fault a backlog the card can
+        run. Consulted only when a give-up is about to act on a structural queue wedge over available
+        capacity; a broken pool's give-up never yields (no lane reclaim restores a dead pool). The first call
+        of an episode issues the unload (the scheduler skips busy lanes and lanes already asked, so this never
+        tears down in-flight work or re-spams the flag); subsequent calls keep yielding only inside
+        :data:`PP_RECLAIM_REMEDY_GRACE_SECONDS`, after which the remedy is judged to have failed and the
+        ordinary give-up proceeds. Returns False when no fresh unload could be issued and no issued one is
+        still within its window: there is nothing left to yield to.
+        """
+        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
+        if self._inference_scheduler.ram_reclaim_cycle_grace_active():
+            structural_queue_wedge = False
+        if not structural_queue_wedge or not self.is_inference_capacity_available():
+            return False
+        now = self._clock()
+        if (
+            self.pp_reclaim_remedy_issued_at is not None
+            and now - self.pp_reclaim_remedy_issued_at <= self.PP_RECLAIM_REMEDY_GRACE_SECONDS
+        ):
+            return True
+        if self._inference_scheduler.unload_post_process_models_from_vram():
+            self.pp_reclaim_remedy_issued_at = now
+            logger.warning(
+                "Save-our-ship: the wedged head's blocker may be the post-processing lane's resident VRAM; "
+                f"issued the idle lane unload and yielding up to {self.PP_RECLAIM_REMEDY_GRACE_SECONDS:.0f}s "
+                "for the freed room to admit the head before faulting the backlog.",
+            )
+            return True
+        return False
 
     def give_up_on_wedged_jobs(self, *, terminal: bool = False) -> None:
         """Fault unservable jobs and abort when no pool can recover.

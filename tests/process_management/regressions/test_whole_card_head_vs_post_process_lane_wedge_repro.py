@@ -553,3 +553,49 @@ class TestReclaimBoundaries:
         scheduler.preload_models()
 
         assert pp_lane.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+
+class TestGiveUpRemedyGraceIsBounded:
+    """The reclaim yield is a bounded grace, not a new way to park forever."""
+
+    async def test_reclaim_that_never_lands_still_faults_after_the_grace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hostile self-infliction: the lane accepts the unload but its VRAM never frees; give-up still fires.
+
+        The guard must drive the lane unload and yield, but a remedy that provably fails to land within
+        :data:`WorkerRecoveryCoordinator.PP_RECLAIM_REMEDY_GRACE_SECONDS` may not suppress the safety valve:
+        past the window the ordinary give-up faults the backlog so the horde reissues it. Without this bound
+        the guard would convert the faulted-backlog harm into an unbounded park, the worse wedge class.
+        """
+        pm = make_testable_process_manager(device_free_mb=_DEVICE_FREE_AT_WEDGE_MB)
+        clock = _FakeClock()
+        _install_supervisor(pm, clock)
+        coordinator = pm._recovery_coordinator
+        coordinator._clock = clock  # the remedy grace must run on the same driven clock
+        pp_lane = await _latch_wedge_with_reclaimable_pp_lane(pm, model=_FLUX_MODEL)
+        monkeypatch.setattr(pm, "_abort", lambda: None)
+
+        proc = pm._process_map[0]
+        monkeypatch.setattr(
+            pm._process_lifecycle,
+            "rebuild_inference_pool",
+            lambda *, reason: setattr(proc, "last_process_state", HordeProcessState.WAITING_FOR_JOB),
+        )
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+        grace = coordinator.PP_RECLAIM_REMEDY_GRACE_SECONDS
+        first_fault_at: float | None = None
+        for _ in range(int(grace) + 60):
+            clock.advance(1)
+            coordinator.run_recovery_supervisor()
+            if any(record.detail.get("jobs_faulted", 0) > 0 for record in _abandoned_records(pm)):
+                first_fault_at = clock.now
+                break
+
+        # The remedy was genuinely driven: the idle lane was asked to unload its modules.
+        assert pp_lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        # And the yield stayed bounded: the give-up faulted the backlog once the grace expired, not before.
+        assert first_fault_at is not None, "the guard parked the wedge forever: the give-up never fired"
+        assert first_fault_at > grace, "the give-up faulted inside the remedy grace it was meant to yield"
+        assert len(list(pm._job_tracker.jobs_pending_inference)) == 0
