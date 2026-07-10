@@ -26,13 +26,13 @@ dependencies = [
     "aiodns>=3.0.0,<4.0.0",
     "qrcode==7.4.2",
     "certifi",
-    "horde_sdk~=0.26.0",
+    "horde_sdk~=0.26.1",
     "horde_safety~=0.3.0",
     # Requires horde-engine (hordelib) 6.0.0+: the process VRAM telemetry the memory reporter depends on
     # (hordelib.api.get_process_vram_stats, hordelib.utils.torch_memory.offthread_vram_sampling_ready)
     # and the disaggregated stage execution surface (hordelib.execution.stage_payloads plus the
     # HordeLib encode_text_stage / sample_stage / vae_encode_stage / decode_stage entry points).
-    "horde_engine[layerdiffuse,upscale-extra]>=6.0.0,<7.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=6.1.0,<7.0.0",
     "horde_model_reference>=7.0.2,<8.0.0",
     "python-dotenv",
     "ruamel.yaml",
