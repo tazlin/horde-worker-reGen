@@ -1325,6 +1325,8 @@ class HordeWorkerProcessManager:
             release_sampler_process=self._process_map.release_disaggregation_reservation,
             on_sampling_complete=self._on_disaggregation_sampling_complete,
             reroute_monolithic=self._reroute_disaggregated_job_monolithic,
+            encode_lane_paused=lambda: self._process_lifecycle.is_component_gpu_paused,
+            image_lane_paused=lambda: self._process_lifecycle.is_vae_lane_gpu_paused,
             estimate_sampling_peak_mb=self._inference_scheduler.estimate_disaggregated_sampling_peak_mb,
             estimate_decode_spike_mb=self._inference_scheduler.estimate_disaggregated_decode_spike_mb,
             observe_sampling_peak=self._inference_scheduler.observe_disaggregated_sampling_peak,

@@ -300,6 +300,14 @@ class DeviceVramState:
     committed_is_stale: bool
     """True when a committed-ledger contributor's report has aged past the staleness bound; retained for
     diagnostics and telemetry, not admission."""
+    preload_planned_unmaterialized_mb: float = 0.0
+    """The preload-flow share (MB) of :attr:`planned_unmaterialized_mb`: charges for admitted loads still
+    staged in system RAM, whose VRAM materialisation happens only when their dispatch is later admitted
+    against fresh measured truth. A drain-side request (post-processing of an already-sampled job) is priced
+    net of this share: the staged load cannot claim the card before that drain completes (its dispatch gate
+    re-prices it, and the drain's completion is what frees the room it waits on), so charging it against the
+    drain is a circular wait, not protection. Dispatch-flow reservations (in-flight sampling about to spike)
+    stay fully charged for every requester."""
     noise_buffer_mb: float = _ADMISSION_NOISE_BUFFER_MB
     """The admission noise margin (MB) subtracted from the device-free reading, derived per device at snapshot
     assembly from the total via :func:`admission_noise_buffer_mb` so it scales with card capacity; direct
@@ -494,9 +502,19 @@ class VramArbiter:
         # represents it, so subtracting it from the request's own available room would count the load twice and
         # let a re-ask defer forever on its own footprint. Only the target's own reservation is removed; every
         # other unit's stays.
+        overlay_mb = state.planned_unmaterialized_mb
+        if request.kind == VramRequestKind.PP_JOB:
+            # Post-processing drains the pipeline: completing it is what releases the finished job's holds and
+            # frees the room a staged head waits on. A preload-flow charge is a load still in system RAM whose
+            # VRAM claim only happens when its dispatch is later re-priced against fresh measured truth, so
+            # charging it here inverts the dependency and deadlocks the drain behind bookkeeping (the head
+            # cannot materialise until the drain completes, the drain defers on the head's charge). Price the
+            # drain against physical truth plus the dispatch-flow reservations only (in-flight sampling really
+            # is about to spike); the same reasoning already admits the disaggregated decode unconditionally.
+            overlay_mb = max(0.0, overlay_mb - state.preload_planned_unmaterialized_mb)
         net_reservations_mb = max(
             0.0,
-            state.planned_unmaterialized_mb - max(0.0, request.own_planned_unmaterialized_mb),
+            overlay_mb - max(0.0, request.own_planned_unmaterialized_mb),
         )
         return evaluate_admission(
             candidate_outstanding_mb=candidate_delta_mb,

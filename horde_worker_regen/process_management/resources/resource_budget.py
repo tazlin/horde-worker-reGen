@@ -1323,6 +1323,33 @@ class CommittedReserveLedger:
         materialised = max(entry.materialized_watermark_mb, max(0.0, current_reserved - entry.reserved_at_admit_mb))
         return max(0.0, entry.vram_mb - materialised)
 
+    def effective_planned_vram_mb_for_flow(self, flow: str, process_reserved_by_pid: dict[int, float]) -> float:
+        """Return one flow's planned VRAM (MB) still outstanding, each entry decayed by what has materialised.
+
+        The per-flow counterpart of :meth:`effective_planned_vram_mb`, letting an admission consumer price a
+        request against only the flows whose charges can physically precede it (a drain-side dispatch must not
+        wait on a queued load's charge whose own materialisation waits on that drain completing). Read-only:
+        it never advances an entry's materialisation watermark (the per-cycle
+        :meth:`effective_planned_vram_mb` owns that ratchet); each entry reports its outstanding charge against
+        the greater of the recorded watermark and the target's current growth.
+
+        Args:
+            flow: The workload flow namespace whose planned charges are summed.
+            process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
+                absent from the map is treated as holding zero.
+        """
+        total = 0.0
+        for (entry_flow, _unit), entry in self._planned.items():
+            if entry_flow != flow:
+                continue
+            current_reserved = process_reserved_by_pid.get(entry.target_process_id, 0.0)
+            materialised = max(
+                entry.materialized_watermark_mb,
+                max(0.0, current_reserved - entry.reserved_at_admit_mb),
+            )
+            total += max(0.0, entry.vram_mb - materialised)
+        return total
+
     def reconcile_planned(self, flow: str, live_units: Iterable[str]) -> None:
         """Prune ``flow``'s planned charges to only the units whose admission is still in flight (self-healing).
 

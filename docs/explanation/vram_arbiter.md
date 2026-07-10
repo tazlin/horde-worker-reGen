@@ -139,6 +139,17 @@ identity cannot express that no-op (the resident model's own reservation can leg
 noise-adjusted ceiling, which would otherwise withhold a dispatch that needs no memory), so this is the
 whole-card analogue of the disaggregated stage dispatch a resident lane never withholds.
 
+Drain-side requests are priced against a narrower overlay. A post-processing chain
+(`PP_JOB`) completes a job that has already sampled: finishing it is what releases the job's holds and frees
+the room a staged head is waiting on. A preload-flow anchor is a load still staged in system RAM whose VRAM
+claim only happens once its dispatch is later re-priced against fresh measured truth, so charging it against
+the drain inverts the dependency into a circular wait: the head cannot materialise until the drain completes,
+while the drain defers on the head's bookkeeping until it ages out and faults the finished job. The identity
+therefore excludes the preload flow's planned share for `PP_JOB` requests and charges only the dispatch-flow
+reservations (in-flight sampling genuinely about to spike) on top of physical truth. This is the same
+reasoning that admits the disaggregated decode stage unconditionally: work that drains the pipeline must not
+be starved by claims whose own turn comes after it.
+
 Before reclaim is consulted, a non-fitting request is checked against the **phantom-ledger** judgement. The
 committed floor is bookkeeping, and the worker cannot hold more device VRAM than the device itself reports
 used: when committed exceeds the truthful device-used reading beyond a tolerance

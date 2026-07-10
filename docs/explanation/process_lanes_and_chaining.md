@@ -29,6 +29,13 @@ same way it forces the VAE lane on. A disaggregated job's VAE lane returns raw d
 requested post-processing runs on this dedicated lane afterward (never inline on the VAE lane), so the lane is
 required whenever disaggregation is enabled.
 
+A disaggregated job whose next stage has no live role process distinguishes why the process is missing. A
+crashed lane ages through the stage-patience window and is faulted so the horde reissues the job. A lane that
+is deliberately paused off-GPU (whole-card residency claiming the card for a heavy head, or the reclaim
+ladder) is a routing decision, not a failure: the job is rerouted to the monolithic path at once, where the
+normal claim/dispatch queue arbitrates waiting on the card, instead of parking against a pause whose restore
+may be minutes away and forfeiting the job at the patience fault.
+
 When safety runs on GPU, only CLIP remains resident while the lane is idle. DeepDanbooru stages from CPU for a
 conditional anime check; BLIP captioning and the aesthetic head are also offloaded after use, and completion
 trims the allocator before `WAITING_FOR_JOB`. This bounds the lane's fixed card cost without making every
@@ -61,9 +68,12 @@ The lane replaces prediction with structure:
   still offering it, the process is idle, and no shared-lane work is committed.
 
 Admission to the lane is governed so a chain the card cannot host never wedges it. The orchestrator admits a
-job only when its marginal candidate fits measured device-free VRAM minus outstanding reservations and the
-proportional noise margin (with the budget on; see
-[Performance and backpressure](performance_and_backpressure.md)). The manager refreshes the arbiter's
+job only when its marginal candidate fits measured device-free VRAM minus outstanding dispatch-flow
+reservations and the proportional noise margin (with the budget on; see
+[Performance and backpressure](performance_and_backpressure.md)). Preload-flow planned charges are excluded
+from that arithmetic: a RAM-staged load's VRAM claim is re-priced at its own dispatch and cannot precede the
+drain whose completion frees the room it waits on, so counting it against the lane would deadlock the drain
+behind bookkeeping until the aging escape faults the finished job. The manager refreshes the arbiter's
 device-memory snapshot immediately before driving the lane, and the selected post-processing job is priced as
 the head of the drain queue: once inference dispatch is being held to let the lane run, the lane must be able
 to take the same reality-based admit a head-of-queue model would get after reclaim is exhausted. Three

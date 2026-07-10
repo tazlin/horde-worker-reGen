@@ -1124,3 +1124,110 @@ async def test_liveness_just_dispatched_sampler_is_not_reclaimed_within_the_grac
     assert len(h.sampler.sent) == 1
     assert len(h.sampler2.sent) == 0  # NOT admitted: two non-fitting peaks must never co-run
     assert h.orchestrator._active_sampling_peaks  # A's peak retained (not judged stale within the grace)
+
+
+def test_paused_encode_lane_reroutes_monolithic_instead_of_aging_to_a_fault() -> None:
+    """A conditioning stage whose encode lane is policy-paused reroutes at once: no patience fault, no wait.
+
+    The production wedge: whole-card residency stops the component lane for a heavy head, an in-flight
+    disaggregated job then has no role process for awaiting_conditioning, ages out the 90s patience window,
+    and is faulted for horde reissue even though it could run whole on its own sampler. A deliberate pause is
+    a routing decision, not a crash, so the job must return to the monolithic path immediately.
+    """
+    h = _make_harness()
+    job = _job()
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator._find_encode_service = lambda: None  # the lane was stopped off-GPU
+    h.orchestrator._encode_lane_paused = lambda: True  # by a policy holder, with a live restore path
+
+    h.orchestrator.tick()
+
+    assert h.rerouted == [job]  # rerouted on the first tick, not parked for the patience window
+    assert h.completed == []  # never faulted: the job runs whole instead
+    assert not h.orchestrator.has_job(job)
+    assert h.reserved == set()  # pin released, no reservation leaked
+
+
+def test_paused_image_lane_reroutes_a_source_latent_stage() -> None:
+    """An img2img job whose VAE lane is policy-paused reroutes rather than stalling on the source latent."""
+    h = _make_harness()
+    job = _job()
+    h.orchestrator.register(job, needs_source_latent=True, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator._find_image_lane = lambda: None
+    h.orchestrator._image_lane_paused = lambda: True
+
+    h.orchestrator.tick()
+
+    assert h.rerouted == [job]
+    assert h.completed == []
+    assert h.reserved == set()
+
+
+def test_crashed_encode_lane_without_a_pause_still_ages_to_the_patience_fault() -> None:
+    """A genuinely missing lane (no policy pause) keeps the patience fault so the horde reissues the job."""
+    h = _make_harness()
+    job = _job()
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator._find_encode_service = lambda: None  # crashed and not yet replaced
+
+    h.orchestrator.tick()  # anchors the patience clock; no reroute
+    assert h.rerouted == []
+    h.virtual_now[0] = _STAGE_PATIENCE_SECONDS + 1.0
+    h.orchestrator.tick()
+
+    assert h.rerouted == []
+    assert len(h.completed) == 1
+    assert h.completed[0][2] == GENERATION_STATE.faulted
+
+
+def test_a_paused_image_lane_does_not_reroute_a_conditioning_stage() -> None:
+    """The pause predicate is stage-scoped: the other lane's pause never reroutes a conditioning stall."""
+    h = _make_harness()
+    job = _job()
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator._find_encode_service = lambda: None
+    h.orchestrator._image_lane_paused = lambda: True  # unrelated lane paused
+
+    h.orchestrator.tick()
+
+    assert h.rerouted == []  # the conditioning stall ages through patience instead
+    assert h.orchestrator.has_job(job)
+
+
+@pytest.mark.asyncio
+async def test_paused_image_lane_reroutes_a_decode_stage() -> None:
+    """A job whose latent is ready but whose VAE lane got policy-paused reroutes instead of faulting."""
+    h = _make_harness()
+    job = _job()
+    job_id = job.sdk_api_job_info.id_
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=_SAMPLER_PID,
+            process_launch_identifier=0,
+            info="",
+            results=[SampleSliceResult(job_id=job_id, latent_bytes=b"latent", state=GENERATION_STATE.ok)],
+        ),
+    )
+
+    # The whole-card claim stops the VAE lane before the decode dispatches.
+    h.orchestrator._find_image_lane = lambda: None
+    h.orchestrator._image_lane_paused = lambda: True
+    h.orchestrator.tick()
+
+    assert h.rerouted == [job]
+    assert h.completed == []
+    assert h.reserved == set()

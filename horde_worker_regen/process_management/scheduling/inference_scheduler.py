@@ -3622,7 +3622,9 @@ class InferenceScheduler:
 
         Both admission-reservation flows are reconciled by omission before the outstanding total is read: a
         preload whose process finished, faulted, or died, or an in-progress job that finalised or died, drops
-        its reservation here so a re-ask is never blocked by a dead unit's stale reservation.
+        its reservation here so a re-ask is never blocked by a dead unit's stale reservation. The preload
+        flow's share is also carried separately, so the arbiter can price drain-side requests (post-processing)
+        net of RAM-staged loads whose VRAM claim waits on that very drain completing.
         """
         raw_total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         baseline_mb = self._admission_baseline_mb(device_index)
@@ -3639,6 +3641,10 @@ class InferenceScheduler:
         self._reserve_ledger.reconcile_planned(DISPATCH_ADMISSION_FLOW, self._in_flight_dispatch_units(device_index))
         per_process_reserved = self._committed_process_reserved_by_pid(device_index)
         planned_mb = self._reserve_ledger.effective_planned_vram_mb(per_process_reserved)
+        preload_planned_mb = self._reserve_ledger.effective_planned_vram_mb_for_flow(
+            PRELOAD_ADMISSION_FLOW,
+            per_process_reserved,
+        )
         noise_buffer_mb = admission_noise_buffer_mb(raw_total_mb)
         self._admission_headroom_mb_by_device[device_index if device_index is not None else 0] = (
             None if device_free_mb is None else device_free_mb - planned_mb - noise_buffer_mb
@@ -3674,6 +3680,7 @@ class InferenceScheduler:
             baseline_mb=baseline_mb,
             committed_vram_mb=committed_mb,
             planned_unmaterialized_mb=planned_mb,
+            preload_planned_unmaterialized_mb=preload_planned_mb,
             committed_is_stale=committed_is_stale,
             noise_buffer_mb=noise_buffer_mb,
             per_process_reserved_mb=per_process_reserved,

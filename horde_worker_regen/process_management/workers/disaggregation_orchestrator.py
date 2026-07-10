@@ -223,6 +223,8 @@ class DisaggregationOrchestrator:
         release_sampler_process: Callable[[int], None] = lambda _pid: None,
         on_sampling_complete: Callable[[HordeJobInfo], None] = lambda _job_info: None,
         reroute_monolithic: Callable[[HordeJobInfo], None] = lambda _job_info: None,
+        encode_lane_paused: Callable[[], bool] = lambda: False,
+        image_lane_paused: Callable[[], bool] = lambda: False,
         estimate_sampling_peak_mb: Callable[[HordeJobInfo], float | None] = lambda _job_info: None,
         estimate_decode_spike_mb: Callable[[HordeJobInfo], float | None] = lambda _job_info: None,
         observe_sampling_peak: Callable[[HordeJobInfo, float], None] = lambda _job_info, _peak_mb: None,
@@ -248,7 +250,13 @@ class DisaggregationOrchestrator:
             on_sampling_complete: Called with a job when its sampling finishes, so the tracker can free the
                 inference slot (move the job to the decoding stage) while the job stays in-flight.
             reroute_monolithic: Called with a job whose stage kept hitting resource-class faults past the defer
-                window, to return it to the monolithic inference path (the job stays owned/tracked throughout).
+                window, or whose role lane is deliberately paused, to return it to the monolithic inference
+                path (the job stays owned/tracked throughout).
+            encode_lane_paused: Whether the encode/component service lane is deliberately paused off-GPU by a
+                policy holder (whole-card residency or the reclaim ladder). A missing role process under such a
+                pause is a routing decision, not a crash: the job reroutes monolithically at once instead of
+                aging toward the patience fault.
+            image_lane_paused: The image/VAE lane counterpart of ``encode_lane_paused``.
             estimate_sampling_peak_mb: Returns a job's estimated sampling-phase activation peak (MB, a whole-
                 process weights-plus-activation figure), or None when no estimate is available. Consulted by the
                 concurrent-sampling gate; a None estimate never blocks a dispatch.
@@ -272,6 +280,8 @@ class DisaggregationOrchestrator:
         self._release_sampler_process = release_sampler_process
         self._on_sampling_complete = on_sampling_complete
         self._reroute_monolithic = reroute_monolithic
+        self._encode_lane_paused = encode_lane_paused
+        self._image_lane_paused = image_lane_paused
         self._estimate_sampling_peak_mb = estimate_sampling_peak_mb
         self._estimate_decode_spike_mb = estimate_decode_spike_mb
         self._observe_sampling_peak = observe_sampling_peak
@@ -457,7 +467,13 @@ class DisaggregationOrchestrator:
                 # A stage deferring under device pressure could not clear it within the window (it keeps
                 # faulting resource-class, or stays undispatchable): re-route the whole job monolithically
                 # rather than retrying forever.
-                self._reroute_to_monolithic(state)
+                self._reroute_to_monolithic(
+                    state,
+                    reason=(
+                        f"stage {state.stage} stayed resource-deferred past the "
+                        f"{_RESOURCE_DEFER_SECONDS}s defer window"
+                    ),
+                )
                 continue
             outcome = self._try_dispatch(state)
             if outcome == _DispatchOutcome.DISPATCHED:
@@ -473,7 +489,17 @@ class DisaggregationOrchestrator:
                 state.gate_deferred_since = None
             else:  # NO_ROLE: the next stage genuinely has no live role process to take it.
                 state.gate_deferred_since = None
-                if state.first_stalled_at is None:
+                if self._stage_lane_deliberately_paused(state.stage):
+                    # The lane is not crashed: a policy holder (whole-card residency claiming the card for a
+                    # heavy head, or the reclaim ladder) paused it off-GPU, and its restore may be minutes
+                    # away. The job can run whole on the monolithic path, whose queue is where waiting on the
+                    # card is arbitrated; parking it here only ages it into a patience fault the horde must
+                    # reissue. Reroute it at once.
+                    self._reroute_to_monolithic(
+                        state,
+                        reason=f"the role lane for stage {state.stage} is deliberately paused off-GPU",
+                    )
+                elif state.first_stalled_at is None:
                     state.first_stalled_at = now
                 elif now - state.first_stalled_at > _STAGE_PATIENCE_SECONDS:
                     self._fault_and_finish(state, reason=f"no role process for stage {state.stage}")
@@ -584,6 +610,20 @@ class DisaggregationOrchestrator:
         # dispatched this tick (child not yet reporting busy) is not reclaimed out from under a live sampling.
         dispatched_at = owner.sample_dispatched_at
         return dispatched_at is not None and now - dispatched_at > _SAMPLING_LIVENESS_GRACE_SECONDS
+
+    def _stage_lane_deliberately_paused(self, stage: DisaggJobStage) -> bool:
+        """Whether ``stage``'s role process is a service lane currently paused off-GPU by a policy holder.
+
+        Distinguishes a routing decision (whole-card residency or the reclaim ladder stopped the lane, with a
+        live restore path) from a crash: only the former reroutes the job monolithically; a genuinely missing
+        lane still ages through the patience fault so the horde reissues the job. Sampling is never
+        lane-paused (samplers are inference processes, not service lanes), so it always reports False.
+        """
+        if stage == DisaggJobStage.AWAITING_CONDITIONING:
+            return self._encode_lane_paused()
+        if stage in (DisaggJobStage.AWAITING_SOURCE_LATENT, DisaggJobStage.AWAITING_LATENT_DECODE):
+            return self._image_lane_paused()
+        return False
 
     def _try_dispatch(self, state: _DisaggJobState) -> _DispatchOutcome:
         """Dispatch the job's current stage to a role process; report whether it sent, stalled, or was gated."""
@@ -964,19 +1004,23 @@ class DisaggregationOrchestrator:
             )
             return True
         if now - state.resource_defer_started_at > _RESOURCE_DEFER_SECONDS:
-            self._reroute_to_monolithic(state)
+            self._reroute_to_monolithic(
+                state,
+                reason=f"resource-class stage faults persisted past the {_RESOURCE_DEFER_SECONDS}s defer window",
+            )
         return True
 
-    def _reroute_to_monolithic(self, state: _DisaggJobState) -> None:
-        """Return a job to the monolithic inference path after its stage kept failing resource-class.
+    def _reroute_to_monolithic(self, state: _DisaggJobState, *, reason: str) -> None:
+        """Return a job to the monolithic inference path instead of forfeiting it.
 
-        The job stays owned and tracked throughout: its pin is released and it is popped from the pipeline,
-        then the injected ``reroute_monolithic`` returns it to the normal claim/dispatch path (latched so the
-        re-claim runs monolithic). No images-faulted report is emitted; the job runs whole instead.
+        Taken when a stage kept failing resource-class past its defer window, or when its role lane is
+        deliberately paused off-GPU. The job stays owned and tracked throughout: its pin is released and it is
+        popped from the pipeline, then the injected ``reroute_monolithic`` returns it to the normal
+        claim/dispatch path (latched so the re-claim runs monolithic). No images-faulted report is emitted;
+        the job runs whole instead.
         """
         logger.warning(
-            f"Disaggregation: re-routing job {self._key(state.job_info)} to monolithic inference; "
-            f"resource-class stage faults persisted past the {_RESOURCE_DEFER_SECONDS}s defer window",
+            f"Disaggregation: re-routing job {self._key(state.job_info)} to monolithic inference; {reason}",
         )
         self._release_pin(state)
         self._release_sampling_peak(state)
