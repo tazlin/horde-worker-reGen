@@ -323,6 +323,15 @@ supervisor: a transient hold (reclaim frees the idle resident within a few ticks
 hold that genuinely never clears (foreign pressure, reclaim exhausted) is exactly the case the recovery
 supervisor exists to reroute, identical to a never-admittable preload.
 
+**Source-latent routing.** Whether a disaggregated job enters at the source-latent encode stage or straight
+at conditioning derives from the SDK's effective (post-fallback) source processing, never the raw pop field. A
+source-requiring mode (img2img, inpainting/outpainting, remix) whose source image is unusable resolves to
+txt2img and enters at conditioning, so a job the converter runs as txt2img is never routed through a
+source-latent encode of a placeholder image. The same effective mode governs disaggregation class-eligibility,
+so a mislabeled job is eligible as the txt2img job it actually runs. The resolution is the SDK's single
+authority (`horde_sdk.worker.dispatch.ai_horde.image.source_image`), shared with the image parameter
+converter, so the routing decision and the executed generation cannot disagree.
+
 **Disaggregated sampling.** The orchestrator's concurrent-sampling gate admits a first-of-kind sampling on an
 empty ledger, then defers to the arbiter's `DISAGG_SAMPLE` verdict for every later sampling. It passes the
 live in-flight sampling total with the request so a peak booked earlier in the same tick is counted before
@@ -344,7 +353,11 @@ admission control, and any stage gate serialises the stage overlap the disaggreg
 identity-shaped stage gate would defer every encode for the whole sampling duration, and a distress-shaped
 one freezes finished work behind transient paging blips). Decode in particular drains the pipeline:
 completing it releases the job's sampler hold, latents, and submit path, which is precisely how memory
-pressure ends; the image lane's tiled decode and its allocation self-heal bound the transient spike. The
+pressure ends; the image lane's tiled decode and its allocation self-heal bound the transient spike. Decode
+returns raw images: it never runs post-processing, so the VAE lane is never blocked on upscale/face-fix work,
+and the decode gate prices only the tiled-decode activation spike. A disaggregated job that requested
+post-processing routes to the dedicated post-processing lane after decode, on the identical path a monolithic
+completion takes (see **Post-processing** below); the disaggregation flag forces that lane on. The
 resource-defer window and monolithic re-route remain reserved for genuine resource-class stage faults
 reported by a child process, never for a parent-side verdict.
 

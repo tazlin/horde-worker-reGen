@@ -747,6 +747,36 @@ def test_pause_post_process_lane_is_noop_when_lane_disabled() -> None:
     assert plm.is_post_process_gpu_paused is False
 
 
+def test_post_process_lane_forced_on_by_disaggregation() -> None:
+    """Disaggregation forces the post-processing lane on even when its own config flag is off.
+
+    A disaggregated job's VAE lane emits raw decoded images and its requested post-processing runs on this
+    lane, so the lane must spawn under disaggregation exactly as the VAE lane does, regardless of
+    ``post_processing_lane_enabled``. Mirrors :func:`vae_lane_enabled` being tied to the disaggregation flag.
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+    fake_ctx.Process.return_value.exitcode = None
+
+    plm = _make_plm(ctx=fake_ctx)
+    plm._runtime_config.bridge_data.post_processing_lane_enabled = False
+    plm._runtime_config.bridge_data.dry_run_skip_post_processing = False
+
+    # With the lane's own flag off and disaggregation off, the lane stays off (the disjunction's other arm).
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = False
+    assert plm.post_process_lane_enabled() is False
+    assert plm.start_post_process_processes() is False
+    assert plm._process_map.num_post_process_processes() == 0
+
+    # Turning disaggregation on forces the lane on and spawns it despite the config flag remaining off.
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+    assert plm.post_process_lane_enabled() is True
+    assert plm.start_post_process_processes() is True
+    assert plm._process_map.num_post_process_processes() == 1
+
+
 def test_pause_and_restore_vae_lane_stops_and_restarts_it_for_whole_card() -> None:
     """A whole-card model stops the disaggregation VAE lane (freeing its context), then restarts it after.
 

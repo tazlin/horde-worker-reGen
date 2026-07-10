@@ -13,20 +13,26 @@ fake role processes, to prove the integration contracts:
 
 from __future__ import annotations
 
+import base64
 import time
+import uuid
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
     HordeImageResult,
+    HordePostProcessControlMessage,
     HordeProcessMessage,
     HordeProcessState,
     HordeSampleResultMessage,
     HordeTextEncodeResultMessage,
+    HordeVaeDecodeControlMessage,
     HordeVaeDecodeResultMessage,
     SampleSliceResult,
 )
@@ -40,6 +46,7 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
 from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
 from horde_worker_regen.process_management.workers.disaggregation_orchestrator import (
     _RESOURCE_DEFER_SECONDS,
+    DisaggJobStage,
     DisaggregatedFault,
 )
 from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
@@ -83,6 +90,170 @@ def _make_manager_with_roles(
     if include_lane:
         pm._process_map[2] = make_mock_process_info(2, model_name=None, process_type=HordeProcessType.VAE_LANE)
     return pm, inference
+
+
+_USABLE_SOURCE_IMAGE = base64.b64encode(b"fake-source-image-bytes").decode("ascii")
+
+
+def _make_source_job(
+    *,
+    source_processing: str,
+    source_image: str | None,
+    model: str = _MODEL,
+    transparent: bool = False,
+) -> ImageGenerateJobPopResponse:
+    """Build a real pop response with an explicit source_processing/source_image, per the conftest idiom.
+
+    ``make_job_pop_response`` does not expose the source fields, and the routing decision under test derives
+    entirely from them, so these are constructed directly. An inline base64 ``source_image`` is a usable
+    source (it decodes); ``None`` is the mislabeled-txt2img case the SDK resolves back to txt2img.
+    """
+    job_id = uuid.uuid4()
+    data: dict[str, Any] = {
+        "id": str(job_id),
+        "ids": [str(job_id)],
+        "model": model,
+        "payload": {
+            "prompt": "test prompt",
+            "width": 512,
+            "height": 512,
+            "ddim_steps": 30,
+            "n_iter": 1,
+            "seed": "42",
+            "sampler_name": "k_euler",
+            "transparent": transparent,
+        },
+        "skipped": {},
+        "source_processing": source_processing,
+    }
+    if source_image is not None:
+        data["source_image"] = source_image
+    return ImageGenerateJobPopResponse(**data)
+
+
+def test_eligibility_derives_from_effective_source_processing() -> None:
+    """Class-eligibility keys on the SDK's effective (post-fallback) mode, not the raw pop field.
+
+    This widens the eligible set relative to the raw field: an inpainting/outpainting pop carrying no usable
+    source resolves to txt2img and becomes eligible as the txt2img job it actually runs, while the same pop
+    with a usable source keeps its inpainting mode and stays monolithic.
+    """
+    pm, _inference = _make_manager_with_roles()
+
+    unusable_inpaint = _make_source_job(source_processing="inpainting", source_image=None)
+    assert pm._disaggregation_class_eligible(unusable_inpaint) is True
+
+    usable_inpaint = _make_source_job(source_processing="inpainting", source_image=_USABLE_SOURCE_IMAGE)
+    assert pm._disaggregation_class_eligible(usable_inpaint) is False
+
+
+def test_transparent_jobs_are_not_disaggregation_eligible() -> None:
+    """A transparent (layerdiffuse) job routes monolithic; its staged decode graph is not identity-validated."""
+    pm, _inference = _make_manager_with_roles()
+
+    transparent_job = _make_source_job(source_processing="txt2img", source_image=None, transparent=True)
+    assert pm._disaggregation_class_eligible(transparent_job) is False
+
+    opaque_job = _make_source_job(source_processing="txt2img", source_image=None, transparent=False)
+    assert pm._disaggregation_class_eligible(opaque_job) is True
+
+
+@pytest.mark.asyncio
+async def test_mislabeled_img2img_registers_at_conditioning_stage_without_source_latent() -> None:
+    """A pop tagged img2img with no source image routes needs_source_latent=False and enters at conditioning."""
+    pm, inference = _make_manager_with_roles()
+    job = _make_source_job(source_processing="img2img", source_image=None)
+    assert pm._is_disaggregatable_sdk_job(job) is True
+
+    await pm._job_tracker.record_popped_job(job)
+    registered = await pm._register_disaggregated_job(job, inference)
+    assert registered is True
+
+    state = pm._disaggregation_orchestrator._jobs[str(job.id_)]
+    assert state.needs_source_latent is False
+    assert state.stage == DisaggJobStage.AWAITING_CONDITIONING
+
+
+@pytest.mark.asyncio
+async def test_genuine_img2img_registers_at_source_latent_stage() -> None:
+    """A pop tagged img2img with a usable source image routes needs_source_latent=True (source-latent entry)."""
+    pm, inference = _make_manager_with_roles()
+    job = _make_source_job(source_processing="img2img", source_image=_USABLE_SOURCE_IMAGE)
+    assert pm._is_disaggregatable_sdk_job(job) is True
+
+    await pm._job_tracker.record_popped_job(job)
+    registered = await pm._register_disaggregated_job(job, inference)
+    assert registered is True
+
+    state = pm._disaggregation_orchestrator._jobs[str(job.id_)]
+    assert state.needs_source_latent is True
+    assert state.stage == DisaggJobStage.AWAITING_SOURCE_LATENT
+
+
+@pytest.mark.asyncio
+async def test_mislabeled_img2img_flows_txt2img_dag_end_to_end() -> None:
+    """A pop mislabeled img2img (no source) flows the txt2img DAG: encode -> sample -> decode -> safety.
+
+    The disaggregation entry stage is conditioning, not source-latent, so no VAE source-encode of a
+    placeholder image ever runs; the job completes and hands off to safety with its sampler pin released.
+    """
+    pm, inference = _make_manager_with_roles()
+    job = _make_source_job(source_processing="img2img", source_image=None)
+    await pm._job_tracker.record_popped_job(job)
+
+    routed = await pm._inference_scheduler._dispatch_disaggregated(
+        job,
+        inference,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+    assert routed is True
+
+    orchestrator = pm._disaggregation_orchestrator
+    state = orchestrator._jobs[str(job.id_)]
+    assert state.needs_source_latent is False
+    assert state.stage == DisaggJobStage.AWAITING_CONDITIONING  # txt2img entry: no source-latent encode
+
+    orchestrator.tick()  # dispatch text-encode to the component process
+    await orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.id_,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    orchestrator.tick()  # dispatch the sample stage to the pinned sampler
+    await orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=0,
+            process_launch_identifier=0,
+            info="",
+            results=[SampleSliceResult(job_id=job.id_, latent_bytes=b"latent", state=GENERATION_STATE.ok)],
+        ),
+    )
+    tracked = pm._job_tracker.get_tracked_job(job.id_)
+    assert tracked is not None and tracked.stage == JobStage.DISAGGREGATION_DECODING
+
+    orchestrator.tick()  # dispatch the decode stage to the image lane
+    await orchestrator.handle_stage_result(
+        HordeVaeDecodeResultMessage(
+            process_id=2,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.id_,
+            job_image_results=[HordeImageResult(image_bytes=b"img")],
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    await pm.drive_disaggregation()
+
+    pending_safety_ids = [ji.sdk_api_job_info.id_ for ji in pm._job_tracker.jobs_pending_safety_check]
+    assert job.id_ in pending_safety_ids
+    assert pm._process_map.is_reserved_for_disaggregation(0) is False  # no reservation leaked
 
 
 def test_eligibility_requires_flag_family_and_live_roles() -> None:
@@ -292,6 +463,120 @@ async def test_disaggregated_flow_pins_releases_and_completes() -> None:
     pending_safety_ids = [ji.sdk_api_job_info.id_ for ji in pm._job_tracker.jobs_pending_safety_check]
     assert job.id_ in pending_safety_ids
     assert pm._process_map.is_reserved_for_disaggregation(0) is False  # no reservation leaked
+
+
+async def _run_disaggregated_job_through_decode(
+    pm: HordeWorkerProcessManager,
+    inference: HordeProcessInfo,
+    job: ImageGenerateJobPopResponse,
+) -> None:
+    """Route a job through the disaggregated DAG (encode -> sample -> decode) up to its decode result.
+
+    Leaves the decode completion queued on the orchestrator; the caller drives ``drive_disaggregation`` to
+    route it into the safety/post-processing pipeline. The decode result carries a single raw image, exactly
+    what the VAE lane now returns (no inline post-processing).
+    """
+    await pm._job_tracker.record_popped_job(job)
+    await pm._inference_scheduler._dispatch_disaggregated(
+        job,
+        inference,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+    orchestrator = pm._disaggregation_orchestrator
+    orchestrator.tick()  # dispatch text-encode to the component process
+    await orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.id_,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    orchestrator.tick()  # dispatch the sample stage to the pinned sampler
+    await orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=0,
+            process_launch_identifier=0,
+            info="",
+            results=[SampleSliceResult(job_id=job.id_, latent_bytes=b"latent", state=GENERATION_STATE.ok)],
+        ),
+    )
+    orchestrator.tick()  # dispatch the decode stage to the VAE lane
+    await orchestrator.handle_stage_result(
+        HordeVaeDecodeResultMessage(
+            process_id=2,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.id_,
+            job_image_results=[HordeImageResult(image_bytes=b"img")],
+            state=GENERATION_STATE.ok,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_disaggregated_job_with_post_processing_routes_through_the_dedicated_pp_lane() -> None:
+    """A disaggregated job requesting post-processing routes decode -> synthetic result -> the PP lane.
+
+    The VAE lane's decode control message carries no post-processing (that field is gone), so the lane only
+    decodes; the synthetic completion then flows the identical post-processing path a monolithic completion
+    takes, dispatching a ``HordePostProcessControlMessage`` to a dedicated POST_PROCESS process. This holds
+    even though ``post_processing_lane_enabled`` is False in the harness, because disaggregation forces the
+    lane on.
+    """
+    pm, inference = _make_manager_with_roles()
+    post_process_lane = make_mock_process_info(3, model_name=None, process_type=HordeProcessType.POST_PROCESS)
+    pm._process_map[3] = post_process_lane
+
+    job = make_job_pop_response(model=_MODEL, post_processing=["RealESRGAN_x4plus"])
+    await _run_disaggregated_job_through_decode(pm, inference, job)
+
+    # The VAE lane received a decode with no post-processing work: the field no longer exists on the message.
+    decode_message = pm._process_map[2].pipe_connection.send.call_args.args[0]
+    assert isinstance(decode_message, HordeVaeDecodeControlMessage)
+    assert not hasattr(decode_message, "post_processing")
+
+    await pm.drive_disaggregation()  # route the completion; a PP request must go to the PP lane, not safety
+
+    pending_pp_ids = [ji.sdk_api_job_info.id_ for ji in pm._job_tracker.jobs_pending_post_processing]
+    assert job.id_ in pending_pp_ids  # queued for the dedicated post-processing lane
+    pending_safety_ids = [ji.sdk_api_job_info.id_ for ji in pm._job_tracker.jobs_pending_safety_check]
+    assert job.id_ not in pending_safety_ids  # did not skip post-processing to safety
+
+    # The PP orchestrator dispatches the queued job to the POST_PROCESS lane with the raw decoded image.
+    pm._post_process_orchestrator._sampling_coresidency_check = lambda reserve_mb: True  # type: ignore[method-assign]
+    await pm.start_post_processing()
+
+    pp_control_message = post_process_lane.pipe_connection.send.call_args.args[0]
+    assert isinstance(pp_control_message, HordePostProcessControlMessage)
+    assert pp_control_message.job_id == job.id_
+    assert pp_control_message.images_bytes == [b"img"]  # the VAE lane's raw decode output
+    assert pp_control_message.post_processing == ["RealESRGAN_x4plus"]
+
+
+@pytest.mark.asyncio
+async def test_disaggregated_job_without_post_processing_flows_straight_to_safety() -> None:
+    """A disaggregated job requesting no post-processing routes decode -> safety, dispatching no PP work."""
+    pm, inference = _make_manager_with_roles()
+    post_process_lane = make_mock_process_info(3, model_name=None, process_type=HordeProcessType.POST_PROCESS)
+    pm._process_map[3] = post_process_lane
+
+    job = make_job_pop_response(model=_MODEL)  # no post_processing
+    await _run_disaggregated_job_through_decode(pm, inference, job)
+    await pm.drive_disaggregation()
+
+    pending_safety_ids = [ji.sdk_api_job_info.id_ for ji in pm._job_tracker.jobs_pending_safety_check]
+    assert job.id_ in pending_safety_ids  # straight to safety
+    pending_pp_ids = [ji.sdk_api_job_info.id_ for ji in pm._job_tracker.jobs_pending_post_processing]
+    assert job.id_ not in pending_pp_ids  # never queued for post-processing
+
+    pm._post_process_orchestrator._sampling_coresidency_check = lambda reserve_mb: True  # type: ignore[method-assign]
+    await pm.start_post_processing()
+    post_process_lane.pipe_connection.send.assert_not_called()  # no post-processing dispatched
 
 
 @pytest.mark.asyncio

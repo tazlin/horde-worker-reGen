@@ -37,6 +37,10 @@ from horde_sdk.ai_horde_api.apimodels import (
     UserDetailsResponse,
     WorkerDetailItem,
 )
+from horde_sdk.worker.dispatch.ai_horde.image.source_image import (
+    job_requires_source_image_input,
+    resolve_effective_source_processing,
+)
 from loguru import logger
 
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
@@ -1868,9 +1872,13 @@ class HordeWorkerProcessManager:
         """Whether ``sdk_job`` belongs to the class of jobs that run disaggregated (stable, no liveness).
 
         Class membership is a property of the job and the worker config alone: pipeline disaggregation is
-        enabled; the job is txt2img/img2img/remix with no control_type; its model's baseline is an SD1.5 or
-        SDXL family (the only v1-validated families, resolved from the loaded model reference, never guessed
-        from the name); and the job has not been re-routed out of the pipeline. It deliberately does not
+        enabled; the job's effective (post-fallback) source processing is txt2img/img2img/remix with no
+        control_type and no transparency (the layerdiffuse decode graph is not identity-validated on the
+        staged path); its model's baseline is an SD1.5 or SDXL family (the only v1-validated families, resolved
+        from the loaded model reference, never guessed from the name); and the job has not been re-routed out
+        of the pipeline. Effective source processing is the SDK's single-truth resolution: a source-requiring
+        mode (img2img/inpainting/outpainting/remix) whose source image is unusable resolves to txt2img, so
+        such a pop is class-eligible as the txt2img job it will actually run. It deliberately does not
         consult live role processes or transient residency state, so residency forecasting charges a job that
         will run disaggregated its sampler-only footprint even during a whole-card window when the lane is
         paused: were this coupled to liveness, the forecast would flip to the monolithic footprint mid-window
@@ -1878,9 +1886,11 @@ class HordeWorkerProcessManager:
         """
         if not self.bridge_data.enable_pipeline_disaggregation:
             return False
-        if sdk_job.source_processing not in ("txt2img", "img2img", "remix"):
+        if resolve_effective_source_processing(sdk_job) not in ("txt2img", "img2img", "remix"):
             return False
         if sdk_job.payload.control_type:
+            return False
+        if sdk_job.payload.transparent:
             return False
         if sdk_job.model is None:
             return False
@@ -1938,7 +1948,7 @@ class HordeWorkerProcessManager:
             return True
         self._disaggregation_orchestrator.register(
             job_info,
-            needs_source_latent=sdk_job.source_processing in ("img2img", "remix"),
+            needs_source_latent=job_requires_source_image_input(sdk_job),
             pinned_sampler_process_id=sampler_process.process_id,
             pinned_sampler_launch_identifier=sampler_process.process_launch_identifier,
         )

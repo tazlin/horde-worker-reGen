@@ -2,8 +2,9 @@
 
 Under pipeline disaggregation a job is split into stages that run in separate processes exchanging
 small activations, not weights: a text-encode service produces CONDITIONING, a UNet-only sampler
-consumes it and produces a LATENT, an image lane VAE-decodes it (and post-processes) to final
-images, with an optional VAE-encode front-end for img2img. This orchestrator drives that per-job
+consumes it and produces a LATENT, an image lane VAE-decodes it to raw images (post-processing runs
+on the dedicated post-processing lane afterward), with an optional VAE-encode front-end for img2img.
+This orchestrator drives that per-job
 DAG from the parent: it dispatches each stage to the appropriate role process, holds the
 intermediate blobs so a stage's death loses only the executing stage (the parent re-dispatches from
 held state), and advances a job to the next stage as each result arrives.
@@ -251,8 +252,8 @@ class DisaggregationOrchestrator:
             estimate_sampling_peak_mb: Returns a job's estimated sampling-phase activation peak (MB, a whole-
                 process weights-plus-activation figure), or None when no estimate is available. Consulted by the
                 concurrent-sampling gate; a None estimate never blocks a dispatch.
-            estimate_decode_spike_mb: Returns a job's estimated bundled VAE-decode-plus-post-processing
-                activation spike (MB), or None when unavailable. Charged by the arbiter's decode gate; None
+            estimate_decode_spike_mb: Returns a job's estimated VAE tiled-decode activation spike (MB), or
+                None when unavailable. Charged by the arbiter's decode gate; None
                 prices the decode as unpriced, so the gate then only withholds a decode onto an already
                 over-committed card.
             observe_sampling_peak: Called with a job and the pinned sampler process's measured peak reserved
@@ -791,22 +792,20 @@ class DisaggregationOrchestrator:
         latent = state.source_latent_bytes  # reused field holds the sampled latent by this stage
         if latent is None:
             return _DispatchOutcome.NO_ROLE
-        # Decode is priced with the job's bundled decode-plus-post-processing spike, so a decode is withheld when
-        # it would over-commit the card alongside an in-flight sampling rather than driving both into paging.
+        # Decode is priced with the job's tiled-decode activation spike, so a decode is withheld when it would
+        # over-commit the card alongside an in-flight sampling rather than driving both into paging. Any
+        # requested post-processing runs on the dedicated post-processing lane after the decode completes.
         if not self._admit_stage(
             VramRequestKind.DISAGG_DECODE,
             state,
             candidate_delta_mb=self._estimate_decode_spike_mb(state.job_info),
         ):
             return self._defer_stage_for_pressure(state, "vae-decode")
-        payload = state.job_info.sdk_api_job_info.payload
-        post_processing = list(payload.post_processing) if payload.post_processing else []
         message = HordeVaeDecodeControlMessage(
             **self._loader_identity(state.job_info).model_dump(),
             job_id=state.job_info.sdk_api_job_info.id_,
             sdk_api_job_info=state.job_info.sdk_api_job_info,
             latent_bytes=latent,
-            post_processing=post_processing,
         )
         return _DispatchOutcome.DISPATCHED if self._send(lane, message, state) else _DispatchOutcome.NO_ROLE
 

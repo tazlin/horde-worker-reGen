@@ -66,8 +66,10 @@ class JobStage(enum.Enum):
     INFERENCE_IN_PROGRESS = auto()
     """Sent to an inference process which has not yet returned a result."""
     DISAGGREGATION_DECODING = auto()
-    """A disaggregated job whose sampling finished; its latent is being decoded (and post-processed) on the
-    image lane while the sampler slot has been released for the next job.
+    """A disaggregated job whose sampling finished; its latent is being decoded to raw images on the VAE
+    lane while the sampler slot has been released for the next job. On completion the job routes to the
+    dedicated post-processing lane (if it requested post-processing) or straight to safety, the same as a
+    monolithic inference completion.
 
     Deliberately not counted in ``jobs_in_progress`` (the inference concurrency cap), so the freed sampler is
     schedulable again, yet the job is still tracked and in-flight: the disaggregation orchestrator holds its

@@ -6569,7 +6569,7 @@ class InferenceScheduler:
         )
 
     def estimate_disaggregated_decode_spike_mb(self, job_info: HordeJobInfo) -> float | None:
-        """Return a disaggregated job's bundled VAE-decode-plus-post-processing spike (MB), or None if unsizable.
+        """Return a disaggregated job's VAE tiled-decode activation spike (MB), or None if unsizable.
 
         Injected into the disaggregation orchestrator's decode gate. The bounded tiled-decode activation working
         set (:func:`predict_job_decode_spike_mb`, the same figure the lane co-residency charge derives from) is

@@ -910,11 +910,15 @@ class ProcessLifecycleManager:
     def post_process_lane_enabled(self) -> bool:
         """Whether the dedicated post-processing lane should be running.
 
-        Pipeline disaggregation runs its VAE stages on the dedicated VAE lane (see
-        :meth:`start_vae_lane_processes`), not this lane, so the post-processing lane follows its own
-        configuration flag and is not forced on by disaggregation.
+        Enabled by its own configuration flag, and additionally forced on by pipeline disaggregation: a
+        disaggregated job's VAE lane emits raw decoded images and its requested post-processing runs on this
+        lane, so disaggregation requires the lane exactly as it requires the VAE lane (see
+        :meth:`vae_lane_enabled`).
         """
-        return self._runtime_config.bridge_data.post_processing_lane_enabled
+        return (
+            self._runtime_config.bridge_data.post_processing_lane_enabled
+            or self._runtime_config.bridge_data.enable_pipeline_disaggregation
+        )
 
     def _post_process_card(self) -> CardRuntime:
         """Return the card the dedicated post-processing lane is pinned to.

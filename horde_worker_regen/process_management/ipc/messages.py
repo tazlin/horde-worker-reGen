@@ -502,7 +502,7 @@ class HordeControlFlag(enum.Enum):
     START_VAE_ENCODE = auto()
     """Signal the image lane to VAE-encode a source image to a latent (img2img/inpaint front-end)."""
     START_VAE_DECODE = auto()
-    """Signal the image lane to VAE-decode a latent (and run any post-processing) to final images."""
+    """Signal the image lane to VAE-decode a latent to raw images (post-processing runs on its own lane)."""
     EVALUATE_SAFETY = auto()
     """Signal the child process to evaluate safety of images from inference."""
     UNLOAD_MODELS_FROM_VRAM = auto()
@@ -922,10 +922,11 @@ class HordeVaeEncodeResultMessage(HordeProcessMessage):
 
 
 class HordeVaeDecodeControlMessage(HordeControlMessage, HordeStageModelMixin):
-    """Dispatch a job's latent decode (and post-processing) to the image lane (START_VAE_DECODE).
+    """Dispatch a job's latent decode to the VAE lane (START_VAE_DECODE).
 
-    The lane loads only the VAE, decodes the sampler's LATENT to images, then runs any requested
-    post-processing (upscalers/face-fixers) on the models it keeps resident, returning final images.
+    The lane loads only the VAE and decodes the sampler's LATENT to raw images. Post-processing never runs
+    here: a job requesting upscale/face-fix routes to the dedicated post-processing lane after decode, so the
+    VAE lane is never blocked on post-processing work.
     """
 
     control_flag: HordeControlFlag = HordeControlFlag.START_VAE_DECODE
@@ -935,19 +936,17 @@ class HordeVaeDecodeControlMessage(HordeControlMessage, HordeStageModelMixin):
     """The job as sent by the API (the VAE identity and output dimensions are derived from it)."""
     latent_bytes: bytes
     """The serialized LATENT to decode."""
-    post_processing: list[str] = Field(default_factory=list)
-    """The requested post-processor names to run after decode, in request order (may be empty)."""
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
 
 
 class HordeVaeDecodeResultMessage(HordeProcessMessage):
-    """The final images from a job's decode (and post-processing) stage."""
+    """The raw decoded images from a job's VAE-decode stage."""
 
     job_id: GenerationID
     """The ID of the job whose latent was decoded."""
     job_image_results: list[HordeImageResult] | None = None
-    """The per-image results (decoded, post-processed), or None if the stage faulted with no output."""
+    """The per-image raw decoded results, or None if the stage faulted with no output."""
     state: GENERATION_STATE
     """The state of the job to be sent to the API (``ok`` or ``faulted``)."""
     fault_is_resource_class: bool = False

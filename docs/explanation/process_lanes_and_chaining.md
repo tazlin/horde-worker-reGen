@@ -24,6 +24,11 @@ when the safety process is CPU-only). It is controlled by `dedicated_post_proces
 - `off`: no lane, and the worker does not offer post-processing at all. The lane is the only place
   post-processing runs; there is no inline fallback inside the inference processes.
 
+Pipeline disaggregation (`enable_pipeline_disaggregation`) forces the lane on regardless of this control, the
+same way it forces the VAE lane on. A disaggregated job's VAE lane returns raw decoded images, and its
+requested post-processing runs on this dedicated lane afterward (never inline on the VAE lane), so the lane is
+required whenever disaggregation is enabled.
+
 When safety runs on GPU, only CLIP remains resident while the lane is idle. DeepDanbooru stages from CPU for a
 conditional anime check; BLIP captioning and the aesthetic head are also offloaded after use, and completion
 trims the allocator before `WAITING_FOR_JOB`. This bounds the lane's fixed card cost without making every

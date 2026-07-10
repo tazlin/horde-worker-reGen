@@ -924,24 +924,24 @@ class MessageDispatcher:
         The disaggregation orchestrator assembles a :class:`HordeInferenceResultMessage` from a job whose
         stages ran across the encode service, samplers, and image lane, then hands it here so its images (or
         its fault) flow into the identical safety/submit path a monolithic child result takes. The images are
-        already VAE-decoded and post-processed by the image lane's decode stage, so the post-processing lane
-        is bypassed (``post_processing_already_applied``): re-queuing for post-processing would run the
-        upscaler/face-fixer a second time on an already-processed image.
+        the VAE lane's raw decode output, so a job requesting post-processing routes to the dedicated
+        post-processing lane exactly as a monolithic completion does.
         """
-        await self._handle_inference_result(message, post_processing_already_applied=True)
+        await self._handle_inference_result(message, is_disaggregated_completion=True)
 
     async def _handle_inference_result(
         self,
         message: HordeInferenceResultMessage,
         *,
-        post_processing_already_applied: bool = False,
+        is_disaggregated_completion: bool = False,
     ) -> None:
         """Handle an inference job result message.
 
-        ``post_processing_already_applied`` is set for a parent-synthesized disaggregated completion whose
-        images the image lane already post-processed: the in-progress release tolerates the job's
-        disaggregation-decoding stage (it never sat in ``INFERENCE_IN_PROGRESS`` at completion), and the
-        post-processing lane is bypassed so the images route straight to safety.
+        ``is_disaggregated_completion`` is set for a parent-synthesized disaggregated completion: the
+        in-progress release tolerates the job's disaggregation-decoding stage (it never sat in
+        ``INFERENCE_IN_PROGRESS`` at completion). Post-processing routing is identical to a monolithic
+        completion: the synthetic result carries raw decoded images, so a job requesting post-processing is
+        queued for the dedicated post-processing lane.
         """
         # A result (success, fault, or even one for a job we no longer track) means the slot is no longer
         # sampling, so retire its in-flight timestamps first: before the graded-slowdown monitor can read
@@ -980,7 +980,7 @@ class MessageDispatcher:
         # A disaggregated completion never sits in INFERENCE_IN_PROGRESS at this point: the sampler slot was
         # released (and the job moved to the disaggregation-decoding stage) the moment sampling finished, so a
         # failed release is expected there and not an error.
-        if not released and not post_processing_already_applied:
+        if not released and not is_disaggregated_completion:
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} not found in jobs_in_progress. "
                 "Did it fault? "
@@ -1020,8 +1020,11 @@ class MessageDispatcher:
         jobs_completed_counter.add(1)
 
         requested_post_processing = job_info.sdk_api_job_info.payload.post_processing
-        if requested_post_processing and not post_processing_already_applied:
-            if self._runtime_config.bridge_data.post_processing_lane_enabled:
+        if requested_post_processing:
+            # Disaggregation forces the post-processing lane on regardless of the lane's own config flag, the
+            # same way it forces the VAE lane on, so a disaggregated completion routes to the lane here.
+            lane_enabled = bridge_data.post_processing_lane_enabled or bridge_data.enable_pipeline_disaggregation
+            if lane_enabled:
                 await self._job_tracker.queue_for_post_processing(job_info)
                 return
             # The lane is the only post-processing path; with it disabled the job should never have been
