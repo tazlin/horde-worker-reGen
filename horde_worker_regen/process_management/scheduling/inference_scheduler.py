@@ -2564,6 +2564,33 @@ class InferenceScheduler:
         """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
         self._head_starvation_job_id = None
         self._head_starvation_since = 0.0
+        # A dispatch means the card is fed, so the idle-fill breaker (if armed) is done; disarm it and
+        # restart the ladder so the next idle episode begins at the smallest, quickest rung.
+        if self._state.wants_idle_fill_candidate:
+            self._state.wants_idle_fill_candidate = False
+            self._state.idle_fill_rung = 0
+
+    def _update_idle_fill_arm(self, bridge_data: reGenBridgeData) -> None:
+        """Arm or disarm the idle-fill breaker from the head-starvation clock and free-sibling availability.
+
+        Arms when a queue head has sat on an idle device past ``idle_fill_threshold_seconds`` (its model still
+        loading, nothing in progress) while an inference sibling is free to run a fill job. The head-starvation
+        clock is already forced to zero whenever any job is in progress, so this is inert in steady state and
+        fires only for the "stuck doing nothing but downloading" case. Disarms (and resets the ladder) once
+        the head is no longer starved or no sibling is free.
+        """
+        threshold = bridge_data.idle_fill_threshold_seconds
+        starved_long_enough = (
+            threshold is not None
+            and self._head_starvation_since > 0.0
+            and (time.time() - self._head_starvation_since) >= threshold
+        )
+        has_free_sibling = self._process_map.get_first_available_inference_process() is not None
+        if starved_long_enough and has_free_sibling:
+            self._state.wants_idle_fill_candidate = True
+        elif self._state.wants_idle_fill_candidate:
+            self._state.wants_idle_fill_candidate = False
+            self._state.idle_fill_rung = 0
 
     def _diagnose_dispatch_stall(
         self,
@@ -7037,9 +7064,12 @@ class InferenceScheduler:
             process_with_model.last_job_referenced = next_job
             process_with_model.loaded_horde_model_name = next_job.model
             process_with_model.loaded_horde_model_baseline = horde_model_baseline
+            # Optimistically mark the slot primed at dispatch (staging toward sampling, not yet in the
+            # denoise loop); it advances to INFERENCE_STARTING on the first step. Keeps the slot readable
+            # as busy-and-owning-the-job the instant START_INFERENCE is sent, before the child confirms.
             self._process_map.on_process_state_change(
                 process_id=process_with_model.process_id,
-                new_state=HordeProcessState.INFERENCE_STARTING,
+                new_state=HordeProcessState.INFERENCE_PRIMED,
             )
 
         else:
@@ -7915,4 +7945,7 @@ class InferenceScheduler:
                     # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
                     # dispatching. Throttled, read-only; it never changes scheduling.
                     self._log_dispatch_stall_if_needed(stable_diffusion_reference)
+                    # Arm the idle-fill breaker off the same idle-head signal: if the head has been starved
+                    # long enough with a free sibling, let the popper over-pop a quick no-LoRA fill job.
+                    self._update_idle_fill_arm(bridge_data)
                     self.unload_models()

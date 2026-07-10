@@ -43,7 +43,11 @@ from horde_worker_regen.process_management.models.feature_readiness import (
     is_offered,
 )
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
-from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
+from horde_worker_regen.process_management.models.model_sizing import (
+    ModelSizeTier,
+    is_extra_large_model,
+    model_size_tier,
+)
 from horde_worker_regen.process_management.resources.model_serviceability import (
     assess_model_serviceability,
     model_footprint_figures_for_baseline,
@@ -253,6 +257,12 @@ def _select_models_for_pop(
         return None
 
     return models
+
+
+_MAX_IDLE_FILL_RUNG = 3
+"""Highest idle-fill ladder index: the four rungs are (light, small), (light, large), (heavy, small),
+(heavy, large). The escalation counter is capped here; the shaping helper re-clamps to the concrete rung
+count for a worker that has no model for some tier."""
 
 
 def _baseline_value_for_model(model_metadata: ModelMetadata | None, model_name: str) -> str | None:
@@ -499,6 +509,60 @@ class JobPopper:
     def _is_large_model(self, model_name: str | None) -> bool:
         """Whether a model is in the EXTRA_LARGE ('very large') tier the pop limiters govern."""
         return model_name is not None and is_extra_large_model(model_name, self._baseline_value_for(model_name))
+
+    def _apply_idle_fill_ladder(
+        self,
+        models: set[str],
+        pop_max_power: int,
+        bridge_data: reGenBridgeData,
+    ) -> tuple[set[str], int]:
+        """Shape a fill pop to the current idle-fill rung: a smallest-fastest-first, size-narrowed slice.
+
+        Groups the already-serviceable offered models by size tier (LIGHT = sd15/sd2, HEAVY = sdxl; the
+        whole-card EXTRA_LARGE tier can never quick-start, so it is dropped) and builds a smallest-fastest-first
+        rung list -- (light, small), (light, large), (heavy, small), (heavy, large) -- skipping any rung whose
+        group the worker has no model for. The current ``idle_fill_rung`` (clamped to the concrete rung count)
+        selects the offered subset and its max-power cap. Falls back to a flat small offer when model metadata
+        is unavailable (baselines would all read light) or no light/heavy model is configured, so the fill
+        degrades to a single small pop rather than mislabelling a heavy model as light. The caller sets
+        ``allow_lora=False``.
+        """
+        small_cap = min(
+            pop_max_power,
+            line_skip_pop_max_power(
+                high_performance_mode=bool(bridge_data.high_performance_mode),
+                moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
+            ),
+        )
+        large_cap = pop_max_power
+
+        if self._model_metadata is None:
+            return models, small_cap
+
+        light: set[str] = set()
+        heavy: set[str] = set()
+        for model in models:
+            tier = model_size_tier(model, self._baseline_value_for(model))
+            if tier == ModelSizeTier.LIGHT:
+                light.add(model)
+            elif tier == ModelSizeTier.HEAVY:
+                heavy.add(model)
+            # EXTRA_LARGE (Flux/Cascade/Qwen/...) wants the whole card and can never quick-start; drop it.
+
+        rungs: list[tuple[set[str], int]] = []
+        if light:
+            rungs.append((light, small_cap))
+            rungs.append((light, large_cap))
+        if heavy:
+            rungs.append((heavy, small_cap))
+            rungs.append((heavy, large_cap))
+
+        if not rungs:
+            return models, small_cap
+
+        rung_index = min(self._state.idle_fill_rung, len(rungs) - 1)
+        rung_models, rung_cap = rungs[rung_index]
+        return rung_models, rung_cap
 
     def _large_models_loaded_or_queued(self) -> frozenset[str]:
         """The very-large models currently resident on a process or held in the local queue (incl. in flight)."""
@@ -964,16 +1028,19 @@ class JobPopper:
         # the bias applied further down (small, non-LoRA) can actually be exercised. Genuinely protective
         # gates (shutdown, RAM/safety backpressure, failure pause, no free process) still apply.
         line_skip_wanted = self._state.wants_line_skip_candidate
-        if line_skip_wanted:
+        # Idle-fill yields to the aux line-skip: when both would apply, the line-skip's flat small-non-LoRA
+        # bias runs and the ladder is suppressed, so a single pop is never double-shaped.
+        idle_fill_wanted = self._state.wants_idle_fill_candidate and not line_skip_wanted
+        if line_skip_wanted or idle_fill_wanted:
             urgent = True
 
         if self._handle_consecutive_failures(bridge_data, cur_time):
             return
 
-        # Admit one extra job past the configured depth when a line-skip is wanted: the skip job is expected
-        # to leave the queue immediately for the idle sibling, so bounding the relaxation to a single slot
-        # keeps intake from running away if it cannot be placed this cycle.
-        if self._is_queue_full(bridge_data, extra_allowance=1 if line_skip_wanted else 0):
+        # Admit one extra job past the configured depth when a line-skip or idle-fill is wanted: that job is
+        # expected to leave the queue immediately for the idle sibling, so bounding the relaxation to a single
+        # slot keeps intake from running away if it cannot be placed this cycle.
+        if self._is_queue_full(bridge_data, extra_allowance=1 if (line_skip_wanted or idle_fill_wanted) else 0):
             return
 
         # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
@@ -1025,10 +1092,12 @@ class JobPopper:
             await asyncio.sleep(3)
             return
 
-        # The megapixelstep governor holds pops so large in-flight jobs can drain; a line-skip job is small
-        # by construction and fills a GPU the blocked head has left idle, so it must not be held behind the
-        # very backlog it is meant to relieve.
-        if not line_skip_wanted and self._pop_throttler.should_wait_for_megapixelsteps(bridge_data):
+        # The megapixelstep governor holds pops so large in-flight jobs can drain; a line-skip or idle-fill
+        # job is small by construction and fills a GPU the blocked head has left idle, so it must not be held
+        # behind the very backlog it is meant to relieve.
+        if not (line_skip_wanted or idle_fill_wanted) and self._pop_throttler.should_wait_for_megapixelsteps(
+            bridge_data,
+        ):
             return
 
         if not urgent and self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
@@ -1113,7 +1182,7 @@ class JobPopper:
         # download finishes. A LoRA candidate would itself block on a download, so it can never skip; a
         # smaller max_power keeps the returned job under the scheduler's line-skip eMPS ceiling. The
         # scheduler clears the flag once the blocking download ends.
-        if self._state.wants_line_skip_candidate:
+        if line_skip_wanted:
             pop_allow_lora = False
             pop_max_power = min(
                 pop_max_power,
@@ -1122,6 +1191,12 @@ class JobPopper:
                     moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
                 ),
             )
+        elif idle_fill_wanted:
+            # Idle-fill ladder: offer a no-LoRA, smallest-fastest-first slice of the models (small sd15 ->
+            # large sd15 -> small sdxl -> large sdxl) so a card idled behind a download is fed the quickest
+            # work the horde currently has, escalating only when it has nothing lighter.
+            models, pop_max_power = self._apply_idle_fill_ladder(models, pop_max_power, bridge_data)
+            pop_allow_lora = False
 
         # First-class feature readiness: withhold a gated feature (ControlNet, SDXL-ControlNet,
         # post-processing) until its models/annotators are actually on disk, so the worker never
@@ -1224,6 +1299,10 @@ class JobPopper:
         if job_pop_response.id_ is None:
             self._state.last_pop_no_jobs_available = True
             self._state.last_pop_skipped_reasons = skipped_reasons
+            if idle_fill_wanted:
+                # The horde had nothing at this rung; climb one so the next fill tick offers the
+                # next-heaviest quick-start work. Clamped; the shaping helper re-clamps per worker.
+                self._state.idle_fill_rung = min(self._state.idle_fill_rung + 1, _MAX_IDLE_FILL_RUNG)
             logger.info(info_string)
             self._pop_throttler.on_no_jobs_available(
                 cur_time,
@@ -1242,6 +1321,9 @@ class JobPopper:
         self._replaced_due_to_maintenance = False
         self._state.last_pop_no_jobs_available = False
         self._state.last_pop_skipped_reasons = {}
+        if idle_fill_wanted:
+            # Fed at this rung; restart the ladder at the smallest, quickest rung for the next idle episode.
+            self._state.idle_fill_rung = 0
         self._pop_throttler.on_job_popped()
 
         has_loras = job_pop_response.payload.loras is not None and len(job_pop_response.payload.loras) > 0

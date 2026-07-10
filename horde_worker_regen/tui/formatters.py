@@ -135,6 +135,7 @@ STATE_LABELS: dict[str, str] = {
     "PRELOADED_MODEL": "Preloaded",
     "DOWNLOADING_MODEL": "Downloading",
     "DOWNLOADING_AUX_MODEL": "Fetching aux",
+    "INFERENCE_PRIMED": "Priming",
     "INFERENCE_STARTING": "Sampling",
     "POST_PROCESSING": "Post-proc",
     "INFERENCE_COMPLETE": "Inference done",

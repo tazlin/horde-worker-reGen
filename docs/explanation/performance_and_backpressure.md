@@ -336,6 +336,31 @@ still exceeds the threshold, so the cap bypass and the pop bias last only as lon
 as the stall does. Set `aux_model_download_line_skip_threshold_seconds` to unset
 to disable the breaker entirely.
 
+#### Idle-fill: over-popping a quick job up a size ladder when a card would idle
+
+The line-skip breaker above fires only when the idle cause is an *auxiliary*
+download. A card can also idle behind a main-model download or an empty queue: the
+head is parked on a device with a free sibling but its checkpoint is not yet
+resident. The head-starvation clock (which only runs while nothing is in progress,
+so it is zero in steady state) measures exactly this. Once it passes
+`idle_fill_threshold_seconds` with a free inference sibling, the scheduler arms
+`WorkerState.wants_idle_fill_candidate` and the popper over-pops a small no-LoRA
+**fill** job to run in the meantime. Unlike the flat line-skip bias, the fill climbs
+a smallest-fastest-first **ladder** so the card is fed the quickest work the horde
+currently has: (light=sd15, small) → (light, large) → (heavy=sdxl, small) →
+(heavy, large), narrowing both the offered models (by size tier, dropping the
+whole-card EXTRA_LARGE tier that can never quick-start) and the `max_power` per rung.
+Rungs whose baseline the worker has no model for are skipped, and when model metadata
+is unavailable the fill degrades to a single flat small pop. The ladder advances one
+rung each time a fill pop finds no job at the current rung (so it tries the
+next-heaviest quick-start work only when the horde has nothing lighter) and resets to
+the smallest rung once a fill job is obtained or the card is fed. The same one-slot
+over-pop and gate relaxations as the line-skip apply, and the same protective gates
+(shutdown, RAM/safety backpressure, a free process) still hold. Idle-fill yields to
+the aux line-skip when both would apply, so a single pop is never double-shaped. It is
+armed only when a head is genuinely starved with a free sibling, so it is inert in
+steady state. Set `idle_fill_threshold_seconds` to unset to disable it.
+
 The borrowing rule also covers an auxiliary download that has already entered the in-progress set. The
 concurrency cap normally counts that job, but `DOWNLOADING_AUX_MODEL` is not sampling; if the pending head is
 small, non-LoRA, and resident on another idle process, it dispatches immediately and records the active

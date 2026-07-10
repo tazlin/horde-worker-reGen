@@ -1166,7 +1166,8 @@ class HordeInferenceProcess(HordeProcess):
 
         from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
-        self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
+        # Primed for the sample stage: the pinned sampler advances to INFERENCE_STARTING on its first step.
+        self.send_process_state_change_message(HordeProcessState.INFERENCE_PRIMED, info="Priming")
         start_time = time.time()
         reference_manager = ensure_offline_reference_manager()
         results: list[SampleSliceResult] = []
@@ -1533,9 +1534,12 @@ class HordeInferenceProcess(HordeProcess):
                         info=error_message,
                     )
 
+                # Primed, not yet sampling: the model is IN_USE and the slot owns the job, but the denoise
+                # loop is entered inside start_inference() below (after acquiring the inference slot and the
+                # GPU sampling lease). The parent advances this slot to INFERENCE_STARTING on the first step.
                 self.on_horde_model_state_change(
                     horde_model_name=message.horde_model_name,
-                    process_state=HordeProcessState.INFERENCE_STARTING,
+                    process_state=HordeProcessState.INFERENCE_PRIMED,
                     horde_model_state=ModelLoadState.IN_USE,
                 )
 

@@ -44,7 +44,7 @@ _EXPECTED_PROCESS_STATE_SOURCES: dict[HordeProcessState, frozenset[HordeProcessS
             HordeProcessState.PRELOADED_MODEL,
         },
     ),
-    HordeProcessState.INFERENCE_STARTING: frozenset(
+    HordeProcessState.INFERENCE_PRIMED: frozenset(
         {
             HordeProcessState.WAITING_FOR_JOB,
             HordeProcessState.JOB_RECEIVED,
@@ -57,9 +57,32 @@ _EXPECTED_PROCESS_STATE_SOURCES: dict[HordeProcessState, frozenset[HordeProcessS
             HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
         },
     ),
-    HordeProcessState.INFERENCE_COMPLETE: frozenset({HordeProcessState.INFERENCE_STARTING}),
+    # Normally reached by the first-step upgrade from INFERENCE_PRIMED; the other predecessors remain
+    # allowed because stage lanes (disaggregated sample, text-encode) and the simulator emit
+    # INFERENCE_STARTING directly as a busy marker without passing through PRIMED.
+    HordeProcessState.INFERENCE_STARTING: frozenset(
+        {
+            HordeProcessState.INFERENCE_PRIMED,
+            HordeProcessState.WAITING_FOR_JOB,
+            HordeProcessState.JOB_RECEIVED,
+            HordeProcessState.PRELOADING_MODEL,
+            HordeProcessState.PRELOADED_MODEL,
+            HordeProcessState.INFERENCE_COMPLETE,
+            HordeProcessState.DOWNLOADING_AUX_MODEL,
+            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+            HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+            HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
+        },
+    ),
+    HordeProcessState.INFERENCE_COMPLETE: frozenset(
+        {
+            HordeProcessState.INFERENCE_PRIMED,
+            HordeProcessState.INFERENCE_STARTING,
+        },
+    ),
     HordeProcessState.INFERENCE_FAILED: frozenset(
         {
+            HordeProcessState.INFERENCE_PRIMED,
             HordeProcessState.INFERENCE_STARTING,
             HordeProcessState.JOB_RECEIVED,
         },
@@ -252,6 +275,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 # First sampling step of this job: the slot has finished its one-time pre-sampling work,
                 # so start the clock the graded-slowdown monitor measures sampling time against.
                 self[process_id].current_first_step_at = time.time()
+                # The slot has crossed from staging (INFERENCE_PRIMED) into the denoise loop; report the
+                # narrowed sampling state so "Sampling" means actually sampling, not waiting for the lease.
+                if self[process_id].last_process_state == HordeProcessState.INFERENCE_PRIMED:
+                    self[process_id].last_process_state = HordeProcessState.INFERENCE_STARTING
+                    self[process_id].last_process_state_started_at = time.time()
             self[process_id].last_current_step = current_step
             self[process_id].last_total_steps = total_steps
             self[process_id].last_iterations_per_second = iterations_per_second
@@ -587,7 +615,14 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         step has been observed.
         """
         process_info = self[process_id]
-        if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
+        # INFERENCE_PRIMED is the pre-first-step staging window (the slot dispatched, streaming a model
+        # through VRAM / encoding the prompt / waiting for the lease); INFERENCE_STARTING is the denoise
+        # loop. Both must be watched: a slot wedged in PRIMED never emits a step, which is the 0%-hang the
+        # first_step_timeout branch below is meant to catch.
+        if process_info.last_process_state not in (
+            HordeProcessState.INFERENCE_PRIMED,
+            HordeProcessState.INFERENCE_STARTING,
+        ):
             return False
 
         timeout = inference_step_timeout
@@ -1245,7 +1280,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         return count
 
     def num_busy_with_inference(self, *, device_index: int | None = None) -> int:
-        """Return the number of processes that are actively sampling.
+        """Return the number of processes committed to an inference job (staging or sampling).
+
+        Counts both INFERENCE_PRIMED (dispatched, staging its pipeline, holding VRAM) and
+        INFERENCE_STARTING (sampling), because a primed slot has already committed the card to a job for
+        coresidency and admission purposes even before the first step.
 
         Args:
             device_index: When given, count only processes pinned to that card; when None, count across
@@ -1257,26 +1296,36 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 continue
             if device_index is not None and p.device_index != device_index:
                 continue
-            if p.last_process_state == HordeProcessState.INFERENCE_STARTING:
+            if p.last_process_state in (
+                HordeProcessState.INFERENCE_PRIMED,
+                HordeProcessState.INFERENCE_STARTING,
+            ):
                 count += 1
         return count
 
     def has_inference_in_progress(self) -> bool:
-        """Whether a live inference slot is actively running a job (worker-wide).
+        """Whether a live inference slot is running a job worker-wide (dispatched/staging or sampling).
 
-        True only while a slot is mid-inference (INFERENCE_STARTING) on a process still alive. This is the
-        "real inference is advancing" fact the deadlock clear and the wedge assessment both key on, kept in
-        one place so they cannot drift apart. Deliberately narrower than ``is_process_busy`` (which also
-        counts PROCESS_STARTING / preloading / downloading): a slot merely starting or loading a model is
-        not running a job and must keep the anti-flap guard. Worker-wide on purpose: the queue-deadlock
-        premise is itself all-cards-idle, so any one card mid-inference is enough to disprove it.
+        True while a slot is either staging a dispatched job (INFERENCE_PRIMED) or in the denoise loop
+        (INFERENCE_STARTING) on a process still alive. This is the "the worker is making forward progress
+        on a job" fact the deadlock clear and the wedge assessment both key on, kept in one place so they
+        cannot drift apart. Deliberately narrower than ``is_process_busy`` (which also counts
+        PROCESS_STARTING / preloading / downloading a not-yet-dispatched model): a slot merely starting or
+        loading a model is not yet running a job and must keep the anti-flap guard. A primed slot IS
+        running a dispatched job, so it must count, otherwise a staging window (all slots dispatched but
+        none stepping yet) would read as all-cards-idle and could trip a false queue-deadlock verdict.
+        Worker-wide on purpose: the queue-deadlock premise is itself all-cards-idle, so any one card
+        running a job is enough to disprove it.
         """
         for process_info in self.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
             if not process_info.is_process_alive():
                 continue
-            if process_info.last_process_state == HordeProcessState.INFERENCE_STARTING:
+            if process_info.last_process_state in (
+                HordeProcessState.INFERENCE_PRIMED,
+                HordeProcessState.INFERENCE_STARTING,
+            ):
                 return True
         return False
 

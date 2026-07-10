@@ -112,7 +112,7 @@ holds anyway:
   each control-loop tick, any `in_progress` job that **no live slot is actively
   working** is punted (retryably) once it has been un-owned for a short grace
   window. The grace rides out the brief dispatch race between marking a job
-  in-progress and the slot reporting `INFERENCE_STARTING`. The key subtlety is
+  in-progress and the slot reporting `INFERENCE_PRIMED`. The key subtlety is
   *ownership*: a slot only owns its job while it cannot accept new work. An
   **idle** slot (`can_accept_job()` is true) whose `last_job_referenced` still
   points at the job does **not** shield it, because that reference is retained

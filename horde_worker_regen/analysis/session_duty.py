@@ -543,7 +543,10 @@ def _partial_kind(sample: dict[str, Any], *, fallback: DutyLossKind) -> DutyLoss
         return DutyLossKind.POST_PROCESSING
     if "PRELOADING_MODEL" in state or "MODEL" in state or "PRELOAD" in state:
         return DutyLossKind.MODEL_LOAD
-    if "INFERENCE_STARTING" in state or "VRAM" in state:
+    # The one-time RAM->VRAM staging/prompt-encode window is INFERENCE_PRIMED (INFERENCE_STARTING now
+    # means the denoise loop is actually running, which is not a duty loss). Attribute the transfer gap
+    # to the primed window.
+    if "INFERENCE_PRIMED" in state or "VRAM" in state:
         return DutyLossKind.VRAM_TRANSFER
     if "UNLOAD" in state or "EVICT" in state:
         return DutyLossKind.MODEL_UNLOAD

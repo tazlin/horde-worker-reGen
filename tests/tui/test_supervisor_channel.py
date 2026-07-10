@@ -48,7 +48,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 17
+    assert SUPERVISOR_PROTOCOL_VERSION == 18
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:

@@ -36,6 +36,7 @@ class ProcessTemperature(StrEnum):
 
 _HOT_STATES = frozenset(
     {
+        "INFERENCE_PRIMED",
         "INFERENCE_STARTING",
         "POST_PROCESSING",
         "ALCHEMY_STARTING",
@@ -96,6 +97,7 @@ def classify_process_temperature(
 
 
 _HOT_PHRASES = {
+    "INFERENCE_PRIMED": "priming",
     "INFERENCE_STARTING": "sampling",
     "POST_PROCESSING": "post-proc",
     "ALCHEMY_STARTING": "alchemy",

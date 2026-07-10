@@ -687,7 +687,14 @@ class MessageDispatcher:
             self._state.torch_build_cpu_only = True
             self._state.torch_build_cpu_only_reason = message.info
 
-        if message.process_state == HordeProcessState.INFERENCE_STARTING:
+        # INFERENCE_PRIMED is the dispatch-edge state the whole-job slot now reports (it advances to
+        # INFERENCE_STARTING parent-side on the first step), so the model-in-use bookkeeping fires here;
+        # stage lanes (disaggregated sample, text-encode) still emit INFERENCE_STARTING directly, so both
+        # are handled. The bookkeeping is idempotent for the primed->starting upgrade.
+        if message.process_state in (
+            HordeProcessState.INFERENCE_PRIMED,
+            HordeProcessState.INFERENCE_STARTING,
+        ):
             self._handle_inference_starting(message.process_id)
 
         if (

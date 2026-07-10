@@ -119,8 +119,16 @@ class HordeProcessState(enum.Enum):
     UNLOADED_MODEL_FROM_RAM = auto()
     """The process has unloaded a model from RAM."""
 
+    INFERENCE_PRIMED = auto()
+    """The job is dispatched to the slot and staging toward sampling, not yet in the ComfyUI denoise loop.
+
+    Covers the window from dispatch through the one-time pre-sampling work (streaming a model's components
+    through VRAM, the initial prompt encode) and the wait for the GPU sampling lease. The slot holds the
+    job and its VRAM (it is busy and owns the job) but produces no sampling step yet. It advances to
+    ``INFERENCE_STARTING`` on the first ``INFERENCE_STEP``. Kept distinct from ``INFERENCE_STARTING`` so a
+    slot waiting for the lease is not reported as actively sampling."""
     INFERENCE_STARTING = auto()
-    """The process is starting inference."""
+    """The process is inside the ComfyUI denoise loop, producing sampling steps (reached on the first step)."""
     INFERENCE_COMPLETE = auto()
     """The process has finished inference."""
     INFERENCE_FAILED = auto()

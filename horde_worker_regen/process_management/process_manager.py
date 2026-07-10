@@ -3726,7 +3726,10 @@ class HordeWorkerProcessManager:
         for process in (ProcessSnapshot.from_process_info(info) for info in self._process_map.values()):
             if process.current_job_id != job_id:
                 continue
-            if stage == WorkLedgerStage.INFERENCE and process.last_process_state == "INFERENCE_STARTING":
+            if stage == WorkLedgerStage.INFERENCE and process.last_process_state in (
+                "INFERENCE_PRIMED",
+                "INFERENCE_STARTING",
+            ):
                 return process
             if stage == WorkLedgerStage.POST_PROCESSING and process.last_process_state == "POST_PROCESSING":
                 return process
@@ -4003,6 +4006,8 @@ class HordeWorkerProcessManager:
                 if resident is not None:
                     if resident.last_process_state.name == "INFERENCE_STARTING":
                         why = f"Process {resident.process_id} is busy sampling."
+                    elif resident.last_process_state.name == "INFERENCE_PRIMED":
+                        why = f"Process {resident.process_id} is staging a job toward sampling."
                     elif resident.last_process_state.name == "DOWNLOADING_AUX_MODEL":
                         why = f"Process {resident.process_id} is downloading auxiliary models."
                     else:
@@ -4507,7 +4512,11 @@ class HordeWorkerProcessManager:
                 if info.process_type == HordeProcessType.INFERENCE
                 and info.device_index == device_index
                 and info.is_process_alive()
-                and info.last_process_state == HordeProcessState.INFERENCE_STARTING
+                and info.last_process_state
+                in (
+                    HordeProcessState.INFERENCE_PRIMED,
+                    HordeProcessState.INFERENCE_STARTING,
+                )
             )
 
             residency_model, residency_phase = self._inference_scheduler.card_residency(fault_key)

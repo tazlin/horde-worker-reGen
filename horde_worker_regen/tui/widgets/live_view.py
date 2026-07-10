@@ -39,6 +39,7 @@ _BAR_WIDTH = 36
 
 _ACTIVE_STATES = frozenset(
     {
+        "INFERENCE_PRIMED",
         "INFERENCE_STARTING",
         "POST_PROCESSING",
         "ALCHEMY_STARTING",

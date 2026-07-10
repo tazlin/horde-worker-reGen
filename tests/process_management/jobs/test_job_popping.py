@@ -14,7 +14,11 @@ from collections.abc import Callable
 from unittest.mock import AsyncMock, Mock, patch
 
 from horde_sdk import RequestErrorResponse
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopRequest, LorasPayloadEntry
+from horde_sdk.ai_horde_api.apimodels import (
+    ImageGenerateJobPopRequest,
+    ImageGenerateJobPopResponse,
+    LorasPayloadEntry,
+)
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
@@ -29,6 +33,8 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
 from horde_worker_regen.utils.job_utils import line_skip_pop_max_power
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -2066,6 +2072,189 @@ class TestAuxDownloadLineSkipRelaxationBounds:
         await popper.api_job_pop()
 
         session.submit_request.assert_not_awaited()
+
+
+_SD15_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+_SDXL_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+_FLUX_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
+_SMALL_CAP = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
+
+
+class _FakeModelMetadata:
+    """Minimal metadata stub mapping model names to baselines for idle-fill ladder tests."""
+
+    def __init__(self, baselines: dict[str, KNOWN_IMAGE_GENERATION_BASELINE]) -> None:
+        self._baselines = baselines
+
+    def get_baseline(self, model_name: str) -> KNOWN_IMAGE_GENERATION_BASELINE | None:
+        return self._baselines.get(model_name)
+
+
+def _idle_fill_state(rung: int = 0) -> WorkerState:
+    """A worker state with the idle-fill breaker armed at the given ladder rung."""
+    state = WorkerState()
+    state.wants_idle_fill_candidate = True
+    state.idle_fill_rung = rung
+    return state
+
+
+class TestIdleFillLadderShaping:
+    """``_apply_idle_fill_ladder`` offers a smallest-fastest-first, size-narrowed no-LoRA slice per rung.
+
+    The rungs are (light=sd15, small), (light, large), (heavy=sdxl, small), (heavy, large); rungs whose
+    baseline the worker has no model for are skipped, and the whole-card EXTRA_LARGE tier is never a fill.
+    """
+
+    @staticmethod
+    def _ladder(
+        baselines: dict[str, KNOWN_IMAGE_GENERATION_BASELINE],
+        rung: int,
+        *,
+        max_power: int = _SMALL_CAP * 4,
+    ) -> tuple[set[str], int]:
+        popper = _make_popper(state=_idle_fill_state(rung), image_models_to_load=list(baselines))
+        popper._model_metadata = _FakeModelMetadata(baselines)  # type: ignore[assignment]
+        return popper._apply_idle_fill_ladder(set(baselines), max_power, make_mock_bridge_data())
+
+    def test_rung0_offers_light_at_small_cap(self) -> None:
+        models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 0)
+        assert models == {"sd15a"}
+        assert cap == _SMALL_CAP
+
+    def test_rung1_offers_light_at_large_cap(self) -> None:
+        large = _SMALL_CAP * 4
+        models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 1, max_power=large)
+        assert models == {"sd15a"}
+        assert cap == large
+
+    def test_rung2_offers_heavy_at_small_cap(self) -> None:
+        models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 2)
+        assert models == {"sdxlA"}
+        assert cap == _SMALL_CAP
+
+    def test_rung3_offers_heavy_at_large_cap(self) -> None:
+        large = _SMALL_CAP * 4
+        models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 3, max_power=large)
+        assert models == {"sdxlA"}
+        assert cap == large
+
+    def test_absent_light_baseline_skips_to_heavy(self) -> None:
+        # A worker with only SDXL models has no sd15 rungs, so rung 0 is the sdxl-small rung.
+        models, cap = self._ladder({"sdxlA": _SDXL_BASELINE, "sdxlB": _SDXL_BASELINE}, 0)
+        assert models == {"sdxlA", "sdxlB"}
+        assert cap == _SMALL_CAP
+
+    def test_extra_large_never_offered_as_fill(self) -> None:
+        baselines = {"sd15a": _SD15_BASELINE, "fluxA": _FLUX_BASELINE}
+        low, _ = self._ladder(baselines, 0)
+        high, _ = self._ladder(baselines, 3)  # clamps to the last existing (light) rung
+        assert low == {"sd15a"}
+        assert "fluxA" not in high
+
+    def test_metadata_none_falls_back_to_flat_small(self) -> None:
+        large = _SMALL_CAP * 4
+        popper = _make_popper(state=_idle_fill_state(0), image_models_to_load=["m1", "m2"])
+        popper._model_metadata = None  # type: ignore[assignment]
+        models, cap = popper._apply_idle_fill_ladder({"m1", "m2"}, large, make_mock_bridge_data())
+        assert models == {"m1", "m2"}  # unchanged: no baseline info to narrow by
+        assert cap == _SMALL_CAP
+
+
+class TestIdleFillEscalationAndGates:
+    """Full-pop behaviour when the scheduler arms ``wants_idle_fill_candidate``."""
+
+    async def test_no_lora_offered_on_fill(self) -> None:
+        """A fill pop never advertises LoRA support (a LoRA job would itself block on a download)."""
+        popper, session = _make_line_skip_popper(
+            state=_idle_fill_state(0),
+            job_tracker=JobTracker(),
+            bridge_data=make_mock_bridge_data(allow_lora=True),
+        )
+        await popper.api_job_pop()
+        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
+        assert request.allow_lora is False
+
+    async def test_no_job_advances_the_rung(self) -> None:
+        """When the horde has no job at this rung, the ladder climbs one rung for the next fill tick."""
+        state = _idle_fill_state(0)
+        popper, session = _make_line_skip_popper(state=state, job_tracker=JobTracker())
+        # The horde's "no jobs available" is a success response with id_=None (not an error response).
+        session.submit_request = AsyncMock(return_value=ImageGenerateJobPopResponse(id=None, ids=[], payload={}))
+        await popper.api_job_pop()
+        assert state.idle_fill_rung == 1
+
+    async def test_rung_clamps_at_the_max(self) -> None:
+        """The rung counter never runs away past the last ladder index on repeated no-jobs."""
+        state = _idle_fill_state(3)
+        popper, session = _make_line_skip_popper(state=state, job_tracker=JobTracker())
+        session.submit_request = AsyncMock(return_value=ImageGenerateJobPopResponse(id=None, ids=[], payload={}))
+        await popper.api_job_pop()
+        assert state.idle_fill_rung == 3
+
+    @_full_flow_patches
+    async def test_fill_job_resets_the_rung(self, _mock_req_cls: Mock) -> None:
+        """Obtaining a fill job restarts the ladder at the smallest rung for the next idle episode."""
+        state = _idle_fill_state(2)
+        horde_session = AsyncMock()
+        horde_session.submit_request = AsyncMock(return_value=make_job_pop_response())
+        popper = _make_popper(
+            state=state,
+            process_map=_make_process_map_with_available_processes(),
+            job_tracker=JobTracker(),
+            horde_client_session=horde_session,
+        )
+
+        await popper.api_job_pop()
+
+        assert state.idle_fill_rung == 0
+
+    async def test_armed_pops_through_full_queue(self) -> None:
+        """Idle-fill admits one extra job past the configured depth (the permitted over-pop)."""
+        job_tracker = JobTracker()
+        await _queue_head_model_jobs(job_tracker, 2)  # queue_size=1, max_threads=1 -> depth cap is 2
+        await job_tracker.increment_jobs_completed()
+        popper, session = _make_line_skip_popper(state=_idle_fill_state(0), job_tracker=job_tracker)
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+
+    async def test_full_queue_blocks_pop_when_unarmed(self) -> None:
+        """The same full queue blocks the pop when idle-fill is not armed (depth cap otherwise honoured)."""
+        job_tracker = JobTracker()
+        await _queue_head_model_jobs(job_tracker, 2)
+        await job_tracker.increment_jobs_completed()
+        popper, session = _make_line_skip_popper(state=WorkerState(), job_tracker=job_tracker)
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+
+    async def test_yields_to_aux_line_skip(self) -> None:
+        """When both breakers are armed, the aux line-skip wins: the ladder is suppressed and does not climb."""
+        state = _idle_fill_state(1)
+        state.wants_line_skip_candidate = True
+        popper, session = _make_line_skip_popper(state=state, job_tracker=JobTracker())
+
+        await popper.api_job_pop()
+
+        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
+        assert request.allow_lora is False  # the line-skip bias still withholds LoRA
+        assert state.idle_fill_rung == 1  # the ladder did not advance: idle-fill yielded
+
+    async def test_unarmed_leaves_pop_unbiased(self) -> None:
+        """With neither breaker armed, LoRA and max_power are advertised unchanged."""
+        popper, session = _make_line_skip_popper(
+            state=WorkerState(),
+            job_tracker=JobTracker(),
+            bridge_data=make_mock_bridge_data(allow_lora=True, max_power=64),
+        )
+
+        await popper.api_job_pop()
+
+        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
+        assert request.allow_lora is True
+        assert request.max_pixels == 64 * 8 * 64 * 64
 
 
 # endregion

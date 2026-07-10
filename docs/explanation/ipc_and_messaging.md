@@ -100,7 +100,8 @@ stateDiagram-v2
     UNLOADED_MODEL_FROM_VRAM --> UNLOADED_MODEL_FROM_RAM
     UNLOADED_MODEL_FROM_RAM --> WAITING_FOR_JOB
     WAITING_FOR_JOB --> JOB_RECEIVED
-    JOB_RECEIVED --> INFERENCE_STARTING
+    JOB_RECEIVED --> INFERENCE_PRIMED
+    INFERENCE_PRIMED --> INFERENCE_STARTING
     INFERENCE_STARTING --> INFERENCE_COMPLETE
     INFERENCE_STARTING --> INFERENCE_FAILED
     INFERENCE_COMPLETE --> WAITING_FOR_JOB
@@ -114,9 +115,12 @@ stateDiagram-v2
     PROCESS_ENDED --> [*]
 ```
 
-> The diagram above shows the primary transitions. Many intermediate states
+> The diagram above shows the primary transitions. A dispatched inference slot is
+> `INFERENCE_PRIMED` while it stages its pipeline and waits for the GPU sampling lease,
+> and advances to `INFERENCE_STARTING` only on the first sampling step (so `INFERENCE_STARTING`
+> means the denoise loop is actually running, not merely dispatched). Many intermediate states
 > (e.g. `PRELOADED_MODEL`, `DOWNLOAD_AUX_COMPLETE`) can also transition directly
-> back to `WAITING_FOR_JOB` or to `INFERENCE_STARTING`. The alchemy states
+> back to `WAITING_FOR_JOB` or to `INFERENCE_PRIMED`. The alchemy states
 > (`ALCHEMY_STARTING` → `ALCHEMY_COMPLETE` / `ALCHEMY_FAILED`, reported by both
 > inference and safety processes while running a form) and a few other edges are
 > omitted for clarity; see

@@ -1959,6 +1959,8 @@ class OverviewView(Vertical):
         """Map a process state name to a display colour."""
         if state in ("INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING"):
             return "green"
+        if state == "INFERENCE_PRIMED":
+            return "cyan"
         if state in ("INFERENCE_FAILED", "ALCHEMY_FAILED", "SAFETY_FAILED", "PROCESS_ENDED"):
             return "red"
         if state == "WAITING_FOR_JOB":

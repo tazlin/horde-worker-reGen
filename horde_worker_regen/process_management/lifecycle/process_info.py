@@ -322,7 +322,8 @@ class HordeProcessInfo:
         This does not include the process starting up or shutting down.
         """
         return (
-            self.last_process_state == HordeProcessState.INFERENCE_STARTING
+            self.last_process_state == HordeProcessState.INFERENCE_PRIMED
+            or self.last_process_state == HordeProcessState.INFERENCE_STARTING
             or self.last_process_state == HordeProcessState.POST_PROCESSING
             or self.last_process_state == HordeProcessState.ALCHEMY_STARTING
             or self.last_process_state == HordeProcessState.DOWNLOADING_MODEL
