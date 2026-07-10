@@ -16,7 +16,12 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.ipc.supervisor_channel import StatsSample
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
-from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
+from horde_worker_regen.process_management.resources.run_metrics import (
+    DecisionKind,
+    DecisionVerdict,
+    ResourceStateKind,
+    WorkerRunMetrics,
+)
 from horde_worker_regen.process_management.simulation._dummy_jobs import dummy_job_factory
 
 
@@ -347,3 +352,207 @@ class TestStatsRollupsAndExport:
         metrics.record_stats_sample(StatsSample(timestamp=10.0, jobs_submitted=1))
 
         assert metrics.stats_export_state().warning_over_50_mib
+
+
+def _read_export_events(tmp_path: Path) -> list[dict[str, object]]:
+    """Return every JSONL export event across the session's stats files, oldest-first."""
+    import json
+
+    events: list[dict[str, object]] = []
+    for path in sorted((tmp_path / ".horde_worker_regen" / "stats").glob("stats-v*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            events.append(json.loads(line))
+    return events
+
+
+def _decisions(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [event for event in events if event.get("event") == "decision"]
+
+
+class TestSessionAndResourceEvents:
+    """Session boundary and resource-state export events (opt-in stats JSONL)."""
+
+    def test_session_start_carries_config_snapshot(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """A session_start event serializes with its discriminator and the flat config snapshot."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="9.9.9")
+        metrics.record_session_start(config={"max_power": 32, "high_performance_mode": True}, timestamp=1.0)
+
+        events = _read_export_events(tmp_path)
+        assert len(events) == 1
+        assert events[0]["event"] == "session_start"
+        assert events[0]["worker_version"] == "9.9.9"
+        assert events[0]["config"] == {"max_power": 32, "high_performance_mode": True}
+
+    def test_session_end_reports_duration_and_totals(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """session_end derives duration from the recorded start and carries terminal totals."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+        metrics.record_session_start(config={}, timestamp=100.0)
+        metrics.record_session_end(reason="graceful_shutdown", jobs_submitted=7, jobs_faulted=1, timestamp=160.0)
+
+        end_events = [event for event in _read_export_events(tmp_path) if event["event"] == "session_end"]
+        assert len(end_events) == 1
+        assert end_events[0]["duration_seconds"] == 60.0
+        assert end_events[0]["reason"] == "graceful_shutdown"
+        assert end_events[0]["jobs_submitted"] == 7
+        assert end_events[0]["jobs_faulted"] == 1
+
+    def test_resource_state_event_serializes(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """A resource_state transition serializes with its discriminator and flat inputs."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+        event = metrics.record_resource_state(
+            state_kind=ResourceStateKind.GOVERNOR,
+            state="saturated",
+            device_index=0,
+            reason="device_free_governor_transition",
+            inputs={"device_free_mb": 512.0},
+            timestamp=5.0,
+        )
+
+        assert event is not None
+        events = [item for item in _read_export_events(tmp_path) if item["event"] == "resource_state"]
+        assert len(events) == 1
+        assert events[0]["state_kind"] == "governor"
+        assert events[0]["state"] == "saturated"
+        assert events[0]["inputs"] == {"device_free_mb": 512.0}
+
+    def test_no_events_written_when_export_disabled(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """With export off, decision/resource/session recorders write nothing and open no file."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        assert (
+            metrics.record_decision(
+                decision_kind=DecisionKind.PP_DEFERRAL,
+                subject="job-1",
+                verdict=DecisionVerdict.DEFER,
+                timestamp=1.0,
+            )
+            is None
+        )
+        metrics.record_resource_state(state_kind=ResourceStateKind.WDDM_PAGING, state="active", timestamp=1.0)
+        metrics.record_session_start(config={}, timestamp=1.0)
+        assert not (tmp_path / ".horde_worker_regen" / "stats").exists()
+
+
+class TestDecisionCoalescing:
+    """The record_decision chokepoint enforces the >1 Hz no-verbatim-repeat rule."""
+
+    def test_sustained_identical_decision_emits_once(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """Many identical sub-second evaluations collapse to a single opening DecisionEvent."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+
+        for tick in range(50):
+            metrics.record_decision(
+                decision_kind=DecisionKind.PP_DEFERRAL,
+                subject="job-1",
+                verdict=DecisionVerdict.DEFER,
+                reason="pp_does_not_fit",
+                inputs={"available_mb": 100.0},
+                timestamp=10.0 + tick * 0.1,  # 50 ticks across 5 seconds, all under the heartbeat interval
+            )
+
+        decisions = _decisions(_read_export_events(tmp_path))
+        assert len(decisions) == 1
+        assert decisions[0]["verdict"] == "defer"
+        assert decisions[0]["repeat_count"] == 0
+        assert decisions[0]["resolved"] is False
+
+    def test_heartbeat_after_interval_carries_repeat_count(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """Once the heartbeat interval elapses, one further record carries the accumulated repeat count."""
+        import horde_worker_regen.process_management.resources.run_metrics as run_metrics
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(run_metrics, "_DECISION_HEARTBEAT_SECONDS", 30.0)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+
+        # Opening record at t=0, then sub-heartbeat repeats, then one call past the interval.
+        for tick in range(31):
+            metrics.record_decision(
+                decision_kind=DecisionKind.PP_DEFERRAL,
+                subject="job-1",
+                verdict=DecisionVerdict.DEFER,
+                timestamp=float(tick),
+            )
+
+        decisions = _decisions(_read_export_events(tmp_path))
+        assert len(decisions) == 2  # one opening + one heartbeat
+        heartbeat = decisions[1]
+        assert heartbeat["repeat_count"] == 30  # the 30 suppressed ticks between t=1 and t=30
+        assert heartbeat["resolved"] is False
+
+    def test_signature_change_emits_distinct_record(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """A change of verdict or reason is a fresh transition, not a coalesced repeat."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+
+        metrics.record_decision(
+            decision_kind=DecisionKind.INFERENCE_DISPATCH,
+            subject="job-1",
+            verdict=DecisionVerdict.DEFER,
+            reason="reason_a",
+            timestamp=1.0,
+        )
+        metrics.record_decision(
+            decision_kind=DecisionKind.INFERENCE_DISPATCH,
+            subject="job-1",
+            verdict=DecisionVerdict.DENY,
+            reason="reason_b",
+            timestamp=1.5,
+        )
+
+        decisions = _decisions(_read_export_events(tmp_path))
+        assert [item["verdict"] for item in decisions] == ["defer", "deny"]
+        assert all(item["resolved"] is False for item in decisions)
+
+    def test_resolving_verdict_closes_open_decision(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """A resolving verdict for a tracked subject emits one final resolved record."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+
+        metrics.record_decision(
+            decision_kind=DecisionKind.PP_DEFERRAL,
+            subject="job-1",
+            verdict=DecisionVerdict.DEFER,
+            timestamp=1.0,
+        )
+        metrics.record_decision(
+            decision_kind=DecisionKind.PP_DEFERRAL,
+            subject="job-1",
+            verdict=DecisionVerdict.NO_OP,
+            reason="left_pending_queue",
+            timestamp=2.0,
+        )
+
+        decisions = _decisions(_read_export_events(tmp_path))
+        assert len(decisions) == 2
+        assert decisions[0]["resolved"] is False
+        assert decisions[1]["resolved"] is True
+
+    def test_resolving_verdict_for_untracked_subject_is_dropped(
+        self, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
+        """A resolving verdict for a subject that was never deferred writes nothing (no admit-only lines)."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+
+        assert (
+            metrics.record_decision(
+                decision_kind=DecisionKind.PP_DEFERRAL,
+                subject="job-1",
+                verdict=DecisionVerdict.NO_OP,
+                timestamp=1.0,
+            )
+            is None
+        )
+        assert _decisions(_read_export_events(tmp_path)) == []

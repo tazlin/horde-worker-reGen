@@ -103,6 +103,18 @@ limited_console_messages: false
 log_purge_max_age_days: 30
 log_purge_max_total_gb: 5
 
+# Structured stats export (.horde_worker_regen/stats/stats-v*.jsonl), for offline analysis of a run.
+# stats_export_enabled: export a machine-readable per-session stats stream (session boundaries, per-job
+#   records, periodic samples, resource/decision events) on every start, without the dashboard toggle.
+#   Off by default so upgrading never begins writing extra files unprompted.
+# stats_purge_max_age_days / stats_purge_max_total_gb: retention for that directory, mirroring the log
+#   purge (0 disables the respective stage). Only recognized stats-v* files are ever eligible.
+# stats_autozip_enabled: gzip inactive prior-session stats files to .jsonl.gz at startup before purging.
+stats_export_enabled: false
+stats_purge_max_age_days: 30
+stats_purge_max_total_gb: 5
+stats_autozip_enabled: true
+
 #######################################
 ## Dreamer (Stable Diffusion Worker) ##
 #######################################

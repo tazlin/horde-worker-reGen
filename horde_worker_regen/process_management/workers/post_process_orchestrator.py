@@ -24,6 +24,11 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     predict_job_post_processing_vram_mb,
 )
+from horde_worker_regen.process_management.resources.run_metrics import (
+    DecisionKind,
+    DecisionSink,
+    DecisionVerdict,
+)
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     ActuatorCommandKind,
@@ -50,6 +55,11 @@ _DEFER_LOG_INTERVAL_SECONDS = 30.0
 
 A long unfittable wait should leave a few diagnostic lines, not one per scheduling tick; the reclaim
 request and the aging decision are governed separately so this throttle only bounds log volume."""
+
+
+def _round_or_none(value: float | None) -> float | None:
+    """Round a measured MB figure to one decimal, passing ``None`` through for absent telemetry."""
+    return None if value is None else round(value, 1)
 
 
 @dataclass
@@ -98,6 +108,7 @@ class PostProcessOrchestrator:
         vram_actuator: VramActuator | None = None,
         sampling_coresidency_check: Callable[[float], bool] | None = None,
         whole_card_residency_active: Callable[[], bool] = lambda: False,
+        decision_sink: DecisionSink | None = None,
     ) -> None:
         """Initialize the orchestrator with references to its dependencies.
 
@@ -116,6 +127,8 @@ class PostProcessOrchestrator:
             sampling_coresidency_check: Given a chain's estimated peak (MB), whether the card can run it
                 alongside the sampling currently in progress. None (unit tests) allows co-running always.
             whole_card_residency_active: Whether a whole-card residency still owns the lane pause.
+            decision_sink: Optional callback the manager injects to record the lane's admission decisions
+                (deferrals and their resolution) to the stats export. None in unit tests and until wired.
         """
         self._process_map = process_map
         self._job_tracker = job_tracker
@@ -128,6 +141,9 @@ class PostProcessOrchestrator:
         self._vram_actuator = vram_actuator
         self._sampling_coresidency_check = sampling_coresidency_check
         self._whole_card_residency_active = whole_card_residency_active
+        # Injected by the manager: records the lane's admission decisions (deferrals and their resolution)
+        # to the stats export, coalesced on the receiving side. None in unit tests and until wired.
+        self._decision_sink = decision_sink
         # Overridable so the load simulator can drive the aging window off its virtual clock; monotonic
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
@@ -319,12 +335,42 @@ class PostProcessOrchestrator:
                 f"{reclaim_note}",
             )
 
+        # The decision inputs, persisted for offline analysis. Called every deferral tick; the sink coalesces
+        # a sustained deferral into one opening record plus bounded heartbeats (independent of the log throttle
+        # above, so the two cannot drift into lockstep or mask each other).
+        if self._decision_sink is not None:
+            measured = verdict.measured
+            self._decision_sink(
+                decision_kind=DecisionKind.PP_DEFERRAL,
+                subject=key,
+                verdict=DecisionVerdict.DEFER,
+                reason=verdict.reason or "pp_does_not_fit",
+                inputs={
+                    "device_index": post_process_process.device_index,
+                    "candidate_delta_mb": round(reserve_vram_mb, 1),
+                    "device_free_mb": _round_or_none(measured.device_free_mb),
+                    "available_mb": _round_or_none(measured.available_mb),
+                    "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
+                    "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
+                },
+                timestamp=now,
+            )
+
     def _prune_deferrals(self, pending: tuple[HordeJobInfo, ...]) -> None:
         """Drop deferral bookkeeping for jobs that have left the pending queue (dispatched, aged, faulted)."""
         pending_ids = {str(job.sdk_api_job_info.id_) for job in pending}
         for key in list(self._deferrals):
             if key not in pending_ids:
                 del self._deferrals[key]
+                # The subject left the pending queue: close any open deferral decision for it with a final
+                # resolving record (a resolving verdict for an untracked subject is dropped by the sink).
+                if self._decision_sink is not None:
+                    self._decision_sink(
+                        decision_kind=DecisionKind.PP_DEFERRAL,
+                        subject=key,
+                        verdict=DecisionVerdict.NO_OP,
+                        reason="left_pending_queue",
+                    )
 
     async def start_post_processing(self) -> None:
         """Dispatch pending post-processing work, bypassing an unfittable head and aging out the unservable.

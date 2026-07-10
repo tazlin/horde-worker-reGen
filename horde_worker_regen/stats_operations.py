@@ -74,6 +74,19 @@ def default_stats_dir() -> Path:
     return default_app_state_dir() / "stats"
 
 
+def is_worker_stats_file(filename: str) -> bool:
+    """Return whether *filename* is a worker stats export file (uncompressed or gzipped).
+
+    Recognizes only files the exporter itself writes: a ``stats-v`` prefix and a ``.jsonl`` or
+    ``.jsonl.gz`` suffix. This is the fail-closed allowlist the guarded stats purge deletes against, so
+    anything else in the stats directory (a foreign file, a leftover ``.tmp``, a subdirectory) is never
+    matched and never touched.
+    """
+    return filename.startswith(_STATS_FILE_PREFIX) and filename.endswith(
+        (_STATS_JSONL_SUFFIX, _STATS_GZIP_SUFFIX),
+    )
+
+
 def compress_old_stats_files(stats_dir: Path | None = None, *, include_latest: bool = False) -> StatsOperationReport:
     """Compress retained uncompressed stats JSONL files with gzip.
 

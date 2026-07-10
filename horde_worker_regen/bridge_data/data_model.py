@@ -569,6 +569,37 @@ class reGenBridgeData(CombinedHordeBridgeData):
     between age-outs. The currently active sinks are the newest files and are trimmed last. Set 0 to rely
     only on the age-out."""
 
+    stats_export_enabled: bool = Field(default=False)
+    """If true, the worker exports structured per-session stats JSONL for every run without a manual toggle.
+
+    The worker can write a machine-readable ``stats-v*.jsonl`` stream (session boundaries, per-job records,
+    periodic samples, and resource/decision events) under ``.horde_worker_regen/stats`` for offline
+    analysis. That export is normally opt-in per session from the dashboard; set this true to have it
+    enabled automatically on every start. Off by default so upgrading never begins writing extra files
+    unprompted. The dashboard toggle still works and overrides this for the running session."""
+
+    stats_purge_max_age_days: float = Field(default=30.0, ge=0.0)
+    """Delete exported stats files older than this many days at startup (0 disables the age-out).
+
+    Mirrors ``log_purge_max_age_days`` for the ``.horde_worker_regen/stats`` directory: at startup the
+    worker deletes any recognized ``stats-v*.jsonl``/``.jsonl.gz`` file last modified more than this many
+    days ago. Only files the exporter itself writes are ever eligible; anything else in the directory is
+    left untouched. Set 0 to keep stats until only ``stats_purge_max_total_gb`` trims them."""
+
+    stats_purge_max_total_gb: float = Field(default=5.0, ge=0.0)
+    """Cap the total size of the ``.horde_worker_regen/stats`` directory in gigabytes (0 disables the cap).
+
+    After the age-out (``stats_purge_max_age_days``), if the directory still exceeds this many gigabytes the
+    worker deletes the oldest recognized stats files first until it fits. The active session file is the
+    newest and is trimmed last. Set 0 to rely only on the age-out."""
+
+    stats_autozip_enabled: bool = Field(default=True)
+    """If true, compress inactive exported stats files to ``.jsonl.gz`` at startup before purging.
+
+    At startup the worker gzip-compresses every retained ``stats-v*.jsonl`` except the newest (the file it
+    is about to write to), so prior-session exports occupy far less disk before the age-out and size-cap
+    run over them. Only recognized stats files are touched, via an atomic temp-then-replace compression."""
+
     dreamer: bool = Field(default=True)
     """If true, this worker pops and processes image-generation jobs (the dreamer role).
 
@@ -863,6 +894,17 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """The number of seconds for a process to be downloading an auxiliary model, and with no non-lora
     models available to skip the line, before the worker will attempt to pop a non-lora small job
     to keep the GPU busy. Keep unset to disable the breaker."""
+
+    idle_fill_threshold_seconds: int | None = Field(default=5, ge=0)
+    """Seconds the queue head may sit on an idle device (its model still downloading/loading) with a free
+    inference sibling before the worker over-pops a small no-LoRA "fill" job to keep the GPU busy.
+
+    The fill is drawn up a smallest-fastest-first ladder (small sd15 -> larger sd15 -> small sdxl -> larger
+    sdxl, skipping baselines the worker has no model for), advancing a rung each time the horde has no job at
+    the current rung, so the card is fed the quickest-to-start work available instead of idling while a
+    download finishes. LoRA jobs are never offered for the fill (they would themselves block on a download).
+    Only ever fires when a head is genuinely starved with a free sibling, so it is inert in steady state.
+    Keep unset to disable."""
 
     self_maintenance_fault_threshold: int = Field(default=6, ge=0)
     """Terminal resource/OOM faults within `self_maintenance_window_seconds` before the worker

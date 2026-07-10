@@ -83,7 +83,12 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampling_vram_mb,
     predict_job_weight_mb,
 )
-from horde_worker_regen.process_management.resources.run_metrics import ChurnKind
+from horde_worker_regen.process_management.resources.run_metrics import (
+    ChurnKind,
+    DecisionKind,
+    DecisionSink,
+    DecisionVerdict,
+)
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     DeviceVramState,
@@ -477,6 +482,7 @@ class InferenceScheduler:
         performance_model: PerformanceModel | None = None,
         reserve_ledger: CommittedReserveLedger | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+        decision_sink: DecisionSink | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
 
@@ -509,6 +515,9 @@ class InferenceScheduler:
             post_processing_lane_commitments_provider (Callable[[], int] | None): Optional count of
                 non-JobTracker work already committed to the shared post-processing lane, such as
                 graph-backed alchemy forms waiting for or running on that lane.
+            decision_sink (DecisionSink | None): Optional callback the manager injects to record
+                dispatch-residency admission decisions (holds and their release) to the stats export.
+                ``None`` in unit tests and until wired; emission is a no-op then.
         """
         self._state = state
         self._process_map = process_map
@@ -518,6 +527,9 @@ class InferenceScheduler:
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
         self._post_processing_lane_commitments_provider = post_processing_lane_commitments_provider or (lambda: 0)
+        # Injected by the manager: records dispatch-residency admission decisions (holds and their release)
+        # to the stats export, coalesced on the receiving side. None in unit tests and until wired.
+        self._decision_sink = decision_sink
         # Per-card runtime plan for multi-GPU routing. A single entry (or None) means single-GPU, where the
         # dispatch path stays card-agnostic and byte-identical to before multi-GPU existed.
         self._card_runtimes: dict[int, CardRuntime] = card_runtimes if card_runtimes is not None else {}
@@ -7093,6 +7105,7 @@ class InferenceScheduler:
         for held_id in [held_id for held_id in self._dispatch_hold_since if held_id not in pending_ids]:
             self._dispatch_hold_since.pop(held_id, None)
             self._dispatch_hold_reclaim_requested.discard(held_id)
+            self._resolve_dispatch_decision(held_id, reason="left_pending_queue")
 
     def _note_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_requested: bool) -> None:
         """Record that the dispatch of ``job`` was held this pass, stamping the first hold and its cause.
@@ -7131,6 +7144,22 @@ class InferenceScheduler:
             self._dispatch_hold_reclaim_requested.discard(job_id)
         else:
             self._dispatch_reconciliation_released_by_natural_free += 1
+        self._resolve_dispatch_decision(job_id, reason="dispatch_admitted")
+
+    def _resolve_dispatch_decision(self, job_id: str, *, reason: str) -> None:
+        """Close any open dispatch-hold decision for ``job_id`` with a final resolving record.
+
+        A resolving verdict for a subject the recorder is not tracking is dropped, so calling this for a
+        job that was never held is harmless.
+        """
+        if self._decision_sink is None:
+            return
+        self._decision_sink(
+            decision_kind=DecisionKind.INFERENCE_DISPATCH,
+            subject=job_id,
+            verdict=DecisionVerdict.NO_OP,
+            reason=reason,
+        )
 
     def _dispatch_residency_reconciliation_holds(
         self,
@@ -7261,6 +7290,26 @@ class InferenceScheduler:
         finally:
             self._preload_actuation = None
         self._note_dispatch_hold(next_job, reclaim_requested=bool(actuations))
+
+        if self._decision_sink is not None and next_job.id_ is not None:
+            measured = verdict.measured
+            self._decision_sink(
+                decision_kind=DecisionKind.INFERENCE_DISPATCH,
+                subject=str(next_job.id_),
+                verdict=DecisionVerdict.DEFER,
+                reason=verdict.reason or verdict.disposition.value,
+                inputs={
+                    "model": str(next_job.model),
+                    "device_index": device_index,
+                    "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
+                    "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
+                    "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
+                    "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
+                    "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
+                    "is_head_of_queue": is_head_of_queue,
+                    "reclaim_requested": bool(actuations),
+                },
+            )
 
         suppressed = self._scheduler_diagnostic_suppressed_count(
             "dispatch_residency_hold",

@@ -360,6 +360,37 @@ registry cannot silently drift out of step with the code that writes the logs.
 Both limits are independent; set both to `0` to keep all logs indefinitely (only the
 loguru per-sink rotation count then applies).
 
+### Stats export and retention
+
+Alongside the human-readable logs, the worker can write a machine-readable per-session
+**stats stream** (`stats-v*.jsonl`) under `.horde_worker_regen/stats`, for offline analysis
+of a run: session boundaries with a resolved config snapshot, one record per finished job,
+periodic samples, and coalesced admission/dispatch/reclaim decisions and device-state
+transitions. See the [Stats export reference](../reference/stats.md) for the file format and
+event schema.
+
+This export is **opt-in**. It is normally toggled per session from the dashboard;
+`stats_export_enabled` makes it automatic on every start instead. It is off by default, so
+upgrading never begins writing extra files unprompted; the dashboard toggle still overrides
+the setting for the running session.
+
+The stats directory gets the same startup lifecycle as `logs/`: with `stats_autozip_enabled`
+the orchestrator first gzip-compresses inactive prior-session files to `.jsonl.gz` (leaving
+the file it is about to write untouched), then ages out and size-caps the directory. The purge
+shares the same fail-closed guard as the log purge: it only ever considers a direct child of
+the stats directory, only a regular file (symlinks skipped), and only a file recognized as a
+`stats-v*.jsonl`/`.jsonl.gz` the exporter itself writes, so a foreign file, a leftover `.tmp`,
+or a nested folder is never touched.
+
+| Field                      | Default | Effect                                                                                          |
+| -------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `stats_export_enabled`     | `false` | Export the per-session stats stream on every start, without the dashboard toggle.               |
+| `stats_purge_max_age_days` | `30`    | Delete exported stats files older than this many days at startup. `0` disables the age-out.     |
+| `stats_purge_max_total_gb` | `5`     | After the age-out, if the stats dir still exceeds this many GB, delete oldest-first until it fits. `0` disables the size cap. |
+| `stats_autozip_enabled`    | `true`  | Gzip inactive prior-session stats files to `.jsonl.gz` at startup before purging.               |
+
+As with logs, the retention limits are independent; set both to `0` to keep stats indefinitely.
+
 ## Configuration flow at a glance
 
 ```

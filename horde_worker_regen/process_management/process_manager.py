@@ -146,7 +146,13 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     is_model_locally_unservable_for,
 )
-from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
+from horde_worker_regen.process_management.resources.run_metrics import (
+    DecisionKind,
+    DecisionVerdict,
+    ResourceStateKind,
+    RunMetricsSnapshot,
+    WorkerRunMetrics,
+)
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.resources.vram_attribution import (
     _REPORT_STALENESS_SECONDS,
@@ -1109,6 +1115,17 @@ class HordeWorkerProcessManager:
 
         self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
 
+        # Persistent opt-in: begin session-scoped stats export for the whole run without a dashboard toggle.
+        # The runtime SET_STATS_EXPORT command still overrides this for the session either way. Strict-bool
+        # so a Mock bridge_data under test (whose every attribute is truthy) does not spuriously enable it;
+        # the real config field is a plain bool, so this is identical for a live worker.
+        if self.bridge_data.stats_export_enabled is True:
+            import horde_worker_regen
+
+            self._run_metrics.set_stats_export(True, worker_version=horde_worker_regen.__version__)
+            self._run_metrics.record_session_start(config=self._stats_config_snapshot())
+        self._session_end_recorded = False
+
         # Measure real GPU core uptime (the duty cycle) for the whole worker session, not just the
         # benchmark. A coarse 1s poll is plenty for the rolling-window trend and threshold logs and
         # is far cheaper than the benchmark's 0.1s sampler. It no-ops on CPU/fake/non-NVIDIA backends
@@ -1121,6 +1138,7 @@ class HordeWorkerProcessManager:
         self._wddm_paging_monitor = WddmPagingMonitor()
         self._last_wddm_sample_timestamp = 0.0
         self._wddm_elevated_streak = 0
+        self._wddm_paging_active = False
         # The device-free governor: a debounced read of NVML device-level free VRAM per card, the only
         # truthful proximity-to-cliff signal under WDDM (per-process reads lie once the driver demotes an
         # allocator to system memory). PRESSURE holds new VRAM growth; SATURATED runs reclaim. Sampled on
@@ -1242,6 +1260,7 @@ class HordeWorkerProcessManager:
                 "num_graph_forms_waiting_or_running",
                 0,
             ),
+            decision_sink=self._run_metrics.record_decision,
         )
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
         # can estimate the free VRAM achievable under sole residency (total - one process's context) and,
@@ -1286,6 +1305,7 @@ class HordeWorkerProcessManager:
                 )
             ),
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
+            decision_sink=self._run_metrics.record_decision,
         )
         self._post_process_orchestrator.set_vram_arbiter(self._vram_arbiter)
 
@@ -2321,10 +2341,19 @@ class HordeWorkerProcessManager:
         else:
             self._wddm_elevated_streak = 0
 
-        self._inference_scheduler.note_wddm_paging(
-            elevated,
-            active=self._wddm_elevated_streak >= self._WDDM_PAGING_CONSECUTIVE_SAMPLES,
-        )
+        active = self._wddm_elevated_streak >= self._WDDM_PAGING_CONSECUTIVE_SAMPLES
+        self._inference_scheduler.note_wddm_paging(elevated, active=active)
+
+        # Edge-triggered: record only when the debounced paging verdict flips, so this is naturally low
+        # frequency rather than one record per monitor sample.
+        if active != self._wddm_paging_active:
+            self._wddm_paging_active = active
+            self._run_metrics.record_resource_state(
+                state_kind=ResourceStateKind.WDDM_PAGING,
+                state="active" if active else "cleared",
+                reason="wddm_shared_segment_paging",
+                inputs={"elevated_streak": self._wddm_elevated_streak},
+            )
 
     def _read_device_free_total_mb(self, device_index: int) -> tuple[float, float] | None:
         """Return device ``index``'s ``(free_mb, total_mb)`` via NVML, torch-free, or None when unavailable.
@@ -2377,6 +2406,19 @@ class HordeWorkerProcessManager:
                     f"{sample.state.value} (free {device_free_mb:.0f}MB; soft floor {sample.soft_floor_mb:.0f}MB, "
                     f"hard floor {sample.hard_floor_mb:.0f}MB of total {total_mb:.0f}MB)",
                 )
+                self._run_metrics.record_resource_state(
+                    state_kind=ResourceStateKind.GOVERNOR,
+                    state=sample.state.value,
+                    device_index=device_index,
+                    reason="device_free_governor_transition",
+                    inputs={
+                        "previous_state": sample.previous_state.value,
+                        "device_free_mb": round(device_free_mb, 1),
+                        "soft_floor_mb": round(sample.soft_floor_mb, 1),
+                        "hard_floor_mb": round(sample.hard_floor_mb, 1),
+                        "total_vram_mb": round(total_mb, 1),
+                    },
+                )
 
             hold_growth = sample.state in (GovernorState.PRESSURE, GovernorState.SATURATED)
             self._inference_scheduler.set_vram_growth_hold(device_index, hold_growth)
@@ -2400,15 +2442,34 @@ class HordeWorkerProcessManager:
             # Drive the single-owner verified reclaim ladder every governed tick: while SATURATED (or forced by
             # the per-step floor) it issues and verifies one rung per sample; once the card recovers the call
             # clears the episode. The ladder is scoped to the card the governor sampled.
+            saturated = sample.state == GovernorState.SATURATED or forced_by_per_step_floor
             self._reclaim_ladder.on_tick(
                 device_index,
-                saturated=sample.state == GovernorState.SATURATED or forced_by_per_step_floor,
+                saturated=saturated,
                 healthy=sample.state == GovernorState.HEALTHY,
                 device_free_mb=device_free_mb,
                 actuator=self._inference_scheduler,
                 ladder_builder=lambda dev=device_index: build_reclaim_ladder(
                     self._inference_scheduler.build_reclaim_ladder_candidates(dev),
                 ),
+            )
+
+            # The reclaim episode as a coalesced decision: while a card is saturated the recorder emits one
+            # opening record plus bounded heartbeats, and one resolving record when the card recovers, rather
+            # than one per governed tick. NO_OP on a card that was never saturated is dropped by the recorder.
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.RECLAIM_RUNG,
+                subject=f"device:{device_index}",
+                verdict=DecisionVerdict.DEFER if saturated else DecisionVerdict.NO_OP,
+                reason="saturated" if saturated else "recovered",
+                inputs={
+                    "device_index": device_index,
+                    "device_free_mb": round(device_free_mb, 1),
+                    "total_vram_mb": round(total_mb, 1),
+                    "governor_state": sample.state.value,
+                    "forced_by_per_step_floor": forced_by_per_step_floor,
+                    "saturation_unresolved": self._reclaim_ladder.is_saturation_unresolved(device_index),
+                },
             )
 
     def latest_device_free_mb(self, device_index: int = 0) -> float | None:
@@ -3164,6 +3225,34 @@ class HordeWorkerProcessManager:
             reason=reason,
         )
 
+    def _stats_config_snapshot(self) -> dict[str, str | int | float | bool | None]:
+        """Return a flat snapshot of the throughput-relevant resolved config for the session_start marker.
+
+        A curated, one-level-deep view of the bridge_data fields that shape throughput and resource
+        behaviour. It is the anchor a later analysis uses to attribute an observed change to the
+        configuration it ran under; kept flat and scalar so any downstream reader consumes it directly.
+        """
+        bridge = self.bridge_data
+        image_models = bridge.image_models_to_load
+        return {
+            "max_power": bridge.max_power,
+            "max_threads": bridge.max_threads,
+            "queue_size": bridge.queue_size,
+            "high_performance_mode": bridge.high_performance_mode,
+            "safety_on_gpu": bridge.safety_on_gpu,
+            "unload_models_from_vram_often": bridge.unload_models_from_vram_often,
+            "whole_card_exclusive_residency": bridge.whole_card_exclusive_residency,
+            "gpu_sampling_lease_enabled": bridge.gpu_sampling_lease_enabled,
+            "dedicated_post_processing": bridge.dedicated_post_processing,
+            "post_processing_lane_enabled": bridge.post_processing_lane_enabled,
+            "allow_post_processing": bridge.allow_post_processing,
+            "enable_pipeline_disaggregation": bridge.enable_pipeline_disaggregation,
+            "dreamer": bridge.dreamer,
+            "alchemist": bridge.alchemist,
+            "num_models": len(image_models) if image_models is not None else 0,
+            "gpu_device_indices": str(bridge.gpu_device_indices) if bridge.gpu_device_indices is not None else None,
+        }
+
     def get_run_metrics_snapshot(self) -> RunMetricsSnapshot:
         """Return the run-wide metrics snapshot (stage latencies, downloads, high-waters, crashes)."""
         phase, process_state_summary = self.describe_run_phase()
@@ -3566,6 +3655,8 @@ class HordeWorkerProcessManager:
                 import horde_worker_regen
 
                 self._run_metrics.set_stats_export(enabled, worker_version=horde_worker_regen.__version__)
+                if enabled:
+                    self._run_metrics.record_session_start(config=self._stats_config_snapshot())
                 logger.info(f"Supervisor {'enabled' if enabled else 'disabled'} stats JSONL export.")
 
     def _apply_set_concurrency(self, target_threads: int | None, target_processes: int | None) -> None:
@@ -5093,8 +5184,27 @@ class HordeWorkerProcessManager:
     def _start_timed_shutdown(self) -> None:
         self._shutdown_manager.start_timed_shutdown()
 
+    def _record_session_end_once(self, reason: str) -> None:
+        """Emit the session_end marker at most once, with terminal totals. Best-effort; never raises."""
+        if self._session_end_recorded:
+            return
+        self._session_end_recorded = True
+        try:
+            snapshot = self.get_run_metrics_snapshot()
+            submitted = sum(1 for job in snapshot.jobs if not job.faulted)
+            faulted = sum(1 for job in snapshot.jobs if job.faulted)
+            self._run_metrics.record_session_end(
+                reason=reason,
+                jobs_submitted=submitted,
+                jobs_faulted=faulted,
+                process_recoveries=snapshot.num_process_recoveries,
+            )
+        except Exception as end_error:  # noqa: BLE001 - session_end is best-effort; never block shutdown
+            logger.debug(f"session_end record skipped: {type(end_error).__name__}: {end_error}")
+
     def _shutdown(self) -> None:
         # Flush the latest self-calibration before exit so the next run starts warm.
+        self._record_session_end_once("graceful_shutdown")
         self._performance_model.save()
         self._shutdown_manager.shutdown()
 

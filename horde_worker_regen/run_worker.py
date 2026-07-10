@@ -110,6 +110,26 @@ def main(
         max_total_gb=bridge_data.log_purge_max_total_gb,
     )
 
+    # Same lifecycle for the stats-export directory: compress inactive prior-session files (leaving the
+    # about-to-be-active file untouched), then age out and size-cap. Both steps are best-effort and never
+    # block startup; the compression and delete guards only ever touch recognized stats-v* files.
+    if bridge_data.stats_autozip_enabled:
+        from horde_worker_regen.stats_operations import compress_old_stats_files
+
+        try:
+            compress_old_stats_files(include_latest=False)
+        except Exception as compress_error:  # noqa: BLE001 - stats hygiene must never block startup
+            logger.warning(
+                f"Stats autozip failed ({type(compress_error).__name__}: {compress_error}); continuing startup.",
+            )
+
+    from horde_worker_regen.stats_purge import purge_worker_stats_safely
+
+    purge_worker_stats_safely(
+        max_age_days=bridge_data.stats_purge_max_age_days,
+        max_total_gb=bridge_data.stats_purge_max_total_gb,
+    )
+
     start_working(
         ctx=ctx,
         bridge_data=bridge_data,

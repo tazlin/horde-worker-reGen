@@ -184,6 +184,7 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "Self-maintenance",
             "GPU sampling lease",
             "Logs",
+            "Stats",
             "Other",
         ),
     ),
@@ -229,6 +230,9 @@ SECTION_GUIDANCE: dict[str, str] = {
     "in parallel. Counterproductive with unload_models_from_vram_often (no staged residency to overlap). "
     "Changes to these fields require a worker restart.",
     "Logs": "Automatic log cleanup runs at startup only. Set both values to 0 to keep logs indefinitely.",
+    "Stats": "Structured stats export (.horde_worker_regen/stats) plus its startup retention and autozip. "
+    "Enable export to write a machine-readable per-session stream for offline analysis; cleanup and "
+    "compression run at startup only. Set both retention values to 0 to keep stats indefinitely.",
     "Dry-run": "Testing flags that skip real GPU work. All fields here require a worker restart. "
     "Do not enable these on a production worker.",
 }
@@ -1182,6 +1186,45 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=1024.0,
         unit="GB",
         explicit_default=5.0,
+    ),
+    # Stats
+    ConfigField(
+        "stats_export_enabled",
+        "Export stats JSONL",
+        FieldKind.BOOL,
+        "Stats",
+        "Write a structured per-session stats stream on every start (off by default; the dashboard toggle "
+        "still overrides per session).",
+    ),
+    ConfigField(
+        "stats_purge_max_age_days",
+        "Stats max age",
+        FieldKind.FLOAT,
+        "Stats",
+        "Delete exported stats files older than this many days at startup. 0 disables the age limit.",
+        minimum=0.0,
+        maximum=3650.0,
+        unit="days",
+        explicit_default=30.0,
+    ),
+    ConfigField(
+        "stats_purge_max_total_gb",
+        "Stats max total size",
+        FieldKind.FLOAT,
+        "Stats",
+        "After age cleanup, delete oldest stats files until the stats dir is under this many GB. 0 disables it.",
+        minimum=0.0,
+        maximum=1024.0,
+        unit="GB",
+        explicit_default=5.0,
+    ),
+    ConfigField(
+        "stats_autozip_enabled",
+        "Autozip stats files",
+        FieldKind.BOOL,
+        "Stats",
+        "Gzip inactive prior-session stats files to .jsonl.gz at startup before purging.",
+        explicit_default=True,
     ),
     # ConfigField(
     #     "capture_kudos_training_data",

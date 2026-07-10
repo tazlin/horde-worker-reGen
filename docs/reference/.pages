@@ -2,4 +2,5 @@ title: Reference
 nav:
     - cli.md
     - logs.md
+    - stats.md
     - codebase-map.md

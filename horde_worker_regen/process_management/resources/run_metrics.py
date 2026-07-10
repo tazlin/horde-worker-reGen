@@ -9,10 +9,12 @@ crash events, and headline counters into one :class:`RunMetricsSnapshot`.
 
 from __future__ import annotations
 
+import enum
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
@@ -56,6 +58,56 @@ _STATS_ROTATE_BYTES = 5 * 1024 * 1024
 _STATS_WARNING_BYTES = 50 * 1024 * 1024
 """Drop churn timestamps older than this so the lists stay bounded on a long-running worker. Far wider
 than the duty-cycle report window, so every report's lookback is fully covered."""
+
+_DECISION_HEARTBEAT_SECONDS = 30.0
+"""While a decision holds the same verdict at scheduler-tick rate, emit at most one export record per
+this interval (carrying the accumulated repeat count) rather than one per tick. Bounds a sustained
+head-of-line hold to a transition record plus occasional heartbeats plus a resolution."""
+
+_MAX_TRACKED_DECISIONS = 512
+"""Cap on concurrently-tracked ``(kind, subject)`` decision keys. A subject that is never resolved (a job
+that simply vanished) leaves a stale key; when the cap is exceeded the least-recently-emitted key is
+evicted so the coalescing table cannot grow without bound."""
+
+FlatScalarMap = dict[str, str | int | float | bool | None]
+"""A flat, JSON-scalar-only mapping. Decision/config/resource-state payloads stay one level deep so any
+downstream reader (a timeline tool, a spreadsheet) can consume them without walking nested structures."""
+
+
+class DecisionKind(enum.StrEnum):
+    """Which arbitration produced a :class:`DecisionEvent`."""
+
+    VRAM_ADMISSION = "vram_admission"
+    INFERENCE_DISPATCH = "inference_dispatch"
+    PP_DEFERRAL = "pp_deferral"
+    RECLAIM_RUNG = "reclaim_rung"
+
+
+class DecisionVerdict(enum.StrEnum):
+    """The disposition an arbitration reached for its subject.
+
+    ``admit``/``freed``/``no_op`` are *resolving* verdicts: reaching one closes an open deferral/withhold
+    for that subject (see :data:`_RESOLVING_VERDICTS`). The rest hold the subject and are what the
+    coalescing recorder collapses when they repeat.
+    """
+
+    ADMIT = "admit"
+    DEFER = "defer"
+    DENY = "deny"
+    WITHHOLD = "withhold"
+    FREED = "freed"
+    NO_OP = "no_op"
+
+
+_RESOLVING_VERDICTS = frozenset({DecisionVerdict.ADMIT, DecisionVerdict.FREED, DecisionVerdict.NO_OP})
+
+
+class ResourceStateKind(enum.StrEnum):
+    """Which device/overflow signal changed state in a :class:`ResourceStateEvent`."""
+
+    GOVERNOR = "governor"
+    WDDM_PAGING = "wddm_paging"
+    SATURATION_UNRESOLVED = "saturation_unresolved"
 
 
 class JobMetricsRecord(BaseModel):
@@ -105,6 +157,121 @@ class StatsJobCompletedEvent(BaseModel):
     baseline: str | None = None
 
 
+class SessionStartEvent(BaseModel):
+    """One JSONL export event marking a worker session's start with a resolved config snapshot.
+
+    The config snapshot is a curated flat map of the throughput-relevant bridge_data fields as resolved
+    for this run. It is the anchor that lets a later analysis attribute a behavioural change to the
+    configuration it ran under, and A/B one setting across sessions.
+    """
+
+    event: Literal["session_start"] = "session_start"
+    worker_version: str
+    timestamp: float
+    config: FlatScalarMap = Field(default_factory=dict)
+
+
+class SessionEndEvent(BaseModel):
+    """One JSONL export event marking a worker session's clean end with terminal totals."""
+
+    event: Literal["session_end"] = "session_end"
+    worker_version: str
+    timestamp: float
+    reason: str = ""
+    duration_seconds: float | None = None
+    jobs_submitted: int = 0
+    jobs_faulted: int = 0
+    process_recoveries: int = 0
+    kudos_per_hour: float | None = None
+
+
+class DecisionEvent(BaseModel):
+    """One JSONL export event recording an admission/dispatch/reclaim decision and its inputs.
+
+    ``inputs`` carries the already-computed quantities the arbiter decided from (device-free VRAM,
+    outstanding reservations, the noise margin, the candidate delta, chosen rung, promised/realized
+    frees, ...), so a post-mortem reads the decision arithmetic directly instead of reconstructing it
+    from prose.
+
+    The recorder collapses a decision that repeats verbatim at tick rate: ``repeat_count`` is how many
+    identical evaluations this record stands in for since the previous emission, ``first_seen_ts`` is when
+    the current unresolved condition first appeared, and ``resolved`` is set on the final record emitted
+    when the condition clears (the subject was admitted or freed).
+    """
+
+    event: Literal["decision"] = "decision"
+    decision_kind: DecisionKind
+    subject: str
+    verdict: DecisionVerdict
+    reason: str = ""
+    inputs: FlatScalarMap = Field(default_factory=dict)
+    repeat_count: int = 0
+    first_seen_ts: float
+    timestamp: float
+    resolved: bool = False
+
+
+class ResourceStateEvent(BaseModel):
+    """One JSONL export event recording an edge-triggered device/overflow state transition.
+
+    These are already edge counters (a governor band change, WDDM paging turning active or clearing, the
+    reclaim ladder declaring saturation unresolved), so each call is a genuine transition and no
+    coalescing is required.
+    """
+
+    event: Literal["resource_state"] = "resource_state"
+    state_kind: ResourceStateKind
+    state: str
+    timestamp: float
+    device_index: int | None = None
+    reason: str = ""
+    inputs: FlatScalarMap = Field(default_factory=dict)
+
+
+StatsExportEvent = (
+    StatsSampleEvent
+    | StatsJobCompletedEvent
+    | SessionStartEvent
+    | SessionEndEvent
+    | DecisionEvent
+    | ResourceStateEvent
+)
+"""Any typed event the stats JSONL exporter can append (discriminated by its ``event`` field)."""
+
+
+class DecisionSink(Protocol):
+    """The callable a decision-making collaborator is handed to record its verdicts.
+
+    Structurally satisfied by :meth:`WorkerRunMetrics.record_decision`, so the scheduler and the PP
+    orchestrator can emit decisions without importing (or depending on) the run-metrics aggregator: the
+    process manager injects the bound method, and the coalescing/no-repeat policy lives entirely on the
+    receiving side.
+    """
+
+    def __call__(
+        self,
+        *,
+        decision_kind: DecisionKind,
+        subject: str,
+        verdict: DecisionVerdict,
+        reason: str = ...,
+        inputs: FlatScalarMap | None = ...,
+        timestamp: float | None = ...,
+    ) -> DecisionEvent | None:
+        """Record one decision verdict for ``subject`` (see :meth:`WorkerRunMetrics.record_decision`)."""
+        ...
+
+
+@dataclass
+class _DecisionCoalesceState:
+    """Per-``(kind, subject)`` bookkeeping the decision recorder uses to collapse tick-rate repeats."""
+
+    signature: tuple[str, str]
+    first_seen_ts: float
+    last_emit_ts: float
+    suppressed_since_emit: int
+
+
 class _StatsJsonlExporter:
     """Session-scoped, rotating JSONL writer for stats samples and finalized jobs."""
 
@@ -132,7 +299,7 @@ class _StatsJsonlExporter:
         """Whether export disabled itself after an IO failure."""
         return self._disabled_by_error
 
-    def write(self, event: StatsSampleEvent | StatsJobCompletedEvent) -> bool:
+    def write(self, event: StatsExportEvent) -> bool:
         """Append one typed event. Returns False when an IO error disabled export."""
         if self._disabled_by_error:
             return False
@@ -352,6 +519,9 @@ class WorkerRunMetrics:
         self._form_rollups: dict[str, StatsRollupRow] = {}
         self._stats_exporter: _StatsJsonlExporter | None = None
         self._stats_export_enabled = False
+        self._worker_version = ""
+        self._session_start_time: float | None = None
+        self._decision_states: dict[tuple[DecisionKind, str], _DecisionCoalesceState] = {}
         self._churn_event_times: dict[ChurnKind, list[float]] = {
             "model_swap": [],
             "vram_eviction": [],
@@ -372,6 +542,7 @@ class WorkerRunMetrics:
         self._model_rollups.clear()
         self._baseline_rollups.clear()
         self._form_rollups.clear()
+        self._decision_states.clear()
         for times in self._churn_event_times.values():
             times.clear()
 
@@ -544,8 +715,215 @@ class WorkerRunMetrics:
     def set_stats_export(self, enabled: bool, *, worker_version: str) -> None:
         """Enable or disable session-scoped stats JSONL export."""
         self._stats_export_enabled = enabled
+        self._worker_version = worker_version
         if enabled and self._stats_exporter is None:
             self._stats_exporter = _StatsJsonlExporter(worker_version=worker_version)
+
+    def record_session_start(self, *, config: FlatScalarMap, timestamp: float | None = None) -> None:
+        """Emit a ``session_start`` marker carrying a flat snapshot of the resolved run configuration.
+
+        Records the session start time (used for ``session_end`` duration) unconditionally; writes the
+        export event only when export is enabled. Intended to be called once, at worker start, after
+        :meth:`set_stats_export`, so it is the first line of the session's file.
+        """
+        now = time.time() if timestamp is None else timestamp
+        self._session_start_time = now
+        self._write_export_event(
+            SessionStartEvent(worker_version=self._worker_version, timestamp=now, config=dict(config)),
+        )
+
+    def record_session_end(
+        self,
+        *,
+        reason: str,
+        jobs_submitted: int = 0,
+        jobs_faulted: int = 0,
+        process_recoveries: int = 0,
+        kudos_per_hour: float | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        """Emit a ``session_end`` marker with terminal totals. Writes only when export is enabled."""
+        now = time.time() if timestamp is None else timestamp
+        duration = None if self._session_start_time is None else max(0.0, now - self._session_start_time)
+        self._write_export_event(
+            SessionEndEvent(
+                worker_version=self._worker_version,
+                timestamp=now,
+                reason=reason,
+                duration_seconds=duration,
+                jobs_submitted=jobs_submitted,
+                jobs_faulted=jobs_faulted,
+                process_recoveries=process_recoveries,
+                kudos_per_hour=kudos_per_hour,
+            ),
+        )
+
+    def record_decision(
+        self,
+        *,
+        decision_kind: DecisionKind,
+        subject: str,
+        verdict: DecisionVerdict,
+        reason: str = "",
+        inputs: FlatScalarMap | None = None,
+        timestamp: float | None = None,
+    ) -> DecisionEvent | None:
+        """Record an arbitration decision, coalescing tick-rate repeats into one record plus heartbeats.
+
+        Decision points are re-evaluated every scheduling tick, so a naive per-call emission would flood
+        the export with identical lines many times per second. This is the sole chokepoint that enforces
+        the no-verbatim-repeat rule, keyed by ``(decision_kind, subject)``:
+
+        * A new subject, or a change of ``(verdict, reason)``, emits one transition record.
+        * The same holding verdict repeating only emits again once every
+          :data:`_DECISION_HEARTBEAT_SECONDS`, carrying the accumulated ``repeat_count``.
+        * A *resolving* verdict (:data:`_RESOLVING_VERDICTS`) for a currently-open subject emits one final
+          ``resolved=True`` record and drops the subject; a resolving verdict for an untracked subject is
+          not recorded at all (an admission that never had to wait is not a decision worth a line).
+
+        Returns the event written (for tests/callers), or ``None`` when the call was coalesced away or
+        export is disabled. Safe and cheap to call every tick.
+        """
+        if not self._stats_export_enabled or self._stats_exporter is None:
+            return None
+        now = time.time() if timestamp is None else timestamp
+        key = (decision_kind, subject)
+        signature = (str(verdict), reason)
+        state = self._decision_states.get(key)
+        is_resolving = verdict in _RESOLVING_VERDICTS
+
+        if state is None:
+            if is_resolving:
+                return None
+            self._decision_states[key] = _DecisionCoalesceState(
+                signature=signature,
+                first_seen_ts=now,
+                last_emit_ts=now,
+                suppressed_since_emit=0,
+            )
+            self._prune_decision_states()
+            return self._emit_decision(
+                decision_kind,
+                subject,
+                verdict,
+                reason,
+                inputs,
+                repeat_count=0,
+                first_seen_ts=now,
+                now=now,
+                resolved=False,
+            )
+
+        if is_resolving:
+            del self._decision_states[key]
+            return self._emit_decision(
+                decision_kind,
+                subject,
+                verdict,
+                reason,
+                inputs,
+                repeat_count=state.suppressed_since_emit,
+                first_seen_ts=state.first_seen_ts,
+                now=now,
+                resolved=True,
+            )
+
+        if state.signature != signature:
+            state.signature = signature
+            state.first_seen_ts = now
+            state.last_emit_ts = now
+            state.suppressed_since_emit = 0
+            return self._emit_decision(
+                decision_kind,
+                subject,
+                verdict,
+                reason,
+                inputs,
+                repeat_count=0,
+                first_seen_ts=now,
+                now=now,
+                resolved=False,
+            )
+
+        state.suppressed_since_emit += 1
+        if now - state.last_emit_ts >= _DECISION_HEARTBEAT_SECONDS:
+            repeat_count = state.suppressed_since_emit
+            state.last_emit_ts = now
+            state.suppressed_since_emit = 0
+            return self._emit_decision(
+                decision_kind,
+                subject,
+                verdict,
+                reason,
+                inputs,
+                repeat_count=repeat_count,
+                first_seen_ts=state.first_seen_ts,
+                now=now,
+                resolved=False,
+            )
+        return None
+
+    def record_resource_state(
+        self,
+        *,
+        state_kind: ResourceStateKind,
+        state: str,
+        device_index: int | None = None,
+        reason: str = "",
+        inputs: FlatScalarMap | None = None,
+        timestamp: float | None = None,
+    ) -> ResourceStateEvent | None:
+        """Record an edge-triggered device/overflow transition. Writes only when export is enabled.
+
+        Callers pass genuine transitions (a governor band change, paging turning active or clearing), so
+        no coalescing is applied. Returns the event written, or ``None`` when export is disabled.
+        """
+        if not self._stats_export_enabled or self._stats_exporter is None:
+            return None
+        now = time.time() if timestamp is None else timestamp
+        event = ResourceStateEvent(
+            state_kind=state_kind,
+            state=state,
+            timestamp=now,
+            device_index=device_index,
+            reason=reason,
+            inputs=dict(inputs or {}),
+        )
+        self._write_export_event(event)
+        return event
+
+    def _emit_decision(
+        self,
+        decision_kind: DecisionKind,
+        subject: str,
+        verdict: DecisionVerdict,
+        reason: str,
+        inputs: FlatScalarMap | None,
+        *,
+        repeat_count: int,
+        first_seen_ts: float,
+        now: float,
+        resolved: bool,
+    ) -> DecisionEvent:
+        event = DecisionEvent(
+            decision_kind=decision_kind,
+            subject=subject,
+            verdict=verdict,
+            reason=reason,
+            inputs=dict(inputs or {}),
+            repeat_count=repeat_count,
+            first_seen_ts=first_seen_ts,
+            timestamp=now,
+            resolved=resolved,
+        )
+        self._write_export_event(event)
+        return event
+
+    def _prune_decision_states(self) -> None:
+        if len(self._decision_states) <= _MAX_TRACKED_DECISIONS:
+            return
+        oldest_key = min(self._decision_states, key=lambda k: self._decision_states[k].last_emit_ts)
+        del self._decision_states[oldest_key]
 
     def record_stats_sample(self, sample: StatsSample) -> StatsSample | None:
         """Append a periodic stats sample at most once per second and export it when enabled."""
@@ -634,17 +1012,17 @@ class WorkerRunMetrics:
         if record.phase_metrics is not None and record.phase_metrics.vram_used_high_water_mb is not None:
             row.vram_high_water_mb = max(row.vram_high_water_mb, record.phase_metrics.vram_used_high_water_mb)
 
-    def _write_sample_event(self, sample: StatsSample) -> None:
+    def _write_export_event(self, event: StatsExportEvent) -> None:
         if not self._stats_export_enabled or self._stats_exporter is None:
             return
-        if not self._stats_exporter.write(StatsSampleEvent(sample=sample)):
+        if not self._stats_exporter.write(event):
             self._stats_export_enabled = False
 
+    def _write_sample_event(self, sample: StatsSample) -> None:
+        self._write_export_event(StatsSampleEvent(sample=sample))
+
     def _write_job_event(self, record: JobMetricsRecord, *, baseline: str | None) -> None:
-        if not self._stats_export_enabled or self._stats_exporter is None:
-            return
-        if not self._stats_exporter.write(StatsJobCompletedEvent(job=record, baseline=baseline)):
-            self._stats_export_enabled = False
+        self._write_export_event(StatsJobCompletedEvent(job=record, baseline=baseline))
 
     def _decimated_stats_samples(self) -> list[StatsSample]:
         if len(self._all_stats_samples) <= _STATS_ALL_SESSION_POINTS:
