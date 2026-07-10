@@ -60,9 +60,10 @@ The lane replaces prediction with structure:
   candidates. The lane is considered for whole-lane pause only when post-processing is enabled, the worker is
   still offering it, the process is idle, and no shared-lane work is committed.
 
-Admission to the lane is governed so a chain the card cannot host never wedges it. The orchestrator admits
-a job only when its estimated peak plus the VRAM reserve fits the lane card's free VRAM (with the budget on;
-see [Performance and backpressure](performance_and_backpressure.md)). The manager refreshes the arbiter's
+Admission to the lane is governed so a chain the card cannot host never wedges it. The orchestrator admits a
+job only when its marginal candidate fits measured device-free VRAM minus outstanding reservations and the
+proportional noise margin (with the budget on; see
+[Performance and backpressure](performance_and_backpressure.md)). The manager refreshes the arbiter's
 device-memory snapshot immediately before driving the lane, and the selected post-processing job is priced as
 the head of the drain queue: once inference dispatch is being held to let the lane run, the lane must be able
 to take the same reality-based admit a head-of-queue model would get after reclaim is exhausted. Three
@@ -77,10 +78,16 @@ behaviors keep an unfittable chain from parking the queue:
   circuit breaker because the worker accepted post-processing work it could not host.
 - **Bounded reclaim**: an unfittable job executes each newly available arbiter reclaim plan once per starvation
   episode through the shared reclaim owner, rather than issuing an unrelated model-only sweep every scheduling
-  tick. The plan can release idle caches, evict idle weights, and move safety off-GPU when the operator permits
-  it. If safety is initially busy, its off-GPU action may join and run after the safety backlog clears. This
-  gives accepted lane work a path to the measured room its verdict requires without repeatedly churning
-  inference residency.
+  tick. The first rejection leaves service-lane borrowing disabled while idle caches, idle weights, reducible
+  inference contexts, and any policy-permitted safety action run in their existing order. Only if a fresh
+  measured re-check still does not fit and those softer actions are exhausted may the drain borrow one idle VAE
+  or component lane context. That one-context loan is the episode limit; a continuing non-fit falls through to
+  normal admission aging and recovery instead of stacking lane teardown. Busy service lanes are never
+  candidates; the borrowed pause is kept while PP work remains and restored only after the pending and active
+  PP sets drain. An applied-action receipt and the existing pause-owner guard ensure this path restores only a
+  pause it acquired. Safety may move off-GPU only under the operator's existing policy. This gives accepted lane
+  work a path to measured room without repeatedly churning inference residency or weakening the recovery
+  fences.
 
 Pending post-processing work also owns lane liveness. If the queue is non-empty and no `POST_PROCESS` process
 exists, the orchestrator asks lifecycle to start the lane; lifecycle still owns the actual admission checks

@@ -3624,6 +3624,11 @@ class InferenceScheduler:
             if self._process_lifecycle.is_vae_lane_gpu_paused
             else self._process_map.num_vae_lane_processes(device_index=device_index)
         )
+        component_lane_contexts = (
+            0
+            if self._process_lifecycle.is_component_gpu_paused
+            else self._process_map.num_component_processes(device_index=device_index)
+        )
         idle_process_ids, busy_process_ids = self._gpu_process_activity_ids(device_index)
         return DeviceVramState(
             total_vram_mb=raw_total_mb,
@@ -3644,6 +3649,15 @@ class InferenceScheduler:
             ),
             post_process_context_count=post_process_contexts,
             vae_lane_context_count=vae_lane_contexts,
+            vae_lane_reclaim_allowed=(
+                vae_lane_contexts > 0
+                and self._has_idle_service_lane_for_reclaim(HordeProcessType.VAE_LANE, device_index)
+            ),
+            component_lane_context_count=component_lane_contexts,
+            component_lane_reclaim_allowed=(
+                component_lane_contexts > 0
+                and self._has_idle_service_lane_for_reclaim(HordeProcessType.COMPONENT, device_index)
+            ),
             per_process_overhead_mb=per_process_mb,
             marginal_mb=marginal_mb,
             vram_reserve_mb=self._vram_budget.reserve_mb,
@@ -5062,8 +5076,21 @@ class InferenceScheduler:
 
     def _has_idle_post_process_process_for_reclaim(self, device_index: int | None) -> bool:
         """Return true when a post-processing process is live, idle, and on the requested card."""
+        return self._has_idle_service_lane_for_reclaim(HordeProcessType.POST_PROCESS, device_index)
+
+    def _has_idle_service_lane_for_reclaim(
+        self,
+        process_type: HordeProcessType,
+        device_index: int | None,
+    ) -> bool:
+        """Return whether a live service lane of ``process_type`` is idle on the requested card.
+
+        Lane teardown returns a real CUDA context but is more disruptive than releasing cache or weights, so
+        both candidate-specific PP reclaim and the verified saturation ladder use this same last-moment liveness
+        check. A lane that is encoding, decoding, or post-processing is never offered as a reclaim target.
+        """
         for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.POST_PROCESS:
+            if process_info.process_type != process_type:
                 continue
             if device_index is not None and process_info.device_index != device_index:
                 continue
@@ -5094,6 +5121,7 @@ class InferenceScheduler:
             lifecycle.vae_lane_enabled()
             and not lifecycle.is_vae_lane_gpu_paused
             and self._process_map.num_vae_lane_processes(device_index=device_index) > 0
+            and self._has_idle_service_lane_for_reclaim(HordeProcessType.VAE_LANE, device_index)
         ):
             lanes.append(
                 LaneReclaimCandidate(
@@ -5106,6 +5134,7 @@ class InferenceScheduler:
             lifecycle.component_lane_enabled()
             and not lifecycle.is_component_gpu_paused
             and self._process_map.num_component_processes(device_index=device_index) > 0
+            and self._has_idle_service_lane_for_reclaim(HordeProcessType.COMPONENT, device_index)
         ):
             lanes.append(
                 LaneReclaimCandidate(

@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
+    ActuatorCommandKind,
     VramActuator,
     VramArbiter,
     VramRequest,
@@ -65,6 +66,8 @@ class _DeferralRecord:
     reclaim_requested: bool = False
     applied_actuations: tuple[ActuatorCommand, ...] = ()
     """Most recent arbiter plan executed for this episode; a newly available plan may run once later."""
+    admission_reclaim_attempted: bool = False
+    """Whether a non-fitting arbiter verdict already spent the ordinary cache/model reclaim opportunity."""
 
 
 class PostProcessOrchestrator:
@@ -129,6 +132,11 @@ class PostProcessOrchestrator:
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
         self._deferrals: dict[str, _DeferralRecord] = {}
+        # Service-lane pauses this PP drain actually acquired through the shared reclaim actuator. The receipt
+        # from execute_arbiter_commands excludes no-ops, so restoring these can never lift a same-owner pause an
+        # independent governor episode already held. Kept across individual jobs and released once the accepted
+        # PP queue and active lane both drain, avoiding pause/restore churn between adjacent PP jobs.
+        self._borrowed_service_lane_actuations: set[ActuatorCommandKind] = set()
         # The single VRAM arbiter, injected by the manager. It is the deciding authority for the lane's memory
         # admission question (replacing the banned free-VRAM read). None until wired (and in tests), where the
         # gate admits on missing telemetry.
@@ -160,6 +168,7 @@ class PostProcessOrchestrator:
         arbiter = self._vram_arbiter
         if arbiter is None or not arbiter.has_cycle:
             return None
+        record = self._deferrals.get(str(completed_job_info.sdk_api_job_info.id_))
         return arbiter.evaluate(
             VramRequest(
                 kind=VramRequestKind.PP_JOB,
@@ -169,6 +178,11 @@ class PostProcessOrchestrator:
                 target_process_id=post_process_process.process_id,
                 candidate_delta_mb=reserve_vram_mb,
                 is_head_of_queue=True,
+                allow_idle_service_lane_reclaim=(
+                    record is not None
+                    and record.admission_reclaim_attempted
+                    and not self._borrowed_service_lane_actuations
+                ),
             ),
         )
 
@@ -229,7 +243,7 @@ class PostProcessOrchestrator:
         job_id: object,
         post_process_process: HordeProcessInfo,
         reserve_vram_mb: float,
-        required_actuations: tuple[ActuatorCommand, ...],
+        verdict: VramVerdict,
         now: float,
     ) -> None:
         """Record that a job could not be admitted this tick, requesting reclaim once and logging thriftily.
@@ -248,12 +262,13 @@ class PostProcessOrchestrator:
 
         issued_reclaim = False
         reclaim_action_available = False
+        required_actuations = verdict.required_actuations
         if (
             required_actuations
             and self._vram_actuator is not None
             and required_actuations != record.applied_actuations
         ):
-            VerifiedReclaimLadder.execute_arbiter_commands(
+            applied_actuations = VerifiedReclaimLadder.execute_arbiter_commands(
                 required_actuations,
                 self._vram_actuator,
                 device_index=post_process_process.device_index,
@@ -261,7 +276,13 @@ class PostProcessOrchestrator:
             )
             record.applied_actuations = required_actuations
             record.reclaim_requested = True
-            reclaim_action_available = True
+            for actuation in applied_actuations:
+                if actuation.kind in (
+                    ActuatorCommandKind.PAUSE_VAE_LANE,
+                    ActuatorCommandKind.PAUSE_COMPONENT_LANE,
+                ):
+                    self._borrowed_service_lane_actuations.add(actuation.kind)
+            reclaim_action_available = bool(applied_actuations)
             issued_reclaim = True
         elif not record.reclaim_requested:
             reclaim_action_available = self._request_vram_reclaim(
@@ -270,14 +291,10 @@ class PostProcessOrchestrator:
             )
             record.reclaim_requested = True
             issued_reclaim = True
+        record.admission_reclaim_attempted = True
 
         if first_seen or (now - record.last_logged_at) >= _DEFER_LOG_INTERVAL_SECONDS:
             record.last_logged_at = now
-            bridge_data = self._runtime_config.bridge_data
-            free_vram_mb = self._process_map.get_free_vram_mb(device_index=post_process_process.device_index)
-            available_mb = (
-                free_vram_mb - self._reserve_ledger.total_vram_mb() if free_vram_mb is not None else float("nan")
-            )
             if issued_reclaim:
                 reclaim_note = (
                     "Issued the available VRAM reclaim actions."
@@ -286,10 +303,20 @@ class PostProcessOrchestrator:
                 )
             else:
                 reclaim_note = "Idle VRAM reclaim already requested this episode."
+            measured = verdict.measured
+            device_free_mb = measured.device_free_mb
+            available_mb = measured.available_mb
+            arithmetic = (
+                f"{available_mb:.0f} MB available from device-free {device_free_mb:.0f} MB minus "
+                f"{measured.outstanding_reservations_mb:.0f} MB outstanding reservations and "
+                f"{measured.noise_buffer_mb:.0f} MB noise"
+                if available_mb is not None and device_free_mb is not None
+                else verdict.reason
+            )
             logger.warning(
-                f"Deferring post-processing for job {job_id}: estimated peak {reserve_vram_mb:.0f} MB plus "
-                f"reserve {bridge_data.vram_reserve_mb:.0f} MB exceeds free VRAM after commitments "
-                f"({available_mb:.0f} MB available on card {post_process_process.device_index}). {reclaim_note}",
+                f"Deferring post-processing for job {job_id}: candidate {reserve_vram_mb:.0f} MB does not fit "
+                f"the measured device room on card {post_process_process.device_index} ({arithmetic}). "
+                f"{reclaim_note}",
             )
 
     def _prune_deferrals(self, pending: tuple[HordeJobInfo, ...]) -> None:
@@ -313,6 +340,7 @@ class PostProcessOrchestrator:
         - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation
           episode, not once per scheduling tick.
         """
+        self._restore_borrowed_service_lanes_if_drained()
         pending = self._job_tracker.jobs_pending_post_processing
         self._prune_deferrals(pending)
         if not pending:
@@ -365,6 +393,34 @@ class PostProcessOrchestrator:
         # A no-image fault needs no lane, so age out unservable jobs whether or not the lane is free: a
         # busy or unfittable head must never hold a long-waiting job past its patience window.
         await self._age_out_unfittable(now=now)
+
+    def _restore_borrowed_service_lanes_if_drained(self) -> None:
+        """Restore service lanes this PP drain borrowed once no accepted PP work remains.
+
+        A pause stays in place while a PP job is queued or active, because restoring its CUDA context before the
+        chain allocates would recreate the exact non-fit the pause resolved. Adjacent PP jobs share the same
+        bounded loan. The owner-guarded actuator restore is idempotent; a pause already restored elsewhere is a
+        harmless False, and the receipt-based set ensures this path never attempts to lift a pause it did not
+        acquire.
+        """
+        if not self._borrowed_service_lane_actuations:
+            return
+        if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+            return
+        actuator = self._vram_actuator
+        if actuator is None:
+            return
+
+        # Reverse the reclaim order. The current drain contract borrows at most one lane, and retaining the
+        # canonical unwind order keeps this robust if the eligible lane order grows later.
+        for kind in (ActuatorCommandKind.PAUSE_COMPONENT_LANE, ActuatorCommandKind.PAUSE_VAE_LANE):
+            if kind not in self._borrowed_service_lane_actuations:
+                continue
+            if kind is ActuatorCommandKind.PAUSE_COMPONENT_LANE:
+                actuator.restore_component_lane(None)
+            else:
+                actuator.restore_vae_lane(None)
+            self._borrowed_service_lane_actuations.discard(kind)
 
     def _ensure_lane_liveness_for_pending_work(self) -> None:
         """Ask lifecycle for a lane when pending work has no live dispatch target."""
@@ -450,7 +506,7 @@ class PostProcessOrchestrator:
                 job_id=completed_job_info.sdk_api_job_info.id_,
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
-                required_actuations=verdict.required_actuations,
+                verdict=verdict,
                 now=now,
             )
         return False

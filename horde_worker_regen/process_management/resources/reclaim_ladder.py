@@ -504,7 +504,7 @@ class VerifiedReclaimLadder:
         *,
         device_index: int | None,
         for_head_of_queue: bool,
-    ) -> None:
+    ) -> tuple[ActuatorCommand, ...]:
         """Run the arbiter's deferred-preload actuations through this single reclaim owner.
 
         The verified ladder (governor SATURATED path) and the arbiter's per-cycle DEFER ladder are the worker's
@@ -513,17 +513,30 @@ class VerifiedReclaimLadder:
         :class:`ActuatorCommand` onto the caller's :class:`VramActuator`, one action each, exactly as the
         preload path did inline: RELEASE_CACHE targets an idle lane, EVICT_IDLE_MODEL frees an idle resident,
         REDUCE_LIVE_CONTEXTS collapses the live context count, CYCLE_SAFETY_OFF_GPU frees the safety context.
-        The arbiter guarantees RELEASE_CACHE targets only idle lanes, so a busy lane is never asked to release.
+        The arbiter guarantees RELEASE_CACHE and service-lane pause targets are idle, so live work is never
+        disturbed. Returns exactly the commands whose actuator reported that it acted; callers that temporarily
+        borrow a service lane use this receipt to restore only a pause they actually acquired, never a same-owner
+        pause that the governor's independent saturation episode already held.
         """
+        applied: list[ActuatorCommand] = []
         for command in commands:
             if command.kind is ActuatorCommandKind.RELEASE_CACHE and command.target_process_id is not None:
-                actuator.release_cache(command.target_process_id)
+                acted = actuator.release_cache(command.target_process_id)
             elif command.kind is ActuatorCommandKind.EVICT_IDLE_MODEL:
-                actuator.evict_idle_model(device_index, for_head_of_queue=for_head_of_queue)
+                acted = actuator.evict_idle_model(device_index, for_head_of_queue=for_head_of_queue)
             elif command.kind is ActuatorCommandKind.REDUCE_LIVE_CONTEXTS:
-                actuator.reduce_live_contexts(device_index)
+                acted = actuator.reduce_live_contexts(device_index)
+            elif command.kind is ActuatorCommandKind.PAUSE_VAE_LANE:
+                acted = actuator.pause_vae_lane(device_index)
+            elif command.kind is ActuatorCommandKind.PAUSE_COMPONENT_LANE:
+                acted = actuator.pause_component_lane(device_index)
             elif command.kind is ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU:
-                actuator.cycle_safety_off_gpu(device_index)
+                acted = actuator.cycle_safety_off_gpu(device_index)
+            else:
+                acted = False
+            if acted:
+                applied.append(command)
+        return tuple(applied)
 
     @staticmethod
     def _execute(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> bool:

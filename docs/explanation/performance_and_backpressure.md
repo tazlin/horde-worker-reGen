@@ -592,8 +592,8 @@ to leave the GPU for whole-card/reclaim pressure. A disabled post-processing lan
 offering post-processing at all, a non-idle `POST_PROCESS` process, or queued shared-lane work (image
 post-processing or graph-backed alchemy) is not a pause candidate. An **actively-sampling process is never a
 rung**: it is the one process the driver did not demote, and tearing it down would trade a slow job for a
-faulted one. Both the candidate assembly and the targeted unload refuse a busy process, so immunity holds at
-two layers.
+faulted one. A VAE, component, or post-processing service lane doing live work is likewise never a pause rung.
+Both candidate assembly and the targeted action re-check liveness, so immunity holds at two layers.
 
 It **verifies**. A real release shows up in NVML device-used within a sample or two, so after issuing a rung
 the engine watches the next one or two governor samples and compares the realized device-free gain against
@@ -637,11 +637,26 @@ it) rather than sitting in `PENDING_POST_PROCESSING` forever and wedging the dra
 
 The post-processing drain uses a fresh arbiter snapshot. The control loop refreshes the frozen device picture
 immediately before asking the lane admission gate to run, then refreshes it again before the normal governance
-and inference-scheduling pass. When the scheduler is holding sampling so a pending chain can drain, that chain
-is the head of the drain queue. A non-fitting verdict retains its complete reclaim plan and executes it through
-the shared reclaim owner; when policy permits, safety off-GPU is the final lane-specific action after idle
-caches and weights. The chain then re-asks against the next measured device-free reading rather than waiting
-behind a model-only reclaim that cannot produce the room its verdict requires.
+and inference-scheduling pass. Admission compares the chain's marginal candidate with measured device-free
+VRAM minus outstanding (not-yet-materialized) reservations and the proportional noise margin. It does not add
+the configured reserve to the candidate or subtract already-realized commitments a second time.
+
+When the scheduler is holding sampling so a pending chain can drain, that chain is the head of the drain queue.
+Its first non-fitting verdict keeps service-lane borrowing disabled while the existing idle-cache, idle-model,
+context-count, and policy-permitted safety plan runs through the shared reclaim owner. Within that plan safety
+remains ordered after the softer actions. If a fresh device sample still does not fit and no softer action is
+available, a later verdict may borrow **one** verified-idle disaggregation service context, in the existing
+VAE-then-component ladder order. The loan is capped at one lane for the entire PP drain episode; if that is not
+enough, the worker leaves further teardown to the existing aging and recovery systems. Active sampling still
+blocks admission, a busy service lane is never eligible, and post-processing cannot pause its own lane.
+
+The drain records the actuator's applied-action receipt and restores only a service-lane pause it actually
+acquired. It holds that pause across adjacent queued or active post-processing chains, then unwinds it in
+reverse order once both the pending and active PP sets are empty. This composes with the existing pause-owner
+fence: it cannot clear a whole-card-residency pause or a reclaim-ladder pause acquired by another episode.
+Safety off-GPU remains the final lane-specific action only when the operator's existing policy permits it; this
+drain path neither enables nor bypasses that policy. If no safe reclaim can make the chain fit, queue scanning,
+bounded admission aging, and ultimately SOS remain the liveness backstops.
 
 Whole-card release ordering preserves that priority. Accepted post-processing prevents a residency completion
 from restoring safety onto the GPU until the lane drains. Separately, once the residency model has no pending

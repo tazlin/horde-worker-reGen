@@ -139,6 +139,10 @@ class ActuatorCommandKind(StrEnum):
     """Evict an idle VRAM-resident model to reclaim its weights."""
     REDUCE_LIVE_CONTEXTS = "reduce_live_contexts"
     """Reduce the live inference context count so a retained per-context reservation returns to the device."""
+    PAUSE_VAE_LANE = "pause_vae_lane"
+    """Temporarily stop an idle VAE service lane so its CUDA context returns to the device."""
+    PAUSE_COMPONENT_LANE = "pause_component_lane"
+    """Temporarily stop an idle component service lane so its CUDA context returns to the device."""
     CYCLE_SAFETY_OFF_GPU = "cycle_safety_off_gpu"
     """Cycle the safety model off the GPU to reclaim its context."""
 
@@ -171,6 +175,22 @@ class VramActuator(Protocol):
 
     def reduce_live_contexts(self, device_index: int | None) -> bool:
         """Reduce the live inference-context count so a retained per-context reservation returns to the card."""
+        ...
+
+    def pause_vae_lane(self, device_index: int | None) -> bool:
+        """Pause an idle VAE service lane so its CUDA context returns to the card."""
+        ...
+
+    def pause_component_lane(self, device_index: int | None) -> bool:
+        """Pause an idle component service lane so its CUDA context returns to the card."""
+        ...
+
+    def restore_vae_lane(self, device_index: int | None) -> bool:
+        """Restore a VAE service lane this reclaim path previously paused."""
+        ...
+
+    def restore_component_lane(self, device_index: int | None) -> bool:
+        """Restore a component service lane this reclaim path previously paused."""
         ...
 
     def cycle_safety_off_gpu(self, device_index: int | None) -> bool:
@@ -244,6 +264,12 @@ class VramRequest:
     teardown regardless of that warrant. Both a preload/whole-card head and a monolithic-dispatch head set it
     when they are the true head of queue; an ordinary (un-starved) dispatch and a line-skip never reach the
     escalation."""
+    allow_idle_service_lane_reclaim: bool = False
+    """Whether a re-checked PP drain head may borrow one idle disaggregation service-lane context.
+
+    False on the first admission rejection, while existing cache/model reclaim is still being attempted. The
+    PP orchestrator enables it only on a fresh measured re-check that remains non-fitting, so a reversible lane
+    pause is an escalation after the softer actions rather than a competing first response."""
 
 
 @dataclass(frozen=True)
@@ -294,6 +320,12 @@ class DeviceVramState:
     """Number of on-GPU post-processing contexts on this card."""
     vae_lane_context_count: int = 0
     """Number of on-GPU VAE/image-lane contexts on this card."""
+    vae_lane_reclaim_allowed: bool = False
+    """Whether a VAE service lane on this card is live, idle, and policy-owned by no existing pause."""
+    component_lane_context_count: int = 0
+    """Number of on-GPU component/text-encode contexts on this card."""
+    component_lane_reclaim_allowed: bool = False
+    """Whether a component service lane on this card is live, idle, and policy-owned by no existing pause."""
     per_process_overhead_mb: float = 0.0
     """Fixed device overhead (MB) of the first/sole CUDA context."""
     marginal_mb: float = 0.0
@@ -678,7 +710,23 @@ class VramArbiter:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.EVICT_IDLE_MODEL, device_index=None))
         if request.can_reduce_live_contexts:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None))
-        if request.kind is VramRequestKind.PP_JOB and state.safety_context_count > 0 and state.safety_reclaim_allowed:
+        service_lane_added = False
+        if request.kind is VramRequestKind.PP_JOB and request.allow_idle_service_lane_reclaim and not commands:
+            # PP cannot pause its own lane. Offer one idle disaggregation service context in the verified
+            # ladder's existing VAE -> component order. The caller caps this at one successful loan for the
+            # drain episode and restores only a pause whose actuator reported that it actually acquired.
+            if state.vae_lane_context_count > 0 and state.vae_lane_reclaim_allowed:
+                commands.append(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_VAE_LANE, device_index=None))
+                service_lane_added = True
+            elif state.component_lane_context_count > 0 and state.component_lane_reclaim_allowed:
+                commands.append(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_COMPONENT_LANE, device_index=None))
+                service_lane_added = True
+        if (
+            request.kind is VramRequestKind.PP_JOB
+            and not service_lane_added
+            and state.safety_context_count > 0
+            and state.safety_reclaim_allowed
+        ):
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None))
         return tuple(commands)
 

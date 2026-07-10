@@ -454,12 +454,13 @@ _PP_DEFER_WARNING_THRESHOLD = 10
 def detect_post_processing_deferral_starvation(context: SessionContext) -> list[Finding]:
     """The post-processing lane deferring the same job indefinitely instead of serving or faulting it.
 
-    The lane's admission gate compares a job's estimated peak (plus the configured reserve) against the
-    card's free VRAM after commitments. When that inequality can never be satisfied for the head of the
-    pending queue, the head is deferred every scheduling tick, everything behind it waits, and the
-    worker never reports the job faulted. The signature is one job accumulating deferral warnings by the
-    tens to hundreds; when no lane completion lands after the storm begins, the whole lane is starved, not
-    just the head.
+    The lane's admission gate compares a job's marginal post-processing candidate against truthful device-free
+    VRAM after outstanding reservations and the admission noise margin. Older logs described a different
+    free-after-commitments figure, but both formats share the stable ``Deferring post-processing`` prefix this
+    detector keys on. When the measured fit can never be satisfied for the head, the head is deferred every
+    scheduling tick, everything behind it waits, and the worker never reports the job faulted. The signature is
+    one job accumulating deferral warnings by the tens to hundreds; when no lane completion lands after the
+    storm begins, the whole lane is starved, not just the head.
     """
     defer_records: dict[str, list[LogRecord]] = {}
     for record in context.session.records:
@@ -484,9 +485,9 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
 
     verdict = (
         f"Job {worst_job} was deferred by the post-processing admission gate {len(worst)} time(s) "
-        f"({len(defer_records)} job(s) deferred in total). Its estimated peak plus the VRAM reserve never "
-        "fit the card's free-after-commitments figure, and no bounded no-image fault ever released it, so its "
-        "finished inference was held unsubmitted."
+        f"({len(defer_records)} job(s) deferred in total). Its marginal post-processing candidate never fit "
+        "the card's measured device room, and no bounded no-image fault ever released it, so its finished "
+        "inference was held unsubmitted."
     )
     if lane_fully_starved:
         verdict += (
@@ -500,13 +501,13 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
             title="Post-processing lane starved by its admission gate",
             verdict=verdict,
             remediation=(
-                "Verify the admission inputs: the free-VRAM figure must reflect the lane's card (not a stale "
-                "minimum across children) and must not re-subtract commitments already realised in the "
-                "measurement, and the per-chain peak estimate must match measured op costs. A deferred job "
-                "must age out to a no-image fault after a bounded wait instead of parking forever, and "
-                "fittable jobs behind an unfittable head must be dispatched ahead of it. As a stopgap, "
-                "lower resident VRAM on the lane's card (fewer processes or models) or disable "
-                "post-processing on this worker."
+                "Verify the admission inputs: device-free VRAM must reflect the lane's card, reservations must "
+                "include only memory not yet materialized in that measurement, the proportional noise margin "
+                "must be applied once, and the per-chain marginal candidate must match measured operation "
+                "costs. A deferred drain head should spend ordinary idle cache/model reclaim first, then may "
+                "temporarily borrow only a verified-idle service-lane context. It must still age out to a "
+                "no-image fault after a bounded wait, and fittable jobs behind it must be allowed to pass. As a "
+                "stopgap, lower resident VRAM on the lane's card or disable post-processing on this worker."
             ),
             evidence=[_evidence(r) for r in (worst[:2] + worst[-2:])],
             see_also="process_lanes_and_chaining",

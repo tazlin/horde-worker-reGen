@@ -44,6 +44,19 @@ Get-Content bridge_1.log -Wait
 less +F bridge_1.log
 ```
 
+## VRAM admission diagnostics
+
+A warning beginning `Deferring post-processing for job` records a lane-admission miss. Its candidate is the
+post-processing chain's marginal VRAM requirement. The available-room expression reports the same arithmetic
+the arbiter decided from: current device-free VRAM minus outstanding reservations and the proportional noise
+margin. Outstanding means memory not yet materialized in the device-free sample; already-realized commitments
+are not subtracted again.
+
+The stable prefix is part of the diagnostics contract used by `horde-log diagnose`. The numeric wording may
+become more precise without invalidating older logs, so the detector accepts both the current measured-room
+format and the former free-after-commitments format. Repeated warnings for one job, with no later PP completion,
+surface as `post_processing_deferral_starvation` in the dashboard's Diagnostics tab.
+
 ## Sharing logs
 
 Do **not** post `.log` files in public channels. Send them to a maintainer directly: we cannot

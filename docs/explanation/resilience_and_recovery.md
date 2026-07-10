@@ -210,6 +210,17 @@ manager-side **actions**:
   `run_recovery_supervisor()` runs each control-loop tick and applies the
   returned action.
 
+  A pending post-processing drain can deliberately hold new inference sampling,
+  so admission gets one bounded chance to reclaim ordinary idle memory and, only
+  after a fresh non-fitting measurement, borrow one verified-idle VAE or component
+  service-lane context. That resolves the known all-idle mutex before it matures
+  into a structural queue deadlock. It does **not** excuse the queue from wedge
+  assessment, reset the structural-deadlock timer, or suppress SOS. When no safe
+  context can be reclaimed—or the operator's safety-placement policy forbids the
+  remaining action—the ordinary admission-patience fault and SOS escalation stay
+  authoritative. The local fix removes the avoidable resource cycle without
+  weakening the recovery system that catches every other cause.
+
   A wedge episode closes (and its escalation counter resets) on a clean streak
   alone only before any soft reset has been attempted. Once a soft reset has been
   spent, the streak must be corroborated by real forward progress since the most
