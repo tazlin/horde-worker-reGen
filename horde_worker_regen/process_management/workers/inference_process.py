@@ -522,42 +522,52 @@ class HordeInferenceProcess(HordeProcess):
         Returns:
             float | None: The time elapsed during downloading, or None if no models were downloaded.
         """
-        # Not a plain ``with self._aux_model_lock:`` because the bound block-exit release can raise
-        # when the supervisor has force-released the shared lock out from under us; see
+        lora_manager = self._shared_model_manager.manager.lora
+        if lora_manager is None:
+            raise RuntimeError("Failed to load LORA model manager")
+
+        loras = job_info.payload.loras or []
+        if not loras:
+            # A job with no LoRAs has no aux work, so it must never touch the process-wide
+            # ``_aux_model_lock`` (a single bounded semaphore shared by every inference child). Acquiring
+            # it here would serialize a no-LoRA job behind an unrelated slot's in-flight LoRA download,
+            # and those no-LoRA jobs are exactly the quick work used to keep the GPU fed while another
+            # slot downloads. Blocking them there strands the card, and because it happens before any
+            # heartbeat-protected busy state is published, the stalled job also reads as orphaned/hung to
+            # the watchdogs.
+            logger.info("No auxiliary models to download")
+            return None
+
+        # Publish the busy state and start the liveness heartbeat *before* the blocking lock acquire and
+        # any drain. The shared ``_aux_model_lock`` acquire below can itself block for the entire duration
+        # of another slot's LoRA download; the in-flight-download drains further in (``reset_adhoc_cache``
+        # and ``wait_for_downloads``) are likewise unbounded and can stall on a wedged background download
+        # (e.g. one retrying ENOSPC on a full disk). Until the parent has seen DOWNLOADING_AUX_MODEL it
+        # reads this slot as WAITING_FOR_JOB (``can_accept_job``) and punts the in-progress job; without a
+        # heartbeat the same stall reads as a hung process. Either verdict escalates to a Save-our-ship
+        # soft reset. Starting both signals up front keeps the slot visibly busy-and-alive for the whole
+        # aux phase, lock-wait included.
+        self.send_aux_model_message(
+            process_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
+            info="Resolving auxiliary models",
+            time_elapsed=0.0,
+            job_info=job_info,
+        )
+        self.send_heartbeat_message(HordeHeartbeatType.OTHER)
+        aux_heartbeat_stop, aux_heartbeat_thread = self._start_aux_download_heartbeat_thread()
+
+        # Not a plain ``with self._aux_model_lock:`` because the bound block-exit release can raise when
+        # the supervisor has force-released the shared lock out from under us; see
         # ``_release_aux_model_lock`` for why that over-release is benign and must not be fatal.
-        self._aux_model_lock.acquire()
+        aux_lock_acquired = False
         try:
+            self._aux_model_lock.acquire()
+            aux_lock_acquired = True
+
             time_start = time.time()
             deadline_at = (
                 time_start + aux_download_deadline_seconds if aux_download_deadline_seconds is not None else None
             )
-
-            lora_manager = self._shared_model_manager.manager.lora
-            if lora_manager is None:
-                raise RuntimeError("Failed to load LORA model manager")
-
-            loras = job_info.payload.loras or []
-            if not loras:
-                logger.info("No auxiliary models to download")
-                return None
-
-            # Publish the busy state and start the liveness heartbeat *before* any blocking drain. Both
-            # the in-flight-download drains below (``reset_adhoc_cache`` and the already-available-LoRA
-            # ``wait_for_downloads``) are unbounded and can stall indefinitely on a wedged background
-            # download (e.g. one retrying ENOSPC on a full disk). Until the parent has seen
-            # DOWNLOADING_AUX_MODEL it still reads this slot as WAITING_FOR_JOB (``can_accept_job``), so
-            # the orphaned-job watchdog punts the in-progress job; without a heartbeat the same stall
-            # reads as a hung process. Either verdict escalates to a Save-our-ship soft reset (an
-            # observed disk-full recovery storm). Starting both signals up front keeps the slot visibly
-            # busy-and-alive for the whole aux phase, however long a drain blocks.
-            self.send_aux_model_message(
-                process_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
-                info="Resolving auxiliary models",
-                time_elapsed=0.0,
-                job_info=job_info,
-            )
-            self.send_heartbeat_message(HordeHeartbeatType.OTHER)
-            aux_heartbeat_stop, aux_heartbeat_thread = self._start_aux_download_heartbeat_thread()
 
             performed_a_download = False
             try:
@@ -643,7 +653,13 @@ class HordeInferenceProcess(HordeProcess):
             logger.info("No auxiliary models downloaded")
             return None
         finally:
-            self._release_aux_model_lock()
+            # Idempotent with the inner finally around the download loop; also covers the case where the
+            # blocking acquire above raised before that inner block ran, so the heartbeat thread never
+            # outlives this call.
+            aux_heartbeat_stop.set()
+            aux_heartbeat_thread.join(timeout=1.0)
+            if aux_lock_acquired:
+                self._release_aux_model_lock()
 
     def _release_aux_model_lock(self) -> None:
         """Release the shared aux-model lock, tolerating a benign supervisor-forced over-release.

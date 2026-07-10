@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import multiprocessing
 import queue
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
+
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
@@ -31,25 +34,49 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 from tests.process_management.conftest import make_job_pop_response
 
+# A LoRA job so ``download_aux_models`` actually takes the shared lock: a no-LoRA job now returns before
+# ever acquiring it (see ``test_aux_lock_no_lora_passthrough_repro``), so the over-release it once guarded
+# cannot arise on that path at all. The over-release hazard exists only for jobs that hold the lock.
+_JOB_LORAS = [LorasPayloadEntry(name="1683285", model=1.0, clip=1.0, is_version=True)]
 
-class _LockReclaimingManager:
-    """Lora-manager holder that force-releases the shared aux lock the first time it is touched.
+
+class _LockReclaimingLoraManager:
+    """Lora manager that force-releases the shared aux lock from *inside* the critical section.
 
     Stands in for the supervisor concurrently reclaiming the shared aux-model lock (via
-    ``_release_held_primitives``) while this still-alive child is mid critical-section.
+    ``_release_held_primitives``) while this still-alive child holds it. The release is injected into
+    ``reset_adhoc_cache`` -- the first manager call ``download_aux_models`` makes *after* acquiring the
+    lock -- so it faithfully models a reclaim of a genuinely-held lock. The job's LoRA is reported
+    already-available, so the method performs no fresh fetch and its only real work is draining.
     """
 
     def __init__(self, aux_lock: Any) -> None:  # noqa: ANN401
         self._aux_lock = aux_lock
         self._fired = False
 
-    @property
-    def lora(self) -> Mock:
+    def load_model_database(self) -> None:
+        return None
+
+    def reset_adhoc_cache(self) -> None:
         if not self._fired:
             self._fired = True
-            # The supervisor's force-release lands here, inside the child's `with` block.
+            # The supervisor's force-release lands here, while the child holds the lock.
             self._aux_lock.release()
-        return Mock()  # a non-None lora manager; a no-LoRA job returns before it is used
+
+    def is_model_available(self, name: Any) -> bool:  # noqa: ANN401
+        return True
+
+    def wait_for_downloads(self, timeout: float | None = None) -> None:
+        return None
+
+    def are_downloads_complete(self) -> bool:
+        return True
+
+    def save_reference_to_disk(self) -> None:
+        return None
+
+    def fetch_adhoc_lora(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - not reached
+        raise AssertionError("the already-available LoRA must not be re-fetched")
 
 
 def _bare_inference_proc(aux_lock: Any, active_model: str) -> HordeInferenceProcess:  # noqa: ANN401
@@ -60,12 +87,21 @@ def _bare_inference_proc(aux_lock: Any, active_model: str) -> HordeInferenceProc
     """
     proc = object.__new__(HordeInferenceProcess)
     proc._aux_model_lock = aux_lock
-    proc._shared_model_manager = SimpleNamespace(manager=_LockReclaimingManager(aux_lock))  # pyrefly: ignore
+    proc._shared_model_manager = SimpleNamespace(  # pyrefly: ignore
+        manager=SimpleNamespace(lora=_LockReclaimingLoraManager(aux_lock)),
+    )
     proc._active_model_name = active_model
     proc._end_process = False
     proc._control_inbox = queue.Queue()
     proc.on_horde_model_state_change = Mock()  # pyrefly: ignore
     proc.send_process_state_change_message = Mock()  # pyrefly: ignore
+    # The busy state + heartbeat now publish before the blocking acquire; stub them and the disk-floor
+    # and metrics helpers so the test isolates the lock behaviour.
+    proc.send_aux_model_message = Mock()  # pyrefly: ignore
+    proc.send_heartbeat_message = Mock()  # pyrefly: ignore
+    proc._start_aux_download_heartbeat_thread = Mock(return_value=(threading.Event(), Mock()))  # pyrefly: ignore
+    proc._enforce_lora_disk_floor = Mock()  # pyrefly: ignore
+    proc._send_download_metrics_if_any = Mock()  # pyrefly: ignore
     # The resident START_INFERENCE branch runs inference once the aux download returns; stub it (and
     # the result hand-off) so the test isolates the lock behaviour, not the HordeLib inference path.
     proc.start_inference = Mock(return_value=[object()])  # pyrefly: ignore
@@ -82,7 +118,7 @@ def test_download_aux_models_survives_supervisor_lock_reclaim() -> None:
     """
     aux_lock = multiprocessing.Lock()
     proc = _bare_inference_proc(aux_lock, active_model="CyberRealistic Pony")
-    job = make_job_pop_response(model="CyberRealistic Pony", loras=None)
+    job = make_job_pop_response(model="CyberRealistic Pony", loras=_JOB_LORAS)
 
     result = proc.download_aux_models(job)
 
@@ -103,7 +139,7 @@ def test_aux_lock_over_release_does_not_end_the_inference_process() -> None:
     aux_lock = multiprocessing.Lock()
     model = "CyberRealistic Pony"
     proc = _bare_inference_proc(aux_lock, active_model=model)
-    job = make_job_pop_response(model=model, loras=None)
+    job = make_job_pop_response(model=model, loras=_JOB_LORAS)
 
     proc._control_inbox.put(
         HordeInferenceControlMessage(
