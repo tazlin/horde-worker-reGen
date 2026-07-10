@@ -33,6 +33,7 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
+    LorasPayloadEntry,
 )
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import GenerationID
@@ -317,6 +318,13 @@ class JobTracker:
         # Cumulative completed inference results per card, for the dashboard's per-card jobs/hr trend. Keyed
         # like the fault streaks (device_index, None on a single-GPU host); monotonic across the session.
         self._card_inference_results: dict[int | None, int] = {}
+
+        # LoRA files known present on disk, keyed by (name, is_version), learned as jobs complete their aux
+        # downloads. A pending LoRA job may line-skip onto an idle sibling lane only when every LoRA it needs
+        # is already here: otherwise the skip would just move the blocking download to that lane. The
+        # scheduler consults this to keep an all-LoRA queue feeding the GPU without trading one download for
+        # another, and drops the set whenever files may be evicted underneath it (see clear_cached_loras).
+        self._cached_lora_keys: set[str] = set()
 
         # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
         # tracker faults terminally; the worker opts into bounded retry via set_retry_policy().
@@ -1241,6 +1249,37 @@ class JobTracker:
             return False
         tracked.job_info.time_to_download_aux_models = time_elapsed
         return True
+
+    @staticmethod
+    def _lora_cache_key(lora: LorasPayloadEntry) -> str:
+        """Identity of the on-disk file a LoRA payload entry resolves to.
+
+        Only the reference (``name``) and whether it names a specific version (``is_version``) select the
+        file; the per-job strengths and trigger injection do not change what is downloaded.
+        """
+        return f"{lora.name}\x1f{bool(lora.is_version)}"
+
+    def mark_job_loras_cached(self, job: ImageGenerateJobPopResponse | None) -> None:
+        """Record that every LoRA ``job`` needs is now present on disk (its aux download completed).
+
+        Synchronous on purpose: the read side runs inside the scheduler's synchronous dispatch selection.
+        """
+        if job is None:
+            return
+        for lora in job.payload.loras or []:
+            self._cached_lora_keys.add(self._lora_cache_key(lora))
+
+    def are_all_job_loras_cached(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether every LoRA ``job`` needs has been seen present on disk this session.
+
+        Vacuously True for a job with no LoRAs. A caller avoiding a fresh blocking download checks this
+        before line-skipping a LoRA-carrying job onto an idle lane.
+        """
+        return all(self._lora_cache_key(lora) in self._cached_lora_keys for lora in job.payload.loras or [])
+
+    def clear_cached_loras(self) -> None:
+        """Forget the cached-LoRA set, for when files may have been evicted underneath the worker."""
+        self._cached_lora_keys.clear()
 
     async def get_time_popped(self, job: ImageGenerateJobPopResponse) -> float | None:
         """Get the time a job was popped from the queue."""

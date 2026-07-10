@@ -5833,6 +5833,23 @@ class InferenceScheduler:
             }
         logger.debug(f"Line-skip candidate {candidate_id} {message}")
 
+    def _loras_cached_for_line_skip(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``job``'s LoRAs are all on disk, so line-skipping onto it introduces no fresh download.
+
+        The line-skip contract refuses a LoRA-carrying candidate because filling the idle lane with another
+        download would only trade one blocking download for another. That reasoning holds only while the
+        LoRAs are absent: once every LoRA a job needs is already cached, skipping it onto a resident idle
+        lane samples immediately and keeps the GPU fed from an otherwise all-LoRA queue. The cached set is
+        not trusted while the worker purges LoRAs on download or its LoRA disk is exhausted, since either can
+        evict a file after it was recorded; in those modes the set is dropped and the candidate is refused,
+        preserving the no-trade contract.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        if bridge_data.purge_loras_on_download or self._state.lora_disk_exhausted:
+            self._job_tracker.clear_cached_loras()
+            return False
+        return self._job_tracker.are_all_job_loras_cached(job)
+
     def _select_line_skip_candidate(
         self,
         displaced_job: ImageGenerateJobPopResponse,
@@ -5843,14 +5860,17 @@ class InferenceScheduler:
     ) -> NextJobAndProcess | None:
         """Select a small, ready job that may bypass ``displaced_job`` while its slot is non-sampling.
 
-        Scans the pending jobs for the first resident on an idle process that carries no LoRAs, is not a
-        degraded retry, and is within the per-performance-mode size limit. A candidate sharing the blocked
-        head's model qualifies as long as that model is resident on a *different* idle process than the
-        downloading head (``displaced_process_id``): during an aux-model download the head's own slot reads
-        as able to accept work, so a same-model skip is routed onto a sibling copy, never back onto the
-        downloading slot. This keeps a mono-model queue from starving the GPU whenever its one head stalls
-        on a LoRA download. Returns a :class:`NextJobAndProcess` carrying the :class:`LineSkip` record, or
-        None when nothing qualifies. Rejections are logged (rate-limited).
+        Scans the pending jobs for the first resident on an idle process that carries no LoRAs it must still
+        download, is not a degraded retry, and is within the per-performance-mode size limit. A LoRA-carrying
+        candidate qualifies only when every LoRA it needs is already cached on disk (see
+        :meth:`_loras_cached_for_line_skip`), so the skip introduces no fresh blocking download in place of
+        the head's. A candidate sharing the blocked head's model qualifies as long as that model is resident
+        on a *different* idle process than the downloading head (``displaced_process_id``): during an
+        aux-model download the head's own slot reads as able to accept work, so a same-model skip is routed
+        onto a sibling copy, never back onto the downloading slot. This keeps a mono-model queue from
+        starving the GPU whenever its one head stalls on a LoRA download. Returns a
+        :class:`NextJobAndProcess` carrying the :class:`LineSkip` record, or None when nothing qualifies.
+        Rejections are logged (rate-limited).
         """
         for candidate_small_job in next_n_jobs:
             candidate_id = str(candidate_small_job.id_)[:8]
@@ -5860,8 +5880,13 @@ class InferenceScheduler:
             if candidate_small_job.model is None:
                 self._log_line_skip_rejection(candidate_id, "missing_model", "rejected: missing model.")
                 continue
-            if job_has_loras:
-                self._log_line_skip_rejection(candidate_id, "has_loras", "rejected: candidate has LoRAs.")
+            if job_has_loras and not self._loras_cached_for_line_skip(candidate_small_job):
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "uncached_loras",
+                    "rejected: candidate has LoRAs not yet cached on disk (skipping would trade one blocking "
+                    "download for another).",
+                )
                 continue
             if self._job_tracker.is_degraded_dispatch_pending(candidate_small_job):
                 self._log_line_skip_rejection(

@@ -839,6 +839,9 @@ class MessageDispatcher:
                 f"in {message.time_elapsed}"
                 "</>",
             )
+            # The job's LoRAs are now on disk; record them so a later pending job needing the same LoRAs may
+            # line-skip an aux-download-blocked lane without itself triggering a fresh blocking download.
+            self._job_tracker.mark_job_loras_cached(message.sdk_api_job_info)
             if message.sdk_api_job_info not in self._job_tracker.jobs_lookup:
                 if message.sdk_api_job_info is not None:
                     logger.warning(

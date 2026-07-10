@@ -280,17 +280,28 @@ different job, causing the block decision to be wasted.
 
 #### Sourcing a skip job when none is queued
 
-A line-skip needs a small, non-LoRA job that is already resident on an idle
-sibling process. A candidate sharing the blocked head's model qualifies too, as
+A line-skip needs a small job that is already resident on an idle sibling process
+and that needs no fresh download to run. A candidate carrying LoRAs qualifies only
+when *every* LoRA it needs is already cached on disk: the job tracker learns which
+LoRAs are present as jobs complete their aux downloads (`mark_job_loras_cached` on
+each `DOWNLOAD_AUX_COMPLETE`), and the scheduler admits a LoRA candidate only when
+all of its LoRAs are in that set. This preserves the standing "don't trade one
+blocking download for another" contract exactly (an uncached LoRA candidate would
+only move the download to the borrowed lane) while still feeding the GPU from an
+all-LoRA queue whose files were already fetched by an earlier job. The cache is not
+trusted while the worker purges LoRAs on download (`purge_loras_on_download`) or its
+LoRA disk is exhausted (`WorkerState.lora_disk_exhausted`), since either can evict a
+file after it was recorded; in those modes the set is dropped and LoRA candidates are
+refused. A candidate sharing the blocked head's model qualifies too, as
 long as that model is resident on a *different* idle process than the downloading
 head (its own slot reads as able to accept work while it downloads aux models, so
 the skip is routed onto a sibling copy, never back onto the downloading slot).
 This keeps a mono-model queue from starving whenever its one head stalls on a
-LoRA download. Often a candidate is available: the queue holds a mix and the
-scheduler simply picks it. But when the blocked head sits behind an
-auxiliary-model download and *nothing queued qualifies* (every other queued job is
-itself LoRA-bearing, is too large, or shares the head's model with no idle sibling
-copy to run it on), the GPU would idle for the whole download. `aux_model_download_line_skip_threshold_seconds` bounds how long the
+LoRA download. Often a candidate is available: the queue holds a mix, or a cached
+LoRA, and the scheduler simply picks it. But when the blocked head sits behind an
+auxiliary-model download and *nothing queued qualifies* (every other queued job
+needs an uncached LoRA download, is too large, is not resident, or shares the head's
+model with no idle sibling copy to run it on), the GPU would idle for the whole download. `aux_model_download_line_skip_threshold_seconds` bounds how long the
 scheduler tolerates that before acting: once a slot has been in
 `DOWNLOADING_AUX_MODEL` past the threshold with no usable candidate, it arms
 `WorkerState.wants_line_skip_candidate`. Two things then happen:
