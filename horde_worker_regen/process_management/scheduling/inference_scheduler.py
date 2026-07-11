@@ -644,6 +644,7 @@ class InferenceScheduler:
         self._model_recently_missing_time = 0.0
         self._batch_wait_log_time = 0.0
         self._pending_line_skip = None
+        self._aux_backfill_heads_staged: set[str] = set()
         self._model_last_in_demand = {}
 
         # Constructed with safe defaults; the live reserves are synced from the (reloadable) config each
@@ -4642,9 +4643,17 @@ class InferenceScheduler:
             for_head_of_queue=is_head_blocker,
             device_index=target_device_index,
         )
-        idle_contexts_teardownable = is_head_blocker and self._has_teardownable_idle_context(
-            available_process,
+        live_inference_processes = self._process_map.num_loaded_inference_processes(
             device_index=target_device_index,
+        )
+        idle_contexts_teardownable = (
+            is_head_blocker
+            and max_resident is not None
+            and max_resident < live_inference_processes
+            and self._has_teardownable_idle_context(
+                available_process,
+                device_index=target_device_index,
+            )
         )
         request = self._build_preload_request(
             job,
@@ -5032,10 +5041,17 @@ class InferenceScheduler:
 
         Establishes whole-card residency for the head at the depth the rejected peak sized, then evicts the
         idle residents on the other processes so their contexts' retained VRAM returns to the card. A no-op
-        when no head-preload context is recorded.
+        when no head-preload context is recorded, the target could not be sized, or the command is stale and
+        the live pool is already at or below its target. The last guard is deliberately before exclusivity and
+        residency side effects: a command that cannot remove a context must not reserve the card, pause service
+        lanes, or open a whole-card grace window that masks a genuine structural wedge.
         """
         actuation = self._preload_actuation
         if actuation is None:
+            return False
+        target = actuation.max_resident
+        live_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        if target is None or target >= live_processes:
             return False
         first_time = not self._job_tracker.is_admitted_exclusive(actuation.job)
         self._job_tracker.mark_admitted_exclusive(actuation.job)
@@ -5043,7 +5059,7 @@ class InferenceScheduler:
             actuation.job,
             actuation.forecast,
             announce=first_time,
-            target_override=actuation.max_resident,
+            target_override=target,
             device_index=device_index,
         )
         self.unload_models_from_vram(
@@ -5337,6 +5353,7 @@ class InferenceScheduler:
         self._restore_deferred_safety_gpu_load()
         self._converge_whole_card_residency()
         self._expire_stale_model_map_entries()
+        self._prune_aux_backfill_staging_claims()
 
         if self._pending_post_processing_should_hold_preload():
             return False
@@ -5609,6 +5626,45 @@ class InferenceScheduler:
                 reason="preload concurrency gate",
             )
 
+        aux_backfill_forecast = (
+            self._aux_blocked_backfill_staging_forecast(
+                job,
+                head_job=head_job,
+                available_process=available_process,
+            )
+            if self._budget_active()
+            else None
+        )
+        if aux_backfill_forecast is not None:
+            baseline = self._model_metadata.get_baseline(job.model)
+            if not self._apply_ram_verdict(
+                job,
+                baseline,
+                is_head_blocker=False,
+                no_live_resource_consumer=False,
+            ):
+                return self._preload_outcome(
+                    AdmissionDecision.DEFER_BUDGET,
+                    job=job,
+                    process=available_process,
+                    reason="aux-blocked backfill does not fit the RAM budget",
+                )
+            if self._send_preload(job, available_process):
+                assert head_job is not None
+                self._aux_backfill_heads_staged.add(self._job_tracking_key(head_job))
+                return self._preload_outcome(
+                    AdmissionDecision.PRESTAGE,
+                    job=job,
+                    process=available_process,
+                    reason="RAM-staged quick backfill while queue head downloads auxiliaries",
+                )
+            return self._preload_outcome(
+                AdmissionDecision.STOP_PASS,
+                job=job,
+                process=available_process,
+                reason="aux-blocked backfill preload send failed",
+            )
+
         # Resource budget gate: a fresh preload loads this model's weights into the shared device
         # (VRAM) and into system RAM, so admit it only when both measured free VRAM and available
         # RAM cover its estimated cost plus their reserves. This is the proactive guard against the
@@ -5631,6 +5687,84 @@ class InferenceScheduler:
         return self._preload_outcome(
             AdmissionDecision.STOP_PASS, job=job, process=available_process, reason="preload send failed"
         )
+
+    def _aux_blocked_backfill_staging_forecast(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        head_job: ImageGenerateJobPopResponse | None,
+        available_process: HordeProcessInfo,
+    ) -> StreamForecast | None:
+        """Return the forecast when ``job`` may stage behind an auxiliary-blocked queue head.
+
+        A model preload stages weights in system RAM; the model does not materialize on the device until
+        dispatch. When the queue head is downloading auxiliaries, charging its future sampling footprint can
+        otherwise prevent every later nonresident model from staging, while line-skip requires exactly such a
+        resident model. This bounded path permits one ordinary preload pass to stage a quick, distinct-model
+        backfill without treating the two jobs as concurrent samplers.
+
+        The candidate must satisfy the same immediate-work contract as line-skip: no missing auxiliaries, no
+        degraded retry, and a bounded effective size. It must also be independently forecast to co-reside and
+        not require isolation. RAM admission, checkpoint-load serialization, and dispatch-time VRAM
+        reconciliation remain authoritative at their normal call sites.
+        """
+        if head_job is None or job is head_job or job.model is None or job.model == head_job.model:
+            return None
+        if self._job_tracking_key(head_job) in self._aux_backfill_heads_staged:
+            return None
+        if self._job_tracker.is_degraded_dispatch_pending(job):
+            return None
+
+        head_is_downloading = any(
+            process.process_type is HordeProcessType.INFERENCE
+            and process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
+            and process.last_job_referenced == head_job
+            for process in self._process_map.values()
+        )
+        if not head_is_downloading:
+            return None
+
+        job_has_loras = job.payload.loras is not None and len(job.payload.loras) > 0
+        if job_has_loras and not self._loras_cached_for_line_skip(job):
+            return None
+        if job.payload.tis:
+            return None
+
+        bridge_data = self._runtime_config.bridge_data
+        candidate_limit = line_skip_candidate_emps_limit(
+            high_performance_mode=bool(bridge_data.high_performance_mode),
+            moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
+        )
+        if self.get_single_job_effective_megapixelsteps(job) > candidate_limit:
+            return None
+
+        target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
+        baseline = self._model_metadata.get_baseline(job.model)
+        forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
+        if not forecast.fits_coresident or forecast.admit_requires_isolation:
+            return None
+        return forecast
+
+    @staticmethod
+    def _job_tracking_key(job: ImageGenerateJobPopResponse) -> str:
+        """Return a stable key for scheduler bookkeeping tied to one popped job."""
+        return str(job.id_) if job.id_ is not None else str(id(job))
+
+    def _prune_aux_backfill_staging_claims(self) -> None:
+        """Release staging claims after their queue heads leave auxiliary download.
+
+        One head may stage at most one backfill while its auxiliary download is active. Keeping the claim for
+        that entire state prevents a worker with several idle siblings from filling every slot with speculative
+        models. Once the head leaves the state, ordinary preload and dispatch policy owns all slots again.
+        """
+        active_head_keys = {
+            self._job_tracking_key(process.last_job_referenced)
+            for process in self._process_map.values()
+            if process.process_type is HordeProcessType.INFERENCE
+            and process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
+            and process.last_job_referenced is not None
+        }
+        self._aux_backfill_heads_staged.intersection_update(active_head_keys)
 
     def _select_head_room_process(self) -> HordeProcessInfo | None:
         """Pick an idle inference process to free for a starved head-of-queue job, or None.
@@ -5987,6 +6121,13 @@ class InferenceScheduler:
                     "uncached_loras",
                     "rejected: candidate has LoRAs not yet cached on disk (skipping would trade one blocking "
                     "download for another).",
+                )
+                continue
+            if candidate_small_job.payload.tis:
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "textual_inversions",
+                    "rejected: candidate has textual inversions whose cache residency is not tracked.",
                 )
                 continue
             if self._job_tracker.is_degraded_dispatch_pending(candidate_small_job):

@@ -217,11 +217,13 @@ evidence rather than a long clock. Two timings apply, deliberately different:
   re-ask can then fit. Because the trigger is short, a re-ask arrives every scheduler cycle; that is safe
   because the teardown scales to a fixed target and retires its victims from the process map synchronously, so
   a repeated command sees the count already at target and tears nothing more down (`_establish_whole_card_residency`
-  only scales while the live count exceeds the target, and re-stamps the residency once). This escalation
-  is normally the preload/whole-card path. A starved `MONOLITHIC_DISPATCH` head may use the same escape only
-  when its candidate peak computes a maximum resident-process target below the current live pool. Merely
-  finding an idle sibling does not qualify: a target at or above the live count proves pruning that context
-  cannot address the deficit, so the dispatch stays out of whole-card residency.
+  only scales while the live count exceeds the target, and re-stamps the residency once). Both the preload and
+  `MONOLITHIC_DISPATCH` paths may use this escape only when the candidate peak computes a maximum
+  resident-process target below the current live pool. Merely finding an idle sibling does not qualify: a
+  target at or above the live count proves pruning that context cannot address the deficit, so the request
+  stays out of whole-card residency. The actuator repeats that check against the current live count before it
+  acquires exclusivity or pauses service lanes, because a correctly-issued command can become stale after an
+  earlier scheduler tick has already retired its victims.
 * **The genuinely-foreign starvation diagnostic keeps its 60s threshold (`_STARVATION_DIAGNOSTIC_SECONDS`).** A
   head whose shortfall is real foreign load with no first-party context reclaim has no surgical remedy the
   arbiter can apply, so its long-wait warning stays at 60s (see below); shortening it would only spam the log.

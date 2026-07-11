@@ -297,7 +297,9 @@ long as that model is resident on a *different* idle process than the downloadin
 head (its own slot reads as able to accept work while it downloads aux models, so
 the skip is routed onto a sibling copy, never back onto the downloading slot).
 This keeps a mono-model queue from starving whenever its one head stalls on a
-LoRA download. Often a candidate is available: the queue holds a mix, or a cached
+LoRA download. Textual-inversion cache residency is not tracked, so a TI-bearing
+candidate remains ineligible; treating it as ready could replace one auxiliary
+download with another. Often a candidate is available: the queue holds a mix, or a cached
 LoRA, and the scheduler simply picks it. But when the blocked head sits behind an
 auxiliary-model download and *nothing queued qualifies* (every other queued job
 needs an uncached LoRA download, is too large, is not resident, or shares the head's
@@ -335,6 +337,27 @@ download finishes. The scheduler clears the flag as soon as no aux download
 still exceeds the threshold, so the cap bypass and the pop bias last only as long
 as the stall does. Set `aux_model_download_line_skip_threshold_seconds` to unset
 to disable the breaker entirely.
+
+An already-popped candidate may need the same transition from nonresident to
+resident. Ordinarily preload admission reserves the model's future sampling
+footprint in VRAM as soon as its RAM preload is sent. That reservation prevents
+two independently admitted models from later materialising onto an overcommitted
+card, but it can also form a circular wait while the head is only downloading
+auxiliaries: the later model cannot line-skip until it is staged, while its staging
+is denied by VRAM that the head has not materialised.
+
+For that state, the scheduler may RAM-stage one quick, distinct-model backfill per
+blocked head. The candidate uses the line-skip size and auxiliary-readiness rules,
+must independently forecast as co-resident rather than requiring isolation, and
+must pass the normal RAM budget. Actual checkpoint loads remain serialized, and
+the dispatch-time measured-VRAM reconciliation remains authoritative before the
+staged model can materialise on the device. This is temporal sharing of an idle
+sampling window, not permission for concurrent overcommit. A genuine exclusive or
+degraded job, an uncached LoRA, any TI, RAM pressure, or an isolation-requiring
+candidate retains its existing hold. The one-candidate claim lasts until the head
+leaves `DOWNLOADING_AUX_MODEL`, preventing a multi-process worker from filling all
+of its idle slots with speculative models. Graceful shutdown applies the same rule
+to jobs already accepted into the drain; it still prevents new pops.
 
 #### Idle-fill: over-popping a quick job up a size ladder when a card would idle
 
@@ -1020,10 +1043,12 @@ model and forcing a full reload storm. This is the structural remedy for the `th
 thrash: it fires exactly when the admission verdict would otherwise reject the head every tick and route
 it into an evict-all admit.
 
-The same arithmetic guards the dispatch-time starvation escape. Finding an idle sibling is not enough to
-claim whole-card residency: the computed maximum must be lower than the number of live inference processes.
-If the target is equal to or above the live pool, inference-context pruning cannot relieve the measured
-shortfall, so dispatch does not mark the job exclusive or cycle safety through the residency machinery.
+The same arithmetic guards the preload- and dispatch-time starvation escapes. Finding an idle sibling is not
+enough to claim whole-card residency: the computed maximum must be lower than the number of live inference
+processes. If the target is equal to or above the live pool, inference-context pruning cannot relieve the
+measured shortfall, so neither path marks the job exclusive or cycles service lanes through the residency
+machinery. The reduction actuator checks the target against the current live count again before any side
+effects, preserving idempotence when a command becomes stale after an earlier tick already shrank the pool.
 
 Both of those teardown paths (the streaming forecast's `needs_teardown` and the verdict-driven context
 reduction) are gated on the demand being **trustworthy** before the worker engages the disruptive whole-card

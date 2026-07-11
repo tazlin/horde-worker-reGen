@@ -17,10 +17,11 @@ cached set is learned as jobs complete their aux downloads and is not trusted wh
 LoRAs on download or its LoRA disk is exhausted (either can evict a file after it was recorded), so those
 modes fall back to the original refusal.
 
-These tests pin both halves: an uncached LoRA candidate is still refused (contract intact), a cached one
-feeds the idle lane (wedge resolved), and a completed download lets the next job needing the same LoRAs
-skip. GREEN controls (no-LoRA backfill) bound the mechanism; the fence guards cover the purge and
-disk-exhausted modes and all-or-nothing cache coverage.
+These tests pin both halves: an uncached LoRA candidate is still refused, a cached one feeds the idle lane,
+and a completed download lets the next job needing the same LoRAs skip. A nonresident candidate may stage
+through the bounded RAM-only path so future-VRAM reservations do not make residency and line-skip depend on
+each other. The fence guards cover RAM admission, isolation, checkpoint-load serialization, textual
+inversions, speculative-preload breadth, purge and disk-exhausted modes, and all-or-nothing cache coverage.
 """
 
 from __future__ import annotations
@@ -29,10 +30,11 @@ from collections.abc import Iterable
 from unittest.mock import Mock
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import NextJobAndProcess
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -67,6 +69,15 @@ def _small_job(model: str, *, lora_names: Iterable[str] = ()) -> ImageGenerateJo
     """A small (512x512, 20-step) job, well under any performance-mode line-skip eMPS ceiling."""
     entries = _lora_entries(lora_names)
     return make_job_pop_response(model, width=512, height=512, ddim_steps=20, loras=entries or None)
+
+
+def _small_ti_job(model: str, ti_name: str) -> ImageGenerateJobPopResponse:
+    """A small job whose textual inversion may require an auxiliary download."""
+    job = make_job_pop_response(model, width=512, height=512, ddim_steps=20)
+    payload = job.payload.model_copy(
+        update={"tis": [TIPayloadEntry(name=ti_name, inject_ti="prompt")]},
+    )
+    return job.model_copy(update={"payload": payload})
 
 
 def _make_scheduler(
@@ -112,9 +123,28 @@ def _make_scheduler(
     return scheduler
 
 
-async def _dispatch(scheduler: InferenceScheduler) -> object | None:
+async def _dispatch(scheduler: InferenceScheduler) -> NextJobAndProcess | None:
     """One real dispatch decision (the value ``start_inference`` acts on)."""
     return await scheduler.get_next_job_and_process()
+
+
+def _configure_aux_staging_budget(
+    scheduler: InferenceScheduler,
+    *,
+    candidate_isolation_required: bool = False,
+    ram_fits: bool = True,
+) -> None:
+    """Make resource outcomes explicit while tests exercise auxiliary-blocked staging policy."""
+    scheduler._budget_active = Mock(return_value=True)
+    scheduler._preload_blocked_by_ram_pressure = Mock(return_value=False)
+    scheduler._forecast_streaming = Mock(
+        return_value=Mock(
+            fits_coresident=not candidate_isolation_required,
+            admit_requires_isolation=candidate_isolation_required,
+        ),
+    )
+    scheduler._admit_preload_under_budget = Mock(return_value=False)
+    scheduler._apply_ram_verdict = Mock(return_value=ram_fits)
 
 
 class TestLoraAuxDownloadLaneStarvation:
@@ -303,6 +333,216 @@ class TestLoraAuxDownloadLaneStarvation:
 
         result = await _dispatch(scheduler)
         assert result is None, "no queued job's base model is resident on the idle lane, so nothing can skip in"
+
+    async def test_nonresident_backfill_stages_while_head_downloads_aux(self) -> None:
+        """A quick distinct-model backfill may stage in RAM while the blocked head reserves future VRAM.
+
+        Model preload is RAM-only until dispatch materializes the model on the device. A pending head's planned
+        sampling charge must therefore not create a circular wait where a later job cannot line-skip because its
+        model is not resident, but cannot become resident because the head's future VRAM is reserved.
+        """
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_job(_PONY)
+
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle = make_mock_process_info(1, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+        )
+        _configure_aux_staging_budget(scheduler)
+
+        assert scheduler.preload_models() is True
+        assert idle.loaded_horde_model_name == _PONY
+
+        idle.last_process_state = HordeProcessState.PRELOADED_MODEL
+        result = await _dispatch(scheduler)
+        assert result is not None
+        assert result.next_job is backfill
+        assert result.process_with_model is idle
+
+    async def test_uncached_lora_backfill_is_not_staged(self) -> None:
+        """RAM staging retains the line-skip rule that missing auxiliaries cannot replace one download with another."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_job(_PONY, lora_names=["missing-lora"])
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle = make_mock_process_info(1, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+        )
+        _configure_aux_staging_budget(scheduler)
+
+        assert scheduler.preload_models() is False
+        assert idle.loaded_horde_model_name == _CYBER
+
+    async def test_aux_backfill_staging_obeys_ram_budget(self) -> None:
+        """A RAM shortfall keeps a quick backfill on disk even though its head is blocked on auxiliaries."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_job(_PONY)
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle = make_mock_process_info(1, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+        )
+        _configure_aux_staging_budget(scheduler, ram_fits=False)
+
+        assert scheduler.preload_models() is False
+        assert idle.loaded_horde_model_name == _CYBER
+
+    async def test_isolation_requiring_backfill_is_not_staged(self) -> None:
+        """A candidate that independently needs isolation cannot borrow an auxiliary download's idle window."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_job(_PONY)
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle = make_mock_process_info(1, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+        )
+        _configure_aux_staging_budget(scheduler, candidate_isolation_required=True)
+
+        assert scheduler.preload_models() is False
+        assert idle.loaded_horde_model_name == _CYBER
+
+    async def test_graceful_drain_can_stage_already_accepted_backfill(self) -> None:
+        """Shutdown stops new pops but still prepares queued jobs that the worker has already accepted."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_job(_PONY)
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle = make_mock_process_info(1, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        state = WorkerState(shutting_down=True)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+            state=state,
+        )
+        _configure_aux_staging_budget(scheduler)
+
+        assert scheduler.preload_models() is True
+        assert idle.loaded_horde_model_name == _PONY
+
+    async def test_only_one_backfill_stages_per_aux_blocked_head(self) -> None:
+        """Several idle siblings cannot turn one auxiliary wait into an unbounded speculative preload burst."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        first = _small_job(_PONY)
+        second = _small_job(_ANI_PONY)
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle_a = make_mock_process_info(1, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+        idle_b = make_mock_process_info(2, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        for job in (head, first, second):
+            await track_popped_job_async(job_tracker, job)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle_a, 2: idle_b}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _ANI_PONY: make_mock_model_reference_record(_ANI_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+        )
+        _configure_aux_staging_budget(scheduler)
+
+        assert scheduler.preload_models() is True
+        assert scheduler.preload_models() is False
+        assert sum(p.loaded_horde_model_name in {_PONY, _ANI_PONY} for p in (idle_a, idle_b)) == 1
+
+    async def test_checkpoint_preload_serialization_still_blocks_backfill_staging(self) -> None:
+        """An actual checkpoint load retains the per-card serialization fence during auxiliary backfill."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_job(_PONY)
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        loading = make_mock_process_info(1, model_name=_ANI_PONY, state=HordeProcessState.PRELOADING_MODEL)
+        idle = make_mock_process_info(2, model_name=_CYBER, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: loading, 2: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+                _ANI_PONY: make_mock_model_reference_record(_ANI_PONY, baseline=_SDXL),
+                _CYBER: make_mock_model_reference_record(_CYBER, baseline=_SDXL),
+            },
+        )
+        _configure_aux_staging_budget(scheduler)
+
+        assert scheduler.preload_models() is False
+        assert idle.loaded_horde_model_name == _CYBER
+
+    async def test_textual_inversion_backfill_is_not_assumed_cached(self) -> None:
+        """Textual inversions do not line-skip or stage until their cache residency can be verified."""
+        head = _small_job(_ILLUSTRIOUS, lora_names=["head-lora"])
+        backfill = _small_ti_job(_PONY, "candidate-ti")
+        downloading = make_mock_process_info(0, model_name=_ILLUSTRIOUS, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        downloading.last_job_referenced = head
+        idle = make_mock_process_info(1, model_name=_PONY, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, head)
+        await track_popped_job_async(job_tracker, backfill)
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: downloading, 1: idle}),
+            job_tracker=job_tracker,
+            reference={
+                _ILLUSTRIOUS: make_mock_model_reference_record(_ILLUSTRIOUS, baseline=_SDXL),
+                _PONY: make_mock_model_reference_record(_PONY, baseline=_SDXL),
+            },
+        )
+
+        assert await _dispatch(scheduler) is None
 
 
 class TestCachedLoraLineSkipFenceGuards:
