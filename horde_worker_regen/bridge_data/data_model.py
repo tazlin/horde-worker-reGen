@@ -715,7 +715,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     force the post-processing lane on: that lane follows its own configuration and only carries the
     upscale/face-fix work. Default false (the monolithic path) until validated on the operator's card."""
 
-    enable_image_utilities: bool = Field(default=False)
+    enable_image_utilities: bool = Field(default=True)
     """Run the dedicated image-utilities lane (the ``horde_image_utilities`` capability service).
 
     The lane runs from its own virtual environment as a loopback HTTP service, so the native,
