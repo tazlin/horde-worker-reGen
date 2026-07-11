@@ -64,6 +64,14 @@ class JobStage(enum.Enum):
 
     PENDING_INFERENCE = auto()
     """Popped and waiting for (or undergoing dispatch to) an inference process."""
+    PENDING_ANNOTATION = auto()
+    """A ControlNet generation job whose control map the image-utilities lane is deriving off-GPU.
+
+    Entered from ``PENDING_INFERENCE`` when the lane is healthy and can serve the job's control type, so
+    the job is held out of the inference-eligible set until its control map arrives. It returns to
+    ``PENDING_INFERENCE`` on success (carrying the map) or on any fallthrough (annotation fault, age-out,
+    or the lane dying), so a job here always resolves back into the normal generation flow and is never
+    lost. This stage precedes the generation chain, so it drives no chain milestone."""
     INFERENCE_IN_PROGRESS = auto()
     """Sent to an inference process which has not yet returned a result."""
     DISAGGREGATION_DECODING = auto()
@@ -110,10 +118,18 @@ class InferenceFailureResolution(enum.Enum):
 _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
     JobStage.PENDING_INFERENCE: frozenset(
         {
+            JobStage.PENDING_ANNOTATION,
             JobStage.INFERENCE_IN_PROGRESS,
             JobStage.DETACHED,
             JobStage.PENDING_POST_PROCESSING,
             JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+        },
+    ),
+    JobStage.PENDING_ANNOTATION: frozenset(
+        {
+            JobStage.PENDING_INFERENCE,
+            JobStage.DETACHED,
             JobStage.PENDING_SUBMIT,
         },
     ),
@@ -167,6 +183,7 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
 
 _QUEUED_STAGES: tuple[JobStage, ...] = (
     JobStage.PENDING_INFERENCE,
+    JobStage.PENDING_ANNOTATION,
     JobStage.INFERENCE_IN_PROGRESS,
     JobStage.DISAGGREGATION_DECODING,
     JobStage.PENDING_POST_PROCESSING,
@@ -239,6 +256,20 @@ class TrackedJob:
     dispatch, and the scheduler carries these bytes on the inference control message so the child injects
     them instead of re-annotating in the main venv. None for every other job. See the image-utilities lane
     explanation doc for the pre-annotation flow."""
+    annotation_attempted: bool = False
+    """Set once the image-utilities lane has been asked to pre-annotate this job's control map.
+
+    Latched at the moment the job is parked in ``PENDING_ANNOTATION`` and never cleared, so a job released
+    back to ``PENDING_INFERENCE`` by success, annotation fault, age-out, or lane death is dispatched exactly
+    once as decided and can never be re-parked by a later control-loop scan. This is the anti-ping-pong
+    guard: without it a job that fell through to in-graph annotation would be re-selected for the lane on
+    the next tick and oscillate."""
+    annotation_process_id: int | None = None
+    """The image-utilities process id that owns this job's in-flight annotation, or None.
+
+    Set when the job is parked in ``PENDING_ANNOTATION`` and dispatched, so the orphan reconcile can
+    release the job to in-graph the instant that specific lane process is gone (died or was replaced),
+    rather than waiting for the age-out backstop. Cleared implicitly when the job leaves the stage."""
     post_process_process_id: int | None = None
     """The post-processing process id that owns the current post-processing attempt, if any."""
     post_process_launch_identifier: int | None = None
@@ -696,6 +727,44 @@ class JobTracker:
         ]
         queued.sort(key=lambda t: t.pop_order)
         return tuple(t.sdk_api_job_info for t in queued)
+
+    @property
+    def jobs_pending_annotation(self) -> tuple[TrackedJob, ...]:
+        """Return tracked jobs parked in ``PENDING_ANNOTATION``, in stage-entry (FIFO) order.
+
+        Returns the ``TrackedJob`` records (not pop responses) because the annotation orchestration reads
+        the control type, the owning lane process, and the stage-entry time directly off them.
+        """
+        return tuple(self._jobs_in_stage(JobStage.PENDING_ANNOTATION))
+
+    def move_to_pending_annotation(self, job_id: GenerationID, *, process_id: int) -> bool:
+        """Park a pending-inference job in ``PENDING_ANNOTATION``, owned by ``process_id``.
+
+        Latches :attr:`TrackedJob.annotation_attempted` first so the job can never be re-parked once it has
+        been offered to the lane, regardless of how the annotation resolves. Only a job currently in
+        ``PENDING_INFERENCE`` can be parked; any other stage returns False and is left untouched.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_INFERENCE:
+            return False
+        tracked.annotation_attempted = True
+        tracked.annotation_process_id = process_id
+        return self._set_stage(tracked, JobStage.PENDING_ANNOTATION)
+
+    def resolve_annotation(self, job_id: GenerationID, control_map_bytes: bytes | None) -> bool:
+        """Release a parked job back to ``PENDING_INFERENCE``, carrying the derived control map or None.
+
+        ``control_map_bytes`` is the annotated map on success, or None for every fallthrough (annotation
+        fault, age-out, or lane death), in which case the job re-enters inference with no premade map and
+        hordelib runs the annotation in-graph. A job not currently parked returns False (a late or
+        duplicate result is a no-op).
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_ANNOTATION:
+            return False
+        tracked.premade_control_map_bytes = control_map_bytes
+        tracked.annotation_process_id = None
+        return self._set_stage(tracked, JobStage.PENDING_INFERENCE)
 
     @property
     def job_pop_timestamps(self) -> dict[ImageGenerateJobPopResponse, float]:

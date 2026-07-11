@@ -166,11 +166,17 @@ the SDK enum value is ``post_process``.
 """
 
 
-def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
+def expand_offered_forms(bridge_data: reGenBridgeData, *, utilities_lane_healthy: bool = True) -> list[str]:
     """Expand the bridge-data `forms` config into the individual form names the API expects.
 
     "post-process" expands to every known upscaler, facefixer, and strip_background,
     mirroring the legacy alchemist. Caption requires the explicit BLIP opt-in.
+
+    ``strip_background`` runs only on the out-of-venv image-utilities lane and has no in-graph fallback,
+    so it is offered only when that lane is both provisioned (:func:`strip_background_available`) and
+    currently up (``utilities_lane_healthy``). The pure-torch upscalers and face-fixers are unaffected by
+    the lane's health. ``utilities_lane_healthy`` defaults True for the config-only callers that cannot see
+    runtime process state; the pop path passes the live reading.
     """
     offered: list[str] = []
     configured_forms = bridge_data.forms or list(DEFAULT_ALCHEMY_FORMS)
@@ -237,10 +243,11 @@ def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
             ):
                 continue
             offered.append(facefixer_value)
-        # strip_background needs rembg (no wheels on some backends); drop just it on a lean install.
-        # Upscalers/face-fixers above are pure torch and stay on offer. Unlike image-generation
-        # post-processing, alchemy forms are enumerated per-form, so this granular drop is possible.
-        if strip_background_available():
+        # strip_background runs only on the image-utilities lane (no in-graph fallback); drop just it when
+        # that lane is not provisioned or is momentarily down. Upscalers/face-fixers above are pure torch
+        # and stay on offer. Unlike image-generation post-processing, alchemy forms are enumerated per-form,
+        # so this granular drop is possible.
+        if strip_background_available() and utilities_lane_healthy:
             offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS)
         else:
             offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS if not is_strip_background_form(m.value))
@@ -527,14 +534,16 @@ class AlchemyCoordinator:
         if (time.time() - self._last_pop_time) < self._pop_frequency:
             return False
 
-        offered = expand_offered_forms(bridge_data)
+        offered = expand_offered_forms(bridge_data, utilities_lane_healthy=self._utilities_lane_healthy())
         if not offered:
             return False
 
-        # Don't pop work no process can currently take.
+        # Don't pop work no process can currently take. strip_background runs on the image-utilities lane,
+        # so that lane counts as a place work can land alongside the graph and CLIP lanes.
         graph_available = self._process_map.get_first_available(WorkerCapability.ALCHEMY_GRAPH) is not None
         clip_available = self._process_map.get_first_available(WorkerCapability.ALCHEMY_CLIP) is not None
-        if not (graph_available or clip_available):
+        utilities_available_lane = self._process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is not None
+        if not (graph_available or clip_available or utilities_available_lane):
             return False
 
         # Legacy backfill: only pop when the image queue is fully drained.
@@ -549,6 +558,14 @@ class AlchemyCoordinator:
             return False
 
         return self._has_vram_headroom() and self._has_ram_headroom()
+
+    def _utilities_lane_healthy(self) -> bool:
+        """Return True when an image-utilities lane process is up and past startup.
+
+        Gates the ``strip_background`` offer at pop time: the form has no in-graph fallback, so it must not
+        be advertised while no lane can serve it (a still-starting, ending, or absent lane).
+        """
+        return self._process_map.num_loaded_utilities_processes() > 0
 
     def _has_spare_image_lane(self) -> bool:
         """Return True if an idle inference lane exists beyond what queued image jobs need."""
@@ -681,7 +698,7 @@ class AlchemyCoordinator:
             name=bridge_data.alchemist_name,
             bridge_agent=f"AI Horde Worker reGen:{runtime_version()}:https://github.com/Haidra-Org/horde-worker-reGen",
             priority_usernames=bridge_data.priority_usernames,
-            forms=expand_offered_forms(bridge_data),
+            forms=expand_offered_forms(bridge_data, utilities_lane_healthy=self._utilities_lane_healthy()),
             amount=max(bridge_data.queue_size, 1),
             threads=1,
             max_tiles=min(max(bridge_data.max_power, 1), 256),

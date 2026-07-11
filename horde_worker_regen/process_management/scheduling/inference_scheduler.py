@@ -7074,6 +7074,13 @@ class InferenceScheduler:
             return
 
         bridge_data = self._runtime_config.bridge_data
+        # Carry the pre-annotated ControlNet control map, if the image-utilities lane derived one for this
+        # job before dispatch; the inference child injects it so hordelib skips re-annotating in the main
+        # venv. None (every non-annotated job) preserves the normal in-graph preprocessing path.
+        tracked_for_dispatch = self._job_tracker.get_tracked_job(next_job.id_) if next_job.id_ is not None else None
+        premade_control_map_bytes = (
+            tracked_for_dispatch.premade_control_map_bytes if tracked_for_dispatch is not None else None
+        )
         if process_with_model.safe_send_message(
             HordeInferenceControlMessage(
                 control_flag=HordeControlFlag.START_INFERENCE,
@@ -7083,6 +7090,7 @@ class InferenceScheduler:
                 aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
                     bridge_data,
                 ),
+                premade_control_map_bytes=premade_control_map_bytes,
             ),
         ):
             await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)

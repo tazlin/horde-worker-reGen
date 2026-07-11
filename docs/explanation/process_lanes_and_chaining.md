@@ -177,14 +177,20 @@ stage did not complete.
 
 1. **Pop**: the job registers with the tracker; its chain flow is built from the payload (post-processing
    requested or not).
-2. **Generate**: the scheduler dispatches to an inference process; the raw images return to the main process
+2. **Pre-annotate** (ControlNet jobs the utilities lane can serve): the control loop parks the job in the
+   `PENDING_ANNOTATION` stage and derives its control map off-GPU on the
+   [image-utilities lane](image_utilities_lane.md) before it is eligible for inference. This stage precedes
+   the generate node, so it drives no chain milestone; the job returns to `PENDING_INFERENCE` carrying the
+   map on success, or with no map (in-graph fallthrough) on any failure, and is never re-parked. A job the
+   lane cannot serve skips this step entirely.
+3. **Generate**: the scheduler dispatches to an inference process; the raw images return to the main process
    at the generate stage's completion milestone.
-3. **Post-process** (when requested): the dispatcher queues the job for the lane; the post-processing
+4. **Post-process** (when requested): the dispatcher queues the job for the lane; the post-processing
    orchestrator dispatches the first fittable pending job, sends the raw images and the requested operations,
    and the processed images replace the raw ones. A chain that never fits the card ages out to a no-image
    fault; an orphan watchdog requeues a job whose result was lost (bounded), then faults without images.
-4. **Safety**: unchanged; the safety orchestrator sends the (possibly post-processed) images for evaluation.
-5. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
+5. **Safety**: unchanged; the safety orchestrator sends the (possibly post-processed) images for evaluation.
+6. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
 
 Graph alchemy forms (standalone upscale/facefix jobs) ride the same lane via the `ALCHEMY_GRAPH` capability
 and count as lane commitments while they are pending or in flight; `strip_background` instead routes to the

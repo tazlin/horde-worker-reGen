@@ -73,48 +73,78 @@ correctly. Teardown is still driven through the control pipe and the handle's te
 
 ## Job flow: pre-annotation, strip rerouting, pop gating
 
-### ControlNet pre-annotation (availability-driven)
+### ControlNet pre-annotation (availability-driven, in-graph fallthrough)
 
 A ControlNet image job whose source image is not already a control map, and which did not request the
 control map as its output, needs its control map derived before generation. Rather than run that annotation
-in the worker's main venv, the job flow dispatches it to the utilities lane (`START_ANNOTATION`) once the
-source images are downloaded; the job is not eligible for inference dispatch until the annotation result
-arrives, and the derived control map (PNG bytes) is carried on the inference control message so the
-inference child injects it and hordelib runs the `none` preprocessor over it instead of re-annotating.
+in the worker's main venv, the control loop parks such a job in the `PENDING_ANNOTATION` stage and
+dispatches `START_ANNOTATION` to an idle utilities lane process. A parked job is held out of the
+inference-eligible set until its control map arrives; the derived control map (PNG bytes) is then stored on
+the tracked job, the job returns to `PENDING_INFERENCE`, and the scheduler carries the bytes on the
+inference control message so the inference child injects them and hordelib runs the `none` preprocessor over
+them instead of re-annotating. At most one annotation is dispatched per idle lane process per control-loop
+tick, so the single serial lane is paced and the rest of the queue keeps feeding inference.
 
 Which control types are pre-annotated is **availability-driven**, not hardcoded. The utilities process
 cannot necessarily serve every control type: a detector whose heavy backend is not importable in the lane's
-environment (for example `seg` today), or whose weights are not pre-placed, is not servable. The adapter
-polls `GET /annotators` (per-detector `available` + `weights_present`) on bring-up and on its memory
-cadence, caches the servable set, and emits it as an annotator-availability snapshot. A control type in that
-set is pre-annotated on the lane; anything **not** in it (unavailable backend, or missing weights) falls
-through to hordelib's in-graph preprocessor, which runs today with no extra dependencies. `return_control_map`
-jobs for an unservable control type fall through the same way (hordelib's annotation-only pipeline still
-produces the map). The carve-out therefore shrinks automatically as the lane gains detectors, with nothing
-to maintain per control type.
+environment, or whose weights are not pre-placed, is not servable. The adapter polls `GET /annotators`
+(per-detector `available` + `weights_present`) on bring-up and on its memory cadence and emits the servable
+set as an annotator-availability snapshot; the parent caches it per lane process. A control type in that set
+is pre-annotated on the lane; anything **not** in it falls through to hordelib's in-graph preprocessor,
+which runs today with no extra dependencies. The set grows automatically as the lane gains detectors, with
+nothing to maintain per control type.
 
-If a pre-annotation faults (the lane returns an error, or the utilities process dies mid-annotation), the
-job is faulted through the normal job-fault path with metadata and reissued, never left parked.
+The liveness contract is that a parked job always resolves back into the normal generation flow and is
+never lost. Every failure mode releases it to **in-graph fallthrough** (returned to `PENDING_INFERENCE`
+carrying no premade map, so hordelib annotates it during generation), not a fault:
+
+- **Annotation fault**: the lane returns an error result; the job is released in-graph.
+- **Age-out**: a park that outlives a bounded timeout (comfortably longer than the lane's own annotate
+  timeout, so a legitimately slow result is not raced) is released in-graph.
+- **Lane death or replacement**: the moment the owning lane process leaves the map (died, or was replaced),
+  every job it owned is released in-graph, so no job is left parked behind a dead lane.
+
+An **anti-ping-pong latch** guarantees each job is offered to the lane at most once: a job released by any
+of the above is marked annotation-attempted and is never re-parked by a later scan, so it dispatches
+in-graph exactly once-decided rather than oscillating between the stages.
 
 ### strip_background rerouting
 
 `strip_background` runs on the utilities lane (its `rembg` stack never enters the main venv), so
 `capability_for_alchemy_form` routes it to `IMAGE_UTILITIES`. A standalone `strip_background` alchemy form
-is dispatched straight to the lane. Inside a generation job's post-processing chain, the pure-torch steps
-(upscale, face-fix) still run on the post-processing lane; `strip_background` is then applied last on the
-utilities lane, preserving the request ordering, before the job proceeds to safety and submit. The flow
-degrades gracefully to fewer hops when steps are absent (inference → post-processing → utilities → safety →
-submit). A utilities failure at any hop faults the job rather than wedging it.
+is dispatched straight to the lane and its result reaches submit through the alchemy coordinator's normal
+path.
 
 ### Pop gating
 
-ControlNet annotation and background removal are advertised only when the lane can serve them.
-`capabilities.utilities_available` (the utilities venv is provisioned and `enable_image_utilities` is not
-disabled) gates the config coercion, so a worker without the lane never advertises `allow_controlnet` /
-`allow_sdxl_controlnet` and drops the whole post-processing bucket (the API cannot accept upscale/face-fix
-while refusing `strip_background`). At runtime, offers are additionally gated on a **healthy** utilities
-process existing, re-evaluated on process state changes rather than polled, so a crashed or restarting lane
-withholds its offers until it recovers.
+ControlNet annotation and background removal are advertised only when the lane can serve them, but on
+different terms because their fallback stories differ. `capabilities.utilities_available` (the utilities
+venv is provisioned and `enable_image_utilities` is not disabled) gates the config coercion, so a worker
+without the lane provisioned never advertises `allow_controlnet` / `allow_sdxl_controlnet` and drops the
+whole post-processing bucket (the API cannot accept upscale/face-fix while refusing `strip_background`).
+
+Beyond that static provisioning gate the two features diverge at runtime:
+
+- **`strip_background` has no in-graph fallback** (the main venv is purged of `rembg`), so its alchemy
+  offer is additionally gated on a **healthy** utilities lane process existing right now: a provisioned but
+  crashed or restarting lane withholds the `strip_background` offer until it recovers.
+- **ControlNet pops are not gated on runtime lane health.** A provisioned lane that is momentarily down
+  still pops controlnet work, because the in-graph preprocessor is a real dynamic fallback: the job is
+  simply dispatched with no premade map. The provisioning coercion, not runtime health, is the controlnet
+  gate.
+
+### Seams that fall through in-graph
+
+Two ControlNet behaviors deliberately do not route through the lane and fall through to hordelib instead:
+
+- **`return_control_map` jobs** (the deliverable is the control map itself) are excluded from
+  pre-annotation and dispatched normally, so hordelib produces the map in-graph. The eligibility predicate
+  `job_wants_pre_annotation` is where routing them wholly through the lane into the submit path (without
+  inference) would attach, alongside a submit-path handoff mirroring the alchemy coordinator's.
+- **The strip-last post-processing tail for generation jobs** (inference → post-processing lane for
+  upscale/face-fix → utilities `strip_background` last → safety → submit) routes its pure-torch steps
+  through the post-processing lane as usual; the utilities `strip_background` leg attaches at the
+  post-processing completion handoff. A standalone `strip_background` alchemy form runs on the lane directly.
 
 ## Weight pre-placement
 

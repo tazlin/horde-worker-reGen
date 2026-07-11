@@ -37,6 +37,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     UserDetailsResponse,
     WorkerDetailItem,
 )
+from horde_sdk.utils.image_utils import base64_str_to_bytes
 from horde_sdk.worker.dispatch.ai_horde.image.source_image import (
     job_requires_source_image_input,
     resolve_effective_source_processing,
@@ -63,10 +64,13 @@ from horde_worker_regen.process_management.ipc.message_dispatcher import Message
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
     AlchemyFormSpec,
+    HordeAnnotationResultMessage,
+    HordeAnnotatorAvailabilityMessage,
     HordeImageResult,
     HordeInferenceResultMessage,
     HordeProcessState,
     HordeStageModelMixin,
+    HordeStartAnnotationControlMessage,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
@@ -196,6 +200,62 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
     from horde_worker_regen.process_management.jobs.job_tracker import TrackedJob
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
+
+
+_CONTROLNET_ANNOTATION_RESOLUTION = 512
+"""Resolution the image-utilities lane derives control maps at.
+
+Matches hordelib's in-graph AIO preprocessor default so a pre-annotated map is the same size the in-graph
+preprocessor would have produced; the ControlNet applies it at the generation resolution either way."""
+
+
+def _control_type_name(control_type: object) -> str | None:
+    """Return a job's control type as its canonical annotator-name string, or None when unset.
+
+    ``KNOWN_IMAGE_CONTROLNETS`` is a string enum whose value is the annotator name (``canny``, ``depth``,
+    ...); ``str()`` yields that name for both the enum and a plain string, which is exactly the key the
+    servable-set snapshot and the annotators endpoint use.
+    """
+    if control_type is None:
+        return None
+    return str(control_type)
+
+
+def _resolve_source_image_bytes(job: ImageGenerateJobPopResponse) -> bytes | None:
+    """Return the job's source image as encoded bytes for annotation, or None when unavailable.
+
+    Mirrors the SDK converter's resolution: a URL source uses the downloaded base64 copy, an inline source
+    is already base64. A missing or undecodable source yields None so the job falls through to in-graph
+    annotation rather than faulting here.
+    """
+    source = job.source_image
+    if source is None:
+        return None
+    base64_value = job.get_downloaded_source_image() if source.startswith("http") else source
+    if base64_value is None:
+        return None
+    try:
+        return base64_str_to_bytes(base64_value)
+    except Exception:
+        return None
+
+
+def job_wants_pre_annotation(job: ImageGenerateJobPopResponse) -> bool:
+    """Return whether a job is a ControlNet generation whose control map should be derived off-GPU.
+
+    True only when the job requests a control type, its source is a real image (not already a control map),
+    and the deliverable is a generation rather than the control map itself. ``return_control_map`` jobs are
+    excluded here (routing them wholly through the lane into the submit path is a separate seam), as are
+    jobs with no source image (nothing to annotate); both fall through to hordelib's in-graph path.
+    """
+    payload = job.payload
+    if payload.control_type is None:
+        return False
+    if payload.image_is_control:
+        return False
+    if payload.return_control_map:
+        return False
+    return job.source_image is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1148,6 +1208,11 @@ class HordeWorkerProcessManager:
         self._governor_states_by_device: dict[int, GovernorState] = {}
         self._last_device_free_mb_by_device: dict[int, float] = {}
         self._last_device_total_mb_by_device: dict[int, float] = {}
+
+        # The control types each image-utilities lane process can currently annotate, keyed by its process
+        # id, learned from the lane's availability snapshots. The pre-annotation scan keys on the union of
+        # these; an entry is pruned when its process leaves the map so a dead lane never appears servable.
+        self._annotator_servable_types: dict[int, frozenset[str]] = {}
         # The single-owner verified reclaim ladder: when the governor calls a card SATURATED it issues one
         # pressure-relief rung per tick (newest idle model -> idle allocator caches -> older idle models ->
         # lane pauses -> safety off GPU), then verifies the realized NVML device-free gain against the rung's
@@ -1406,6 +1471,8 @@ class HordeWorkerProcessManager:
             run_metrics=self._run_metrics,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
+        self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
+        self._message_dispatcher.set_annotator_availability_handler(self._on_annotator_availability)
 
         self._image_coordinator = ImageGenerationCoordinator(
             job_popper=self._job_popper,
@@ -2871,6 +2938,11 @@ class HordeWorkerProcessManager:
             self._begin_vram_arbiter_cycle()
             self._inference_scheduler.run_governance_tick()
 
+            # Pre-annotate controlnet jobs off-GPU before scheduling: parks eligible jobs (removing them
+            # from the inference-eligible set until their control map arrives) and releases resolved,
+            # aged-out, or lane-orphaned parks back to inference so a freed job can be dispatched this tick.
+            self._advance_pending_annotations()
+
             if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
                 await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
 
@@ -2947,6 +3019,181 @@ class HordeWorkerProcessManager:
 
         await self._sleep(self._loop_interval / 2)
         return True
+
+    _PENDING_ANNOTATION_TIMEOUT_SECONDS = 180.0
+    """How long a job may sit in ``PENDING_ANNOTATION`` before it is released to in-graph annotation.
+
+    Exceeds the adapter's per-request annotate timeout so the parent never ages out a job whose result is
+    still legitimately in flight, while bounding how long one job is held out of inference if the lane
+    answers health yet silently drops a specific annotation. A dead or unresponsive lane is caught sooner:
+    the orphan reconcile releases parked jobs the instant that lane process leaves the map."""
+
+    def _servable_control_types(self) -> frozenset[str]:
+        """Return the union of control types every live image-utilities lane can currently annotate.
+
+        Prunes snapshots from processes no longer in the map so a dead lane cannot keep a control type
+        looking servable, then unions what remains (there is normally one lane, so this is that lane's set).
+        """
+        live_ids = {
+            info.process_id for info in self._process_map.values() if info.process_type == HordeProcessType.UTILITIES
+        }
+        for stale_id in [pid for pid in self._annotator_servable_types if pid not in live_ids]:
+            del self._annotator_servable_types[stale_id]
+        servable: set[str] = set()
+        for types in self._annotator_servable_types.values():
+            servable |= types
+        return frozenset(servable)
+
+    def _on_annotator_availability(self, message: HordeAnnotatorAvailabilityMessage) -> None:
+        """Cache which control types the reporting image-utilities lane can annotate right now."""
+        self._annotator_servable_types[message.process_id] = frozenset(message.servable_control_types)
+
+    def _on_annotation_result(self, message: HordeAnnotationResultMessage) -> None:
+        """Release a parked job on an annotation result: with the map on success, in-graph on a fault."""
+        succeeded = message.state == GENERATION_STATE.ok and message.control_map_bytes is not None
+        control_map_bytes = message.control_map_bytes if succeeded else None
+        if not self._job_tracker.resolve_annotation(message.job_id, control_map_bytes):
+            # The job already left PENDING_ANNOTATION (an orphan reconcile released it when its lane died, or
+            # this is a duplicate/late result); nothing to do.
+            return
+        subject = f"job:{str(message.job_id)[:8]}"
+        if succeeded:
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                subject=subject,
+                verdict=DecisionVerdict.ADMIT,
+                reason="annotated",
+            )
+        else:
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                subject=subject,
+                verdict=DecisionVerdict.NO_OP,
+                reason="in_graph_fallthrough",
+                inputs={"cause": "annotation_faulted", "fault_reason": message.fault_reason or ""},
+            )
+
+    def _advance_pending_annotations(self) -> None:
+        """Reconcile, age out, and dispatch the image-utilities pre-annotation stage for controlnet jobs.
+
+        Runs once per control-loop tick before the scheduling cycle. Order matters: parks whose lane is gone
+        and aged-out parks are released back to inference first so a freed job can be dispatched this same
+        tick, then fresh eligible jobs are offered to an idle lane. The whole pass is a no-op unless the
+        operator explicitly enabled the lane, so a default (mock-truthy) config never activates it.
+        """
+        if self.bridge_data.enable_image_utilities is not True:
+            return
+        self._reconcile_orphaned_annotation_jobs()
+        self._age_out_pending_annotations()
+        self._dispatch_pending_annotations()
+
+    def _reconcile_orphaned_annotation_jobs(self) -> None:
+        """Release any parked job whose owning image-utilities lane process is gone (died or replaced)."""
+        live_ids = {
+            info.process_id
+            for info in self._process_map.values()
+            if info.process_type == HordeProcessType.UTILITIES and info.is_process_alive()
+        }
+        for tracked in self._job_tracker.jobs_pending_annotation:
+            if tracked.annotation_process_id in live_ids:
+                continue
+            if self._job_tracker.resolve_annotation(tracked.job_id, None):
+                logger.warning(
+                    f"Releasing job {str(tracked.job_id)[:8]} to in-graph annotation: its image-utilities "
+                    "lane is no longer available.",
+                )
+                self._run_metrics.record_decision(
+                    decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                    subject=f"job:{str(tracked.job_id)[:8]}",
+                    verdict=DecisionVerdict.NO_OP,
+                    reason="in_graph_fallthrough",
+                    inputs={"cause": "lane_gone"},
+                )
+
+    def _age_out_pending_annotations(self) -> None:
+        """Release any job that has sat in ``PENDING_ANNOTATION`` past the bounded timeout, in-graph."""
+        now = time.time()
+        for tracked in self._job_tracker.jobs_pending_annotation:
+            age = now - tracked.current_stage_since if tracked.current_stage_since else 0.0
+            if age < self._PENDING_ANNOTATION_TIMEOUT_SECONDS:
+                continue
+            if self._job_tracker.resolve_annotation(tracked.job_id, None):
+                logger.warning(
+                    f"Releasing job {str(tracked.job_id)[:8]} to in-graph annotation: pre-annotation timed "
+                    f"out after {age:.0f}s.",
+                )
+                self._run_metrics.record_decision(
+                    decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                    subject=f"job:{str(tracked.job_id)[:8]}",
+                    verdict=DecisionVerdict.NO_OP,
+                    reason="in_graph_fallthrough",
+                    inputs={"cause": "age_out", "age_seconds": round(age, 1)},
+                )
+
+    def _dispatch_pending_annotations(self) -> None:
+        """Park eligible controlnet jobs and dispatch their annotation to an idle image-utilities lane.
+
+        A job is eligible when it is a controlnet generation with a source image (not already a control map,
+        not a ``return_control_map`` request), has not already been offered to the lane (the anti-ping-pong
+        latch), and its control type is in the lane's servable set. At most one annotation is dispatched per
+        idle lane process per tick, so the single serial lane is paced and inference keeps being fed the
+        rest of the queue rather than every controlnet job being parked at once.
+        """
+        servable = self._servable_control_types()
+        if not servable:
+            return
+        used_process_ids: set[int] = set()
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.id_ is None:
+                continue
+            tracked = self._job_tracker.get_tracked_job(job.id_)
+            if tracked is None or tracked.stage != JobStage.PENDING_INFERENCE or tracked.annotation_attempted:
+                continue
+            if not job_wants_pre_annotation(job):
+                continue
+            control_type = _control_type_name(job.payload.control_type)
+            if control_type is None or control_type not in servable:
+                continue
+            process_info = self._first_available_utilities_process(exclude=used_process_ids)
+            if process_info is None:
+                return
+            source_image_bytes = _resolve_source_image_bytes(job)
+            if source_image_bytes is None:
+                continue
+            if not self._job_tracker.move_to_pending_annotation(job.id_, process_id=process_info.process_id):
+                continue
+            sent = process_info.safe_send_message(
+                HordeStartAnnotationControlMessage(
+                    job_id=job.id_,
+                    control_type=control_type,
+                    source_image_bytes=source_image_bytes,
+                    resolution=_CONTROLNET_ANNOTATION_RESOLUTION,
+                ),
+            )
+            if not sent:
+                # The lane went away between selection and send; release the job straight back to in-graph
+                # rather than leaving it parked with no annotation coming.
+                self._job_tracker.resolve_annotation(job.id_, None)
+                continue
+            used_process_ids.add(process_info.process_id)
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                subject=f"job:{str(job.id_)[:8]}",
+                verdict=DecisionVerdict.DEFER,
+                reason="pre_annotate",
+                inputs={"control_type": control_type, "process_id": process_info.process_id},
+            )
+
+    def _first_available_utilities_process(self, *, exclude: set[int]) -> HordeProcessInfo | None:
+        """Return an idle image-utilities lane process not already used this tick, or None."""
+        for info in self._process_map.values():
+            if info.process_type != HordeProcessType.UTILITIES:
+                continue
+            if info.process_id in exclude:
+                continue
+            if info.can_accept_job():
+                return info
+        return None
 
     _REFERENCE_REFRESH_INTERVAL_SECONDS = 1800.0
     """How often the parent re-downloads the model reference and tells subprocesses to reload from
@@ -3806,6 +4053,7 @@ class HordeWorkerProcessManager:
         """
         return {
             JobStage.PENDING_INFERENCE: WorkLedgerStage.QUEUED,
+            JobStage.PENDING_ANNOTATION: WorkLedgerStage.QUEUED,
             JobStage.INFERENCE_IN_PROGRESS: WorkLedgerStage.INFERENCE,
             JobStage.DISAGGREGATION_DECODING: WorkLedgerStage.INFERENCE,
             JobStage.DETACHED: WorkLedgerStage.PREPARING,

@@ -73,6 +73,9 @@ class _StubProcessMap:
     def get_capable_processes(self, capability: WorkerCapability) -> list[_IdleLane]:
         return self._image_lanes if capability is WorkerCapability.IMAGE_GEN else []
 
+    def num_loaded_utilities_processes(self) -> int:
+        return 0
+
     def get_free_vram_mb(self) -> float | None:
         return self._free_vram_mb
 

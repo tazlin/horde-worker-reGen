@@ -81,6 +81,7 @@ class DecisionKind(enum.StrEnum):
     INFERENCE_DISPATCH = "inference_dispatch"
     PP_DEFERRAL = "pp_deferral"
     RECLAIM_RUNG = "reclaim_rung"
+    ANNOTATION_ROUTING = "annotation_routing"
 
 
 class DecisionVerdict(enum.StrEnum):

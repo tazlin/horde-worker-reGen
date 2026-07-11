@@ -21,6 +21,8 @@ from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_DOWNLOAD_FAILED_INFO,
     HordeAlchemyResultMessage,
+    HordeAnnotationResultMessage,
+    HordeAnnotatorAvailabilityMessage,
     HordeAuxModelStateChangeMessage,
     HordeDownloadAvailabilityMessage,
     HordeDownloadMetricsMessage,
@@ -155,6 +157,10 @@ class MessageDispatcher:
     _reserve_ledger: CommittedReserveLedger
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
+    _on_annotation_result: Callable[[HordeAnnotationResultMessage], None] | None = None
+    """Invoked when the image-utilities lane reports a ControlNet annotation result (map bytes or a fault)."""
+    _on_annotator_availability: Callable[[HordeAnnotatorAvailabilityMessage], None] | None = None
+    """Invoked when the image-utilities lane reports which control types it can currently annotate."""
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
     _on_download_metrics: Callable[[HordeDownloadMetricsMessage], None] | None = None
     _on_download_availability: Callable[[HordeDownloadAvailabilityMessage], None] | None = None
@@ -257,6 +263,17 @@ class MessageDispatcher:
     def set_alchemy_result_handler(self, handler: Callable[[HordeAlchemyResultMessage], None]) -> None:
         """Register the callback invoked when a child process reports an alchemy form result."""
         self._on_alchemy_result = handler
+
+    def set_annotation_result_handler(self, handler: Callable[[HordeAnnotationResultMessage], None]) -> None:
+        """Register the callback invoked when the image-utilities lane reports an annotation result."""
+        self._on_annotation_result = handler
+
+    def set_annotator_availability_handler(
+        self,
+        handler: Callable[[HordeAnnotatorAvailabilityMessage], None],
+    ) -> None:
+        """Register the callback invoked when the image-utilities lane reports its servable control types."""
+        self._on_annotator_availability = handler
 
     def set_stage_result_handler(self, handler: Callable[[HordeProcessMessage], Awaitable[None]]) -> None:
         """Register the callback invoked when a disaggregated stage reports its result.
@@ -434,6 +451,16 @@ class MessageDispatcher:
                     await self._on_stage_result(message)
                 else:
                     logger.error(f"Received {type(message).__name__} with no stage-result handler registered")
+            elif isinstance(message, HordeAnnotationResultMessage):
+                # An annotation is a pre-inference stage, not a job completion, so it is deliberately not
+                # counted by ``_record_completed_job``; the handler releases the parked job back to inference.
+                if self._on_annotation_result is not None:
+                    self._on_annotation_result(message)
+                else:
+                    logger.error(f"Received annotation result with no handler registered: {message.job_id}")
+            elif isinstance(message, HordeAnnotatorAvailabilityMessage):
+                if self._on_annotator_availability is not None:
+                    self._on_annotator_availability(message)
 
     def _classify_retired_launch_message(self, message: HordeProcessMessage) -> _RetiredLaunchMessageAction:
         """Classify a message that may belong to an intentionally retired launch."""
@@ -450,6 +477,7 @@ class MessageDispatcher:
                 HordeInferenceResultMessage,
                 HordeSafetyResultMessage,
                 HordeAlchemyResultMessage,
+                HordeAnnotationResultMessage,
                 HordePostProcessResultMessage,
                 *_STAGE_RESULT_MESSAGE_TYPES,
             ),
