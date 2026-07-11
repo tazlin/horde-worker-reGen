@@ -48,6 +48,7 @@ from horde_sdk.worker.chaining import (
 from horde_sdk.worker.consts import GENERATION_PROGRESS
 from loguru import logger
 
+from horde_worker_regen.process_management.ipc.messages import HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
@@ -90,6 +91,15 @@ class JobStage(enum.Enum):
     """Inference finished and the job requested post-processing; waiting for the post-processing lane."""
     POST_PROCESSING = auto()
     """Sent to the post-processing process; awaiting the post-processed images."""
+    PENDING_STRIP = auto()
+    """A generation job whose post-processing includes background removal, awaiting its strip pass off-GPU.
+
+    Background removal runs on the image-utilities lane (its ``rembg`` stack never enters the main venv), as
+    the last image transform after any upscale or face-fix on the post-processing lane. Entered after
+    inference (a strip-only job skips the post-processing lane) or after the post-processing lane finishes
+    the other transforms; it advances to ``PENDING_SAFETY_CHECK`` on success. Background removal has no
+    in-graph fallback, so a fault, age-out, or lane death here is a no-image fault (the job is reissued),
+    matching the post-processing lane's policy."""
     PENDING_SAFETY_CHECK = auto()
     """Inference (and any post-processing) finished; waiting for a safety process slot."""
     SAFETY_CHECKING = auto()
@@ -129,6 +139,7 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
     JobStage.PENDING_ANNOTATION: frozenset(
         {
             JobStage.PENDING_INFERENCE,
+            JobStage.PENDING_SAFETY_CHECK,
             JobStage.DETACHED,
             JobStage.PENDING_SUBMIT,
         },
@@ -139,6 +150,7 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
             JobStage.DISAGGREGATION_DECODING,
             JobStage.DETACHED,
             JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_STRIP,
             JobStage.PENDING_SAFETY_CHECK,
             JobStage.PENDING_SUBMIT,
         },
@@ -148,6 +160,7 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
             JobStage.PENDING_INFERENCE,
             JobStage.DETACHED,
             JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_STRIP,
             JobStage.PENDING_SAFETY_CHECK,
             JobStage.PENDING_SUBMIT,
         },
@@ -155,6 +168,7 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
     JobStage.DETACHED: frozenset(
         {
             JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_STRIP,
             JobStage.PENDING_SAFETY_CHECK,
             JobStage.PENDING_SUBMIT,
             JobStage.PENDING_INFERENCE,
@@ -167,8 +181,16 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
         {
             JobStage.DETACHED,
             JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_STRIP,
             JobStage.PENDING_SAFETY_CHECK,
             JobStage.PENDING_SUBMIT,
+        },
+    ),
+    JobStage.PENDING_STRIP: frozenset(
+        {
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+            JobStage.DETACHED,
         },
     ),
     JobStage.PENDING_SAFETY_CHECK: frozenset(
@@ -188,6 +210,7 @@ _QUEUED_STAGES: tuple[JobStage, ...] = (
     JobStage.DISAGGREGATION_DECODING,
     JobStage.PENDING_POST_PROCESSING,
     JobStage.POST_PROCESSING,
+    JobStage.PENDING_STRIP,
     JobStage.PENDING_SAFETY_CHECK,
     JobStage.SAFETY_CHECKING,
     JobStage.PENDING_SUBMIT,
@@ -269,6 +292,12 @@ class TrackedJob:
 
     Set when the job is parked in ``PENDING_ANNOTATION`` and dispatched, so the orphan reconcile can
     release the job to in-graph the instant that specific lane process is gone (died or was replaced),
+    rather than waiting for the age-out backstop. Cleared implicitly when the job leaves the stage."""
+    strip_process_id: int | None = None
+    """The image-utilities process id that owns this job's in-flight background strip, or None.
+
+    None while the job waits in ``PENDING_STRIP`` for a free lane; set when the strip is dispatched, so the
+    orphan reconcile can fault the job the instant that specific lane process is gone (died or was replaced)
     rather than waiting for the age-out backstop. Cleared implicitly when the job leaves the stage."""
     post_process_process_id: int | None = None
     """The post-processing process id that owns the current post-processing attempt, if any."""
@@ -565,6 +594,26 @@ class JobTracker:
             self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING)
             return
 
+        if new_stage == JobStage.PENDING_STRIP:
+            # Background strip is the last post-processing transform. Coming straight from generation
+            # (a strip-only job) the generate node has not been closed yet; coming from the post-processing
+            # lane the post-processing node is already executing.
+            if old_stage in (JobStage.INFERENCE_IN_PROGRESS, JobStage.DISAGGREGATION_DECODING):
+                self._advance_chain(tracked, GENERATION_PROGRESS.GENERATION_COMPLETE)
+            self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING)
+            return
+
+        if new_stage == JobStage.PENDING_SAFETY_CHECK and old_stage == JobStage.PENDING_STRIP:
+            self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING_COMPLETE)
+            return
+
+        if new_stage == JobStage.PENDING_SAFETY_CHECK and old_stage == JobStage.PENDING_ANNOTATION:
+            # A return_control_map job's deliverable was produced by the annotation lane in place of a
+            # generation, so mark the generate node run-and-complete before entering safety.
+            self._advance_chain(tracked, GENERATION_PROGRESS.GENERATING)
+            self._advance_chain(tracked, GENERATION_PROGRESS.GENERATION_COMPLETE)
+            return
+
         if new_stage == JobStage.PENDING_SAFETY_CHECK:
             self._advance_chain(tracked, GENERATION_PROGRESS.GENERATION_COMPLETE)
             if snapshot.get(POST_PROCESS_STAGE_NAME) == CHAIN_NODE_STATE.EXECUTING:
@@ -765,6 +814,69 @@ class JobTracker:
         tracked.premade_control_map_bytes = control_map_bytes
         tracked.annotation_process_id = None
         return self._set_stage(tracked, JobStage.PENDING_INFERENCE)
+
+    def route_annotation_deliverable_to_safety(self, job_id: GenerationID, control_map_bytes: bytes) -> bool:
+        """Route a ``return_control_map`` job's derived control map into safety in place of inference.
+
+        For a job whose requested output *is* the control map, the annotation is the deliverable: the map
+        becomes the job's single image result and the job moves straight to the safety stage (the same
+        post-generation path a monolithic completion takes), never touching an inference process. A job not
+        currently parked, or one carrying no job info, returns False (a late or duplicate result is a no-op).
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_ANNOTATION or tracked.job_info is None:
+            return False
+        tracked.annotation_process_id = None
+        tracked.job_info.job_image_results = [HordeImageResult(image_bytes=control_map_bytes)]
+        tracked.job_info.state = GENERATION_STATE.ok
+        return self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+
+    @property
+    def jobs_pending_strip(self) -> tuple[TrackedJob, ...]:
+        """Return tracked jobs in the ``PENDING_STRIP`` stage, in stage-entry (FIFO) order.
+
+        Returns the ``TrackedJob`` records because the strip orchestration reads the images to strip, the
+        owning lane process, and the stage-entry time directly off them.
+        """
+        return tuple(self._jobs_in_stage(JobStage.PENDING_STRIP))
+
+    async def queue_for_strip(self, job_info: HordeJobInfo, *, from_post_processing: bool) -> bool:
+        """Move a job into the ``PENDING_STRIP`` stage for its background-removal pass on the utilities lane.
+
+        ``from_post_processing`` is True when the job already ran upscale/face-fix on the post-processing
+        lane (its inference-success bookkeeping was recorded then); False for a strip-only job coming
+        straight from inference, which records that bookkeeping here exactly as :meth:`queue_for_safety`
+        does. Returns whether the job entered the stage.
+        """
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            logger.error(
+                f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot queue it for background strip",
+            )
+            return False
+        if not self._set_stage(tracked, JobStage.PENDING_STRIP):
+            logger.warning(
+                f"Refusing to queue job {job_info.sdk_api_job_info.id_} for background strip from stage "
+                f"{tracked.stage.name}; keeping its existing result.",
+            )
+            return False
+        tracked.job_info = job_info
+        tracked.strip_process_id = None
+        if from_post_processing:
+            self._total_num_post_processing_progress += 1
+        else:
+            self.record_model_inference_success(
+                job_info.sdk_api_job_info.model,
+                device_index=tracked.last_dispatched_device_index,
+            )
+            self.note_card_inference_result(tracked.last_dispatched_device_index)
+        return True
+
+    def mark_strip_dispatched(self, job_id: GenerationID, *, process_id: int) -> None:
+        """Record that a parked strip job's pass was dispatched to image-utilities process ``process_id``."""
+        tracked = self._tracked_by_id(job_id)
+        if tracked is not None and tracked.stage == JobStage.PENDING_STRIP:
+            tracked.strip_process_id = process_id
 
     @property
     def job_pop_timestamps(self) -> dict[ImageGenerateJobPopResponse, float]:

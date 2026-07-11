@@ -108,12 +108,37 @@ An **anti-ping-pong latch** guarantees each job is offered to the lane at most o
 of the above is marked annotation-attempted and is never re-parked by a later scan, so it dispatches
 in-graph exactly once-decided rather than oscillating between the stages.
 
+### return_control_map: the map is the deliverable
+
+When a job's requested output *is* the control map (`return_control_map`), a successful annotation is the
+whole job: the map becomes the job's single image result and the job moves straight from `PENDING_ANNOTATION`
+to the safety stage (the same post-generation path a normal completion takes), never touching an inference
+process. This is served only when the control type is servable and the lane is healthy; otherwise, and on
+any annotation fault, age-out, or lane death, the job falls through to `PENDING_INFERENCE` exactly like a
+pre-annotation fallthrough, and hordelib's in-graph annotation-only path produces the map end to end. The
+anti-ping-pong latch applies identically.
+
 ### strip_background rerouting
 
 `strip_background` runs on the utilities lane (its `rembg` stack never enters the main venv), so
-`capability_for_alchemy_form` routes it to `IMAGE_UTILITIES`. A standalone `strip_background` alchemy form
-is dispatched straight to the lane and its result reaches submit through the alchemy coordinator's normal
-path.
+`capability_for_alchemy_form` routes a standalone `strip_background` alchemy form straight to the lane, and
+its result reaches submit through the alchemy coordinator's normal path.
+
+Inside a generation job's post-processing, background removal is the **last** image transform. It is split
+from the pure-torch transforms: a job with any upscaler or face-fixer runs those on the post-processing lane
+first (the lane's pass drops `strip_background`, which it can no longer run), and the job then enters the
+`PENDING_STRIP` stage, where the control loop dispatches `START_BACKGROUND_STRIP` to an idle utilities lane
+process. A job whose only post-processing is background removal skips the post-processing lane entirely and
+goes straight to `PENDING_STRIP`. On success the stripped images move on to safety; the chain is
+inference -> post-processing lane (upscale/face-fix) -> utilities strip (last) -> safety -> submit, dropping
+the post-processing-lane hop when no pure-torch transform was requested.
+
+Background removal has **no in-graph fallback**, so its liveness contract differs from pre-annotation: a
+strip that faults, ages out, or whose lane dies mid-pass is a **no-image fault** (the horde reissues the
+job), never a silent submit of un-stripped images. This matches the post-processing lane, which likewise
+faults without images a job whose requested post-processing could not run. As with the strip pass being
+dispatched one per idle lane per tick, no job is ever left parked indefinitely: the bounded age-out is the
+backstop, and a dead lane is caught immediately by the orphan reconcile.
 
 ### Pop gating
 
@@ -132,19 +157,6 @@ Beyond that static provisioning gate the two features diverge at runtime:
   still pops controlnet work, because the in-graph preprocessor is a real dynamic fallback: the job is
   simply dispatched with no premade map. The provisioning coercion, not runtime health, is the controlnet
   gate.
-
-### Seams that fall through in-graph
-
-Two ControlNet behaviors deliberately do not route through the lane and fall through to hordelib instead:
-
-- **`return_control_map` jobs** (the deliverable is the control map itself) are excluded from
-  pre-annotation and dispatched normally, so hordelib produces the map in-graph. The eligibility predicate
-  `job_wants_pre_annotation` is where routing them wholly through the lane into the submit path (without
-  inference) would attach, alongside a submit-path handoff mirroring the alchemy coordinator's.
-- **The strip-last post-processing tail for generation jobs** (inference → post-processing lane for
-  upscale/face-fix → utilities `strip_background` last → safety → submit) routes its pure-torch steps
-  through the post-processing lane as usual; the utilities `strip_background` leg attaches at the
-  post-processing completion handoff. A standalone `strip_background` alchemy form runs on the lane directly.
 
 ## Weight pre-placement
 

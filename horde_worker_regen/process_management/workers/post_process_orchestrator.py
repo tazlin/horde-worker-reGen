@@ -4,6 +4,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from loguru import logger
 
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
@@ -631,13 +632,17 @@ class PostProcessOrchestrator:
         send failed and the lane could not be marked for replacement (a starting/dead lane the caller
         should leave to recovery).
         """
-        post_processing = completed_job_info.sdk_api_job_info.payload.post_processing
+        # Background removal is not run here: it has no in-graph path (its ``rembg`` stack is not in the
+        # main venv) and is applied last on the image-utilities lane after this pass. Only the pure-torch
+        # transforms (upscale/face-fix) go to the post-processing child.
+        post_processing = completed_job_info.sdk_api_job_info.payload.post_processing or []
+        lane_forms = [form for form in post_processing if not is_strip_background_form(form)]
         message_sent_succeeded = post_process_process.safe_send_message(
             HordePostProcessControlMessage(
                 control_flag=HordeControlFlag.START_POST_PROCESS,
                 job_id=completed_job_info.sdk_api_job_info.id_,
                 images_bytes=completed_job_info.images_bytes,
-                post_processing=list(post_processing) if post_processing else [],
+                post_processing=lane_forms,
             ),
         )
 

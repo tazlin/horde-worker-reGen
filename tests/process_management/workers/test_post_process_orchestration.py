@@ -6,6 +6,7 @@ import time
 from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from horde_sdk.worker.chaining import CHAIN_NODE_STATE
 
 from horde_worker_regen.process_management.ipc.messages import (
@@ -336,6 +337,23 @@ class TestStartPostProcessing:
         assert sent.job_id == job_info.sdk_api_job_info.id_
         assert sent.images_bytes == [b"raw-image"]
         assert sent.post_processing == ["RealESRGAN_x4plus", "GFPGAN"]
+
+    async def test_strip_background_is_dropped_from_the_post_processing_lane_pass(self) -> None:
+        """Background removal has no in-graph path, so only the pure-torch transforms go to the lane."""
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus", "strip_background"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        sent = lane.pipe_connection.send.call_args.args[0]
+        assert isinstance(sent, HordePostProcessControlMessage)
+        assert sent.post_processing == ["RealESRGAN_x4plus"]
+        assert all(not is_strip_background_form(form) for form in sent.post_processing)
 
     async def test_successful_dispatch_reserves_estimated_post_process_vram(self, monkeypatch: object) -> None:
         """Active post-processing is charged to the shared committed-VRAM ledger until its result arrives."""

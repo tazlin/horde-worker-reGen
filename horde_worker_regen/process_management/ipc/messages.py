@@ -516,6 +516,12 @@ class HordeControlFlag(enum.Enum):
 
     The utilities process runs the annotator (canny/depth/etc.) in its own venv and returns the control
     map as PNG bytes, so the annotator's native stack never enters the worker's main environment."""
+    START_BACKGROUND_STRIP = auto()
+    """Signal the image-utilities process to remove the background from a generation job's images.
+
+    The strip is the last image transform in a generation job's post-processing tail (after any upscale or
+    face-fix on the post-processing lane), run here because its ``rembg`` stack never enters the worker's
+    main environment. The utilities process returns the stripped images so the job proceeds to safety."""
     EVALUATE_SAFETY = auto()
     """Signal the child process to evaluate safety of images from inference."""
     UNLOAD_MODELS_FROM_VRAM = auto()
@@ -762,6 +768,43 @@ class HordeAnnotatorAvailabilityMessage(HordeProcessMessage):
 
     servable_control_types: list[str] = Field(default_factory=list)
     """The control types the lane can annotate right now (dependency importable and weights not missing)."""
+
+
+class HordeStartStripControlMessage(HordeControlMessage):
+    """Dispatch a generation job's images to the image-utilities process for background removal.
+
+    The strip is the last image transform in the post-processing tail: the images carried here are the
+    job's current images (raw from inference for a strip-only job, or already upscaled/face-fixed by the
+    post-processing lane). The utilities process removes each image's background and returns the results as
+    :class:`HordeStripResultMessage`, so the ``rembg`` stack never enters the worker's main environment.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_BACKGROUND_STRIP
+    job_id: GenerationID
+    """The ID of the job whose images are being stripped."""
+    images_bytes: list[bytes]
+    """The encoded images to strip, in order (one entry per generated image in the batch)."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeStripResultMessage(HordeProcessMessage):
+    """The stripped images from a generation job's background-removal stage, from the image-utilities process.
+
+    Mirrors the other result-message fault idiom (:class:`HordePostProcessResultMessage`): a successful
+    stage carries the stripped ``images_bytes``; a faulted stage carries an empty list plus ``fault_reason``,
+    and ``state`` tells the parent whether the strip succeeded. A fault routes the job to a no-image fault
+    exactly as a failed post-processing pass does, because background removal has no in-graph fallback.
+    """
+
+    job_id: GenerationID
+    """The ID of the job whose images were stripped."""
+    images_bytes: list[bytes] = Field(default_factory=list)
+    """The stripped images, in order, or empty if the strip faulted."""
+    state: GENERATION_STATE
+    """The state of the stage to be sent to the API (``ok`` or ``faulted``)."""
+    fault_reason: str | None = None
+    """The originating error summary (``"{type}: {message}"``) when the stage faulted, else None."""
 
 
 class HordeSafetyControlMessage(HordeControlMessage):

@@ -12,6 +12,7 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import GenerationID
+from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from loguru import logger
 
 from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
@@ -38,6 +39,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessStateChangeMessage,
     HordeSafetyResultMessage,
     HordeSampleResultMessage,
+    HordeStripResultMessage,
     HordeTextEncodeResultMessage,
     HordeVaeDecodeResultMessage,
     HordeVaeEncodeResultMessage,
@@ -161,6 +163,8 @@ class MessageDispatcher:
     """Invoked when the image-utilities lane reports a ControlNet annotation result (map bytes or a fault)."""
     _on_annotator_availability: Callable[[HordeAnnotatorAvailabilityMessage], None] | None = None
     """Invoked when the image-utilities lane reports which control types it can currently annotate."""
+    _on_strip_result: Callable[[HordeStripResultMessage], Awaitable[None]] | None = None
+    """Invoked when the image-utilities lane reports a generation job's background-strip result."""
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
     _on_download_metrics: Callable[[HordeDownloadMetricsMessage], None] | None = None
     _on_download_availability: Callable[[HordeDownloadAvailabilityMessage], None] | None = None
@@ -274,6 +278,10 @@ class MessageDispatcher:
     ) -> None:
         """Register the callback invoked when the image-utilities lane reports its servable control types."""
         self._on_annotator_availability = handler
+
+    def set_strip_result_handler(self, handler: Callable[[HordeStripResultMessage], Awaitable[None]]) -> None:
+        """Register the callback invoked when the image-utilities lane reports a background-strip result."""
+        self._on_strip_result = handler
 
     def set_stage_result_handler(self, handler: Callable[[HordeProcessMessage], Awaitable[None]]) -> None:
         """Register the callback invoked when a disaggregated stage reports its result.
@@ -461,6 +469,13 @@ class MessageDispatcher:
             elif isinstance(message, HordeAnnotatorAvailabilityMessage):
                 if self._on_annotator_availability is not None:
                     self._on_annotator_availability(message)
+            elif isinstance(message, HordeStripResultMessage):
+                # The strip is a post-inference stage, not a fresh job completion (inference already counted
+                # the job), so it is deliberately not passed to ``_record_completed_job``.
+                if self._on_strip_result is not None:
+                    await self._on_strip_result(message)
+                else:
+                    logger.error(f"Received background-strip result with no handler registered: {message.job_id}")
 
     def _classify_retired_launch_message(self, message: HordeProcessMessage) -> _RetiredLaunchMessageAction:
         """Classify a message that may belong to an intentionally retired launch."""
@@ -478,6 +493,7 @@ class MessageDispatcher:
                 HordeSafetyResultMessage,
                 HordeAlchemyResultMessage,
                 HordeAnnotationResultMessage,
+                HordeStripResultMessage,
                 HordePostProcessResultMessage,
                 *_STAGE_RESULT_MESSAGE_TYPES,
             ),
@@ -1059,26 +1075,56 @@ class MessageDispatcher:
 
         requested_post_processing = job_info.sdk_api_job_info.payload.post_processing
         if requested_post_processing:
-            # Disaggregation forces the post-processing lane on regardless of the lane's own config flag, the
-            # same way it forces the VAE lane on, so a disaggregated completion routes to the lane here.
-            lane_enabled = bridge_data.post_processing_lane_enabled or bridge_data.enable_pipeline_disaggregation
-            if lane_enabled:
-                await self._job_tracker.queue_for_post_processing(job_info)
+            # Background removal runs on the image-utilities lane as the last transform, so it is split from
+            # the pure-torch transforms (upscale/face-fix) that run on the post-processing lane. A job with
+            # any pure-torch transform goes to the post-processing lane first (which drops strip from its
+            # pass), and the strip is applied afterward; a strip-only job skips the post-processing lane.
+            non_strip_forms = [form for form in requested_post_processing if not is_strip_background_form(form)]
+            has_strip = any(is_strip_background_form(form) for form in requested_post_processing)
+            if non_strip_forms:
+                # Disaggregation forces the post-processing lane on regardless of the lane's own config flag,
+                # the same way it forces the VAE lane on, so a disaggregated completion routes to the lane.
+                lane_enabled = bridge_data.post_processing_lane_enabled or bridge_data.enable_pipeline_disaggregation
+                if lane_enabled:
+                    await self._job_tracker.queue_for_post_processing(job_info)
+                    return
+                # The lane is the only path for the pure-torch transforms; with it disabled the job should
+                # never have been popped with post-processing at all. Report a no-image fault so the horde
+                # reissues it instead of silently returning a result that did not receive its post-processing.
+                reason = "job requested post-processing but the dedicated post-processing lane is disabled"
+                logger.error(
+                    f"Job {message.sdk_api_job_info.id_} requested post-processing "
+                    f"({requested_post_processing}) but the dedicated post-processing lane is disabled; "
+                    "reporting the job faulted without images.",
+                )
+                self._job_tracker.note_post_processing_overcommit_fault()
+                await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
                 return
-            # The lane is the only post-processing path; with it disabled the job should never have been
-            # popped with post-processing at all. Report a no-image fault so the horde reissues it instead
-            # of silently returning a result that did not receive the requested post-processing.
-            reason = "job requested post-processing but the dedicated post-processing lane is disabled"
-            logger.error(
-                f"Job {message.sdk_api_job_info.id_} requested post-processing "
-                f"({requested_post_processing}) but the dedicated post-processing lane is disabled; "
-                "reporting the job faulted without images.",
-            )
-            self._job_tracker.note_post_processing_overcommit_fault()
-            await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
-            return
+            if has_strip:
+                if bridge_data.enable_image_utilities is not True:
+                    await self._fault_strip_lane_unavailable(job_info)
+                    return
+                # Strip-only: skip the post-processing lane entirely and go straight to the utilities strip.
+                await self._job_tracker.queue_for_strip(job_info, from_post_processing=False)
+                return
 
         await self._job_tracker.queue_for_safety(job_info)
+
+    async def _fault_strip_lane_unavailable(self, job_info: HordeJobInfo) -> None:
+        """No-image fault a job needing background removal while the image-utilities lane is disabled.
+
+        Background removal has no in-graph fallback, so a job that requested it cannot be served anywhere
+        while the lane is off (an operator flipping ``enable_image_utilities`` off mid-run with strip work in
+        flight is the realistic path). Report a no-image fault so the horde reissues it, rather than parking
+        the job in a stage whose driver never runs while the lane is disabled (which would strand it).
+        """
+        reason = "job requested background removal but the image-utilities lane is disabled"
+        logger.error(
+            f"Job {job_info.sdk_api_job_info.id_} requested background removal but the image-utilities lane "
+            "is disabled; reporting the job faulted without images.",
+        )
+        self._job_tracker.note_post_processing_overcommit_fault()
+        await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
 
     async def _handle_post_process_result(self, message: HordePostProcessResultMessage) -> None:
         """Handle a post-processing result: adopt the processed images and move the job on to safety.
@@ -1135,6 +1181,16 @@ class MessageDispatcher:
             return
 
         completed_job_info.job_image_results = message.job_image_results
+
+        # If this job also requested background removal, the post-processing lane ran only the pure-torch
+        # transforms; the strip is applied last on the image-utilities lane before safety.
+        post_processing = completed_job_info.sdk_api_job_info.payload.post_processing or []
+        if any(is_strip_background_form(form) for form in post_processing):
+            if self._runtime_config.bridge_data.enable_image_utilities is not True:
+                await self._fault_strip_lane_unavailable(completed_job_info)
+                return
+            await self._job_tracker.queue_for_strip(completed_job_info, from_post_processing=True)
+            return
 
         await self._job_tracker.queue_for_safety_post_processed(completed_job_info)
 

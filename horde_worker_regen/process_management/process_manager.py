@@ -71,6 +71,8 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     HordeStageModelMixin,
     HordeStartAnnotationControlMessage,
+    HordeStartStripControlMessage,
+    HordeStripResultMessage,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
@@ -241,19 +243,18 @@ def _resolve_source_image_bytes(job: ImageGenerateJobPopResponse) -> bytes | Non
 
 
 def job_wants_pre_annotation(job: ImageGenerateJobPopResponse) -> bool:
-    """Return whether a job is a ControlNet generation whose control map should be derived off-GPU.
+    """Return whether a ControlNet job's control map should be derived on the image-utilities lane.
 
-    True only when the job requests a control type, its source is a real image (not already a control map),
-    and the deliverable is a generation rather than the control map itself. ``return_control_map`` jobs are
-    excluded here (routing them wholly through the lane into the submit path is a separate seam), as are
-    jobs with no source image (nothing to annotate); both fall through to hordelib's in-graph path.
+    True when the job requests a control type and its source is a real image (not already a control map)
+    that is present to annotate. This covers both a generation job (whose derived map is injected as its
+    premade control map) and a ``return_control_map`` job (whose derived map *is* its deliverable); the
+    result handler routes the two differently. A job with no source image (nothing to annotate) falls
+    through to hordelib's in-graph path.
     """
     payload = job.payload
     if payload.control_type is None:
         return False
     if payload.image_is_control:
-        return False
-    if payload.return_control_map:
         return False
     return job.source_image is not None
 
@@ -1473,6 +1474,7 @@ class HordeWorkerProcessManager:
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
         self._message_dispatcher.set_annotator_availability_handler(self._on_annotator_availability)
+        self._message_dispatcher.set_strip_result_handler(self._on_strip_result)
 
         self._image_coordinator = ImageGenerationCoordinator(
             job_popper=self._job_popper,
@@ -2943,6 +2945,10 @@ class HordeWorkerProcessManager:
             # aged-out, or lane-orphaned parks back to inference so a freed job can be dispatched this tick.
             self._advance_pending_annotations()
 
+            # Drive the background-strip tail (the last post-processing transform, run off the main venv):
+            # dispatch waiting strips to an idle lane and fault (reissue) any whose lane died or aged out.
+            await self._advance_pending_strips()
+
             if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
                 await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
 
@@ -2986,6 +2992,9 @@ class HordeWorkerProcessManager:
                 and not self._state.last_pop_recently()
                 and len(self._job_tracker.jobs_pending_inference) == 0
                 and len(self._job_tracker.jobs_in_progress) == 0
+                # A parked annotation job resolves back into inference, so keep the inference pool up until
+                # none remain, or a released controlnet job would find no process to run on.
+                and len(self._job_tracker.jobs_pending_annotation) == 0
             ):
                 self._process_lifecycle.end_inference_processes()
                 if (
@@ -2993,6 +3002,8 @@ class HordeWorkerProcessManager:
                     and len(self._job_tracker.jobs_being_safety_checked) == 0
                     and len(self._job_tracker.jobs_pending_post_processing) == 0
                     and len(self._job_tracker.jobs_being_post_processed) == 0
+                    # A pending background strip runs on the utilities lane, so keep it up until strips drain.
+                    and len(self._job_tracker.jobs_pending_strip) == 0
                     and self._alchemy_coordinator.num_forms_pending == 0
                     and self._alchemy_coordinator.num_forms_in_flight == 0
                     and self._alchemy_coordinator.num_forms_awaiting_submit == 0
@@ -3049,24 +3060,44 @@ class HordeWorkerProcessManager:
         self._annotator_servable_types[message.process_id] = frozenset(message.servable_control_types)
 
     def _on_annotation_result(self, message: HordeAnnotationResultMessage) -> None:
-        """Release a parked job on an annotation result: with the map on success, in-graph on a fault."""
-        succeeded = message.state == GENERATION_STATE.ok and message.control_map_bytes is not None
-        control_map_bytes = message.control_map_bytes if succeeded else None
+        """Release a parked job on an annotation result.
+
+        On success the routing forks on the job's requested output: a ``return_control_map`` job's map *is*
+        the deliverable, so it goes straight to safety in place of inference; every other controlnet job
+        carries the map back into inference as its premade control map. On any fault both forms fall through
+        to in-graph annotation (a ``return_control_map`` job's in-graph path still produces the map).
+        """
+        subject = f"job:{str(message.job_id)[:8]}"
+        tracked = self._job_tracker.get_tracked_job(message.job_id)
+        map_bytes = message.control_map_bytes
+        succeeded = message.state == GENERATION_STATE.ok and map_bytes is not None
+        wants_delivery = tracked is not None and bool(tracked.sdk_api_job_info.payload.return_control_map)
+
+        if succeeded and wants_delivery and map_bytes is not None:
+            if self._job_tracker.route_annotation_deliverable_to_safety(message.job_id, map_bytes):
+                self._run_metrics.record_decision(
+                    decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                    subject=subject,
+                    verdict=DecisionVerdict.ADMIT,
+                    reason="control_map_delivered",
+                )
+            return
+
+        control_map_bytes = map_bytes if succeeded else None
         if not self._job_tracker.resolve_annotation(message.job_id, control_map_bytes):
             # The job already left PENDING_ANNOTATION (an orphan reconcile released it when its lane died, or
             # this is a duplicate/late result); nothing to do.
             return
-        subject = f"job:{str(message.job_id)[:8]}"
         if succeeded:
             self._run_metrics.record_decision(
-                decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                 subject=subject,
                 verdict=DecisionVerdict.ADMIT,
                 reason="annotated",
             )
         else:
             self._run_metrics.record_decision(
-                decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                 subject=subject,
                 verdict=DecisionVerdict.NO_OP,
                 reason="in_graph_fallthrough",
@@ -3103,7 +3134,7 @@ class HordeWorkerProcessManager:
                     "lane is no longer available.",
                 )
                 self._run_metrics.record_decision(
-                    decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                    decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                     subject=f"job:{str(tracked.job_id)[:8]}",
                     verdict=DecisionVerdict.NO_OP,
                     reason="in_graph_fallthrough",
@@ -3123,7 +3154,7 @@ class HordeWorkerProcessManager:
                     f"out after {age:.0f}s.",
                 )
                 self._run_metrics.record_decision(
-                    decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                    decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                     subject=f"job:{str(tracked.job_id)[:8]}",
                     verdict=DecisionVerdict.NO_OP,
                     reason="in_graph_fallthrough",
@@ -3177,7 +3208,7 @@ class HordeWorkerProcessManager:
                 continue
             used_process_ids.add(process_info.process_id)
             self._run_metrics.record_decision(
-                decision_kind=DecisionKind.ANNOTATION_ROUTING,
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                 subject=f"job:{str(job.id_)[:8]}",
                 verdict=DecisionVerdict.DEFER,
                 reason="pre_annotate",
@@ -3194,6 +3225,134 @@ class HordeWorkerProcessManager:
             if info.can_accept_job():
                 return info
         return None
+
+    _PENDING_STRIP_TIMEOUT_SECONDS = 180.0
+    """How long a job may sit in ``PENDING_STRIP`` before its background strip is faulted without images.
+
+    Bounds how long a generation job waits on its background-removal pass when the lane answers health yet
+    drops a specific strip. A dead or unresponsive lane is caught sooner by the orphan reconcile. On expiry
+    the job is a no-image fault (reissued), because background removal has no in-graph fallback: this matches
+    the post-processing lane, which also faults a job whose requested post-processing could not run."""
+
+    async def _on_strip_result(self, message: HordeStripResultMessage) -> None:
+        """Adopt a background-strip result: on success move the job to safety, on a fault reissue it.
+
+        Background removal is the job's advertised post-processing, so a failed strip is a no-image fault
+        (the horde reissues the job) rather than a silent submit of un-stripped images, exactly as the
+        post-processing lane treats a failed pass.
+        """
+        tracked = self._job_tracker.get_tracked_job(message.job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_STRIP or tracked.job_info is None:
+            # The job already left PENDING_STRIP (an orphan reconcile faulted it when its lane died, or this
+            # is a duplicate/late result); nothing to do.
+            return
+        subject = f"job:{str(message.job_id)[:8]}"
+        job_info = tracked.job_info
+        tracked.strip_process_id = None
+        if message.state == GENERATION_STATE.ok and message.images_bytes:
+            job_info.job_image_results = [HordeImageResult(image_bytes=image) for image in message.images_bytes]
+            job_info.state = GENERATION_STATE.ok
+            await self._job_tracker.queue_for_safety_post_processed(job_info)
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                subject=subject,
+                verdict=DecisionVerdict.ADMIT,
+                reason="background_stripped",
+            )
+            return
+        reason = message.fault_reason or "background removal failed"
+        self._job_tracker.note_post_processing_overcommit_fault()
+        await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
+        self._run_metrics.record_decision(
+            decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+            subject=subject,
+            verdict=DecisionVerdict.DENY,
+            reason="strip_faulted_no_images",
+            inputs={"fault_reason": reason},
+        )
+
+    async def _advance_pending_strips(self) -> None:
+        """Reconcile, age out, and dispatch the image-utilities background-strip stage for generation jobs.
+
+        Runs once per control-loop tick. Orphaned strips (their lane gone) and aged-out strips are faulted
+        without images first (the reissue policy background removal shares with the post-processing lane),
+        then a fresh eligible job is offered to an idle lane. A no-op unless the operator enabled the lane,
+        so a default (mock-truthy) config never activates it.
+        """
+        if self.bridge_data.enable_image_utilities is not True:
+            return
+        await self._reconcile_orphaned_strip_jobs()
+        await self._age_out_pending_strips()
+        self._dispatch_pending_strips()
+
+    async def _reconcile_orphaned_strip_jobs(self) -> None:
+        """Fault (no images) any strip job whose owning image-utilities lane process is gone."""
+        live_ids = {
+            info.process_id
+            for info in self._process_map.values()
+            if info.process_type == HordeProcessType.UTILITIES and info.is_process_alive()
+        }
+        for tracked in self._job_tracker.jobs_pending_strip:
+            if tracked.strip_process_id is None or tracked.strip_process_id in live_ids:
+                continue
+            await self._fault_strip_job(tracked, cause="lane_gone", detail="its image-utilities lane is gone")
+
+    async def _age_out_pending_strips(self) -> None:
+        """Fault (no images) any job that has sat in ``PENDING_STRIP`` past the bounded timeout."""
+        now = time.time()
+        for tracked in self._job_tracker.jobs_pending_strip:
+            age = now - tracked.current_stage_since if tracked.current_stage_since else 0.0
+            if age < self._PENDING_STRIP_TIMEOUT_SECONDS:
+                continue
+            await self._fault_strip_job(
+                tracked, cause="age_out", detail=f"background strip timed out after {age:.0f}s"
+            )
+
+    async def _fault_strip_job(self, tracked: TrackedJob, *, cause: str, detail: str) -> None:
+        """Report a no-image fault for a strip job that cannot complete, so the horde reissues it."""
+        if tracked.job_info is None:
+            return
+        logger.error(f"Faulting job {str(tracked.job_id)[:8]} without images: {detail}.")
+        self._job_tracker.note_post_processing_overcommit_fault()
+        await self._job_tracker.fault_post_inference_job(tracked.job_info, reason=detail)
+        self._run_metrics.record_decision(
+            decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+            subject=f"job:{str(tracked.job_id)[:8]}",
+            verdict=DecisionVerdict.DENY,
+            reason="strip_faulted_no_images",
+            inputs={"cause": cause},
+        )
+
+    def _dispatch_pending_strips(self) -> None:
+        """Dispatch each waiting job's background strip to an idle image-utilities lane (one per lane per tick).
+
+        Pacing one dispatch per idle lane per tick keeps the single serial lane from being flooded while the
+        rest of the pipeline keeps moving.
+        """
+        used_process_ids: set[int] = set()
+        for tracked in self._job_tracker.jobs_pending_strip:
+            if tracked.strip_process_id is not None or tracked.job_info is None:
+                continue
+            images_bytes = tracked.job_info.images_bytes
+            if not images_bytes:
+                continue
+            process_info = self._first_available_utilities_process(exclude=used_process_ids)
+            if process_info is None:
+                return
+            sent = process_info.safe_send_message(
+                HordeStartStripControlMessage(job_id=tracked.job_id, images_bytes=images_bytes),
+            )
+            if not sent:
+                continue
+            self._job_tracker.mark_strip_dispatched(tracked.job_id, process_id=process_info.process_id)
+            used_process_ids.add(process_info.process_id)
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                subject=f"job:{str(tracked.job_id)[:8]}",
+                verdict=DecisionVerdict.DEFER,
+                reason="background_strip",
+                inputs={"process_id": process_info.process_id},
+            )
 
     _REFERENCE_REFRESH_INTERVAL_SECONDS = 1800.0
     """How often the parent re-downloads the model reference and tells subprocesses to reload from
@@ -4059,6 +4218,7 @@ class HordeWorkerProcessManager:
             JobStage.DETACHED: WorkLedgerStage.PREPARING,
             JobStage.PENDING_POST_PROCESSING: WorkLedgerStage.POST_PROCESSING,
             JobStage.POST_PROCESSING: WorkLedgerStage.POST_PROCESSING,
+            JobStage.PENDING_STRIP: WorkLedgerStage.POST_PROCESSING,
             JobStage.PENDING_SAFETY_CHECK: WorkLedgerStage.SAFETY,
             JobStage.SAFETY_CHECKING: WorkLedgerStage.SAFETY,
             JobStage.PENDING_SUBMIT: WorkLedgerStage.SUBMIT,

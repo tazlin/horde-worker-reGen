@@ -55,6 +55,8 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     HordeProcessStateChangeMessage,
     HordeStartAnnotationControlMessage,
+    HordeStartStripControlMessage,
+    HordeStripResultMessage,
 )
 from horde_worker_regen.process_management.lifecycle.process_info import ChildProcessHandle
 
@@ -343,6 +345,10 @@ class UtilitiesProcessAdapter:
             self._handle_annotation(message)
             return
 
+        if isinstance(message, HordeStartStripControlMessage):
+            self._handle_strip(message)
+            return
+
         if isinstance(message, HordeAlchemyControlMessage):
             self._handle_alchemy(message)
             return
@@ -385,6 +391,50 @@ class UtilitiesProcessAdapter:
             ),
         )
         self._send_state(HordeProcessState.ALCHEMY_COMPLETE, f"Annotation {message.control_type} complete")
+        self._set_annotating(False)
+
+    def _handle_strip(self, message: HordeStartStripControlMessage) -> None:
+        """Strip the background from each of a generation job's images and put the result on the queue.
+
+        Reuses the same background-removal translation the standalone ``strip_background`` alchemy form uses
+        (:meth:`remove_background`), but emits a :class:`HordeStripResultMessage` so the parent routes the
+        stripped images back into the generation job's safety/submit tail rather than the alchemy submit path.
+        A failure on any image faults the whole stage (empty result), which the parent turns into a no-image
+        fault, matching how the post-processing lane treats a failed pass.
+        """
+        self._set_annotating(True)
+        self._send_state(HordeProcessState.ALCHEMY_STARTING, "Background strip")
+        started_at = time.monotonic()
+        stripped: list[bytes] = []
+        state = GENERATION_STATE.ok
+        fault_reason: str | None = None
+        try:
+            for image_bytes in message.images_bytes:
+                stripped.append(self.remove_background(image_bytes))
+        except Exception as e:
+            state = GENERATION_STATE.faulted
+            fault_reason = f"{type(e).__name__}: {e}"
+            stripped = []
+            logger.error(f"Image utilities background strip failed: {fault_reason}")
+
+        time_elapsed = time.monotonic() - started_at
+        self._process_message_queue.put(
+            HordeStripResultMessage(
+                process_id=self._process_id,
+                process_launch_identifier=self._process_launch_identifier,
+                reported_os_pid=self._server.pid,
+                info="Background strip complete" if fault_reason is None else fault_reason,
+                time_elapsed=time_elapsed,
+                job_id=message.job_id,
+                images_bytes=stripped,
+                state=state,
+                fault_reason=fault_reason,
+            ),
+        )
+        completed_state = (
+            HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
+        )
+        self._send_state(completed_state, "Background strip complete")
         self._set_annotating(False)
 
     def _handle_alchemy(self, message: HordeAlchemyControlMessage) -> None:

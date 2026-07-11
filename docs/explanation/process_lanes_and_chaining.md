@@ -189,8 +189,14 @@ stage did not complete.
    orchestrator dispatches the first fittable pending job, sends the raw images and the requested operations,
    and the processed images replace the raw ones. A chain that never fits the card ages out to a no-image
    fault; an orphan watchdog requeues a job whose result was lost (bounded), then faults without images.
-5. **Safety**: unchanged; the safety orchestrator sends the (possibly post-processed) images for evaluation.
-6. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
+   `strip_background` is excluded from this pass (it has no in-graph path) and runs last on the
+   [image-utilities lane](image_utilities_lane.md) instead (step 5).
+5. **Background strip** (when `strip_background` was requested): the last image transform, run on the
+   image-utilities lane in the `PENDING_STRIP` stage after any upscale/face-fix. A strip-only job reaches
+   here straight from generation, skipping the post-processing lane. With no in-graph fallback, a fault,
+   age-out, or lane death here is a no-image fault (reissue), matching the post-processing lane.
+6. **Safety**: unchanged; the safety orchestrator sends the (possibly post-processed) images for evaluation.
+7. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
 
 Graph alchemy forms (standalone upscale/facefix jobs) ride the same lane via the `ALCHEMY_GRAPH` capability
 and count as lane commitments while they are pending or in flight; `strip_background` instead routes to the

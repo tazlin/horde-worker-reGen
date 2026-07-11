@@ -81,7 +81,9 @@ class DecisionKind(enum.StrEnum):
     INFERENCE_DISPATCH = "inference_dispatch"
     PP_DEFERRAL = "pp_deferral"
     RECLAIM_RUNG = "reclaim_rung"
-    ANNOTATION_ROUTING = "annotation_routing"
+    IMAGE_UTILITIES_ROUTING = "image_utilities_routing"
+    """How a job was routed through the out-of-venv image-utilities lane: control-map pre-annotation (and
+    its in-graph fallthrough), a ``return_control_map`` delivery, or the background-strip tail."""
 
 
 class DecisionVerdict(enum.StrEnum):
