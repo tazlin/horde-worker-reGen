@@ -303,11 +303,12 @@ class DeviceVramState:
     preload_planned_unmaterialized_mb: float = 0.0
     """The preload-flow share (MB) of :attr:`planned_unmaterialized_mb`: charges for admitted loads still
     staged in system RAM, whose VRAM materialisation happens only when their dispatch is later admitted
-    against fresh measured truth. A drain-side request (post-processing of an already-sampled job) is priced
-    net of this share: the staged load cannot claim the card before that drain completes (its dispatch gate
-    re-prices it, and the drain's completion is what frees the room it waits on), so charging it against the
-    drain is a circular wait, not protection. Dispatch-flow reservations (in-flight sampling about to spike)
-    stay fully charged for every requester."""
+    against fresh measured truth. Two request classes are priced net of this share because ordering
+    guarantees they commit VRAM before any staged load can: a drain-side request (post-processing of an
+    already-sampled job, whose completion is what frees the room a staged load waits on) and the true head
+    of queue (every staged sibling's dispatch admission necessarily follows the head's). Charging either the
+    staged plans is a circular wait, not protection. Dispatch-flow reservations (in-flight sampling about to
+    spike) stay fully charged for every requester."""
     noise_buffer_mb: float = _ADMISSION_NOISE_BUFFER_MB
     """The admission noise margin (MB) subtracted from the device-free reading, derived per device at snapshot
     assembly from the total via :func:`admission_noise_buffer_mb` so it scales with card capacity; direct
@@ -503,19 +504,30 @@ class VramArbiter:
         # let a re-ask defer forever on its own footprint. Only the target's own reservation is removed; every
         # other unit's stays.
         overlay_mb = state.planned_unmaterialized_mb
-        if request.kind == VramRequestKind.PP_JOB:
-            # Post-processing drains the pipeline: completing it is what releases the finished job's holds and
-            # frees the room a staged head waits on. A preload-flow charge is a load still in system RAM whose
-            # VRAM claim only happens when its dispatch is later re-priced against fresh measured truth, so
-            # charging it here inverts the dependency and deadlocks the drain behind bookkeeping (the head
-            # cannot materialise until the drain completes, the drain defers on the head's charge). Price the
-            # drain against physical truth plus the dispatch-flow reservations only (in-flight sampling really
-            # is about to spike); the same reasoning already admits the disaggregated decode unconditionally.
-            overlay_mb = max(0.0, overlay_mb - state.preload_planned_unmaterialized_mb)
-        net_reservations_mb = max(
-            0.0,
-            overlay_mb - max(0.0, request.own_planned_unmaterialized_mb),
+        own_mb = max(0.0, request.own_planned_unmaterialized_mb)
+        # A preload-flow charge is a load still in system RAM whose VRAM claim only happens when its dispatch
+        # is later re-priced against fresh measured truth. Two request classes are, by ordering, guaranteed to
+        # commit VRAM before any such staged load can, so charging them the preload share inverts the
+        # dependency and deadlocks the queue behind bookkeeping:
+        #
+        # - PP_JOB drains the pipeline: completing it is what releases the finished job's holds and frees the
+        #   room a staged head waits on (the same reasoning already admits the disaggregated decode
+        #   unconditionally).
+        # - The true head of queue (preload or monolithic dispatch): every other staged load sits behind it,
+        #   and a staged load's materialisation is gated on its own dispatch admission, which cannot precede
+        #   the head's. Charging the head a sibling's staged plan therefore parks the head on room that can
+        #   only ever be claimed after the head itself runs; nothing clears it but the recovery supervisor.
+        #
+        # Both are priced against physical truth plus the dispatch-flow reservations only (in-flight sampling
+        # really is about to spike). The requester's own preload-flow charge is part of the netted share, so
+        # the two subtractions must not stack (that would eat into other units' dispatch-flow charges): the
+        # larger of the share and the own charge is removed once.
+        nets_preload_share = request.kind == VramRequestKind.PP_JOB or (
+            request.is_head_of_queue and request.kind in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH)
         )
+        if nets_preload_share:
+            own_mb = max(own_mb, state.preload_planned_unmaterialized_mb)
+        net_reservations_mb = max(0.0, overlay_mb - own_mb)
         return evaluate_admission(
             candidate_outstanding_mb=candidate_delta_mb,
             device_free_mb=state.device_free_mb,

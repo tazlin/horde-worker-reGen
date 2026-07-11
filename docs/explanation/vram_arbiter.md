@@ -139,15 +139,24 @@ identity cannot express that no-op (the resident model's own reservation can leg
 noise-adjusted ceiling, which would otherwise withhold a dispatch that needs no memory), so this is the
 whole-card analogue of the disaggregated stage dispatch a resident lane never withholds.
 
-Drain-side requests are priced against a narrower overlay. A post-processing chain
-(`PP_JOB`) completes a job that has already sampled: finishing it is what releases the job's holds and frees
-the room a staged head is waiting on. A preload-flow anchor is a load still staged in system RAM whose VRAM
-claim only happens once its dispatch is later re-priced against fresh measured truth, so charging it against
-the drain inverts the dependency into a circular wait: the head cannot materialise until the drain completes,
-while the drain defers on the head's bookkeeping until it ages out and faults the finished job. The identity
-therefore excludes the preload flow's planned share for `PP_JOB` requests and charges only the dispatch-flow
-reservations (in-flight sampling genuinely about to spike) on top of physical truth. This is the same
-reasoning that admits the disaggregated decode stage unconditionally: work that drains the pipeline must not
+Two request classes are priced against a narrower overlay, because ordering guarantees they commit VRAM
+before any staged load can. A preload-flow anchor is a load still staged in system RAM whose VRAM claim only
+happens once its dispatch is later re-priced against fresh measured truth; charging it against work that
+necessarily precedes that dispatch inverts the dependency into a circular wait that only the recovery
+supervisor's soft resets and give-up faults can break.
+
+The first class is the drain side. A post-processing chain (`PP_JOB`) completes a job that has already
+sampled: finishing it is what releases the job's holds and frees the room a staged head is waiting on, so a
+drain deferring on the head's bookkeeping ages out and faults the finished job. The second class is the true
+head of queue itself (`PRELOAD` or `MONOLITHIC_DISPATCH` with `is_head_of_queue`): every other staged load
+sits behind the head, and a staged sibling's materialisation is gated on its own dispatch admission, which
+cannot precede the head's. Charging the head a queued sibling's staged plan parks the head on room that can
+only ever be claimed after the head itself runs; with two staged loads the standoff is mutual and the queue
+wedges outright. Both classes are therefore priced against physical truth plus the dispatch-flow
+reservations only (in-flight sampling genuinely about to spike); the requester's own preload-flow charge is
+part of the excluded share, so the per-target self-netting does not stack on top of it. A non-head request
+(a line-skip) stays fully charged, so it can never consume the room a staged head is waiting on. This is the
+same reasoning that admits the disaggregated decode stage unconditionally: work whose turn has come must not
 be starved by claims whose own turn comes after it.
 
 Before reclaim is consulted, a non-fitting request is checked against the **phantom-ledger** judgement. The
