@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import time
-from multiprocessing.process import BaseProcess
-from typing import override
+from typing import Protocol, override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -29,15 +28,51 @@ except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 
 
+class ChildProcessHandle(Protocol):
+    """The OS-process control surface the lifecycle drives a child process through.
+
+    A spawned child is a ``multiprocessing.BaseProcess``, which satisfies this structurally. The
+    image-utilities lane is not a spawn but an out-of-venv subprocess bridged by a parent-side adapter;
+    the adapter exposes a handle satisfying this same surface (see ``lifecycle/utilities_adapter.py``), so
+    the crash reaper and teardown treat both uniformly without knowing which is which.
+    """
+
+    @property
+    def pid(self) -> int | None:
+        """The OS process id, or None before the process has started."""
+        ...
+
+    @property
+    def exitcode(self) -> int | None:
+        """The exit code, or None while the process is still running or has not started."""
+        ...
+
+    def is_alive(self) -> bool:
+        """Return whether the process is currently running."""
+        ...
+
+    def terminate(self) -> None:
+        """Ask the process to terminate."""
+        ...
+
+    def kill(self) -> None:
+        """Forcibly kill the process."""
+        ...
+
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for the process to exit, up to ``timeout`` seconds."""
+        ...
+
+
 class HordeProcessInfo:
     """Contains information about a horde child process."""
 
-    mp_process: BaseProcess
-    """The multiprocessing process object for this process.
+    mp_process: ChildProcessHandle
+    """The OS-process control surface for this process (see :class:`ChildProcessHandle`).
 
-    Typed as ``BaseProcess`` (not ``multiprocessing.Process``) because the parent creates children
-    from an explicit spawn context (``ctx.Process(...)``), which returns a ``SpawnProcess``, a
-    sibling of ``multiprocessing.Process``, both subclassing ``BaseProcess``.
+    For a spawned child this is the ``BaseProcess`` returned by ``ctx.Process(...)`` (a ``SpawnProcess``,
+    a sibling of ``multiprocessing.Process``, both subclassing ``BaseProcess``). For the out-of-venv
+    image-utilities lane it is the adapter's handle wrapping the capability-service subprocess.
     """
     pipe_connection: Connection
     """The connection through which messages can be sent to this process."""
@@ -231,7 +266,7 @@ class HordeProcessInfo:
 
     def __init__(
         self,
-        mp_process: BaseProcess,
+        mp_process: ChildProcessHandle,
         pipe_connection: Connection,
         process_id: int,
         process_type: HordeProcessType,
@@ -243,7 +278,8 @@ class HordeProcessInfo:
         """Initialize a new HordeProcessInfo object.
 
         Args:
-            mp_process (BaseProcess): The multiprocessing process object for this process.
+            mp_process (ChildProcessHandle): The OS-process control surface for this process (a spawned \
+                ``BaseProcess`` or the utilities adapter's subprocess handle).
             pipe_connection (Connection): The connection through which messages can be sent to this process.
             process_id (int): The ID of this process. This is not an OS process ID.
             process_type (HordeProcessType): The type of this process.

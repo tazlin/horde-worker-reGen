@@ -127,6 +127,14 @@ per-slot breaker. This count is the equivalent signal for safety: a pool that ha
 this many times in the window is failing (e.g. a safety process that crashes on every start), which the
 recovery supervisor escalates rather than rebuilding the pool forever."""
 
+UTILITIES_PROCESS_EXPECTED_VRAM_MB: float = 1024.0
+"""Provisional expected device footprint (MB) charged when admitting the image-utilities lane.
+
+A rough-order-of-magnitude seed covering the lane's second CUDA/onnxruntime context overhead plus a small
+annotator/background-removal model headroom, charged against free VRAM at start so the lane is deferred
+rather than started onto a pressured card. It is a placeholder to be recalibrated against the measured
+footprint of the capability service once the job-flow routing exercises it."""
+
 PENDING_GPU_START_NO_PROGRESS_SECONDS: float = 600.0
 """How long deferred GPU starts may show no free-VRAM progress before recovery may escalate normally."""
 
@@ -396,6 +404,10 @@ class ProcessLifecycleManager:
         self._component_processes_ending = False
         self._vae_lane_processes_should_be_replaced = False
         self._vae_lane_processes_ending = False
+        # The image-utilities lane (an out-of-venv capability-service subprocess bridged by a parent-side
+        # adapter) reuses the post-processing lane's simple end -> delete -> start replacement machine.
+        self._utilities_processes_should_be_replaced = False
+        self._utilities_processes_ending = False
         # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
         # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
         # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
@@ -623,14 +635,25 @@ class ProcessLifecycleManager:
             context_mb = 0.0
         return soft_floor_mb(total_mb) + context_mb
 
-    def _gpu_start_has_headroom(self, device_index: int, *, cpu_only: bool = False) -> tuple[bool, str]:
-        """Return whether a CUDA-capable child may start now, plus a human-readable reason if not."""
+    def _gpu_start_has_headroom(
+        self,
+        device_index: int,
+        *,
+        cpu_only: bool = False,
+        extra_required_mb: float = 0.0,
+    ) -> tuple[bool, str]:
+        """Return whether a CUDA-capable child may start now, plus a human-readable reason if not.
+
+        ``extra_required_mb`` adds a per-process expected-footprint charge on top of the generic
+        soft-floor + context requirement, for a lane (such as the image-utilities lane) whose own device
+        footprint should be reserved before it is admitted.
+        """
         if cpu_only:
             return True, ""
         free_mb = self._device_free_mb_provider(device_index)
         if free_mb is None:
             return True, ""
-        required_mb = self._gpu_start_required_free_mb(device_index)
+        required_mb = self._gpu_start_required_free_mb(device_index) + extra_required_mb
         governor_state = self._device_governor_state_provider(device_index)
         if free_mb >= required_mb and governor_state == GovernorState.HEALTHY:
             return True, ""
@@ -676,6 +699,7 @@ class ProcessLifecycleManager:
         HordeProcessType.POST_PROCESS,
         HordeProcessType.VAE_LANE,
         HordeProcessType.COMPONENT,
+        HordeProcessType.UTILITIES,
     )
     """GPU-context process types whose spawn is a VRAM-materializing event for LIFO reclaim ranking."""
 
@@ -772,6 +796,10 @@ class ProcessLifecycleManager:
             if self._process_map.num_vae_lane_processes() > 0:
                 return False
             return self.start_vae_lane_processes()
+        if pending.process_type is HordeProcessType.UTILITIES:
+            if self._process_map.num_utilities_processes() > 0:
+                return False
+            return self.start_utilities_processes()
         return False
 
     def _log_recovery_diagnostics(self, process_info: HordeProcessInfo, reason: str) -> None:
@@ -1089,6 +1117,193 @@ class ProcessLifecycleManager:
     def post_process_processes_should_be_replaced(self) -> bool:
         """Whether the dedicated post-processing lane is flagged for replacement."""
         return self._post_process_processes_should_be_replaced
+
+    def utilities_process_enabled(self) -> bool:
+        """Whether the dedicated image-utilities lane should be running.
+
+        Gated on an explicit config flag, guarded with ``is True`` so a mock bridge-data object (whose
+        every attribute reads truthy) never spuriously enables the lane in tests.
+        """
+        return self._runtime_config.bridge_data.enable_image_utilities is True
+
+    def _utilities_card(self) -> CardRuntime:
+        """Return the card the image-utilities lane is pinned to (the post-processing lane's placement)."""
+        return self._post_process_card()
+
+    def utilities_lane_card_index(self) -> int:
+        """Return the device index the image-utilities lane is (or would be) pinned to."""
+        return self._utilities_card().device_index
+
+    def _utilities_device_pin_env(self, lane_card: CardRuntime) -> dict[str, str]:
+        """Return the env-var device-pin patch for the utilities subprocess, or empty when no pin applies.
+
+        Mirrors :func:`worker_entry_points._apply_device_pin`, but returns the patch (for the child's env)
+        rather than mutating this process's environment. ``mask_kind`` is None on a single-GPU host (no pin,
+        byte-identical to before); DirectML/CPU/MPS need no env mask. Best-effort: a failure logs and yields
+        no pin rather than blocking the lane.
+        """
+        kind = lane_card.mask_kind
+        if kind is None:
+            return {}
+        try:
+            from hordelib.utils.device_pinning import device_pin_env
+            from hordelib.utils.torch_memory import AcceleratorKind
+
+            accelerator = AcceleratorKind(kind)
+            if accelerator in (AcceleratorKind.directml, AcceleratorKind.cpu, AcceleratorKind.mps):
+                return {}
+            pin_env, _extra_args = device_pin_env(accelerator, lane_card.device_index)
+            return dict(pin_env)
+        except Exception as pin_error:
+            logger.warning(
+                f"Could not compute a device pin for the image utilities lane on device "
+                f"{lane_card.device_index} ({kind}): {type(pin_error).__name__} {pin_error}. Running unmasked.",
+            )
+            return {}
+
+    def _build_utilities_child_env(self, lane_card: CardRuntime) -> dict[str, str]:
+        """Build the hardened environment for the image-utilities subprocess."""
+        env = dict(os.environ)
+        cache_home = os.environ.get("AIWORKER_CACHE_HOME")
+        if cache_home:
+            env["AIWORKER_CACHE_HOME"] = cache_home
+            # The annotator weights are resolved from the shared model cache. The precise subdirectory is a
+            # job-flow concern resolved when annotation routing lands; the cache root is the safe default.
+            env["HIU_ANNOTATOR_MODEL_DIR"] = cache_home
+        env["HIU_ALLOW_DOWNLOADS"] = "false"
+        env.update(self._utilities_device_pin_env(lane_card))
+        return env
+
+    def _utilities_interpreter_available(self) -> bool:
+        """Return whether the real utilities venv interpreter exists (always True for an injected factory).
+
+        Only the default (real) factory launches an actual subprocess, so only it needs the provisioned
+        venv; a test-injected factory bypasses the check. This keeps an enabled-but-unprovisioned worker
+        from crash-looping the lane instead of quietly declining to start it.
+        """
+        from horde_worker_regen.process_management.worker_entry_points import create_utilities_adapter
+
+        if self._entry_points.utilities_adapter_factory is not create_utilities_adapter:
+            return True
+        from worker_bootstrap import paths
+
+        return paths.utilities_python().is_file()
+
+    def start_utilities_processes(self) -> bool:
+        """Start the dedicated image-utilities lane, if enabled and not already running."""
+        if not self.utilities_process_enabled():
+            return False
+
+        if self._process_map.num_utilities_processes() > 0:
+            return True
+
+        if not self._utilities_interpreter_available():
+            logger.error(
+                "The image-utilities lane is enabled but its virtual environment interpreter is missing; "
+                "not starting the lane. Provision the utilities venv to enable it.",
+            )
+            return False
+
+        lane_card = self._utilities_card()
+        key = self._pending_gpu_start_key(HordeProcessType.UTILITIES, None)
+        if key in self._pending_gpu_starts:
+            return False
+        can_start, defer_reason = self._gpu_start_has_headroom(
+            lane_card.device_index,
+            extra_required_mb=UTILITIES_PROCESS_EXPECTED_VRAM_MB,
+        )
+        if not can_start:
+            self._defer_gpu_start(
+                process_type=HordeProcessType.UTILITIES,
+                process_id=None,
+                device_index=lane_card.device_index,
+                reason=f"image utilities lane start: {defer_reason}",
+            )
+            return False
+
+        from worker_bootstrap import paths
+
+        pid = self._allocate_inference_pid()
+        pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
+        child_env = self._build_utilities_child_env(lane_card)
+
+        try:
+            adapter = self._entry_points.utilities_adapter_factory(
+                pid,
+                self._process_message_queue,
+                child_pipe_connection,
+                self.num_processes_launched,
+                device_index=lane_card.device_index,
+                python_executable=str(paths.utilities_python()),
+                child_env=child_env,
+            )
+            adapter.start()
+        except Exception as e:
+            logger.error(f"Failed to start the image utilities lane: {type(e).__name__} {e}")
+            return False
+
+        self._process_map[pid] = HordeProcessInfo(
+            mp_process=adapter.handle,
+            pipe_connection=pipe_connection,
+            process_id=pid,
+            process_type=HordeProcessType.UTILITIES,
+            last_process_state=HordeProcessState.PROCESS_STARTING,
+            process_launch_identifier=self.num_processes_launched,
+            device_index=lane_card.device_index,
+        )
+        self._register_owned(self._process_map[pid])
+
+        logger.info(f"Started image utilities process (id: {pid}, device_index: {lane_card.device_index})")
+        self.num_processes_launched += 1
+        return True
+
+    def end_utilities_processes(self) -> None:
+        """End any dedicated image-utilities processes."""
+        for process_info in self._process_map.get_stoppable_utilities_processes():
+            process_info.end_intended = True
+            process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+            self._process_map.on_process_ending(process_id=process_info.process_id)
+            self._forget_owned(process_info)
+
+            logger.info(f"Ended image utilities process {process_info.process_id}")
+
+    def _initiate_utilities_replacement(self) -> None:
+        """Flag the image-utilities lane for replacement so the control loop's state machine restarts it."""
+        self._utilities_processes_should_be_replaced = True
+
+    def _replace_all_utilities_process(self) -> None:
+        """Replace the dedicated image-utilities process across control-loop ticks.
+
+        Mirrors the post-processing lane's replacement state machine: enter the ending phase (covering a
+        process that died while still ``PROCESS_STARTING``), wait for the old process to drain out of the
+        map, then start a fresh one.
+        """
+        if not self._utilities_processes_should_be_replaced:
+            return
+
+        if not self._utilities_processes_ending:
+            self._utilities_processes_ending = True
+            if self._process_map.num_loaded_utilities_processes() > 0:
+                self.end_utilities_processes()
+            return
+
+        if self._process_map.num_loaded_utilities_processes() == 0 and self._process_map.num_utilities_processes() > 0:
+            self._process_map.delete_utilities_processes()
+
+        if (
+            self._utilities_processes_ending
+            and self._process_map.num_loaded_utilities_processes() == 0
+            and self._process_map.num_utilities_processes() == 0
+        ):
+            self.start_utilities_processes()
+            self._utilities_processes_ending = False
+            self._utilities_processes_should_be_replaced = False
+            self._num_process_recoveries += 1
+
+    @property
+    def utilities_processes_should_be_replaced(self) -> bool:
+        """Whether the dedicated image-utilities lane is flagged for replacement."""
+        return self._utilities_processes_should_be_replaced
 
     def _component_lane_enabled(self) -> bool:
         """Whether the dedicated text-encode service should run.
@@ -1733,6 +1948,8 @@ class ProcessLifecycleManager:
         # The VAE lane is the disaggregated pipeline's VAE-encode/decode stage; likewise a no-op unless
         # pipeline disaggregation is enabled.
         self.start_vae_lane_processes()
+        # The image-utilities lane is the out-of-venv capability service; a no-op unless it is enabled.
+        self.start_utilities_processes()
 
         pending_inference_starts = sum(
             1 for pending in self._pending_gpu_starts.values() if pending.process_type is HordeProcessType.INFERENCE
@@ -2314,6 +2531,9 @@ class ProcessLifecycleManager:
         elif process_info.process_type == HordeProcessType.VAE_LANE:
             self._initiate_vae_lane_replacement()
             self._replace_all_vae_lane_process()
+        elif process_info.process_type == HordeProcessType.UTILITIES:
+            self._initiate_utilities_replacement()
+            self._replace_all_utilities_process()
         elif process_info.process_type == HordeProcessType.INFERENCE:
             self._replace_inference_process(process_info)
         return True

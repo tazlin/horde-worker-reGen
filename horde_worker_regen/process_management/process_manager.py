@@ -2884,6 +2884,7 @@ class HordeWorkerProcessManager:
             self._process_lifecycle._replace_all_post_process_process()
             self._process_lifecycle._replace_all_component_process()
             self._process_lifecycle._replace_all_vae_lane_process()
+            self._process_lifecycle._replace_all_utilities_process()
 
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
             # before it can wedge the head of the queue.
@@ -2927,6 +2928,7 @@ class HordeWorkerProcessManager:
                     self._process_lifecycle.end_safety_processes()
                     self._process_lifecycle.end_post_process_processes()
                     self._process_lifecycle.end_component_processes()
+                    self._process_lifecycle.end_utilities_processes()
 
             if self.is_time_for_shutdown():
                 return False

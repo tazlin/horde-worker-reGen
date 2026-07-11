@@ -2,7 +2,7 @@ import contextlib
 import os
 import sys
 import time
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -19,6 +19,9 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
     write_startup_crash,
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
+
+if TYPE_CHECKING:
+    from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesLaneAdapter
 
 # Env var the parent process sets (from its own ``-v`` count) so spawned workers inherit the
 # operator's verbosity intent instead of a hardcoded value. Read by ``resolve_worker_log_verbosity``.
@@ -1063,6 +1066,58 @@ def start_download_process(
         worker_process.main_loop()
 
 
+class UtilitiesAdapterFactory(Protocol):
+    """The signature a callable must have to construct the image-utilities lane's parent-side adapter.
+
+    Unlike the other entry points (multiprocessing targets that run inside a spawned child), this builds a
+    parent-resident adapter that owns an out-of-venv capability-service subprocess. Injectable so tests
+    exercise the lifecycle without launching a real subprocess.
+    """
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        control_connection: Connection,
+        process_launch_identifier: int,
+        *,
+        device_index: int,
+        python_executable: str,
+        child_env: dict[str, str],
+    ) -> "UtilitiesLaneAdapter":
+        """Build the image-utilities lane adapter over a capability service run by ``python_executable``."""
+
+
+def create_utilities_adapter(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    control_connection: Connection,
+    process_launch_identifier: int,
+    *,
+    device_index: int,
+    python_executable: str,
+    child_env: dict[str, str],
+) -> "UtilitiesLaneAdapter":
+    """Build the real image-utilities lane adapter over a ``CapabilityServerProcess``.
+
+    The heavy imports (``horde_image_utilities`` and the adapter module) are deferred to call time so this
+    default is safe to reference from the torch-free orchestrator even when the utilities venv is absent.
+    """
+    from horde_image_utilities.launcher import CapabilityServerProcess
+
+    from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesProcessAdapter
+
+    server = CapabilityServerProcess(python_executable=python_executable, env=child_env)
+    return UtilitiesProcessAdapter(
+        process_id=process_id,
+        process_message_queue=process_message_queue,
+        control_connection=control_connection,
+        process_launch_identifier=process_launch_identifier,
+        server=server,
+        device_index=device_index,
+    )
+
+
 class ProcessEntryPoints:
     """The multiprocessing targets used when launching child worker processes.
 
@@ -1080,6 +1135,7 @@ class ProcessEntryPoints:
     vae_lane_entry_point: VaeLaneProcessEntryPoint
     component_entry_point: ComponentProcessEntryPoint
     download_entry_point: DownloadProcessEntryPoint
+    utilities_adapter_factory: UtilitiesAdapterFactory
 
     def __init__(
         self,
@@ -1090,6 +1146,7 @@ class ProcessEntryPoints:
         vae_lane_entry_point: VaeLaneProcessEntryPoint | None = None,
         component_entry_point: ComponentProcessEntryPoint | None = None,
         download_entry_point: DownloadProcessEntryPoint | None = None,
+        utilities_adapter_factory: UtilitiesAdapterFactory | None = None,
     ) -> None:
         """Initialise with the given entry points, defaulting to the real ones.
 
@@ -1106,6 +1163,8 @@ class ProcessEntryPoints:
                 the dedicated component lane process. Defaults to `start_component_process`.
             download_entry_point (DownloadProcessEntryPoint | None, optional): The target for \
                 the background download process. Defaults to `start_download_process`.
+            utilities_adapter_factory (UtilitiesAdapterFactory | None, optional): The factory for the \
+                image-utilities lane's parent-side adapter. Defaults to `create_utilities_adapter`.
         """
         self.inference_entry_point = (
             inference_entry_point if inference_entry_point is not None else start_inference_process
@@ -1122,4 +1181,7 @@ class ProcessEntryPoints:
         )
         self.download_entry_point = (
             download_entry_point if download_entry_point is not None else start_download_process
+        )
+        self.utilities_adapter_factory = (
+            utilities_adapter_factory if utilities_adapter_factory is not None else create_utilities_adapter
         )

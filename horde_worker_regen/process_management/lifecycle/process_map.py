@@ -1223,6 +1223,55 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             logger.debug(f"Deleting VAE lane process {process_info.process_id} from process map")
             self.retire_process(process_info, "VAE lane replacement")
 
+    def num_utilities_processes(self, *, device_index: int | None = None) -> int:
+        """Return the number of dedicated image-utilities lane processes.
+
+        Args:
+            device_index: When given, count only utilities processes pinned to that card; when None, count
+                across every card.
+        """
+        count = 0
+        for p in self.values():
+            if p.process_type == HordeProcessType.UTILITIES and (
+                device_index is None or p.device_index == device_index
+            ):
+                count += 1
+        return count
+
+    def num_loaded_utilities_processes(self) -> int:
+        """Return the number of image-utilities lane processes past startup and not yet shutting down."""
+        count = 0
+        for p in self.values():
+            if (
+                p.process_type == HordeProcessType.UTILITIES
+                and p.last_process_state != HordeProcessState.PROCESS_STARTING
+                and p.last_process_state != HordeProcessState.PROCESS_ENDING
+                and p.last_process_state != HordeProcessState.PROCESS_ENDED
+            ):
+                count += 1
+        return count
+
+    def get_stoppable_utilities_processes(self) -> list[HordeProcessInfo]:
+        """Return image-utilities lane processes that can be sent an end command.
+
+        Any live process that has not already entered its terminal shutdown states; lifecycle teardown
+        needs this broader set than a can-accept-work finder would.
+        """
+        return [
+            p
+            for p in self.values()
+            if p.process_type == HordeProcessType.UTILITIES
+            and p.last_process_state not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+        ]
+
+    def delete_utilities_processes(self) -> None:
+        """Clear all dedicated image-utilities lane processes."""
+        processes_to_delete = [p for p in self.values() if p.process_type == HordeProcessType.UTILITIES]
+
+        for process_info in processes_to_delete:
+            logger.debug(f"Deleting image utilities process {process_info.process_id} from process map")
+            self.retire_process(process_info, "image utilities lane replacement")
+
     def get_process_by_horde_model_name(
         self,
         horde_model_name: str,

@@ -12,6 +12,10 @@ the chain model that describes a job's route through it, and why post-processing
 | Inference | `INFERENCE` (pool, per card) | The image-generation checkpoint(s) | Image generation (`IMAGE_GEN`) |
 | Post-processing | `POST_PROCESS` (single) | Upscalers, face-fixers, background removal | Job post-processing phases and graph alchemy forms (`ALCHEMY_GRAPH`) |
 | Safety | `SAFETY` (single) | The CLIP safety stack | Safety evaluation (`SAFETY_EVAL`) and CLIP alchemy forms (`ALCHEMY_CLIP`) |
+| Image utilities | `UTILITIES` (single) | ControlNet annotators, background-removal stack | ControlNet annotation and background removal (`IMAGE_UTILITIES`) |
+
+The image-utilities lane is the odd one out: it is not a multiprocessing child but an out-of-venv
+subprocess bridged by a parent-side adapter. See [Image utilities lane](image_utilities_lane.md).
 
 Dispatch keys on the capability flags (`WorkerCapability`), not on process types, so a new work kind adds a
 flag and a handler rather than special cases. The download process sits outside the lanes entirely.
@@ -182,7 +186,9 @@ stage did not complete.
 4. **Safety**: unchanged; the safety orchestrator sends the (possibly post-processed) images for evaluation.
 5. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
 
-Graph alchemy forms (standalone upscale/facefix/strip_background jobs) ride the same lane via the
-`ALCHEMY_GRAPH` capability and count as lane commitments while they are pending or in flight; CLIP forms
-(caption/interrogation/nsfw) stay on the safety process. The alchemy coordinator owns its own pop/submit
-loop, but the image popper reads its graph-lane commitment count for post-processing offer shaping.
+Graph alchemy forms (standalone upscale/facefix jobs) ride the same lane via the `ALCHEMY_GRAPH` capability
+and count as lane commitments while they are pending or in flight; `strip_background` instead routes to the
+out-of-venv [image-utilities lane](image_utilities_lane.md) (`IMAGE_UTILITIES` capability), where its
+`rembg` stack stays out of the main environment; CLIP forms (caption/interrogation/nsfw) stay on the safety
+process. The alchemy coordinator owns its own pop/submit loop, but the image popper reads its graph-lane
+commitment count for post-processing offer shaping.

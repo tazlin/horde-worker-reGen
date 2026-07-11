@@ -715,6 +715,14 @@ class reGenBridgeData(CombinedHordeBridgeData):
     force the post-processing lane on: that lane follows its own configuration and only carries the
     upscale/face-fix work. Default false (the monolithic path) until validated on the operator's card."""
 
+    enable_image_utilities: bool = Field(default=False)
+    """Run the dedicated image-utilities lane (the ``horde_image_utilities`` capability service).
+
+    The lane runs from its own virtual environment as a loopback HTTP service, so the native,
+    accelerator-gated stack behind ControlNet annotation and background removal never enters the worker's
+    main environment. When true, the worker starts and supervises that subprocess as an ordinary child.
+    Default false until the utilities venv is provisioned and the job-flow routing is wired."""
+
     vram_reserve_mb: int = Field(default=2048, ge=0)
     """Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak.
 

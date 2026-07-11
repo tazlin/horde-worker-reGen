@@ -60,6 +60,14 @@ class HordeProcessType(enum.Enum):
     pauses/restores off-GPU during whole-card windows, reports ``POST_PROCESSING`` state), but distinct from
     ``POST_PROCESS`` so a busy post-processing lane can never block a critical-path VAE stage and its
     co-residency charge (the tiled-decode spike) stays honest. See ``workers/vae_lane_process.py``."""
+    UTILITIES = auto()
+    """A dedicated image-utilities lane: the ``horde_image_utilities`` capability service in its own venv.
+
+    Unlike every other type, this process is not a multiprocessing spawn: it is an out-of-venv subprocess
+    (``python -m horde_image_utilities``) bridged by a parent-side adapter that speaks the standard IPC
+    message vocabulary on its behalf, so the lifecycle, process map, and TUI treat it as an ordinary child.
+    It holds the annotator/background-removal stack away from the worker's main environment and answers over
+    loopback HTTP. See ``lifecycle/utilities_adapter.py``."""
 
 
 ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES: frozenset[HordeProcessType] = frozenset(
@@ -69,6 +77,7 @@ ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES: frozenset[HordeProcessType] = frozenset(
         HordeProcessType.POST_PROCESS,
         HordeProcessType.COMPONENT,
         HordeProcessType.VAE_LANE,
+        HordeProcessType.UTILITIES,
     },
 )
 """Process types whose control dispatch implements ``RELEASE_ALLOCATOR_CACHE``.
@@ -93,6 +102,8 @@ class WorkerCapability(enum.Flag):
     """Graph-backed alchemy forms: upscalers, facefixers, strip_background."""
     ALCHEMY_CLIP = enum.auto()
     """CLIP-stack alchemy forms: caption, interrogation, nsfw."""
+    IMAGE_UTILITIES = enum.auto()
+    """Out-of-venv image utilities: ControlNet annotation and background removal (the utilities lane)."""
 
 
 DEFAULT_CAPABILITIES: dict[HordeProcessType, WorkerCapability] = {
@@ -102,6 +113,7 @@ DEFAULT_CAPABILITIES: dict[HordeProcessType, WorkerCapability] = {
     HordeProcessType.DOWNLOAD: WorkerCapability(0),
     HordeProcessType.COMPONENT: WorkerCapability(0),
     HordeProcessType.VAE_LANE: WorkerCapability(0),
+    HordeProcessType.UTILITIES: WorkerCapability.IMAGE_UTILITIES,
 }
 """The capabilities each process type declares by default."""
 

@@ -77,6 +77,9 @@ Want to know how it works under the hood, or contribute a change? The
     the worker's log lines, the `horde-log` detectors that read them, and the
     dashboard's Diagnostics tab are kept in sync with one shared facade and a
     contract test, so a new detector needs the fewest manual touches.
+17. **[Image utilities lane](explanation/image_utilities_lane.md)**: the
+    out-of-venv capability service, the parent-side adapter that bridges it into
+    the ordinary child contract, its control verbs, and how it is supervised.
 
 The **[codebase map](reference/codebase-map.md)** is a file-to-responsibility
 quick reference, and the auto-generated API reference for every module lives

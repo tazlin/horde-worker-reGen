@@ -100,6 +100,39 @@ For Intel XPU, install the torch build ad-hoc first (no locked build exists):
 uv pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
+### Image-utilities capability venv (the second environment)
+
+Some capabilities are served by the `horde-image-utilities` service, which runs from its **own virtual
+environment** separate from the worker's `.venv`. Keeping it separate means its native, accelerator-gated
+dependencies never share a dependency resolution with the worker's, so neither environment forces a
+compromise on the other's pins.
+
+**Where it lives.** In the peered data directory alongside the managed CPython and uv cache
+(`<worker>-data/utilities-venv/`), so recreating or reinstalling the worker folder does not discard it.
+
+**How it is provisioned.** After a successful worker sync, the bootstrap (`bootstrap.py sync`) provisions
+the utilities venv when:
+
+1. the resolved feature set is non-empty (the same `HORDE_WORKER_FEATURES` resolution used for the
+   worker's own extras: NVIDIA/CPU want it by default, lean backends only when opted in, and `none` opts
+   out), **and**
+2. a CI-compiled requirements pin exists for the resolved backend token.
+
+It creates the venv against the same pinned managed CPython and installs the pin into it, then records a
+stamp (the backend token plus the requirements-file SHA256) so a subsequent sync re-provisions only when
+the pin or backend actually changes. A provisioning failure is non-fatal: the worker still runs, the
+failure is warned, and the next sync retries it.
+
+**The requirements-file mechanism.** The pins live at `requirements/utilities.<backend_token>.txt` (one
+per locked torch build: `cu126`, `cu130`, `cu132`, `cpu`). Each is a fully-resolved, hashed
+`uv pip compile` output of `horde-image-utilities[server,annotators_<X>,rembg_<X>,mediapipe]` compiled in
+CI; when a pin carries `--hash=` lines the install enforces them with `--require-hashes`. A backend with
+no committed pin simply has nothing to provision yet (the step stays a no-op). See `requirements/README.md`
+for the naming and generation details.
+
+**Controls.** `HORDE_WORKER_FEATURES` decides whether it is wanted (as above). To skip it for an emergency
+worker-only install, pass `--skip-utilities` to `sync`/`install` or set `HORDE_WORKER_SKIP_UTILITIES=1`.
+
 ### Config coercion (advertised == runnable)
 
 Whatever is installed, the worker reads hordelib's capability registry
