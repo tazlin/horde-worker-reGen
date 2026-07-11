@@ -22,6 +22,9 @@ from horde_worker_regen.server_capabilities import (
 )
 
 
+_PRODUCTION_SWAGGER_URL = "https://aihorde.net/api/swagger.json"
+
+
 def _pop_input_schema(extended_controlnet: bool) -> dict[str, object]:
     """The `PopInputStable` schema, with the extended-controlnet property present only on new servers."""
     properties: dict[str, object] = {"allow_controlnet": {"type": "boolean"}}
@@ -46,6 +49,24 @@ def _swagger_2_doc(
             _POP_INPUT_SCHEMA_NAME: _pop_input_schema(extended_controlnet),
         },
     }
+
+
+_cached_production_swagger_doc: dict[str, object] | None = None
+
+
+def _production_swagger_doc() -> dict[str, object]:
+    """The production swagger.json shape, for a live probe."""
+    global _cached_production_swagger_doc
+    if _cached_production_swagger_doc is not None:
+        return _cached_production_swagger_doc
+
+    import requests
+
+    response = requests.get(_PRODUCTION_SWAGGER_URL)
+    response.raise_for_status()
+    _cached_production_swagger_doc = response.json()
+
+    return _cached_production_swagger_doc
 
 
 def _openapi_3_doc(
@@ -109,6 +130,35 @@ class TestParseEnum:
         """A schema table missing the expected schema raises (so the caller can fail-closed)."""
         with pytest.raises((KeyError, TypeError)):
             _parse_enum({}, _FORM_SCHEMA_NAME, _FORM_ENUM_KEYS)
+
+    @pytest.mark.network
+    def test_production_swagger_doc_parses(self) -> None:
+        """The production swagger.json shape is parseable and yields a non-empty form enum."""
+        doc = _production_swagger_doc()
+        schemas = _schemas(doc)
+        forms = _parse_enum(schemas, _FORM_SCHEMA_NAME, _FORM_ENUM_KEYS)
+        assert isinstance(forms, frozenset)
+        assert len(forms) > 0
+
+    @pytest.mark.network
+    def test_production_swagger_doc_has_metadata_type_enum(self) -> None:
+        """The production swagger.json shape is parseable and yields a non-empty generation-metadata type enum."""
+        doc = _production_swagger_doc()
+        schemas = _schemas(doc)
+        metadata_types = _parse_enum(schemas, _METADATA_TYPE_SCHEMA_NAME, _METADATA_TYPE_ENUM_KEYS)
+        assert isinstance(metadata_types, frozenset)
+        assert len(metadata_types) > 0
+
+    @pytest.mark.network
+    def test_production_swagger_doc_has_pop_input_schema(self) -> None:
+        """The production swagger.json shape is parseable and yields a `PopInputStable` schema with properties.
+
+        ``PopInputStable`` uses ``allOf`` composition; we exercise ``_parse_property_present`` here
+        rather than manually unwinding the schema.
+        """
+        doc = _production_swagger_doc()
+        schemas = _schemas(doc)
+        assert _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, "allow_controlnet") is True
 
 
 class TestServerSupportGate:
@@ -211,8 +261,8 @@ class TestGenerationMetadataTypeGate:
         assert server_supports_generation_metadata_type("aesthetic_score") is False
 
     @pytest.mark.asyncio
-    async def test_missing_metadata_schema_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """If the metadata schema is absent entirely, the whole probe fails-closed (both gates)."""
+    async def test_missing_metadata_schema_keeps_other_gates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A missing metadata schema fails-closed for that gate only; the forms gate still succeeds."""
 
         async def _fake_fetch(url: str) -> dict[str, object]:
             return {"definitions": {_FORM_SCHEMA_NAME: {"properties": {"name": {"enum": ["caption"]}}}}}
@@ -221,7 +271,7 @@ class TestGenerationMetadataTypeGate:
         await refresh_server_capabilities(force=True)
 
         assert server_supports_generation_metadata_type("aesthetic_score") is False
-        assert server_supports_interrogation_form("caption") is False
+        assert server_supports_interrogation_form("caption") is True
 
 
 class TestParsePropertyPresent:
@@ -247,6 +297,62 @@ class TestParsePropertyPresent:
         with pytest.raises(TypeError):
             _parse_property_present(
                 {_POP_INPUT_SCHEMA_NAME: {"properties": ["not", "an", "object"]}},
+                _POP_INPUT_SCHEMA_NAME,
+                _EXTENDED_CONTROLNET_PROPERTY,
+            )
+
+    def test_all_of_present_property(self) -> None:
+        """A property declared inside an ``allOf`` branch (possibly via ``$ref``) reads as present."""
+        schemas = {
+            _POP_INPUT_SCHEMA_NAME: {
+                "allOf": [
+                    {"$ref": "#/definitions/PopInput"},
+                    {"properties": {"allow_controlnet": {"type": "boolean"}}},
+                ],
+            },
+            "PopInput": {"properties": {"allow_img2img": {"type": "boolean"}}},
+        }
+        assert _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, "allow_controlnet") is True
+        assert _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, "allow_img2img") is True
+
+    def test_all_of_absent_property(self) -> None:
+        """A property absent from all ``allOf`` branches returns False (not an error)."""
+        schemas = {
+            _POP_INPUT_SCHEMA_NAME: {
+                "allOf": [
+                    {"properties": {"allow_lora": {"type": "boolean"}}},
+                ],
+            },
+        }
+        assert _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, _EXTENDED_CONTROLNET_PROPERTY) is False
+
+    def test_all_of_unresolved_ref_raises(self) -> None:
+        """An unresolvable ``$ref`` inside ``allOf`` raises (unknown schema shape, treated as fail-closed)."""
+        schemas = {
+            _POP_INPUT_SCHEMA_NAME: {
+                "allOf": [
+                    {"$ref": "#/definitions/NonexistentSchema"},
+                ],
+            },
+        }
+        with pytest.raises(KeyError):
+            _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, "allow_controlnet")
+
+    def test_all_of_non_dict_entry_raises(self) -> None:
+        """A non-dict ``allOf`` entry raises (unexpected shape)."""
+        schemas = {
+            _POP_INPUT_SCHEMA_NAME: {
+                "allOf": ["not_an_object"],
+            },
+        }
+        with pytest.raises(TypeError):
+            _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, "allow_controlnet")
+
+    def test_neither_properties_nor_all_of_raises(self) -> None:
+        """A schema with neither ``properties`` nor ``allOf`` raises (unknown shape)."""
+        with pytest.raises(KeyError):
+            _parse_property_present(
+                {_POP_INPUT_SCHEMA_NAME: {"type": "object"}},
                 _POP_INPUT_SCHEMA_NAME,
                 _EXTENDED_CONTROLNET_PROPERTY,
             )
@@ -302,8 +408,8 @@ class TestExtendedControlNetGate:
         assert server_supports_extended_controlnet() is True
 
     @pytest.mark.asyncio
-    async def test_missing_pop_input_schema_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """If `PopInputStable` is absent entirely, the whole probe fails-closed (all gates)."""
+    async def test_missing_pop_input_schema_keeps_other_gates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A missing ``PopInputStable`` fails-closed for the extended-controlnet gate only."""
 
         async def _fake_fetch(url: str) -> dict[str, object]:
             return {
@@ -317,4 +423,4 @@ class TestExtendedControlNetGate:
         await refresh_server_capabilities(force=True)
 
         assert server_supports_extended_controlnet() is False
-        assert server_supports_interrogation_form("caption") is False
+        assert server_supports_interrogation_form("caption") is True

@@ -96,20 +96,54 @@ def _parse_enum(schemas: dict[str, object], schema_name: str, enum_keys: tuple[s
     return frozenset(str(value) for value in node)
 
 
+def _resolve_all_of_entry(entry: object, schemas: dict[str, object]) -> dict[str, object]:
+    """Resolve a single ``allOf`` entry, chasing a ``$ref`` if present."""
+    if isinstance(entry, dict) and "$ref" in entry:
+        ref_name: str = entry["$ref"].split("/")[-1]
+        resolved = schemas.get(ref_name)
+        if resolved is None:
+            raise KeyError(f"unresolved $ref {entry['$ref']}")
+        if not isinstance(resolved, dict):
+            raise TypeError(f"resolved $ref {entry['$ref']} is not an object")
+        return resolved
+    if isinstance(entry, dict):
+        return entry
+    raise TypeError(f"allOf entry is not an object: {entry!r}")
+
+
 def _parse_property_present(schemas: dict[str, object], schema_name: str, property_name: str) -> bool:
     """Return whether ``schema_name``'s ``properties`` table declares ``property_name``.
 
     Unlike :func:`_parse_enum` this is a presence check: an absent property is a definitive ``False``
     (an older server that predates the field), while a malformed schema (missing schema, non-dict
     ``properties``) raises ``KeyError``/``TypeError``. Callers treat any raise as "unknown" (fail-closed).
+
+    Handles ``allOf`` composition: walks each entry, resolving ``$ref`` pointers into *schemas*, and
+    checks the ``properties`` of each resolved object. The property is considered present if it
+    appears in any branch.
     """
     schema = schemas[schema_name]
     if not isinstance(schema, dict):
         raise TypeError(f"schema {schema_name} is not an object")
-    properties = schema["properties"]
-    if not isinstance(properties, dict):
-        raise TypeError(f"properties of {schema_name} is not an object")
-    return property_name in properties
+
+    # Direct properties (most schemas).
+    if "properties" in schema:
+        properties = schema["properties"]
+        if not isinstance(properties, dict):
+            raise TypeError(f"properties of {schema_name} is not an object")
+        return property_name in properties
+
+    # allOf composition (e.g. PopInputStable extends PopInput).
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        for entry in all_of:
+            resolved = _resolve_all_of_entry(entry, schemas)
+            props = resolved.get("properties")
+            if isinstance(props, dict) and property_name in props:
+                return True
+        return False
+
+    raise KeyError(f"schema {schema_name} has no properties or allOf")
 
 
 async def _fetch_swagger_spec(url: str) -> dict[str, object]:
@@ -141,29 +175,43 @@ async def refresh_server_capabilities(*, force: bool = False) -> None:
     try:
         spec = await _fetch_swagger_spec(url)
         schemas = _extract_schemas(spec)
+    except Exception as exc:
+        _next_refresh_monotonic = now + FAILURE_RETRY_SECONDS
+        logger.warning(f"Could not fetch swagger spec from {url}: {type(exc).__name__} {exc}")
+        return
+
+    # Each probe is independent: a failure in one must not discard results from the others.
+    try:
         forms = _parse_enum(schemas, _FORM_SCHEMA_NAME, _FORM_ENUM_KEYS)
+    except Exception as exc:
+        logger.warning(f"Could not parse interrogation form enum: {type(exc).__name__} {exc}")
+    else:
+        if forms != _supported_interrogation_forms:
+            logger.info(f"Server-supported interrogation forms: {sorted(forms)}")
+        _supported_interrogation_forms = forms
+
+    try:
         metadata_types = _parse_enum(schemas, _METADATA_TYPE_SCHEMA_NAME, _METADATA_TYPE_ENUM_KEYS)
+    except Exception as exc:
+        logger.warning(f"Could not parse generation-metadata type enum: {type(exc).__name__} {exc}")
+    else:
+        if metadata_types != _supported_generation_metadata_types:
+            logger.info(f"Server-supported generation-metadata types: {sorted(metadata_types)}")
+        _supported_generation_metadata_types = metadata_types
+
+    try:
         extended_controlnet = _parse_property_present(
             schemas,
             _POP_INPUT_SCHEMA_NAME,
             _EXTENDED_CONTROLNET_PROPERTY,
         )
     except Exception as exc:
-        # Keep any prior good result; just retry sooner. Fail-closed only matters before the first
-        # success, when the caches are still None.
-        _next_refresh_monotonic = now + FAILURE_RETRY_SECONDS
-        logger.warning(f"Could not probe server capabilities from {url}: {type(exc).__name__} {exc}")
-        return
+        logger.warning(f"Could not probe extended ControlNet: {type(exc).__name__} {exc}")
+    else:
+        if extended_controlnet != _supports_extended_controlnet:
+            logger.info(f"Server supports extended ControlNet: {extended_controlnet}")
+        _supports_extended_controlnet = extended_controlnet
 
-    if forms != _supported_interrogation_forms:
-        logger.info(f"Server-supported interrogation forms: {sorted(forms)}")
-    if metadata_types != _supported_generation_metadata_types:
-        logger.info(f"Server-supported generation-metadata types: {sorted(metadata_types)}")
-    if extended_controlnet != _supports_extended_controlnet:
-        logger.info(f"Server supports extended ControlNet: {extended_controlnet}")
-    _supported_interrogation_forms = forms
-    _supported_generation_metadata_types = metadata_types
-    _supports_extended_controlnet = extended_controlnet
     _next_refresh_monotonic = now + SUCCESS_TTL_SECONDS
 
 
