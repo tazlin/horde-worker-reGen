@@ -231,6 +231,14 @@ class TrackedJob:
 
     Keys this model's over-budget fault streak per card so a model unservable on a small card can still be
     advertised and run on a larger one. None on single-GPU keeps the streak worker-wide, exactly as before."""
+    premade_control_map_bytes: bytes | None = None
+    """The ControlNet control map (PNG bytes) the image-utilities lane annotated ahead of dispatch, or None.
+
+    Set for a ControlNet job whose source image is not already a control map and which did not request the
+    control map as its output: the utilities lane derives the map before the job is eligible for inference
+    dispatch, and the scheduler carries these bytes on the inference control message so the child injects
+    them instead of re-annotating in the main venv. None for every other job. See the image-utilities lane
+    explanation doc for the pre-annotation flow."""
     post_process_process_id: int | None = None
     """The post-processing process id that owns the current post-processing attempt, if any."""
     post_process_launch_identifier: int | None = None

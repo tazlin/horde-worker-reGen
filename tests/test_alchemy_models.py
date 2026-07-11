@@ -70,9 +70,13 @@ class TestRequiredCapability:
     """Forms route to the capability that can serve them."""
 
     def test_graph_forms_route_to_inference_processes(self) -> None:
-        """Graph-backed forms require ALCHEMY_GRAPH (inference processes)."""
-        for form in ("RealESRGAN_x4plus", "4x_AnimeSharp", "NMKD_Siax", "GFPGAN", "CodeFormers", "strip_background"):
+        """Graph-backed forms (upscalers/facefixers) require ALCHEMY_GRAPH (the post-processing lane)."""
+        for form in ("RealESRGAN_x4plus", "4x_AnimeSharp", "NMKD_Siax", "GFPGAN", "CodeFormers"):
             assert required_capability(form) == WorkerCapability.ALCHEMY_GRAPH, form
+
+    def test_strip_background_routes_to_image_utilities(self) -> None:
+        """strip_background runs on the out-of-venv image-utilities lane, not the post-processing lane."""
+        assert required_capability("strip_background") == WorkerCapability.IMAGE_UTILITIES
 
     def test_clip_forms_route_to_safety_process(self) -> None:
         """Text-output forms require ALCHEMY_CLIP (the safety process)."""

@@ -511,6 +511,11 @@ class HordeControlFlag(enum.Enum):
     """Signal the image lane to VAE-encode a source image to a latent (img2img/inpaint front-end)."""
     START_VAE_DECODE = auto()
     """Signal the image lane to VAE-decode a latent to raw images (post-processing runs on its own lane)."""
+    START_ANNOTATION = auto()
+    """Signal the image-utilities process to derive a ControlNet control map from a source image.
+
+    The utilities process runs the annotator (canny/depth/etc.) in its own venv and returns the control
+    map as PNG bytes, so the annotator's native stack never enters the worker's main environment."""
     EVALUATE_SAFETY = auto()
     """Signal the child process to evaluate safety of images from inference."""
     UNLOAD_MODELS_FROM_VRAM = auto()
@@ -640,6 +645,15 @@ class HordeInferenceControlMessage(HordeControlModelMessage):
     (the dominant non-sampling cost on small jobs) is skipped. Defaults to False, preserving the
     aggressive per-job eviction that keeps sibling GPU instances from over-committing."""
 
+    premade_control_map_bytes: bytes | None = None
+    """The pre-computed ControlNet control map (PNG bytes) the image-utilities lane derived, or None.
+
+    Set only for a ControlNet job whose control map the utilities lane annotated ahead of dispatch (the
+    source image was not already a control map and no control map was requested as the output). The
+    inference child injects it as the generation's premade control map so hordelib runs the ``none``
+    preprocessor over it instead of re-deriving the annotation in the main venv. None for every other
+    job, preserving the normal in-graph preprocessing path."""
+
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
 
@@ -689,6 +703,65 @@ class HordeAlchemyResultMessage(HordeProcessMessage):
     """The inline result for non-image forms (caption/interrogation/nsfw/aesthetic/etc.)."""
     image_bytes: bytes | None = None
     """The WebP-encoded result image bytes for graph forms, to be uploaded to R2."""
+
+
+class HordeStartAnnotationControlMessage(HordeControlMessage):
+    """Dispatch a source image to the image-utilities process for ControlNet annotation (START_ANNOTATION).
+
+    The source image is already downloaded and decoded to raw PNG bytes by the main process, so the
+    utilities process never performs network IO for job inputs. The annotator identity is the
+    ``control_type`` (canny, depth, etc.); the utilities process derives the control map at ``resolution``
+    and returns it as :class:`HordeAnnotationResultMessage`.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_ANNOTATION
+    job_id: GenerationID
+    """The ID of the job the control map is being derived for."""
+    control_type: str
+    """The annotator to run (a ControlNet control type such as ``canny`` or ``depth``)."""
+    source_image_bytes: bytes
+    """The encoded (PNG) source image bytes to annotate."""
+    resolution: int = 512
+    """The resolution the annotator should produce the control map at."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeAnnotationResultMessage(HordeProcessMessage):
+    """The control map from a job's annotation stage, sent from the image-utilities process.
+
+    Mirrors the other result-message fault idiom (:class:`HordePostProcessResultMessage`): a successful
+    stage carries ``control_map_bytes``; a faulted stage carries None plus ``fault_reason``, and ``state``
+    tells the parent whether the annotation succeeded.
+    """
+
+    job_id: GenerationID
+    """The ID of the job the control map was derived for."""
+    control_map_bytes: bytes | None = None
+    """The encoded (PNG) control map, or None if the annotation faulted."""
+    state: GENERATION_STATE
+    """The state of the stage to be sent to the API (``ok`` or ``faulted``)."""
+    fault_reason: str | None = None
+    """The originating error summary (``"{type}: {message}"``) when the stage faulted, else None.
+
+    Carries the utilities process's real error text (for example a 409 when the annotator's weights are
+    missing) so a faulted annotation is not blank."""
+
+
+class HordeAnnotatorAvailabilityMessage(HordeProcessMessage):
+    """A snapshot of which ControlNet control types the image-utilities lane can actually annotate.
+
+    The utilities process cannot necessarily serve every control type: a detector whose heavy backend is
+    not importable in the lane's environment (for example ``seg``'s UniFormer today), or whose weights are
+    not pre-placed, is not servable and its ``GET /annotators`` entry reports it. The adapter polls that
+    endpoint and emits this snapshot on bring-up and on refresh, so the job flow can pre-annotate only the
+    control types the lane can serve and let every other controlnet job fall through to hordelib's in-graph
+    preprocessor (which costs no extra dependencies). Availability-driven rather than hardcoded, so the set
+    grows automatically as the lane gains detectors, with no carve-out to maintain here.
+    """
+
+    servable_control_types: list[str] = Field(default_factory=list)
+    """The control types the lane can annotate right now (dependency importable and weights not missing)."""
 
 
 class HordeSafetyControlMessage(HordeControlMessage):

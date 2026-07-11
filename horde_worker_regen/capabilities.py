@@ -1,27 +1,26 @@
 """Runtime detection of optional, backend-blocking features, and config coercion to match.
 
-Some worker features depend on native packages that have no wheels for every accelerator ComfyUI
-supports: ``onnxruntime`` backs the controlnet annotators (only Openpose/DWPose among the
-horde-exposed control types actually needs it) and ``rembg`` backs ``strip_background``. Those
-packages live in ``horde-engine`` extras, re-exported as the worker's ``controlnet`` and
-``post-processing`` extras (see ``pyproject.toml``), so a lean base install on Intel XPU / Apple MPS
-/ Ascend simply lacks them. Everything else (core SD/Flux inference, the NSFW/CSAM safety
-classifier, ESRGAN upscalers, CodeFormer/GFPGAN face-fixers, LoRA, img2img) is pure PyTorch and runs
-on every backend.
+ControlNet annotation (``onnxruntime``) and background removal (``rembg``) depend on native packages
+that have no wheels for every accelerator ComfyUI supports. Rather than install them into the worker's
+main environment, both now run on the dedicated out-of-venv image-utilities lane (the
+``horde_image_utilities`` capability service, see ``lifecycle/utilities_adapter.py``), so their native
+stacks never enter the main venv. Their availability is therefore a single fact: whether that lane is
+provisioned and enabled (:func:`utilities_available`), not whether the packages import here. Everything
+else (core SD/Flux inference, the NSFW/CSAM safety classifier, ESRGAN upscalers, CodeFormer/GFPGAN
+face-fixers, LoRA, img2img) is pure PyTorch, runs on every backend, and runs on the inference and
+post-processing lanes rather than the utilities lane.
 
-This module reads hordelib's typed capability registry (``hordelib.feature_requirements``) and
-coerces the loaded bridge data so the worker never advertises a feature it cannot actually run: a job
-that requested it would otherwise fault. Image-generation post-processing is one atomic switch
+This module coerces the loaded bridge data so the worker never advertises a feature it cannot serve: a
+job that requested it would otherwise fault. Image-generation post-processing is one atomic switch
 (``allow_post_processing``): the AI Horde API has no per-job way to accept upscale/face-fix while
-refusing ``strip_background``, so when ``rembg`` is absent the whole switch is coerced off even though
-the upscalers/face-fixers themselves would run. Alchemy forms are enumerated per-form, so there
-``strip_background`` alone is dropped (see :func:`strip_background_available`) and the pure-torch
-forms stay on offer.
+refusing ``strip_background``, so when the utilities lane is unavailable the whole switch is coerced off
+even though the pure-torch upscalers/face-fixers would still run on the post-processing lane. Alchemy
+forms are enumerated per-form, so there ``strip_background`` alone is dropped (see
+:func:`strip_background_available`) and the pure-torch forms stay on offer.
 
-hordelib is imported lazily inside each probe, and from its torch-free ``feature_requirements`` submodule
-rather than the ``hordelib.api`` facade (which would drag torch into the orchestrator). So importing this
-module (and the process manager) stays cheap, requires no torch, and preserves the no-GPU/no-network
-dry-run test path.
+The utilities-lane probe reads the venv interpreter path from ``worker_bootstrap.paths`` (stdlib-only),
+so importing this module (and the process manager) stays cheap, requires no torch, and preserves the
+no-GPU/no-network dry-run test path.
 """
 
 from __future__ import annotations
@@ -32,8 +31,6 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 if TYPE_CHECKING:
-    from hordelib.feature_impact import FEATURE_KIND
-
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
@@ -66,34 +63,36 @@ def _worker_extra_for_feature() -> dict[str, str]:
     }
 
 
-@functools.lru_cache(maxsize=1)
-def _available_features() -> frozenset[FEATURE_KIND]:
-    """Return the features hordelib reports as runnable in this environment (cached for the process).
+def utilities_available(bridge_data: reGenBridgeData | None = None) -> bool:
+    """Return whether the image-utilities lane can serve ControlNet annotation and background removal.
 
-    Installed packages do not change during a run, so the probe is memoized. Returns an empty set if
-    hordelib cannot be imported at all: in that case the worker cannot run inference regardless, so
-    treating every gated feature as unavailable is the safe reading.
+    The lane is the execution home for both features, so their availability collapses to two facts:
+
+    - the utilities venv interpreter exists on disk (it is provisioned), read the same way the process
+      lifecycle reaches it (``worker_bootstrap.paths.utilities_python``); and
+    - when a config is supplied, the operator has not explicitly disabled the lane
+      (``enable_image_utilities is not False``; a mock bridge-data object whose attributes all read
+      truthy is treated as enabled, matching the coercion call sites).
+
+    Callers without a config (the no-arg dependency probes below) check only provisioning; the enable
+    flag is enforced where a config is in hand (the coercion pass) and, at runtime, by the pop gate that
+    withholds offers while no healthy utilities process exists.
     """
-    try:
-        from hordelib.feature_requirements import available_features
-    except Exception as exc:  # pragma: no cover - hordelib is a hard dependency in practice
-        logger.debug("Could not import hordelib to probe feature availability; assuming none: {}", exc)
-        return frozenset()
-    return frozenset(available_features())
+    from worker_bootstrap import paths
+
+    if not paths.utilities_python().is_file():
+        return False
+    return bridge_data is None or bridge_data.enable_image_utilities is not False
 
 
 def strip_background_available() -> bool:
-    """Return whether background removal (``rembg``) is installed and runnable here."""
-    from hordelib.feature_impact import FEATURE_KIND
-
-    return FEATURE_KIND.strip_background in _available_features()
+    """Return whether background removal (``rembg``) can run, i.e. the image-utilities lane is provisioned."""
+    return utilities_available()
 
 
 def controlnet_available() -> bool:
-    """Return whether controlnet preprocessing (``onnxruntime`` annotators) is installed and runnable."""
-    from hordelib.feature_impact import FEATURE_KIND
-
-    return FEATURE_KIND.controlnet in _available_features()
+    """Return whether ControlNet annotation can run, i.e. the image-utilities lane is provisioned."""
+    return utilities_available()
 
 
 @functools.lru_cache(maxsize=1)
@@ -130,39 +129,25 @@ def describe_available() -> bool:
     return True
 
 
+UTILITIES_LANE_HINT: str = (
+    "the image-utilities lane is not available; provision the utilities venv and set "
+    "enable_image_utilities: true in bridgeData.yaml to enable ControlNet annotation and background removal"
+)
+"""The single actionable remedy for a ControlNet / background-removal feature that cannot run.
+
+Both features run on the out-of-venv image-utilities lane, so their remedy is the same one place: bring
+that lane up. Sourced here so the coercion logs, the benchmark planner, and the feature-readiness table
+all surface identical wording."""
+
+
 def controlnet_install_hint() -> str:
-    """Build the actionable "install the controlnet extra" fragment naming the missing packages.
-
-    Public wrapper around :func:`_install_hint` for the benchmark planner, so a controlnet level that
-    cannot run on this install surfaces the same remedy the runtime coercion logs.
-    """
-    from hordelib.feature_impact import FEATURE_KIND
-
-    return _install_hint(FEATURE_KIND.controlnet)
+    """Return the actionable remedy for ControlNet being unavailable (bring up the image-utilities lane)."""
+    return UTILITIES_LANE_HINT
 
 
 def post_processing_install_hint() -> str:
-    """Build the actionable "install the post-processing extra" fragment naming the missing packages.
-
-    Public wrapper around :func:`_install_hint` for the feature-readiness table, so a post-processing
-    feature that cannot run on this install surfaces the same remedy the runtime coercion logs.
-    """
-    from hordelib.feature_impact import FEATURE_KIND
-
-    return _install_hint(FEATURE_KIND.strip_background)
-
-
-def _install_hint(feature: FEATURE_KIND) -> str:
-    """Build an actionable "install this extra" fragment naming the missing packages for *feature*."""
-    from hordelib.feature_requirements import missing_packages
-
-    missing = missing_packages(feature)
-    extra = _worker_extra_for_feature().get(feature.value, feature.value)
-    packages = ", ".join(missing) if missing else "the required packages"
-    return (
-        f"{packages} not installed; install `horde-worker-reGen[{extra}]` (or use an install profile "
-        "that includes it) to enable this on your backend"
-    )
+    """Return the actionable remedy for background removal being unavailable (bring up the utilities lane)."""
+    return UTILITIES_LANE_HINT
 
 
 def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
@@ -272,14 +257,15 @@ def coerce_bridge_data_to_capabilities(bridge_data: reGenBridgeData, *, log: boo
     # hot reload path. Done before the hordelib feature probes because it needs none of them.
     coercions.extend(_coerce_workload_config(bridge_data, log=log))
 
-    from hordelib.feature_impact import FEATURE_KIND
+    # ControlNet annotation and background removal both run on the image-utilities lane, so the config is
+    # honoured here (the enable flag as well as provisioning) rather than by the no-arg dependency probes.
+    utilities_ready = utilities_available(bridge_data)
 
-    if not strip_background_available() and bridge_data.allow_post_processing:
+    if not utilities_ready and bridge_data.allow_post_processing:
         bridge_data.allow_post_processing = False
-        hint = _install_hint(FEATURE_KIND.strip_background)
         message = (
-            f"allow_post_processing coerced to False: {hint}. Post-processing is offered as one "
-            "bucket because the AI Horde API cannot accept upscale/face-fix while refusing "
+            f"allow_post_processing coerced to False: {UTILITIES_LANE_HINT}. Post-processing is offered as "
+            "one bucket because the AI Horde API cannot accept upscale/face-fix while refusing "
             "strip_background, so the whole option is disabled. (Alchemy still offers the pure-torch "
             "upscalers and face-fixers if alchemist is enabled.)"
         )
@@ -287,11 +273,10 @@ def coerce_bridge_data_to_capabilities(bridge_data: reGenBridgeData, *, log: boo
         if log:
             logger.warning(message)
 
-    if not controlnet_available() and (bridge_data.allow_controlnet or bridge_data.allow_sdxl_controlnet):
+    if not utilities_ready and (bridge_data.allow_controlnet or bridge_data.allow_sdxl_controlnet):
         bridge_data.allow_controlnet = False
         bridge_data.allow_sdxl_controlnet = False
-        hint = _install_hint(FEATURE_KIND.controlnet)
-        message = f"allow_controlnet and allow_sdxl_controlnet coerced to False: {hint}."
+        message = f"allow_controlnet and allow_sdxl_controlnet coerced to False: {UTILITIES_LANE_HINT}."
         coercions.append(message)
         if log:
             logger.warning(message)

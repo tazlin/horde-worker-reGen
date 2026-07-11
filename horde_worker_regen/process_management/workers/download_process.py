@@ -509,6 +509,7 @@ class HordeDownloadProcess(HordeProcess):
             f"post_processing={self._allow_post_processing} nsfw={self._nsfw}",
         )
         self._ensure_executor_threads(self._desired_executor_threads)
+        self._maybe_prefetch_rembg_weight()
         while not self._end_process:
             try:
                 progressed = self._orchestrate()
@@ -711,6 +712,31 @@ class HordeDownloadProcess(HordeProcess):
                 feature=FEATURE_SAFETY,
             ),
         )
+
+    def _maybe_prefetch_rembg_weight(self) -> None:
+        """Pre-place the rembg ``u2net.onnx`` weight for the image-utilities lane, off the orchestrator thread.
+
+        The capability service runs with downloads disabled, so ``strip_background`` would fault there without
+        this file on disk. It is fetched on a one-shot daemon thread (a ~176MB download must never block the
+        download orchestrator) and gated on ``allow_post_processing``: the AI Horde bundles background removal
+        into the post-processing offer, so a worker not offering post-processing never needs the weight. A
+        cleaner gate would consult ``enable_image_utilities`` directly, but the download process is not handed
+        that flag today; this proxy over-fetches only for a post-processing worker that never enables the lane.
+        Best-effort: any failure is logged and the process continues (the service still surfaces its own
+        missing-model error if the file never lands).
+        """
+        if not self._allow_post_processing:
+            return
+
+        def _run() -> None:
+            try:
+                from horde_worker_regen.process_management.workers.rembg_prefetch import ensure_u2net_present
+
+                ensure_u2net_present()
+            except Exception as e:  # noqa: BLE001 - a prefetch failure must never crash the download process
+                logger.warning(f"Download process: rembg u2net pre-place failed (continuing): {type(e).__name__} {e}")
+
+        threading.Thread(target=_run, name="download-rembg-prefetch", daemon=True).start()
 
     def _enqueue_aux_tasks(self) -> None:
         """Enumerate the enabled aux categories into per-model host-tagged tasks (LoRa/annotators coarse)."""

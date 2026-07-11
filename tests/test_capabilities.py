@@ -1,28 +1,25 @@
 """Unit tests for capability detection and the bridge-data coercion it drives.
 
-The feature-availability probe (``capabilities._available_features``) is monkeypatched so these tests
-need none of the optional packages (rembg / onnxruntime) installed and assert the coercion behaviour
-directly: a worker must never advertise a feature whose backend packages are absent.
+ControlNet annotation and background removal both run on the out-of-venv image-utilities lane, so their
+availability collapses to one probe (``capabilities.utilities_available``): is that lane provisioned and
+enabled. The probe (and, for the coercion matrix, ``utilities_available`` itself) is monkeypatched so these
+tests need no provisioned venv and assert the coercion behaviour directly: a worker must never advertise a
+feature the utilities lane cannot serve.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
-from hordelib.feature_impact import FEATURE_KIND
 
 from horde_worker_regen import capabilities, compute_mode
 from horde_worker_regen.process_management.jobs.alchemy_popper import expand_offered_forms
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
-_ALL_FEATURES = frozenset(FEATURE_KIND)
-_NO_FEATURES: frozenset[FEATURE_KIND] = frozenset()
-_ONLY_PURE_TORCH = frozenset(
-    f for f in FEATURE_KIND if f not in {FEATURE_KIND.strip_background, FEATURE_KIND.controlnet}
-)
 
-
-def _patch_features(monkeypatch: pytest.MonkeyPatch, available: frozenset[FEATURE_KIND]) -> None:
-    monkeypatch.setattr(capabilities, "_available_features", lambda: available)
+def _patch_utilities(monkeypatch: pytest.MonkeyPatch, available: bool) -> None:
+    """Force the image-utilities availability probe (both the no-arg and config-aware call forms)."""
+    monkeypatch.setattr(capabilities, "utilities_available", lambda bridge_data=None: available)
 
 
 def _bridge_data(**overrides: object) -> SimpleNamespace:
@@ -30,6 +27,7 @@ def _bridge_data(**overrides: object) -> SimpleNamespace:
         allow_post_processing=True,
         allow_controlnet=True,
         allow_sdxl_controlnet=True,
+        enable_image_utilities=True,
         dry_run_skip_inference=False,
         dreamer=True,
         alchemist=False,
@@ -39,9 +37,9 @@ def _bridge_data(**overrides: object) -> SimpleNamespace:
     return bd
 
 
-def test_no_coercion_when_all_features_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With every feature installed, no flag is touched and nothing is reported."""
-    _patch_features(monkeypatch, _ALL_FEATURES)
+def test_no_coercion_when_utilities_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the utilities lane available, no flag is touched and nothing is reported."""
+    _patch_utilities(monkeypatch, True)
     bd = _bridge_data()
 
     coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
@@ -52,39 +50,14 @@ def test_no_coercion_when_all_features_available(monkeypatch: pytest.MonkeyPatch
     assert bd.allow_sdxl_controlnet is True
 
 
-def test_post_processing_coerced_off_when_strip_background_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Missing rembg coerces the whole post-processing bucket off but leaves controlnet alone."""
-    # Only strip_background is missing; the controlnet annotators are present.
-    _patch_features(monkeypatch, _ALL_FEATURES - {FEATURE_KIND.strip_background})
-    bd = _bridge_data()
+def test_both_buckets_coerced_off_when_utilities_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the utilities lane is unavailable, both the post-processing and controlnet buckets are dropped.
 
-    coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
-
-    assert bd.allow_post_processing is False
-    # The atomic post-processing bucket is independent of controlnet, which stays on.
-    assert bd.allow_controlnet is True
-    assert len(coercions) == 1
-    assert "allow_post_processing" in coercions[0]
-    assert "post-processing" in coercions[0]
-
-
-def test_controlnet_coerced_off_when_annotators_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Missing onnxruntime coerces both controlnet flags off but leaves post-processing alone."""
-    _patch_features(monkeypatch, _ALL_FEATURES - {FEATURE_KIND.controlnet})
-    bd = _bridge_data()
-
-    coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
-
-    assert bd.allow_controlnet is False
-    assert bd.allow_sdxl_controlnet is False
-    assert bd.allow_post_processing is True
-    assert len(coercions) == 1
-    assert "controlnet" in coercions[0]
-
-
-def test_both_buckets_coerced_off_on_lean_install(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A lean base install (neither optional package) coerces both buckets off."""
-    _patch_features(monkeypatch, _ONLY_PURE_TORCH)
+    The two features share one execution home now, so they are gated together (unlike the old independent
+    rembg/onnxruntime probes): post-processing off because strip_background cannot run, controlnet off
+    because annotation cannot run.
+    """
+    _patch_utilities(monkeypatch, False)
     bd = _bridge_data()
 
     coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
@@ -93,58 +66,95 @@ def test_both_buckets_coerced_off_on_lean_install(monkeypatch: pytest.MonkeyPatc
     assert bd.allow_controlnet is False
     assert bd.allow_sdxl_controlnet is False
     assert len(coercions) == 2
+    assert any("allow_post_processing" in c for c in coercions)
+    assert any("allow_controlnet" in c for c in coercions)
 
 
 def test_no_coercion_when_flags_already_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Absent packages but already-off flags report nothing (idempotent on the hot-reload path)."""
-    _patch_features(monkeypatch, _NO_FEATURES)
+    """Unavailable lane but already-off flags report nothing (idempotent on the hot-reload path)."""
+    _patch_utilities(monkeypatch, False)
     bd = _bridge_data(allow_post_processing=False, allow_controlnet=False, allow_sdxl_controlnet=False)
 
     coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
 
-    # Nothing to flip, so nothing is reported even though the packages are absent.
     assert coercions == []
 
 
 def test_dry_run_skips_coercion(monkeypatch: pytest.MonkeyPatch) -> None:
     """Dry-run leaves flags untouched since it never runs real inference."""
-    _patch_features(monkeypatch, _NO_FEATURES)
+    _patch_utilities(monkeypatch, False)
     bd = _bridge_data(dry_run_skip_inference=True)
 
     coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
 
-    # Dry-run does not run real inference, so capabilities are irrelevant and flags are untouched.
     assert coercions == []
     assert bd.allow_post_processing is True
     assert bd.allow_controlnet is True
 
 
-def test_helpers_reflect_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The availability helpers track the probe result both ways."""
-    _patch_features(monkeypatch, _NO_FEATURES)
+def test_dependency_helpers_track_utilities_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The no-arg dependency helpers both resolve to the utilities-lane probe."""
+    _patch_utilities(monkeypatch, False)
     assert capabilities.strip_background_available() is False
     assert capabilities.controlnet_available() is False
 
-    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_utilities(monkeypatch, True)
     assert capabilities.strip_background_available() is True
     assert capabilities.controlnet_available() is True
 
 
-def test_expand_offered_forms_drops_strip_background_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Alchemy drops only strip_background on a lean install, keeping the pure-torch forms."""
-    _patch_features(monkeypatch, _ONLY_PURE_TORCH)
+def test_utilities_available_requires_provisioned_venv(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -> None:
+    """utilities_available is False when the venv interpreter is missing, True once it exists."""
+    from worker_bootstrap import paths
+
+    missing = SimpleNamespace(is_file=lambda: False)
+    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: missing)
+    assert capabilities.utilities_available() is False
+
+    present = SimpleNamespace(is_file=lambda: True)
+    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: present)
+    assert capabilities.utilities_available() is True
+
+
+def test_utilities_available_honours_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the venv present, an explicit enable_image_utilities: false makes the lane unavailable."""
+    from worker_bootstrap import paths
+
+    present = SimpleNamespace(is_file=lambda: True)
+    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: present)
+
+    assert capabilities.utilities_available(_bridge_data(enable_image_utilities=False)) is False  # type: ignore[arg-type]
+    assert capabilities.utilities_available(_bridge_data(enable_image_utilities=True)) is True  # type: ignore[arg-type]
+
+
+def test_utilities_available_treats_mock_bridge_data_as_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mock bridge-data object (every attribute truthy) reads as enabled, never spuriously disabled.
+
+    Guards the Mock-truthiness gotcha: ``enable_image_utilities is not False`` must not trip for a Mock
+    whose ``enable_image_utilities`` is itself a truthy Mock.
+    """
+    from worker_bootstrap import paths
+
+    present = SimpleNamespace(is_file=lambda: True)
+    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: present)
+
+    assert capabilities.utilities_available(Mock()) is True  # type: ignore[arg-type]
+
+
+def test_expand_offered_forms_drops_strip_background_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Alchemy drops only strip_background when the utilities lane is unavailable, keeping pure-torch forms."""
+    _patch_utilities(monkeypatch, False)
     bd = SimpleNamespace(forms=["post-process"], alchemy_caption_enabled=False)
 
     offered = expand_offered_forms(bd)  # type: ignore[arg-type]
 
     assert "strip_background" not in offered
-    # The pure-torch graph forms remain on offer.
     assert len(offered) > 0
 
 
 def test_expand_offered_forms_keeps_strip_background_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Alchemy offers strip_background when rembg is installed."""
-    _patch_features(monkeypatch, _ALL_FEATURES)
+    """Alchemy offers strip_background when the utilities lane is available."""
+    _patch_utilities(monkeypatch, True)
     bd = SimpleNamespace(forms=["post-process"], alchemy_caption_enabled=False)
 
     offered = expand_offered_forms(bd)  # type: ignore[arg-type]
@@ -170,7 +180,7 @@ def _cpu_bridge_data(**overrides: object) -> SimpleNamespace:
 
 def test_cpu_install_disables_image_generation(monkeypatch: pytest.MonkeyPatch) -> None:
     """A CPU-only install clears the image model list and dynamic loading, keeping alchemist on."""
-    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_utilities(monkeypatch, True)
     _patch_cpu_install(monkeypatch, cpu=True)
     bd = _cpu_bridge_data()
 
@@ -184,8 +194,8 @@ def test_cpu_install_disables_image_generation(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_non_cpu_install_leaves_image_generation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A GPU install does not touch the image model list."""
-    _patch_features(monkeypatch, _ALL_FEATURES)
+    """A GPU install with the utilities lane available does not touch the image model list."""
+    _patch_utilities(monkeypatch, True)
     _patch_cpu_install(monkeypatch, cpu=False)
     bd = _cpu_bridge_data()
 
@@ -198,7 +208,7 @@ def test_non_cpu_install_leaves_image_generation(monkeypatch: pytest.MonkeyPatch
 
 def test_cpu_install_idempotent_when_already_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Re-running on an already-disabled CPU config reports nothing (hot-reload safe)."""
-    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_utilities(monkeypatch, True)
     _patch_cpu_install(monkeypatch, cpu=True)
     bd = _cpu_bridge_data(image_models_to_load=[], dynamic_models=False)
 
@@ -251,7 +261,7 @@ def test_enabled_workloads_empty_when_nothing_selected(monkeypatch: pytest.Monke
 
 def test_dreamer_false_disables_image_generation_on_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
     """A deliberate dreamer: false opt-out clears image models on a GPU install too."""
-    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_utilities(monkeypatch, True)
     _patch_cpu_install(monkeypatch, cpu=False)
     bd = _cpu_bridge_data(dreamer=False, alchemist=True)
 

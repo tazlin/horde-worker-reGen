@@ -59,6 +59,25 @@ AUX_DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS = 5.0
 """How often a child reports liveness while blocked in an ad-hoc AUX-model download."""
 
 
+def inject_premade_control_map(
+    generation_parameters: ImageGenerationParameters,
+    control_map_bytes: bytes,
+) -> bool:
+    """Assign a pre-computed control map onto a job's controlnet parameters, returning whether it applied.
+
+    The image-utilities lane annotates a ControlNet job's control map ahead of dispatch; setting it here
+    makes hordelib run the ``none`` preprocessor over the supplied map (``control_uses_premade_map``)
+    instead of re-deriving the annotation in the main venv. A no-op (returns False) when the job carries
+    no controlnet component, which should not happen for an annotated job but is guarded so a mismatched
+    dispatch degrades to normal in-graph preprocessing rather than raising.
+    """
+    controlnet_params = generation_parameters.additional_params.controlnet_params
+    if controlnet_params is None:
+        return False
+    controlnet_params.control_map = control_map_bytes
+    return True
+
+
 class AuxDownloadDeadlineExceeded(Exception):
     """Raised inside the child when a job's aux (LoRa/TI) downloads blow their dispatch deadline.
 
@@ -75,6 +94,7 @@ class AuxDownloadDeadlineExceeded(Exception):
 
 
 if TYPE_CHECKING:
+    from horde_sdk.generation_parameters.image.object_models import ImageGenerationParameters
     from hordelib.api import HordeLib, ProgressReport, ResultingImageReturn, SharedModelManager
 else:
     # Create a dummy class to prevent type errors at runtime
@@ -1030,6 +1050,7 @@ class HordeInferenceProcess(HordeProcess):
         job_info: ImageGenerateJobPopResponse,
         *,
         keep_model_resident: bool = False,
+        premade_control_map_bytes: bytes | None = None,
     ) -> list[ResultingImageReturn] | None:
         """Start an inference job in the HordeLib instance.
 
@@ -1039,6 +1060,10 @@ class HordeInferenceProcess(HordeProcess):
                 instead of evicting it, so a following same-model job skips the RAM->VRAM reload. The
                 scheduler sets this only when it has confirmed the next job reuses the model and the
                 VRAM budget allows it. Defaults to False.
+            premade_control_map_bytes (bytes | None, optional): A ControlNet control map the
+                image-utilities lane annotated ahead of dispatch, injected into the job's controlnet
+                parameters so hordelib runs the ``none`` preprocessor over it. None for a job with no
+                pre-annotated control map. Defaults to None.
 
         Returns:
             list[Image] | None: The generated images, or None if inference failed.
@@ -1084,6 +1109,7 @@ class HordeInferenceProcess(HordeProcess):
                         results = self._run_typed_inference(
                             job_info,
                             keep_model_resident=keep_model_resident,
+                            premade_control_map_bytes=premade_control_map_bytes,
                         )
         except Exception as e:
             # Keep a reason for the faulted result: the main process logs it and classifies a
@@ -1117,6 +1143,7 @@ class HordeInferenceProcess(HordeProcess):
         job_info: ImageGenerateJobPopResponse,
         *,
         keep_model_resident: bool,
+        premade_control_map_bytes: bytes | None = None,
     ) -> list[ResultingImageReturn]:
         """Run a job through hordelib's typed generation path.
 
@@ -1125,6 +1152,10 @@ class HordeInferenceProcess(HordeProcess):
         `HordeLib.generate` with automatic pipeline selection. Any post-processing the job
         requested is not run here: the raw images are returned and the main process routes them
         to the dedicated post-processing lane.
+
+        When ``premade_control_map_bytes`` is set, the image-utilities lane already annotated this job's
+        ControlNet control map, so it is injected into the converted parameters before generation and the
+        in-graph preprocessor runs ``none`` over it rather than re-deriving the annotation here.
         """
         from horde_sdk.worker.dispatch.ai_horde.image.convert import (
             convert_image_job_pop_response_to_parameters,
@@ -1136,6 +1167,15 @@ class HordeInferenceProcess(HordeProcess):
             api_response=job_info,
             model_reference_manager=ensure_offline_reference_manager(),
         )
+
+        if premade_control_map_bytes is not None and not inject_premade_control_map(
+            conversion_result.generation_parameters,
+            premade_control_map_bytes,
+        ):
+            logger.warning(
+                f"Job {job_info.id_} carried a pre-annotated control map but has no controlnet parameters; "
+                "falling back to in-graph preprocessing.",
+            )
 
         from hordelib.api import AUTO_PIPELINE
 
@@ -1548,6 +1588,7 @@ class HordeInferenceProcess(HordeProcess):
                 results = self.start_inference(
                     message.sdk_api_job_info,
                     keep_model_resident=message.keep_model_resident_after,
+                    premade_control_map_bytes=message.premade_control_map_bytes,
                 )
 
                 if results is None or len(results) == 0:
