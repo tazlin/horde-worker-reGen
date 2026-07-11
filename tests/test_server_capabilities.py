@@ -6,29 +6,44 @@ import pytest
 
 from horde_worker_regen import server_capabilities
 from horde_worker_regen.server_capabilities import (
+    _EXTENDED_CONTROLNET_PROPERTY,
     _FORM_ENUM_KEYS,
     _FORM_SCHEMA_NAME,
     _METADATA_TYPE_ENUM_KEYS,
     _METADATA_TYPE_SCHEMA_NAME,
+    _POP_INPUT_SCHEMA_NAME,
     _parse_enum,
+    _parse_property_present,
     refresh_server_capabilities,
     reset_server_capabilities_cache,
+    server_supports_extended_controlnet,
     server_supports_generation_metadata_type,
     server_supports_interrogation_form,
 )
 
 
+def _pop_input_schema(extended_controlnet: bool) -> dict[str, object]:
+    """The `PopInputStable` schema, with the extended-controlnet property present only on new servers."""
+    properties: dict[str, object] = {"allow_controlnet": {"type": "boolean"}}
+    if extended_controlnet:
+        properties[_EXTENDED_CONTROLNET_PROPERTY] = {"type": "boolean"}
+    return {"properties": properties}
+
+
 def _swagger_2_doc(
     forms: list[str],
     metadata_types: list[str] | None = None,
+    *,
+    extended_controlnet: bool = True,
 ) -> dict[str, object]:
-    """A minimal Swagger 2.0 document carrying both probed enums."""
+    """A minimal Swagger 2.0 document carrying every probed schema."""
     if metadata_types is None:
         metadata_types = ["lora", "censorship"]
     return {
         "definitions": {
             _FORM_SCHEMA_NAME: {"properties": {"name": {"enum": forms}}},
             _METADATA_TYPE_SCHEMA_NAME: {"properties": {"type": {"enum": metadata_types}}},
+            _POP_INPUT_SCHEMA_NAME: _pop_input_schema(extended_controlnet),
         },
     }
 
@@ -36,6 +51,8 @@ def _swagger_2_doc(
 def _openapi_3_doc(
     forms: list[str],
     metadata_types: list[str] | None = None,
+    *,
+    extended_controlnet: bool = True,
 ) -> dict[str, object]:
     """The OpenAPI 3 (`components.schemas`) shape, the fallback if the server ever migrates."""
     if metadata_types is None:
@@ -45,6 +62,7 @@ def _openapi_3_doc(
             "schemas": {
                 _FORM_SCHEMA_NAME: {"properties": {"name": {"enum": forms}}},
                 _METADATA_TYPE_SCHEMA_NAME: {"properties": {"type": {"enum": metadata_types}}},
+                _POP_INPUT_SCHEMA_NAME: _pop_input_schema(extended_controlnet),
             },
         },
     }
@@ -203,4 +221,100 @@ class TestGenerationMetadataTypeGate:
         await refresh_server_capabilities(force=True)
 
         assert server_supports_generation_metadata_type("aesthetic_score") is False
+        assert server_supports_interrogation_form("caption") is False
+
+
+class TestParsePropertyPresent:
+    """The property-presence helper reports declared properties and raises on a malformed schema."""
+
+    def test_present_property(self) -> None:
+        """A declared property reads as present."""
+        schemas = _schemas(_swagger_2_doc(["caption"], extended_controlnet=True))
+        assert _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, _EXTENDED_CONTROLNET_PROPERTY) is True
+
+    def test_absent_property_is_false_not_error(self) -> None:
+        """An undeclared property is a definitive False (an older server), not a raise."""
+        schemas = _schemas(_swagger_2_doc(["caption"], extended_controlnet=False))
+        assert _parse_property_present(schemas, _POP_INPUT_SCHEMA_NAME, _EXTENDED_CONTROLNET_PROPERTY) is False
+
+    def test_missing_schema_raises(self) -> None:
+        """A schema table missing the named schema raises (so the caller can fail-closed)."""
+        with pytest.raises((KeyError, TypeError)):
+            _parse_property_present({}, _POP_INPUT_SCHEMA_NAME, _EXTENDED_CONTROLNET_PROPERTY)
+
+    def test_malformed_properties_raises(self) -> None:
+        """A schema whose `properties` is not an object raises (unexpected shape, treated as unknown)."""
+        with pytest.raises(TypeError):
+            _parse_property_present(
+                {_POP_INPUT_SCHEMA_NAME: {"properties": ["not", "an", "object"]}},
+                _POP_INPUT_SCHEMA_NAME,
+                _EXTENDED_CONTROLNET_PROPERTY,
+            )
+
+
+class TestExtendedControlNetGate:
+    """The extended-controlnet gate is fail-closed and follows property presence on `PopInputStable`."""
+
+    def test_fail_closed_before_any_probe(self) -> None:
+        """With no successful probe yet, extended controlnet reads as unsupported."""
+        assert server_supports_extended_controlnet() is False
+
+    @pytest.mark.asyncio
+    async def test_supported_when_property_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A probe whose `PopInputStable` declares the property opens the gate."""
+
+        async def _fake_fetch(url: str) -> dict[str, object]:
+            return _swagger_2_doc(["caption"], extended_controlnet=True)
+
+        monkeypatch.setattr(server_capabilities, "_fetch_swagger_spec", _fake_fetch)
+        await refresh_server_capabilities(force=True)
+
+        assert server_supports_extended_controlnet() is True
+
+    @pytest.mark.asyncio
+    async def test_unsupported_when_property_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A probe against an older server (no such property) keeps the gate closed."""
+
+        async def _fake_fetch(url: str) -> dict[str, object]:
+            return _swagger_2_doc(["caption"], extended_controlnet=False)
+
+        monkeypatch.setattr(server_capabilities, "_fetch_swagger_spec", _fake_fetch)
+        await refresh_server_capabilities(force=True)
+
+        assert server_supports_extended_controlnet() is False
+
+    @pytest.mark.asyncio
+    async def test_failure_keeps_prior_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A transient probe failure must not drop an already-proven capability."""
+
+        async def _good_fetch(url: str) -> dict[str, object]:
+            return _swagger_2_doc(["caption"], extended_controlnet=True)
+
+        monkeypatch.setattr(server_capabilities, "_fetch_swagger_spec", _good_fetch)
+        await refresh_server_capabilities(force=True)
+        assert server_supports_extended_controlnet() is True
+
+        async def _failing_fetch(url: str) -> dict[str, object]:
+            raise ConnectionError("boom")
+
+        monkeypatch.setattr(server_capabilities, "_fetch_swagger_spec", _failing_fetch)
+        await refresh_server_capabilities(force=True)
+        assert server_supports_extended_controlnet() is True
+
+    @pytest.mark.asyncio
+    async def test_missing_pop_input_schema_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If `PopInputStable` is absent entirely, the whole probe fails-closed (all gates)."""
+
+        async def _fake_fetch(url: str) -> dict[str, object]:
+            return {
+                "definitions": {
+                    _FORM_SCHEMA_NAME: {"properties": {"name": {"enum": ["caption"]}}},
+                    _METADATA_TYPE_SCHEMA_NAME: {"properties": {"type": {"enum": ["lora"]}}},
+                },
+            }
+
+        monkeypatch.setattr(server_capabilities, "_fetch_swagger_spec", _fake_fetch)
+        await refresh_server_capabilities(force=True)
+
+        assert server_supports_extended_controlnet() is False
         assert server_supports_interrogation_form("caption") is False

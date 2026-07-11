@@ -23,6 +23,7 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 
+from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES
 from horde_worker_regen.process_management.ipc.messages import (
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
@@ -282,6 +283,51 @@ class TestUnservableControlType:
         tracked = pm._job_tracker.get_tracked_job(job.id_)
         assert tracked is not None
         assert not tracked.annotation_attempted
+
+
+class TestExtendedControlnetHostileInput:
+    """An extended-controlnet job that arrives while the worker withholds extended is faulted for reissue."""
+
+    async def test_unoffered_extended_job_is_faulted(self) -> None:
+        """A queued extended-type job while extended is not fully servable is reissued, never annotated."""
+        pm = make_testable_process_manager(enable_image_utilities=True, extended_controlnet=True)
+        util = _add_utilities_process(pm)
+        # Only a classic type is servable, so the extended surface is not fully ready; extended stays withheld.
+        _mark_servable(pm, ["canny"])
+        job = _make_controlnet_job(control_type="lineart")
+        assert job.id_ is not None
+        await pm._job_tracker.record_popped_job(job, time_popped=time.time())
+
+        pm._fault_unready_extended_controlnet_jobs()
+
+        assert job not in pm._job_tracker.jobs_pending_inference
+        assert not _sent(util).called
+
+    async def test_classic_job_is_never_faulted_by_the_backstop(self) -> None:
+        """The extended hostile-input backstop leaves classic controlnet jobs untouched."""
+        pm = make_testable_process_manager(enable_image_utilities=True, extended_controlnet=True)
+        _add_utilities_process(pm)
+        _mark_servable(pm, ["canny"])
+        job = _make_controlnet_job(control_type="depth")
+        assert job.id_ is not None
+        await pm._job_tracker.record_popped_job(job, time_popped=time.time())
+
+        pm._fault_unready_extended_controlnet_jobs()
+
+        assert job in pm._job_tracker.jobs_pending_inference
+
+    async def test_offered_extended_job_is_not_faulted(self) -> None:
+        """When the whole extended surface is servable and opted in, an extended job is kept (to be annotated)."""
+        pm = make_testable_process_manager(enable_image_utilities=True, extended_controlnet=True)
+        _add_utilities_process(pm)
+        _mark_servable(pm, sorted(EXTENDED_CONTROL_TYPES))
+        job = _make_controlnet_job(control_type="lineart")
+        assert job.id_ is not None
+        await pm._job_tracker.record_popped_job(job, time_popped=time.time())
+
+        pm._fault_unready_extended_controlnet_jobs()
+
+        assert job in pm._job_tracker.jobs_pending_inference
 
 
 class TestLaneDisabled:

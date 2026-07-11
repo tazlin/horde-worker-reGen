@@ -66,6 +66,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
 )
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.runtime_version import runtime_version
+from horde_worker_regen.server_capabilities import server_supports_extended_controlnet
 from horde_worker_regen.telemetry_spans import queue_depth_counter, span_job_pop
 from horde_worker_regen.utils.job_utils import get_single_job_magnitude, line_skip_pop_max_power
 
@@ -356,6 +357,7 @@ class JobPopper:
     _card_runtimes: dict[int, CardRuntime]
     _model_metadata: ModelMetadata | None
     _post_processing_lane_commitments_provider: Callable[[], int]
+    _extended_controlnet_ready_provider: Callable[[], bool]
 
     def __init__(
         self,
@@ -376,6 +378,7 @@ class JobPopper:
         whole_card_residency_active: Callable[[], bool] | None = None,
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+        extended_controlnet_ready_provider: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -401,6 +404,11 @@ class JobPopper:
         post-processing lane (currently graph alchemy). It is added to image-job post-processing commitments
         for offer shaping, so the worker does not accept more image post-processing work while the shared lane
         is already committed elsewhere.
+
+        `extended_controlnet_ready_provider` reports whether the extended controlnet annotators are servable
+        right now. It is ANDed with the operator's `extended_controlnet` flag to decide the per-pop
+        `allow_extended_controlnet` offer, so a fresh install advertises extended only once its annotators
+        land. It defaults to "never ready", keeping the offer fail-closed when a popper is wired without it.
         """
         self._state = state
         self._process_map = process_map
@@ -419,6 +427,11 @@ class JobPopper:
             post_processing_lane_commitments_provider
             if post_processing_lane_commitments_provider is not None
             else (lambda: 0)
+        )
+        # Fail-closed: a popper wired without an extended-readiness provider (and the tests) never advertises
+        # the extended controlnet types, so an old bridge cannot be tricked into offering them.
+        self._extended_controlnet_ready_provider = (
+            extended_controlnet_ready_provider if extended_controlnet_ready_provider is not None else (lambda: False)
         )
         self._large_model_pop_governor = LargeModelPopGovernor()
 
@@ -1239,6 +1252,18 @@ class JobPopper:
         if pop_allow_post_processing and self._should_withhold_post_processing_offer(bridge_data):
             pop_allow_post_processing = False
 
+        # Extended controlnet is a dynamic, per-pop opt-in: the operator flag AND live annotator readiness
+        # AND proof that the connected server understands the field. It is additionally clamped to the
+        # classic offer, since a worker offering extended must always also serve the classic set (extended
+        # implies legacy). Every conjunct fails closed, so a fresh install (or one talking to a server that
+        # predates the feature) advertises extended only once every gate is satisfied, no restart required.
+        pop_allow_extended_controlnet = (
+            bridge_data.extended_controlnet is True
+            and pop_allow_controlnet
+            and self._extended_controlnet_ready_provider()
+            and server_supports_extended_controlnet()
+        )
+
         try:
             job_pop_request = ImageGenerateJobPopRequest(
                 apikey=bridge_data.api_key,
@@ -1255,6 +1280,7 @@ class JobPopper:
                 allow_unsafe_ipaddr=bridge_data.allow_unsafe_ip,
                 allow_post_processing=pop_allow_post_processing,
                 allow_controlnet=pop_allow_controlnet,
+                allow_extended_controlnet=pop_allow_extended_controlnet,
                 allow_sdxl_controlnet=pop_allow_sdxl_controlnet,
                 extra_slow_worker=bridge_data.extra_slow_worker,
                 limit_max_steps=bridge_data.limit_max_steps,

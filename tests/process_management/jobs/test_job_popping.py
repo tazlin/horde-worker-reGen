@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 from unittest.mock import AsyncMock, Mock, patch
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopRequest,
@@ -33,8 +34,6 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
-from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
-
 from horde_worker_regen.utils.job_utils import line_skip_pop_max_power
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -62,6 +61,7 @@ def _make_popper(
     dry_run_skip_api: bool = False,
     model_availability: ModelAvailability | None = None,
     post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+    extended_controlnet_ready_provider: Callable[[], bool] | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -97,6 +97,7 @@ def _make_popper(
         dry_run_skip_api=dry_run_skip_api,
         model_availability=model_availability,
         post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
+        extended_controlnet_ready_provider=extended_controlnet_ready_provider,
     )
 
 
@@ -401,6 +402,115 @@ class TestFeatureReadinessGate:
         request = await self._pop_and_capture_request(availability, allow_controlnet=True)
 
         assert request.allow_controlnet is True
+
+
+_SERVER_SUPPORTS_EXTENDED_CONTROLNET = (
+    "horde_worker_regen.process_management.jobs.job_popper.server_supports_extended_controlnet"
+)
+
+
+class TestExtendedControlnetOffer:
+    """allow_extended_controlnet ANDs the operator flag, live annotator readiness, and the server probe."""
+
+    @staticmethod
+    def _ready_availability() -> ModelAvailability:
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            controlnet_present=True,
+            post_processing_present=True,
+        )
+        return availability
+
+    @classmethod
+    async def _pop_and_capture_request(
+        cls,
+        *,
+        extended_controlnet: bool,
+        ready: bool,
+        server_supports: bool = True,
+    ) -> object:
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                extended_controlnet=extended_controlnet,
+                allow_controlnet=True,
+            ),
+            model_availability=cls._ready_availability(),
+            extended_controlnet_ready_provider=lambda: ready,
+        )
+        with patch(_SERVER_SUPPORTS_EXTENDED_CONTROLNET, return_value=server_supports):
+            await popper.api_job_pop()
+        session.submit_request.assert_awaited_once()
+        return session.submit_request.call_args.args[0]
+
+    async def test_flag_off_sends_false_even_when_ready(self) -> None:
+        """The operator opt-out withholds extended regardless of annotator readiness."""
+        request = await self._pop_and_capture_request(extended_controlnet=False, ready=True)
+        assert request.allow_extended_controlnet is False
+
+    async def test_flag_on_but_not_ready_sends_false(self) -> None:
+        """Opted in but the annotators are not yet servable: the offer stays fail-closed."""
+        request = await self._pop_and_capture_request(extended_controlnet=True, ready=False)
+        assert request.allow_extended_controlnet is False
+
+    async def test_flag_on_and_ready_sends_true(self) -> None:
+        """Opted in with servable annotators and a server that proves support: extended is advertised."""
+        request = await self._pop_and_capture_request(extended_controlnet=True, ready=True)
+        assert request.allow_extended_controlnet is True
+        # Extended implies the classic set: a worker offering extended always also offers classic controlnet.
+        assert request.allow_controlnet is True
+
+    async def test_server_without_support_clamps_even_when_flagged_and_ready(self) -> None:
+        """The server-capability gate withholds extended even with the flag on and annotators servable."""
+        request = await self._pop_and_capture_request(
+            extended_controlnet=True,
+            ready=True,
+            server_supports=False,
+        )
+        assert request.allow_extended_controlnet is False
+        # The classic offer is unaffected by the extended-controlnet server gate.
+        assert request.allow_controlnet is True
+
+    async def test_readiness_flip_between_pops_changes_offer_without_restart(self) -> None:
+        """A False->True annotator-readiness flip changes the sent value on the next pop, no restart."""
+        ready = {"value": False}
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()
+        session = Mock()
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(extended_controlnet=True, allow_controlnet=True),
+            model_availability=self._ready_availability(),
+            extended_controlnet_ready_provider=lambda: ready["value"],
+        )
+
+        with patch(_SERVER_SUPPORTS_EXTENDED_CONTROLNET, return_value=True):
+            session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+            popper._state.last_pop_no_jobs_available = False
+            await popper.api_job_pop(urgent=True)
+            first_request = session.submit_request.call_args.args[0]
+            assert first_request.allow_extended_controlnet is False
+
+            ready["value"] = True
+            session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+            popper._state.last_pop_no_jobs_available = False
+            await popper.api_job_pop(urgent=True)
+            second_request = session.submit_request.call_args.args[0]
+            assert second_request.allow_extended_controlnet is True
 
 
 class TestPostProcessingBreakerSuppression:

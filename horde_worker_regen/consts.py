@@ -1,6 +1,36 @@
 """Constants for the reGen bridge."""
 
+from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ANNOTATION_CONTROL_TYPES
+
 BRIDGE_CONFIG_FILENAME = "bridgeData.yaml"
+
+CLASSIC_CONTROL_TYPES = frozenset(
+    {
+        "canny",
+        "hed",
+        "depth",
+        "normal",
+        "openpose",
+        "seg",
+        "scribble",
+        "fakescribbles",
+    },
+)
+"""The classic controlnet control types every controlnet-capable worker serves.
+
+Mirrors AI-Horde's ``LEGACY_IMAGE_CONTROL_TYPES`` in annotation spelling: the server's ``hough`` alias is
+the image-generation spelling of the ``mlsd`` line detector, and the server treats only ``hough`` (not
+``mlsd``) as classic, so ``mlsd`` is deliberately absent here and counts as extended.
+"""
+
+EXTENDED_CONTROL_TYPES = frozenset(
+    member.value for member in KNOWN_ANNOTATION_CONTROL_TYPES if member.value not in CLASSIC_CONTROL_TYPES
+)
+"""The extended controlnet control types (everything the annotators can produce beyond the classic set).
+
+A worker only advertises ``allow_extended_controlnet`` once its annotators cover this whole set, because the
+per-pop offer is a single boolean and the server may then dispatch any extended control type to it.
+"""
 
 VERSION_META_REMOTE_URL = (
     "https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/horde_worker_regen/_version_meta.json"

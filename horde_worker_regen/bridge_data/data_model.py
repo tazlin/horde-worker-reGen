@@ -723,6 +723,16 @@ class reGenBridgeData(CombinedHordeBridgeData):
     main environment. When true, the worker starts and supervises that subprocess as an ordinary child.
     Default false until the utilities venv is provisioned and the job-flow routing is wired."""
 
+    extended_controlnet: bool = Field(default=True)
+    """Operator opt-in to the extended controlnet control types (everything beyond the classic set).
+
+    Advertising extended controlnet is a per-pop decision, not a static capability: the worker only offers
+    it once the annotators for the extended types are actually servable (the image-utilities lane reports
+    them, or their weight files are on disk for in-graph annotation). This flag is the operator's disk-space
+    opt-out; setting it false keeps the worker on the classic controlnet set even after the extended
+    annotators are available. The effective per-pop value is this flag AND that readiness, so a fresh
+    install advertises extended only after its annotators finish downloading, without a restart."""
+
     vram_reserve_mb: int = Field(default=2048, ge=0)
     """Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak.
 

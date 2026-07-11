@@ -23,7 +23,14 @@ The same reasoning applies to the *generation-metadata type* enum
 score to every image generation as a ``gen_metadata`` entry, and the server validates each entry's
 ``type`` against that enum, rejecting the *whole* submit if it sees an unknown type. So the aesthetic
 score is only produced once the server advertises the ``aesthetic_score`` type, letting a worker that
-carries the feature ship ahead of the server's go-live. Both enums are read from the one Swagger fetch.
+carries the feature ship ahead of the server's go-live.
+
+A third probe is a *property-presence* check rather than an enum-membership one. The
+``allow_extended_controlnet`` pop field only exists on the server's ``PopInputStable`` schema
+(``definitions.PopInputStable.properties.allow_extended_controlnet``) from the release that ships
+extended ControlNet. A worker that carries the feature must not advertise ``allow_extended_controlnet``
+until the server proves it understands the field, so this is gated fail-closed the same way: ``False``
+until a probe confirms the property is present. All three probes are read from the one Swagger fetch.
 """
 
 from __future__ import annotations
@@ -50,8 +57,12 @@ _FORM_ENUM_KEYS = ("properties", "name", "enum")
 _METADATA_TYPE_SCHEMA_NAME = "GenerationMetadataStable"
 _METADATA_TYPE_ENUM_KEYS = ("properties", "type", "enum")
 
+_POP_INPUT_SCHEMA_NAME = "PopInputStable"
+_EXTENDED_CONTROLNET_PROPERTY = "allow_extended_controlnet"
+
 _supported_interrogation_forms: frozenset[str] | None = None
 _supported_generation_metadata_types: frozenset[str] | None = None
+_supports_extended_controlnet: bool | None = None
 _next_refresh_monotonic: float = 0.0
 
 
@@ -85,6 +96,22 @@ def _parse_enum(schemas: dict[str, object], schema_name: str, enum_keys: tuple[s
     return frozenset(str(value) for value in node)
 
 
+def _parse_property_present(schemas: dict[str, object], schema_name: str, property_name: str) -> bool:
+    """Return whether ``schema_name``'s ``properties`` table declares ``property_name``.
+
+    Unlike :func:`_parse_enum` this is a presence check: an absent property is a definitive ``False``
+    (an older server that predates the field), while a malformed schema (missing schema, non-dict
+    ``properties``) raises ``KeyError``/``TypeError``. Callers treat any raise as "unknown" (fail-closed).
+    """
+    schema = schemas[schema_name]
+    if not isinstance(schema, dict):
+        raise TypeError(f"schema {schema_name} is not an object")
+    properties = schema["properties"]
+    if not isinstance(properties, dict):
+        raise TypeError(f"properties of {schema_name} is not an object")
+    return property_name in properties
+
+
 async def _fetch_swagger_spec(url: str) -> dict[str, object]:
     """Fetch and parse the server's Swagger/OpenAPI document. Separated out as a test seam."""
     async with (
@@ -103,7 +130,8 @@ async def refresh_server_capabilities(*, force: bool = False) -> None:
     iteration (alchemy and image generation both): it self-throttles, fetches off no hot path, and
     never raises (a probe failure only logs and schedules an earlier retry).
     """
-    global _supported_interrogation_forms, _supported_generation_metadata_types, _next_refresh_monotonic
+    global _supported_interrogation_forms, _supported_generation_metadata_types
+    global _supports_extended_controlnet, _next_refresh_monotonic
 
     now = time.monotonic()
     if not force and now < _next_refresh_monotonic:
@@ -115,6 +143,11 @@ async def refresh_server_capabilities(*, force: bool = False) -> None:
         schemas = _extract_schemas(spec)
         forms = _parse_enum(schemas, _FORM_SCHEMA_NAME, _FORM_ENUM_KEYS)
         metadata_types = _parse_enum(schemas, _METADATA_TYPE_SCHEMA_NAME, _METADATA_TYPE_ENUM_KEYS)
+        extended_controlnet = _parse_property_present(
+            schemas,
+            _POP_INPUT_SCHEMA_NAME,
+            _EXTENDED_CONTROLNET_PROPERTY,
+        )
     except Exception as exc:
         # Keep any prior good result; just retry sooner. Fail-closed only matters before the first
         # success, when the caches are still None.
@@ -126,8 +159,11 @@ async def refresh_server_capabilities(*, force: bool = False) -> None:
         logger.info(f"Server-supported interrogation forms: {sorted(forms)}")
     if metadata_types != _supported_generation_metadata_types:
         logger.info(f"Server-supported generation-metadata types: {sorted(metadata_types)}")
+    if extended_controlnet != _supports_extended_controlnet:
+        logger.info(f"Server supports extended ControlNet: {extended_controlnet}")
     _supported_interrogation_forms = forms
     _supported_generation_metadata_types = metadata_types
+    _supports_extended_controlnet = extended_controlnet
     _next_refresh_monotonic = now + SUCCESS_TTL_SECONDS
 
 
@@ -146,9 +182,20 @@ def server_supports_generation_metadata_type(metadata_type: str) -> bool:
     return _supported_generation_metadata_types is not None and metadata_type in _supported_generation_metadata_types
 
 
+def server_supports_extended_controlnet() -> bool:
+    """Return whether the server is known to accept the ``allow_extended_controlnet`` pop field.
+
+    Fail-closed: ``False`` until a probe confirms the property exists on the server's ``PopInputStable``
+    schema, so a worker never advertises extended ControlNet to a server that would reject the pop.
+    """
+    return _supports_extended_controlnet is True
+
+
 def reset_server_capabilities_cache() -> None:
     """Clear the cached probe result. For tests and forced re-probing."""
-    global _supported_interrogation_forms, _supported_generation_metadata_types, _next_refresh_monotonic
+    global _supported_interrogation_forms, _supported_generation_metadata_types
+    global _supports_extended_controlnet, _next_refresh_monotonic
     _supported_interrogation_forms = None
     _supported_generation_metadata_types = None
+    _supports_extended_controlnet = None
     _next_refresh_monotonic = 0.0

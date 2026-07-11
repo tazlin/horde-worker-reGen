@@ -4728,7 +4728,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.13.0"
+version = "5.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -4741,9 +4741,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ec/e1/720ff7ff666b04279fea5bb7ac3ef8675e98f0ddbc1b8cb8bc9f3889d62e/transformers-5.13.0.tar.gz", hash = "sha256:940c1428e42a4238f9ccf0cd41e63c590701aa63c19fd2ce3d7d602222d68495", size = 9195801, upload-time = "2026-07-03T16:05:39.362Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/f7/418169401560cec2b61512e6bf37b0cfb4c8e27700cfa868a1de073cb65d/transformers-5.13.1.tar.gz", hash = "sha256:1e2452d6778a7482158df5d5dacf6bf775d5b2fdcfce33caaf7f6b0e5f3e3397", size = 9196891, upload-time = "2026-07-11T09:15:50.845Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a5/3a/d99704c5effe10c6339c98cb236259161103e159bb99a78468b6729572ec/transformers-5.13.0-py3-none-any.whl", hash = "sha256:8adbc1d20bd5463cd6876b2eb7cb31971e1065788e7dc6bc12bab597a7c504b7", size = 11503730, upload-time = "2026-07-03T16:05:35.569Z" },
+    { url = "https://files.pythonhosted.org/packages/29/47/54eacf96b5c835bbd6ca631aa2740e7705ed63d9e3a8afd2d2cc6d09cae5/transformers-5.13.1-py3-none-any.whl", hash = "sha256:53f0ea8aa397e29244c2377ba981bcaf0c87adcf44fbdd447ef6306522afcacd", size = 11503977, upload-time = "2026-07-11T09:15:46.801Z" },
 ]
 
 [[package]]
@@ -4880,11 +4880,11 @@ wheels = [
 
 [[package]]
 name = "types-regex"
-version = "2026.6.28.20260630"
+version = "2026.7.10.20260711"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a1/36/88aac7af6d8943f5c744daa49eec4a31d81396a10a551372ecf78fb7cb05/types_regex-2026.6.28.20260630.tar.gz", hash = "sha256:5fafe434b578d3d77640aab948a3ebfc9efea723412bfae5551b3f55086ab6a7", size = 13428, upload-time = "2026-06-30T06:00:04.144Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/d4/44daa013494ca2979d2b5113b10f8c22dcda420d7418291564780fb835e0/types_regex-2026.7.10.20260711.tar.gz", hash = "sha256:9aa1b142060add5d4a4f42146ebcb70e01e7b2789e7ce473255323f3c5eedded", size = 13441, upload-time = "2026-07-11T04:51:22.219Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/04/9d/454dfccb80909ce841b5f814c57e06957c787cf1e8db1213c82de8f6b14d/types_regex-2026.6.28.20260630-py3-none-any.whl", hash = "sha256:69b72cd53de57afd1d20f9c13ebc2e769b7254d5c600ce5604340d4636b0c0b6", size = 11152, upload-time = "2026-06-30T06:00:03.129Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/07/54a13b0f0f4cf1879bbeddb04c78b3cd7c94aa661facf648001499220547/types_regex-2026.7.10.20260711-py3-none-any.whl", hash = "sha256:c7094184715b1bd5e466cc49414cd101303d8a5167ea5a61804f31e8f168bf48", size = 11149, upload-time = "2026-07-11T04:51:21.245Z" },
 ]
 
 [[package]]

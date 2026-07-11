@@ -51,6 +51,7 @@ from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities, enabled_workloads
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
+    EXTENDED_CONTROL_TYPES,
 )
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
@@ -1449,6 +1450,7 @@ class HordeWorkerProcessManager:
             model_metadata=self._model_metadata,
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             admission_baseline_provider=self.latest_baseline_estimate_mb,
+            extended_controlnet_ready_provider=self._extended_controlnet_ready,
             post_processing_lane_commitments_provider=lambda: getattr(
                 getattr(self, "_alchemy_coordinator", None),
                 "num_graph_forms_waiting_or_running",
@@ -1470,6 +1472,7 @@ class HordeWorkerProcessManager:
             reserve_ledger=self._reserve_ledger,
             canned_alchemy_source=canned_alchemy_source,
             run_metrics=self._run_metrics,
+            annotation_types_provider=self._servable_control_types,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
@@ -2940,6 +2943,10 @@ class HordeWorkerProcessManager:
             self._begin_vram_arbiter_cycle()
             self._inference_scheduler.run_governance_tick()
 
+            # Reissue any queued extended-controlnet job the worker never offered (hostile or stale-race
+            # input) before it can reach annotation or in-graph preprocessing.
+            self._fault_unready_extended_controlnet_jobs()
+
             # Pre-annotate controlnet jobs off-GPU before scheduling: parks eligible jobs (removing them
             # from the inference-eligible set until their control map arrives) and releases resolved,
             # aged-out, or lane-orphaned parks back to inference so a freed job can be dispatched this tick.
@@ -3055,6 +3062,28 @@ class HordeWorkerProcessManager:
             servable |= types
         return frozenset(servable)
 
+    def _extended_controlnet_ready(self) -> bool:
+        """Return whether every extended controlnet annotator is servable right now (torch-free, fail-closed).
+
+        Re-evaluated on each pop so the offer can flip from withheld to offered once the annotators land,
+        with no restart. With the image-utilities lane enabled, readiness is the live lane servable set
+        covering the whole extended control-type surface; otherwise (in-graph annotation) it is the extended
+        annotator weight files being present on disk, resolved through horde_model_reference's on-disk layout
+        (the same authority the lane's child environment is pointed at). A resolution failure fails closed.
+        """
+        if self.bridge_data.enable_image_utilities is True:
+            return self._servable_control_types() >= EXTENDED_CONTROL_TYPES
+        try:
+            from horde_model_reference.on_disk_layout import (
+                annotators_present_for_control_types,
+                resolve_weights_root,
+            )
+
+            return annotators_present_for_control_types(sorted(EXTENDED_CONTROL_TYPES), resolve_weights_root())
+        except Exception as e:  # noqa: BLE001 - readiness is best-effort; a resolution failure must fail closed.
+            logger.debug(f"Extended controlnet readiness probe failed: {type(e).__name__}: {e}")
+            return False
+
     def _on_annotator_availability(self, message: HordeAnnotatorAvailabilityMessage) -> None:
         """Cache which control types the reporting image-utilities lane can annotate right now."""
         self._annotator_servable_types[message.process_id] = frozenset(message.servable_control_types)
@@ -3103,6 +3132,38 @@ class HordeWorkerProcessManager:
                 reason="in_graph_fallthrough",
                 inputs={"cause": "annotation_faulted", "fault_reason": message.fault_reason or ""},
             )
+
+    def _fault_unready_extended_controlnet_jobs(self) -> None:
+        """Reissue any queued extended-controlnet job the worker is not currently offering (hostile input).
+
+        The extended offer is fail-closed and dynamic: the worker only advertises the extended control types
+        once its annotators are servable and the operator opted in. A queued extended-type job while that
+        offer is withheld is therefore hostile or a stale race, so it is faulted non-retryably (the horde
+        reissues it to a capable worker) rather than being let through to annotation or in-graph
+        preprocessing, where a missing annotator would fault it far later (or produce a garbage map). The
+        readiness probe is paid only when an extended-type job is actually queued (normally never).
+        """
+        extended_jobs = [
+            job
+            for job in list(self._job_tracker.jobs_pending_inference)
+            if job not in self._job_tracker.jobs_in_progress
+            and (control_type := _control_type_name(job.payload.control_type)) is not None
+            and control_type in EXTENDED_CONTROL_TYPES
+        ]
+        if not extended_jobs:
+            return
+        if self.bridge_data.extended_controlnet is True and self._extended_controlnet_ready():
+            return
+        for job in extended_jobs:
+            self._job_tracker.handle_job_fault_now(
+                job,
+                retryable=False,
+                fault_reason="extended_controlnet_not_offered",
+            )
+        logger.warning(
+            f"Faulted {len(extended_jobs)} queued extended-controlnet job(s) for reissue: the worker is not "
+            "currently offering the extended control types.",
+        )
 
     def _advance_pending_annotations(self) -> None:
         """Reconcile, age out, and dispatch the image-utilities pre-annotation stage for controlnet jobs.

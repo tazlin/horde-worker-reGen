@@ -23,6 +23,7 @@ import statistics
 import time
 from asyncio import CancelledError
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, override
 
@@ -38,9 +39,11 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 from horde_sdk.ai_horde_api.apimodels.alchemy.submit import AlchemyJobSubmitResponse
 from horde_sdk.generation_parameters.alchemy.consts import (
+    KNOWN_ANNOTATION_CONTROL_TYPES,
     KNOWN_FACEFIXERS,
     KNOWN_MISC_POST_PROCESSORS,
     KNOWN_UPSCALERS,
+    is_annotation_form,
     is_strip_background_form,
 )
 from loguru import logger
@@ -157,6 +160,7 @@ DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = (
     PALETTE_FORM_NAME,
     DESCRIBE_FORM_NAME,
     AESTHETIC_FORM_NAME,
+    "annotation",
 )
 """Forms an alchemist offers when ``bridge_data.forms`` is left unset (an empty list means "all").
 
@@ -166,7 +170,12 @@ the SDK enum value is ``post_process``.
 """
 
 
-def expand_offered_forms(bridge_data: reGenBridgeData, *, utilities_lane_healthy: bool = True) -> list[str]:
+def expand_offered_forms(
+    bridge_data: reGenBridgeData,
+    *,
+    utilities_lane_healthy: bool = True,
+    annotation_types: frozenset[str] = frozenset(),
+) -> list[str]:
     """Expand the bridge-data `forms` config into the individual form names the API expects.
 
     "post-process" expands to every known upscaler, facefixer, and strip_background,
@@ -215,6 +224,13 @@ def expand_offered_forms(bridge_data: reGenBridgeData, *, utilities_lane_healthy
     # one-time predictor-weight download happens lazily in the safety process on first use.
     if AESTHETIC_FORM_NAME in configured and server_supports_interrogation_form(AESTHETIC_FORM_NAME):
         offered.append(AESTHETIC_FORM_NAME)
+    if (
+        "annotation" in configured
+        and utilities_lane_healthy
+        and annotation_types
+        and server_supports_interrogation_form("annotation")
+    ):
+        offered.append("annotation")
     if "post-process" in configured:
         # Newly-added (beta) upscalers are withheld until the server lists them: it rejects the whole
         # pop if offered an unknown post-processor. The gate is fail-closed until probed, so the worker
@@ -351,6 +367,7 @@ class AlchemyCoordinator:
         reserve_ledger: CommittedReserveLedger | None = None,
         canned_alchemy_source: CannedAlchemySource | None = None,
         run_metrics: WorkerRunMetrics | None = None,
+        annotation_types_provider: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators.
 
@@ -369,6 +386,7 @@ class AlchemyCoordinator:
             run_metrics: The shared run-metrics aggregator. Each finished form is recorded here (its name,
                 pop->submit timing, and outcome) so alchemy gets the same recent-jobs and rollup
                 observability image generation has. ``None`` (unit tests) disables that recording.
+            annotation_types_provider: Return the control types currently servable by utilities lanes.
         """
         self._state = state
         self._process_map = process_map
@@ -379,6 +397,7 @@ class AlchemyCoordinator:
         self._api_sessions = api_sessions
         self._canned_alchemy_source = canned_alchemy_source
         self._run_metrics = run_metrics
+        self._annotation_types_provider = annotation_types_provider
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
         self.num_forms_submitted = 0
@@ -534,7 +553,11 @@ class AlchemyCoordinator:
         if (time.time() - self._last_pop_time) < self._pop_frequency:
             return False
 
-        offered = expand_offered_forms(bridge_data, utilities_lane_healthy=self._utilities_lane_healthy())
+        offered = expand_offered_forms(
+            bridge_data,
+            utilities_lane_healthy=self._utilities_lane_healthy(),
+            annotation_types=self._annotation_types(),
+        )
         if not offered:
             return False
 
@@ -566,6 +589,23 @@ class AlchemyCoordinator:
         be advertised while no lane can serve it (a still-starting, ending, or absent lane).
         """
         return self._process_map.num_loaded_utilities_processes() > 0
+
+    def _annotation_types(self) -> frozenset[str]:
+        """Return the servable annotation control types the pop request can carry.
+
+        The provider surfaces whatever the live utilities lanes report as annotatable. That raw set is
+        narrowed to ``KNOWN_ANNOTATION_CONTROL_TYPES`` here because the pop request field is typed as a list
+        of that enum and is built ahead of the pop's own error handling, so a control type the enum cannot
+        name would raise a validation error (crash-looping the pop loop) rather than a handled skip. An empty
+        result withholds the form entirely: the server reads an absent or empty ``annotation_types`` as
+        matching every type, so offering the form without a servable, nameable type would draw work no lane
+        here can produce.
+        """
+        provider = getattr(self, "_annotation_types_provider", None)
+        if provider is None:
+            return frozenset()
+        nameable = {member.value for member in KNOWN_ANNOTATION_CONTROL_TYPES}
+        return frozenset(control_type for control_type in provider() if control_type in nameable)
 
     def _has_spare_image_lane(self) -> bool:
         """Return True if an idle inference lane exists beyond what queued image jobs need."""
@@ -693,12 +733,18 @@ class AlchemyCoordinator:
         self._last_pop_time = time.time()
         bridge_data = self.bridge_data
 
+        annotation_types = self._annotation_types()
         pop_request = _AlchemyPopRequest(
             apikey=bridge_data.api_key,
             name=bridge_data.alchemist_name,
             bridge_agent=f"AI Horde Worker reGen:{runtime_version()}:https://github.com/Haidra-Org/horde-worker-reGen",
             priority_usernames=bridge_data.priority_usernames,
-            forms=expand_offered_forms(bridge_data, utilities_lane_healthy=self._utilities_lane_healthy()),
+            forms=expand_offered_forms(
+                bridge_data,
+                utilities_lane_healthy=self._utilities_lane_healthy(),
+                annotation_types=annotation_types,
+            ),
+            annotation_types=sorted(annotation_types) or None,
             amount=max(bridge_data.queue_size, 1),
             threads=1,
             max_tiles=min(max(bridge_data.max_power, 1), 256),
@@ -751,11 +797,19 @@ class AlchemyCoordinator:
                 )
                 continue
 
+            control_type = None
+            if is_annotation_form(form.form):
+                control_type = form.payload.control_type if form.payload is not None else None
+                if control_type is None:
+                    logger.error(f"Popped annotation form has no control_type: {form}")
+                    continue
+
             spec = AlchemyFormSpec(
                 form_id=str(form.id_),
                 form=str(form.form),
                 source_image_bytes=source_image_bytes,
                 r2_upload=form.r2_upload,
+                control_type=str(control_type) if control_type is not None else None,
             )
             self._form_time_popped[spec.form_id] = time.time()
             self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_bytes)

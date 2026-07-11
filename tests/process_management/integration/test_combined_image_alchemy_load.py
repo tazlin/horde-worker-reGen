@@ -514,6 +514,30 @@ class TestLostFormReaping:
         assert coordinator.num_forms_faulted == 0
         assert ledger.total_vram_mb() == 2000.0
 
+    def test_annotation_form_is_reaped_when_the_utilities_lane_dies(self) -> None:
+        """An annotation form whose image-utilities lane dies is dropped (faulted) so it can be reissued.
+
+        Annotation has no in-graph fallback and runs only on the utilities lane; if that lane hard-crashes
+        before a result, nothing else will ever answer for the form, so the reaper must fault it rather than
+        leave it wedged in ``_in_flight`` holding a concurrency slot.
+        """
+        process = _DispatchProcessInfo(process_id=9, launch=1)
+        coordinator, process_map = self._dispatch_one(
+            form_id="form-ann",
+            form="annotation",
+            capability=WorkerCapability.IMAGE_UTILITIES,
+            process=process,
+            ledger=CommittedReserveLedger(),
+        )
+        assert coordinator._in_flight_owner["form-ann"] == (9, 1)
+
+        process_map.kill(9)
+        coordinator._reap_lost_in_flight_forms()
+
+        assert "form-ann" not in coordinator._in_flight
+        assert "form-ann" not in coordinator._in_flight_owner
+        assert coordinator.num_forms_faulted == 1
+
 
 class _FakeVmem:
     def __init__(self, *, available_mb: float) -> None:

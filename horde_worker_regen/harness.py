@@ -26,7 +26,7 @@ import multiprocessing
 import os
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -54,6 +54,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     CannedJobSource,
     GeneratingAlchemySource,
     GeneratingJobSource,
+    SoakAlchemyForm,
     SoakImageTemplate,
     TimedJobSource,
     make_canned_job,
@@ -188,8 +189,9 @@ class HarnessConfig:
     soak_image_templates: list[SoakImageTemplate] = field(default_factory=list)
     """Weighted job templates the soak generates image jobs from (required when soaking)."""
 
-    soak_alchemy_templates: list[tuple[str, float]] = field(default_factory=list)
-    """Weighted ``(form_name, weight)`` pairs the soak generates alchemy forms from (optional)."""
+    soak_alchemy_templates: Sequence[SoakAlchemyForm] = field(default_factory=list)
+    """Weighted ``(form, weight)`` or ``(form, weight, control_type)`` entries the soak generates alchemy
+    forms from (optional). The control type carries an ``annotation`` form's detector identity."""
 
     soak_drain_timeout_seconds: float = 60.0
     """After the soak period, how long to wait for in-flight work to drain before shutting down."""

@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from horde_sdk.generation_parameters.alchemy.consts import (
+    is_annotation_form,
     is_facefixer_form,
     is_strip_background_form,
     is_upscaler_form,
@@ -88,7 +89,7 @@ def capability_for_alchemy_form(form: str) -> WorkerCapability:
     nsfw) runs on the CLIP stack in the safety process. This is the one place the form-to-capability
     routing fact lives.
     """
-    if is_strip_background_form(form):
+    if is_strip_background_form(form) or is_annotation_form(form):
         return WorkerCapability.IMAGE_UTILITIES
     if is_upscaler_form(form) or is_facefixer_form(form):
         return WorkerCapability.ALCHEMY_GRAPH

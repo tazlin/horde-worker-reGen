@@ -53,7 +53,7 @@ def _make_small_png() -> bytes:
 
 
 _SMALL_PNG = _make_small_png()
-_CANNED_CONTROL_MAP = b"\x89PNG\r\n\x1a\ncontrol-map-bytes"
+_CANNED_CONTROL_MAP = _SMALL_PNG
 _MEMORY_JSON: dict[str, object] = {
     "process_rss_bytes": 123_456_789,
     "torch_allocated_bytes": 64 * 1024 * 1024,
@@ -468,6 +468,43 @@ def test_strip_background_form_routes_to_utilities_and_matches_pp_shape(
         parent_conn.close()
 
 
+def test_annotation_form_routes_to_utilities_and_matches_image_result_shape(
+    http_service: tuple[_ServiceState, str],
+) -> None:
+    """An annotation alchemy form runs the requested detector and emits WebP bytes for R2."""
+    state, base_url = http_service
+    result_queue: queue.Queue[object] = queue.Queue()
+    parent_connection, child_connection = multiprocessing.Pipe(duplex=True)
+    adapter, _ = _build_adapter(base_url, result_queue, child_connection)
+
+    adapter.start()
+    try:
+        assert _wait_for(lambda: HordeProcessState.WAITING_FOR_JOB in _states(list(result_queue.queue)))
+        parent_connection.send(
+            HordeAlchemyControlMessage(
+                control_flag=HordeControlFlag.START_ALCHEMY,
+                form=AlchemyFormSpec(
+                    form_id="00000000-0000-0000-0000-0000000000ac",
+                    form="annotation",
+                    source_image_bytes=_SMALL_PNG,
+                    control_type="canny",
+                    r2_upload="https://example.invalid/upload",
+                ),
+            ),
+        )
+        assert _wait_for(
+            lambda: any(isinstance(message, HordeAlchemyResultMessage) for message in list(result_queue.queue)),
+        )
+        result = next(message for message in _drain(result_queue) if isinstance(message, HordeAlchemyResultMessage))
+        assert result.form == "annotation"
+        assert result.state == GENERATION_STATE.ok
+        assert result.image_bytes is not None and result.image_bytes[:4] == b"RIFF"
+        assert any(path.startswith("/annotators/canny") for path in state.paths_hit)
+    finally:
+        adapter.stop()
+        parent_connection.close()
+
+
 def test_strip_background_service_failure_faults_the_form(http_service: tuple[_ServiceState, str]) -> None:
     """A service failure during background removal faults the alchemy form (never wedges the lane)."""
     state, base_url = http_service
@@ -494,6 +531,73 @@ def test_strip_background_service_failure_faults_the_form(http_service: tuple[_S
         assert result.state == GENERATION_STATE.faulted
         assert result.image_bytes is None
         # The lane returns to idle after the fault, proving it keeps serving (no wedge).
+        assert _wait_for(lambda: adapter.handle.is_alive() is True)
+    finally:
+        adapter.stop()
+        parent_conn.close()
+
+
+def test_annotation_missing_weights_faults_the_form(http_service: tuple[_ServiceState, str]) -> None:
+    """A 409 (missing weights) from the annotator faults the form rather than wedging the lane."""
+    state, base_url = http_service
+    state.annotate_status = 409
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, _ = _build_adapter(base_url, q, child_conn)
+
+    adapter.start()
+    try:
+        assert _wait_for(lambda: HordeProcessState.WAITING_FOR_JOB in _states(list(q.queue)))
+        parent_conn.send(
+            HordeAlchemyControlMessage(
+                control_flag=HordeControlFlag.START_ALCHEMY,
+                form=AlchemyFormSpec(
+                    form_id="00000000-0000-0000-0000-0000000000ad",
+                    form="annotation",
+                    source_image_bytes=_SMALL_PNG,
+                    control_type="canny",
+                ),
+            ),
+        )
+        assert _wait_for(lambda: any(isinstance(m, HordeAlchemyResultMessage) for m in list(q.queue)))
+        result = next(m for m in _drain(q) if isinstance(m, HordeAlchemyResultMessage))
+        assert result.state == GENERATION_STATE.faulted
+        assert result.image_bytes is None
+        # The lane returns to idle after the fault, proving it keeps serving (no wedge).
+        assert _wait_for(lambda: adapter.handle.is_alive() is True)
+    finally:
+        adapter.stop()
+        parent_conn.close()
+
+
+def test_annotation_without_control_type_faults_without_calling_the_service(
+    http_service: tuple[_ServiceState, str],
+) -> None:
+    """A hostile annotation form with no control_type faults cleanly and never reaches the annotator."""
+    state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, _ = _build_adapter(base_url, q, child_conn)
+
+    adapter.start()
+    try:
+        assert _wait_for(lambda: HordeProcessState.WAITING_FOR_JOB in _states(list(q.queue)))
+        parent_conn.send(
+            HordeAlchemyControlMessage(
+                control_flag=HordeControlFlag.START_ALCHEMY,
+                form=AlchemyFormSpec(
+                    form_id="00000000-0000-0000-0000-0000000000ae",
+                    form="annotation",
+                    source_image_bytes=_SMALL_PNG,
+                    control_type=None,
+                ),
+            ),
+        )
+        assert _wait_for(lambda: any(isinstance(m, HordeAlchemyResultMessage) for m in list(q.queue)))
+        result = next(m for m in _drain(q) if isinstance(m, HordeAlchemyResultMessage))
+        assert result.state == GENERATION_STATE.faulted
+        assert result.image_bytes is None
+        assert not any(path.startswith("/annotators/") for path in state.paths_hit)
         assert _wait_for(lambda: adapter.handle.is_alive() is True)
     finally:
         adapter.stop()

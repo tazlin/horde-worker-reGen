@@ -679,6 +679,8 @@ class AlchemyFormSpec(BaseModel):
     """The encoded source image bytes to process."""
     r2_upload: str | None = None
     """The R2 URL to upload image-form results to, when applicable."""
+    control_type: str | None = None
+    """The requested control-map type for an ``annotation`` form, otherwise ``None``."""
 
 
 class HordeAlchemyControlMessage(HordeControlMessage):

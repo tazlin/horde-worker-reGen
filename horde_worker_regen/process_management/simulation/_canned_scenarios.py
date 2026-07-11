@@ -7,7 +7,7 @@ import functools
 import random
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from horde_sdk.ai_horde_api.apimodels import (
@@ -143,6 +143,8 @@ def make_canned_job(
     loras: list[LorasPayloadEntry] | None = None,
     tis: list[TIPayloadEntry] | None = None,
     control_type: str | None = None,
+    return_control_map: bool = False,
+    image_is_control: bool = False,
     workflow: str | None = None,
     post_processing: list[str] | None = None,
     hires_fix: bool = False,
@@ -156,6 +158,11 @@ def make_canned_job(
     as the live API provides. A controlnet job, or a workflow job (e.g. ``qr_code``), without
     an explicit source image gets a synthetic one automatically, since both consume a control
     image.
+
+    ``return_control_map`` requests the derived control map as the deliverable in place of a
+    generation, and ``image_is_control`` marks the source image as already being a control map
+    (which suppresses pre-annotation). Both mirror the like-named ``ImageGenerateJobPopPayload``
+    fields the image-utilities routing predicate reads.
     """
     job = dummy_job_factory(model_name)
     data = job.model_dump(by_alias=True)
@@ -183,6 +190,10 @@ def make_canned_job(
         data["payload"]["control_type"] = control_type
         if source_image_base64 is None:
             source_image_base64 = base64.b64encode(make_source_image_bytes()).decode("utf-8")
+    if return_control_map:
+        data["payload"]["return_control_map"] = True
+    if image_is_control:
+        data["payload"]["image_is_control"] = True
     if workflow is not None:
         data["payload"]["workflow"] = workflow
         if source_image_base64 is None:
@@ -383,6 +394,8 @@ class SoakImageTemplate:
     steps: int = 30
     n_iter: int = 1
     control_type: str | None = None
+    return_control_map: bool = False
+    image_is_control: bool = False
     workflow: str | None = None
     post_processing: list[str] = field(default_factory=list)
     hires_fix: bool = False
@@ -437,6 +450,8 @@ class GeneratingJobSource(CannedJobSource):
             ddim_steps=template.steps,
             n_iter=template.n_iter,
             control_type=template.control_type,
+            return_control_map=template.return_control_map,
+            image_is_control=template.image_is_control,
             workflow=template.workflow,
             post_processing=template.post_processing or None,
             hires_fix=template.hires_fix,
@@ -444,16 +459,29 @@ class GeneratingJobSource(CannedJobSource):
         )
 
 
-class GeneratingAlchemySource(CannedAlchemySource):
-    """A never-exhausting alchemy source that mints fresh forms from weighted form names."""
+SoakAlchemyForm = tuple[str, float] | tuple[str, float, str | None]
+"""A weighted alchemy-form entry for the soak: ``(form, weight)`` or ``(form, weight, control_type)``.
 
-    def __init__(self, form_weights: list[tuple[str, float]], *, seed: int = 0) -> None:
-        """Initialise with ``(form_name, weight)`` pairs to generate from."""
+The optional third element is the control type an ``annotation`` form carries (canny, depth, teed,
+...); it is ``None`` (or omitted) for every other form, which needs no control type."""
+
+
+class GeneratingAlchemySource(CannedAlchemySource):
+    """A never-exhausting alchemy source that mints fresh forms from weighted form names.
+
+    An ``annotation`` form entry carries the control type to annotate, so the minted spec routes to the
+    image-utilities lane with the control type that lane needs (a control-type-less annotation form
+    faults there). Every other form leaves the control type ``None``.
+    """
+
+    def __init__(self, form_weights: Sequence[SoakAlchemyForm], *, seed: int = 0) -> None:
+        """Initialise with ``(form, weight)`` or ``(form, weight, control_type)`` entries to generate from."""
         super().__init__([])
         if not form_weights:
             raise ValueError("GeneratingAlchemySource requires at least one form")
-        self._form_names = [name for name, _ in form_weights]
-        self._form_weights = [max(weight, 0.0) for _, weight in form_weights]
+        self._form_names = [entry[0] for entry in form_weights]
+        self._form_control_types = [entry[2] if len(entry) > 2 else None for entry in form_weights]
+        self._form_weights = [max(entry[1], 0.0) for entry in form_weights]
         if sum(self._form_weights) <= 0:
             self._form_weights = [1.0] * len(self._form_names)
         self._rng = random.Random(seed)
@@ -478,12 +506,13 @@ class GeneratingAlchemySource(CannedAlchemySource):
         """Generate a fresh alchemy form from a weighted-random form name (or None once stopped)."""
         if self._stopped:
             return None
-        form = self._rng.choices(self._form_names, weights=self._form_weights, k=1)[0]
+        index = self._rng.choices(range(len(self._form_names)), weights=self._form_weights, k=1)[0]
         return AlchemyFormSpec(
             form_id=str(uuid.uuid4()),
-            form=form,
+            form=self._form_names[index],
             source_image_bytes=self._source_image,
             r2_upload=DUMMY_R2_UPLOAD_URL,
+            control_type=self._form_control_types[index],
         )
 
 

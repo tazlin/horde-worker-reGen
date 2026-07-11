@@ -438,15 +438,12 @@ class UtilitiesProcessAdapter:
         self._set_annotating(False)
 
     def _handle_alchemy(self, message: HordeAlchemyControlMessage) -> None:
-        """Run one strip_background alchemy form on the service and emit the standard alchemy result.
+        """Run one image-utilities alchemy form and emit the standard alchemy result.
 
-        The image-utilities lane serves only ``strip_background`` among the alchemy forms (see
-        ``capability_for_alchemy_form``); any other form arriving here is a routing error, faulted so the
-        coordinator reissues rather than the worker wedging. The result message mirrors the post-processing
-        lane's exactly (WebP ``image_bytes`` ready for R2, ``time_elapsed`` timing), so the alchemy
-        coordinator's submit path consumes it without knowing which lane produced it.
+        The lane serves ``strip_background`` and ``annotation``. Any other form arriving here is a routing
+        error. Both successful paths return WebP bytes ready for the existing R2 submit flow.
         """
-        from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
+        from horde_sdk.generation_parameters.alchemy.consts import is_annotation_form, is_strip_background_form
 
         form = message.form
         self._set_annotating(True)
@@ -456,17 +453,29 @@ class UtilitiesProcessAdapter:
         state = GENERATION_STATE.ok
         fault_reason: str | None = None
 
-        if not is_strip_background_form(form.form):
-            state = GENERATION_STATE.faulted
-            fault_reason = f"image utilities lane does not serve alchemy form '{form.form}'"
-            logger.error(fault_reason)
-        else:
+        if is_annotation_form(form.form):
+            if form.control_type is None:
+                state = GENERATION_STATE.faulted
+                fault_reason = "annotation alchemy form is missing control_type"
+                logger.error(fault_reason)
+            else:
+                try:
+                    image_bytes = self.annotate_for_alchemy(form.control_type, form.source_image_bytes)
+                except Exception as e:
+                    state = GENERATION_STATE.faulted
+                    fault_reason = f"{type(e).__name__}: {e}"
+                    logger.error(f"Image utilities annotation ({form.form_id}) failed: {fault_reason}")
+        elif is_strip_background_form(form.form):
             try:
                 image_bytes = self.remove_background(form.source_image_bytes)
             except Exception as e:
                 state = GENERATION_STATE.faulted
                 fault_reason = f"{type(e).__name__}: {e}"
                 logger.error(f"Image utilities strip_background ({form.form_id}) failed: {fault_reason}")
+        else:
+            state = GENERATION_STATE.faulted
+            fault_reason = f"image utilities lane does not serve alchemy form '{form.form}'"
+            logger.error(fault_reason)
 
         time_elapsed = time.monotonic() - started_at
         self._process_message_queue.put(
@@ -487,6 +496,26 @@ class UtilitiesProcessAdapter:
         )
         self._send_state(completed_state, f"Alchemy {form.form} ({form.form_id}) complete")
         self._set_annotating(False)
+
+    def annotate_for_alchemy(self, control_type: str, image_bytes: bytes) -> bytes:
+        """Return an annotation result encoded as WebP for the alchemy R2 result path.
+
+        Args:
+            control_type: The control-map detector identifier.
+            image_bytes: Encoded source image bytes.
+
+        Returns:
+            WebP-encoded control-map bytes.
+        """
+        import io
+
+        from PIL import Image
+
+        control_map_bytes = self.annotate(control_type, image_bytes)
+        control_map = Image.open(io.BytesIO(control_map_bytes))
+        buffer = io.BytesIO()
+        control_map.save(buffer, format="WebP", quality=95, method=6)
+        return buffer.getvalue()
 
     def remove_background(self, image_bytes: bytes) -> bytes:
         """Strip an image's background via the service and return the result WebP-encoded for R2.

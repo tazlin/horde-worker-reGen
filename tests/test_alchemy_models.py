@@ -78,6 +78,10 @@ class TestRequiredCapability:
         """strip_background runs on the out-of-venv image-utilities lane, not the post-processing lane."""
         assert required_capability("strip_background") == WorkerCapability.IMAGE_UTILITIES
 
+    def test_annotation_routes_to_image_utilities(self) -> None:
+        """Annotation runs on the isolated image-utilities lane."""
+        assert required_capability("annotation") == WorkerCapability.IMAGE_UTILITIES
+
     def test_clip_forms_route_to_safety_process(self) -> None:
         """Text-output forms require ALCHEMY_CLIP (the safety process)."""
         for form in ("caption", "interrogation", "nsfw", "vectorize", "palette", "describe"):
@@ -108,6 +112,29 @@ class TestExpandOfferedForms:
         """Caption is offered once alchemy_caption_enabled is set."""
         bridge_data = self._bridge_data(alchemy_caption_enabled=True)
         assert "caption" in expand_offered_forms(bridge_data)
+
+    def test_annotation_offered_with_a_servable_type(self, monkeypatch: object) -> None:
+        """Annotation is offered only when the server and utilities lane can both serve it."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["annotation"])
+
+        assert expand_offered_forms(bridge_data, annotation_types=frozenset({"canny"})) == ["annotation"]
+        assert expand_offered_forms(bridge_data, annotation_types=frozenset()) == []
+
+    def test_annotation_withheld_without_lane_or_server(self, monkeypatch: object) -> None:
+        """Annotation is fail-closed: a down lane or an unaware server withholds it even with servable types.
+
+        The form has no in-graph fallback, so advertising it while no lane can serve it (or while the server
+        does not yet list it, which would make the server reject the entire pop) must not happen.
+        """
+        bridge_data = self._bridge_data(forms=["annotation"])
+        types = frozenset({"canny"})
+
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        assert expand_offered_forms(bridge_data, utilities_lane_healthy=False, annotation_types=types) == []
+
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        assert expand_offered_forms(bridge_data, utilities_lane_healthy=True, annotation_types=types) == []
 
     def test_restricted_forms(self) -> None:
         """An explicit forms list restricts what is offered."""
@@ -301,6 +328,7 @@ class TestAlchemySubmitShapes:
         process_queue = _RecordingQueue()
         process.process_id = 0
         process.process_launch_identifier = 1
+        process.device_index = 0
         process.process_message_queue = cast(ProcessQueue, process_queue)
         monkeypatch.setattr(process, "_score_aesthetic", lambda _image: 4.9564)
         monkeypatch.setattr(process, "_send_alchemy_job_metrics", lambda _form: None)
@@ -556,6 +584,22 @@ class TestAlchemyDispatch:
         assert submit.time_popped == 123.0
 
 
+class TestAnnotationTypesProvider:
+    """The coordinator narrows the lane's servable set to control types the pop enum can name."""
+
+    def test_intersects_with_known_control_types(self) -> None:
+        """A servable type the pop enum cannot name is dropped, so the enum-typed field never rejects it."""
+        coordinator = AlchemyCoordinator.__new__(AlchemyCoordinator)
+        coordinator._annotation_types_provider = lambda: frozenset({"canny", "not_a_real_control_type"})
+        assert coordinator._annotation_types() == frozenset({"canny"})
+
+    def test_empty_without_a_provider(self) -> None:
+        """With no provider wired the coordinator reports no servable types, so the form is withheld."""
+        coordinator = AlchemyCoordinator.__new__(AlchemyCoordinator)
+        coordinator._annotation_types_provider = None
+        assert coordinator._annotation_types() == frozenset()
+
+
 class TestAlchemyHeadroomEstimator:
     """The estimator predicts VRAM cost from observed runs, bounded by the configured floor."""
 
@@ -642,11 +686,13 @@ class _PolicyProcessMap:
         clip: object = None,
         idle_image_lanes: int = 0,
         free_vram_mb: float | None = None,
+        utilities_lanes: int = 0,
     ) -> None:
         self._graph = graph
         self._clip = clip
         self._image_lanes = [_IdleProc() for _ in range(idle_image_lanes)]
         self._free_vram_mb = free_vram_mb
+        self._utilities_lanes = utilities_lanes
 
     def get_first_available(self, capability: WorkerCapability) -> object:
         if capability is WorkerCapability.ALCHEMY_GRAPH:
@@ -662,6 +708,9 @@ class _PolicyProcessMap:
 
     def get_free_vram_mb(self) -> float | None:
         return self._free_vram_mb
+
+    def num_loaded_utilities_processes(self) -> int:
+        return self._utilities_lanes
 
 
 def _make_policy_coordinator(

@@ -193,6 +193,13 @@ allow_post_processing: true
 # Note: Additional RAM/VRAM overhead. Low VRAM cards (<6GB) should be cautious.
 allow_controlnet: false
 
+# Offer the extended ControlNet control types (everything beyond the classic set).
+# The worker only advertises these once their annotators are actually available (the image-utilities
+# lane serves them, or their weight files are on disk), so this is an opt-out, not an opt-in: leave it
+# true to serve them as soon as they are ready, or set it false to stay on the classic set and save the
+# annotator disk space. Has no effect unless `allow_controlnet: true`.
+extended_controlnet: true
+
 # Offer SDXL jobs with high memory add-ons like ControlNet or transparency.
 # Note: Significant additional RAM/VRAM overhead. Medium VRAM cards (<12GB) should be cautious.
 # Requires `allow_controlnet: true`.

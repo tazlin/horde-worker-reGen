@@ -158,6 +158,15 @@ Beyond that static provisioning gate the two features diverge at runtime:
   simply dispatched with no premade map. The provisioning coercion, not runtime health, is the controlnet
   gate.
 
+`allow_extended_controlnet` carries a further, server-side gate on top of the operator opt-in
+(`extended_controlnet` in `bridgeData`) and live annotator readiness. The `allow_extended_controlnet` pop
+field only exists on the AI Horde server from the release that ships extended ControlNet, and a server
+that does not recognise the field rejects the whole pop. So the worker advertises it only once the
+server-capability probe (see [`server_capabilities`][horde_worker_regen.server_capabilities]) confirms the
+field is present on the server's `PopInputStable` schema. The gate is fail-closed: a worker talking to an
+older server never offers extended ControlNet, and begins offering it within the probe TTL of the server
+going live, no restart required.
+
 ## Weight pre-placement
 
 The capability service runs with downloads disabled (`HIU_ALLOW_DOWNLOADS=false`), so it never fetches its
