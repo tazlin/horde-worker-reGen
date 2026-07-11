@@ -1162,14 +1162,30 @@ class ProcessLifecycleManager:
             return {}
 
     def _build_utilities_child_env(self, lane_card: CardRuntime) -> dict[str, str]:
-        """Build the hardened environment for the image-utilities subprocess."""
+        """Build the hardened environment for the image-utilities subprocess.
+
+        The annotator checkpoint directory is resolved through horde_model_reference's on-disk layout
+        (torch-free, the same authority hordelib's preload writes through), so the service reads exactly
+        the files the worker pre-places. The service's vendor directory (the pinned upstream clone) and
+        rembg cache self-resolve from ``AIWORKER_CACHE_HOME``, so only the cache root is forwarded for
+        those. Downloads stay disabled: a missing weight must surface as a typed error, not a fetch.
+        """
         env = dict(os.environ)
         cache_home = os.environ.get("AIWORKER_CACHE_HOME")
         if cache_home:
             env["AIWORKER_CACHE_HOME"] = cache_home
-            # The annotator weights are resolved from the shared model cache. The precise subdirectory is a
-            # job-flow concern resolved when annotation routing lands; the cache root is the safe default.
-            env["HIU_ANNOTATOR_MODEL_DIR"] = cache_home
+            try:
+                from horde_model_reference.on_disk_layout import annotator_root, resolve_weights_root
+
+                env["HIU_ANNOTATOR_MODEL_DIR"] = str(annotator_root(resolve_weights_root()))
+            except Exception as resolve_error:
+                # Leave the variable unset so the service falls back to its own isolated-cache default; a
+                # wrong directory would 409 every annotation, an unset one at least keeps the layout rule
+                # in one place (the service's own resolution).
+                logger.warning(
+                    f"Could not resolve the annotator weights root for the utilities lane: "
+                    f"{type(resolve_error).__name__} {resolve_error}",
+                )
         env["HIU_ALLOW_DOWNLOADS"] = "false"
         env.update(self._utilities_device_pin_env(lane_card))
         return env
