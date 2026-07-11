@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from worker_bootstrap import backend, cli, detect
+from worker_bootstrap import backend, cli, detect, utilities_env
 
 
 def _decision(token: str) -> detect.BackendDecision:
@@ -568,6 +568,91 @@ def test_sync_amd_windows_profile_uses_rocm_path(
     monkeypatch.setattr(rocm, "sync_rocm", fake_rocm_sync)
     assert cli.main(["sync", "--backend", "rocm-windows"]) == 0
     assert calls == [("rocm", "rocm-windows")]
+
+
+# --- utilities-venv provisioning wire-in (after a successful sync) ---------------------------------
+
+
+def _write_utilities_pin(root: Path, token: str) -> None:
+    """Write a CI-style utilities requirements pin so provisioning has a file to install from."""
+    pin = utilities_env.utilities_requirements_file(token=token, root=root)
+    pin.parent.mkdir(parents=True, exist_ok=True)
+    pin.write_text("horde-image-utilities==1.0.0\n", encoding="utf-8")
+
+
+def test_sync_provisions_utilities_when_wanted_and_pinned(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful sync provisions the utilities venv when features are wanted and a pin exists."""
+    root, _ = env
+    _write_utilities_pin(root, "cu126")
+    provisioned: list[str] = []
+    monkeypatch.setattr(
+        cli.runner,
+        "provision_utilities",
+        lambda uv, *, backend_token, **kw: provisioned.append(backend_token),
+    )
+    assert cli.main(["sync"]) == 0
+    assert provisioned == ["cu126"]
+
+
+def test_sync_skips_utilities_when_no_pin(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no committed pin for the backend, the wire-in stays a no-op (nothing to provision yet)."""
+    _, _ = env
+    called: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
+    assert cli.main(["sync"]) == 0
+    assert called == []
+
+
+def test_sync_skip_utilities_flag_suppresses_provision(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--skip-utilities suppresses provisioning even when it would otherwise run."""
+    root, _ = env
+    _write_utilities_pin(root, "cu126")
+    called: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
+    assert cli.main(["sync", "--skip-utilities"]) == 0
+    assert called == []
+
+
+def test_sync_skip_utilities_env_suppresses_provision(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """HORDE_WORKER_SKIP_UTILITIES=1 suppresses provisioning (the emergency env guard)."""
+    root, _ = env
+    _write_utilities_pin(root, "cu126")
+    monkeypatch.setenv("HORDE_WORKER_SKIP_UTILITIES", "1")
+    called: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
+    assert cli.main(["sync"]) == 0
+    assert called == []
+
+
+def test_sync_features_none_does_not_want_utilities(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """HORDE_WORKER_FEATURES=none strips the feature set, so the utilities venv is not wanted."""
+    root, _ = env
+    _write_utilities_pin(root, "cu126")
+    monkeypatch.setenv("HORDE_WORKER_FEATURES", "none")
+    called: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
+    assert cli.main(["sync"]) == 0
+    assert called == []
+
+
+def test_sync_utilities_provision_failure_is_non_fatal(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A utilities-provision failure warns but never turns a completed worker sync into a failure."""
+    root, calls = env
+    _write_utilities_pin(root, "cu126")
+
+    def boom(uv: str, *, backend_token: str, **kw: object) -> None:
+        raise utilities_env.UtilitiesProvisionError("could not create the utilities venv (exit code 2).")
+
+    monkeypatch.setattr(cli.runner, "provision_utilities", boom)
+    assert cli.main(["sync"]) == 0  # the worker sync succeeded; the utilities failure is post-success
+    assert calls == [("sync", "cu126")]
+    assert "could not create the utilities venv" in capsys.readouterr().err
 
 
 # --- preview / hold / prune path (existing .venv, so the dry-run preview runs) ---------------------

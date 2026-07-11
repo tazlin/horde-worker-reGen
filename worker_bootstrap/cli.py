@@ -12,7 +12,18 @@ from datetime import datetime
 from pathlib import Path
 
 from worker_bootstrap import backend as backend_mod
-from worker_bootstrap import config_seed, consent, detect, gitbin, paths, runner, sync_plan, updater, uvbin
+from worker_bootstrap import (
+    config_seed,
+    consent,
+    detect,
+    gitbin,
+    paths,
+    runner,
+    sync_plan,
+    updater,
+    utilities_env,
+    uvbin,
+)
 
 _BACKEND_ENV = "HORDE_WORKER_BACKEND"
 _FEATURES_ENV = "HORDE_WORKER_FEATURES"
@@ -61,6 +72,7 @@ class _SyncOptions:
     confirm_threshold_bytes: int
     headless_policy: str
     prune: bool
+    skip_utilities: bool
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -97,12 +109,15 @@ def _sync_options(args: argparse.Namespace) -> _SyncOptions:
 
     prune = not getattr(args, "no_prune", False) and _env_bool("HORDE_WORKER_SYNC_PRUNE", True)
 
+    skip_utilities = getattr(args, "skip_utilities", False) or _env_bool("HORDE_WORKER_SKIP_UTILITIES", False)
+
     return _SyncOptions(
         preview=preview,
         hold=hold,
         confirm_threshold_bytes=max(confirm_mb, 0) * 1024 * 1024,
         headless_policy=policy,
         prune=prune,
+        skip_utilities=skip_utilities,
     )
 
 
@@ -163,6 +178,32 @@ def _maybe_prune(uv: str, root: Path, options: _SyncOptions) -> None:
         print("Cache cleanup was interrupted and skipped; the install is complete.", file=sys.stderr)
     else:
         print("Cache cleanup did not complete (non-fatal); the install is complete.", file=sys.stderr)
+
+
+def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOptions) -> None:
+    """Provision the image-utilities capability venv after a successful sync, when wanted and stale.
+
+    The utilities venv is a separate environment for the ``horde-image-utilities`` capability service; the
+    worker runs without it, so its provisioning is post-success and non-fatal (a failure warns but never
+    turns an otherwise-complete install into a reported failure, mirroring :func:`_maybe_prune`). It is
+    skipped entirely when the resolved feature set is empty (nothing wants it), when no CI-compiled
+    requirements pin exists for the token yet, when a matching stamp shows it is already current, or when
+    it is disabled via ``--skip-utilities`` / ``HORDE_WORKER_SKIP_UTILITIES``.
+    """
+    if options.skip_utilities:
+        return
+    env_value = os.environ.get(_FEATURES_ENV)
+    if not utilities_env.utilities_provision_wanted(token=token, env_value=env_value):
+        return
+    if not utilities_env.needs_provision(backend_token=token, root=root):
+        return
+    print("Provisioning the image-utilities capability venv (a separate environment)...", flush=True)
+    try:
+        runner.provision_utilities(uv, backend_token=token, root=root)
+    except utilities_env.UtilitiesProvisionError as error:
+        print(f"WARNING: {error}", file=sys.stderr)
+        return
+    print("Image-utilities capability venv is ready.")
 
 
 def _is_headless() -> bool:
@@ -388,6 +429,7 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
         _verify_installed_torch_arch(uv, root, token)
         _maybe_prune(uv, root, options)
         _write_sync_stamp(root)
+        _maybe_provision_utilities(uv, root, token, options)
     return rc
 
 
@@ -843,6 +885,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "--no-prune",
             action="store_true",
             help="Do not auto-prune the worker's owned uv cache after a successful sync.",
+        )
+        target.add_argument(
+            "--skip-utilities",
+            action="store_true",
+            help="Skip provisioning the image-utilities capability venv (env: HORDE_WORKER_SKIP_UTILITIES=1).",
         )
         target.add_argument(
             "--cache-mode",

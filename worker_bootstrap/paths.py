@@ -47,6 +47,37 @@ def python_install_dir(root: Path | None = None) -> Path:
     return data_root(root) / "python"
 
 
+def utilities_venv_dir(root: Path | None = None) -> Path:
+    """Return the second (utilities) virtual environment directory, in the peered data dir.
+
+    The image-utilities capability service runs from its own virtual environment so its native,
+    accelerator-gated dependencies never share a resolution with the worker's ``.venv``. It lives in the
+    peered data dir (a sibling of the worker folder, preserved when the worker folder is deleted or
+    reinstalled) alongside the managed CPython and uv cache, so recreating the worker folder does not
+    discard it.
+    """
+    return data_root(root) / "utilities-venv"
+
+
+def utilities_python(root: Path | None = None) -> Path:
+    """Return the Python interpreter inside the utilities venv (platform-aware Scripts/ vs bin/)."""
+    venv = utilities_venv_dir(root)
+    if os.name == "nt":
+        return venv / "Scripts" / "python.exe"
+    return venv / "bin" / "python"
+
+
+def utilities_stamp_file(root: Path | None = None) -> Path:
+    """Return the stamp recording what the utilities venv was last provisioned against.
+
+    Holds the backend token and the SHA256 of the requirements file the venv was installed from. It lives
+    inside the utilities venv so it is discarded whenever that venv is recreated, keeping the recorded
+    fingerprint and the actually-installed packages consistent, and so a matching stamp lets a launch skip
+    a redundant reinstall.
+    """
+    return utilities_venv_dir(root) / ".horde-utilities-stamp"
+
+
 def uv_cache_mode() -> str:
     """Return the uv cache mode: ``"shared"`` or ``"isolated"`` (default).
 

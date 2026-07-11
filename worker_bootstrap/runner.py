@@ -11,10 +11,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from worker_bootstrap import paths
+from worker_bootstrap import paths, utilities_env
 
 
 def build_child_env(root: Path | None = None) -> dict[str, str]:
@@ -246,6 +246,45 @@ def uv_run(uv: str, command: list[str], *, root: Path | None = None, no_sync: bo
         args.append("--no-sync")
     args += command
     return run_uv(uv, args, root=root)
+
+
+def provision_utilities(
+    uv: str,
+    *,
+    backend_token: str,
+    root: Path | None = None,
+    command_runner: Callable[[list[str]], int] | None = None,
+) -> None:
+    """Create and populate the image-utilities venv for *backend_token*, stamping it on full success.
+
+    Runs the argv command lists from
+    :func:`worker_bootstrap.utilities_env.plan_utilities_provision` through the same hardened child
+    environment as every other uv call (via :func:`run_uv`), so the utilities venv is built against the
+    peered uv cache and managed CPython the worker uses. The stamp is written only after every command
+    succeeds, so an interrupted or failed provision is retried on the next sync rather than recorded as
+    complete.
+
+    Args:
+        uv: The uv executable to invoke.
+        backend_token: The locked torch-build token whose requirements pin to install.
+        root: The install root (defaults to :func:`worker_bootstrap.paths.install_root`).
+        command_runner: Executes one argv list and returns its exit code (injectable for tests). Defaults
+            to running it through :func:`run_uv` in the install dir with the hardened env.
+
+    Raises:
+        UtilitiesProvisionError: When any provisioning command exits non-zero, naming the failed step.
+    """
+    root = root or paths.install_root()
+    run_command = command_runner or (lambda argv: run_uv(uv, argv[1:], root=root))
+    for command in utilities_env.plan_utilities_provision(uv=uv, backend_token=backend_token, root=root):
+        exit_code = run_command(command)
+        if exit_code != 0:
+            raise utilities_env.UtilitiesProvisionError(
+                f"the utilities-venv step `{' '.join(command)}` failed (exit code {exit_code}). "
+                f"Re-run the sync to retry, or set HORDE_WORKER_SKIP_UTILITIES=1 to skip the utilities "
+                f"venv for now (the worker still runs; capabilities that need it are unavailable).",
+            )
+    utilities_env.write_utilities_stamp(backend_token=backend_token, root=root)
 
 
 def query_torch_arch_list(uv: str, *, root: Path | None = None) -> list[str] | None:
