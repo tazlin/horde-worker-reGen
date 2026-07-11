@@ -160,12 +160,17 @@ depend on this queue-gated cycle running; see
 3. **Blocking rules**: `ProcessMap.keep_single_inference` (a resident ControlNet-XL slot that must
    stay exclusive) can defer launch. Batch and card-demanding serialization is not held here: it is
    priced per-card against measured headroom by the scheduler's size-tier overlap gate.
-4. **`start_inference()`**: sends `START_INFERENCE` with the full `ImageGenerateJobPopResponse`; on
+4. **Auxiliary preparation**: when a resident-model head carries LoRAs that have not been prepared for that
+   job, `start_inference()` first sends `PREPARE_AUX_MODELS`. The child resolves the files under the normal
+   download deadline and heartbeats, emits `DOWNLOAD_AUX_COMPLETE`, and returns idle. The job stays
+   `PENDING_INFERENCE`, owns no sampling reservation, and can be line-skipped by bounded ready work. It must
+   still pass the ordinary dispatch gates afterward.
+5. **`start_inference()`**: sends `START_INFERENCE` with the full `ImageGenerateJobPopResponse`; on
    success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. By the
    [dual-presence rule](job_state_machine.md#the-stage-dual-presence-rule) it stays visible in the
    `jobs_pending_inference` view until the result arrives. On send failure the job faults straight to
    `PENDING_SUBMIT` (`handle_job_fault`).
-5. **`unload_models()` / `unload_models_from_vram()`**: evict idle models not needed by the upcoming
+6. **`unload_models()` / `unload_models_from_vram()`**: evict idle models not needed by the upcoming
    queue (LRU-informed; see [model eviction](performance_and_backpressure.md#model-eviction-lru)).
 
 The full scheduling-priority rationale (performance-model scoring, model affinity, the line-skip

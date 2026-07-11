@@ -612,6 +612,7 @@ class TestHandleInferenceResult:
         self,
         *,
         state: WorkerState,
+        in_progress: bool = True,
     ) -> tuple[JobTracker, object]:
         """Drive a single aux-download-marker faulted result through the dispatcher."""
         from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -626,7 +627,8 @@ class TestHandleInferenceResult:
 
         job = make_job_pop_response(model="stable_diffusion")
         job_info = await job_tracker.record_popped_job(job)
-        await mark_job_in_progress_async(job_tracker, job)
+        if in_progress:
+            await mark_job_in_progress_async(job_tracker, job)
 
         message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker, state=state)
 
@@ -652,6 +654,14 @@ class TestHandleInferenceResult:
         assert state.lora_download_backoff.strikes == 1
         assert state.lora_download_backoff.pops_suppressed(time.time())
         # No prior incident, so the first stall is requeued, not faulted terminally.
+        assert job_info not in job_tracker.jobs_pending_submit
+
+    async def test_pending_aux_preparation_fault_keeps_first_retry(self) -> None:
+        """A preparation-only download fault retries while the job remains pending."""
+        state = WorkerState()
+        job_tracker, job_info = await self._run_aux_fault(state=state, in_progress=False)
+
+        assert state.lora_download_backoff.strikes == 1
         assert job_info not in job_tracker.jobs_pending_submit
 
     async def test_aux_download_fault_during_incident_is_terminal(self) -> None:
@@ -887,7 +897,7 @@ class TestHandleAuxModelStateChange:
         )
 
     async def test_download_aux_complete_records_time(self) -> None:
-        """When an aux model finishes downloading, the time to download should be recorded on the job info."""
+        """Aux completion records timing and makes that same job eligible for ordinary dispatch."""
         job_tracker = JobTracker()
         job = make_job_pop_response(model="stable_diffusion")
         job_info = await job_tracker.record_popped_job(job)
@@ -904,3 +914,4 @@ class TestHandleAuxModelStateChange:
         )
 
         assert job_info.time_to_download_aux_models == 3.5
+        assert job_tracker.are_job_aux_models_prepared(job) is True

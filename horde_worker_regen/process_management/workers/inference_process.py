@@ -47,6 +47,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
+    HordePrepareAuxControlMessage,
     HordeProcessState,
     HordeSampleControlMessage,
     HordeSampleResultMessage,
@@ -1527,6 +1528,21 @@ class HordeInferenceProcess(HordeProcess):
                 seamless_tiling_enabled=message.seamless_tiling_enabled,
                 job_info=message.sdk_api_job_info,
                 aux_download_deadline_seconds=message.aux_download_deadline_seconds,
+            )
+        elif isinstance(message, HordePrepareAuxControlMessage):
+            download_time = self.download_aux_models(
+                message.sdk_api_job_info,
+                aux_download_deadline_seconds=message.aux_download_deadline_seconds,
+            )
+            self.send_aux_model_message(
+                process_state=HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+                info="Auxiliary models ready",
+                time_elapsed=download_time or 0.0,
+                job_info=message.sdk_api_job_info,
+            )
+            self.send_process_state_change_message(
+                process_state=HordeProcessState.WAITING_FOR_JOB,
+                info="Waiting for job",
             )
         elif isinstance(message, HordeSampleControlMessage):
             self._run_sample_stage(message)

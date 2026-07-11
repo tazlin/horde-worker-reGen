@@ -34,6 +34,7 @@ each child's dedicated pipe. All children send **status messages**
 | Message                             | Purpose                             | Carries                                                                                            |
 | ----------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `HordePreloadInferenceModelMessage` | Ask a process to load a model       | Model name, download/load flags                                                                    |
+| `HordePrepareAuxControlMessage`     | Resolve a pending job's LoRAs without sampling | Model name, full job, download deadline                                                 |
 | `HordeInferenceControlMessage`      | Start inference on a job            | Full `ImageGenerateJobPopResponse`                                                                 |
 | `HordeAlchemyControlMessage`        | Run one alchemy form (`START_ALCHEMY`) | `AlchemyFormSpec` (form name, pre-downloaded base64 source image, optional R2 upload URL)       |
 | `HordeSafetyControlMessage`         | Evaluate safety of completed images | Images + metadata                                                                                  |
@@ -151,9 +152,11 @@ bookkeeping before the child acknowledges:
 
 1. Sending `PRELOAD_MODEL` → parent marks the model `LOADING` in
    `HordeModelMap`.
-2. Sending `START_INFERENCE` → parent adds the job to `jobs_in_progress` and
+2. Sending `PREPARE_AUX_MODELS` → parent marks the target process
+   `DOWNLOADING_AUX_MODEL`, but deliberately leaves the job pending and creates no sampling reservation.
+3. Sending `START_INFERENCE` → parent adds the job to `jobs_in_progress` and
    sets the process state to `JOB_RECEIVED`.
-3. Sending `UNLOAD_MODELS_FROM_VRAM` → parent marks the model as no longer in
+4. Sending `UNLOAD_MODELS_FROM_VRAM` → parent marks the model as no longer in
    VRAM.
 
 If the child never receives the message (pipe broken, process died), the

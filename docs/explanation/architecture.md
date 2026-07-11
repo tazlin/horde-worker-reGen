@@ -139,8 +139,8 @@ and monitors child process health.
    touches a GPU directly.
 
 2. **Inference process(es)** (always process `1` and up): The number is
-   configurable via `queue_size` / `max_threads`. Receives `START_INFERENCE`
-   control messages with full job payloads, runs hordelib (Stable Diffusion
+   configurable via `queue_size` / `max_threads`. Receives `PREPARE_AUX_MODELS`
+   for pending LoRA resolution and `START_INFERENCE` control messages with full job payloads, runs hordelib (Stable Diffusion
    pipeline), streams back heartbeats and progress, and finally sends a
    `HordeInferenceResultMessage` with base64-encoded images. When alchemy is
    enabled, these same processes also handle **graph** alchemy forms (upscalers,

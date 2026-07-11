@@ -497,6 +497,8 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to download a model."""
     PRELOAD_MODEL = auto()
     """Signal the child process to preload a model."""
+    PREPARE_AUX_MODELS = auto()
+    """Signal an inference child to resolve a pending job's LoRAs without starting inference."""
     START_INFERENCE = auto()
     """Signal the child process to start inference."""
     START_ALCHEMY = auto()
@@ -635,6 +637,19 @@ class HordePreloadInferenceModelMessage(HordeControlModelMessage):
 
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
+
+
+class HordePrepareAuxControlMessage(HordeControlModelMessage):
+    """Resolve a pending image job's auxiliary files without claiming a sampling slot.
+
+    The job remains pending in the parent while the child runs the same bounded, heartbeat-protected LoRA
+    download path used by inference.  Completion makes the ordinary inference dispatch eligible; it does not
+    bypass sampling admission or reserve VRAM.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.PREPARE_AUX_MODELS
+    sdk_api_job_info: ImageGenerateJobPopResponse
+    """The pending job whose LoRA references must be present before dispatch."""
 
 
 class HordeInferenceControlMessage(HordeControlModelMessage):

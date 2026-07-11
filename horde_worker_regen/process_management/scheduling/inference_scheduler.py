@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlModelMessage,
     HordeInferenceControlMessage,
     HordePreloadInferenceModelMessage,
+    HordePrepareAuxControlMessage,
     HordeProcessState,
     ModelLoadState,
 )
@@ -4848,6 +4849,28 @@ class InferenceScheduler:
             disaggregated=self._is_disaggregation_class_eligible(displaced_head),
         )
 
+    def _line_skip_displaces_pending_aux_preparation(
+        self,
+        displaced_job: ImageGenerateJobPopResponse,
+    ) -> bool:
+        """Return whether a line-skip jumps a pending, preparation-only auxiliary download.
+
+        Unlike the historical START_INFERENCE download shape, a preparation-only head cannot begin sampling
+        when its files finish: the child returns to WAITING_FOR_JOB and the parent must dispatch it through the
+        arbiter again.  A bounded line-skip may therefore use the currently measured free room without also
+        preserving enough room for the pending head.  All other line-skips retain head protection, including
+        legacy/in-flight downloads whose child can proceed directly from download into sampling.
+        """
+        if displaced_job in self._job_tracker.jobs_in_progress:
+            return False
+        return any(
+            process.process_type is HordeProcessType.INFERENCE
+            and process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
+            and process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
+            and process.last_job_referenced == displaced_job
+            for process in self._process_map.values()
+        )
+
     def _context_reduction_demand(
         self,
         vram_verdict: BudgetVerdict,
@@ -7437,6 +7460,14 @@ class InferenceScheduler:
             and max_resident < live_inference_processes
             and self._has_teardownable_idle_context(process_with_model, device_index=device_index)
         )
+        active_jobs_on_card = (
+            self._jobs_in_progress_on_card(device_index)
+            if self._multi_gpu_routing_active and device_index is not None
+            else self._job_tracker.jobs_in_progress
+        )
+        prepared_head_reprices_activation = self._job_tracker.are_job_aux_models_prepared(next_job) and bool(
+            active_jobs_on_card,
+        )
         request = VramRequest(
             kind=VramRequestKind.MONOLITHIC_DISPATCH,
             job_label=str(next_job.model),
@@ -7444,9 +7475,16 @@ class InferenceScheduler:
             device_index=device_index,
             target_process_id=process_with_model.process_id,
             candidate_delta_mb=candidate_delta_mb,
-            candidate_already_resident=self._candidate_weights_resident_on_process(
-                next_job.model,
-                process_with_model.process_id,
+            # An ordinary dispatch onto resident weights is a no-materialisation fast path. A prepared head
+            # re-entering while another job owns a live reservation is not: its weights may be resident, but
+            # its activations would overlap that admitted peak. Reprice the activation-only delta so the
+            # preparation boundary cannot turn resident-weight credit into an ungoverned second sampler.
+            candidate_already_resident=(
+                self._candidate_weights_resident_on_process(
+                    next_job.model,
+                    process_with_model.process_id,
+                )
+                and not prepared_head_reprices_activation
             ),
             own_planned_unmaterialized_mb=self._own_planned_charge_mb(
                 device_index=device_index,
@@ -7572,6 +7610,10 @@ class InferenceScheduler:
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
 
+        if next_job_and_process.line_skip is None and self._job_requires_aux_preparation(next_job):
+            self._send_aux_preparation(next_job, process_with_model)
+            return False
+
         degraded_dispatch = self._job_tracker.is_degraded_dispatch_pending(next_job)
         if degraded_dispatch and len(self._job_tracker.jobs_in_progress) > 0:
             # A degraded retry (after a resource/OOM failure) runs in isolation to minimise VRAM
@@ -7593,16 +7635,21 @@ class InferenceScheduler:
             return False
 
         line_skip = next_job_and_process.line_skip
+        displaces_pending_aux_preparation = (
+            line_skip is not None and self._line_skip_displaces_pending_aux_preparation(line_skip.displaced_job)
+        )
         if self._dispatch_residency_reconciliation_holds(
             next_job,
             process_with_model,
             # A line-skip dispatch is not the true head of queue, so it presents is_head_of_queue=False and the
-            # head it jumped priced as head_outstanding_mb. Head protection then reserves the card's physical
-            # room for that head rather than letting the skipper consume the space the head needs.
+            # head it jumped priced as head_outstanding_mb. Head protection reserves the card's physical room
+            # for a head that may begin sampling on its own after a legacy in-flight download. A pending-only
+            # auxiliary preparation is different: its child returns idle and the head must re-enter admission,
+            # so the bounded skipper may use measured free room now without creating an ungoverned overlap.
             is_head_of_queue=line_skip is None,
             head_outstanding_mb=(
                 None
-                if line_skip is None
+                if line_skip is None or displaces_pending_aux_preparation
                 else self._displaced_head_outstanding_mb(
                     line_skip.displaced_job,
                     device_index=process_with_model.device_index if self._multi_gpu_routing_active else None,
@@ -7669,6 +7716,55 @@ class InferenceScheduler:
         # orchestrator intent's "Holding dispatch" does not stick after the stall resolves.
         self._dispatch_stall_last_reason = None
 
+        return True
+
+    def _job_requires_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Return whether a pending job must resolve LoRAs before it may claim sampling admission.
+
+        A base model can already be resident while the job's LoRAs are not.  Preparing those files under a
+        separate control command keeps the job pending and therefore creates no dispatch reservation.  Once
+        preparation completes, START_INFERENCE still revalidates the files child-side and passes through every
+        ordinary VRAM, concurrency, post-processing, and degraded-retry gate.
+        """
+        return bool(job.payload.loras) and not self._job_tracker.are_job_aux_models_prepared(job)
+
+    def _send_aux_preparation(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
+        """Ask a resident job's lane to prepare LoRAs while the job remains pending.
+
+        The process state is advanced optimistically, matching the worker's other IPC sends, so the next
+        scheduling pass can line-skip bounded ready work without racing the child's acknowledgement.  A failed
+        send changes no state and leaves the job pending for lifecycle recovery or a later retry.
+        """
+        if job.model is None:
+            return False
+        sent = process_with_model.safe_send_message(
+            HordePrepareAuxControlMessage(
+                horde_model_name=job.model,
+                sdk_api_job_info=job,
+                aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
+                    self._runtime_config.bridge_data,
+                ),
+            ),
+        )
+        if not sent:
+            return False
+        logger.info(
+            f"Preparing auxiliary models for pending job {str(job.id_)[:8]} on process "
+            f"{process_with_model.process_id} before sampling admission",
+        )
+        process_with_model.last_control_flag = HordeControlFlag.PREPARE_AUX_MODELS
+        self._process_map.on_last_job_reference_change(
+            process_id=process_with_model.process_id,
+            last_job_referenced=job,
+        )
+        self._process_map.on_process_state_change(
+            process_id=process_with_model.process_id,
+            new_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
+        )
         return True
 
     def _compute_wanted_models(self) -> set[str]:
@@ -7901,6 +7997,7 @@ class InferenceScheduler:
 
             if process_info.is_process_busy():
                 logger.debug(f"Process {process_info.process_id} is busy")
+                continue
 
             if process_info.loaded_horde_model_name is not None:
                 if len(bridge_data.image_models_to_load) == 1 and not under_pressure:

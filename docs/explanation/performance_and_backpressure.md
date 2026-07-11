@@ -278,6 +278,16 @@ download, the skip decision is cached in `_pending_line_skip` so the second call
 agrees with the first. Without this cache, the launch call could pick a
 different job, causing the block decision to be wasted.
 
+An uncached-LoRA job whose base model is already resident is prepared before it is dispatched. The parent
+sends `PREPARE_AUX_MODELS`; the child runs the ordinary deadline-bounded, heartbeat-protected LoRA resolver
+and returns to `WAITING_FOR_JOB`. The job remains `PENDING_INFERENCE` throughout, so auxiliary I/O neither
+claims an inference-concurrency slot nor creates a future sampling reservation. `DOWNLOAD_AUX_COMPLETE`
+marks that same job ready for the normal `START_INFERENCE` path. This separation is important: a child that
+has already received `START_INFERENCE` can proceed directly from its download into sampling, so its dispatch
+reservation must remain charged and cannot safely be loaned to a line-skipper.
+If the preparation download reaches its deadline, the ordinary auxiliary-download backoff and bounded retry
+policy still applies; a retry leaves the job in `PENDING_INFERENCE` rather than requiring a stage self-transition.
+
 #### Sourcing a skip job when none is queued
 
 A line-skip needs a small job that is already resident on an idle sibling process
@@ -358,6 +368,21 @@ candidate retains its existing hold. The one-candidate claim lasts until the hea
 leaves `DOWNLOADING_AUX_MODEL`, preventing a multi-process worker from filling all
 of its idle slots with speculative models. Graceful shutdown applies the same rule
 to jobs already accepted into the drain; it still prevents new pops.
+
+At dispatch, a line-skip past a preparation-only head is priced against measured physical room without
+reserving enough leftover room for that pending head. This is narrower than the general line-skip rule: the
+prepared head cannot start on its own when the download completes, and must re-enter dispatch admission.
+The skipper immediately records its own dispatch reservation; if preparation finishes while it is still
+sampling, that reservation holds the head until the card is safe. Legacy/in-progress auxiliary downloads
+retain ordinary head protection because their child may proceed directly into sampling.
+If the prepared head retained its base weights in VRAM, only those weights are credited: while another job is
+in progress, the head's activation delta is still repriced against that job's reservation rather than taking
+the ordinary resident-dispatch no-op shortcut.
+
+Reclaim cannot evict from a busy inference lane, including a lane in `DOWNLOADING_AUX_MODEL`. Such an unload
+would be queued behind the active command, cannot improve the current admission reading, and would overwrite
+the parent's optimistic control marker before preparation completes. Reconciliation may evict idle siblings;
+the active preparation lane remains owned until it reports completion or lifecycle recovery replaces it.
 
 #### Idle-fill: over-popping a quick job up a size ladder when a card would idle
 

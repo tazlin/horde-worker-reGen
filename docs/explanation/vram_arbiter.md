@@ -155,9 +155,20 @@ only ever be claimed after the head itself runs; with two staged loads the stand
 wedges outright. Both classes are therefore priced against physical truth plus the dispatch-flow
 reservations only (in-flight sampling genuinely about to spike); the requester's own preload-flow charge is
 part of the excluded share, so the per-target self-netting does not stack on top of it. A non-head request
-(a line-skip) stays fully charged, so it can never consume the room a staged head is waiting on. This is the
+(a line-skip) normally stays fully charged, so it cannot consume the room a staged head is waiting on. The
+one bounded exception is a line-skip past a `PREPARE_AUX_MODELS` head that is still pending rather than
+in-progress: auxiliary completion returns that child to `WAITING_FOR_JOB`, so the head cannot materialise
+until it re-enters this arbiter. The skipper may use measured room now and records its own dispatch
+reservation; that reservation then holds the prepared head if their sampling peaks cannot coexist. An
+in-progress/legacy auxiliary download receives no exception because it can flow directly into sampling. This is the
 same reasoning that admits the disaggregated decode stage unconditionally: work whose turn has come must not
 be starved by claims whose own turn comes after it.
+
+When the prepared head re-enters dispatch while another job is in progress on its card, retained base weights
+do not make the request a complete no-op. The scheduler credits those resident weights but reprices the head's
+activation-only delta against the other job's live reservation. Ordinary resident dispatches retain their
+no-materialisation fast path; this narrower rule prevents auxiliary preparation from hiding a second peak
+behind resident-weight credit.
 
 Before reclaim is consulted, a non-fitting request is checked against the **phantom-ledger** judgement. The
 committed floor is bookkeeping, and the worker cannot hold more device VRAM than the device itself reports
@@ -194,11 +205,13 @@ committed load fits capacity but the candidate tips the inequality over, the sho
 candidate physically fits the truthful device-free read minus the noise buffer at that moment, and only for
 the true head of queue. That is the remaining useful "best effort" case: fitting into measured reality, not
 hoping an over-commit will work. A non-head request (a line-skip job selected ahead of a downloading head) is
-denied that admit even when the card physically has room right now, because materialising into it starves the
-head the skipper jumped: the head needs the same space and took precedence. If it does not physically fit (or
+denied that admit even when the card physically has room right now, because materialising into it can starve a
+head already authorized to proceed from download into sampling. A preparation-only pending head is not yet
+authorized, so its bounded skipper omits `head_outstanding_mb` and both jobs take their turns through ordinary
+measured admission. If the candidate does not physically fit (or
 the requester is not the head), the disposition is `DEFER` and the `admission_foreign_pressure_defers` counter
 advances. The dispatch-reconciliation gate plumbs the same truth, presenting `is_head_of_queue=False` for a
-line-skip dispatch so a line-skipper is held rather than committing over the head at the dispatch seam.
+line-skip dispatch and retaining head protection except for that preparation-only pending state.
 
 The "foreign" label is earned, not assumed. Before a non-fitting head is charged to foreign pressure, the
 arbiter separates a shortfall the worker can itself reclaim: a head whose deficit is held by its own idle

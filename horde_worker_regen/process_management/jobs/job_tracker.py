@@ -310,6 +310,12 @@ class TrackedJob:
     out-of-memory) past the defer window. While set, the disaggregation-eligibility predicate treats the job as
     monolithic (so it is charged its full footprint and never re-claimed into the pipeline). Cleared naturally
     when the job leaves the tracker. See :meth:`requeue_disaggregated_for_monolithic`."""
+    aux_models_prepared: bool = False
+    """Whether this job's LoRAs completed the explicit pending-queue preparation pass.
+
+    This is job-scoped rather than a general cache claim: it authorizes this same head to proceed to ordinary
+    dispatch, while line-skip candidates continue to use the stricter cache-residency policy.
+    """
     chain_context: ChainExecutionContext | None = None
     """The chain-stage state for this job's unit of work, or None for jobs registered outside the pop path.
 
@@ -1455,8 +1461,16 @@ class JobTracker:
         """
         if job is None:
             return
+        tracked = self._tracked_for(job)
+        if tracked is not None:
+            tracked.aux_models_prepared = True
         for lora in job.payload.loras or []:
             self._cached_lora_keys.add(self._lora_cache_key(lora))
+
+    def are_job_aux_models_prepared(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Return whether this pending job completed its explicit auxiliary preparation pass."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and tracked.aux_models_prepared
 
     def are_all_job_loras_cached(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether every LoRA ``job`` needs has been seen present on disk this session.
@@ -1677,7 +1691,14 @@ class JobTracker:
             retryable and tracked.time_popped is not None and tracked.inference_attempts < self._max_inference_attempts
         )
 
-        if can_retry and self._set_stage(tracked, JobStage.PENDING_INFERENCE):
+        # Auxiliary preparation runs while the job is already pending. Its child can report the same bounded
+        # download fault as an in-progress inference command, but there is no stage transition to perform when
+        # retrying it: remaining in PENDING_INFERENCE is the requeue. Treat that as a successful retry decision
+        # rather than asking the transition table for a forbidden self-edge and faulting the job terminally.
+        requeued = can_retry and (
+            tracked.stage is JobStage.PENDING_INFERENCE or self._set_stage(tracked, JobStage.PENDING_INFERENCE)
+        )
+        if requeued:
             degraded = resource_failure and not tracked.degraded_retry_used
             if degraded:
                 tracked.degraded_retry_used = True
