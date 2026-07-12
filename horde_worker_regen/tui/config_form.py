@@ -35,6 +35,7 @@ ALCHEMY_FORMS = (
     "palette",
     "describe",
     "aesthetic",
+    "annotation",
 )
 
 DEDICATED_POST_PROCESSING_CHOICES = ("auto", "on", "off")
