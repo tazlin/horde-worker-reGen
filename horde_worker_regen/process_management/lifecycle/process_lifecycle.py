@@ -2803,7 +2803,11 @@ class ProcessLifecycleManager:
 
         live = [p for p in self._process_map.values() if p.process_type == HordeProcessType.INFERENCE]
         for process_info in live:
-            self._replace_inference_process(process_info, intentional_reason=f"soft reset: {reason}")
+            self._replace_inference_process(
+                process_info,
+                intentional_reason=f"soft reset: {reason}",
+                recovery_requeue=True,
+            )
 
         for slot_id in revived:
             if slot_id not in self._process_map:
@@ -2877,6 +2881,7 @@ class ProcessLifecycleManager:
         intentional_reclaim: bool = False,
         intentional_reason: str | None = None,
         resource_fault_reason: str | None = None,
+        recovery_requeue: bool = False,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -2904,6 +2909,10 @@ class ProcessLifecycleManager:
                 failure. That routes it to the bounded degraded/isolated retry (which clears the device for
                 it) rather than a plain re-dispatch onto another over-committed slot. Unlike the intentional
                 paths this still takes the full crash/recovery bookkeeping (it *is* a recovery).
+            recovery_requeue: When True, this replacement is part of a save-our-ship pool rebuild, so a
+                requeued in-flight job is a retry the recovery cycle granted. Marking it lets the same
+                cycle's give-up leave the job queued for a dispatch opportunity instead of terminally
+                faulting the retry it just granted.
         """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
@@ -2971,6 +2980,7 @@ class ProcessLifecycleManager:
                 retryable=not (aux_download_stall and not aux_stall_retryable),
                 is_resource_failure=resource_fault_reason is not None,
                 fault_reason=resource_fault_reason,
+                recovery_requeue=recovery_requeue,
             )
 
         if intentional_reclaim or intentional_reason is not None:

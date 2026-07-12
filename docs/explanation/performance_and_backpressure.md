@@ -36,7 +36,12 @@ call, it runs a series of gates:
 
 1. **Shutdown check**: if `WorkerState.shutting_down`, skip.
 2. **Consecutive failure backoff**: if ≥ 3 consecutive failures, pause for
-   `CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS` (180 s).
+   `CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS` (180 s). Only *generation/submit* failures
+   count here. A job faulted by scheduling recovery (a save-our-ship give-up
+   reissuing a wedged backlog, tagged `JobFaultOrigin.SCHEDULING_RECOVERY`) is a
+   recovery action with its own escalation ladder, so the submit path excludes it
+   from this counter: a give-up batch must not manufacture the pop pause on top of
+   the recovery it is already performing, compounding one outage into a longer one.
 3. **Queue full**: if `queue_size + 1 + (max_threads - 1)` jobs are in the
    pipeline, skip.
 4. **Hold-back gate**: if jobs are pending inference but no jobs have been

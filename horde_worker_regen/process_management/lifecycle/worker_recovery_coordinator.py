@@ -14,7 +14,7 @@ from horde_worker_regen.process_management.config.worker_state import PopPauseOw
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
-from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -56,6 +56,13 @@ class WorkerRecoveryCoordinator:
     bounds the yield: a reclaim that never lands (the lane wedged, or the freed room still insufficient) falls
     through to the ordinary give-up so the horde reissues the jobs rather than the worker parking forever.
     Sized to the post-processing admission-patience window."""
+
+    HEAD_RECOVERY_BUDGET_FALLBACK_SECONDS = 150.0
+    """Give-up deferral budget for head-of-queue model materialisation when no numeric preload timeout is set.
+
+    The deferral normally bounds itself by ``bridge_data.preload_timeout``; this is the backstop bound used
+    only if that value is not a real number, so a materialisation that never completes can never defer give-up
+    forever. Matches the ``preload_timeout`` default."""
 
     def __init__(
         self,
@@ -136,6 +143,11 @@ class WorkerRecoveryCoordinator:
         # no such remedy is in flight. Cleared when the wedge episode closes so a later episode gets its own
         # remedy attempt.
         self.pp_reclaim_remedy_issued_at: float | None = None
+        # When head-of-queue model materialisation (a preload/load for the head over an otherwise idle pool)
+        # was first observed in the current continuity; None when the head is not materialising. Bounds the
+        # give-up deferral so a stuck load still escalates. Cleared when materialisation stops or the episode
+        # closes.
+        self.head_recovery_in_flight_since: float | None = None
 
     @property
     def bridge_data(self) -> reGenBridgeData:
@@ -552,6 +564,27 @@ class WorkerRecoveryCoordinator:
         self._abort_callback()
         return True
 
+    def _head_recovery_in_flight(self) -> bool:
+        """Return whether the head's model is materialising within its preload budget (give-up defers to it).
+
+        A save-our-ship give-up over a lane that reads ready must not fault the head-of-queue job while the
+        pool is in the middle of loading that job's model: a ready lane whose head model is still materialising
+        is capacity in flight, not a wedge over a healthy pool. This reports the deferral while the scheduler
+        sees the head materialising, bounded by ``bridge_data.preload_timeout`` so a load that never lands (a
+        stuck preload) stops deferring and the wedge escalates exactly as before.
+        """
+        if not self._inference_scheduler.head_model_materializing():
+            self.head_recovery_in_flight_since = None
+            return False
+        now = self._clock()
+        if self.head_recovery_in_flight_since is None:
+            self.head_recovery_in_flight_since = now
+        budget = self.bridge_data.preload_timeout
+        budget_seconds = (
+            float(budget) if isinstance(budget, int | float) else self.HEAD_RECOVERY_BUDGET_FALLBACK_SECONDS
+        )
+        return (now - self.head_recovery_in_flight_since) < budget_seconds
+
     def run_recovery_supervisor(self) -> None:
         """Drive save-our-ship escalation one tick and perform any returned action."""
         if self._state.shutting_down:
@@ -561,6 +594,7 @@ class WorkerRecoveryCoordinator:
         self.maybe_reset_stuck_governance_hold()
         is_wedged = self.assess_wedge()
         made_progress = self.made_progress_since_episode()
+        head_recovery_in_flight = self._head_recovery_in_flight()
         if self.is_inference_pool_unrecoverable() or self.is_safety_pool_unrecoverable():
             self.episode_saw_unrecoverable_pool = True
         if self.episode_saw_unrecoverable_pool:
@@ -572,6 +606,7 @@ class WorkerRecoveryCoordinator:
             is_wedged=is_wedged,
             pool_ready=self.is_inference_pool_ready(),
             made_progress=made_progress,
+            head_recovery_in_flight=head_recovery_in_flight,
         )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:
@@ -582,6 +617,7 @@ class WorkerRecoveryCoordinator:
             self.episode_post_processing_progress_baseline = None
             self.episode_saw_unrecoverable_pool = False
             self.pp_reclaim_remedy_issued_at = None
+            self.head_recovery_in_flight_since = None
         if action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()
             # Re-anchor the progress baseline to the reset: the episode may close only when work moves forward
@@ -742,20 +778,36 @@ class WorkerRecoveryCoordinator:
         structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
         if self._inference_scheduler.ram_reclaim_cycle_grace_active():
             structural_queue_wedge = False
+        in_progress = self._job_tracker.jobs_in_progress
         if not self.is_inference_capacity_available() or structural_queue_wedge:
             for job in list(self._job_tracker.jobs_pending_inference):
-                if job not in self._job_tracker.jobs_in_progress:
-                    self._job_tracker.handle_job_fault_now(job, retryable=False)
-                    # Release any disaggregation state so a give-up never strands a held pin/ledger entry.
-                    if job.id_ is not None:
-                        self._release_disaggregated_job(job.id_)
-                    faulted += 1
+                if job in in_progress:
+                    continue
+                # A retry a same-cycle pool rebuild just granted is left queued for a dispatch opportunity: a
+                # non-terminal give-up must not fault the very retry recovery granted before the rebuilt pool
+                # has had a chance to run it. The terminal give-up (the wedge outlived the continuation cycle)
+                # faults it regardless, so this defers the drop by at most one cycle, it does not prevent it.
+                if not terminal and job.id_ is not None and self._job_tracker.retry_granted_by_recovery(job.id_):
+                    continue
+                self._job_tracker.handle_job_fault_now(
+                    job,
+                    retryable=False,
+                    fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY,
+                )
+                # Release any disaggregation state so a give-up never strands a held pin/ledger entry.
+                if job.id_ is not None:
+                    self._release_disaggregated_job(job.id_)
+                faulted += 1
         if not self.is_safety_capacity_available():
             stuck_safety = list(self._job_tracker.jobs_pending_safety_check) + list(
                 self._job_tracker.jobs_being_safety_checked,
             )
             for job_info in stuck_safety:
-                self._job_tracker.handle_job_fault_now(job_info.sdk_api_job_info, retryable=False)
+                self._job_tracker.handle_job_fault_now(
+                    job_info.sdk_api_job_info,
+                    retryable=False,
+                    fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY,
+                )
                 if job_info.sdk_api_job_info.id_ is not None:
                     self._release_disaggregated_job(job_info.sdk_api_job_info.id_)
                 faulted += 1

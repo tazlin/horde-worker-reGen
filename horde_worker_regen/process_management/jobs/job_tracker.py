@@ -218,6 +218,22 @@ _QUEUED_STAGES: tuple[JobStage, ...] = (
 """Stages counted by ``num_jobs_total`` (everything except ``DETACHED``)."""
 
 
+class JobFaultOrigin(enum.StrEnum):
+    """What kind of action terminally faulted a job.
+
+    A terminal fault reported by the worker's generation flow (an inference failure exhausting its retries,
+    an un-submittable result) is a verdict on the work itself and feeds the consecutive-failure pop pause. A
+    fault issued by scheduling recovery (the save-our-ship give-up faulting a wedged backlog so the horde
+    reissues it) is a recovery action, not a generation outcome: it carries its own escalation ladder, so the
+    submit path must not also let it manufacture the consecutive-failure pause on top of that recovery.
+    """
+
+    GENERATION = enum.auto()
+    """The default: a fault arising from generating, post-processing, safety-checking, or submitting the job."""
+    SCHEDULING_RECOVERY = enum.auto()
+    """A fault issued by a scheduling-recovery action (save-our-ship give-up), excluded from the failure pause."""
+
+
 @dataclass
 class TrackedJob:
     """A single job known to the worker, with its current lifecycle stage."""
@@ -322,6 +338,19 @@ class TrackedJob:
     Built at registration from the job's requested stages (generate, optional post-processing, safety,
     submit) and advanced in lockstep with :class:`JobStage` transitions, so any observer can read which
     stage of the routing plan the job is in without re-deriving it from queue membership."""
+    retry_granted_by_recovery: bool = False
+    """Set when a pool-rebuild requeued this job to ``PENDING_INFERENCE`` as part of a save-our-ship soft reset.
+
+    A rebuild grants the in-flight job another attempt, but a blanket give-up firing before the rebuilt pool
+    has had a chance to dispatch it would terminally fault the very retry the rebuild just granted. While this
+    is set the non-terminal give-up leaves the job queued so it gets a dispatch opportunity first; a dispatch
+    (``mark_inference_started``) clears it, and a terminal give-up faults it regardless (the wedge outlived the
+    continuation cycle)."""
+    fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION
+    """Which kind of action terminally faulted this job; see :class:`JobFaultOrigin`.
+
+    Read by the submit path to decide whether the fault counts toward the consecutive-failure pop pause: a
+    scheduling-recovery give-up is excluded, a generation/submit fault is not."""
 
 
 @dataclass(frozen=True)
@@ -702,6 +731,16 @@ class JobTracker:
         tracked = self._tracked_by_id(job_id)
         return tracked.stage if tracked is not None else None
 
+    def retry_granted_by_recovery(self, job_id: GenerationID) -> bool:
+        """Return whether a save-our-ship pool rebuild granted this job a retry it has not yet been able to run."""
+        tracked = self._tracked_by_id(job_id)
+        return tracked is not None and tracked.retry_granted_by_recovery
+
+    def was_faulted_by_scheduling_recovery(self, job_id: GenerationID) -> bool:
+        """Return whether this job's terminal fault was issued by a scheduling-recovery action (give-up)."""
+        tracked = self._tracked_by_id(job_id)
+        return tracked is not None and tracked.fault_origin is JobFaultOrigin.SCHEDULING_RECOVERY
+
     def tracked_jobs(self) -> tuple[TrackedJob, ...]:
         """Return active tracked jobs in lifecycle order for read-only observers."""
         return tuple(sorted(self._jobs.values(), key=lambda tracked: (tracked.stage_sequence, tracked.pop_order)))
@@ -1056,6 +1095,9 @@ class JobTracker:
         if tracked.stage != JobStage.INFERENCE_IN_PROGRESS:
             self._total_num_inference_starts += 1
         tracked.last_dispatched_device_index = device_index
+        # The job took its dispatch opportunity, so a recovery-granted retry is no longer awaiting one: a
+        # later give-up may treat it as an ordinary job.
+        tracked.retry_granted_by_recovery = False
         self._set_stage(tracked, JobStage.INFERENCE_IN_PROGRESS)
 
     async def release_in_progress(self, job: ImageGenerateJobPopResponse) -> bool:
@@ -1611,6 +1653,8 @@ class JobTracker:
         retryable: bool = True,
         scheduling_fault: bool = False,
         fault_reason: str | None = None,
+        recovery_requeue: bool = False,
+        fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
     ) -> InferenceFailureResolution:
         """Resolve a faulted job: requeue it for another (possibly degraded) attempt, or fault it.
 
@@ -1619,6 +1663,8 @@ class JobTracker:
         safety failure or a shutdown drain, where re-running inference cannot help). ``scheduling_fault``
         marks an ownership/scheduling failure (e.g. an orphan punt) that must not feed the per-card
         "locally unservable" streak, since it is not a verdict on whether the model fits the card.
+        ``recovery_requeue`` marks a requeue granted by a save-our-ship pool rebuild, protecting the retry
+        from a same-cycle give-up; ``fault_origin`` records what kind of action a *terminal* fault was.
         """
         return self._resolve_inference_failure_impl(
             faulted_job,
@@ -1628,6 +1674,8 @@ class JobTracker:
             retryable=retryable,
             scheduling_fault=scheduling_fault,
             fault_reason=fault_reason,
+            recovery_requeue=recovery_requeue,
+            fault_origin=fault_origin,
         )
 
     def handle_job_fault_now(
@@ -1640,6 +1688,8 @@ class JobTracker:
         retryable: bool = True,
         scheduling_fault: bool = False,
         fault_reason: str | None = None,
+        recovery_requeue: bool = False,
+        fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
     ) -> InferenceFailureResolution:
         """Synchronous fault path for sync callers (e.g. process crash handling). See :meth:`handle_job_fault`."""
         return self._resolve_inference_failure_impl(
@@ -1650,6 +1700,8 @@ class JobTracker:
             retryable=retryable,
             scheduling_fault=scheduling_fault,
             fault_reason=fault_reason,
+            recovery_requeue=recovery_requeue,
+            fault_origin=fault_origin,
         )
 
     def _resolve_inference_failure_impl(
@@ -1662,6 +1714,8 @@ class JobTracker:
         retryable: bool,
         scheduling_fault: bool = False,
         fault_reason: str | None = None,
+        recovery_requeue: bool = False,
+        fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
     ) -> InferenceFailureResolution:
         tracked = self._tracked_for(faulted_job)
 
@@ -1699,6 +1753,10 @@ class JobTracker:
             tracked.stage is JobStage.PENDING_INFERENCE or self._set_stage(tracked, JobStage.PENDING_INFERENCE)
         )
         if requeued:
+            if recovery_requeue:
+                # A pool rebuild granted this attempt; the same recovery cycle's give-up must not fault it
+                # before the rebuilt pool has had a dispatch opportunity (cleared at mark_inference_started).
+                tracked.retry_granted_by_recovery = True
             degraded = resource_failure and not tracked.degraded_retry_used
             if degraded:
                 tracked.degraded_retry_used = True
@@ -1712,6 +1770,7 @@ class JobTracker:
             return InferenceFailureResolution.RETRY_DEGRADED if degraded else InferenceFailureResolution.RETRY
 
         # Terminal fault: out of attempts, not retryable, or the requeue transition was refused.
+        tracked.fault_origin = fault_origin
         tracked.job_info.fault_job()
         tracked.job_info.time_to_generate = process_timeout
         self._record_fault_diagnostics(tracked, is_resource_failure=resource_failure, fault_reason=fault_reason)

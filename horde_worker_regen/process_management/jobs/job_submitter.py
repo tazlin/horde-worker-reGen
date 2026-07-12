@@ -420,7 +420,13 @@ class JobSubmitter:
             logger.error(
                 f"Job {job_info.ids} faulted, removing from completed jobs after submitting the faults to the horde",
             )
-            self._state.consecutive_failed_jobs += 1
+            # A fault issued by scheduling recovery (a save-our-ship give-up reissuing a wedged backlog) is a
+            # recovery action, not a generation outcome: it has its own escalation ladder, so it is excluded
+            # from the consecutive-failure pop pause. Counting a give-up batch here would manufacture the pause
+            # on top of the recovery, compounding one outage into a longer one. Genuine generation/submit
+            # failures are unaffected and still latch the pause exactly as before.
+            if job_info.id_ is None or not self._job_tracker.was_faulted_by_scheduling_recovery(job_info.id_):
+                self._state.consecutive_failed_jobs += 1
 
         if completed_job_info.job_image_results is not None:
             if len(completed_job_info.job_image_results) != completed_job_info.sdk_api_job_info.payload.n_iter:

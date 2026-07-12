@@ -284,6 +284,26 @@ The escalation, in order:
    second give-up is then flagged terminal and abandons ship deliberately rather
    than faulting jobs on every tick forever.
 
+   Readiness gates on a lane *accepting*, but an accepting lane can still be
+   mid-preload of the head-of-queue job's model: it reads ready while the very job
+   the pool is loading is still queued. Faulting there drops a job the card is
+   actively materialising. So the ready-wedged clock also **defers to head-model
+   materialisation**: while the scheduler reports the head-of-queue model in its
+   loading state (`head_model_materializing()`, driven from the model map's loading
+   entry) over an otherwise idle pool, the give-up anchor is held. The deferral is
+   **bounded by the preload budget** (`preload_timeout`): a load that never lands (a
+   stuck preload) stops deferring once the budget elapses, so the wedge still
+   escalates. A ready lane whose head model is loading is capacity in flight, not a
+   wedge over a healthy pool.
+
+   A soft-reset rebuild requeues each live slot's in-flight job (`inference attempt
+   N/max, requeuing`), granting it another attempt. So the same cycle's give-up must
+   not immediately fault the very retries the rebuild just granted: a **recovery-
+   granted retry is spared by the non-terminal give-up** until the rebuilt pool has
+   had a dispatch opportunity (the grant is marked on the job at requeue and cleared
+   when it is dispatched). The terminal give-up faults it regardless, so this defers
+   the drop by at most one continuation cycle rather than preventing it.
+
    A queue-deadlock give-up over available capacity first checks for a **reachable
    lane-reclaim remedy**: a head that does not fit only because the idle
    post-processing lane's resident module weights hold its room is servable the

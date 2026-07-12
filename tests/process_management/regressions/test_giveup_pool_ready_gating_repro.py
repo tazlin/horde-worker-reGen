@@ -25,7 +25,7 @@ import time
 import pytest
 
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEvent, LedgerEventType
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import (
@@ -371,3 +371,234 @@ class TestZeroProgressSoftResetDoesNotReLogAsFirst:
             if pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1:
                 break
         assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1
+
+
+def _set_head_model_loading(pm: HordeWorkerProcessManager, *, model: str = "resident") -> None:
+    """Put the head-of-queue job's model into the map's LOADING state (a preload in flight over an idle lane)."""
+    pm._inference_scheduler._horde_model_map.update_entry(
+        model,
+        load_state=ModelLoadState.LOADING,
+        process_id=0,
+    )
+
+
+class TestHeadModelMaterialisingDefersGiveUp:
+    """A ready lane whose head-of-queue model is still loading is capacity in flight, not a wedge to fault.
+
+    The boot-window test above holds give-up off while the *pool* is booting (no lane accepting). This covers
+    the incident's second window: the rebuilt pool is accepting again, but the scheduler is mid-preload of the
+    head's model. Give-up must defer to that load (bounded by the preload budget) instead of faulting the very
+    job the pool is loading.
+    """
+
+    async def test_loading_head_over_ready_pool_is_not_faulted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pool accepting + head model LOADING: give-up is held off; the head is never faulted."""
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        _install_supervisor(pm, clock)
+        # The head-materialisation deferral is bounded on the coordinator's clock; drive it off the same fake
+        # clock so the whole test window stays well inside the (default, large) preload budget.
+        pm._recovery_coordinator._clock = clock
+        await _latch_structural_queue_wedge(pm)
+        _set_head_model_loading(pm)
+        proc = pm._process_map[0]
+
+        # A soft reset rebuilds the pool; the replacement lane comes back accepting (ready) while the head's
+        # model is still loading. The rebuild does not disturb the model-map LOADING state.
+        monkeypatch.setattr(
+            pm._process_lifecycle,
+            "rebuild_inference_pool",
+            lambda *, reason: setattr(proc, "last_process_state", HordeProcessState.WAITING_FOR_JOB),
+        )
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+        give_up_calls: list[dict[str, object]] = []
+        real_give_up = pm._recovery_coordinator.give_up_on_wedged_jobs
+
+        def _spy_give_up(**kwargs: object) -> None:
+            give_up_calls.append(kwargs)
+            real_give_up(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(pm._recovery_coordinator, "give_up_on_wedged_jobs", _spy_give_up)
+
+        assert pm._recovery_coordinator.assess_wedge() is True
+        assert pm._inference_scheduler.head_model_materializing() is True  # precondition for the deferral
+
+        # Tick well past the pool-ready grace with the head's model loading the entire time.
+        for _ in range(12):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+
+        assert give_up_calls == []  # the loading head deferred give-up for the whole window
+        assert _abandoned_records(pm) == []
+        assert len(list(pm._job_tracker.jobs_pending_inference)) == 1  # the head was never faulted
+
+        # The load completes and the queue clears (the head would dispatch); the worker resumes cleanly.
+        pm._inference_scheduler._horde_model_map.expire_entry("resident")
+        pm._message_dispatcher._in_queue_deadlock = False
+        for _ in range(4):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+
+        assert give_up_calls == []
+        assert _abandoned_records(pm) == []
+        assert len(list(pm._job_tracker.jobs_pending_inference)) == 1
+
+    async def test_stuck_head_load_still_escalates_after_the_preload_budget(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A head load that never completes only defers give-up for the preload budget, then escalates."""
+        preload_budget = 8
+        pm = make_testable_process_manager()
+        # The gpu-config resolution re-clamps a construction-time preload_timeout, so set the deferral budget
+        # directly on the live bridge data the coordinator reads.
+        pm.bridge_data.preload_timeout = preload_budget
+        clock = _FakeClock()
+        _install_supervisor(pm, clock)
+        pm._recovery_coordinator._clock = clock
+        await _latch_structural_queue_wedge(pm)
+        _set_head_model_loading(pm)
+        proc = pm._process_map[0]
+
+        monkeypatch.setattr(pm, "_abort", lambda: None)
+        monkeypatch.setattr(
+            pm._process_lifecycle,
+            "rebuild_inference_pool",
+            lambda *, reason: setattr(proc, "last_process_state", HordeProcessState.WAITING_FOR_JOB),
+        )
+        monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+        # The head's model stays LOADING and the wedge persists for the whole run: the deferral must be
+        # bounded by the preload budget rather than parking give-up forever.
+        first_give_up_at: float | None = None
+        for _ in range(40):
+            clock.advance(1)
+            pm._recovery_coordinator.run_recovery_supervisor()
+            if _abandoned_records(pm):
+                first_give_up_at = clock.now
+                break
+
+        assert first_give_up_at is not None, "give-up never fired: the head-load deferral was unbounded"
+        # It fired only after the preload budget elapsed, never inside it (that window belongs to the load).
+        assert first_give_up_at > preload_budget
+
+
+async def test_recovery_granted_retry_survives_first_give_up_then_faults_when_wedge_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry a pool rebuild granted gets a dispatch opportunity: the first give-up spares it, the terminal does not.
+
+    The rebuild requeues an in-flight job (``recovery_requeue``), granting it another attempt. A non-terminal
+    give-up in the same cycle must not terminally fault that retry before the rebuilt pool has had a chance to
+    run it; the terminal give-up (the wedge outlived the continuation cycle) faults it regardless.
+    """
+    pm = make_testable_process_manager()
+    clock = _FakeClock()
+    _install_supervisor(pm, clock)
+    await _latch_structural_queue_wedge(pm)
+    pm._job_tracker.set_retry_policy(2)
+
+    # Emulate the rebuild granting this in-flight job a retry: it is requeued to PENDING_INFERENCE and marked
+    # as a recovery-granted retry (exactly what _replace_inference_process does during a soft-reset rebuild).
+    head = pm._job_tracker.jobs_pending_inference[0]
+    assert head.id_ is not None
+    pm._job_tracker.handle_job_fault_now(head, retryable=True, recovery_requeue=True)
+    assert pm._job_tracker.retry_granted_by_recovery(head.id_) is True
+
+    aborted = {"called": False}
+    monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+
+    proc = pm._process_map[0]
+    monkeypatch.setattr(
+        pm._process_lifecycle,
+        "rebuild_inference_pool",
+        lambda *, reason: setattr(proc, "last_process_state", HordeProcessState.WAITING_FOR_JOB),
+    )
+    monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+    give_up_calls: list[dict[str, object]] = []
+    real_give_up = pm._recovery_coordinator.give_up_on_wedged_jobs
+
+    def _spy_give_up(**kwargs: object) -> None:
+        pending_before = len(list(pm._job_tracker.jobs_pending_inference))
+        real_give_up(**kwargs)  # type: ignore[arg-type]
+        give_up_calls.append(
+            {
+                "terminal": kwargs.get("terminal"),
+                "pending_before": pending_before,
+                "pending_after": len(list(pm._job_tracker.jobs_pending_inference)),
+            },
+        )
+
+    monkeypatch.setattr(pm._recovery_coordinator, "give_up_on_wedged_jobs", _spy_give_up)
+
+    for _ in range(60):
+        clock.advance(1)
+        pm._recovery_coordinator.run_recovery_supervisor()
+        if aborted["called"]:
+            break
+
+    assert give_up_calls, "give-up never fired"
+    # The first give-up was non-terminal and left the recovery-granted retry queued for a dispatch opportunity.
+    assert give_up_calls[0]["terminal"] is False
+    assert give_up_calls[0]["pending_after"] == 1
+    # A later terminal give-up (the wedge outlived the continuation cycle) faults it regardless.
+    terminal_calls = [call for call in give_up_calls if call["terminal"] is True]
+    assert terminal_calls, "the persisting wedge never reached a terminal give-up"
+    assert terminal_calls[-1]["pending_after"] == 0
+    assert aborted["called"] is True
+
+
+async def _fault_pending_as_generation_failure(pm: HordeWorkerProcessManager) -> None:
+    """Terminally fault every pending-inference job as an ordinary generation failure (default origin)."""
+    for job in list(pm._job_tracker.jobs_pending_inference):
+        pm._job_tracker.handle_job_fault_now(job, retryable=False)
+
+
+async def _drain_faulted_submits(pm: HordeWorkerProcessManager, count: int) -> None:
+    """Run the submit accounting over ``count`` queued faulted jobs with the network stubbed out."""
+    pm._job_submitter._dry_run_skip_api = True
+    for _ in range(count):
+        await pm._job_submitter.api_submit_job()
+
+
+async def test_give_up_batch_does_not_manufacture_consecutive_failure_pause() -> None:
+    """A give-up batch faulting several jobs is a recovery action, so it must not latch the pop pause."""
+    pm = make_testable_process_manager()
+    pm._process_map[0] = make_mock_process_info(0, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
+    for _ in range(3):
+        await track_popped_job_async(pm._job_tracker, make_job_pop_response(model="resident"))
+
+    # A structural queue wedge over a live pool is the give-up's fault trigger; the jobs are servable-looking
+    # but reissued so the horde re-dispatches them. None was a generation failure.
+    pm._message_dispatcher._in_queue_deadlock = True
+    pm._message_dispatcher._queue_deadlock_model = "resident"
+    pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - 60
+
+    pm._recovery_coordinator.give_up_on_wedged_jobs(terminal=False)
+    assert len(list(pm._job_tracker.jobs_pending_submit)) == 3  # all three faulted and queued to submit
+
+    await _drain_faulted_submits(pm, 3)
+
+    assert pm._state.consecutive_failed_jobs == 0  # the recovery batch did not feed the failure counter
+    latched = pm._job_popper._handle_consecutive_failures(pm.bridge_data, time.time())
+    assert latched is False
+    assert pm._state.too_many_consecutive_failed_jobs is False
+
+
+async def test_genuine_generation_failures_still_latch_the_consecutive_failure_pause() -> None:
+    """The counterpart: three real generation failures still count and latch the pop pause, exactly as before."""
+    pm = make_testable_process_manager()
+    for _ in range(3):
+        await track_popped_job_async(pm._job_tracker, make_job_pop_response(model="resident"))
+
+    await _fault_pending_as_generation_failure(pm)
+    assert len(list(pm._job_tracker.jobs_pending_submit)) == 3
+
+    await _drain_faulted_submits(pm, 3)
+
+    assert pm._state.consecutive_failed_jobs == 3  # real failures still count
+    latched = pm._job_popper._handle_consecutive_failures(pm.bridge_data, time.time())
+    assert latched is True
+    assert pm._state.too_many_consecutive_failed_jobs is True

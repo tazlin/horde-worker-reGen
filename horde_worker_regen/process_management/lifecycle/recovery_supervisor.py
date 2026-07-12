@@ -209,7 +209,14 @@ class RecoverySupervisor:
         self._give_up_cycles = max(0, self._give_up_cycles - 1)
         self._give_up_is_terminal = False
 
-    def evaluate(self, *, is_wedged: bool, pool_ready: bool, made_progress: bool = False) -> RecoveryAction:
+    def evaluate(
+        self,
+        *,
+        is_wedged: bool,
+        pool_ready: bool,
+        made_progress: bool = False,
+        head_recovery_in_flight: bool = False,
+    ) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 
         Args:
@@ -224,6 +231,11 @@ class RecoverySupervisor:
                 rebuild's transient not-wedged window can satisfy the streak without any work moving. Ignored
                 before the first soft reset (a self-healing wedge that never needed a reset closes on the streak
                 alone). Defaults to False so an un-wired caller escalates rather than silently resetting.
+            head_recovery_in_flight: Whether the pool is actively materialising the head-of-queue job's model
+                (a preload/load underway over an otherwise idle lane). A ready lane whose head model is still
+                loading is capacity in flight, not a wedge over a healthy pool, so the ready-wedged give-up
+                anchor is held while this is True: give-up must not fault a job the pool is loading. The caller
+                bounds this by the preload budget, so a load that never lands still anchors and escalates.
         """
         now = self._clock()
         self._give_up_is_terminal = False
@@ -266,7 +278,11 @@ class RecoverySupervisor:
         )
         effective_ready = pool_ready or boot_allowance_elapsed
 
-        if is_wedged and effective_ready:
+        # A ready lane whose head-of-queue model is still materialising is capacity in flight, not a wedge
+        # over a healthy pool: hold the ready-wedged anchor so give-up cannot fault a job the pool is loading.
+        # The caller bounds ``head_recovery_in_flight`` by the preload budget, so a load that never lands
+        # stops deferring and the anchor sets, letting the wedge escalate exactly as before.
+        if is_wedged and effective_ready and not head_recovery_in_flight:
             if self._ready_wedged_since is None:
                 self._ready_wedged_since = now
         else:

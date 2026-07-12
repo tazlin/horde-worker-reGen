@@ -2600,6 +2600,27 @@ class InferenceScheduler:
             return 0.0
         return time.time() - self._head_starvation_since
 
+    def head_model_materializing(self) -> bool:
+        """Return whether the head-of-queue inference job's model is actively loading onto an idle pool.
+
+        True when nothing is in progress and the first not-yet-running queued job's model is in the model
+        map's LOADING state (a preload is underway), or a missing-model recovery has just kicked a fresh
+        preload for the head (the brief window between expiring the stale entry and the new LOADING state).
+        A ready lane whose head model is still materialising is capacity in flight, not a wedge over a
+        healthy pool: the recovery coordinator reads this to hold save-our-ship give-up off (bounded by the
+        preload budget) so it does not fault a job the pool is in the middle of loading. Read-only.
+        """
+        pending = self._job_tracker.jobs_pending_inference
+        if not pending:
+            return False
+        if self._process_map.has_inference_in_progress():
+            return False
+        in_progress = set(self._job_tracker.jobs_in_progress)
+        head = next((job for job in pending if job not in in_progress), None)
+        if head is None or head.model is None:
+            return False
+        return self._horde_model_map.is_model_loading(head.model) or self._model_recently_missing
+
     def _clear_head_starvation_timer(self) -> None:
         """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
         self._head_starvation_job_id = None
