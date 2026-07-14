@@ -1,4 +1,4 @@
-"""RED reproduction: a latched queue-deadlock flag triggers a save-our-ship soft reset on a healthy worker.
+"""Reproduces an issue where a latched queue-deadlock flag could trigger a SOS soft reset on a healthy worker.
 
 Observed in a live session on a contended 16GB ``max_threads=1`` worker. The sequence:
 
@@ -19,11 +19,6 @@ queue-deadlock flag could not clear while an unrelated sibling was slow to start
 queue is stuck" meaning is false the instant a job is in progress on a live slot; a starting sibling
 must not keep it latched, and the worker-level wedge assessment must not fire while real inference is
 advancing.
-
-These tests assert the corrected behavior and are expected to FAIL (RED) against the current code.
-``test_sustained_all_idle_queue_deadlock_is_still_a_wedge`` is the guard (expected GREEN): a genuine
-sustained queue deadlock with every slot idle must still escalate, so the fix does not blind the
-recovery supervisor to a real wedge.
 """
 
 from __future__ import annotations
@@ -68,7 +63,7 @@ async def test_queue_deadlock_clears_when_job_in_progress_despite_starting_sibli
 
     pm.detect_deadlock()
 
-    # RED: the queue is no longer deadlocked (a job is in progress on a live slot), so the flag must clear
+    # The queue is no longer deadlocked (a job is in progress on a live slot), so the flag must clear
     # rather than stay latched by the starting sibling.
     assert pm._message_dispatcher.get_deadlock_snapshot().in_queue_deadlock is False
 
@@ -98,12 +93,12 @@ async def test_worker_with_job_in_progress_is_not_assessed_as_wedged() -> None:
     pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - _STRUCTURAL_WEDGE_AGE
     pm.detect_deadlock()
 
-    # RED: a job is in progress on a live, healthy slot, so the worker is not wedged.
+    # A job is in progress on a live, healthy slot, so the worker is not wedged.
     assert pm._recovery_coordinator.assess_wedge() is False
 
 
 async def test_sustained_all_idle_queue_deadlock_is_still_a_wedge() -> None:
-    """Guard (expected GREEN): a real sustained all-idle queue deadlock must still escalate to a wedge.
+    """Guard: a real sustained all-idle queue deadlock must still escalate to a wedge.
 
     Nothing is in progress, every slot is idle, and the head's model cannot be placed; the flag has been
     set well past the structural-wedge window. This is the genuine wedge the recovery supervisor exists

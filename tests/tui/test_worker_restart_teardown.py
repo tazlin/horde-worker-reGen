@@ -151,9 +151,7 @@ class _FakeCtx:
 def _install_tree_kill_spy(monkeypatch: pytest.MonkeyPatch, ctx: _FakeCtx) -> list[int]:
     """Patch ``worker_launcher.kill_process_tree`` with a spy that reaps a fake process's grandchildren.
 
-    Returns the list that records the pids the supervisor asked to tree-kill. The patch tolerates the
-    symbol being absent today (the RED state): the spy simply never fires, so the recorded pids stay empty
-    and the orphan assertions fail until the production code routes its force-kill through this helper.
+    Returns the list that records the pids the supervisor asked to tree-kill.
     """
     killed_pids: list[int] = []
 

@@ -488,7 +488,7 @@ class TestPrestagedHeadWaitsForSoleResidency:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """RED on a naive fix: with idle siblings still up, the pre-staged head must defer, not sample."""
+        """With idle siblings still up, the pre-staged head must defer, not sample."""
         _seed_flux_weight_estimates(monkeypatch)
 
         # Three sibling contexts still on the card and free not yet recovered: residency not converged.

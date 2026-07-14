@@ -1,4 +1,4 @@
-"""RED reproduction of a non-beneficial whole-card residency and associated wedge.
+"""Reproduction of a non-beneficial whole-card residency and associated wedge.
 
 The live incident had two idle inference processes on a 16 GB card.  An SDXL head was initially deferred
 while post-processing and a queued sibling preload held VRAM.  After the short starvation grace the arbiter

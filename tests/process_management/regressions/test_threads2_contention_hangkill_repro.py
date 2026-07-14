@@ -34,8 +34,6 @@ features; the fix is to feed that expectation into the grader (grade sampling ag
 sampling has started) and into the kill timeout (scale the per-step grace with the job's expected work and
 any measured contention, bounded so a genuine wedge is still reaped).
 
-These scenarios are RED against the current scheduler. Guards assert the fix stays bounded and leaves
-light / cold-start / idle / uncalibrated cases untouched.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""RED reproduction: a PP drain head can deadlock behind idle disaggregation-lane contexts.
+"""Reproduces a PP drain head deadlocking behind idle disaggregation-lane contexts.
 
 The dedicated post-processing lane is admitted against truthful device-free VRAM.  On the 16 GB live shape
 that motivated this regression, a two-operation upscale/face-fix chain asks for 6,429 MB while the arbiter sees
@@ -20,8 +20,6 @@ These tests specify the cooperative boundary before production code changes:
 * an active sampler is never disturbed to make PP fit; and
 * disabling safety-off-GPU remains authoritative -- PP liveness cannot bypass that operator policy.
 
-The primary test is intentionally RED on the unfixed code: the PP job remains pending and neither service lane
-is paused, reproducing the exact precondition that later trips the SOS reset.
 """
 
 from __future__ import annotations

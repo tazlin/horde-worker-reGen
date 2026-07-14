@@ -1,4 +1,4 @@
-"""RED repro: concurrent inference dispatch ignores in-flight progress and model size.
+"""Reproduces an issue where concurrent inference dispatch could ignore in-flight progress and model size.
 
 The concurrency cap (``max_threads``) is a pure count: as soon as fewer than ``max_threads`` jobs
 are in progress and a process holding the next job's model can accept work, the scheduler dispatches
@@ -13,10 +13,6 @@ that job, no matter what the already-running job(s) are doing. Two consequences 
   jobs (or anything extra-large, or a batched job) need the running job to be well underway, or the
   whole card, before another sampler joins.
 
-These tests assert the *desired* policy: overlap is gated on the running job's progress, scaled by the
-baseline/size of both the running and the candidate job. They fail against the current count-only cap
-(the second job is admitted immediately) and should pass once a progress-and-size-aware overlap gate
-is in place.
 """
 
 from __future__ import annotations

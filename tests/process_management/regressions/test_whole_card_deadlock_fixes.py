@@ -228,7 +228,7 @@ class TestNonHeadContextReductionBlocked:
         )
 
     async def test_head_context_reduction_still_works(self) -> None:
-        """GREEN control: the head-of-queue CAN still establish residency via context reduction.
+        """Control: the head-of-queue CAN still establish residency via context reduction.
 
         The fix must be scoped: it only blocks non-head jobs, not the head itself.
         This tests directly that ``context_reduction_demanded`` evaluates to True only when
@@ -418,7 +418,7 @@ class TestWholeCardResidencyProtectsFromVramEviction:
         )
 
     def test_non_residency_model_not_protected_under_pressure(self) -> None:
-        """GREEN control: a model NOT holding a residency is still evictable under pressure.
+        """Control: a model NOT holding a residency is still evictable under pressure.
 
         The fix must be scoped: only the residency holder is protected; other models are evictable as before.
         """

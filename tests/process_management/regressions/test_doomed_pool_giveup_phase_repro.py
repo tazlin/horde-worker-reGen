@@ -25,8 +25,7 @@ aborting.
 
 These tests drive the real recovery supervisor, soft-reset, and give-up paths through that slow-restart
 cycle (the pool's respawn/crash is emulated by toggling the quarantine set, since no real children run
-in unit tests) and assert the worker eventually aborts. It does not, so they are RED until the abort
-no longer depends on the pool being quarantined at the exact give-up tick.
+in unit tests) and assert the worker eventually aborts.
 """
 
 from __future__ import annotations

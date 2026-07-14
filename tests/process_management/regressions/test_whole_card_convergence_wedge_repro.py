@@ -27,11 +27,10 @@ drains. Busy processes are still never torn down.
 
 These tests pin that fixed behaviour: the whole-card-aware shrink reaches the budget target even when the
 excess siblings hold queued models, while the *default* (benchmark / pressure) shrink still protects them (so
-the narrowing did not leak). The GREEN controls pin the cases that always worked (a model-free or
-non-queued-model sibling is stoppable, a busy sibling is never the victim), so a regression cannot pass.
-``TestWedgeDispatchDiagnostic``
-guards the worker half of the logging<->detector seam (the stall is still attributed precisely if a future
-change reintroduces an un-torn-down queued-model sibling).
+the narrowing did not leak). The controls pin the cases that always worked (a model-free or non-queued-model
+sibling is stoppable, a busy sibling is never the victim), so a regression cannot pass.
+``TestWedgeDispatchDiagnostic`` guards the worker half of the logging<->detector seam (the stall is still
+attributed precisely if a future change reintroduces an un-torn-down queued-model sibling).
 """
 
 from __future__ import annotations
@@ -236,7 +235,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
         )
 
     async def test_model_free_idle_sibling_is_stoppable(self) -> None:
-        """GREEN control: a model-free idle sibling is not protected, so convergence reaches the target."""
+        """Control: a model-free idle sibling is not protected, so convergence reaches the target."""
         flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
         bare_idle = make_mock_process_info(3, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         for proc in (flux_holder, bare_idle):
@@ -263,7 +262,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
         assert remaining == 1, "a model-free idle sibling must be stoppable so the head reaches sole residency"
 
     async def test_idle_sibling_with_non_queued_model_is_stoppable(self) -> None:
-        """GREEN control: an idle sibling whose model is NOT queued is stoppable (the guard does not protect it).
+        """Control: an idle sibling whose model is NOT queued is stoppable (the guard does not protect it).
 
         Same geometry as the wedge but the resident sibling model (``AlbedoBase XL``) is absent from the queue,
         so the protection that wedges the real case does not engage and convergence reaches the target.
@@ -353,7 +352,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
         assert remaining == 1
 
     async def test_busy_sibling_is_never_the_victim(self) -> None:
-        """GREEN guard: convergence must never stop a *busy* process even when it would help reach target.
+        """Guard: convergence must never stop a *busy* process even when it would help reach target.
 
         Not a wedge to fix; a sanity check that the fix for the queued-model case must keep: a process
         mid-inference is never a teardown victim, so a reduction request that can only be satisfied by killing
@@ -512,7 +511,7 @@ class TestConvergenceLoopWedge:
         assert scheduler._whole_card_teardown_exhausted(forecast) is True
 
     async def test_residency_converges_when_sibling_is_model_free(self) -> None:
-        """GREEN control: model-free idle siblings let the convergence loop reach the target and ready the head.
+        """Control: model-free idle siblings let the convergence loop reach the target and ready the head.
 
         The same end-to-end path with nothing protecting the excess siblings, proving the wiring is sound: the
         loop stops one to reach the budget target and the head clears its dispatch gate.

@@ -1,4 +1,4 @@
-"""RED reproduction: the per-file validation cache survives a taint + re-download.
+"""The per-file validation cache survives a taint + re-download.
 
 ``HordeDownloadProcess._feature_model_present`` caches a validated feature file for the session
 (``_validated_feature_files``) so the event-driven presence refresh never re-hashes a known-good file. But
@@ -11,8 +11,6 @@ after a re-download the cache must be evicted for those keys. It currently is no
 * The annotator verify's recovery window cannot withhold ControlNet on the presence path as its own comments
   intend, because the refresh reads the stale "valid" verdict throughout.
 
-These tests assert the post-fix behaviour (the cache is invalidated by a re-download), so they fail RED
-against the current code.
 """
 
 from __future__ import annotations

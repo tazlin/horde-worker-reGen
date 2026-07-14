@@ -1,4 +1,4 @@
-"""RED reproduction: a deliberate RAM-reclaim process cycle is misread as a structural queue wedge.
+"""Reproduces a deliberate RAM-reclaim process cycle being misread as a structural queue wedge.
 
 Scenario: a sole-process worker (max_threads=1) finishes a heavy head and the allocator retains its
 pages even after an explicit RAM unload. The failure path:
@@ -25,11 +25,8 @@ residency establish/restore (``whole_card_residency_grace_active``) and the heav
 save-our-ship wedge assessment; the RAM-reclaim cycle, an equally deliberate, equally bounded hold,
 does not, so its window is the one that trips the supervisor.
 
-These tests assert the corrected behavior and are expected to FAIL (RED) against current code: while a
-RAM-reclaim cycle is in its bounded grace window, ``_assess_wedge`` must not report a structural wedge,
-and the still-servable backlog must not be faulted. The guard tests (``...still_escalates``) are
-expected GREEN: a genuine sustained wedge with *no* recent reclaim must still escalate, so the grace
-does not blind the supervisor to a real wedge.
+While a RAM-reclaim cycle is in its bounded grace window, ``_assess_wedge`` must not report a structural wedge,
+and the still-servable backlog must not be faulted.
 """
 
 from __future__ import annotations
@@ -122,7 +119,7 @@ class TestRamReclaimCycleIsNotAStructuralWedge:
 
         # Sanity: the pool is not otherwise broken; the only signal is the deliberate reclaim window.
         assert pm._recovery_coordinator.is_inference_pool_unrecoverable() is False
-        # RED: the cycled slot is mid-respawn by the worker's own deliberate reclaim, not a wedge.
+        # The cycled slot is mid-respawn by the worker's own deliberate reclaim, not a wedge.
         assert pm._recovery_coordinator.assess_wedge() is False
 
     async def test_single_head_after_reclaim_is_not_wedged(self) -> None:
@@ -196,7 +193,7 @@ class TestRamReclaimCycleGiveUpKeepsBacklog:
         assert pending_before == 2
         pm._recovery_coordinator.give_up_on_wedged_jobs()
 
-        # RED: the jobs are servable once the cycled slot comes up; the reclaim window must not drop them.
+        # The jobs are servable once the cycled slot comes up; the reclaim window must not drop them.
         assert len(list(pm._job_tracker.jobs_pending_inference)) == pending_before
 
     async def test_give_up_preserves_single_head_after_reclaim(self) -> None:
@@ -216,7 +213,7 @@ class TestRamReclaimCycleGiveUpKeepsBacklog:
 
 
 class TestRamReclaimGraceIsScoped:
-    """Guards (expected GREEN): the reclaim grace must not blind the supervisor to a genuine wedge."""
+    """Guards: the reclaim grace must not blind the supervisor to a genuine wedge."""
 
     async def test_genuine_sustained_wedge_without_reclaim_still_escalates(self) -> None:
         """No reclaim in play: an all-idle slot with an unschedulable head still trips the wedge.

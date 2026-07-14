@@ -130,7 +130,7 @@ class TestWatchdogPuntsIdleShieldedOrphan:
 
         # Backdate the grace clock so a single reconcile pass is past the window. With the bug the entry
         # is pruned before it can be acted on (the job is wrongly "owned"), so the backdate is irrelevant
-        # and the job stays pinned; that divergence is what makes this RED.
+        # and the job stays pinned.
         pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
             pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
         )

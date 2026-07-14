@@ -26,11 +26,6 @@ its whole process tree is force-killed (orphan-proof, like a crash) and it is ro
 restart budget. Keying on loop liveness rather than snapshot freshness is deliberate: a worker legitimately
 busy loading weights keeps ticking its loop, so this never cries wolf on a slow download/preload the way a
 snapshot-age threshold would.
-
-Several of these are RED until that watchdog exists: the positive-detection cases assert a kill/relaunch
-that does not happen today. The false-positive guards assert the watchdog must *not* fire on healthy or
-intentionally-quiet workers; they protect the eventual implementation from the restart-churn that a naive
-snapshot-age trigger previously caused.
 """
 
 from __future__ import annotations

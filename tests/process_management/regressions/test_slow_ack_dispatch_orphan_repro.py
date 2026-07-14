@@ -1,4 +1,4 @@
-"""RED reproduction: the orphan watchdog punts a slot that is slow to acknowledge its dispatch.
+"""The orphan watchdog punts a slot that is slow to acknowledge its dispatch.
 
 Observed in a live session (a 16GB, ``max_threads=1`` worker carrying ~110 models, so its inference
 slots constantly cycle for RAM reclaim and re-spawn under host contention). A light img2img job was
@@ -18,11 +18,6 @@ job. ``start_inference`` stamps the slot with ``last_control_flag == START_INFER
 ``current_inference_started_at`` (dispatch time) and ``last_job_referenced``; a slot so stamped is the
 genuine owner of the dispatched job during the brief window before it acks, and must not be treated as
 an idle slot carrying a stale reference (the lost-result case the watchdog legitimately punts).
-
-These tests assert the corrected behavior and are expected to FAIL (RED) against the current code:
-
-* ``test_freshly_dispatched_slot_owns_its_job_despite_waiting_state``: ownership recognition.
-* ``test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot``: the watchdog backstop.
 
 ``test_idle_slot_with_stale_reference_is_still_punted`` is the guard: it pins the watchdog's legitimate
 behavior (a truly idle slot carrying only a stale reference, no dispatch in flight, is still an orphan)
@@ -68,7 +63,7 @@ async def test_freshly_dispatched_slot_owns_its_job_despite_waiting_state() -> N
     slot.last_job_referenced = job
     assert job.id_ is not None
 
-    # RED: the slot holding the freshly dispatched job is its owner.
+    # The slot holding the freshly dispatched job is its owner.
     assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is True
 
 
@@ -94,14 +89,14 @@ async def test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot(
 
     pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
-    # RED: an owned job is never marked orphaned, so it is not on the grace clock and not punted.
+    # An owned job is never marked orphaned, so it is not on the grace clock and not punted.
     assert job.id_ not in pm._recovery_coordinator.orphan_in_progress_since
     assert pm._job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
     assert pm._recovery_coordinator.orphan_punt_history == []
 
 
 async def test_idle_slot_with_stale_reference_is_still_punted() -> None:
-    """Guard (expected GREEN, before and after the fix): a stale reference with no dispatch is an orphan.
+    """Guard: a stale reference with no dispatch is an orphan.
 
     A genuinely idle slot whose ``last_job_referenced`` is a long-finished job (no START_INFERENCE in
     flight, no fresh dispatch stamp) does not own the job a lost result stranded in progress. The

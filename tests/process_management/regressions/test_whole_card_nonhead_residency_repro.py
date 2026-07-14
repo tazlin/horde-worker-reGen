@@ -229,7 +229,7 @@ class TestHeadFluxStillClaimsCard:
     """The head-gate must not break the case the whole-card residency exists for: a heavy head."""
 
     async def test_flux_as_head_reserves_the_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When Flux is the head, the whole-card residency must still be established (control, stays GREEN)."""
+        """When Flux is the head, the whole-card residency must still be established (control)."""
         _seed_flux_needs_exclusive(monkeypatch)
         resident_sibling = _resident(1, _OTHER_SDXL, HordeProcessState.WAITING_FOR_JOB)
         spare = _resident(2, None, HordeProcessState.WAITING_FOR_JOB)

@@ -1,4 +1,4 @@
-"""RED reproduction: Go live after a benchmark drain does not restore inference capacity.
+"""Reproduces an issue where go live after a benchmark drain did not restore inference capacity.
 
 The new benchmark-over-worker flow frees the GPU *gracefully* instead of stopping the worker: it drains the
 queue, enters the download-only hold, and scales the inference processes to zero (``SET_CONCURRENCY`` with
@@ -11,9 +11,6 @@ which short-circuits the moment that flag is set. Nothing else regrows the pool 
 operation (the only auto-scaling paths shrink under VRAM pressure or restore a whole-card residency they
 themselves established). So after a benchmark drain, Go live resumes job popping while the inference pool sits
 at zero: the worker accepts jobs it has no process to run.
-
-These tests assert the post-fix behaviour (Go live restores inference capacity), so they fail RED against the
-current code.
 """
 
 from __future__ import annotations

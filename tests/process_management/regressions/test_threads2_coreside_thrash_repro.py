@@ -20,10 +20,6 @@ The desired behavior these scenarios assert:
   reduce the live process count (free a context) so two SDXL models co-reside and pipeline, never to
   evict every resident model and reload each job.
 * ``max_threads=1`` (one or two contexts, the optimism harmless) must be unaffected: no spurious teardown.
-
-These are RED against the current scheduler; the fix is to reconcile the forecast's marginal with the
-measured idle floor and route a context over-commit into the existing process-count-reduction machinery
-instead of the exclusive-evict-all admit.
 """
 
 from __future__ import annotations
