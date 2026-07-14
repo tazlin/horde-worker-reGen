@@ -48,12 +48,22 @@ does or does not fit:
 - A card with no device-free reading yet DEFERS with a throttled diagnostic: the primary admission input is
   absent, so the arbiter neither denies nor fabricates a fictional free figure; it waits for the next reading.
 
-There is no overcommit-admit path. A head that never becomes admittable while the device is idle is caught by
-the structural-queue-wedge recovery supervisor (the deadlock detector feeding the worker recovery
-coordinator), which soft-resets the pools and, failing that, faults the wedged jobs non-retryably so the
-horde reissues them elsewhere. Before that, a genuinely-parked head past :data:`_STARVATION_DIAGNOSTIC_SECONDS`
-emits a warning naming the arithmetic and increments :attr:`VramArbiter.starvation_diagnostics`, so the
-inequality is in the log for the post-mortem.
+Admission does not overcommit on arithmetic alone, with one bounded, evidence-seeking exception. A head that
+has starved past :data:`_STARVATION_DIAGNOSTIC_SECONDS` at a converged-empty card (no worker reservations, no
+worker-resident model, nothing left for make-room to reclaim), whose demand is under the achievable ceiling
+(possible on this card in principle) yet misses the instantaneous available reading by no more than
+:data:`_MEASURED_ATTEMPT_BAND_MB`, is admitted for exactly one real load so measured reality decides rather than
+the conservative static prediction: a success teaches the learned peak the true figure, a failure is the
+strongest possible evidence and arms the ceiling hold. The attempt rides the ordinary FITS path, so every
+downstream safety applies unchanged, and it fires at most once per head-starvation episode. A shortfall beyond
+the band, or a card with reclaim still to do, keeps deferring.
+
+Absent that escape hatch, a head that never becomes admittable while the device is idle is caught by the
+structural-queue-wedge recovery supervisor (the deadlock detector feeding the worker recovery coordinator),
+which soft-resets the pools and, failing that, faults the wedged jobs non-retryably so the horde reissues them
+elsewhere. Before that, a genuinely-parked head past :data:`_STARVATION_DIAGNOSTIC_SECONDS` emits a warning
+naming the arithmetic and increments :attr:`VramArbiter.starvation_diagnostics`, so the inequality is in the
+log for the post-mortem.
 """
 
 from __future__ import annotations
@@ -91,7 +101,30 @@ diagnostic warning naming the full admission arithmetic. This is observability, 
 stays queued. The structural-queue-wedge recovery supervisor is the mechanism that actually reroutes a
 never-admittable idle-device head (it soft-resets the pools at the wedge horizon and then faults the wedged
 jobs non-retryably for horde reissue); this warning is a slower, self-explaining backstop that fires if such a
-head is somehow still parked, so the arithmetic is in the log for the post-mortem."""
+head is somehow still parked, so the arithmetic is in the log for the post-mortem. It is also the age at which
+the measured-attempt escape hatch (see :data:`_MEASURED_ATTEMPT_BAND_MB`) becomes eligible: a head this starved
+has exhausted every reclaim, so a close-but-no arithmetic verdict on a card the worker has nothing left to free
+is the moment to let one real load decide rather than defer indefinitely."""
+
+_MEASURED_ATTEMPT_BAND_MB = 1024.0
+"""Uncertainty band (MB) within which a starved head at a converged-empty card is admitted for one real load
+attempt despite not fitting the instantaneous available reading.
+
+The measured-truth identity refuses on arithmetic (candidate > available), but a static sampling-VRAM
+prediction is deliberately conservative relative to a model's true peak, and the instantaneous device-free
+reading oscillates as foreign (desktop/OS) VRAM breathes. When the head has starved past the diagnostic
+horizon, the card is converged-empty (no worker reservations, no worker-resident model, nothing left for
+make-room to reclaim), and the candidate is under the achievable ceiling (so it is possible on this card in
+principle), a shortfall this small is exactly the regime where the prediction's conservatism or a transient
+foreign dip explains the gap. Admitting one measured load lets reality decide: a success teaches the learned
+peak the true figure, a failure (child OOM) is the strongest possible evidence and arms the ceiling hold. The
+band is wide enough to cover ordinary prediction conservatism yet small enough that a genuinely oversized
+demand keeps deferring toward the give-up backstop rather than banging the card with a hopeless attempt."""
+
+_CONVERGED_EMPTY_RESERVATION_EPSILON_MB = 1.0
+"""Slack (MB) below which the net outstanding worker reservations count as zero when judging a card
+converged-empty. The reservations are whole admitted plans (a preload staged, a dispatch admitted); a truly
+empty card nets to 0.0 after the head's own plan is subtracted, and this epsilon only absorbs float noise."""
 
 
 class VramRequestKind(StrEnum):
@@ -234,6 +267,17 @@ class VramRequest:
     defer forever on its own footprint. Subtracting the target's own outstanding reservation makes the request's
     load count at most once, while every other unit's reservation stays fully charged."""
     is_head_of_queue: bool = False
+    head_job_id: str | None = None
+    """The head job's stable unique id, keying the measured-attempt one-shot so at most one real load is
+    attempted per head-starvation episode. None falls back to :attr:`job_label` (the model), which is unique
+    enough within a single evaluation but not across two jobs of the same model, so the scheduler passes the
+    job id proper. Only consulted for the measured-attempt escape hatch."""
+    measured_attempt_in_progress: bool = False
+    """True when the scheduler has already begun a measured load attempt for this head (it tagged the job on a
+    prior admit). The arbiter then keeps admitting the request so the preload -> dispatch progression completes
+    without a fresh one-shot: the attempt is underway and re-gating it mid-load would strand a job the card is
+    already loading. Distinct from the first emission, which the one-shot set gates. Left False for every
+    ordinary request."""
     head_outstanding_mb: float | None = None
     """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
     when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
@@ -352,6 +396,13 @@ class DeviceVramState:
     """The truthful NVML device-level free VRAM (MB) for this card, or None before the first read. The primary
     admission input: a request FITS iff its candidate fits ``device_free_mb - outstanding_reservations -
     noise``. None yields a throttled-diagnostic DEFER, never a denial or a fabricated figure."""
+    foreign_floor_mb: float | None = None
+    """The sustained minimum of measured non-worker (OS/desktop/other-process) VRAM usage (MB) on this card,
+    or None when it has not yet been established (cold start, or fewer than a full observation window of
+    samples). An empty card cannot free this held-by-others floor, so the achievable ceiling a candidate is
+    judged impossible against is ``total - noise - foreign_floor``. Computed outside the arbiter where the
+    snapshot is built (the arbiter stays a pure function of measured state); None preserves the pre-foreign
+    behaviour exactly (``total - noise``)."""
     reclaim_unresolved: bool = False
     """True when the governor's verified reclaim ladder exhausted its rungs while still SATURATED; carried for
     diagnostics and telemetry, not admission."""
@@ -382,6 +433,19 @@ class DeviceVramState:
         )
         return max(0.0, headroom_mb)
 
+    def achievable_ceiling_mb(self) -> float | None:
+        """Return the most VRAM (MB) this card could ever offer one load, or None when the total is unknown.
+
+        An emptied card releases every worker reservation and allocation but cannot reclaim the noise buffer
+        nor the sustained foreign floor (VRAM held by the OS/desktop/other processes). The ceiling is
+        therefore ``total - noise_buffer - foreign_floor``; a candidate above it can never fit this card
+        however much the worker reclaims. An unknown foreign floor contributes zero, preserving the
+        pre-foreign ``total - noise_buffer`` boundary.
+        """
+        if self.total_vram_mb is None:
+            return None
+        return self.total_vram_mb - self.noise_buffer_mb - (self.foreign_floor_mb or 0.0)
+
 
 @dataclass(frozen=True)
 class MeasuredVramSnapshot:
@@ -408,6 +472,13 @@ class VramVerdict:
     reason: str
     measured: AdmissionVerdict
     required_actuations: tuple[ActuatorCommand, ...] = ()
+    measured_attempt: bool = False
+    """True when this FITS is the measured-attempt escape hatch rather than an ordinary fit: the candidate did
+    not fit the instantaneous available reading, but a starved head at a converged-empty card whose demand is
+    under the achievable ceiling is admitted for one real load so measured reality decides (see
+    :data:`_MEASURED_ATTEMPT_BAND_MB`). The scheduler tags the job on this flag so a subsequent child OOM is
+    routed to a terminal scheduling-recovery fault that arms the ceiling hold with real-attempt evidence, rather
+    than to the ordinary degraded retry. False for every arithmetic fit and every non-FITS disposition."""
 
     @property
     def admits(self) -> bool:
@@ -453,11 +524,19 @@ class VramArbiter:
         self._cycle_seq = 0
         self._starvation_diag_cycle: dict[int, int] = {}
         self._device_free_missing_diag_cycle: dict[int, int] = {}
+        # Head jobs (by id) whose measured-load escape hatch has already fired this session, so the one-shot is
+        # never re-emitted within an episode: a marked job either runs (leaves the head) or faults terminally
+        # (leaves the head), so an id is added once per genuine episode and never re-queried after the job clears.
+        self._measured_attempts_started: set[str] = set()
         self.admission_foreign_pressure_defers = 0
         self.first_party_context_defers = 0
         self.starvation_diagnostics = 0
         self.starvation_context_teardowns = 0
         self.device_free_missing_defers = 0
+        self.measured_attempts = 0
+        """Count of measured-load attempts emitted (a starved head at a converged-empty card admitted for one
+        real load despite not fitting the instantaneous reading). Counts first emissions only, not the
+        in-progress continuations that carry an already-tagged job through preload -> dispatch."""
 
     def begin_cycle(self, snapshot: MeasuredVramSnapshot) -> None:
         """Freeze the measurement this cycle's requests are priced against."""
@@ -589,9 +668,13 @@ class VramArbiter:
                 disposition=VramDisposition.DENY,
                 request_kind=request.kind,
                 device_index=request.device_index,
-                reason=f"candidate cannot fit an empty card; measured: {measured.reason()}",
+                reason=self._impossibility_reason(request, state, measured),
                 measured=measured,
             )
+
+        measured_attempt = self._measured_attempt(request, measured)
+        if measured_attempt is not None:
+            return measured_attempt
 
         teardown_actuations = self._starvation_context_teardown(request)
         if teardown_actuations is not None:
@@ -660,6 +743,119 @@ class VramArbiter:
                 f"measured: {measured.reason()}"
             ),
             measured=measured,
+        )
+
+    def _measured_attempt(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+    ) -> VramVerdict | None:
+        """Return a measured-load FITS for a starved head at a converged-empty card, or None to defer as usual.
+
+        Reached only for a non-fitting candidate that is not structurally impossible. The measured-truth identity
+        refuses on arithmetic, but that arithmetic is built on a conservative static prediction and an
+        instantaneous device-free reading that oscillates as foreign VRAM breathes. When the head has starved
+        past the diagnostic horizon, the card is converged-empty (the worker has nothing left to reclaim for it),
+        the candidate is under the achievable ceiling, and the shortfall against available is within the
+        uncertainty band, deferring only burns an idle card on arithmetic that may be wrong. This admits one real
+        load so measured reality decides; every downstream safety (per-step floors, watchdogs, OOM
+        classification, whole-card residency) applies unchanged because it rides the ordinary FITS path.
+
+        The one-shot is per head-starvation episode: the first eligible evaluation emits the attempt (and logs
+        the arithmetic once), subsequent evaluations of the same job defer as before. Once the scheduler has
+        tagged the job (``measured_attempt_in_progress``), the arbiter keeps admitting it so the preload ->
+        dispatch progression completes without a second one-shot. Returns None for every request the escape hatch
+        does not cover, so the caller's ordinary teardown/ladder/defer path runs.
+        """
+        if not request.is_head_of_queue:
+            return None
+        if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
+            return None
+        if request.measured_attempt_in_progress:
+            return self._measured_attempt_verdict(request, measured, first_emission=False)
+        if not self._measured_attempt_eligible(request, measured):
+            return None
+        key = request.head_job_id or request.job_label
+        if key in self._measured_attempts_started:
+            return None
+        self._measured_attempts_started.add(key)
+        self.measured_attempts += 1
+        available_mb = measured.available_mb if measured.available_mb is not None else 0.0
+        logger.warning(
+            f"VRAM: attempting a measured load of head-of-queue {request.job_label}: candidate "
+            f"{measured.candidate_outstanding_mb:.0f} MB vs available {available_mb:.0f} MB, a "
+            f"{measured.candidate_outstanding_mb - available_mb:.0f} MB shortfall within the "
+            f"{_MEASURED_ATTEMPT_BAND_MB:.0f} MB band; the card is empty with nothing left to reclaim and the "
+            f"static prediction may be conservative, so one real load decides. measured: {measured.reason()}",
+        )
+        return self._measured_attempt_verdict(request, measured, first_emission=True)
+
+    def _measured_attempt_eligible(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+    ) -> bool:
+        """Whether the measured-attempt trigger holds: starved head, converged-empty card, within-band shortfall.
+
+        The candidate is already known not to fit and not to be structurally impossible. This adds the three
+        remaining conditions: the head has starved past the diagnostic horizon, the shortfall against available
+        is a small positive figure within the uncertainty band, and the card is converged-empty for make-room.
+        """
+        if request.starved_seconds < _STARVATION_DIAGNOSTIC_SECONDS:
+            return False
+        available_mb = measured.available_mb
+        if available_mb is None:
+            return False
+        shortfall_mb = measured.candidate_outstanding_mb - available_mb
+        if shortfall_mb <= 0.0 or shortfall_mb > _MEASURED_ATTEMPT_BAND_MB:
+            return False
+        return self._card_converged_empty(request, measured)
+
+    @staticmethod
+    def _card_converged_empty(request: VramRequest, measured: AdmissionVerdict) -> bool:
+        """Whether the card has nothing left for make-room to reclaim for this head: converged-empty.
+
+        The make-room has converged when no worker reservation is outstanding (the requester's own staged plan
+        is already netted out of ``measured.outstanding_reservations_mb``), no idle resident model can be evicted
+        (``has_reclaimable_idle_model``, computed for the head, is True whenever any other inference process
+        holds an evictable VRAM-resident model), and no idle sibling CUDA context can be torn down
+        (``idle_contexts_teardownable``). A busy sibling holding the card is excluded by the caller's
+        starvation gate: a head queued behind live work reports zero starved-seconds, so reaching here past the
+        diagnostic horizon already means no busy worker holds the card. In that state every reclaim rung the
+        arbiter's ladder and the head escalation offer is exhausted, so a remaining shortfall is held by foreign
+        VRAM or is an artefact of the conservative prediction, not by anything the worker can free.
+
+        The live-context count (``num_loaded_inference_processes``) is deliberately not consulted: it counts
+        live inference processes, not VRAM-resident models, so the always-present target process would make it
+        non-zero on a genuinely empty card. Resident-model presence is read through the reclaim signal instead,
+        which is exactly the make-room question this predicate asks.
+        """
+        return (
+            measured.outstanding_reservations_mb <= _CONVERGED_EMPTY_RESERVATION_EPSILON_MB
+            and not request.has_reclaimable_idle_model
+            and not request.idle_contexts_teardownable
+        )
+
+    def _measured_attempt_verdict(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+        *,
+        first_emission: bool,
+    ) -> VramVerdict:
+        """Build the measured-attempt FITS verdict (first emission or an in-progress continuation)."""
+        prefix = "measured load attempt" if first_emission else "measured load attempt (in progress)"
+        return VramVerdict(
+            disposition=VramDisposition.FITS,
+            request_kind=request.kind,
+            device_index=request.device_index,
+            reason=(
+                f"{prefix}: candidate does not fit the instantaneous reading but the card is empty and the "
+                f"demand is under the achievable ceiling; admitting one real load to let measured reality decide. "
+                f"measured: {measured.reason()}"
+            ),
+            measured=measured,
+            measured_attempt=True,
         )
 
     def _evaluate_sampling(self, request: VramRequest, state: DeviceVramState) -> VramVerdict:
@@ -848,13 +1044,63 @@ class VramArbiter:
 
     @staticmethod
     def _structurally_impossible(request: VramRequest, state: DeviceVramState) -> bool:
-        """Whether the candidate alone exceeds an empty card's room, so no escalation could seat it.
+        """Whether the candidate exceeds the card's achievable ceiling, so no escalation could seat it.
 
-        An empty card offers ``total - noise_buffer`` (every reservation released, every allocation freed). A
-        candidate larger than that can never fit on this card however much is reclaimed, so it DENIES rather
-        than deferring forever. Unknown total cannot prove impossibility, so it returns False.
+        An emptied card offers ``total - noise_buffer - foreign_floor``: every worker reservation released and
+        every worker allocation freed, but the noise buffer and the VRAM other processes sustain (the foreign
+        floor) are not the worker's to reclaim. A candidate larger than that can never fit on this card however
+        much the worker reclaims, so it DENIES rather than deferring forever. An unknown total cannot prove
+        impossibility (returns False); an unknown foreign floor contributes zero, so the boundary collapses to
+        the pre-foreign ``total - noise_buffer``.
         """
-        if state.total_vram_mb is None:
+        ceiling_mb = state.achievable_ceiling_mb()
+        if ceiling_mb is None:
             return False
         candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        return candidate_delta_mb > state.total_vram_mb - state.noise_buffer_mb
+        return candidate_delta_mb > ceiling_mb
+
+    @staticmethod
+    def _impossibility_reason(
+        request: VramRequest,
+        state: DeviceVramState,
+        measured: AdmissionVerdict,
+    ) -> str:
+        """Spell out the achievable-ceiling arithmetic behind a structural-impossibility DENY."""
+        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
+        ceiling_mb = state.achievable_ceiling_mb() or 0.0
+        total_mb = state.total_vram_mb or 0.0
+        foreign_mb = state.foreign_floor_mb or 0.0
+        return (
+            f"candidate {candidate_delta_mb:.0f} MB exceeds this card's achievable ceiling {ceiling_mb:.0f} MB "
+            f"(total {total_mb:.0f} - noise {state.noise_buffer_mb:.0f} - foreign floor {foreign_mb:.0f}); no "
+            f"reclaim on this card can seat it. measured: {measured.reason()}"
+        )
+
+    def device_state(self, device_index: int | None) -> DeviceVramState | None:
+        """Return the frozen per-device state for a card this cycle, or None when unpriced.
+
+        Lets a caller that received a DENY read the exact measured arithmetic (total, noise, foreign floor)
+        the disposition was reasoned from, without reaching into the snapshot itself.
+        """
+        if self._cycle is None:
+            return None
+        return self._cycle.device(device_index)
+
+    def any_other_device_can_seat(self, request: VramRequest, *, exclude_device_index: int | None) -> bool:
+        """Whether some card other than ``exclude_device_index`` could ever seat this candidate.
+
+        Prices the candidate's structural impossibility against every other card's frozen state: True as soon
+        as one card is not structurally impossible for it (a real reroute target), False when every other card
+        fails the same achievable-ceiling test (or there is no other card). A single-driving-device worker has
+        no other card, so this is always False there. Used by the caller to decide whether an unroutable head
+        must be faulted terminally rather than deferred toward a reroute that cannot arrive.
+        """
+        if self._cycle is None:
+            return False
+        exclude_key = exclude_device_index if exclude_device_index is not None else 0
+        for device_index, state in self._cycle.devices.items():
+            if device_index == exclude_key:
+                continue
+            if not self._structurally_impossible(request, state):
+                return True
+        return False

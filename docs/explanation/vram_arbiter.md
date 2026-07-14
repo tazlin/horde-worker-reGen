@@ -271,9 +271,35 @@ A head deferred past the 60s diagnostic threshold with reclaim genuinely exhaust
 supervisor, which detects a stuck queue with no dispatch progress, soft-resets the pools, and then faults
 wedged jobs non-retryably so the horde can reissue them elsewhere.
 
-`DENY` is reserved for a candidate that could not fit even an empty card. Model-level prevention keeps those
-jobs out earlier, so a runtime `DENY` is a diagnostic boundary rather than a throughput path. The first
-concurrent sampling of its kind admits on an empty ledger.
+`DENY` is reserved for a candidate that could not fit even an emptied card: one whose demand exceeds the
+card's **achievable ceiling**, the card total minus the noise buffer minus the sustained foreign floor (the
+VRAM the OS/desktop/other processes hold, measured outside the arbiter as the trailing-window minimum of
+`total - device-free - worker-committed` and carried on the device state; an unknown floor collapses the
+ceiling to `total - noise`, preserving the pre-foreign boundary). Model-level prevention keeps most such jobs
+out earlier, and when a runtime `DENY` does fire for the true head with no other card that could seat it, the
+scheduler faults the head for reissue and places the model on a conditional, self-lifting ceiling hold
+(re-checked against the current ceiling, lifted once the foreign floor recedes) rather than deferring into a
+permanent wedge (see [the achievable ceiling in Performance and Backpressure](performance_and_backpressure.md#the-achievable-ceiling-a-model-that-can-never-fit-this-card)).
+The first concurrent sampling of its kind admits on an empty ledger.
+
+Between a plain `DEFER` and a structural `DENY` sits one bounded escape hatch: the **measured-load attempt**. A
+candidate under the achievable ceiling is possible on this card in principle, so a static sampling-VRAM
+prediction that misses the instantaneous available reading by only a little may simply be conservative, or the
+foreign VRAM may have breathed up for one reading. When the true head has starved past the 60s diagnostic
+horizon at a *converged-empty* card (no worker reservations outstanding and no worker-resident model to evict:
+make-room has nothing left to reclaim), and the shortfall against available is within a band (1024 MB), the
+arbiter stops deferring an idle card on arithmetic that may be wrong and admits the head for exactly one real
+load, so measured reality decides. The attempt rides the ordinary `FITS` path, so every downstream safety (the
+per-step floors, the watchdogs, the OOM classification, the whole-card residency machinery) applies unchanged.
+It is one-shot per head-starvation episode: a success teaches the learned peak the true figure so future
+arithmetic improves and nothing else happens; a failure (the child faults with the out-of-memory
+classification) is the strongest possible evidence the demand does not fit this card now, so the job is faulted
+terminally as a scheduling-recovery action (excluded from the consecutive-failure pop pause, exactly like the
+unroutable-head fault) and the model's conditional ceiling hold is armed against the demand the real load
+actually failed at, with the operator warning firing once. A shortfall beyond the band, or a card with reclaim
+still to do, keeps deferring toward the give-up backstop as before: the escape hatch only fires where the
+arithmetic says close-but-no at an empty card, which is exactly where a real attempt is worth more than another
+deferral.
 
 Disaggregated sampling is priced differently: the static concurrent-sampling headroom now lives on the
 device state alone (device total net of baseline, minus the fixed and marginal context overheads, the

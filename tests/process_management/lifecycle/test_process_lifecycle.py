@@ -8,16 +8,19 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from tests.process_management.conftest import (
@@ -63,7 +66,6 @@ def _make_plm(
         process_message_queue=Mock(),
         card_runtimes=make_test_card_runtimes(target_process_count=2),
         disk_lock=Mock(),
-        aux_model_lock=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         max_safety_processes=1,
@@ -489,100 +491,6 @@ def test_crash_replacement_still_counts_as_a_recovery() -> None:
 
     assert plm._num_process_recoveries == 1
     assert len(plm._slot_recovery_history.get(1, [])) == 1
-
-
-def test_aux_download_teardown_registers_backoff_strike() -> None:
-    """Reaping a slot stuck downloading aux models arms the LoRA-pop backoff."""
-    plm = _make_plm()
-    plm._end_inference_process = Mock()  # type: ignore[method-assign]
-    plm._start_inference_process = Mock()  # type: ignore[method-assign]
-
-    stuck = make_mock_process_info(1, model_name="CyberRealistic Pony", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
-    plm._process_map[1] = stuck
-
-    assert plm._state.lora_download_backoff.strikes == 0
-
-    plm._replace_inference_process(stuck)
-
-    assert plm._state.lora_download_backoff.strikes == 1
-    assert plm._state.lora_download_backoff.pops_suppressed(time.time())
-
-
-async def test_aux_stall_retryable_first_then_dropped_during_incident() -> None:
-    """The first aux stall keeps its ordinary retry; a stall during the active incident is dropped."""
-    plm = _make_plm()
-    plm._end_inference_process = Mock()  # type: ignore[method-assign]
-    plm._start_inference_process = Mock()  # type: ignore[method-assign]
-    plm._job_tracker.handle_job_fault_now = Mock()  # type: ignore[method-assign]
-
-    job = make_job_pop_response()
-    await track_popped_job_async(plm._job_tracker, job)
-
-    first = make_mock_process_info(1, model_name="WAI", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
-    first.last_job_referenced = job
-    plm._process_map[1] = first
-    plm._replace_inference_process(first)
-
-    # No incident was active before this strike, so the lone stall keeps its ordinary retry.
-    assert plm._job_tracker.handle_job_fault_now.call_args.kwargs["retryable"] is True
-
-    # The strike above made the incident active; a subsequent aux stall is faulted terminally.
-    second = make_mock_process_info(1, model_name="WAI", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
-    second.last_job_referenced = job
-    plm._process_map[1] = second
-    plm._replace_inference_process(second)
-
-    assert plm._job_tracker.handle_job_fault_now.call_args.kwargs["retryable"] is False
-
-
-def test_intentional_reclaim_does_not_register_backoff_strike() -> None:
-    """A deliberate idle-slot reclaim is not a download failure and must not arm the backoff."""
-    plm = _make_plm()
-    plm._end_inference_process = Mock()  # type: ignore[method-assign]
-    plm._start_inference_process = Mock()  # type: ignore[method-assign]
-
-    idle = make_mock_process_info(1, model_name=None, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
-    plm._process_map[1] = idle
-
-    plm._replace_inference_process(idle, intentional_reclaim=True)
-
-    assert plm._state.lora_download_backoff.strikes == 0
-
-
-def test_effective_aux_download_timeout_shortens_under_backoff() -> None:
-    """The stuck-aux grace is the configured timeout until a strike, then the shortened fast-fault value."""
-    from horde_worker_regen.process_management.lifecycle.process_lifecycle import FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS
-
-    plm = _make_plm()
-    bridge_data = plm._runtime_config.bridge_data
-
-    assert plm._effective_aux_download_timeout(bridge_data) == bridge_data.download_timeout
-
-    plm._state.lora_download_backoff.register_timeout(time.time())
-    assert plm._effective_aux_download_timeout(bridge_data) == min(
-        bridge_data.download_timeout,
-        FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS,
-    )
-
-
-def test_aux_download_deadline_for_dispatch_tracks_watchdog_minus_margin() -> None:
-    """The child-side deadline is the (backoff-aware) watchdog timeout minus the safety margin, floored."""
-    from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
-        AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS,
-        FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS,
-        MIN_AUX_DOWNLOAD_DEADLINE_SECONDS,
-    )
-
-    plm = _make_plm()
-    bridge_data = plm._runtime_config.bridge_data
-
-    expected_idle = bridge_data.download_timeout - AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS
-    assert plm.aux_download_deadline_for_dispatch(bridge_data) == expected_idle
-
-    plm._state.lora_download_backoff.register_timeout(time.time())
-    expected_incident = FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS - AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS
-    assert plm.aux_download_deadline_for_dispatch(bridge_data) == expected_incident
-    assert plm.aux_download_deadline_for_dispatch(bridge_data) >= MIN_AUX_DOWNLOAD_DEADLINE_SECONDS
 
 
 def test_get_processes_with_model_for_queued_job_empty() -> None:
@@ -1153,48 +1061,48 @@ def test_stuck_starting_safety_arms_replacement() -> None:
     assert plm.safety_processes_should_be_replaced is True
 
 
-def test_aux_download_timeout_uses_state_duration_not_recent_liveness() -> None:
-    """AUX download replacement is bounded by time in state, not by heartbeat silence.
+def test_operation_timeout_uses_state_duration_not_recent_liveness() -> None:
+    """Operation replacement is bounded by time in state, not by heartbeat silence.
 
-    The child now emits liveness while blocked in the LoRA download path. That should keep the worker
-    from looking globally unresponsive, but it must not make a download unkillable if it exceeds the
-    configured operation timeout.
+    A child emits liveness while blocked in a long operation (loading a checkpoint into VRAM). That should
+    keep the worker from looking globally unresponsive, but it must not make the operation unkillable if it
+    exceeds the configured operation timeout.
     """
-    aux = make_mock_process_info(0, model_name="m", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    loading = make_mock_process_info(0, model_name="m", state=HordeProcessState.PRELOADING_MODEL)
     now = time.time()
-    aux.last_process_state_started_at = now - 1000
-    aux.last_received_timestamp = now
-    aux.last_heartbeat_timestamp = now
-    plm = _make_plm(process_map=ProcessMap({0: aux}))
+    loading.last_process_state_started_at = now - 1000
+    loading.last_received_timestamp = now
+    loading.last_heartbeat_timestamp = now
+    plm = _make_plm(process_map=ProcessMap({0: loading}))
     plm._replace_inference_process = Mock()  # type: ignore[method-assign]
 
     replaced = plm._check_and_replace_process(
-        aux,
+        loading,
         120.0,
-        HordeProcessState.DOWNLOADING_AUX_MODEL,
-        "stuck downloading",
+        HordeProcessState.PRELOADING_MODEL,
+        "stuck loading",
         use_state_duration=True,
     )
 
     assert replaced is True
-    plm._replace_inference_process.assert_called_once_with(aux)
+    plm._replace_inference_process.assert_called_once_with(loading)
 
 
 def test_silence_timeout_still_uses_recent_liveness_by_default() -> None:
     """Non-operation checks keep their existing silence-based behavior."""
-    aux = make_mock_process_info(0, model_name="m", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    loading = make_mock_process_info(0, model_name="m", state=HordeProcessState.PRELOADING_MODEL)
     now = time.time()
-    aux.last_process_state_started_at = now - 1000
-    aux.last_received_timestamp = now
-    aux.last_heartbeat_timestamp = now
-    plm = _make_plm(process_map=ProcessMap({0: aux}))
+    loading.last_process_state_started_at = now - 1000
+    loading.last_received_timestamp = now
+    loading.last_heartbeat_timestamp = now
+    plm = _make_plm(process_map=ProcessMap({0: loading}))
     plm._replace_inference_process = Mock()  # type: ignore[method-assign]
 
     replaced = plm._check_and_replace_process(
-        aux,
+        loading,
         120.0,
-        HordeProcessState.DOWNLOADING_AUX_MODEL,
-        "stuck downloading",
+        HordeProcessState.PRELOADING_MODEL,
+        "stuck loading",
     )
 
     assert replaced is False
@@ -1481,3 +1389,144 @@ class TestPagedSlowdownWatchdog:
 
         assert plm._paging_victim_replacements == 1
         assert plm._job_tracker.is_degraded_dispatch_pending(job) is True
+
+
+class _FakeClock:
+    """A hand-advanceable clock shared by the aux coordinator, the supervisor, and the recovery coordinator."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestGiveUpDefersToAuxPrefetch:
+    """Save-our-ship give-up defers to a head-of-queue job whose auxiliary prefetch is still in flight."""
+
+    def _wedged_recovery_coordinator(
+        self,
+        *,
+        job_tracker: JobTracker,
+        head_aux_prefetch_in_flight: object,
+        clock: _FakeClock,
+    ) -> WorkerRecoveryCoordinator:
+        """A recovery coordinator over a ready-but-structurally-wedged pool with one idle inference lane."""
+        ready_lane = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({1: ready_lane})
+
+        lifecycle = Mock()
+        lifecycle._num_process_recoveries = 0
+        lifecycle.has_pending_inference_starts.return_value = False
+        lifecycle.pending_gpu_starts_backing_off.return_value = False
+        lifecycle.has_pending_safety_starts.return_value = False
+        lifecycle.quarantined_inference_slots = frozenset()
+        lifecycle.safety_pool_failing = False
+
+        dispatcher = Mock()
+        dispatcher.get_deadlock_snapshot.return_value.indicates_structural_wedge.return_value = True
+
+        scheduler = Mock()
+        scheduler.head_model_materializing.return_value = False
+        scheduler.whole_card_residency_grace_active.return_value = False
+        scheduler.heavy_head_load_grace_active.return_value = False
+        scheduler.ram_reclaim_cycle_grace_active.return_value = False
+        scheduler.governance_healthy_but_held.return_value = False
+        scheduler.unload_post_process_models_from_vram.return_value = False
+
+        bridge_data = Mock()
+        bridge_data.max_threads = 1
+        bridge_data.preload_timeout = 150.0
+
+        return WorkerRecoveryCoordinator(
+            state=WorkerState(),
+            runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+            job_tracker=job_tracker,
+            process_map=process_map,
+            process_lifecycle=lifecycle,
+            message_dispatcher=dispatcher,
+            inference_scheduler=scheduler,
+            action_ledger=ActionLedger(),
+            reserve_ledger=CommittedReserveLedger(),
+            bridge_data_provider=lambda: bridge_data,
+            max_inference_processes_provider=lambda: 1,
+            abort_callback=Mock(),
+            head_aux_prefetch_in_flight=head_aux_prefetch_in_flight,
+            recovery_supervisor=RecoverySupervisor(clock=clock),
+            clock=clock,
+        )
+
+    async def test_pending_lora_job_is_not_given_up_before_its_prefetch_deadline(self) -> None:
+        """The head LoRA job survives the whole in-flight window, then faults via the coordinator's deadline."""
+        clock = _FakeClock()
+        tracker = JobTracker()
+        job = make_job_pop_response(
+            "resident_model",
+            loras=[LorasPayloadEntry(name="styleA", model=1.0, clip=1.0, is_version=False)],
+        )
+        await track_popped_job_async(tracker, job)
+
+        aux = AuxPrefetchCoordinator(
+            job_tracker=tracker,
+            state=WorkerState(),
+            prefetch_sender=lambda _entries, _pins: None,
+            download_timeout_provider=lambda: 100.0,
+            clock=clock,
+        )
+        aux.on_job_popped(job)  # arms the deadline at now + 100
+
+        def head_aux_prefetch_in_flight() -> bool:
+            in_progress = set(tracker.jobs_in_progress)
+            head = next((j for j in tracker.jobs_pending_inference if j not in in_progress), None)
+            if head is None or head.id_ is None or tracker.are_job_aux_models_prepared(head):
+                return False
+            return aux.has_live_deadline(head.id_)
+
+        coordinator = self._wedged_recovery_coordinator(
+            job_tracker=tracker,
+            head_aux_prefetch_in_flight=head_aux_prefetch_in_flight,
+            clock=clock,
+        )
+
+        # Drive save-our-ship across the whole in-flight window (well past every soft-reset/give-up grace).
+        # The prefetch is in flight, so give-up must never fault the head: it stays pending and unclaimed.
+        assert coordinator._head_recovery_in_flight() is True
+        for _ in range(40):
+            clock.now += 2.0
+            aux.scan_deadlines()
+            coordinator.run_recovery_supervisor()
+            assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE, "give-up faulted a job still prefetching"
+        assert coordinator._head_recovery_in_flight() is True
+
+        # Past the deadline the coordinator (not give-up) faults the job, and the deferral predicate clears.
+        clock.now = 1_000.0 + 101.0
+        aux.scan_deadlines()
+        assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+        assert coordinator._head_recovery_in_flight() is False
+
+    async def test_give_up_faults_the_head_when_no_prefetch_is_in_flight(self) -> None:
+        """Contrast: with no in-flight prefetch to defer to, the same wedge does give up on the head.
+
+        Proves the deferral is load-bearing rather than a no-op: identical pool/wedge state faults the head
+        once nothing reports an in-flight prefetch.
+        """
+        clock = _FakeClock()
+        tracker = JobTracker()
+        job = make_job_pop_response(
+            "resident_model",
+            loras=[LorasPayloadEntry(name="styleA", model=1.0, clip=1.0, is_version=False)],
+        )
+        await track_popped_job_async(tracker, job)
+
+        coordinator = self._wedged_recovery_coordinator(
+            job_tracker=tracker,
+            head_aux_prefetch_in_flight=lambda: False,
+            clock=clock,
+        )
+
+        for _ in range(40):
+            clock.now += 2.0
+            coordinator.run_recovery_supervisor()
+            if tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT:
+                break
+        assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT, "give-up should fault a head with no prefetch"

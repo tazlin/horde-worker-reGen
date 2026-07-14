@@ -21,7 +21,6 @@ from horde_worker_regen.server_capabilities import (
     server_supports_interrogation_form,
 )
 
-
 _PRODUCTION_SWAGGER_URL = "https://aihorde.net/api/swagger.json"
 
 

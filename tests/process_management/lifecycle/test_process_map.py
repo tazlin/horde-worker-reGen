@@ -120,7 +120,7 @@ class TestProcessStateTransitions:
 
     def test_state_started_at_changes_only_on_state_change(self) -> None:
         """Heartbeat and memory liveness must not reset the current state's duration clock."""
-        proc = make_mock_process_info(0, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        proc = make_mock_process_info(0, state=HordeProcessState.DOWNLOADING_MODEL)
         process_map = ProcessMap({0: proc})
         proc.last_process_state_started_at = 123.0
 

@@ -52,6 +52,7 @@ from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities, 
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     EXTENDED_CONTROL_TYPES,
+    TOTAL_LORA_DOWNLOAD_TIMEOUT,
 )
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
@@ -76,6 +77,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeStripResultMessage,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    ADHOC_PREFETCH_FEATURES,
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
@@ -120,6 +122,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
 from horde_worker_regen.process_management.models.desired_state import DesiredState
 from horde_worker_regen.process_management.models.download_coordinator import ModelDownloadCoordinator
 from horde_worker_regen.process_management.models.feature_readiness import (
@@ -632,14 +635,13 @@ class MultiprocessingPrimitives:
     The GPU-concurrency gates (inference / VAE-decode / sampling-lease semaphores) are held **per card**:
     each driven GPU gets its own so one card's sampling cannot block another's. On a single-GPU host each
     map has exactly one entry keyed by index 0, sized identically to the old single semaphores. The
-    process message queue, disk/aux locks, and download-bandwidth semaphore are genuinely shared across
+    process message queue, disk lock, and download-bandwidth semaphore are genuinely shared across
     all cards and stay singular.
     """
 
     process_message_queue: ProcessQueue
     inference_semaphores: dict[int, Semaphore]
     disk_lock: Lock_MultiProcessing
-    aux_model_lock: Lock_MultiProcessing
     vae_decode_semaphores: dict[int, Semaphore]
     gpu_sampling_leases: dict[int, Semaphore]
     """Per-card GPU sampling lease: serializes that card's denoising loop across its inference processes so
@@ -681,7 +683,6 @@ class MultiprocessingPrimitives:
                 for index, card in per_card.items()
             },
             disk_lock=Lock_MultiProcessing(ctx=ctx),
-            aux_model_lock=Lock_MultiProcessing(ctx=ctx),
             vae_decode_semaphores={
                 index: BoundedSemaphore_MultiProcessing(card.vae_decode_semaphore_size, ctx=ctx)
                 for index, card in per_card.items()
@@ -861,9 +862,6 @@ class HordeWorkerProcessManager:
 
     _disk_lock: Lock_MultiProcessing
     """A lock to prevent multiple processes from accessing the disk at once."""
-
-    _aux_model_lock: Lock_MultiProcessing
-    """A lock to prevent multiple processes from accessing the auxiliary models at once (such as LoRas)."""
 
     _lru: LRUCache
     """A simple LRU cache. This is used to keep track of the most recently used models."""
@@ -1084,7 +1082,6 @@ class HordeWorkerProcessManager:
         # above); only the genuinely shared primitives are read out here.
         self._process_message_queue = mp_primitives.process_message_queue
         self._disk_lock = mp_primitives.disk_lock
-        self._aux_model_lock = mp_primitives.aux_model_lock
         self._download_bandwidth_semaphore = mp_primitives.download_bandwidth_semaphore
 
         # Take ownership of child OS pids so a parent that died hard can have its orphaned children
@@ -1116,7 +1113,6 @@ class HordeWorkerProcessManager:
             process_message_queue=self._process_message_queue,
             card_runtimes=self._card_runtimes,
             disk_lock=self._disk_lock,
-            aux_model_lock=self._aux_model_lock,
             download_bandwidth_semaphore=self._download_bandwidth_semaphore,
             gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
             runtime_config=self._runtime_config,
@@ -1160,6 +1156,15 @@ class HordeWorkerProcessManager:
             bridge_data_provider=lambda: self.bridge_data,
             stable_diffusion_reference_provider=lambda: self.stable_diffusion_reference,
             enable_background_downloads=self._enable_background_downloads,
+        )
+
+        self._aux_prefetch_coordinator = AuxPrefetchCoordinator(
+            job_tracker=self._job_tracker,
+            state=self._state,
+            prefetch_sender=self._process_lifecycle.request_aux_prefetch,
+            download_timeout_provider=self._aux_prefetch_download_timeout,
+            pin_sender=self._process_lifecycle.request_aux_pin_update,
+            in_flight_provider=self._aux_prefetch_in_flight_downloads,
         )
 
         self._message_dispatcher = MessageDispatcher(
@@ -1274,6 +1279,7 @@ class HordeWorkerProcessManager:
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
         self._message_dispatcher.set_download_availability_handler(self._download_coordinator.on_download_availability)
+        self._message_dispatcher.set_aux_prefetch_result_handler(self._aux_prefetch_coordinator.on_prefetch_result)
         self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
         self._message_dispatcher.set_inference_step_observer(self._observe_inference_step)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
@@ -1422,6 +1428,7 @@ class HordeWorkerProcessManager:
             max_inference_processes_provider=lambda: self.max_inference_processes,
             abort_callback=lambda: self._abort(),
             release_disaggregated_job=self._disaggregation_orchestrator.release_job,
+            head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
         )
 
         self._job_submitter = JobSubmitter(
@@ -1456,6 +1463,12 @@ class HordeWorkerProcessManager:
                 "num_graph_forms_waiting_or_running",
                 0,
             ),
+            on_job_popped=(
+                self._aux_prefetch_coordinator.on_job_popped
+                if self._enable_background_downloads
+                else self._fault_aux_job_without_downloader
+            ),
+            background_downloads_enabled=self._enable_background_downloads,
         )
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
@@ -2947,6 +2960,15 @@ class HordeWorkerProcessManager:
             # input) before it can reach annotation or in-graph preprocessing.
             self._fault_unready_extended_controlnet_jobs()
 
+            # Fault any pending job whose ad-hoc LoRA/TI prefetch never resolved by its deadline, so a job is
+            # never left pending forever waiting on an auxiliary download that stalled or was lost. Then
+            # reconcile (re-request any aux-bearing pending job left without an in-flight request, healing a
+            # retryable requeue, a lost result, or a restarted downloader) and refresh the eviction-pin set so
+            # a completed job's files stop being pinned without waiting for the next pop.
+            if self._enable_background_downloads:
+                self._aux_prefetch_coordinator.scan_deadlines()
+                self._aux_prefetch_coordinator.reconcile_and_refresh_pins()
+
             # Pre-annotate controlnet jobs off-GPU before scheduling: parks eligible jobs (removing them
             # from the inference-eligible set until their control map arrives) and releases resolved,
             # aged-out, or lane-orphaned parks back to inference so a freed job can be dispatched this tick.
@@ -3083,6 +3105,77 @@ class HordeWorkerProcessManager:
         except Exception as e:  # noqa: BLE001 - readiness is best-effort; a resolution failure must fail closed.
             logger.debug(f"Extended controlnet readiness probe failed: {type(e).__name__}: {e}")
             return False
+
+    def _head_aux_prefetch_in_flight(self) -> bool:
+        """Whether the head-of-queue pending job is auxiliary-gated with its prefetch still in flight.
+
+        Read by the recovery coordinator so save-our-ship give-up defers to a head whose LoRAs/TIs are still
+        being placed on disk (bounded by that job's prefetch deadline). False when background downloads are
+        off (there is no prefetch pipeline), when the head carries no auxiliary files, when it is already
+        prepared, or when no live deadline is tracked for it.
+        """
+        if not self._enable_background_downloads:
+            return False
+        in_progress = set(self._job_tracker.jobs_in_progress)
+        head = next((job for job in self._job_tracker.jobs_pending_inference if job not in in_progress), None)
+        if head is None or head.id_ is None:
+            return False
+        if not (head.payload.loras or head.payload.tis):
+            return False
+        if self._job_tracker.are_job_aux_models_prepared(head):
+            return False
+        return self._aux_prefetch_coordinator.has_live_deadline(head.id_)
+
+    def _aux_prefetch_in_flight_downloads(self) -> dict[str, tuple[int, int]]:
+        """The ad-hoc LoRA/TI prefetch downloads the downloader shows in flight, as name -> (downloaded, total).
+
+        Built from the latest download-status snapshot, filtered to the job-driven prefetch features, so the
+        aux coordinator can defer a per-job deadline whose file is still being placed on disk rather than
+        faulting an alive-but-slow transfer. Empty when no snapshot has arrived or nothing prefetch-related
+        is downloading.
+        """
+        status = self._model_availability.status
+        if status is None:
+            return {}
+        in_flight = status.active or ([status.current] if status.current is not None else [])
+        return {
+            download.model_name: (download.downloaded_bytes, download.total_bytes)
+            for download in in_flight
+            if download.feature in ADHOC_PREFETCH_FEATURES
+        }
+
+    def _aux_prefetch_download_timeout(self) -> float:
+        """The per-job aux-prefetch deadline budget (seconds), read from the configured download timeout.
+
+        Falls back to a conservative default when the value is not a real number (a mocked bridge in tests),
+        so the coordinator never derives a deadline from a non-numeric attribute.
+        """
+        configured = self.bridge_data.download_timeout
+        if isinstance(configured, (int, float)):
+            return float(configured)
+        return float(TOTAL_LORA_DOWNLOAD_TIMEOUT + 1)
+
+    def _fault_aux_job_without_downloader(self, job: ImageGenerateJobPopResponse) -> None:
+        """Fault a just-popped auxiliary-bearing job when no downloader exists to prepare it.
+
+        With background downloads disabled there is no download process, no prefetch coordinator, and
+        therefore nothing that could ever prepare (or deadline-fault) a job carrying LoRAs or TIs: left
+        alone it would sit invisible to dispatch forever and starve the queue head into recovery churn.
+        Production always runs with the downloader enabled and suppresses LoRA advertising without one,
+        so this guards injected job sources (harness scenarios, tests) that bypass pop advertising. A job
+        with no auxiliary references is untouched.
+        """
+        if not (job.payload.loras or job.payload.tis):
+            return
+        logger.error(
+            f"Job {str(job.id_)[:8]} requires auxiliary models but background downloads are disabled; "
+            "faulting it immediately (nothing can ever prepare it).",
+        )
+        self._job_tracker.handle_job_fault_now(
+            job,
+            retryable=False,
+            fault_reason="auxiliary models required but background downloads are disabled",
+        )
 
     def _on_annotator_availability(self, message: HordeAnnotatorAvailabilityMessage) -> None:
         """Cache which control types the reporting image-utilities lane can annotate right now."""
@@ -4572,8 +4665,6 @@ class HordeWorkerProcessManager:
                         why = f"Process {resident.process_id} is busy sampling."
                     elif resident.last_process_state.name == "INFERENCE_PRIMED":
                         why = f"Process {resident.process_id} is staging a job toward sampling."
-                    elif resident.last_process_state.name == "DOWNLOADING_AUX_MODEL":
-                        why = f"Process {resident.process_id} is downloading auxiliary models."
                     else:
                         state_phrase = resident.last_process_state.name.lower().replace("_", " ")
                         why = f"Process {resident.process_id} is {state_phrase}."
@@ -4928,7 +5019,7 @@ class HordeWorkerProcessManager:
         if lora_by_disk:
             lora_reason = "LoRA cache volume below its free-space floor"
         elif lora_by_download:
-            lora_reason = "LoRA support suppressed while background downloads run"
+            lora_reason = "LoRA support suppressed while bulk model downloads run"
         readings.append(
             PopGovernorReading(
                 name="lora_pop_backoff",
@@ -5582,6 +5673,19 @@ class HordeWorkerProcessManager:
         self._shutdown()
         self._start_timed_shutdown()
 
+    async def _supervisor_liveness_heartbeat(self) -> None:
+        """Heartbeat the supervisor channel every second for as long as the event loop schedules timers.
+
+        Runs as its own task so liveness reflects the loop's ability to run scheduled work at all: the
+        signal the supervisor's frozen-parent detection needs. The control loop's own per-tick heartbeat
+        cannot carry that meaning, because one tick's body may legitimately span a long message drain.
+        """
+        while not self._state.shut_down:
+            supervisor = self._supervisor
+            if supervisor is not None:
+                supervisor.note_alive()
+            await asyncio.sleep(1.0)
+
     async def _main_loop(self) -> None:
         aiohttp_session = ClientSession(requote_redirect_url=False)
 
@@ -5609,6 +5713,12 @@ class HordeWorkerProcessManager:
                 self._periodic_server_capabilities_loop(),
                 *(flow.run() for flow in self._flows.values()),
             ]
+            if self._supervisor is not None:
+                # Liveness must track the event loop's health, not the control loop's tick boundary: a
+                # long busy tick (heavy message drain) starves a per-tick heartbeat and reads as a frozen
+                # parent to the supervisor, while a genuinely dead loop must still trip it. A dedicated
+                # 1s task heartbeats between the busy tick's own awaits, so only real loop death alarms.
+                coroutines.append(self._supervisor_liveness_heartbeat())
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_reloader.bridge_data_loop())
 

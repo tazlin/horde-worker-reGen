@@ -57,7 +57,6 @@ def _make_plm(*, process_map: ProcessMap, horde_model_map: HordeModelMap) -> Pro
         process_message_queue=Mock(),
         card_runtimes=make_test_card_runtimes(target_process_count=4),
         disk_lock=Mock(),
-        aux_model_lock=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         max_safety_processes=1,

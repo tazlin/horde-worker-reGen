@@ -43,6 +43,7 @@ from tests.analysis.test_detectors import (
     _soft_reset,
     _whole_card_reserve,
 )
+from tests.analysis.test_unsatisfiable_head_starvation import _starvation_diagnostic
 
 # --- Golden lines for detectors whose trigger is not already a reusable helper in test_detectors. ---
 # Each mirrors a specific worker emit; the source is named so a reworded log line is traceable here.
@@ -218,6 +219,16 @@ CONTRACTS: dict[str, Contract] = {
             _force_admit("15:18:52.000", starved_seconds=110, free_vram_mb=19179),
             _soft_reset("15:18:43.000"),
             _give_up("15:19:08.000", jobs=4),
+        ),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_unsatisfiable_head_starvation": Contract(
+        # The same head model deferred with no verified progress repeatedly over a >120s window, with no
+        # give-up or consecutive-failure pause ever clearing it: the silent, unsatisfiable-head wedge.
+        bridge=_bridge(
+            _starvation_diagnostic("18:30:00.000", starved_seconds=130, free_vram_mb=19000),
+            _starvation_diagnostic("18:32:30.000", starved_seconds=205, free_vram_mb=19100),
+            _starvation_diagnostic("18:35:00.000", starved_seconds=280, free_vram_mb=19200),
         ),
         severity=Severity.CRITICAL,
     ),

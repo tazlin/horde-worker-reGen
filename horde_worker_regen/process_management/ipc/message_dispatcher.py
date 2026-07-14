@@ -20,11 +20,11 @@ from horde_worker_regen.process_management.config.runtime_config import RuntimeC
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.messages import (
-    AUX_DOWNLOAD_FAILED_INFO,
+    AUX_RESOLVE_FAILED_INFO,
     HordeAlchemyResultMessage,
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
-    HordeAuxModelStateChangeMessage,
+    HordeAuxPrefetchResultMessage,
     HordeDownloadAvailabilityMessage,
     HordeDownloadMetricsMessage,
     HordeHeartbeatType,
@@ -168,6 +168,8 @@ class MessageDispatcher:
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
     _on_download_metrics: Callable[[HordeDownloadMetricsMessage], None] | None = None
     _on_download_availability: Callable[[HordeDownloadAvailabilityMessage], None] | None = None
+    _on_aux_prefetch_result: Callable[[HordeAuxPrefetchResultMessage], None] | None = None
+    """Invoked when the download process reports per-entry ad-hoc LoRA/TI prefetch outcomes."""
     _on_model_load_failure: Callable[[int, str], None] | None = None
     """Invoked as ``(process_id, horde_model_name)`` when a child reports it failed to load a model."""
     _on_inference_step: Callable[[int], None] | None = None
@@ -308,6 +310,13 @@ class MessageDispatcher:
         """Register the callback invoked when the download process reports on-disk availability."""
         self._on_download_availability = handler
 
+    def set_aux_prefetch_result_handler(
+        self,
+        handler: Callable[[HordeAuxPrefetchResultMessage], None],
+    ) -> None:
+        """Register the callback invoked when the download process reports ad-hoc LoRA/TI prefetch outcomes."""
+        self._on_aux_prefetch_result = handler
+
     def set_model_load_failure_handler(self, handler: Callable[[int, str], None]) -> None:
         """Register the callback invoked when a child reports it failed to load a model.
 
@@ -348,6 +357,8 @@ class MessageDispatcher:
                     and self._on_download_availability is not None
                 ):
                     self._on_download_availability(message)
+                elif isinstance(message, HordeAuxPrefetchResultMessage) and self._on_aux_prefetch_result is not None:
+                    self._on_aux_prefetch_result(message)
                 continue
 
             if not isinstance(message, HordeProcessMessage):
@@ -431,9 +442,6 @@ class MessageDispatcher:
 
             if isinstance(message, HordeProcessStateChangeMessage):
                 self._handle_process_state_change(message)
-
-            if isinstance(message, HordeAuxModelStateChangeMessage):
-                await self._handle_aux_model_state_change(message)
 
             if isinstance(message, HordeModelStateChangeMessage):
                 self._handle_model_state_change(message)
@@ -863,52 +871,6 @@ class MessageDispatcher:
             retryable=True,
         )
 
-    async def _handle_aux_model_state_change(self, message: HordeAuxModelStateChangeMessage) -> None:
-        """Handle an auxiliary model state change message (e.g., LoRa downloads)."""
-        job_info = message.sdk_api_job_info
-        job_context = ""
-        if job_info is not None:
-            lora_count = len(job_info.payload.loras or [])
-            ti_count = len(job_info.payload.tis or [])
-            job_context = (
-                f" for job {str(job_info.id_)[:8]} (model={job_info.model}, loras={lora_count}, tis={ti_count})"
-            )
-
-        if message.process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
-            logger.opt(ansi=True).info(
-                f"<fg #7b7d7d>Process {message.process_id} is downloading extra models{job_context}</>",
-            )
-            self._process_map.on_last_job_reference_change(
-                process_id=message.process_id,
-                last_job_referenced=message.sdk_api_job_info,
-            )
-
-        if message.process_state == HordeProcessState.DOWNLOAD_AUX_COMPLETE:
-            logger.opt(ansi=True).info(
-                "<fg #7b7d7d>"
-                f"Process {message.process_id} finished downloading extra models{job_context} "
-                f"in {message.time_elapsed}"
-                "</>",
-            )
-            # The job's LoRAs are now on disk; record them so a later pending job needing the same LoRAs may
-            # line-skip an aux-download-blocked lane without itself triggering a fresh blocking download.
-            self._job_tracker.mark_job_loras_cached(message.sdk_api_job_info)
-            if message.sdk_api_job_info not in self._job_tracker.jobs_lookup:
-                if message.sdk_api_job_info is not None:
-                    logger.warning(
-                        f"Job {message.sdk_api_job_info.id_} not found in jobs_lookup. (Process {message.process_id})",
-                    )
-                else:
-                    logger.warning(
-                        f"Job not found in jobs_lookup. (Process {message.process_id})",
-                    )
-                logger.debug(f"Jobs lookup: {self._job_tracker.jobs_lookup}")
-            else:
-                await self._job_tracker.set_job_time_to_download_aux_models(
-                    message.sdk_api_job_info,
-                    message.time_elapsed,
-                )
-
     def _handle_model_state_change(self, message: HordeModelStateChangeMessage) -> None:
         """Handle a model state change message."""
         if message.horde_model_state == ModelLoadState.FAILED:
@@ -1208,29 +1170,21 @@ class MessageDispatcher:
         """
         job_id = str(message.sdk_api_job_info.id_) if message.sdk_api_job_info.id_ is not None else None
 
-        # A child that aborted its own stalled aux download (deadline) reports the fault here instead of
-        # the parent's watchdog tearing the process down. Mirror the teardown path's backoff handling: it
-        # is not a resource/OOM failure, it arms the LoRA-download backoff, and (once an incident is
-        # active) it is dropped rather than requeued straight back into the same failing download.
-        # Retryability is read before this strike is recorded so a lone transient stall keeps its retry.
-        is_aux_download_fault = message.info == AUX_DOWNLOAD_FAILED_INFO
-        if is_aux_download_fault:
-            resource_failure = False
-            aux_retryable = not self._state.lora_download_backoff.is_escalation_active(time.time())
-            window = self._state.lora_download_backoff.register_timeout(time.time())
-            logger.warning(
-                f"Job {job_id} aux (LoRA) download was aborted by process {message.process_id} (strike "
-                f"{self._state.lora_download_backoff.strikes}); withholding LoRA job pops for {window:.0f}s.",
-            )
-        else:
-            resource_failure = is_resource_failure(message.info)
-            aux_retryable = True
+        # A child that could not resolve a job's prefetched auxiliary files on disk faults it retryably
+        # (:data:`AUX_RESOLVE_FAILED_INFO`). That is a local disk race, not a CivitAI download failure, so
+        # it does not arm the LoRA-download backoff: the fault flows through the ordinary retryable path.
+        # Withdrawing the job's prepared state here is what makes the retry meaningful: it re-gates the job
+        # out of dispatch and lets the prefetch reconcile sweep re-request the missing files (the session
+        # cache the preparation was derived from has been contradicted by the disk).
+        if message.info == AUX_RESOLVE_FAILED_INFO:
+            self._job_tracker.invalidate_job_aux_preparation(message.sdk_api_job_info)
+        resource_failure = is_resource_failure(message.info)
 
         resolution = await self._job_tracker.handle_job_fault(
             message.sdk_api_job_info,
             process_timeout=message.time_elapsed if message.time_elapsed is not None else 0.0,
             is_resource_failure=resource_failure,
-            retryable=aux_retryable,
+            retryable=True,
         )
 
         if resolution is not InferenceFailureResolution.FAULTED:

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 from pydantic import JsonValue
 
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
@@ -168,6 +168,22 @@ async def mark_job_in_progress_async(job_tracker: JobTracker, job: object) -> No
     await job_tracker.mark_inference_started(job)  # type: ignore[arg-type]
 
 
+def mark_job_aux_prepared(job_tracker: JobTracker, job: ImageGenerateJobPopResponse) -> None:
+    """Simulate the prefetch pipeline placing a job's auxiliary files and clearing its preparation gate.
+
+    Drives the real preparation API (``mark_aux_prefetched`` for each LoRA/TI the job needs, then
+    ``mark_job_aux_prepared_if_ready``) so the job's aux-prepared flag transitions exactly as it does in
+    production, without a live download process. A job whose files are only partially seeded is left
+    unprepared, matching the all-or-nothing gate.
+    """
+    for lora in job.payload.loras or []:
+        job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
+    for ti in job.payload.tis or []:
+        job_tracker.mark_aux_prefetched(ti.name, is_version=False, is_ti=True)
+    if job.id_ is not None:
+        job_tracker.mark_job_aux_prepared_if_ready(job.id_)
+
+
 async def queue_job_for_safety_async(job_tracker: JobTracker, job_info: object) -> None:
     """Queue a completed job for safety checking via JobTracker."""
     await job_tracker.queue_for_safety(job_info)  # type: ignore[arg-type]
@@ -230,7 +246,6 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.large_model_reentry_cooldown_seconds = -1
     bd.unservable_model_fault_threshold = 3
     bd.unservable_model_cooldown_seconds = 900
-    bd.aux_model_download_line_skip_threshold_seconds = 3
     bd.idle_fill_threshold_seconds = 5
     bd.self_maintenance_fault_threshold = 6
     bd.self_maintenance_window_seconds = 600
@@ -333,6 +348,7 @@ def make_job_pop_response(
     seed: str = "42",
     prompt: str = "test prompt",
     loras: list[LorasPayloadEntry] | None = None,
+    tis: list[TIPayloadEntry] | None = None,
     r2_upload: str | None = None,
     post_processing: list[str] | None = None,
     workflow: str | None = None,
@@ -361,6 +377,8 @@ def make_job_pop_response(
         data["payload"]["post_processing"] = post_processing  # pyrefly: ignore - validated by pydantic
     if loras is not None:
         data["payload"]["loras"] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
+    if tis is not None:
+        data["payload"]["tis"] = tis  # pyrefly: ignore - validated by pydantic
     if r2_upload is not None:
         data["r2_upload"] = r2_upload
     return ImageGenerateJobPopResponse(**data)  # pyrefly: ignore - type violations will be caught by pydantic
@@ -388,7 +406,6 @@ def make_test_mp_primitives(device_indices: tuple[int, ...] = (0,)) -> Multiproc
         process_message_queue=Mock(),
         inference_semaphores={index: Mock() for index in device_indices},
         disk_lock=Mock(),
-        aux_model_lock=Mock(),
         vae_decode_semaphores={index: Mock() for index in device_indices},
         gpu_sampling_leases={index: Mock() for index in device_indices},
         download_bandwidth_semaphore=Mock(),

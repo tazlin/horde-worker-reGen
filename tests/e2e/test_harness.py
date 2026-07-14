@@ -122,3 +122,46 @@ async def test_full_lifecycle_with_simulated_inference_time() -> None:
     assert result.num_jobs_completed == len(scenario), (
         f"Expected {len(scenario)} completed jobs, got {result.num_jobs_completed} ({result.failure_summary()})"
     )
+
+
+class TestHarnessBridgeDataCapabilities:
+    """The harness bridge data must advertise every capability the workload actually needs.
+
+    The simulated pop matching honours the request exactly as the live API does, so a capability the
+    bridge does not advertise silently filters that traffic out of the run instead of failing loudly.
+    """
+
+    def test_lora_soak_templates_enable_lora_advertising(self) -> None:
+        """A soak mix carrying LoRA references produces bridge data that advertises LoRA support."""
+        from horde_worker_regen.benchmark.soak import build_lora_storm_soak_scenario
+        from horde_worker_regen.harness import build_harness_bridge_data
+
+        scenario = build_lora_storm_soak_scenario(soak_seconds=30.0)
+        config = HarnessConfig.from_scenario(scenario, process_mode="fake", timeout_seconds=60.0)
+        bridge_data = build_harness_bridge_data(config, [])
+
+        assert bridge_data.allow_lora is True
+
+    def test_plain_scenario_leaves_lora_advertising_at_default(self) -> None:
+        """A workload with no auxiliary references does not force LoRA advertising on."""
+        from horde_worker_regen.harness import build_harness_bridge_data
+
+        config = HarnessConfig(scenario=make_simple_scenario(1), timeout_seconds=60.0)
+        bridge_data = build_harness_bridge_data(config, config.scenario or [])
+
+        # Validation resolves the unset worker-level tri-state; the contract is only that a plain
+        # workload never has LoRA support forced on.
+        assert not bridge_data.allow_lora
+
+    def test_max_power_covers_the_largest_workload_job(self) -> None:
+        """The bridge advertises enough power for the mix's largest job, or heavy templates never pop."""
+        from horde_worker_regen.benchmark.soak import build_production_replay_soak_scenario
+        from horde_worker_regen.harness import build_harness_bridge_data
+
+        scenario = build_production_replay_soak_scenario(soak_seconds=30.0)
+        config = HarnessConfig.from_scenario(scenario, process_mode="fake", timeout_seconds=60.0)
+        bridge_data = build_harness_bridge_data(config, [])
+
+        largest = max(t.width * t.height for t in config.soak_image_templates)
+        assert bridge_data.max_power is not None
+        assert bridge_data.max_power * 8 * 64 * 64 >= largest

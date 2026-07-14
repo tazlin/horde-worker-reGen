@@ -30,9 +30,9 @@ child now drains its control pipe on a dedicated thread), so this is a backstop,
 STALE_SNAPSHOT_DOWNLOAD_SECONDS = 90.0
 """More generous staleness budget when the last snapshot showed a model download/load in flight.
 
-A worker fetching weights (base or aux/LoRA) or loading a model is legitimately busy and the operator
-expects it to take a while, so the "unresponsive" alarm should hold off longer in that case rather
-than cry wolf on a healthy WAN transfer. Applied via :func:`_stale_threshold`."""
+A worker fetching model weights or loading a model is legitimately busy and the operator expects it to
+take a while, so the "unresponsive" alarm should hold off longer in that case rather than cry wolf on a
+healthy WAN transfer. Applied via :func:`_stale_threshold`."""
 
 IDLE_SECONDS = 600.0
 """No work for this long is treated as an idle/low-demand state rather than active serving."""
@@ -44,7 +44,7 @@ _INFERENCE_STATES = frozenset(
 )
 _READY_STATES = frozenset({"WAITING_FOR_JOB", "INFERENCE_COMPLETE", "ALCHEMY_COMPLETE", "PRELOADED_MODEL"})
 _LOADING_STATES = frozenset(
-    {"PROCESS_STARTING", "DOWNLOADING_MODEL", "DOWNLOADING_AUX_MODEL", "PRELOADING_MODEL"},
+    {"PROCESS_STARTING", "DOWNLOADING_MODEL", "PRELOADING_MODEL"},
 )
 
 
@@ -386,7 +386,7 @@ def _warmup_detail(snapshot: WorkerStateSnapshot) -> tuple[str, str]:
     """Describe what the worker is doing while warming up (downloading/loading which model)."""
     for process in snapshot.processes:
         model = process.loaded_horde_model_name or "models"
-        if process.last_process_state in ("DOWNLOADING_MODEL", "DOWNLOADING_AUX_MODEL"):
+        if process.last_process_state == "DOWNLOADING_MODEL":
             return f"downloading {model}", "Fetching model weights. First-time downloads can be large."
         if process.last_process_state == "PRELOADING_MODEL":
             return f"loading {model} into VRAM", "Moving the model onto the GPU."

@@ -1,15 +1,15 @@
-"""Auxiliary preparation must not reserve a sampling slot before the job can sample.
+"""An auxiliary-gated job must hold no sampling slot before it can sample.
 
-A resident-model job may still need a long LoRA download.  Sending the ordinary inference command for
-that work marks the job in progress and reserves its future activation peak before the download begins.
-The line-skip selector can then find a bounded, auxiliary-ready job for an idle sibling, but dispatch-time
-admission charges the downloading job's reservation and withholds the selected work.  Both lanes remain
-non-sampling even though the later job fits the card by itself.
+A resident-model job may still need its LoRAs/TIs placed on disk. The pop-time prefetch pipeline does that
+while the job stays pending, so the job is invisible to dispatch (and preload) until its files land and its
+preparation gate clears. It reserves no future activation peak in the meantime, so a fitting sibling for an
+idle lane is dispatched instead of being withheld behind a phantom reservation.
 
-These tests require auxiliary resolution to remain a pending-queue operation.  The downloading job keeps
-its queue position without owning a sampling reservation; once its auxiliaries are ready it competes at the
-normal dispatch gate, which continues to account for any backfill already sampling.  The controls retain the
-direct path for jobs that need no download and for LoRA jobs whose files are already known to be cached.
+These tests hold that contract: a gated head keeps its queue position without owning a sampling reservation;
+a fitting backfill sibling is fed while it waits; and once its files are cached it competes at the ordinary
+dispatch gate, which continues to account for any backfill already sampling (only one incompatible peak is
+admitted at a time). The controls retain the direct path for jobs that need no auxiliary files and for jobs
+whose files are already known cached.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from tests.process_management.conftest import (
     make_mock_process_info,
     make_test_model_metadata,
     make_test_runtime_config,
+    mark_job_aux_prepared,
     track_popped_job_async,
 )
 
@@ -77,7 +78,6 @@ def _scheduler(
         process_lifecycle=Mock(
             get_processes_with_model_for_queued_job=Mock(return_value=[]),
             is_model_load_quarantined=Mock(return_value=False),
-            aux_download_deadline_for_dispatch=Mock(return_value=120.0),
         ),
         runtime_config=make_test_runtime_config(bridge_data=bridge),
         model_metadata=make_test_model_metadata(reference),
@@ -128,7 +128,12 @@ class TestAuxPreparationRegression:
     """Preparation-only downloads leave sampling capacity available to eligible queued work."""
 
     async def test_uncached_resident_lora_head_prepares_without_sampling_reservation(self) -> None:
-        """A LoRA-blocked head stays pending while its auxiliary files are resolved."""
+        """A LoRA-blocked head stays pending and holds no sampling reservation while its files are placed.
+
+        Preparation is the pop-time prefetch pipeline's job, off the sampling lanes. The head is invisible to
+        dispatch until its prefetch clears its gate, so it neither samples nor reserves any activation peak;
+        the only follower here needs a non-resident model, so nothing else runs this pass either.
+        """
         backfill = _job(_BACKFILL_MODEL)
         scheduler, tracker, head, head_process = await _resident_head_setup(followers=(backfill,))
 
@@ -137,7 +142,7 @@ class TestAuxPreparationRegression:
         assert started is False
         assert head in tracker.jobs_pending_inference
         assert head not in tracker.jobs_in_progress
-        assert head_process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
+        assert head_process.last_control_flag is not HordeControlFlag.START_INFERENCE
         assert scheduler._reserve_ledger.effective_planned_vram_mb({0: 1_372.0}) == 0.0
 
     async def test_prepared_head_allows_ready_backfill_without_weakening_later_admission(self) -> None:
@@ -169,10 +174,7 @@ class TestAuxPreparationRegression:
             device_free_mb=11_000.0,
         )
 
-        assert await scheduler.start_inference() is False
-        assert head_process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
-        assert head not in tracker.jobs_in_progress
-
+        # The gated head is invisible to dispatch, so the resident backfill sibling is fed on the first pass.
         assert await scheduler.start_inference() is True
         assert backfill in tracker.jobs_in_progress
         assert head in tracker.jobs_pending_inference
@@ -180,7 +182,7 @@ class TestAuxPreparationRegression:
         assert backfill_process.last_control_flag is HordeControlFlag.START_INFERENCE
 
         # Completion only makes the head eligible; the backfill's live reservation remains authoritative.
-        tracker.mark_job_loras_cached(head)
+        mark_job_aux_prepared(tracker, head)
         head_process.last_process_state = HordeProcessState.PRELOADED_MODEL
         model_map.update_entry(_HEAD_MODEL, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=0)
         scheduler._concurrent_overlap_allowed = Mock(return_value=True)  # type: ignore[method-assign]
@@ -199,7 +201,12 @@ class TestAuxPreparationRegression:
 async def test_download_completion_and_backfill_dispatch_orderings_admit_only_one_sampler(
     event_order: Sequence[str],
 ) -> None:
-    """Either event ordering makes progress without admitting incompatible sampling peaks together."""
+    """Either event ordering makes progress without admitting incompatible sampling peaks together.
+
+    With a single concurrency lane, the gated LoRA head is invisible while its files are placed, so the
+    resident backfill is fed first regardless of when the download completes or a schedule pass runs. The head
+    then waits behind the one admitted sampler rather than stacking a second incompatible peak.
+    """
     head = _job(_HEAD_MODEL, lora="head-lora")
     backfill = _job(_BACKFILL_MODEL)
     head_process = make_mock_process_info(0, model_name=_HEAD_MODEL, state=HordeProcessState.PRELOADED_MODEL)
@@ -215,10 +222,11 @@ async def test_download_completion_and_backfill_dispatch_orderings_admit_only_on
     model_map.update_entry(_BACKFILL_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
     scheduler = _scheduler(ProcessMap({0: head_process, 1: backfill_process}), tracker, model_map)
 
-    assert await scheduler.start_inference() is False
+    # The gated head yields the first lane to the resident backfill.
+    assert await scheduler.start_inference() is True
     for event in event_order:
         if event == "complete":
-            tracker.mark_job_loras_cached(head)
+            mark_job_aux_prepared(tracker, head)
             head_process.last_process_state = HordeProcessState.PRELOADED_MODEL
         else:
             await scheduler.start_inference()
@@ -226,8 +234,7 @@ async def test_download_completion_and_backfill_dispatch_orderings_admit_only_on
     await scheduler.start_inference()
 
     assert len(tracker.jobs_in_progress) == 1
-    expected = backfill if event_order[0] == "schedule" else head
-    assert tracker.jobs_in_progress[0] is expected
+    assert tracker.jobs_in_progress[0] is backfill
 
 
 async def test_backfill_retries_after_measured_vram_recovers() -> None:
@@ -249,33 +256,17 @@ async def test_backfill_retries_after_measured_vram_recovers() -> None:
     free_mb = {"value": 8_500.0}
     scheduler.set_device_free_mb_provider(lambda _device_index: free_mb["value"])
 
+    # The gated head holds nothing; the backfill is the dispatch head but its sampling peak does not fit the
+    # temporarily-held card, so it defers (holding no reservation) rather than over-committing.
     assert await scheduler.start_inference() is False
     assert await scheduler.start_inference() is False
     assert tracker.jobs_in_progress == ()
-    assert head_process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
+    assert head_process.last_control_flag is not HordeControlFlag.START_INFERENCE
 
     free_mb["value"] = 12_348.0
     scheduler._vram_arbiter = None
     assert await scheduler.start_inference() is True
     assert tracker.jobs_in_progress == (backfill,)
-
-
-async def test_process_replacement_during_preparation_retries_without_claiming_the_job() -> None:
-    """Losing the preparation lane leaves no orphan reservation and a replacement can retry the command."""
-    scheduler, tracker, head, old_process = await _resident_head_setup()
-
-    assert await scheduler.start_inference() is False
-    replacement = make_mock_process_info(0, model_name=_HEAD_MODEL, state=HordeProcessState.PRELOADED_MODEL)
-    replacement.total_vram_mb = 16_375
-    replacement.process_reserved_mb = 1_372
-    scheduler._process_map[0] = replacement
-
-    assert await scheduler.start_inference() is False
-    assert old_process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
-    assert replacement.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
-    assert head in tracker.jobs_pending_inference
-    assert head not in tracker.jobs_in_progress
-    assert scheduler._reserve_ledger.effective_planned_vram_mb({0: 1_372.0}) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -315,10 +306,10 @@ async def test_aux_preparation_is_independent_of_queue_and_worker_shape(
         device_free_mb=device_free_mb,
     )
 
-    assert await scheduler.start_inference() is False
+    await scheduler.start_inference()
     assert head in tracker.jobs_pending_inference
     assert head not in tracker.jobs_in_progress
-    assert head_process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
+    assert head_process.last_control_flag is not HordeControlFlag.START_INFERENCE
 
 
 class TestAuxPreparationControls:
@@ -342,23 +333,25 @@ class TestAuxPreparationControls:
     async def test_cached_lora_head_dispatches_normally(self) -> None:
         """A job already known to have its LoRAs ready does not repeat preparation."""
         scheduler, tracker, head, head_process = await _resident_head_setup(device_free_mb=24_000.0)
-        tracker.mark_job_loras_cached(head)
+        mark_job_aux_prepared(tracker, head)
 
         assert await scheduler.start_inference() is True
         assert head in tracker.jobs_in_progress
         assert head_process.last_control_flag is HordeControlFlag.START_INFERENCE
 
-    async def test_failed_prepare_send_leaves_job_pending_and_retryable(self) -> None:
-        """A failed preparation send neither claims the job nor converts it into an inference fault."""
+    async def test_unprepared_lora_head_holds_no_lane_and_never_samples(self) -> None:
+        """An unprepared LoRA head neither claims its lane nor faults; it simply waits, holding nothing."""
         scheduler, tracker, head, head_process = await _resident_head_setup()
-        head_process.pipe_connection.send.side_effect = Exception("closed test pipe")
 
         assert await scheduler.start_inference() is False
         assert head in tracker.jobs_pending_inference
         assert head not in tracker.jobs_in_progress
         assert head_process.last_control_flag is not HordeControlFlag.START_INFERENCE
+        assert scheduler._reserve_ledger.effective_planned_vram_mb({0: 1_372.0}) == 0.0
 
-        head_process.pipe_connection.send.side_effect = None
-        assert await scheduler.start_inference() is False
-        assert head_process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
-        assert head not in tracker.jobs_in_progress
+        # Once its files are known cached, the same head dispatches through ordinary admission.
+        mark_job_aux_prepared(tracker, head)
+        head_process.total_vram_mb = 16_375
+        assert await scheduler.start_inference() is True
+        assert head in tracker.jobs_in_progress
+        assert head_process.last_control_flag is HordeControlFlag.START_INFERENCE

@@ -24,6 +24,7 @@ rate-limit changes take effect mid-download (the worker loop is blocked inside t
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 import threading
@@ -35,6 +36,8 @@ from typing import TYPE_CHECKING, override
 if TYPE_CHECKING:
     from hordelib.model_manager.base import BaseModelManager
     from hordelib.model_manager.hyper import ModelManager
+    from hordelib.model_manager.lora import LoraModelManager
+    from hordelib.model_manager.ti import TextualInversionModelManager
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -42,6 +45,7 @@ except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock, Semaphore
 
+from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
 from horde_worker_regen.model_download_core import (
@@ -56,12 +60,20 @@ from horde_worker_regen.model_download_core import (
 )
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
+    AuxModelKind,
+    AuxModelRef,
+    AuxPrefetchEntry,
+    AuxPrefetchOutcome,
+    HordeAuxPrefetchControlMessage,
+    HordeAuxPrefetchResultMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeDownloadAvailabilityMessage,
     HordeDownloadControlMessage,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    FEATURE_LORA_ADHOC,
+    FEATURE_TI_ADHOC,
     CurrentDownloadStatus,
     DownloadFailure,
     DownloadItem,
@@ -74,9 +86,17 @@ from horde_worker_regen.process_management.lifecycle.horde_process import (
     WorkerCapability,
 )
 from horde_worker_regen.process_management.models.download_scheduler import (
+    LORA_MANAGER_KEY,
+    LORA_VERSION_MANAGER_KEY,
+    TI_MANAGER_KEY,
     DownloadKind,
     DownloadTask,
     HostAwareDownloadScheduler,
+)
+from horde_worker_regen.process_management.models.lora_disk_guard import (
+    configured_lora_budget_mb_from_env,
+    constrain_lora_cache_to_disk,
+    lora_disk_floor_mb_from_env,
 )
 
 DOWNLOAD_PROCESS_ID = 9000
@@ -90,6 +110,16 @@ _MAX_DOWNLOAD_ATTEMPTS = 3
 """How many times a per-file fetch (image/aux) is re-attempted after a transient failure before giving up."""
 _RETRY_BACKOFF_SECONDS = 10.0
 """Delay before re-queuing a failed per-file fetch (kept short; the scheduler then re-admits it)."""
+
+_ADHOC_PREFETCH_TIMEOUT_SECONDS = 1800.0
+"""Upper bound on one ad-hoc LoRA/TI fetch wait, so a wedged fetch frees the download slot.
+
+The parent's per-job aux deadline is the authoritative backstop that faults an unresolved job, so this
+bound only exists to reclaim the executor slot from a transfer that outlives any plausible slow download.
+It is deliberately far larger than the per-job deadline: reporting a failure here starts a duplicate
+transfer of the same file on the next reconcile re-request (the engine keeps no per-file dedup), so a
+slow-but-alive stream must be left to finish and populate the cache even after its original jobs faulted.
+A genuinely stalled stream is cut much earlier by the engine's per-chunk read timeout."""
 
 FEATURE_IMAGE_MODEL = "image model"
 FEATURE_LORA = "LoRa (default set)"
@@ -230,6 +260,27 @@ class HordeDownloadProcess(HordeProcess):
         # file across that many ranged connections to raise its rate). Retuned live via the control message.
         self._connections_per_file = max(1, connections_per_file)
         self._active: dict[tuple[DownloadKind, str, str], _TaskRuntime] = {}
+        # The pending jobs waiting on each in-flight ad-hoc prefetch task (keyed by the scheduler dedup key),
+        # so one deduplicated download reports its outcome back to every job that requested the same file.
+        self._prefetch_jobs: dict[tuple[DownloadKind, str, str], set[GenerationID]] = {}
+        # Terminal ad-hoc aux rejections (LoRA or TI: invalid/too-large/NSFW/permanently-unavailable) keyed by
+        # task dedup key, stashed by the fetch path and drained when its per-task outcome is emitted, so the
+        # outcome can carry the reason and mark the fetch non-retryable.
+        self._aux_rejections: dict[tuple[DownloadKind, str, str], str] = {}
+        # Aux-prefetch entries whose model manager was not yet loaded when their request arrived are stashed
+        # here (never failed: a still-loading downloader is transient, and faulting would self-inflict a job
+        # fault plus a pop backoff on the parent). They are replayed through the normal staging path once the
+        # managers load. Only the latest pin set is retained, since each request's pins supersede the prior.
+        self._pending_aux_entries: list[AuxPrefetchEntry] = []
+        self._pending_aux_pins: list[AuxModelRef] | None = None
+        # Failed per-file fetches awaiting their retry backoff, drained by the main loop. The retry cannot
+        # re-enqueue from the executor thread that just ran it: the task's dedup key stays in the scheduler's
+        # in-flight set until that thread releases it, so an immediate enqueue is silently dropped. Deferring
+        # to the main loop both survives that window and frees the executor slot during the backoff.
+        self._pending_retries: list[tuple[float, DownloadTask]] = []
+        # The latest config-desired image-model set, so a deferred retry for a model removed from config in
+        # the meantime is dropped exactly as the prune drops its queued counterpart.
+        self._desired_image_models: set[str] | None = None
         self._running_count = 0
         self._executor_threads: list[threading.Thread] = []
         self._executor_seq = 0
@@ -392,6 +443,9 @@ class HordeDownloadProcess(HordeProcess):
             with self._lock:
                 self._reload_requested = True
             return
+        if isinstance(message, HordeAuxPrefetchControlMessage):
+            self._handle_aux_prefetch_request(message)
+            return
         if not isinstance(message, HordeDownloadControlMessage):
             logger.warning(f"Download process received unexpected control message: {type(message).__name__}")
             return
@@ -404,6 +458,7 @@ class HordeDownloadProcess(HordeProcess):
         changed = False
         with self._lock:
             if desired is not None:
+                self._desired_image_models = set(desired)
                 kept = [name for name in self._pending_image_models if name in desired]
                 if len(kept) != len(self._pending_image_models):
                     self._pending_image_models = kept
@@ -462,6 +517,391 @@ class HordeDownloadProcess(HordeProcess):
                 changed = True
         if changed:
             self._send_status(self._phase, force=True)
+
+    # endregion
+
+    # region ad-hoc auxiliary prefetch (LoRA/TI, requested at job pop)
+
+    @staticmethod
+    def _resolve_lora_manager() -> LoraModelManager | None:
+        """Return the loaded LoRA manager, or None if the managers are not loaded yet."""
+        try:
+            from hordelib.api import SharedModelManager
+
+            return SharedModelManager.manager.lora
+        except Exception as e:  # noqa: BLE001 - a probe failure must not crash the download process
+            logger.debug(f"Download process: LoRA manager unavailable: {type(e).__name__}: {e}")
+            return None
+
+    @staticmethod
+    def _resolve_ti_manager() -> TextualInversionModelManager | None:
+        """Return the loaded textual-inversion manager, or None if the managers are not loaded yet."""
+        try:
+            from hordelib.api import SharedModelManager
+
+            return SharedModelManager.manager.ti
+        except Exception as e:  # noqa: BLE001 - a probe failure must not crash the download process
+            logger.debug(f"Download process: TI manager unavailable: {type(e).__name__}: {e}")
+            return None
+
+    def _handle_aux_prefetch_request(self, message: HordeAuxPrefetchControlMessage) -> None:
+        """Stage a popped job's LoRA/TI entries into the scheduler and apply the current eviction pins.
+
+        Entries already on disk report an immediate success outcome; the rest are enqueued as ad-hoc fetch
+        tasks whose per-entry outcome is reported when the executor finishes them. The pin set protects
+        every still-referenced auxiliary file from eviction while its job waits to dispatch.
+
+        An entry whose model manager has not finished loading is not a failure: it is stashed (along with the
+        latest pin set) and replayed once the managers load, so a job popped during the download process's
+        startup window is not faulted and does not arm the parent's LoRA-download pop backoff.
+        """
+        lora = self._resolve_lora_manager()
+        ti = self._resolve_ti_manager()
+        self._apply_eviction_pins(message.pins, lora, ti)
+
+        immediate, tasks, deferred = self._stage_aux_entries(message.entries, lora, ti)
+
+        if deferred or lora is None or ti is None:
+            # A manager still loading could not serve these entries, nor apply its pins; retain both to replay
+            # once it loads. The pin set is overwritten (not accumulated): the newest request is authoritative.
+            with self._lock:
+                self._pending_aux_entries.extend(deferred)
+                self._pending_aux_pins = list(message.pins)
+
+        if tasks:
+            self._scheduler.enqueue_many(tasks)
+        if immediate:
+            self._emit_prefetch_result(immediate)
+        self._send_status(self._phase, force=True)
+
+    def _stage_aux_entries(
+        self,
+        entries: list[AuxPrefetchEntry],
+        lora: LoraModelManager | None,
+        ti: TextualInversionModelManager | None,
+    ) -> tuple[list[AuxPrefetchOutcome], list[DownloadTask], list[AuxPrefetchEntry]]:
+        """Split prefetch entries into immediate outcomes, fetch tasks, and manager-absent (deferred) entries.
+
+        An entry whose manager is loaded resolves now: present on disk yields an immediate success outcome,
+        otherwise it becomes a deduplicated fetch task whose job id is registered against the task's dedup key
+        so the eventual outcome routes back to every requester. An entry whose manager is absent is returned
+        deferred for the caller to stash, never failed.
+        """
+        immediate: list[AuxPrefetchOutcome] = []
+        tasks: list[DownloadTask] = []
+        deferred: list[AuxPrefetchEntry] = []
+        for entry in entries:
+            manager_absent = (entry.kind is AuxModelKind.LORA and lora is None) or (
+                entry.kind is AuxModelKind.TI and ti is None
+            )
+            if manager_absent:
+                deferred.append(entry)
+                continue
+            if self._aux_entry_present(entry, lora, ti):
+                immediate.append(self._prefetch_outcome(entry, ok=True))
+                continue
+            task = self._aux_prefetch_task(entry)
+            with self._lock:
+                self._prefetch_jobs.setdefault(task.dedup_key, set()).add(entry.requesting_job_id)
+            tasks.append(task)
+        return immediate, tasks, deferred
+
+    def _drain_due_retries(self) -> None:
+        """Re-enqueue failed per-file fetches whose retry backoff has elapsed (runs on the main loop).
+
+        By now the failing run's executor thread has released the task's in-flight dedup slot, so the
+        enqueue is not deduplicated away. An image-model retry whose model was removed from config while it
+        waited is dropped, mirroring what the prune does to its queued counterpart.
+        """
+        now = time.monotonic()
+        with self._lock:
+            due = [task for due_at, task in self._pending_retries if now >= due_at]
+            if not due:
+                return
+            self._pending_retries = [(due_at, task) for due_at, task in self._pending_retries if now < due_at]
+            desired = self._desired_image_models
+        for task in due:
+            if task.kind is DownloadKind.IMAGE_MODEL and desired is not None and task.model_name not in desired:
+                continue
+            self._scheduler.enqueue(task)
+
+    def _replay_stashed_aux_prefetch(self) -> None:
+        """Replay aux-prefetch entries stashed while a model manager was still loading, applying stashed pins.
+
+        Runs on the main loop, where the managers are loaded. It drains the stash under the lock and restages
+        each entry through the same presence/dedup/enqueue path a live request uses, then applies the latest
+        stashed pin set. Idempotent: an entry whose manager is still absent (a manager that never loads) is
+        re-stashed rather than failed, so the parent's per-job deadline remains the authoritative backstop.
+        """
+        with self._lock:
+            if not self._pending_aux_entries and self._pending_aux_pins is None:
+                return
+            entries = self._pending_aux_entries
+            self._pending_aux_entries = []
+            pins = self._pending_aux_pins
+            self._pending_aux_pins = None
+
+        lora = self._resolve_lora_manager()
+        ti = self._resolve_ti_manager()
+        if pins is not None:
+            self._apply_eviction_pins(pins, lora, ti)
+
+        immediate, tasks, deferred = self._stage_aux_entries(entries, lora, ti)
+
+        if deferred or lora is None or ti is None:
+            with self._lock:
+                # Preserve any entries/pins a concurrent request stashed while we were replaying: prepend the
+                # still-unservable entries, and only restore our pin set if a newer one has not superseded it.
+                self._pending_aux_entries = deferred + self._pending_aux_entries
+                if pins is not None and self._pending_aux_pins is None:
+                    self._pending_aux_pins = pins
+
+        if tasks:
+            self._scheduler.enqueue_many(tasks)
+        if immediate:
+            self._emit_prefetch_result(immediate)
+
+    @staticmethod
+    def _prefetch_outcome(entry: AuxPrefetchEntry, *, ok: bool, detail: str | None = None) -> AuxPrefetchOutcome:
+        """Build a single-job outcome for an entry resolved (or rejected) at staging time."""
+        return AuxPrefetchOutcome(
+            kind=entry.kind,
+            name=entry.name,
+            is_version=entry.is_version,
+            ok=ok,
+            retryable=True,
+            detail=detail,
+            requesting_job_ids=[entry.requesting_job_id],
+        )
+
+    @staticmethod
+    def _aux_entry_present(
+        entry: AuxPrefetchEntry,
+        lora: LoraModelManager | None,
+        ti: TextualInversionModelManager | None,
+    ) -> bool:
+        """Whether *entry* is already resolvable on disk (a metadata-free short-circuit, no CivitAI call)."""
+        try:
+            if entry.kind is AuxModelKind.LORA:
+                return lora is not None and bool(lora.is_lora_available(entry.name, is_version=entry.is_version))
+            return ti is not None and ti.fuzzy_find_ti_key(entry.name) is not None
+        except Exception as e:  # noqa: BLE001 - a presence probe must not crash; treat as not present
+            logger.debug(f"Download process: aux presence probe for {entry.name!r} failed: {type(e).__name__}: {e}")
+            return False
+
+    @staticmethod
+    def _aux_prefetch_task(entry: AuxPrefetchEntry) -> DownloadTask:
+        """Build the host-tagged ad-hoc fetch task for a not-yet-present prefetch entry."""
+        if entry.kind is AuxModelKind.LORA:
+            manager_key = LORA_VERSION_MANAGER_KEY if entry.is_version else LORA_MANAGER_KEY
+            return DownloadTask(
+                kind=DownloadKind.LORA,
+                model_name=entry.name,
+                host="civitai.com",
+                feature=FEATURE_LORA_ADHOC,
+                manager_key=manager_key,
+            )
+        return DownloadTask(
+            kind=DownloadKind.TI,
+            model_name=entry.name,
+            host="civitai.com",
+            feature=FEATURE_TI_ADHOC,
+            manager_key=TI_MANAGER_KEY,
+        )
+
+    def _apply_eviction_pins(
+        self,
+        pins: list[AuxModelRef],
+        lora: LoraModelManager | None,
+        ti: TextualInversionModelManager | None,
+    ) -> None:
+        """Resolve the referenced pins to manager keys and protect them from eviction on both managers.
+
+        Best-effort: a ref that does not resolve to a key is skipped, and an empty pin set for a manager
+        clears its pins, restoring unrestricted eviction. The managers' own mutex guards the pin mutation,
+        so this does not take the coarse per-manager download lock (which a long fetch would hold).
+        """
+        lora_keys: set[str] = set()
+        ti_keys: set[str] = set()
+        for pin in pins:
+            try:
+                if pin.kind is AuxModelKind.LORA and lora is not None:
+                    key = lora.fuzzy_find_lora_key(pin.name)
+                    if key is not None:
+                        lora_keys.add(key)
+                elif pin.kind is AuxModelKind.TI and ti is not None:
+                    key = ti.fuzzy_find_ti_key(pin.name)
+                    if key is not None:
+                        ti_keys.add(key)
+            except Exception as e:  # noqa: BLE001 - a pin ref that will not resolve is skipped, never fatal
+                logger.debug(f"Download process: aux pin resolve for {pin.name!r} failed: {type(e).__name__}: {e}")
+        if lora is not None:
+            try:
+                lora.set_eviction_pins(lora_keys)
+            except Exception as e:  # noqa: BLE001 - applying pins is best-effort protection
+                logger.debug(f"Download process: applying LoRA eviction pins failed: {type(e).__name__}: {e}")
+        if ti is not None:
+            try:
+                ti.set_eviction_pins(ti_keys)
+            except Exception as e:  # noqa: BLE001 - applying pins is best-effort protection
+                logger.debug(f"Download process: applying TI eviction pins failed: {type(e).__name__}: {e}")
+
+    def _enforce_lora_disk_floor(self, manager: LoraModelManager) -> None:
+        """Constrain the ad-hoc LoRA cache to the free-space floor before fetching, honouring eviction pins.
+
+        Mirrors the inference-side guard so an ad-hoc fetch here observes the same minimum-free-disk floor:
+        the shared cache is one volume, so a fetch that ignored the floor could fill the disk out from under
+        the inference lanes. The installed hordelib ``fetch_adhoc_lora`` does not enforce this itself, so the
+        torch-free disk guard is run here first, capping the ad-hoc budget to what the volume can hold and
+        evicting least-recently-used ad-hoc LoRAs to clear the floor. Eviction runs through the manager's own
+        ``find_oldest_adhoc_entry``/``delete_oldest`` surface, which skips the eviction-pinned files applied
+        via ``set_eviction_pins``, so a file another still-pending job needs is never evicted to make room.
+        Best-effort: any failure is logged and the fetch proceeds, exactly as on the inference side.
+        """
+        floor_mb = lora_disk_floor_mb_from_env(os.getenv)
+        if floor_mb <= 0:
+            return
+        try:
+            result = constrain_lora_cache_to_disk(
+                manager,  # type: ignore[arg-type]  # structural LoraCacheManager; avoids a wider hordelib import
+                floor_mb=floor_mb,
+                configured_budget_mb=configured_lora_budget_mb_from_env(os.getenv),
+            )
+        except Exception as guard_error:  # noqa: BLE001 - the guard must never break the download path
+            logger.debug(f"Download process: LoRA disk guard failed: {type(guard_error).__name__} {guard_error}")
+            return
+        if result.acted:
+            logger.info(
+                f"Download process: LoRA disk guard evicted {result.evicted_count} ad-hoc LoRA(s) "
+                f"(free {result.free_mb_before} -> {result.free_mb_after} MB, floor {floor_mb:.0f} MB).",
+            )
+
+    def _fetch_adhoc_lora_task(
+        self,
+        manager: LoraModelManager,
+        task: DownloadTask,
+        callback: Callable[[int, int], None],
+    ) -> bool:
+        """Ensure one ad-hoc LoRA is on disk; short-circuit if already present, else fetch with a bound.
+
+        The per-chunk *callback* feeds the task's live progress snapshot, so the TUI and the parent's
+        deadline deferral see real byte movement, and the pause/rate controls apply to the stream.
+        """
+        is_version = task.manager_key == LORA_VERSION_MANAGER_KEY
+        # The manager lock covers only the presence probe and floor eviction: the fetch itself waits on the
+        # engine's own per-record completion (its internal pool serializes what actually needs serializing),
+        # so one slow transfer must not hold the lock and stall every other LoRA prefetch behind it.
+        with self._manager_lock(LORA_MANAGER_KEY):
+            if manager.is_lora_available(task.model_name, is_version=is_version):
+                return True
+            self._enforce_lora_disk_floor(manager)
+        try:
+            key, rejected_reason = manager.fetch_adhoc_lora_with_reason(
+                task.model_name,
+                timeout=int(_ADHOC_PREFETCH_TIMEOUT_SECONDS),
+                is_version=is_version,
+                progress_callback=callback,
+            )
+        except TimeoutError:
+            # hordelib's fetch raises on its wait bound, which fires even when the file lands exactly at the
+            # bound; fall through to the availability re-check so a file now on disk reports success, not a
+            # spurious failure. The parent's per-job deadline remains the backstop for a truly-absent file.
+            key = None
+            rejected_reason = None
+        if key is not None:
+            logger.success(f"Download process: prefetched LoRA {task.model_name}")
+            return True
+        if manager.is_lora_available(task.model_name, is_version=is_version):
+            return True
+        if rejected_reason is not None:
+            # A terminal rejection (bad/too-large/NSFW metadata) will never land on disk. Record it so the
+            # emitted outcome tells the parent to skip this LoRA and dispatch the job without it.
+            with self._lock:
+                self._aux_rejections[task.dedup_key] = str(rejected_reason)
+            logger.info(
+                f"Download process: LoRA {task.model_name!r} rejected from ad-hoc download ({rejected_reason}); "
+                "requesting job(s) will proceed without it.",
+            )
+        return False
+
+    def _fetch_adhoc_ti_task(
+        self,
+        manager: TextualInversionModelManager,
+        task: DownloadTask,
+        callback: Callable[[int, int], None],
+    ) -> bool:
+        """Ensure one ad-hoc textual inversion is on disk; short-circuit if present, else fetch with a bound.
+
+        The per-chunk *callback* mirrors the LoRA variant: live progress for observability and deadline
+        deferral, plus pause/rate control over the stream.
+        """
+        # As for LoRA: only the presence probe holds the manager lock, so a slow embedding transfer cannot
+        # serialize every other TI prefetch behind it.
+        with self._manager_lock(TI_MANAGER_KEY):
+            if manager.fuzzy_find_ti_key(task.model_name) is not None:
+                return True
+        try:
+            key, rejected_reason = manager.fetch_adhoc_ti_with_reason(
+                task.model_name,
+                timeout=_ADHOC_PREFETCH_TIMEOUT_SECONDS,
+                progress_callback=callback,
+            )
+        except TimeoutError:
+            # As for LoRA: the fetch wait can raise even when the embedding lands at the bound, so fall
+            # through to the availability re-check rather than reporting a failure for a file now present.
+            key = None
+            rejected_reason = None
+        if key is not None:
+            logger.success(f"Download process: prefetched TI {task.model_name}")
+            return True
+        if manager.fuzzy_find_ti_key(task.model_name) is not None:
+            return True
+        if rejected_reason is not None:
+            # A terminal rejection (the Hordeling permanently refuses this embedding, or its metadata is
+            # bad/too-large/NSFW) will never land on disk. Record it so the emitted outcome tells the parent
+            # to skip this TI and dispatch the job without it.
+            with self._lock:
+                self._aux_rejections[task.dedup_key] = str(rejected_reason)
+            logger.info(
+                f"Download process: TI {task.model_name!r} rejected from ad-hoc download ({rejected_reason}); "
+                "requesting job(s) will proceed without it.",
+            )
+        return False
+
+    def _emit_prefetch_outcome(self, task: DownloadTask, *, ok: bool, aborted: bool, reason: str | None) -> None:
+        """Report one finished ad-hoc prefetch task back to every job that requested it."""
+        with self._lock:
+            job_ids = self._prefetch_jobs.pop(task.dedup_key, set())
+            rejection = self._aux_rejections.pop(task.dedup_key, None)
+        kind = AuxModelKind.LORA if task.kind is DownloadKind.LORA else AuxModelKind.TI
+        is_version = task.manager_key == LORA_VERSION_MANAGER_KEY
+        succeeded = ok and not aborted
+        outcome = AuxPrefetchOutcome(
+            kind=kind,
+            name=task.model_name,
+            is_version=is_version,
+            ok=succeeded,
+            # A terminal aux rejection is not worth retrying; a stalled/aborted/plain failure is, within the
+            # parent's per-job deadline (the parent owns the terminal give-up for those).
+            retryable=rejection is None,
+            rejection_reason=rejection,
+            detail=None if succeeded else (rejection or reason or ("aborted" if aborted else "download failed")),
+            requesting_job_ids=sorted(job_ids, key=str),
+        )
+        self._emit_prefetch_result([outcome])
+
+    def _emit_prefetch_result(self, outcomes: list[AuxPrefetchOutcome]) -> None:
+        """Send an aux-prefetch result message to the parent (never aborts the caller on a queue error)."""
+        message = HordeAuxPrefetchResultMessage(
+            process_id=self.process_id,
+            process_launch_identifier=self.process_launch_identifier,
+            info="aux prefetch result",
+            outcomes=outcomes,
+        )
+        try:
+            self.process_message_queue.put(message)
+        except Exception as e:  # noqa: BLE001 - a result emit must never abort an in-flight download
+            logger.debug(f"Download process: aux prefetch result emit failed: {type(e).__name__}: {e}")
 
     # endregion
 
@@ -631,6 +1071,10 @@ class HordeDownloadProcess(HordeProcess):
         executor-thread pool (:meth:`_executor_loop`), so several hosts download at once. A reference reload
         is deferred until the process is fully idle so it never races an executor reading the managers.
         """
+        # The managers are loaded by the time the main loop reaches here, so any entries stashed during the
+        # startup window (before the control thread's requests could be served) are now staged for real.
+        self._replay_stashed_aux_prefetch()
+        self._drain_due_retries()
         with self._lock:
             paused = self._paused
             reload_requested = self._reload_requested
@@ -1074,7 +1518,11 @@ class HordeDownloadProcess(HordeProcess):
             with self._lock:
                 self._reference_changed_pending = True
 
-        if aborted:
+        if task.kind in (DownloadKind.LORA, DownloadKind.TI):
+            # Ad-hoc prefetch reports a per-entry outcome to the requesting job(s); the parent owns the
+            # retry/backoff/deadline, so these never enter the generic TUI-failure or re-queue bookkeeping.
+            self._emit_prefetch_outcome(task, ok=success, aborted=aborted, reason=reason)
+        elif aborted:
             self._forget_attempts(task)
         elif success:
             self._clear_failure(task.model_name)
@@ -1104,13 +1552,11 @@ class HordeDownloadProcess(HordeProcess):
             f"Download process: {task.model_name} failed ({reason}); retry {attempts}/{_MAX_DOWNLOAD_ATTEMPTS} "
             f"in {_RETRY_BACKOFF_SECONDS:.0f}s",
         )
-        # Back off on this task's own executor thread, then re-queue; a config removal that lands meanwhile
-        # prunes the re-queued task (it is an IMAGE_MODEL not in the desired set) so the retry self-cancels.
-        for _ in range(int(_RETRY_BACKOFF_SECONDS * 10)):
-            if self._end_process:
-                return
-            time.sleep(0.1)
-        self._scheduler.enqueue(task)
+        # Defer the re-enqueue to the main loop rather than enqueueing here: this executor thread still holds
+        # the task's in-flight dedup slot (released only after this returns), so an immediate enqueue would be
+        # silently deduplicated away and the retry lost. Deferring also frees the executor during the backoff.
+        with self._lock:
+            self._pending_retries.append((time.monotonic() + _RETRY_BACKOFF_SECONDS, task))
 
     def _dispatch_task(self, task: DownloadTask, callback: Callable[[int, int], None]) -> bool:
         """Run *task* against the right manager method for its kind; return whether it succeeded.
@@ -1154,6 +1600,16 @@ class HordeDownloadProcess(HordeProcess):
         if task.kind is DownloadKind.ANNOTATOR_VERIFY:
             self._verify_annotators(manager)
             return True
+        if task.kind is DownloadKind.LORA:
+            lora = manager.lora
+            if lora is None:
+                return False
+            return self._fetch_adhoc_lora_task(lora, task, callback)
+        if task.kind is DownloadKind.TI:
+            ti = manager.ti
+            if ti is None:
+                return False
+            return self._fetch_adhoc_ti_task(ti, task, callback)
         return False
 
     def _manager_lock(self, manager_key: str) -> threading.Lock:

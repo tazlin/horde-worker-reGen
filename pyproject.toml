@@ -28,11 +28,14 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.27.0",
     "horde_safety~=0.3.0",
-    # Requires horde-engine (hordelib) 6.0.0+: the process VRAM telemetry the memory reporter depends on
-    # (hordelib.api.get_process_vram_stats, hordelib.utils.torch_memory.offthread_vram_sampling_ready)
-    # and the disaggregated stage execution surface (hordelib.execution.stage_payloads plus the
-    # HordeLib encode_text_stage / sample_stage / vae_encode_stage / decode_stage entry points).
-    "horde_engine[layerdiffuse,upscale-extra]>=6.1.0,<7.0.0",
+    # Requires horde-engine (hordelib) 6.3.3+: process VRAM telemetry (hordelib.api.get_process_vram_stats,
+    # hordelib.utils.torch_memory.offthread_vram_sampling_ready), the disaggregated stage execution surface
+    # (hordelib.execution.stage_payloads plus the HordeLib encode_text_stage / sample_stage / vae_encode_stage /
+    # decode_stage entry points), atomic adhoc weight writes, the read-only adhoc model manager mode
+    # (SharedModelManager.load_model_managers adhoc_read_only) that inference children construct with, and the
+    # streamed adhoc fetch surface (fetch_adhoc_lora/fetch_adhoc_ti progress_callback + per-record completion)
+    # the download process passes its live progress callback into.
+    "horde_engine[layerdiffuse,upscale-extra]>=6.3.3,<7.0.0",
     "horde_model_reference>=7.5.0,<8.0.0",
     "python-dotenv",
     "ruamel.yaml",
@@ -108,6 +111,7 @@ download_models = "horde_worker_regen.download_models:main"
 horde-worker = "horde_worker_regen.tui.app:main"
 horde-worker-web = "horde_worker_regen.tui.web:main"
 horde-worker-host = "horde_worker_regen.tui.worker_host:main"
+horde-worker-attach = "horde_worker_regen.attach_supervisor:main"
 horde-benchmark = "horde_worker_regen.benchmark.cli:main"
 horde-duty-report = "horde_worker_regen.analysis.duty_log_report:main"
 horde-log = "horde_worker_regen.analysis.log_triage_cli:main"

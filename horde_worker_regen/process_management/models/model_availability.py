@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import ADHOC_PREFETCH_FEATURES
+
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadStatusSnapshot
 
@@ -100,21 +102,28 @@ class ModelAvailability:
 
     @property
     def background_download_active(self) -> bool:
-        """Whether the background download process is actively consuming download bandwidth.
+        """Whether a non-prefetch background download is actively consuming download bandwidth.
 
-        A task stays a reported in-flight download for the whole of ``download_one_model``, which
-        includes the post-transfer ``validate_model`` sha256 pass. That verification consumes no network
-        bandwidth, so a download whose bytes have completed (``downloaded_bytes >= total_bytes``) does not
-        count as active here: otherwise the LoRA-pop guard would stay latched through a minutes-long hash
-        of the final model with no further download to mask it. A download with an unknown total
-        (``percent is None``) is still treated as active, since completion cannot be ruled out. When
-        several downloads run in parallel (``active``), the guard holds while *any* of them is still
-        transferring.
+        This gates the worker-wide LoRA-advertising suppression, so it deliberately ignores the job-driven
+        ad-hoc LoRA/TI prefetch downloads (``ADHOC_PREFETCH_FEATURES``): that pipeline is itself how a LoRA
+        job becomes dispatchable, so counting it here would suppress LoRA pops the moment a single prefetch
+        ran and self-serialize LoRA intake. Only bulk/default seeding and image/aux model fetches count.
+
+        A task stays a reported in-flight download for the whole of ``download_one_model``, which includes the
+        post-transfer ``validate_model`` sha256 pass. That verification consumes no network bandwidth, so a
+        download whose bytes have completed (``downloaded_bytes >= total_bytes``) does not count as active
+        here: otherwise the guard would stay latched through a minutes-long hash of the final model with no
+        further download to mask it. A download with an unknown total (``percent is None``) is still treated
+        as active, since completion cannot be ruled out. When several downloads run in parallel (``active``),
+        the guard holds while *any* non-prefetch download is still transferring.
         """
         if self._status is None or self._status.phase.value != _DOWNLOADING_PHASE_VALUE:
             return False
         in_flight = self._status.active or ([self._status.current] if self._status.current is not None else [])
-        return any(download.percent is None or download.percent < 100.0 for download in in_flight)
+        return any(
+            download.feature not in ADHOC_PREFETCH_FEATURES and (download.percent is None or download.percent < 100.0)
+            for download in in_flight
+        )
 
     @property
     def present(self) -> set[str] | None:

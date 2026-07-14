@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -42,6 +42,7 @@ from tests.process_management.conftest import (
     make_test_card_runtimes,
     make_test_model_metadata,
     make_test_runtime_config,
+    mark_job_aux_prepared,
     mark_job_in_progress_async,
     track_popped_job_async,
 )
@@ -90,7 +91,6 @@ def _make_inference_scheduler(
         process_lifecycle=Mock(
             get_processes_with_model_for_queued_job=Mock(return_value=[]),
             is_model_load_quarantined=Mock(return_value=False),
-            aux_download_deadline_for_dispatch=Mock(return_value=120.0),
         ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=model_metadata if model_metadata is not None else make_test_model_metadata(),
@@ -203,63 +203,6 @@ class TestWddmPagingVictimAccessor:
         scheduler.note_wddm_paging({}, active=False)
 
         assert scheduler.wddm_paging_victim_shared_mb_by_pid(5.0) == {}
-
-
-class TestLineSkipRejectionLogThrottle:
-    """The line-skip rejection log is rate-limited per (candidate, reason) without losing fidelity."""
-
-    def _capture(self, fn) -> list[str]:  # noqa: ANN001
-        """Run ``fn`` with a temporary loguru sink and return the line-skip messages it emitted."""
-        from loguru import logger
-
-        messages: list[str] = []
-        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
-        try:
-            fn()
-        finally:
-            logger.remove(sink_id)
-        return [m for m in messages if "Line-skip candidate" in m]
-
-    def test_identical_rejection_repeats_are_throttled(self) -> None:
-        """Re-evaluating the same (candidate, reason) within the interval logs only once."""
-        scheduler = _make_inference_scheduler()
-
-        def emit() -> None:
-            for _ in range(5):
-                scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
-
-        emitted = self._capture(emit)
-        assert len(emitted) == 1
-        assert "rejected: candidate has LoRAs." in emitted[0]
-
-    def test_distinct_reason_or_candidate_logs_immediately(self) -> None:
-        """A changed reason or a different candidate is not suppressed (full fidelity preserved)."""
-        scheduler = _make_inference_scheduler()
-
-        def emit() -> None:
-            scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
-            scheduler._log_line_skip_rejection("abc12345", "same_model", "rejected: same model as blocked job head.")
-            scheduler._log_line_skip_rejection("def67890", "has_loras", "rejected: candidate has LoRAs.")
-
-        emitted = self._capture(emit)
-        assert len(emitted) == 3
-
-    def test_throttle_lifts_after_interval(self) -> None:
-        """Once the interval elapses, the same rejection logs again."""
-        from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-            _LINE_SKIP_REJECTION_LOG_INTERVAL,
-        )
-
-        scheduler = _make_inference_scheduler()
-
-        def emit() -> None:
-            scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
-            # Age the recorded timestamp past the interval so the next call re-emits.
-            scheduler._line_skip_rejection_log_state["abc12345:has_loras"] -= _LINE_SKIP_REJECTION_LOG_INTERVAL + 1
-            scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
-
-        emitted = self._capture(emit)
-        assert len(emitted) == 2
 
 
 class TestPreloadModels:
@@ -418,13 +361,13 @@ class TestPreloadModels:
     @pytest.mark.parametrize(
         "process_state",
         [
-            HordeProcessState.DOWNLOADING_AUX_MODEL,
-            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+            HordeProcessState.DOWNLOADING_MODEL,
+            HordeProcessState.PRELOADING_MODEL,
             HordeProcessState.UNLOADED_MODEL_FROM_RAM,
         ],
     )
-    def test_loading_entry_survives_aux_download_preload_states(self, process_state: HordeProcessState) -> None:
-        """Aux-download preload states are valid owners of a LOADING model-map entry."""
+    def test_loading_entry_survives_valid_loading_owner_states(self, process_state: HordeProcessState) -> None:
+        """A process mid-load (or freshly RAM-unloaded) is a valid owner of a LOADING model-map entry."""
         process_info = make_mock_process_info(0, model_name="new_model", state=process_state)
         process_map = ProcessMap({0: process_info})
         horde_model_map = HordeModelMap(
@@ -667,131 +610,29 @@ class TestGetNextJobAndProcess:
         assert await inference_scheduler.get_next_job_and_process() is None
 
 
-class TestAuxDownloadLineSkip:
-    """Tests for modest resident jobs bypassing a head job blocked on aux downloads."""
+class TestAuxGatedSiblingDispatch:
+    """A gated auxiliary head holds no lane, so a fitting same-model sibling becomes the dispatch head."""
 
-    async def _make_scheduler(
-        self,
-        *,
-        candidate_job: ImageGenerateJobPopResponse | None = None,
-        candidate_process_state: HordeProcessState = HordeProcessState.PRELOADED_MODEL,
-        exclusive_active_job: bool = False,
-        bridge_data: Mock | None = None,
-    ) -> tuple[InferenceScheduler, JobTracker, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
-        """Create a queue where the head job's model is busy downloading aux models."""
-        blocked_process = make_mock_process_info(
-            0,
-            model_name="blocked_model",
-            state=HordeProcessState.DOWNLOADING_AUX_MODEL,
-        )
-        candidate_process = make_mock_process_info(
-            1,
-            model_name="small_model",
-            state=candidate_process_state,
-        )
-        process_map = ProcessMap({0: blocked_process, 1: candidate_process})
-        job_tracker = JobTracker()
+    async def test_same_model_non_aux_sibling_is_fed_while_lora_head_gated(self) -> None:
+        """A same-model non-aux job is fed onto an idle sibling while an unprepared LoRA head stays gated.
 
-        active_aux_job = make_job_pop_response("blocked_model")
-        await track_popped_job_async(job_tracker, active_aux_job)
-        await mark_job_in_progress_async(job_tracker, active_aux_job)
-        if exclusive_active_job:
-            job_tracker.mark_admitted_exclusive(active_aux_job)
-
-        blocked_head_job = make_job_pop_response("blocked_model")
-        await track_popped_job_async(job_tracker, blocked_head_job)
-
-        if candidate_job is None:
-            candidate_job = make_job_pop_response("small_model")
-        await track_popped_job_async(job_tracker, candidate_job)
-
-        scheduler = _make_inference_scheduler(
-            process_map=process_map,
-            job_tracker=job_tracker,
-            bridge_data=bridge_data,
-            max_concurrent=1,
-            max_inference=2,
-        )
-        return scheduler, job_tracker, blocked_head_job, candidate_job
-
-    async def test_modest_resident_job_bypasses_aux_download_cap(self) -> None:
-        """A small resident job can dispatch while the capped slot is only downloading aux models."""
-        scheduler, job_tracker, blocked_head_job, candidate_job = await self._make_scheduler()
-
-        result = await scheduler.get_next_job_and_process()
-
-        assert result is not None
-        assert result.next_job is candidate_job
-        assert result.process_with_model.process_id == 1
-        assert result.line_skip is not None
-        assert result.line_skip.displaced_job is blocked_head_job
-
-        assert await scheduler.start_inference() is True
-        assert candidate_job in job_tracker.jobs_in_progress
-
-    async def test_ready_head_bypasses_cap_occupied_by_an_active_aux_download(self) -> None:
-        """A popped resident head runs when the nominal sampling slot is only fetching another job's LoRAs."""
-        downloading_process = make_mock_process_info(
-            0,
-            model_name="downloading_model",
-            state=HordeProcessState.DOWNLOADING_AUX_MODEL,
-        )
-        ready_process = make_mock_process_info(
-            1,
-            model_name="ready_model",
-            state=HordeProcessState.PRELOADED_MODEL,
-        )
-        job_tracker = JobTracker()
-        active_aux_job = make_job_pop_response(
-            "downloading_model",
-            loras=[LorasPayloadEntry(name="active-download")],
-        )
-        downloading_process.last_job_referenced = active_aux_job
-        await track_popped_job_async(job_tracker, active_aux_job)
-        await mark_job_in_progress_async(job_tracker, active_aux_job)
-        ready_head = make_job_pop_response("ready_model")
-        await track_popped_job_async(job_tracker, ready_head)
-        scheduler = _make_inference_scheduler(
-            process_map=ProcessMap({0: downloading_process, 1: ready_process}),
-            job_tracker=job_tracker,
-            max_concurrent=1,
-            max_inference=2,
-        )
-
-        result = await scheduler.get_next_job_and_process()
-
-        assert result is not None
-        assert result.next_job is ready_head
-        assert result.process_with_model is ready_process
-        assert result.line_skip is not None
-        assert result.line_skip.displaced_job is active_aux_job
-
-    async def test_same_model_candidate_bypasses_via_idle_sibling(self) -> None:
-        """A candidate sharing the blocked head's model skips onto a different idle resident lane.
-
-        A mono-model queue whose one head stalls on a LoRA download would otherwise starve the GPU: every
-        alternative shares the head's model, so the different-model line-skip finds nothing. Routing the
-        same-model job onto a sibling copy (never the downloading slot) keeps the card sampling.
+        A mono-model queue whose head carries not-yet-prepared LoRAs would otherwise starve the GPU. The LoRA
+        head is invisible to dispatch (it holds no lane until its prefetch clears its gate), so a same-model
+        non-LoRA job simply becomes the dispatch head and is fed onto the idle sibling lane, keeping the card
+        sampling. The gated LoRA head is never selected.
         """
-        blocked_process = make_mock_process_info(
-            0, model_name="blocked_model", state=HordeProcessState.DOWNLOADING_AUX_MODEL
-        )
         idle_sibling = make_mock_process_info(2, model_name="blocked_model", state=HordeProcessState.PRELOADED_MODEL)
-        process_map = ProcessMap({0: blocked_process, 2: idle_sibling})
+        process_map = ProcessMap({2: idle_sibling})
         job_tracker = JobTracker()
 
-        active_aux_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-a")])
-        await track_popped_job_async(job_tracker, active_aux_job)
-        await mark_job_in_progress_async(job_tracker, active_aux_job)
-
-        blocked_head_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-b")])
-        await track_popped_job_async(job_tracker, blocked_head_job)
+        lora_head = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-b")])
+        await track_popped_job_async(job_tracker, lora_head)
 
         same_model_candidate = make_job_pop_response("blocked_model")
         await track_popped_job_async(job_tracker, same_model_candidate)
 
         scheduler = _make_inference_scheduler(
-            process_map=process_map, job_tracker=job_tracker, max_concurrent=1, max_inference=2
+            process_map=process_map, job_tracker=job_tracker, max_concurrent=2, max_inference=2
         )
 
         result = await scheduler.get_next_job_and_process()
@@ -799,107 +640,9 @@ class TestAuxDownloadLineSkip:
         assert result is not None
         assert result.next_job is same_model_candidate
         assert result.process_with_model.process_id == 2
-        assert result.line_skip is not None
-        assert result.line_skip.displaced_job is blocked_head_job
-
-    async def test_same_model_candidate_rejected_without_idle_sibling(self) -> None:
-        """CONTROL: with the head's model resident only on the downloading slot, no same-model skip is made."""
-        blocked_process = make_mock_process_info(
-            0, model_name="blocked_model", state=HordeProcessState.DOWNLOADING_AUX_MODEL
-        )
-        process_map = ProcessMap({0: blocked_process})
-        job_tracker = JobTracker()
-
-        active_aux_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-a")])
-        await track_popped_job_async(job_tracker, active_aux_job)
-        await mark_job_in_progress_async(job_tracker, active_aux_job)
-
-        blocked_head_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-b")])
-        await track_popped_job_async(job_tracker, blocked_head_job)
-
-        same_model_candidate = make_job_pop_response("blocked_model")
-        await track_popped_job_async(job_tracker, same_model_candidate)
-
-        scheduler = _make_inference_scheduler(
-            process_map=process_map, job_tracker=job_tracker, max_concurrent=1, max_inference=2
-        )
-
-        assert await scheduler.get_next_job_and_process() is None
-
-    async def test_aux_download_cap_bypass_rejects_oversized_candidate(self) -> None:
-        """The cap bypass still enforces the performance-mode eMPS threshold."""
-        large_candidate = make_job_pop_response("small_model", width=1024, height=1024, ddim_steps=500)
-        bridge_data = make_mock_bridge_data(high_performance_mode=True)
-        scheduler, _, _, _ = await self._make_scheduler(candidate_job=large_candidate, bridge_data=bridge_data)
-
-        assert await scheduler.get_next_job_and_process() is None
-
-    async def test_aux_download_cap_bypass_rejects_lora_candidate(self) -> None:
-        """A bypass candidate that also needs LoRA work must not jump the line."""
-        lora_candidate = make_job_pop_response(
-            "small_model",
-            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
-        )
-        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
-
-        assert await scheduler.get_next_job_and_process() is None
-
-    async def test_aux_download_cap_bypass_requires_ready_candidate_process(self) -> None:
-        """The resident candidate's process must be able to accept work."""
-        scheduler, _, _, _ = await self._make_scheduler(
-            candidate_process_state=HordeProcessState.INFERENCE_STARTING,
-        )
-
-        assert await scheduler.get_next_job_and_process() is None
-
-    async def test_aux_download_cap_bypass_respects_exclusive_in_progress_job(self) -> None:
-        """Exclusive jobs keep full-device isolation even when the head slot is downloading aux models."""
-        scheduler, _, _, _ = await self._make_scheduler(exclusive_active_job=True)
-
-        assert await scheduler.get_next_job_and_process() is None
-
-    async def test_stalled_aux_download_without_bypass_arms_the_pop_candidate_flag(self) -> None:
-        """With no suitable bypass job and the aux download past its threshold, the pop-candidate flag arms."""
-        lora_candidate = make_job_pop_response(
-            "small_model",
-            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
-        )
-        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
-        # The blocked slot has been downloading aux models for longer than the configured threshold.
-        scheduler._process_map[0].last_received_timestamp = time.time() - 10.0
-
-        assert await scheduler.get_next_job_and_process() is None
-        assert scheduler._state.wants_line_skip_candidate is True
-
-    async def test_fresh_aux_download_does_not_arm_the_pop_candidate_flag(self) -> None:
-        """An aux download still inside the threshold does not arm the flag."""
-        lora_candidate = make_job_pop_response(
-            "small_model",
-            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
-        )
-        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
-
-        assert await scheduler.get_next_job_and_process() is None
-        assert scheduler._state.wants_line_skip_candidate is False
-
-    async def test_pop_candidate_flag_clears_once_no_aux_download_exceeds_the_threshold(self) -> None:
-        """The armed flag (which bypasses the in-progress cap) resets when the blocking download ends.
-
-        Left armed, the flag would exempt every future scheduling pass from the in-progress cap for the
-        rest of the session.
-        """
-        lora_candidate = make_job_pop_response(
-            "small_model",
-            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
-        )
-        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
-        scheduler._state.wants_line_skip_candidate = True
-        # The blocked slot's aux download completed; it is preloading/serving again.
-        scheduler._process_map[0].last_process_state = HordeProcessState.PRELOADED_MODEL
-
-        await scheduler.get_next_job_and_process()
-
-        assert scheduler._state.wants_line_skip_candidate is False
+        # No line-skip is needed: the gated LoRA head is not the dispatch head, so the sibling is the head.
+        assert result.line_skip is None
+        assert result.next_job is not lora_head
 
 
 class TestStartInference:
@@ -1613,3 +1356,170 @@ class TestWorkingSetResidency:
 
         assert scheduler.unload_models() is False
         assert process_map[0].last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+
+
+class TestAuxPreparationGate:
+    """The dispatch gate for jobs carrying auxiliary files (LoRAs and textual inversions).
+
+    A job whose auxiliary files are not yet prepared must not dispatch: it holds no lane and no reservation
+    (start_inference returns without adding it to jobs_in_progress) and instead has its files prepared while
+    it stays pending. Once its prepared flag is set, ordinary admission proceeds and it is GPU-fed. The gate
+    covers textual inversions the same way it covers LoRAs.
+    """
+
+    def _lora(self, name: str = "styleA") -> LorasPayloadEntry:
+        return LorasPayloadEntry(name=name, model=1.0, clip=1.0, is_version=False)
+
+    async def _resident(
+        self,
+        job: ImageGenerateJobPopResponse,
+    ) -> tuple[InferenceScheduler, ProcessMap, JobTracker]:
+        """Build a scheduler where ``job``'s model is resident on an idle preloaded process."""
+        process_info = make_mock_process_info(0, model_name=job.model, state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(root={})
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, job)
+        horde_model_map.update_entry(
+            horde_model_name=job.model,
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=0,
+        )
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+        )
+        return scheduler, process_map, job_tracker
+
+    async def test_unprepared_lora_head_holds_no_lane(self) -> None:
+        """An unprepared LoRA head does not dispatch: it stays pending, unclaimed, and holds no lane.
+
+        Preparation is the pop-time prefetch pipeline's job; the scheduler never dispatches the gated head nor
+        sends it any control message, so it holds no lane and no reservation while its files are placed on disk.
+        """
+        job = make_job_pop_response("stable_diffusion", loras=[self._lora()])
+        scheduler, process_map, job_tracker = await self._resident(job)
+
+        assert await scheduler.start_inference() is False
+        assert job not in job_tracker.jobs_in_progress
+        assert job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+        assert process_map[0].last_control_flag != HordeControlFlag.START_INFERENCE
+
+    async def test_prepared_lora_head_is_gpu_fed(self) -> None:
+        """Once its aux-prepared flag is set, the LoRA head dispatches and enters progress."""
+        job = make_job_pop_response("stable_diffusion", loras=[self._lora()])
+        scheduler, process_map, job_tracker = await self._resident(job)
+        mark_job_aux_prepared(job_tracker, job)
+
+        assert await scheduler.start_inference() is True
+        assert job in job_tracker.jobs_in_progress
+        assert process_map[0].last_control_flag == HordeControlFlag.START_INFERENCE
+
+    async def test_unprepared_ti_head_holds_no_lane(self) -> None:
+        """A textual-inversion job gates exactly like a LoRA job: unprepared, it does not dispatch."""
+        job = make_job_pop_response("stable_diffusion", tis=[TIPayloadEntry(name="emb-1")])
+        scheduler, process_map, job_tracker = await self._resident(job)
+
+        assert await scheduler.start_inference() is False
+        assert job not in job_tracker.jobs_in_progress
+        assert process_map[0].last_control_flag != HordeControlFlag.START_INFERENCE
+
+    async def test_prepared_ti_head_is_gpu_fed(self) -> None:
+        """A prepared textual-inversion job dispatches like any other resident job."""
+        job = make_job_pop_response("stable_diffusion", tis=[TIPayloadEntry(name="emb-1")])
+        scheduler, _process_map, job_tracker = await self._resident(job)
+        mark_job_aux_prepared(job_tracker, job)
+
+        assert await scheduler.start_inference() is True
+        assert job in job_tracker.jobs_in_progress
+
+    async def test_non_aux_sibling_dispatches_while_a_lora_job_is_unprepared(self) -> None:
+        """A job with no auxiliary files is never gated: it is GPU-fed even while a LoRA job awaits preparation.
+
+        Both jobs' models are resident on their own idle lanes. The plain job carries no reservation-holding
+        dependency on the LoRA job's preparation, so the scheduler feeds it across successive ticks.
+        """
+        plain = make_job_pop_response("plain_model")
+        lora_job = make_job_pop_response("lora_model", loras=[self._lora()])
+        plain_proc = make_mock_process_info(0, model_name="plain_model", state=HordeProcessState.PRELOADED_MODEL)
+        lora_proc = make_mock_process_info(1, model_name="lora_model", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({0: plain_proc, 1: lora_proc})
+        horde_model_map = HordeModelMap(root={})
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, lora_job)
+        await track_popped_job_async(job_tracker, plain)
+        horde_model_map.update_entry("plain_model", load_state=ModelLoadState.LOADED_IN_RAM, process_id=0)
+        horde_model_map.update_entry("lora_model", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            max_concurrent=2,
+            max_inference=2,
+            bridge_data=make_mock_bridge_data(image_models_to_load=["plain_model", "lora_model"]),
+        )
+
+        # Drive the scheduler until the plain job is fed or a bounded number of ticks elapse; the unprepared
+        # LoRA job must never seize a lane in the meantime.
+        for _ in range(4):
+            await scheduler.start_inference()
+            if plain in job_tracker.jobs_in_progress:
+                break
+        assert plain in job_tracker.jobs_in_progress
+        assert lora_job not in job_tracker.jobs_in_progress
+
+    async def test_cold_model_sibling_preloads_and_samples_while_gated_head_waits(self) -> None:
+        """A cold-model sibling is preloaded and sampled while the gated LoRA head reserves nothing.
+
+        The gated head's base model is resident, but the head cannot sample until its prefetch clears its
+        gate: it holds no lane and no VRAM reservation. A sibling for a not-yet-resident model must therefore
+        be selectable for preload and then dispatch, proving the gated head never reserves capacity that would
+        block the sibling's cold load. This encodes the no-reservation-during-download contract.
+        """
+        resident = "resident_lora_model"
+        cold = "cold_sibling_model"
+        lora_head = make_job_pop_response(resident, loras=[self._lora()])
+        cold_sibling = make_job_pop_response(cold)
+
+        head_lane = make_mock_process_info(0, model_name=resident, state=HordeProcessState.PRELOADED_MODEL)
+        idle_lane = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: head_lane, 1: idle_lane})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(resident, load_state=ModelLoadState.LOADED_IN_RAM, process_id=0)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, lora_head)
+        await track_popped_job_async(job_tracker, cold_sibling)
+
+        reference = {
+            resident: make_mock_model_reference_record(resident),
+            cold: make_mock_model_reference_record(cold),
+        }
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            max_concurrent=2,
+            max_inference=2,
+            model_metadata=make_test_model_metadata(reference),
+            bridge_data=make_mock_bridge_data(image_models_to_load=[resident, cold]),
+        )
+
+        # The cold sibling is selected for preload (the gated head is invisible to preload and holds nothing).
+        assert scheduler.preload_models() is True
+        assert idle_lane.loaded_horde_model_name == cold
+        assert lora_head not in job_tracker.jobs_in_progress
+
+        # Once the sibling's model materialises, it dispatches and samples while the head still waits.
+        idle_lane.last_process_state = HordeProcessState.PRELOADED_MODEL
+        idle_lane.loaded_horde_model_name = cold
+        horde_model_map.update_entry(cold, load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+
+        for _ in range(4):
+            await scheduler.start_inference()
+            if cold_sibling in job_tracker.jobs_in_progress:
+                break
+        assert cold_sibling in job_tracker.jobs_in_progress
+        assert lora_head not in job_tracker.jobs_in_progress
+        assert job_tracker.get_stage(lora_head.id_) == JobStage.PENDING_INFERENCE

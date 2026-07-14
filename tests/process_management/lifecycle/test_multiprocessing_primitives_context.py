@@ -43,7 +43,6 @@ def test_primitives_bind_to_passed_spawn_context() -> None:
     # which is exactly what makes Process.start() under spawn raise. It must be False here.
     assert primitives.process_message_queue._rlock._is_fork_ctx is False  # noqa: SLF001
     assert primitives.disk_lock._is_fork_ctx is False  # noqa: SLF001
-    assert primitives.aux_model_lock._is_fork_ctx is False  # noqa: SLF001
     assert primitives.inference_semaphores[0]._is_fork_ctx is False  # noqa: SLF001
     assert primitives.vae_decode_semaphores[0]._is_fork_ctx is False  # noqa: SLF001
     assert primitives.gpu_sampling_leases[0]._is_fork_ctx is False  # noqa: SLF001

@@ -68,7 +68,7 @@ from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMe
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.server_capabilities import server_supports_extended_controlnet
 from horde_worker_regen.telemetry_spans import queue_depth_counter, span_job_pop
-from horde_worker_regen.utils.job_utils import get_single_job_magnitude, line_skip_pop_max_power
+from horde_worker_regen.utils.job_utils import get_single_job_magnitude, small_pop_max_power
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -379,6 +379,8 @@ class JobPopper:
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
+        on_job_popped: Callable[[ImageGenerateJobPopResponse], None] | None = None,
+        background_downloads_enabled: bool = True,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -434,6 +436,15 @@ class JobPopper:
             extended_controlnet_ready_provider if extended_controlnet_ready_provider is not None else (lambda: False)
         )
         self._large_model_pop_governor = LargeModelPopGovernor()
+        # Notified once per popped job. With background downloads enabled this is the aux-prefetch
+        # coordinator's pop trigger (place the job's LoRAs/TIs on disk while it is still pending); without
+        # them the manager wires a guard that faults auxiliary-bearing jobs immediately, since nothing could
+        # ever prepare one. The no-op default is for tests that construct a popper directly.
+        self._on_job_popped = on_job_popped if on_job_popped is not None else (lambda _job: None)
+        # LoRAs are placed on disk only by the dedicated background download process, so a worker running
+        # without it can never prepare a LoRA job. Advertising LoRA support then would only pop jobs that can
+        # never be fed. Defaults True so a popper constructed directly (and the tests) keeps advertising.
+        self._background_downloads_enabled = background_downloads_enabled
 
         self._max_inference_processes = max_inference_processes
         # The constructor value is the provisioned ceiling; the threads advertised in pop requests
@@ -550,7 +561,7 @@ class JobPopper:
         """
         small_cap = min(
             pop_max_power,
-            line_skip_pop_max_power(
+            small_pop_max_power(
                 high_performance_mode=bool(bridge_data.high_performance_mode),
                 moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
             ),
@@ -726,6 +737,7 @@ class JobPopper:
                 self._shutdown_manager.shutdown()
             self._state.too_many_consecutive_failed_jobs = True
             self._state.too_many_consecutive_failed_jobs_time = cur_time
+            self._state.consecutive_failed_jobs_pause_count += 1
             return True
 
         return False
@@ -736,9 +748,9 @@ class JobPopper:
         Args:
             bridge_data: The active bridge configuration (supplies queue_size / max_threads).
             extra_allowance: Additional queue slots to tolerate beyond the configured depth. Used by the
-                aux-download line-skip breaker to admit one skip job that is expected to dispatch onto an
-                idle sibling immediately rather than buffer, so the normal depth cap would otherwise
-                strand the GPU for the whole download.
+                idle-fill ladder to admit one fill job that is expected to dispatch onto an idle sibling
+                immediately rather than buffer, so the normal depth cap would otherwise strand the GPU while
+                the head waits on its load.
         """
         max_jobs_in_queue = bridge_data.queue_size + 1
         if bridge_data.max_threads > 1:
@@ -839,6 +851,10 @@ class JobPopper:
         Independent of any per-card ``allow_lora`` choice: LoRA storage is one shared cache, so a full disk
         or an in-progress background download suppresses LoRA advertising for the whole worker.
         """
+        if not self._background_downloads_enabled:
+            # No background downloader means no path to place a job's LoRAs on disk, so LoRA support must not
+            # be advertised regardless of the per-card config flag.
+            return False
         if self._state.lora_disk_exhausted:
             return False
         # Repeated ad-hoc download teardowns withhold LoRA support for an escalating window; popping
@@ -974,6 +990,9 @@ class JobPopper:
     ) -> None:
         """Add a successfully popped job to the pending inference queue."""
         await self._job_tracker.record_popped_job(job_pop_response)
+        # Kick off the pending-queue LoRA/TI prefetch for this job (no-op when it carries none, or when the
+        # worker runs without a background download process). Never blocks the pop path on network IO.
+        self._on_job_popped(job_pop_response)
         # Remember the horde-supplied deadline so post-inference backpressure can be sized to it; the
         # field stays at its last known value (or None) when a pop omits the ttl.
         if job_pop_response.ttl is not None:
@@ -1041,27 +1060,17 @@ class JobPopper:
         cur_time = time.time()
         bridge_data = self._runtime_config.bridge_data
 
-        # Aux-download line-skip: the scheduler has flagged that a slot is stalled downloading auxiliary
-        # models past the threshold with nothing already queued able to slip past it. A job popped now is
-        # expected to dispatch immediately onto the idle sibling process (a line-skip), not to buffer, so
-        # the steady-state pacing governors that assume this pop adds durable queue depth do not apply while
-        # the stall lasts. Treat the pop as urgent and let it relax the queue-depth and pop-cadence gates so
-        # the bias applied further down (small, non-LoRA) can actually be exercised. Genuinely protective
-        # gates (shutdown, RAM/safety backpressure, failure pause, no free process) still apply.
-        line_skip_wanted = self._state.wants_line_skip_candidate
-        # Idle-fill yields to the aux line-skip: when both would apply, the line-skip's flat small-non-LoRA
-        # bias runs and the ladder is suppressed, so a single pop is never double-shaped.
-        idle_fill_wanted = self._state.wants_idle_fill_candidate and not line_skip_wanted
-        if line_skip_wanted or idle_fill_wanted:
+        idle_fill_wanted = self._state.wants_idle_fill_candidate
+        if idle_fill_wanted:
             urgent = True
 
         if self._handle_consecutive_failures(bridge_data, cur_time):
             return
 
-        # Admit one extra job past the configured depth when a line-skip or idle-fill is wanted: that job is
-        # expected to leave the queue immediately for the idle sibling, so bounding the relaxation to a single
-        # slot keeps intake from running away if it cannot be placed this cycle.
-        if self._is_queue_full(bridge_data, extra_allowance=1 if (line_skip_wanted or idle_fill_wanted) else 0):
+        # Admit one extra job past the configured depth when an idle-fill is wanted: that job is expected to
+        # leave the queue immediately for the idle sibling, so bounding the relaxation to a single slot keeps
+        # intake from running away if it cannot be placed this cycle.
+        if self._is_queue_full(bridge_data, extra_allowance=1 if idle_fill_wanted else 0):
             return
 
         # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
@@ -1113,10 +1122,10 @@ class JobPopper:
             await asyncio.sleep(3)
             return
 
-        # The megapixelstep governor holds pops so large in-flight jobs can drain; a line-skip or idle-fill
-        # job is small by construction and fills a GPU the blocked head has left idle, so it must not be held
-        # behind the very backlog it is meant to relieve.
-        if not (line_skip_wanted or idle_fill_wanted) and self._pop_throttler.should_wait_for_megapixelsteps(
+        # The megapixelstep governor holds pops so large in-flight jobs can drain; an idle-fill job is small
+        # by construction and fills a GPU the blocked head has left idle, so it must not be held behind the
+        # very backlog it is meant to relieve.
+        if not idle_fill_wanted and self._pop_throttler.should_wait_for_megapixelsteps(
             bridge_data,
         ):
             return
@@ -1191,28 +1200,13 @@ class JobPopper:
             if advertised is not None
             else self._effective_allow_lora(bridge_data)
         )
-        # Stop advertising LoRA support once the queue is already carrying its allowed share of LoRA
-        # jobs, so a non-LoRA job can still be popped and line-skip past a blocked LoRA head.
+        # Stop advertising LoRA support once the queue is already carrying its allowed share of LoRA jobs.
+        # A LoRA job stays pending until its files finish prefetching, so capping the LoRA queue share keeps
+        # non-LoRA work poppable while those jobs wait and the GPU is never starved by an all-LoRA queue.
         if pop_allow_lora and self._lora_queue_cap_reached():
             pop_allow_lora = False
 
-        # Aux-download line-skip bias: the scheduler has flagged that a slot is blocked downloading
-        # auxiliary models past the threshold and no already-queued non-LoRA job is small enough to slip
-        # past it (see aux_model_download_line_skip_threshold_seconds). Bias this pop toward a small,
-        # non-LoRA job so an idle sibling process gets skippable work and the GPU keeps sampling while the
-        # download finishes. A LoRA candidate would itself block on a download, so it can never skip; a
-        # smaller max_power keeps the returned job under the scheduler's line-skip eMPS ceiling. The
-        # scheduler clears the flag once the blocking download ends.
-        if line_skip_wanted:
-            pop_allow_lora = False
-            pop_max_power = min(
-                pop_max_power,
-                line_skip_pop_max_power(
-                    high_performance_mode=bool(bridge_data.high_performance_mode),
-                    moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
-                ),
-            )
-        elif idle_fill_wanted:
+        if idle_fill_wanted:
             # Idle-fill ladder: offer a no-LoRA, smallest-fastest-first slice of the models (small sd15 ->
             # large sd15 -> small sdxl -> large sdxl) so a card idled behind a download is fed the quickest
             # work the horde currently has, escalating only when it has nothing lighter.
@@ -1292,7 +1286,7 @@ class JobPopper:
                 if self._canned_job_source is None:
                     raise RuntimeError("dry_run_skip_api is set but no canned job source is configured")
 
-                job_pop_response = self._canned_job_source.next_pop_response()
+                job_pop_response = self._canned_job_source.next_pop_response(job_pop_request)
                 if job_pop_response.id_ is not None:
                     queue_depth_counter.add(1)
             else:

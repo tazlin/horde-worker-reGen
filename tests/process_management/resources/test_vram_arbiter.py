@@ -362,11 +362,16 @@ class TestStarvationDiagnostic:
     """A head deferred past the diagnostic horizon warns and counts, but still defers (never admits)."""
 
     def _wedged_head(self, starved_seconds: float) -> VramRequest:
-        """A head whose candidate does not fit the device-free room, deferred for ``starved_seconds``."""
-        return _preload(candidate_delta_mb=100.0, is_head_of_queue=True, starved_seconds=starved_seconds)
+        """A head whose candidate misses the device-free room by more than the measured-attempt band.
+
+        The deficit is deliberately far beyond :data:`_MEASURED_ATTEMPT_BAND_MB`, so this is a genuine wedge
+        the diagnostic backstop is for, not the small close-but-no shortfall the measured-load escape hatch
+        admits: the head stays parked and the diagnostic fires.
+        """
+        return _preload(candidate_delta_mb=5000.0, is_head_of_queue=True, starved_seconds=starved_seconds)
 
     def _wedged_state(self) -> DeviceVramState:
-        """A card whose device-free room cannot hold even a 100 MB candidate net of the noise buffer."""
+        """A card whose device-free room falls thousands of MB short of the candidate net of the noise buffer."""
         return _roomy_state(device_free_mb=400.0)
 
     def test_diagnostic_emitted_past_the_horizon_without_admitting(self) -> None:
@@ -917,3 +922,219 @@ def test_reason_line_renders_the_measured_arithmetic() -> None:
     assert "device-free" in verdict.reason
     assert "reservations" in verdict.reason
     assert "noise" in verdict.reason
+
+
+class TestForeignAwareImpossibility:
+    """The achievable ceiling nets the sustained foreign floor out of an emptied card's room.
+
+    Anchored to the reproduced incident: a 16375 MB card whose desktop/other processes sustain ~1912 MB, so a
+    ~14573 MB candidate cannot fit even after every worker resident is evicted, yet sits under the old
+    ``total - noise`` boundary and would otherwise defer forever.
+    """
+
+    _TOTAL_MB = 16375.0
+    _FOREIGN_MB = 1912.0
+    _CANDIDATE_MB = 14573.0
+
+    def _state(self, *, foreign_floor_mb: float | None) -> DeviceVramState:
+        """An emptied card (ample device-free) carrying the derived noise buffer and the given foreign floor."""
+        return _roomy_state(
+            total_vram_mb=self._TOTAL_MB,
+            device_free_mb=self._TOTAL_MB - self._FOREIGN_MB,
+            noise_buffer_mb=admission_noise_buffer_mb(self._TOTAL_MB),
+            foreign_floor_mb=foreign_floor_mb,
+        )
+
+    def test_unknown_floor_preserves_the_old_boundary(self) -> None:
+        """With no foreign floor the impossibility boundary is exactly the pre-foreign ``total - noise``."""
+        arbiter = VramArbiter()
+        # total - noise = 16375 - 818.75 = 15556.25: a candidate just under it defers, just over it denies.
+        arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=None)))
+        assert arbiter.evaluate(_preload(candidate_delta_mb=15556.0)).disposition == VramDisposition.DEFER
+        arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=None)))
+        assert arbiter.evaluate(_preload(candidate_delta_mb=15557.0)).disposition == VramDisposition.DENY
+
+    def test_foreign_floor_denies_a_candidate_the_old_boundary_would_defer(self) -> None:
+        """The measured foreign floor flips the incident candidate from a forever-defer into a DENY."""
+        # Without the floor: 14573 < 15556.25 -> DEFER (the wedge). With it: ceiling 13644.25 -> DENY.
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=None)))
+        assert arbiter.evaluate(_preload(candidate_delta_mb=self._CANDIDATE_MB)).disposition == VramDisposition.DEFER
+        arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=self._FOREIGN_MB)))
+        assert arbiter.evaluate(_preload(candidate_delta_mb=self._CANDIDATE_MB)).disposition == VramDisposition.DENY
+
+    def test_candidate_below_ceiling_still_defers_with_a_floor(self) -> None:
+        """A candidate under the foreign-aware ceiling is not impossible: it defers and reclaims, never denies."""
+        arbiter = VramArbiter()
+        # ceiling = 16375 - 818.75 - 1912 = 13644.25; a 13000 MB candidate is under it (not impossible), but
+        # residents physically hold the card (a tight device-free reading), so it does not fit now and defers.
+        tight = _roomy_state(
+            total_vram_mb=self._TOTAL_MB,
+            device_free_mb=5000.0,
+            noise_buffer_mb=admission_noise_buffer_mb(self._TOTAL_MB),
+            foreign_floor_mb=self._FOREIGN_MB,
+        )
+        arbiter.begin_cycle(_snapshot(tight))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=13000.0, is_head_of_queue=True))
+        assert verdict.disposition == VramDisposition.DEFER
+
+    def test_deny_reason_names_the_ceiling_arithmetic(self) -> None:
+        """The impossibility DENY spells out candidate, achievable ceiling, total, noise, and foreign floor."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=self._FOREIGN_MB)))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=self._CANDIDATE_MB))
+        assert verdict.disposition == VramDisposition.DENY
+        reason = verdict.reason
+        assert "14573" in reason
+        assert "13644" in reason  # achievable ceiling
+        assert "1912" in reason  # foreign floor
+        assert "16375" in reason  # total
+
+    def test_any_other_device_can_seat_finds_a_roomy_sibling_card(self) -> None:
+        """A multi-card cycle where one sibling could seat the candidate reports a reroute target exists."""
+        arbiter = VramArbiter()
+        impossible = self._state(foreign_floor_mb=self._FOREIGN_MB)
+        roomy = _roomy_state(total_vram_mb=48000.0, device_free_mb=40000.0)
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: impossible, 1: roomy}))
+        request = _preload(candidate_delta_mb=self._CANDIDATE_MB, device_index=0)
+        assert arbiter.any_other_device_can_seat(request, exclude_device_index=0) is True
+
+    def test_any_other_device_can_seat_false_when_every_other_card_impossible(self) -> None:
+        """When the only other card is equally impossible, no reroute target exists."""
+        arbiter = VramArbiter()
+        impossible = self._state(foreign_floor_mb=self._FOREIGN_MB)
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: impossible, 1: impossible}))
+        request = _preload(candidate_delta_mb=self._CANDIDATE_MB, device_index=0)
+        assert arbiter.any_other_device_can_seat(request, exclude_device_index=0) is False
+
+    def test_single_device_has_no_reroute_target(self) -> None:
+        """A single-driving-device cycle can never report another card that could seat the candidate."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=self._FOREIGN_MB)))
+        request = _preload(candidate_delta_mb=self._CANDIDATE_MB, device_index=0)
+        assert arbiter.any_other_device_can_seat(request, exclude_device_index=0) is False
+
+
+class TestMeasuredAttemptEscapeHatch:
+    """The measured-load escape hatch: a starved head at a converged-empty card gets one real load attempt.
+
+    The arithmetic refuses on the frozen reading (candidate > available), but a starved head at a card the
+    worker has nothing left to reclaim on, whose demand is under the achievable ceiling and misses available by
+    only a within-band shortfall, is admitted for one real load so measured reality decides rather than a
+    conservative static prediction. The admit rides the ordinary FITS path (``measured_attempt`` flags it), and
+    it fires at most once per head-starvation episode.
+    """
+
+    _CANDIDATE_MB = 14573.0
+    """Faithful to the reproduced incident: a flux head whose static prediction is above the tight reading."""
+
+    def _empty_card(self, **overrides: object) -> DeviceVramState:
+        """A converged-empty card: an ample total, no reservations, a tight-but-close device-free reading.
+
+        The default noise buffer (512 MB) is left in place, so available = device_free - 512. The device-free
+        reading is set so a 14573 MB candidate misses available by a small within-band shortfall.
+        """
+        defaults: dict[str, object] = {"device_free_mb": 14868.0}
+        defaults.update(overrides)
+        return _roomy_state(**defaults)
+
+    def _starved_head(self, **overrides: object) -> VramRequest:
+        """A true head of queue, starved past the diagnostic horizon, with nothing left to reclaim for it."""
+        defaults: dict[str, object] = {
+            "candidate_delta_mb": self._CANDIDATE_MB,
+            "is_head_of_queue": True,
+            "head_job_id": "job-1",
+            "starved_seconds": _STARVATION_DIAGNOSTIC_SECONDS + 1.0,
+        }
+        defaults.update(overrides)
+        return _preload(**defaults)
+
+    def test_within_band_starved_head_gets_one_measured_attempt(self) -> None:
+        """The trigger case: a FITS flagged as a measured attempt, and the attempts counter advances once."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        verdict = arbiter.evaluate(self._starved_head())
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.admits is True
+        assert verdict.measured_attempt is True
+        # The candidate genuinely did not fit the instantaneous reading; the admit is the escape hatch, not a fit.
+        assert verdict.measured.fits is False
+        assert arbiter.measured_attempts == 1
+
+    def test_second_evaluation_same_episode_does_not_reattempt(self) -> None:
+        """One-shot per episode: a second evaluation of the same head defers rather than re-attempting."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        first = arbiter.evaluate(self._starved_head())
+        assert first.measured_attempt is True
+        second = arbiter.evaluate(self._starved_head())
+        assert second.disposition == VramDisposition.DEFER
+        assert second.measured_attempt is False
+        assert arbiter.measured_attempts == 1
+
+    def test_in_progress_attempt_is_carried_through_without_a_new_one_shot(self) -> None:
+        """A job the scheduler already tagged keeps admitting (preload -> dispatch) without consuming a one-shot."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        verdict = arbiter.evaluate(self._starved_head(measured_attempt_in_progress=True))
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+        # A continuation is not a fresh emission, so the attempts counter does not advance.
+        assert arbiter.measured_attempts == 0
+
+    def test_beyond_band_shortfall_defers_as_today(self) -> None:
+        """A shortfall past the uncertainty band keeps deferring: give-up remains the backstop, not a gamble."""
+        arbiter = VramArbiter()
+        # available = 14356; a candidate 1100 MB over it is beyond the 1024 MB band but under the ceiling.
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        verdict = arbiter.evaluate(self._starved_head(candidate_delta_mb=14356.0 + 1100.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_beyond_ceiling_still_denies(self) -> None:
+        """A candidate above the achievable ceiling is structurally impossible: it DENIES, never attempts."""
+        arbiter = VramArbiter()
+        # ceiling = 16375 - 512 - 1912 = 13951; the 14573 candidate exceeds it and cannot fit an empty card.
+        state = self._empty_card(total_vram_mb=16375.0, foreign_floor_mb=1912.0)
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(self._starved_head())
+        assert verdict.disposition == VramDisposition.DENY
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_reclaimable_card_defers_rather_than_gambling(self) -> None:
+        """A card with an idle resident model to evict is not converged-empty: reclaim first, do not attempt."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card(idle_process_ids=frozenset({2}))))
+        verdict = arbiter.evaluate(self._starved_head(has_reclaimable_idle_model=True))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_outstanding_reservation_card_is_not_converged_empty(self) -> None:
+        """An outstanding worker reservation means make-room has not converged: defer, do not attempt."""
+        arbiter = VramArbiter()
+        # A 3000 MB reservation the free reading does not yet reflect; not the requester's own, so not netted.
+        arbiter.begin_cycle(_snapshot(self._empty_card(planned_unmaterialized_mb=3000.0)))
+        verdict = arbiter.evaluate(self._starved_head())
+        assert verdict.disposition != VramDisposition.FITS
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_unstarved_head_does_not_attempt(self) -> None:
+        """Below the starvation horizon the head defers and reclaims as before; the gamble is starvation-gated."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        verdict = arbiter.evaluate(self._starved_head(starved_seconds=5.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_non_head_does_not_attempt(self) -> None:
+        """The escape hatch is a head-of-queue remedy: a line-skipper never triggers it."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        verdict = arbiter.evaluate(self._starved_head(is_head_of_queue=False, starved_seconds=0.0))
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0

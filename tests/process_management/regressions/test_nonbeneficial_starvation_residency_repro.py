@@ -130,9 +130,7 @@ async def _scheduler_for(case: ResidencyCase):  # noqa: ANN202
         max_inference=max(case.live_processes, 1),
         device_free_mb=_INCIDENT_FREE_AFTER_DRAIN_MB,
     )
-    scheduler._is_disaggregation_class_eligible = lambda _job: (
-        case.disaggregation_enabled
-    )
+    scheduler._is_disaggregation_class_eligible = lambda _job: case.disaggregation_enabled
     return scheduler, head, process_map[0]
 
 
@@ -178,15 +176,10 @@ async def test_starvation_request_does_not_offer_a_non_reducing_context_teardown
     scheduler._vram_arbiter = arbiter
     scheduler._execute_preload_actuations = Mock()  # type: ignore[method-assign]
 
-    assert (
-        scheduler._admit_preload_under_budget(head, target, is_head_blocker=True)
-        is False
-    )
+    assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
 
     commands = scheduler._execute_preload_actuations.call_args.args[0]
-    assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in {
-        command.kind for command in commands
-    }, (
+    assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in {command.kind for command in commands}, (
         f"computed target {case.computed_target} cannot reduce {case.live_processes} live processes"
     )
 

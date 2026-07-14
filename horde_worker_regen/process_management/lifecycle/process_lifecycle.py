@@ -31,6 +31,9 @@ from horde_worker_regen.process_management.config.worker_state import WorkerStat
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.messages import (
+    AuxModelRef,
+    AuxPrefetchEntry,
+    HordeAuxPrefetchControlMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeDownloadControlMessage,
@@ -194,28 +197,6 @@ applies. A heavier job (more steps, larger pixels, hires) has longer legitimate 
 than a light one, so the budget tracks its expected work, floored at ``inference_step_timeout`` and capped
 at ``contended_step_timeout`` so a light job stays tight and a genuine wedge is still reaped."""
 
-FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS: float = 60.0
-"""Shortened stuck-aux-download grace applied while a LoRA-download backoff is active.
-
-The first stall is reaped at the configured ``download_timeout`` and registers a backoff strike; once
-the download path is known to be failing there is no value in letting a *requeued* job ride the full
-window again, so further stalls are reaped at this much shorter grace (floored against an
-unusually-low configured ``download_timeout``). This is the fast-fault half of the backoff: it bounds
-how long a job that keeps timing out can hold a slot, instead of burning the full window per attempt."""
-
-AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS: float = 15.0
-"""How far before the stuck-aux watchdog the child's own aux-download deadline is set.
-
-The parent hands each dispatched job a deadline of (its effective aux-download watchdog timeout minus
-this margin); the child cancels a stalled download and faults the job *itself* a beat before the
-watchdog would tear the whole process down, turning a teardown+respawn into a slot-local fault. The
-margin covers the round trip: child cancel -> faulted result -> parent frees the slot, all before the
-next watchdog pass."""
-
-MIN_AUX_DOWNLOAD_DEADLINE_SECONDS: float = 10.0
-"""Floor on the child-side aux-download deadline, so an unusually low configured ``download_timeout``
-cannot drive it to zero (which would fault every LoRA job before it could fetch anything)."""
-
 
 def _job_is_feature_heavy(process_info: HordeProcessInfo) -> bool:
     """Whether the slot's current job carries features that lengthen its heartbeat-silent work.
@@ -249,7 +230,6 @@ class ProcessLifecycleManager:
     _process_message_queue: ProcessQueue
     _card_runtimes: dict[int, CardRuntime]
     _disk_lock: Lock_MultiProcessing
-    _aux_model_lock: Lock_MultiProcessing
     _download_bandwidth_semaphore: Semaphore
     _gpu_sampling_lease_enabled: bool
     _runtime_config: RuntimeConfig
@@ -292,7 +272,6 @@ class ProcessLifecycleManager:
         process_message_queue: ProcessQueue,
         card_runtimes: dict[int, CardRuntime],
         disk_lock: Lock_MultiProcessing,
-        aux_model_lock: Lock_MultiProcessing,
         download_bandwidth_semaphore: Semaphore,
         gpu_sampling_lease_enabled: bool = False,
         runtime_config: RuntimeConfig,
@@ -331,7 +310,6 @@ class ProcessLifecycleManager:
         self._process_message_queue = process_message_queue
         self._card_runtimes = card_runtimes
         self._disk_lock = disk_lock
-        self._aux_model_lock = aux_model_lock
         self._download_bandwidth_semaphore = download_bandwidth_semaphore
         self._gpu_sampling_lease_enabled = gpu_sampling_lease_enabled
         self._runtime_config = runtime_config
@@ -1823,6 +1801,37 @@ class ProcessLifecycleManager:
             ),
         )
 
+    def request_aux_prefetch(self, entries: list[AuxPrefetchEntry], pins: list[AuxModelRef]) -> None:
+        """Ask the download process to prefetch a popped job's LoRAs/TIs and apply the eviction-pin set.
+
+        A no-op when no download process is running or there is nothing to fetch. Pins ride along on every
+        request so the still-referenced auxiliary files stay protected from eviction while their jobs wait to
+        dispatch; a request is therefore sent whenever there are entries, even if the pin set is unchanged.
+        """
+        if self._download_process_info is None:
+            logger.warning("Cannot request aux prefetch: no download process is running")
+            return
+        if not entries:
+            return
+        self._download_process_info.safe_send_message(
+            HordeAuxPrefetchControlMessage(entries=entries, pins=pins),
+        )
+
+    def request_aux_pin_update(self, pins: list[AuxModelRef]) -> None:
+        """Send a pins-only eviction update (no entries) to the download process.
+
+        The edge-triggered companion to :meth:`request_aux_prefetch`: pins normally ride on entry-bearing
+        requests, so between pops a completed job's files would stay pinned until the next fetch. This lets the
+        coordinator push the current pin set the moment it changes, including shrinking it to empty once no
+        tracked job references any auxiliary file. A no-op when no download process is running. The caller
+        coalesces on change, so this is never sent for an unchanged set.
+        """
+        if self._download_process_info is None:
+            return
+        self._download_process_info.safe_send_message(
+            HordeAuxPrefetchControlMessage(entries=[], pins=pins),
+        )
+
     def set_download_controls(
         self,
         *,
@@ -2032,7 +2041,6 @@ class ProcessLifecycleManager:
                 child_pipe_connection,
                 card.inference_semaphore,
                 self._disk_lock,
-                self._aux_model_lock,
                 card.vae_decode_semaphore,
                 self.num_processes_launched,
             ),
@@ -2625,7 +2633,7 @@ class ProcessLifecycleManager:
     def _release_held_primitives(self, process_info: HordeProcessInfo) -> None:
         """Release every shared primitive a replaced inference child might still be holding.
 
-        A child acquires the inference/VAE/sampling semaphores and the disk/aux locks inside its own
+        A child acquires the inference/VAE/sampling semaphores and the disk lock inside its own
         process, so a child that dies or hangs leaves them held; the parent must release on its behalf
         or that concurrency is lost for the lifetime of the worker (one orphaned inference permit at
         ``max_threads=1`` wedges everything). We deliberately do not infer which primitives are held
@@ -2636,12 +2644,11 @@ class ProcessLifecycleManager:
         hold raises ValueError, which we swallow as a harmless no-op rather than inflating a limit.
         """
         # Release the dead child's own card's GPU semaphores (single-GPU = the one card), plus the shared
-        # disk/aux locks. A child with an unknown device falls back to the lowest configured card.
+        # disk lock. A child with an unknown device falls back to the lowest configured card.
         card = self._card_runtimes.get(process_info.device_index) or self._card_runtimes[min(self._card_runtimes)]
         candidates: list[tuple[str, Semaphore | Lock_MultiProcessing]] = [
             ("inference_semaphore", card.inference_semaphore),
             ("disk_lock", self._disk_lock),
-            ("aux_model_lock", self._aux_model_lock),
             ("vae_decode_semaphore", card.vae_decode_semaphore),
         ]
         if self._gpu_sampling_lease_enabled:
@@ -2928,32 +2935,6 @@ class ProcessLifecycleManager:
 
         self._release_held_primitives(process_info)
 
-        aux_download_stall = (
-            process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL and not intentional_reclaim
-        )
-        # Decide retryability against the incident state *before* this strike is recorded: a lone transient
-        # stall (no incident yet) still earns its one ordinary retry, but a stall while a download outage is
-        # already active is faulted terminally below instead of requeued straight back into the same failing
-        # download, which the logs show just stalls and tears the slot down a second time (every doomed job
-        # was costing two process recoveries, not one).
-        aux_stall_retryable = not self._state.lora_download_backoff.is_escalation_active(time.time())
-
-        if aux_download_stall:
-            if job_to_remove is not None:
-                logger.error(
-                    f"Job {job_to_remove.id_ or job_to_remove.ids} was in aux model preload on process "
-                    f"{process_info.process_id} but it failed. Removing.",
-                )
-            # A slot torn down mid aux-download is the reliable signal that the ad-hoc download path is
-            # failing; register a strike so the popper stops feeding new LoRA jobs (escalating window)
-            # and the aux-download watchdog reaps further stalls sooner.
-            window = self._state.lora_download_backoff.register_timeout(time.time())
-            logger.warning(
-                f"Auxiliary (LoRA) download stalled and was torn down (strike "
-                f"{self._state.lora_download_backoff.strikes}); withholding LoRA job pops for "
-                f"{window:.0f}s while downloads recover.",
-            )
-
         if process_info.loaded_horde_model_name is not None:
             self._horde_model_map.expire_entry(process_info.loaded_horde_model_name)
         # Also clear any entry still pointing at this slot by id. When a child reports PROCESS_ENDING
@@ -2967,17 +2948,14 @@ class ProcessLifecycleManager:
             )
 
         if job_to_remove is not None:
-            # A slot crash/hang mid-job is normally retryable: the job is requeued to a fresh slot (bounded
-            # by max_inference_attempts) rather than faulted outright. The crash gives no resource signal,
-            # so it takes the ordinary retry, not the degraded path. The exception is an aux-download stall
-            # during an active download outage: an immediate retry only re-enters the same failing download
-            # and tears down a second slot, so it is faulted terminally (the horde reassigns the job); the
-            # job outcome is the same as the eventual out-of-attempts fault, at half the process churn.
+            # A slot crash/hang mid-job is retryable: the job is requeued to a fresh slot (bounded by
+            # max_inference_attempts) rather than faulted outright. The crash gives no resource signal, so
+            # it takes the ordinary retry, not the degraded path.
             self._job_tracker.handle_job_fault_now(
                 faulted_job=job_to_remove,
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
-                retryable=not (aux_download_stall and not aux_stall_retryable),
+                retryable=True,
                 is_resource_failure=resource_fault_reason is not None,
                 fault_reason=resource_fault_reason,
                 recovery_requeue=recovery_requeue,
@@ -3406,30 +3384,6 @@ class ProcessLifecycleManager:
             return max(base, min(ceiling, scaled))
         return base
 
-    def _effective_aux_download_timeout(self, bridge_data: reGenBridgeData) -> float:
-        """Stuck-aux-download grace, shortened once the LoRA-download backoff is active.
-
-        A healthy worker reaps a stalled aux download at the configured ``download_timeout``. While a
-        backoff incident is active the download path is known to be failing, so a requeued job that
-        keeps timing out is reaped at the much shorter ``FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS`` (never
-        above the configured timeout) rather than holding a slot for the full window again. The
-        shortening self-expires with the incident, so a recovered worker reverts to the full grace.
-        """
-        configured = bridge_data.download_timeout
-        if not self._state.lora_download_backoff.is_escalation_active(time.time()):
-            return configured
-        return min(configured, FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS)
-
-    def aux_download_deadline_for_dispatch(self, bridge_data: reGenBridgeData) -> float:
-        """The child-side aux-download budget to hand a job being dispatched now.
-
-        Set to the current (backoff-aware) stuck-aux watchdog timeout minus a margin, floored, so the
-        child gives up on a stalled download and faults the job a beat before the watchdog would tear the
-        process down. Computed at dispatch, so it reflects the backoff state at that moment.
-        """
-        watchdog = self._effective_aux_download_timeout(bridge_data)
-        return max(MIN_AUX_DOWNLOAD_DEADLINE_SECONDS, watchdog - AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS)
-
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
         import threading
@@ -3546,12 +3500,6 @@ class ProcessLifecycleManager:
                         HordeProcessState.PRELOADING_MODEL,
                         "seems to be stuck preloading a model",
                         False,
-                    ),
-                    (
-                        self._effective_aux_download_timeout(bridge_data),
-                        HordeProcessState.DOWNLOADING_AUX_MODEL,
-                        "seems to be stuck downloading an auxiliary model (LoRa, etc)",
-                        True,
                     ),
                     (
                         bridge_data.preload_timeout,

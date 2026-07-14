@@ -3,6 +3,7 @@
 - [Model Downloads and Availability](#model-downloads-and-availability)
     - [Two kinds of "download"](#two-kinds-of-download)
     - [The dedicated download process](#the-dedicated-download-process)
+    - [Pop-time auxiliary prefetch](#pop-time-auxiliary-prefetch)
     - [Model availability and the pop gate](#model-availability-and-the-pop-gate)
     - [Feature readiness: deps plus models on disk](#feature-readiness-deps-plus-models-on-disk)
     - [Planning: what a config implies for disk](#planning-what-a-config-implies-for-disk)
@@ -99,6 +100,72 @@ the stuck task harmlessly keeps running. The relaxation is logged once.
 (A hordelib without the first-class `controlnet_annotator` manager falls back to the
 legacy single exclusive preload that both fetches and verifies in one ComfyUI init.)
 
+## Pop-time auxiliary prefetch
+
+A job's LoRAs and textual inversions are network fetches that must land before the
+job can sample. Running them on an inference lane occupies a GPU-feeding process for
+the length of the transfer, so the worker instead prefetches them off the inference
+lanes: at pop the parent's
+[`AuxPrefetchCoordinator`][horde_worker_regen.process_management.models.aux_prefetch_coordinator.AuxPrefetchCoordinator]
+computes the job's not-yet-cached auxiliary files and asks the dedicated download
+process to place them on disk while the job stays `PENDING_INFERENCE`. Each file is
+fetched at most once even when several jobs share it, an already-present file
+short-circuits without a CivitAI round-trip, and the request carries an eviction-pin
+set (every auxiliary file any tracked job still references) so a file one pending job
+needs is not evicted before that job dispatches.
+
+The prefetch pipeline is the only preparation path. Until it clears a job's gate the job
+is invisible to both dispatch selection and model preload: it is never chosen as the
+dispatch head, never preloaded or staged, and holds no lane and no VRAM reservation, so
+a fitting sibling behind it is preloaded and sampled instead of idling. Before the
+enforced disk floor a missing LoRA is fetched, the download process constrains the shared
+ad-hoc cache to its free-space floor, evicting least-recently-used ad-hoc LoRAs through the
+manager's own pin-aware eviction so a file another pending job still references is never
+evicted to make room.
+
+The download process reports a per-file outcome back to the parent. A success marks
+the session auxiliary cache and, once every LoRA and textual inversion a pending job
+needs is present, clears that job's dispatch gate. A failure faults the affected
+pending job promptly (it holds no lane or reservation, so nothing in flight is
+disturbed) and feeds the LoRA-download backoff exactly as an inference-side aux
+failure does.
+
+The worker-wide LoRA-advertising suppression (`background_download_active`, which stops
+new LoRA pops while the download subsystem is transferring) is scoped away from this
+pipeline: it counts only non-prefetch downloads (bulk/default seeding, image and aux
+model fetches), never the job-driven ad-hoc LoRA/TI prefetches. Counting a prefetch here
+would suppress the very LoRA pops the prefetch exists to make dispatchable, self-serializing
+LoRA intake the moment one job's file began downloading. The disk-floor and strike-backoff
+suppressions are separate mechanisms and are unaffected by this scoping.
+
+Two mechanisms keep the pipeline live. A per-job deadline derived from the configured
+download timeout, checked in the periodic scheduling scan, faults a job whose prefetch
+never resolves, so a job is never left pending forever: this is the backstop. The
+deadline is a backstop, not the primary detector (the download process reports a real
+failure through the outcome path), so it defers rather than punishing a slow-but-alive
+transfer: when a deadline expires while the downloader still shows the job's file in
+flight, the coordinator extends that job's deadline by one download-timeout budget
+instead of faulting. Deferral is bounded at two extra budgets (three total) so a wedged
+transfer still faults, and short-circuits earlier when the download reports byte progress
+that stops advancing between expiries (a file reporting no bytes cannot show progress, so
+it defers up to the cap). The first deferral per job is logged once; later deferrals of
+the same job stay silent. The download process itself keeps a slow-but-alive transfer
+running well past any per-job deadline (its own fetch bound exists only to reclaim the
+executor slot from an implausibly long transfer): abandoning it would discard the
+progress, and the completed file serves the faulted job's retry, and every later job,
+from cache. In the same
+periodic step a reconcile sweep re-requests any pending auxiliary-bearing job that has no
+request in flight (a retryable-failure requeue, a lost result message, or a download-process
+restart that dropped its in-flight map) and marks a job prepared outright when its files are
+already cached: this is the liveness that heals. The tracker's retry policy bounds the total
+attempts, so a permanently failing job still faults rather than looping. Should an inference
+child later fail to resolve a prefetched file on disk (a raced eviction or disk error), its
+retryable fault withdraws the job's prepared state and forgets the contradicted session-cache
+entries, so the reconcile sweep re-requests the files instead of the scheduler re-dispatching
+the job into the same failure. The coordinator also
+pushes a pins-only eviction update whenever the set of still-referenced auxiliary files
+changes (for example when a job completes), coalesced so an unchanged set is never re-sent.
+
 ## Model availability and the pop gate
 
 [`ModelAvailability`][horde_worker_regen.process_management.models.model_availability.ModelAvailability]
@@ -169,8 +236,10 @@ own. `waiting` clears itself once a download lands; `failed` does not.
 The same readiness drives the display, so the table can never disagree with what
 the worker advertises: the Downloads tab shows the full per-feature table
 (with the install hint when deps are missing), and the Overview health panel
-carries a compact one-line summary of the engaged features. LoRA (fetched per job)
-and the safety models keep their own gating and appear as read-only rows.
+carries a compact one-line summary of the engaged features. Ad-hoc LoRA and textual
+inversion prefetch (fetched per job by the download process, see
+[pop-time auxiliary prefetch](#pop-time-auxiliary-prefetch)) and the safety models
+keep their own gating and appear as read-only rows.
 
 ## Planning: what a config implies for disk
 
@@ -214,6 +283,14 @@ the scheduler admits work under two live limits:
   host may run at once. Left at 1, a single host is never hit by more than one
   download; raise it to also parallelize within a host (useful when many aux models
   share one host, such as the R2 mirror below).
+
+Job-driven ad-hoc LoRA/TI prefetches are exempt from the per-host limit (they
+neither wait for nor consume a host slot; the global ceiling still applies). A
+pending job's dispatch gate is waiting on exactly that fetch, so it must not queue
+behind an unrelated slow transfer to the same host, and the exemption cannot
+stampede a host: the fetches are single-stream (the host limit exists to be polite
+about multi-connection segmented downloads) and the ad-hoc engine's own worker pool
+bounds them again downstream.
 
 Both limits are honoured at startup and retuned live on config reload (raising the
 global limit grows the executor-thread pool so the new ceiling is actually used; it

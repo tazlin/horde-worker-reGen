@@ -1,18 +1,18 @@
-"""Unit tests for the LoRA download backoff escalation/decay logic."""
+"""Unit tests for the auxiliary-download backoff escalation/decay logic."""
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.models.lora_download_backoff import (
+from horde_worker_regen.process_management.models.aux_download_backoff import (
     BASE_BACKOFF_SECONDS,
     MAX_BACKOFF_SECONDS,
     STRIKE_DECAY_SECONDS,
-    LoraDownloadBackoff,
+    AuxDownloadBackoff,
 )
 
 
 def test_first_strike_uses_base_window_and_suppresses() -> None:
     """The first strike suppresses pops for exactly the base window."""
-    backoff = LoraDownloadBackoff()
+    backoff = AuxDownloadBackoff()
     assert not backoff.pops_suppressed(now=1000.0)
 
     window = backoff.register_timeout(now=1000.0)
@@ -26,7 +26,7 @@ def test_first_strike_uses_base_window_and_suppresses() -> None:
 
 def test_consecutive_strikes_double_the_window() -> None:
     """Strikes within an incident escalate the window geometrically."""
-    backoff = LoraDownloadBackoff()
+    backoff = AuxDownloadBackoff()
     now = 1000.0
     windows = []
     for _ in range(4):
@@ -39,7 +39,7 @@ def test_consecutive_strikes_double_the_window() -> None:
 
 def test_window_is_capped() -> None:
     """A sustained incident holds at the maximum window rather than growing unbounded."""
-    backoff = LoraDownloadBackoff()
+    backoff = AuxDownloadBackoff()
     now = 1000.0
     window = 0.0
     for _ in range(20):
@@ -50,7 +50,7 @@ def test_window_is_capped() -> None:
 
 def test_strike_after_quiet_period_resets_escalation() -> None:
     """A strike after the decay window starts a fresh incident at the base window."""
-    backoff = LoraDownloadBackoff()
+    backoff = AuxDownloadBackoff()
     backoff.register_timeout(now=1000.0)
     backoff.register_timeout(now=1001.0)
     assert backoff.strikes == 2
@@ -64,7 +64,7 @@ def test_strike_after_quiet_period_resets_escalation() -> None:
 
 def test_is_escalation_active_tracks_suppression_then_decays() -> None:
     """The escalation stays active through suppression and the decay window, then self-expires."""
-    backoff = LoraDownloadBackoff()
+    backoff = AuxDownloadBackoff()
     assert backoff.is_escalation_active(now=1000.0) is False
 
     backoff.register_timeout(now=1000.0)
@@ -79,7 +79,7 @@ def test_is_escalation_active_tracks_suppression_then_decays() -> None:
 
 def test_remaining_seconds() -> None:
     """remaining_seconds counts down to the resume time and floors at zero."""
-    backoff = LoraDownloadBackoff()
+    backoff = AuxDownloadBackoff()
     backoff.register_timeout(now=1000.0)
     assert backoff.remaining_seconds(now=1000.0) == BASE_BACKOFF_SECONDS
     assert backoff.remaining_seconds(now=1000.0 + BASE_BACKOFF_SECONDS + 5) == 0.0

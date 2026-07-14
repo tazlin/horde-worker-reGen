@@ -163,6 +163,8 @@ class Scenario(BaseModel):
                 workflow=spec.workflow,
                 post_processing=list(spec.post_processing),
                 hires_fix=spec.hires_fix,
+                loras=[LorasPayloadEntry(name=name) for name in spec.lora_names],
+                tis=[TIPayloadEntry(name=name, inject_ti="prompt") for name in spec.ti_names],
                 weight=float(spec.count),
             )
             for spec in self.image_jobs

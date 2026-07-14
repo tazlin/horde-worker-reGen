@@ -1320,15 +1320,25 @@ class TestDownloadProcessConcurrencyFixes:
             thread.join(timeout=5.0)
 
     def test_failed_image_fetch_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A failed per-file fetch is re-queued (bounded), so a transient failure is not abandoned."""
+        """A failed per-file fetch is re-queued (bounded), so a transient failure is not abandoned.
+
+        The retry is recorded while the failing run still holds the task's in-flight dedup slot and lands
+        back in the queue on the main loop's drain once the backoff elapses, so this drives the full
+        record-release-drain path rather than an immediate enqueue the dedup would drop.
+        """
         monkeypatch.setattr(
             "horde_worker_regen.process_management.workers.download_process._RETRY_BACKOFF_SECONDS",
             0.0,
         )
         process = self._make_process()
         task = DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="m", host="h", feature=FEATURE_IMAGE_MODEL)
+        process._scheduler.enqueue(task)
+        claimed = process._scheduler.acquire(timeout=0.5)
+        assert claimed is not None
 
-        process._maybe_retry(task, "boom")
+        process._maybe_retry(claimed, "boom")
+        process._scheduler.release(claimed)
+        process._drain_due_retries()
 
         assert process._attempts[task.dedup_key] == 1
         assert any(t.model_name == "m" for t in process._scheduler.pending_snapshot())

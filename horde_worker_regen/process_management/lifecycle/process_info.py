@@ -138,7 +138,7 @@ class HordeProcessInfo:
     """Epoch time the first sampling step of the current job arrived, or None before sampling starts.
 
     Distinct from ``current_inference_started_at`` (stamped at dispatch): the gap between the two is the
-    one-time pre-sampling work (cold VRAM load, aux/ControlNet download, prompt encode) that emits no
+    one-time pre-sampling work (cold VRAM load, read-only auxiliary resolve, prompt encode) that emits no
     sampling step. The graded-slowdown monitor measures sampling time from here, not from dispatch, so a
     long cold start is not mis-attributed to slow sampling. Stamped on the first ``INFERENCE_STEP`` beat
     and cleared at every job boundary (dispatch, result, slot reset)."""
@@ -363,7 +363,6 @@ class HordeProcessInfo:
             or self.last_process_state == HordeProcessState.POST_PROCESSING
             or self.last_process_state == HordeProcessState.ALCHEMY_STARTING
             or self.last_process_state == HordeProcessState.DOWNLOADING_MODEL
-            or self.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
             or self.last_process_state == HordeProcessState.PRELOADING_MODEL
             or self.last_process_state == HordeProcessState.PRELOADED_MODEL
             or self.last_process_state == HordeProcessState.JOB_RECEIVED

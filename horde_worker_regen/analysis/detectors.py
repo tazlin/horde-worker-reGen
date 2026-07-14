@@ -883,6 +883,95 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
     ]
 
 
+_HEAD_STARVATION_MODEL_RE = re.compile(
+    r"Head-of-queue (?P<model>.+?) deferred (?P<seconds>\d+)s >= \d+s with no verified progress",
+)
+_HEAD_STARVATION_AVAILABLE_RE = re.compile(r"device-free (?P<free>\d+)")
+_HEAD_STARVATION_IDLE_WINDOW_SECONDS = 120.0
+"""Repeated head starvation whose device-idle span reaches this reads as a persistent, not transient, stall."""
+_HEAD_STARVATION_MIN_DIAGNOSTICS = 2
+"""At least this many starvation diagnostics for one model before it reads as repeated rather than a one-off."""
+
+
+def detect_unsatisfiable_head_starvation(context: SessionContext) -> list[Finding]:
+    """One head-of-queue model deferred on an idle device across a long window with no corrective action.
+
+    Distinct from :func:`detect_scheduler_starvation_wedge`, which keys on a wedge that already escalated to a
+    soft reset: this recognizes the *persistent, unsatisfiable* case, where the same head model is
+    deferred with no verified progress over and over while the device stays idle, and no corrective action (a
+    save-our-ship give-up or a consecutive-failure pop-hold) ever clears it. The head is effectively
+    unschedulable and the queue is silently wedged behind it. The model name and the device-idle arithmetic
+    are read straight off the worker's force-admit diagnostic; the critical case is the one nothing resolved.
+    """
+    per_model: dict[str, list[tuple[LogRecord, int]]] = {}
+    for record in context.session.records:
+        match = _HEAD_STARVATION_MODEL_RE.search(record.message)
+        if match is not None:
+            per_model.setdefault(match.group("model"), []).append((record, int(match.group("seconds"))))
+    if not per_model:
+        return []
+
+    model, entries = max(per_model.items(), key=lambda item: len(item[1]))
+    if len(entries) < _HEAD_STARVATION_MIN_DIAGNOSTICS:
+        return []
+
+    timestamps = [record.timestamp for record, _ in entries if record.timestamp is not None]
+    span_seconds = (max(timestamps) - min(timestamps)).total_seconds() if len(timestamps) >= 2 else 0.0
+    max_starved = max(seconds for _, seconds in entries)
+    # The device-idle window is whichever the log makes larger: the reported starvation duration on a single
+    # diagnostic, or the wall-clock span across repeated ones (the same head kept starving the whole time).
+    idle_window = max(span_seconds, float(max_starved))
+    if idle_window < _HEAD_STARVATION_IDLE_WINDOW_SECONDS:
+        return []
+
+    free_vrams = [
+        int(m.group("free")) for record, _ in entries if (m := _HEAD_STARVATION_AVAILABLE_RE.search(record.message))
+    ]
+    free_hint = f", with as much as {max(free_vrams)} MB free VRAM on the device" if free_vrams else ""
+
+    storm_start = min(timestamps) if timestamps else None
+    corrective = _matching(context.session.records, _GIVE_UP_RE) + _matching(
+        context.session.records,
+        _CONSECUTIVE_PAUSE_RE,
+    )
+    resolved = any(
+        storm_start is None or (record.timestamp is not None and record.timestamp >= storm_start)
+        for record in corrective
+    )
+
+    verdict = (
+        f"Head-of-queue `{model}` was deferred with no verified progress {len(entries)} time(s) over "
+        f"{idle_window:.0f}s (up to {max_starved}s starved{free_hint}): far more headroom and time than the "
+        "head needed. The same model kept reaching the head and being deferred on an idle device."
+    )
+    if resolved:
+        verdict += " The worker eventually gave up on the backlog or paused pops, so it did not stay silently wedged."
+    else:
+        verdict += (
+            " No give-up or pop-hold ever cleared it within the window: the head is effectively unschedulable "
+            "and the queue is silently wedged behind it."
+        )
+    return [
+        Finding(
+            id="unsatisfiable_head_starvation",
+            severity=Severity.WARNING if resolved else Severity.CRITICAL,
+            title="Head-of-queue model persistently starved on an idle device",
+            verdict=verdict,
+            remediation=(
+                "Confirm the named model actually fits this device (its resident weights plus activation "
+                "working set against measured device-free VRAM); a head that never admits despite an idle, "
+                "ample-VRAM device points at an over-conservative per-process overhead or an unsatisfiable "
+                "budget for that model. Reduce process churn (unload_models_from_vram_often / "
+                "high_performance_mode) so a settled baseline sizes the overhead, relax the VRAM budget, or "
+                "drop the model if the device genuinely cannot host it. A give-up / pop-hold should bound the "
+                "wait so the head cannot starve the queue indefinitely."
+            ),
+            evidence=[_evidence(record) for record, _ in (entries[:2] + entries[-1:])],
+            see_also="scheduler_starvation_wedge",
+        ),
+    ]
+
+
 def detect_slow_generation_drop_spiral(context: SessionContext) -> list[Finding]:
     """The horde aborting generations as too slow, the drop mechanism behind a slow-worker maintenance.
 
@@ -1403,6 +1492,7 @@ DETECTORS: list[Detector] = [
     detect_gave_up_clean,
     detect_forced_maintenance,
     detect_scheduler_starvation_wedge,
+    detect_unsatisfiable_head_starvation,
     detect_slow_generation_drop_spiral,
     detect_safety_stage_stall,
     detect_whole_card_convergence_wedge,

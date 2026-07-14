@@ -67,7 +67,6 @@ def _two_card_lifecycle(process_map: ProcessMap) -> ProcessLifecycleManager:
             config=bridge_data,
         ),
         disk_lock=Mock(),
-        aux_model_lock=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         max_safety_processes=1,

@@ -22,6 +22,8 @@ from unittest.mock import Mock
 
 from horde_worker_regen.model_download_core import ChunkPacer
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    FEATURE_LORA_ADHOC,
+    FEATURE_TI_ADHOC,
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadStatusSnapshot,
@@ -169,3 +171,75 @@ class TestLastDownloadDoesNotHangGuard:
                 status=DownloadStatusSnapshot(phase=DownloadPhase.DOWNLOADING, current=completed_current),
             )
             assert availability.background_download_active is False
+
+
+class TestPrefetchDownloadsDoNotGateLoraAdvertising:
+    """A job-driven ad-hoc LoRA/TI prefetch is how a LoRA job becomes dispatchable, so it must not gate pops.
+
+    The worker-wide LoRA-advertising guard (``background_download_active``) suppresses LoRA pops only for
+    non-prefetch downloads (bulk/default seeding, image/aux fetches). A single job-driven prefetch flipping
+    the guard would refuse cache-hit LoRA jobs and self-serialize LoRA intake under the prefetch design.
+    """
+
+    @staticmethod
+    def _availability_for(*downloads: CurrentDownloadStatus) -> ModelAvailability:
+        availability = ModelAvailability()
+        availability.update(
+            present=set(),
+            currently_downloading=downloads[0].model_name if downloads else None,
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(
+                phase=DownloadPhase.DOWNLOADING,
+                current=downloads[0] if downloads else None,
+                active=list(downloads),
+            ),
+        )
+        return availability
+
+    def test_adhoc_prefetch_only_leaves_advertising_on(self) -> None:
+        """A snapshot whose only in-flight download is an ad-hoc prefetch does not suppress LoRA advertising."""
+        for feature in (FEATURE_LORA_ADHOC, FEATURE_TI_ADHOC):
+            availability = self._availability_for(
+                CurrentDownloadStatus(
+                    model_name="733630",
+                    feature=feature,
+                    target_dir="",
+                    downloaded_bytes=1_000_000,
+                    total_bytes=50_000_000,
+                ),
+            )
+            assert availability.background_download_active is False
+
+    def test_bulk_image_download_suppresses(self) -> None:
+        """A bulk image-model download in flight suppresses LoRA advertising as before."""
+        availability = self._availability_for(
+            CurrentDownloadStatus(
+                model_name="big-model",
+                feature=FEATURE_IMAGE_MODEL,
+                target_dir="",
+                downloaded_bytes=1_000_000_000,
+                total_bytes=4_000_000_000,
+            ),
+        )
+        assert availability.background_download_active is True
+
+    def test_mixed_prefetch_and_bulk_suppresses(self) -> None:
+        """With both an ad-hoc prefetch and a bulk download in flight, the bulk download still suppresses."""
+        availability = self._availability_for(
+            CurrentDownloadStatus(
+                model_name="733630",
+                feature=FEATURE_LORA_ADHOC,
+                target_dir="",
+                downloaded_bytes=1_000_000,
+                total_bytes=50_000_000,
+            ),
+            CurrentDownloadStatus(
+                model_name="big-model",
+                feature=FEATURE_IMAGE_MODEL,
+                target_dir="",
+                downloaded_bytes=1_000_000_000,
+                total_bytes=4_000_000_000,
+            ),
+        )
+        assert availability.background_download_active is True

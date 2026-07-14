@@ -137,7 +137,10 @@ invariant](#pipeline-invariants) depends on),
 `job_pop_timestamps` derived views).
 
 In dry-run (`dry_run_skip_api`), `CannedJobSource` replaces the API call; everything downstream is
-identical.
+identical. The source receives the same `ImageGenerateJobPopRequest` that would have gone to the Horde.
+Fixed scripted sources replay their next response unchanged, while generating soak sources filter their
+weighted templates against the represented request constraints, so dynamic capability and backpressure
+shaping affects synthetic intake too. See [Architecture → Dry-run mode](architecture.md#dry-run-mode).
 
 ### 2. Schedule and dispatch to a process (`inference_scheduler.py`)
 
@@ -155,16 +158,22 @@ depend on this queue-gated cycle running; see
    concurrent-preload limits differ under `very_fast_disk_mode`.
 2. **Look-ahead**: `get_next_job_and_process(information_only=True)` peeks at the next runnable job to
    decide heavy-model/batch blocking. This method is called _twice_ per cycle (peek, then launch) and
-   must agree with itself; line-skip decisions (a small job jumping ahead of one blocked on a LoRA
-   download) are cached in `_pending_line_skip` to keep the two calls consistent.
+   must agree with itself; line-skip decisions (an already-resident job jumping ahead of a head whose
+   model is still loading, or filling a slot whose process is busy sampling) are cached in
+   `_pending_line_skip` to keep the two calls consistent.
 3. **Blocking rules**: `ProcessMap.keep_single_inference` (a resident ControlNet-XL slot that must
    stay exclusive) can defer launch. Batch and card-demanding serialization is not held here: it is
    priced per-card against measured headroom by the scheduler's size-tier overlap gate.
-4. **Auxiliary preparation**: when a resident-model head carries LoRAs that have not been prepared for that
-   job, `start_inference()` first sends `PREPARE_AUX_MODELS`. The child resolves the files under the normal
-   download deadline and heartbeats, emits `DOWNLOAD_AUX_COMPLETE`, and returns idle. The job stays
-   `PENDING_INFERENCE`, owns no sampling reservation, and can be line-skipped by bounded ready work. It must
-   still pass the ordinary dispatch gates afterward.
+4. **Auxiliary preparation**: a job carrying LoRAs or textual inversions must have those files on disk
+   before it may claim sampling admission. The pop-time prefetch pipeline is the only preparation path: at
+   pop the parent asks the dedicated download process to place the job's not-yet-cached auxiliary files on
+   disk while the job stays `PENDING_INFERENCE`, so dispatch finds them already cached (see
+   [pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch)). While unprepared, the job
+   is invisible to both dispatch selection and preload: it is never chosen as the dispatch head, never
+   preloaded or staged, and owns no lane and no VRAM reservation, so a fitting sibling behind it is fed
+   instead. Once its prepared flag is set it re-enters the ordinary dispatch gates like any other job. A
+   per-job prefetch deadline is the backstop (a job whose files never land faults rather than waiting
+   forever); the periodic reconcile sweep is the liveness that heals a lost or dropped request.
 5. **`start_inference()`**: sends `START_INFERENCE` with the full `ImageGenerateJobPopResponse`; on
    success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. By the
    [dual-presence rule](job_state_machine.md#the-stage-dual-presence-rule) it stays visible in the

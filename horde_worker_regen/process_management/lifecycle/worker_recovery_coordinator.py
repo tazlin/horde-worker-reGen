@@ -80,6 +80,7 @@ class WorkerRecoveryCoordinator:
         max_inference_processes_provider: Callable[[], int],
         abort_callback: Callable[[], None],
         release_disaggregated_job: Callable[[GenerationID], None] = lambda _job_id: None,
+        head_aux_prefetch_in_flight: Callable[[], bool] = lambda: False,
         recovery_supervisor: RecoverySupervisor | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -102,6 +103,12 @@ class WorkerRecoveryCoordinator:
                 job, called whenever a job leaves the tracker by a watchdog/give-up path outside the
                 orchestrator's own flow. Idempotent and a no-op for a job the orchestrator does not hold, so it
                 is safe to call for every released job.
+            head_aux_prefetch_in_flight: Report whether the head-of-queue job is auxiliary-gated with a
+                prefetch still in flight (its per-job deadline exists and has not expired). Save-our-ship
+                give-up defers to it exactly as it defers to a head whose model is materialising: a head
+                waiting on an in-flight auxiliary download is capacity in flight, not a wedge. It is
+                self-bounding by that deadline, so a stalled prefetch stops deferring once the deadline lapses
+                (the coordinator faults the job then). Defaults to "never in flight" for an unwired caller.
             recovery_supervisor: Optional recovery policy object for tests.
             clock: Wall-clock provider for grace windows and rolling recovery counts.
         """
@@ -118,6 +125,7 @@ class WorkerRecoveryCoordinator:
         self._max_inference_processes_provider = max_inference_processes_provider
         self._abort_callback = abort_callback
         self._release_disaggregated_job = release_disaggregated_job
+        self._head_aux_prefetch_in_flight = head_aux_prefetch_in_flight
         self._clock = clock
 
         self.recovery_supervisor = recovery_supervisor or RecoverySupervisor()
@@ -565,6 +573,17 @@ class WorkerRecoveryCoordinator:
         return True
 
     def _head_recovery_in_flight(self) -> bool:
+        """Return whether the head-of-queue job's capacity is in flight, so give-up defers to it.
+
+        True while the head's model is still materialising within its preload budget, or while the head is an
+        auxiliary-gated job whose pop-time prefetch is still in flight (bounded by that prefetch deadline).
+        Either case is capacity in flight over a ready lane, not a wedge over a healthy pool, so give-up must
+        not fault the head. Each input is self-bounding (the preload budget; the prefetch deadline), so a load
+        or a download that never lands stops deferring and the wedge escalates exactly as before.
+        """
+        return self._model_materialization_in_flight() or self._head_aux_prefetch_in_flight()
+
+    def _model_materialization_in_flight(self) -> bool:
         """Return whether the head's model is materialising within its preload budget (give-up defers to it).
 
         A save-our-ship give-up over a lane that reads ready must not fault the head-of-queue job while the

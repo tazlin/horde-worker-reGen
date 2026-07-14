@@ -31,6 +31,9 @@ _TORCH_FREE_IMPORT_MODULES = [
     "horde_worker_regen.capabilities",
     "horde_worker_regen.utils.gpu_monitor",
     "horde_worker_regen.utils.accelerator_probe",
+    # The headless attach supervisor runs the orchestrator role (observe + control over files), so importing
+    # it (which pulls the shared worker launcher and the analysis toolchain) must not drag torch in.
+    "horde_worker_regen.attach_supervisor",
 ]
 
 

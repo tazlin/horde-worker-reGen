@@ -27,12 +27,11 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlModelMessage,
     HordeInferenceControlMessage,
     HordePreloadInferenceModelMessage,
-    HordePrepareAuxControlMessage,
     HordeProcessState,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, LineSkip, NextJobAndProcess
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import (
     ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES,
     HordeProcessType,
@@ -48,6 +47,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     admission_noise_buffer_mb,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.foreign_vram_floor import ForeignVramFloorTracker
 from horde_worker_regen.process_management.resources.model_serviceability import (
     ModelServiceabilityVerdict,
     assess_model_serviceability,
@@ -155,7 +155,6 @@ from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.job_utils import (
     get_single_job_magnitude as _get_single_job_effective_megapixelsteps,
 )
-from horde_worker_regen.utils.job_utils import line_skip_candidate_emps_limit
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
 if TYPE_CHECKING:
@@ -209,17 +208,6 @@ may still read as ``WAITING_FOR_JOB`` until it drains the control pipe and publi
 state. This short grace keeps stale-entry cleanup from expiring a healthy, just-sent preload while still
 letting genuinely abandoned loading entries clear promptly.
 """
-_LINE_SKIP_REJECTION_LOG_INTERVAL = 5.0
-"""Minimum seconds between repeats of an identical line-skip rejection log line.
-
-Line-skip is re-evaluated every (sub-second) scheduling pass while a head job is blocked, so an
-unthrottled per-candidate rejection log floods the file with thousands of identical lines during a
-stall. Repeats of the same (candidate, reason) are collapsed to one per this interval; a new candidate
-or a changed reason still logs immediately, so no distinct information is lost."""
-
-_LINE_SKIP_REJECTION_LOG_MAX_KEYS = 256
-"""Cap on remembered (candidate, reason) throttle keys before stale ones are pruned."""
-
 _RELEASE_CACHE_MIN_RECLAIMABLE_MB = 256.0
 """Minimum reclaimable allocator cache (MB) a GPU process must hold to qualify as a RELEASE_CACHE target.
 
@@ -645,7 +633,6 @@ class InferenceScheduler:
         self._model_recently_missing_time = 0.0
         self._batch_wait_log_time = 0.0
         self._pending_line_skip = None
-        self._aux_backfill_heads_staged: set[str] = set()
         self._model_last_in_demand = {}
 
         # Constructed with safe defaults; the live reserves are synced from the (reloadable) config each
@@ -660,12 +647,20 @@ class InferenceScheduler:
         self._last_preload_admission = None
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
+        # Sustained per-card minimum of measured foreign (non-worker) VRAM usage, folded into each device
+        # state's achievable ceiling so a model that can never fit even an emptied card is DENIED rather than
+        # deferred forever. Driven once per snapshot build from measured device truth; see
+        # build_vram_arbiter_device_state. The tracker runs on a monotonic clock exposed via
+        # _foreign_floor_clock so tests can hand-advance the observation window.
+        self._foreign_vram_floor = ForeignVramFloorTracker()
+        self._foreign_floor_clock: Callable[[], float] = time.monotonic
+        # The job tracker lifts a conditional ceiling hold by re-reading the card's current achievable ceiling;
+        # wire that read here (the scheduler owns the foreign-floor tracker) so the tracker's live predicate
+        # need not reach back into the scheduler.
+        self._job_tracker.set_achievable_ceiling_provider(self.achievable_ceiling_mb)
         # One-shot log throttle, keyed by model, for the "declined a whole-card residency" notice (a teardown
         # demand the warrant gate did not trust; see _whole_card_warranted / _log_whole_card_declined).
         self._whole_card_declined_notified: dict[str, bool] = {}
-        # Rate-limit state for line-skip rejection logs, keyed by "candidate_id:reason"; see
-        # _log_line_skip_rejection. Maps the key to the monotonic time it was last emitted.
-        self._line_skip_rejection_log_state: dict[str, float] = {}
         # Per-context VRAM overhead model: owns the startup-measured per-process and marginal context costs
         # and derives the figures the streaming forecast needs (see ContextOverheadModel). The manager feeds
         # it the probe measurements via set_measured_*, and its attribution tick feeds the truthful
@@ -2555,15 +2550,12 @@ class InferenceScheduler:
         """Track how long the current head-of-queue job has been stuck on an otherwise-idle device.
 
         The clock only runs while no live job is sampling or otherwise using an unclassified in-progress
-        slot: a head waiting behind such work is legitimately queued, not starved. Jobs whose mapped process
-        is only downloading auxiliary files do not suppress the clock because they occupy concurrency without
-        feeding the GPU. It resets whenever the head changes (a different job reached the front) so the
-        backstop measures *this* head's wait, not the queue's age.
+        slot: a head waiting behind such work is legitimately queued, not starved. It resets whenever the
+        head changes (a different job reached the front) so the backstop measures *this* head's wait, not
+        the queue's age.
         """
         head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
-        in_progress_blocks_idle_fill = (
-            len(self._job_tracker.jobs_in_progress) > 0 and not self._only_aux_downloads_in_progress()
-        )
+        in_progress_blocks_idle_fill = len(self._job_tracker.jobs_in_progress) > 0
         if head_id is None or in_progress_blocks_idle_fill:
             self._head_starvation_job_id = None
             self._head_starvation_since = 0.0
@@ -2571,27 +2563,6 @@ class InferenceScheduler:
         if head_id != self._head_starvation_job_id:
             self._head_starvation_job_id = head_id
             self._head_starvation_since = time.time()
-
-    def _only_aux_downloads_in_progress(self) -> bool:
-        """Return whether every in-progress job maps to a process downloading auxiliary files.
-
-        An in-progress job without a matching process reference is treated conservatively as potentially
-        GPU-active. This preserves the concurrency and memory-safety fences when IPC state is incomplete or
-        briefly stale; idle-fill is enabled only when the scheduler can positively identify every live job as
-        download-only.
-        """
-        in_progress_jobs = set(self._job_tracker.jobs_in_progress)
-        if not in_progress_jobs:
-            return False
-
-        aux_download_jobs = {
-            process_info.last_job_referenced
-            for process_info in self._process_map.values()
-            if process_info.process_type == HordeProcessType.INFERENCE
-            and process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
-            and process_info.last_job_referenced is not None
-        }
-        return in_progress_jobs.issubset(aux_download_jobs)
 
     def _head_starved_seconds(self, job: ImageGenerateJobPopResponse) -> float:
         """Seconds this job has been the idle-device head, or 0.0 when it is not the tracked head."""
@@ -3681,6 +3652,12 @@ class InferenceScheduler:
             context_constant_mb=self.resolved_context_constant_mb(),
             device_index=device_index,
         )
+        foreign_floor_mb = self._sustained_foreign_floor_mb(
+            device_index,
+            total_vram_mb=raw_total_mb,
+            device_free_mb=device_free_mb,
+            worker_footprint_mb=committed_mb,
+        )
         oldest_report_age = self._process_map.oldest_committed_report_age_seconds(
             now=time.time(),
             device_index=device_index,
@@ -3760,8 +3737,53 @@ class InferenceScheduler:
             active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
             governor_state=governor_state,
             device_free_mb=device_free_mb,
+            foreign_floor_mb=foreign_floor_mb,
             reclaim_unresolved=reclaim_unresolved,
         )
+
+    def _sustained_foreign_floor_mb(
+        self,
+        device_index: int | None,
+        *,
+        total_vram_mb: float | None,
+        device_free_mb: float | None,
+        worker_footprint_mb: float,
+    ) -> float | None:
+        """Return this card's sustained foreign-VRAM floor (MB), advancing the trailing-window tracker.
+
+        The instantaneous foreign reading is ``total - device_free - worker_footprint``: the device VRAM the
+        NVML reading shows used, less the worker's own committed footprint (the ledger already excludes the
+        shared baseline), so what remains is the VRAM the OS/desktop/other processes hold. It is contributed
+        as a sample only when the card is fully measured and at least one worker process has reported its VRAM
+        footprint; otherwise (cold start, children not yet reporting) no sample is added and the floor stays
+        None, preserving the arbiter's pre-foreign behaviour. The tracker returns the sustained minimum over
+        its trailing window, or None until a full window has been observed.
+        """
+        device_key = device_index if device_index is not None else 0
+        if (
+            total_vram_mb is not None
+            and device_free_mb is not None
+            and self._process_map.committed_ledger_processes(device_index)
+        ):
+            foreign_now_mb: float | None = total_vram_mb - device_free_mb - worker_footprint_mb
+        else:
+            foreign_now_mb = None
+        return self._foreign_vram_floor.update(device_key, foreign_now_mb, now=self._foreign_floor_clock())
+
+    def achievable_ceiling_mb(self, device_index: int | None) -> float | None:
+        """Return a card's current achievable VRAM ceiling (MB): total net of noise and the sustained foreign floor.
+
+        The most VRAM this card could offer one load right now, read live so a conditional ceiling hold can lift
+        the moment the foreign floor recedes. None when the card's total is unknown (no GPU child has reported
+        yet). Reads the sustained foreign floor without recording a fresh sample, so a ceiling read never
+        perturbs the observation window.
+        """
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None:
+            return None
+        device_key = device_index if device_index is not None else 0
+        foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
+        return total_vram_mb - admission_noise_buffer_mb(total_vram_mb) - (foreign_floor_mb or 0.0)
 
     def build_vram_arbiter_snapshot(
         self,
@@ -4213,8 +4235,6 @@ class InferenceScheduler:
             HordeProcessState.PROCESS_STARTING,
             HordeProcessState.DOWNLOADING_MODEL,
             HordeProcessState.PRELOADING_MODEL,
-            HordeProcessState.DOWNLOADING_AUX_MODEL,
-            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
             HordeProcessState.UNLOADED_MODEL_FROM_RAM,
         }
 
@@ -4349,9 +4369,6 @@ class InferenceScheduler:
                     will_load_loras=will_load_loras,
                     seamless_tiling_enabled=seamless_tiling_enabled,
                     sdk_api_job_info=job,
-                    aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
-                        self._runtime_config.bridge_data,
-                    ),
                 ),
             )
 
@@ -4691,6 +4708,8 @@ class InferenceScheduler:
 
         if verdict.disposition is VramDisposition.FITS:
             self._vram_budget_defer_notified = False
+            if verdict.measured_attempt:
+                self._mark_measured_attempt(job, request, device_index=target_device_index)
             # A FITS is a real fit against the truthful device-free reading (the identity already accounts for
             # baseline and foreign load, which are physically inside that reading). The model still loads
             # through system RAM, so the marginal RAM verdict runs.
@@ -4701,9 +4720,24 @@ class InferenceScheduler:
                 no_live_resource_consumer=no_live_resource_consumer,
             )
 
-        # DEFER (or the structural-impossibility DENY, treated identically): run the described pressure-relief
-        # commands so the over-commit is relieved, then defer. There is no overcommit admit: a head that never
-        # becomes admittable while the device is idle is rerouted by the structural-queue-wedge recovery
+        # A structural-impossibility DENY for the true head, with no other card that could ever seat it, is a
+        # permanent wall: the model's demand exceeds this card's achievable ceiling (total net of the noise
+        # buffer and the sustained foreign floor), so deferring only wedges the queue behind a head that no
+        # reclaim can admit and no reroute can rescue. Fault the head terminally so the horde reissues it and
+        # head protection releases, and quarantine the model for the session so it is not popped into the same
+        # wall again. A DENY with a live reroute target, or for a non-head demand, still falls through to the
+        # ordinary defer-and-reclaim path below.
+        if (
+            verdict.disposition is VramDisposition.DENY
+            and is_head_blocker
+            and not arbiter.any_other_device_can_seat(request, exclude_device_index=target_device_index)
+        ):
+            self._fault_unroutable_head(job, arbiter, request, device_index=target_device_index)
+            return False
+
+        # DEFER (or a structural DENY that can still reroute or is not the head): run the described
+        # pressure-relief commands so the over-commit is relieved, then defer. There is no overcommit admit: a
+        # head that stays deferred while the device is idle is rerouted by the structural-queue-wedge recovery
         # supervisor, and the arbiter emits a starvation diagnostic naming the arithmetic before then.
         # Completion is observed via the next cycle's frozen snapshot; the actuations are never awaited inline.
         if not self._vram_budget_defer_notified and not vram_verdict.fits:
@@ -4727,6 +4761,75 @@ class InferenceScheduler:
         finally:
             self._preload_actuation = None
         return False
+
+    def _mark_measured_attempt(
+        self,
+        job: ImageGenerateJobPopResponse,
+        request: VramRequest,
+        *,
+        device_index: int | None,
+    ) -> None:
+        """Tag a job admitted through the arbiter's measured-load escape hatch, recording the attempted demand.
+
+        The arbiter emits the one attempt-start log line (edge-triggered on its own one-shot), so this only
+        records the tag and the candidate the attempt was taken under. The tag rides on the job so that a
+        subsequent child OOM is routed to a terminal scheduling-recovery fault that arms the ceiling hold with
+        real-attempt evidence (the candidate the load actually failed at), rather than to the ordinary degraded
+        retry that would bang the same converged-empty card again.
+        """
+        self._job_tracker.mark_measured_attempt(
+            job,
+            candidate_mb=request.candidate_delta_mb or 0.0,
+            device_index=device_index,
+        )
+
+    def _fault_unroutable_head(
+        self,
+        job: ImageGenerateJobPopResponse,
+        arbiter: VramArbiter,
+        request: VramRequest,
+        *,
+        device_index: int | None,
+    ) -> None:
+        """Terminally fault an unroutable head and place a conditional ceiling hold on its model.
+
+        Reached only for the true head when the measured achievable ceiling (total net of the noise buffer and
+        the sustained foreign floor) cannot hold its predicted demand on any card. The job is faulted now as a
+        scheduling-recovery action so the horde reissues it while it cannot fit (a job is time-bound) and the
+        give-up/head-protection machinery sees the head resolved; the fault is excluded from the
+        consecutive-failure pop pause (a card-fit verdict the recovery path owns, not a generation outcome). The
+        model is placed on a conditional ceiling hold, not a permanent quarantine: pop advertising and dispatch
+        stop offering it *while* the ceiling holds, and it becomes advertisable again on its own once the ceiling
+        recedes (the foreign floor drops). The operator warning is edge-triggered on each fresh arm.
+        """
+        state = arbiter.device_state(device_index)
+        candidate_mb = request.candidate_delta_mb or 0.0
+        ceiling_mb = state.achievable_ceiling_mb() if state is not None else None
+        foreign_mb = state.foreign_floor_mb if state is not None else None
+        arithmetic = (
+            f"model {job.model} needs {candidate_mb:.0f} MB; this card can currently offer at most "
+            f"{ceiling_mb:.0f} MB with {foreign_mb:.0f} MB held by other processes"
+            if ceiling_mb is not None and foreign_mb is not None
+            else f"model {job.model} exceeds this card's current achievable VRAM ceiling"
+        )
+        newly_armed = self._job_tracker.hold_model_by_ceiling(
+            job.model,
+            device_index=device_index,
+            candidate_mb=candidate_mb,
+        )
+        if newly_armed:
+            logger.opt(ansi=True).warning(
+                f"<fg #f0beff>VRAM: {arithmetic}. It is held (not offered) while other processes hold that "
+                "VRAM, and its jobs are faulted for reissue meanwhile. The hold frees automatically once that "
+                "VRAM is released (close other GPU apps), or you can remove the model from this worker's "
+                "config.</>",
+            )
+        self._job_tracker.handle_job_fault_now(
+            job,
+            retryable=False,
+            fault_reason=f"unroutable head (ceiling hold): {arithmetic}",
+            fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY,
+        )
 
     def _ensure_preload_arbiter(self) -> VramArbiter:
         """Return the preload-admission arbiter, priming a private one with the current measurement if unwired.
@@ -4778,6 +4881,8 @@ class InferenceScheduler:
                 target_process_id=available_process.process_id,
             ),
             is_head_of_queue=is_head_blocker,
+            head_job_id=str(job.id_) if job.id_ is not None else None,
+            measured_attempt_in_progress=self._job_tracker.is_measured_attempt(job),
             starved_seconds=self._head_starved_seconds(job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             can_reduce_live_contexts=can_reduce_live_contexts,
@@ -4868,28 +4973,6 @@ class InferenceScheduler:
             baseline,
             process_id=None,
             disaggregated=self._is_disaggregation_class_eligible(displaced_head),
-        )
-
-    def _line_skip_displaces_pending_aux_preparation(
-        self,
-        displaced_job: ImageGenerateJobPopResponse,
-    ) -> bool:
-        """Return whether a line-skip jumps a pending, preparation-only auxiliary download.
-
-        Unlike the historical START_INFERENCE download shape, a preparation-only head cannot begin sampling
-        when its files finish: the child returns to WAITING_FOR_JOB and the parent must dispatch it through the
-        arbiter again.  A bounded line-skip may therefore use the currently measured free room without also
-        preserving enough room for the pending head.  All other line-skips retain head protection, including
-        legacy/in-flight downloads whose child can proceed directly from download into sampling.
-        """
-        if displaced_job in self._job_tracker.jobs_in_progress:
-            return False
-        return any(
-            process.process_type is HordeProcessType.INFERENCE
-            and process.last_control_flag is HordeControlFlag.PREPARE_AUX_MODELS
-            and process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
-            and process.last_job_referenced == displaced_job
-            for process in self._process_map.values()
         )
 
     def _context_reduction_demand(
@@ -5397,7 +5480,6 @@ class InferenceScheduler:
         self._restore_deferred_safety_gpu_load()
         self._converge_whole_card_residency()
         self._expire_stale_model_map_entries()
-        self._prune_aux_backfill_staging_claims()
 
         if self._pending_post_processing_should_hold_preload():
             return False
@@ -5432,7 +5514,18 @@ class InferenceScheduler:
         # model (see the budget-defer branches in the admission pipeline); a later job whose turn has
         # not come never displaces a resident head.
         in_progress_jobs = self._job_tracker.jobs_in_progress
-        head_job = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress_jobs), None)
+        # An aux-unprepared job never anchors preload as the head: it holds no reservation and nothing prices
+        # around it, so the first job eligible to hold capacity is the first pending one that is both not in
+        # progress and not awaiting auxiliary preparation. A fitting sibling behind a gated job is thus the
+        # head that may escalate eviction to become resident, while the gated job stays invisible to preload.
+        head_job = next(
+            (
+                j
+                for j in self._job_tracker.jobs_pending_inference
+                if j not in in_progress_jobs and not self._job_requires_aux_preparation(j)
+            ),
+            None,
+        )
         self._update_head_starvation_timer(head_job)
         if self._resident_head_should_dispatch_before_preload(head_job):
             return False
@@ -5517,6 +5610,12 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
+
+        # An aux-unprepared job never holds a preload: staging its model would reserve a lane and price VRAM
+        # around a job that cannot yet sample. It is invisible to preload until the pop-time prefetch pipeline
+        # clears its gate; the pass moves on so a fitting sibling is preloaded instead.
+        if self._job_requires_aux_preparation(job):
+            return _PreloadJobOutcome.NEXT_JOB
 
         if (unserviceable_reason := self._unserviceable_job_reason(job)) is not None:
             if job not in self._job_tracker.jobs_in_progress:
@@ -5670,45 +5769,6 @@ class InferenceScheduler:
                 reason="preload concurrency gate",
             )
 
-        aux_backfill_forecast = (
-            self._aux_blocked_backfill_staging_forecast(
-                job,
-                head_job=head_job,
-                available_process=available_process,
-            )
-            if self._budget_active()
-            else None
-        )
-        if aux_backfill_forecast is not None:
-            baseline = self._model_metadata.get_baseline(job.model)
-            if not self._apply_ram_verdict(
-                job,
-                baseline,
-                is_head_blocker=False,
-                no_live_resource_consumer=False,
-            ):
-                return self._preload_outcome(
-                    AdmissionDecision.DEFER_BUDGET,
-                    job=job,
-                    process=available_process,
-                    reason="aux-blocked backfill does not fit the RAM budget",
-                )
-            if self._send_preload(job, available_process):
-                assert head_job is not None
-                self._aux_backfill_heads_staged.add(self._job_tracking_key(head_job))
-                return self._preload_outcome(
-                    AdmissionDecision.PRESTAGE,
-                    job=job,
-                    process=available_process,
-                    reason="RAM-staged quick backfill while queue head downloads auxiliaries",
-                )
-            return self._preload_outcome(
-                AdmissionDecision.STOP_PASS,
-                job=job,
-                process=available_process,
-                reason="aux-blocked backfill preload send failed",
-            )
-
         # Resource budget gate: a fresh preload loads this model's weights into the shared device
         # (VRAM) and into system RAM, so admit it only when both measured free VRAM and available
         # RAM cover its estimated cost plus their reserves. This is the proactive guard against the
@@ -5731,84 +5791,6 @@ class InferenceScheduler:
         return self._preload_outcome(
             AdmissionDecision.STOP_PASS, job=job, process=available_process, reason="preload send failed"
         )
-
-    def _aux_blocked_backfill_staging_forecast(
-        self,
-        job: ImageGenerateJobPopResponse,
-        *,
-        head_job: ImageGenerateJobPopResponse | None,
-        available_process: HordeProcessInfo,
-    ) -> StreamForecast | None:
-        """Return the forecast when ``job`` may stage behind an auxiliary-blocked queue head.
-
-        A model preload stages weights in system RAM; the model does not materialize on the device until
-        dispatch. When the queue head is downloading auxiliaries, charging its future sampling footprint can
-        otherwise prevent every later nonresident model from staging, while line-skip requires exactly such a
-        resident model. This bounded path permits one ordinary preload pass to stage a quick, distinct-model
-        backfill without treating the two jobs as concurrent samplers.
-
-        The candidate must satisfy the same immediate-work contract as line-skip: no missing auxiliaries, no
-        degraded retry, and a bounded effective size. It must also be independently forecast to co-reside and
-        not require isolation. RAM admission, checkpoint-load serialization, and dispatch-time VRAM
-        reconciliation remain authoritative at their normal call sites.
-        """
-        if head_job is None or job is head_job or job.model is None or job.model == head_job.model:
-            return None
-        if self._job_tracking_key(head_job) in self._aux_backfill_heads_staged:
-            return None
-        if self._job_tracker.is_degraded_dispatch_pending(job):
-            return None
-
-        head_is_downloading = any(
-            process.process_type is HordeProcessType.INFERENCE
-            and process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
-            and process.last_job_referenced == head_job
-            for process in self._process_map.values()
-        )
-        if not head_is_downloading:
-            return None
-
-        job_has_loras = job.payload.loras is not None and len(job.payload.loras) > 0
-        if job_has_loras and not self._loras_cached_for_line_skip(job):
-            return None
-        if job.payload.tis:
-            return None
-
-        bridge_data = self._runtime_config.bridge_data
-        candidate_limit = line_skip_candidate_emps_limit(
-            high_performance_mode=bool(bridge_data.high_performance_mode),
-            moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
-        )
-        if self.get_single_job_effective_megapixelsteps(job) > candidate_limit:
-            return None
-
-        target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
-        baseline = self._model_metadata.get_baseline(job.model)
-        forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
-        if not forecast.fits_coresident or forecast.admit_requires_isolation:
-            return None
-        return forecast
-
-    @staticmethod
-    def _job_tracking_key(job: ImageGenerateJobPopResponse) -> str:
-        """Return a stable key for scheduler bookkeeping tied to one popped job."""
-        return str(job.id_) if job.id_ is not None else str(id(job))
-
-    def _prune_aux_backfill_staging_claims(self) -> None:
-        """Release staging claims after their queue heads leave auxiliary download.
-
-        One head may stage at most one backfill while its auxiliary download is active. Keeping the claim for
-        that entire state prevents a worker with several idle siblings from filling every slot with speculative
-        models. Once the head leaves the state, ordinary preload and dispatch policy owns all slots again.
-        """
-        active_head_keys = {
-            self._job_tracking_key(process.last_job_referenced)
-            for process in self._process_map.values()
-            if process.process_type is HordeProcessType.INFERENCE
-            and process.last_process_state is HordeProcessState.DOWNLOADING_AUX_MODEL
-            and process.last_job_referenced is not None
-        }
-        self._aux_backfill_heads_staged.intersection_update(active_head_keys)
 
     def _select_head_room_process(self) -> HordeProcessInfo | None:
         """Pick an idle inference process to free for a starved head-of-queue job, or None.
@@ -6003,34 +5985,6 @@ class InferenceScheduler:
             return None
         return self._pick_best_resident_process(candidates)
 
-    def _idle_resident_process_excluding(
-        self,
-        job: ImageGenerateJobPopResponse,
-        *,
-        exclude_process_id: int | None,
-    ) -> HordeProcessInfo | None:
-        """A resident, idle (can-accept) process for ``job`` other than ``exclude_process_id``.
-
-        Used by the line-skip when the candidate shares the blocked head's model: the head's own slot reads
-        as able to accept work while it downloads auxiliary models, so a same-model skip must be routed onto
-        a *different* idle process that already holds the model, never back onto the downloading slot.
-        Returns None when the model is resident only on the excluded slot or on busy lanes, honoring per-card
-        eligibility on a multi-GPU host. Ties break to the least-loaded card, matching dispatch selection.
-        """
-        if job.model is None:
-            return None
-        if self._multi_gpu_routing_active:
-            candidates = self._process_map.get_processes_by_horde_model_name(
-                job.model,
-                allowed_cards=self._eligible_card_indices(job),
-            )
-        else:
-            candidates = self._process_map.get_processes_by_horde_model_name(job.model)
-        ready = [p for p in candidates if p.process_id != exclude_process_id and p.can_accept_job()]
-        if not ready:
-            return None
-        return min(ready, key=lambda p: self._card_inference_load(p.device_index))
-
     def _pinned_lane_resident_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The disaggregation-pinned lane holding ``job``'s model when that is the only resident copy, else None.
 
@@ -6088,201 +6042,6 @@ class InferenceScheduler:
             if candidate is not None:
                 return candidate
         return None
-
-    def _log_line_skip_rejection(self, candidate_id: str, reason_key: str, message: str) -> None:
-        """Emit a line-skip rejection at DEBUG, rate-limited per (candidate, reason).
-
-        Line-skip is re-evaluated every (sub-second) scheduling pass while a head job is blocked, so an
-        unthrottled rejection log floods the file with thousands of identical lines during a stall. This
-        keeps full fidelity (every distinct candidate and reason is still logged, and a changed reason
-        logs immediately) while collapsing the repeats to at most one per
-        ``_LINE_SKIP_REJECTION_LOG_INTERVAL``.
-        """
-        now = time.monotonic()
-        key = f"{candidate_id}:{reason_key}"
-        last = self._line_skip_rejection_log_state.get(key)
-        if last is not None and (now - last) < _LINE_SKIP_REJECTION_LOG_INTERVAL:
-            return
-        self._line_skip_rejection_log_state[key] = now
-        # Prune stale keys so a long-running worker's churn of candidate ids cannot grow this unboundedly.
-        if len(self._line_skip_rejection_log_state) > _LINE_SKIP_REJECTION_LOG_MAX_KEYS:
-            cutoff = now - _LINE_SKIP_REJECTION_LOG_INTERVAL
-            self._line_skip_rejection_log_state = {
-                k: t for k, t in self._line_skip_rejection_log_state.items() if t >= cutoff
-            }
-        logger.debug(f"Line-skip candidate {candidate_id} {message}")
-
-    def _loras_cached_for_line_skip(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Whether ``job``'s LoRAs are all on disk, so line-skipping onto it introduces no fresh download.
-
-        The line-skip contract refuses a LoRA-carrying candidate because filling the idle lane with another
-        download would only trade one blocking download for another. That reasoning holds only while the
-        LoRAs are absent: once every LoRA a job needs is already cached, skipping it onto a resident idle
-        lane samples immediately and keeps the GPU fed from an otherwise all-LoRA queue. The cached set is
-        not trusted while the worker purges LoRAs on download or its LoRA disk is exhausted, since either can
-        evict a file after it was recorded; in those modes the set is dropped and the candidate is refused,
-        preserving the no-trade contract.
-        """
-        bridge_data = self._runtime_config.bridge_data
-        if bridge_data.purge_loras_on_download or self._state.lora_disk_exhausted:
-            self._job_tracker.clear_cached_loras()
-            return False
-        return self._job_tracker.are_all_job_loras_cached(job)
-
-    def _select_line_skip_candidate(
-        self,
-        displaced_job: ImageGenerateJobPopResponse,
-        *,
-        next_n_jobs: list[ImageGenerateJobPopResponse],
-        candidate_job_size: int,
-        displaced_process_id: int | None,
-    ) -> NextJobAndProcess | None:
-        """Select a small, ready job that may bypass ``displaced_job`` while its slot is non-sampling.
-
-        Scans the pending jobs for the first resident on an idle process that carries no LoRAs it must still
-        download, is not a degraded retry, and is within the per-performance-mode size limit. A LoRA-carrying
-        candidate qualifies only when every LoRA it needs is already cached on disk (see
-        :meth:`_loras_cached_for_line_skip`), so the skip introduces no fresh blocking download in place of
-        the head's. A candidate sharing the blocked head's model qualifies as long as that model is resident
-        on a *different* idle process than the downloading head (``displaced_process_id``): during an
-        aux-model download the head's own slot reads as able to accept work, so a same-model skip is routed
-        onto a sibling copy, never back onto the downloading slot. This keeps a mono-model queue from
-        starving the GPU whenever its one head stalls on a LoRA download. Returns a
-        :class:`NextJobAndProcess` carrying the :class:`LineSkip` record, or None when nothing qualifies.
-        Rejections are logged (rate-limited).
-        """
-        for candidate_small_job in next_n_jobs:
-            candidate_id = str(candidate_small_job.id_)[:8]
-            job_has_loras = (
-                candidate_small_job.payload.loras is not None and len(candidate_small_job.payload.loras) > 0
-            )
-            if candidate_small_job.model is None:
-                self._log_line_skip_rejection(candidate_id, "missing_model", "rejected: missing model.")
-                continue
-            if job_has_loras and not self._loras_cached_for_line_skip(candidate_small_job):
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "uncached_loras",
-                    "rejected: candidate has LoRAs not yet cached on disk (skipping would trade one blocking "
-                    "download for another).",
-                )
-                continue
-            if candidate_small_job.payload.tis:
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "textual_inversions",
-                    "rejected: candidate has textual inversions whose cache residency is not tracked.",
-                )
-                continue
-            if self._job_tracker.is_degraded_dispatch_pending(candidate_small_job):
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "degraded",
-                    "rejected: degraded retry must run isolated.",
-                )
-                continue
-
-            if candidate_small_job.model == displaced_job.model:
-                candidate_process_with_model = self._idle_resident_process_excluding(
-                    candidate_small_job,
-                    exclude_process_id=displaced_process_id,
-                )
-                if candidate_process_with_model is None:
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "same_model",
-                        f"rejected: same model as blocked job {str(displaced_job.id_)[:8]} with no other "
-                        "idle resident lane.",
-                    )
-                    continue
-            else:
-                candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
-                if candidate_process_with_model is None:
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "not_resident",
-                        f"rejected: model {candidate_small_job.model} is not resident.",
-                    )
-                    continue
-
-            candidate_effective_mps = self.get_single_job_effective_megapixelsteps(candidate_small_job)
-            if candidate_effective_mps > candidate_job_size:
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "emps",
-                    f"rejected: {candidate_effective_mps} eMPS exceeds {candidate_job_size} eMPS limit.",
-                )
-                continue
-
-            if not candidate_process_with_model.can_accept_job():
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "process_state",
-                    f"rejected: process {candidate_process_with_model.process_id} is "
-                    f"{candidate_process_with_model.last_process_state.name}.",
-                )
-                continue
-
-            logger.debug(
-                f"Line-skip candidate {candidate_id} accepted: {candidate_small_job.model}, "
-                f"{candidate_effective_mps} eMPS <= {candidate_job_size}, process "
-                f"{candidate_process_with_model.process_id} can accept work.",
-            )
-            return NextJobAndProcess(
-                next_job=candidate_small_job,
-                process_with_model=candidate_process_with_model,
-                line_skip=LineSkip(displaced_job=displaced_job),
-            )
-
-        return None
-
-    def _active_aux_download_blocker(
-        self,
-        *,
-        device_index: int | None,
-    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
-        """Return an in-progress job whose slot is downloading auxiliaries instead of sampling.
-
-        The ordinary concurrency cap counts a popped job as in progress as soon as START_INFERENCE is sent,
-        including the time its child spends fetching LoRAs. That work consumes no sampling slot. A different
-        model already resident on an idle process may therefore use the card without increasing denoiser
-        concurrency; this helper identifies the active download whose cap slot can be borrowed.
-        """
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.last_process_state != HordeProcessState.DOWNLOADING_AUX_MODEL:
-                continue
-            job = process_info.last_job_referenced
-            if job is not None and job in self._job_tracker.jobs_in_progress:
-                return job, process_info
-        return None
-
-    def _arm_line_skip_for_stalled_aux_download(
-        self,
-        process_info: HordeProcessInfo,
-        bridge_data: reGenBridgeData,
-    ) -> None:
-        """Arm an urgent line-skip pop when an auxiliary download exceeds its configured threshold.
-
-        The process identifies the card whose non-sampling slot may be borrowed. The existing threshold is
-        retained as the patience fence, and the popper retains all protective backpressure checks; this method
-        only exposes the established urgent-pop path from both scheduler queue shapes.
-
-        Args:
-            process_info: Inference process currently downloading auxiliary files.
-            bridge_data: Active worker configuration containing the line-skip threshold.
-        """
-        threshold_seconds = bridge_data.aux_model_download_line_skip_threshold_seconds
-        if threshold_seconds is None:
-            return
-        if self._process_map.any_model_downloading_aux_more_than_threshold(
-            device_index=process_info.device_index,
-            threshold_seconds=threshold_seconds,
-        ):
-            self._state.wants_line_skip_candidate = True
 
     async def _handle_process_missing(
         self,
@@ -6357,8 +6116,6 @@ class InferenceScheduler:
                 return cached
             self._pending_line_skip = None
 
-        bridge_data = self._runtime_config.bridge_data
-
         next_job: ImageGenerateJobPopResponse | None = None
         next_n_jobs: list[ImageGenerateJobPopResponse] = []
         for job in self._job_tracker.jobs_pending_inference:
@@ -6367,6 +6124,11 @@ class InferenceScheduler:
             # Never make a quarantined model the dispatch head: it can never become resident (preload_models
             # skips it and faults it for reissue), so selecting it here would only stall the scheduler.
             if self._process_lifecycle.is_model_load_quarantined(job.model):
+                continue
+            # An aux-unprepared job is invisible to dispatch: it holds nothing and cannot sample until the
+            # pop-time prefetch pipeline clears its preparation gate. Skipping it here lets a fitting sibling
+            # become the dispatch head and be GPU-fed while the gated job waits, so no lane idles behind it.
+            if self._job_requires_aux_preparation(job):
                 continue
             if next_job is None:
                 next_job = job
@@ -6386,11 +6148,6 @@ class InferenceScheduler:
         process_with_model = self._resident_process_for_job(next_job)
         line_skip: LineSkip | None = None
 
-        candidate_job_size = line_skip_candidate_emps_limit(
-            high_performance_mode=bool(bridge_data.high_performance_mode),
-            moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
-        )
-
         # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
         # concurrency cap is scoped to that card: its own in-progress count vs its own ceilings. The scope is
         # dropped (worker-wide, as on a single-GPU host) when the head is not yet resident (no target card) or
@@ -6408,68 +6165,12 @@ class InferenceScheduler:
         else:
             jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
         max_jobs_allowed = self._max_jobs_in_progress_allowed(card=target_card)
-        if self._state.wants_line_skip_candidate and (
-            bridge_data.aux_model_download_line_skip_threshold_seconds is None
-            or not self._process_map.any_model_downloading_aux_more_than_threshold(
-                threshold_seconds=bridge_data.aux_model_download_line_skip_threshold_seconds,
-            )
-        ):
-            # The aux download that justified bypassing the in-progress cap is no longer blocking (or the
-            # breaker was disabled); without this reset the cap would stay bypassed for the whole session.
-            self._state.wants_line_skip_candidate = False
-        if jobs_in_progress_count >= max_jobs_allowed and not self._state.wants_line_skip_candidate:
+        if jobs_in_progress_count >= max_jobs_allowed:
             if self._job_tracker.has_exclusive_job_in_progress():
                 logger.debug(
-                    "Line-skip blocked: exclusive in-progress job requires isolation "
+                    "Dispatch held at the concurrency cap while an exclusive in-progress job requires isolation "
                     f"(jobs_in_progress={jobs_in_progress_count}, cap={max_jobs_allowed}).",
                 )
-                return None
-            if (
-                process_with_model is not None
-                and process_with_model.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
-            ):
-                logger.debug(
-                    "Line-skip considering cap bypass: head job "
-                    f"{str(next_job.id_)[:8]} is blocked by aux downloads on process "
-                    f"{process_with_model.process_id} "
-                    f"(jobs_in_progress={jobs_in_progress_count}, cap={max_jobs_allowed}, "
-                    f"max_threads={self._max_concurrent_inference_processes}, "
-                    f"gpu_sampling_lease_enabled={bridge_data.gpu_sampling_lease_enabled}).",
-                )
-                bypass = self._select_line_skip_candidate(
-                    next_job,
-                    next_n_jobs=next_n_jobs,
-                    candidate_job_size=candidate_job_size,
-                    displaced_process_id=process_with_model.process_id,
-                )
-                if bypass is not None:
-                    self._pending_line_skip = bypass
-                    return bypass
-
-                # So no already popped job was suitable, let's set the state accordingly so we can attempt
-                # to pop a smaller job next tick
-                self._arm_line_skip_for_stalled_aux_download(process_with_model, bridge_data)
-
-            # The cap may instead be occupied by an *already in-progress* job fetching its auxiliaries. In
-            # that shape the pending head is perfectly ready on another resident process, so inspecting only
-            # the head's process misses the idle-card opportunity. Borrow the non-sampling slot using the same
-            # modest/resident/non-LoRA line-skip contract and preserve the active download as the displaced job.
-            aux_blocker = self._active_aux_download_blocker(
-                device_index=target_card.device_index if target_card is not None else None,
-            )
-            if aux_blocker is not None:
-                active_aux_job, aux_process = aux_blocker
-                bypass = self._select_line_skip_candidate(
-                    active_aux_job,
-                    next_n_jobs=next_n_jobs,
-                    candidate_job_size=candidate_job_size,
-                    displaced_process_id=aux_process.process_id,
-                )
-                if bypass is not None:
-                    self._pending_line_skip = bypass
-                    return bypass
-                self._arm_line_skip_for_stalled_aux_download(aux_process, bridge_data)
-
             return None
 
         if process_with_model is None:
@@ -6521,32 +6222,19 @@ class InferenceScheduler:
                 return None
 
         if not process_with_model.can_accept_job():
-            if process_with_model.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
-                line_skip_selection = self._select_line_skip_candidate(
-                    next_job,
-                    next_n_jobs=next_n_jobs,
-                    candidate_job_size=candidate_job_size,
-                    displaced_process_id=process_with_model.process_id,
-                )
-                if line_skip_selection is None:
-                    return None
-                next_job = line_skip_selection.next_job
-                process_with_model = line_skip_selection.process_with_model
-                line_skip = line_skip_selection.line_skip
-            else:
-                # The head's own process is busy sampling its model, so the head cannot run yet. Rather than
-                # idle a free inference process, fill it with a pending job for a *different* model already
-                # resident there: a multi-threaded worker covers more distinct models per concurrent slot and
-                # avoids duplicate-loading the head's model. The head keeps its queue position via the
-                # line-skip. Falls through to None when nothing distinct is runnable (so a run of same-model
-                # jobs still waits for the busy process rather than duplicating its model).
-                diversity = self._select_idle_thread_diversity_job(next_job, next_n_jobs)
-                if diversity is None:
-                    return None
-                diversity_job, diversity_process = diversity
-                line_skip = LineSkip(displaced_job=next_job)
-                next_job = diversity_job
-                process_with_model = diversity_process
+            # The head's own process is busy sampling its model, so the head cannot run yet. Rather than
+            # idle a free inference process, fill it with a pending job for a *different* model already
+            # resident there: a multi-threaded worker covers more distinct models per concurrent slot and
+            # avoids duplicate-loading the head's model. The head keeps its queue position via the
+            # line-skip. Falls through to None when nothing distinct is runnable (so a run of same-model
+            # jobs still waits for the busy process rather than duplicating its model).
+            diversity = self._select_idle_thread_diversity_job(next_job, next_n_jobs)
+            if diversity is None:
+                return None
+            diversity_job, diversity_process = diversity
+            line_skip = LineSkip(displaced_job=next_job)
+            next_job = diversity_job
+            process_with_model = diversity_process
 
         self._model_recently_missing = False
 
@@ -6561,9 +6249,9 @@ class InferenceScheduler:
         # Hold a would-be concurrent job back until the in-flight job(s) have made size-appropriate
         # headway, so two heavy models (or a batch / extra-large model) do not stack their loads and
         # activation peaks on the card and thrash a sampler into a watchdog teardown. The line-skip
-        # bypass is exempt: it deliberately keeps the GPU fed with a small job while another slot is
-        # only downloading aux models, and is already size-limited. information_only look-ahead is not
-        # gated here so callers still see the next job; the real dispatch path below enforces the hold.
+        # bypass is exempt: it is a resident-model bypass or diversity fill that is already size-appropriate
+        # and keeps the GPU fed while the displaced head waits on its own load. information_only look-ahead
+        # is not gated here so callers still see the next job; the real dispatch path below enforces the hold.
         if (
             not information_only
             and line_skip is None
@@ -7272,10 +6960,8 @@ class InferenceScheduler:
                 horde_model_name=next_job.model,
                 sdk_api_job_info=next_job,
                 keep_model_resident_after=keep_model_resident_after,
-                aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
-                    bridge_data,
-                ),
                 premade_control_map_bytes=premade_control_map_bytes,
+                skipped_aux_models=self._job_tracker.skipped_aux_for_job(next_job),
             ),
         ):
             await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
@@ -7512,6 +7198,8 @@ class InferenceScheduler:
                 target_process_id=process_with_model.process_id,
             ),
             is_head_of_queue=is_head_of_queue,
+            head_job_id=str(next_job.id_) if next_job.id_ is not None else None,
+            measured_attempt_in_progress=self._job_tracker.is_measured_attempt(next_job),
             head_outstanding_mb=head_outstanding_mb,
             starved_seconds=self._head_starved_seconds(next_job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
@@ -7527,6 +7215,8 @@ class InferenceScheduler:
         verdict = self._ensure_preload_arbiter().evaluate(request)
 
         if verdict.admits:
+            if verdict.measured_attempt:
+                self._mark_measured_attempt(next_job, request, device_index=device_index)
             self._resolve_dispatch_hold(next_job)
             return False
 
@@ -7632,7 +7322,10 @@ class InferenceScheduler:
         next_job = next_job_and_process.next_job
 
         if next_job_and_process.line_skip is None and self._job_requires_aux_preparation(next_job):
-            self._send_aux_preparation(next_job, process_with_model)
+            # An unprepared aux job is not dispatchable: it holds no lane and no VRAM reservation while the
+            # pop-time prefetch pipeline places its LoRAs/TIs on disk and clears its preparation gate. It is
+            # already skipped by dispatch selection and preload admission, so a fitting sibling flows past it;
+            # this remains as the terminal gate so such a job can never seize a lane by any path.
             return False
 
         degraded_dispatch = self._job_tracker.is_degraded_dispatch_pending(next_job)
@@ -7656,21 +7349,16 @@ class InferenceScheduler:
             return False
 
         line_skip = next_job_and_process.line_skip
-        displaces_pending_aux_preparation = (
-            line_skip is not None and self._line_skip_displaces_pending_aux_preparation(line_skip.displaced_job)
-        )
         if self._dispatch_residency_reconciliation_holds(
             next_job,
             process_with_model,
             # A line-skip dispatch is not the true head of queue, so it presents is_head_of_queue=False and the
             # head it jumped priced as head_outstanding_mb. Head protection reserves the card's physical room
-            # for a head that may begin sampling on its own after a legacy in-flight download. A pending-only
-            # auxiliary preparation is different: its child returns idle and the head must re-enter admission,
-            # so the bounded skipper may use measured free room now without creating an ungoverned overlap.
+            # for a head that may begin sampling on its own once the lane it waits on frees.
             is_head_of_queue=line_skip is None,
             head_outstanding_mb=(
                 None
-                if line_skip is None or displaces_pending_aux_preparation
+                if line_skip is None
                 else self._displaced_head_outstanding_mb(
                     line_skip.displaced_job,
                     device_index=process_with_model.device_index if self._multi_gpu_routing_active else None,
@@ -7740,53 +7428,16 @@ class InferenceScheduler:
         return True
 
     def _job_requires_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Return whether a pending job must resolve LoRAs before it may claim sampling admission.
+        """Return whether a pending job must resolve its auxiliary files before it may claim sampling admission.
 
-        A base model can already be resident while the job's LoRAs are not.  Preparing those files under a
-        separate control command keeps the job pending and therefore creates no dispatch reservation.  Once
-        preparation completes, START_INFERENCE still revalidates the files child-side and passes through every
-        ordinary VRAM, concurrency, post-processing, and degraded-retry gate.
+        A base model can already be resident while the job's LoRAs or textual inversions are not.  The
+        pop-time prefetch pipeline places those files on disk while the job stays pending, so preparation
+        creates no dispatch reservation.  Once the prepared flag is set, START_INFERENCE still revalidates
+        the files child-side and passes through every ordinary VRAM, concurrency, post-processing, and
+        degraded-retry gate.
         """
-        return bool(job.payload.loras) and not self._job_tracker.are_job_aux_models_prepared(job)
-
-    def _send_aux_preparation(
-        self,
-        job: ImageGenerateJobPopResponse,
-        process_with_model: HordeProcessInfo,
-    ) -> bool:
-        """Ask a resident job's lane to prepare LoRAs while the job remains pending.
-
-        The process state is advanced optimistically, matching the worker's other IPC sends, so the next
-        scheduling pass can line-skip bounded ready work without racing the child's acknowledgement.  A failed
-        send changes no state and leaves the job pending for lifecycle recovery or a later retry.
-        """
-        if job.model is None:
-            return False
-        sent = process_with_model.safe_send_message(
-            HordePrepareAuxControlMessage(
-                horde_model_name=job.model,
-                sdk_api_job_info=job,
-                aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
-                    self._runtime_config.bridge_data,
-                ),
-            ),
-        )
-        if not sent:
-            return False
-        logger.info(
-            f"Preparing auxiliary models for pending job {str(job.id_)[:8]} on process "
-            f"{process_with_model.process_id} before sampling admission",
-        )
-        process_with_model.last_control_flag = HordeControlFlag.PREPARE_AUX_MODELS
-        self._process_map.on_last_job_reference_change(
-            process_id=process_with_model.process_id,
-            last_job_referenced=job,
-        )
-        self._process_map.on_process_state_change(
-            process_id=process_with_model.process_id,
-            new_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
-        )
-        return True
+        has_aux = bool(job.payload.loras) or bool(job.payload.tis)
+        return has_aux and not self._job_tracker.are_job_aux_models_prepared(job)
 
     def _compute_wanted_models(self) -> set[str]:
         """The set of models the worker is actively serving right now.

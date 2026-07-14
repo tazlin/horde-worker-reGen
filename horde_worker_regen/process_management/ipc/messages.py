@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from enum import auto
+from enum import StrEnum, auto
 from typing import ClassVar
 
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
@@ -20,12 +20,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadStatusSnapshot
 
-AUX_DOWNLOAD_FAILED_INFO = "aux-download-deadline-exceeded"
-"""Marker placed in a faulted inference result's ``info`` when a child aborted its own stalled aux download.
+AUX_RESOLVE_FAILED_INFO = "aux-resolve-failed"
+"""Marker placed in a faulted inference result's ``info`` when a child cannot resolve a job's auxiliary files.
 
-The child sets it when an aux (LoRa/TI) download blows the dispatch deadline carried on its control message;
-the parent's message dispatcher recognises it to register a LoRA-download backoff strike and apply the
-backoff-aware retry policy: the same response as a watchdog teardown, but without tearing the process down."""
+The parent's download process places a job's auxiliary (LoRa/TI) files on disk before the job becomes
+dispatchable, so an unresolved file at inference time indicates a raced eviction between prefetch and
+dispatch. The child faults the job retryably with this marker (its model kept resident); the parent's
+prefetch reconcile sweep re-requests the file and re-admits the job, so the race self-heals."""
 
 
 class ModelLoadState(enum.Enum):
@@ -97,11 +98,6 @@ class HordeProcessState(enum.Enum):
     """The process is downloading a model."""
     DOWNLOAD_COMPLETE = auto()
     """The process has finished downloading a model."""
-
-    DOWNLOADING_AUX_MODEL = auto()
-    """The process is downloading an auxiliary model. (e.g., LORA)"""
-    DOWNLOAD_AUX_COMPLETE = auto()
-    """The process has finished downloading an auxiliary model. (e.g., LORA)"""
 
     PRELOADING_MODEL = auto()
     """The process is preloading a model."""
@@ -321,16 +317,6 @@ class HordeModelStateChangeMessage(HordeProcessStateChangeMessage):
     """The state of the model."""
 
 
-class HordeAuxModelStateChangeMessage(HordeProcessStateChangeMessage):
-    """Auxiliary model state change messages that are sent from the child processes to the main process.
-
-    See also `ModelLoadState`.
-    """
-
-    sdk_api_job_info: ImageGenerateJobPopResponse | None = None
-    """If the model state change is related to a job, the job as sent by the API."""
-
-
 class HordeDownloadProgressMessage(HordeModelStateChangeMessage):
     """Download progress messages that are sent from the child processes to the main process."""
 
@@ -497,8 +483,11 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to download a model."""
     PRELOAD_MODEL = auto()
     """Signal the child process to preload a model."""
-    PREPARE_AUX_MODELS = auto()
-    """Signal an inference child to resolve a pending job's LoRAs without starting inference."""
+    PREFETCH_AUX_MODELS = auto()
+    """Signal the dedicated download process to fetch a set of a popped job's LoRAs/TIs ahead of dispatch.
+
+    The sole background downloader places the files on disk while the job stays pending, so dispatch finds
+    them already cached; the inference child then only resolves them read-only and never downloads."""
     START_INFERENCE = auto()
     """Signal the child process to start inference."""
     START_ALCHEMY = auto()
@@ -573,14 +562,6 @@ class HordeControlModelMessage(HordeControlMessage):
     horde_model_name: str
     """The name of the model as defined in the horde model reference."""
 
-    aux_download_deadline_seconds: float | None = None
-    """Wall-clock budget for this job's auxiliary (LoRa/TI) downloads before the child gives up.
-
-    Set by the parent to its own (backoff-aware) stuck-aux watchdog timeout minus a margin, so the child
-    cancels a stalled download and faults the job *itself*, keeping the inference process alive, a beat
-    before the watchdog would otherwise tear the whole process down. ``None`` means no child-side deadline
-    (the watchdog remains the only backstop), preserving behaviour for any sender that does not set it."""
-
 
 class HordeDownloadControlMessage(HordeControlMessage):
     """Ask the dedicated download process to ensure a set of image models are present on disk.
@@ -625,6 +606,86 @@ class HordeDownloadControlMessage(HordeControlMessage):
     """If not None, retune whether the default-LoRa pass purges unused LoRas, applied live."""
 
 
+class AuxModelKind(StrEnum):
+    """Which ad-hoc auxiliary category a prefetch entry names (selects the manager that fetches it)."""
+
+    LORA = "lora"
+    TI = "ti"
+
+
+class AuxModelRef(BaseModel):
+    """Identity of an ad-hoc auxiliary file: the payload reference plus which manager resolves it.
+
+    ``name`` and ``is_version`` are the same fields the API payload carries; the download process resolves
+    them to a manager reference key (LoRAs by version or fuzzy name, TIs by fuzzy name) when it fetches or
+    pins the file. TIs never carry a version, so ``is_version`` is meaningful only for LoRAs.
+    """
+
+    kind: AuxModelKind
+    name: str
+    is_version: bool = False
+
+
+class AuxPrefetchEntry(AuxModelRef):
+    """One auxiliary file a popped job needs, tagged with the job that requested it.
+
+    The requesting job id rides along so a per-entry download outcome can be routed back to the exact
+    pending job(s) waiting on it, without the parent re-deriving the mapping.
+    """
+
+    requesting_job_id: GenerationID
+    """The generation id of the pending job that referenced this auxiliary file."""
+
+
+class HordeAuxPrefetchControlMessage(HordeControlMessage):
+    """Ask the download process to place a popped job's LoRAs/TIs on disk while the job stays pending.
+
+    Each entry is fetched at most once (deduplicated across jobs), reporting a per-entry outcome as a
+    :class:`HordeAuxPrefetchResultMessage`. ``pins`` is the full set of auxiliary files any tracked job
+    still references; the download process applies it as eviction protection so a file another pending job
+    needs is not evicted out from under it before that job dispatches.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.PREFETCH_AUX_MODELS
+    entries: list[AuxPrefetchEntry] = Field(default_factory=list)
+    """The auxiliary files to ensure on disk (already filtered to the not-yet-known-cached set)."""
+    pins: list[AuxModelRef] = Field(default_factory=list)
+    """Every auxiliary file referenced by any tracked job, protected from eviction while still needed."""
+
+
+class AuxPrefetchOutcome(BaseModel):
+    """The result of ensuring one auxiliary file is on disk, routed back to its requesting job(s)."""
+
+    kind: AuxModelKind
+    name: str
+    is_version: bool = False
+    ok: bool
+    """Whether the file is now present on disk (already-present entries report ok immediately)."""
+    retryable: bool = True
+    """Whether a failure is worth another attempt; False marks a terminal (not-found/invalid) failure."""
+    detail: str | None = None
+    """The failure summary (``"{type}: {message}"`` or a short reason) when ``ok`` is False, else None."""
+    rejection_reason: str | None = None
+    """A short reason an auxiliary file was terminally rejected from ad-hoc download (for a LoRA the
+    ``LoRaRejectionReason`` value as a string: invalid metadata, larger than the ad-hoc size cap, or NSFW on an
+    SFW-only worker; for a textual inversion the reason the fetch API permanently refused it). Set only on a
+    failed (``ok`` False) outcome; it directs the parent to skip that file and dispatch the job without it
+    rather than faulting the job. None for a success or a transient (retryable) failure."""
+    requesting_job_ids: list[GenerationID] = Field(default_factory=list)
+    """The pending jobs that requested this file, so the parent can mark or fault them precisely."""
+
+
+class HordeAuxPrefetchResultMessage(HordeProcessMessage):
+    """Per-entry outcomes of an aux-prefetch request, sent by the dedicated download process.
+
+    Like :class:`HordeDownloadAvailabilityMessage`, this is not tied to an entry in the process map: the
+    download process lives outside it, so the parent routes it by the reserved download-process id.
+    """
+
+    outcomes: list[AuxPrefetchOutcome] = Field(default_factory=list)
+    """One outcome per requested entry (success or failure), in no particular order."""
+
+
 class HordePreloadInferenceModelMessage(HordeControlModelMessage):
     """Preload model (for image generation) messages that are sent from the main process to the child processes."""
 
@@ -637,19 +698,6 @@ class HordePreloadInferenceModelMessage(HordeControlModelMessage):
 
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
-
-
-class HordePrepareAuxControlMessage(HordeControlModelMessage):
-    """Resolve a pending image job's auxiliary files without claiming a sampling slot.
-
-    The job remains pending in the parent while the child runs the same bounded, heartbeat-protected LoRA
-    download path used by inference.  Completion makes the ordinary inference dispatch eligible; it does not
-    bypass sampling admission or reserve VRAM.
-    """
-
-    control_flag: HordeControlFlag = HordeControlFlag.PREPARE_AUX_MODELS
-    sdk_api_job_info: ImageGenerateJobPopResponse
-    """The pending job whose LoRA references must be present before dispatch."""
 
 
 class HordeInferenceControlMessage(HordeControlModelMessage):
@@ -665,6 +713,13 @@ class HordeInferenceControlMessage(HordeControlModelMessage):
     budget confirms it can stay resident across the live process set, so the back-to-back force-reload
     (the dominant non-sampling cost on small jobs) is skipped. Defaults to False, preserving the
     aggressive per-job eviction that keeps sibling GPU instances from over-committing."""
+
+    skipped_aux_models: list[AuxModelRef] = Field(default_factory=list)
+    """Auxiliary files this job references that were terminally rejected from ad-hoc download and so will
+    never be on disk. The inference child tolerates their absence at its read-only dispatch presence-check
+    (letting the generator skip each and record a fault-metadata entry) instead of faulting the job for a
+    missing file. A file missing for any other reason still faults the job retryably, so a raced eviction
+    between prefetch and dispatch self-heals."""
 
     premade_control_map_bytes: bytes | None = None
     """The pre-computed ControlNet control map (PNG bytes) the image-utilities lane derived, or None.

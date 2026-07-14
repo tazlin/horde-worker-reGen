@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopPayload,
+    ImageGenerateJobPopRequest,
     ImageGenerateJobPopResponse,
     ImageGenerateJobPopSkippedStatus,
     LorasPayloadEntry,
@@ -19,6 +20,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 from horde_sdk.ai_horde_api.fields import GenerationID
 
+from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES, KNOWN_CONTROLNET_WORKFLOWS
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.simulation._dummy_jobs import DUMMY_R2_UPLOAD_URL, dummy_job_factory
 
@@ -74,8 +76,14 @@ class CannedJobSource:
             return None
         return len(self._jobs)
 
-    def next_pop_response(self) -> ImageGenerateJobPopResponse:
-        """Return the next canned job, or a no-job-available response once exhausted."""
+    def next_pop_response(self, pop_request: ImageGenerateJobPopRequest | None = None) -> ImageGenerateJobPopResponse:
+        """Return the next canned job, or a no-job-available response once exhausted.
+
+        ``pop_request`` is the request the popper would have sent to the live API. A fixed-list source
+        replays a scripted scenario verbatim, so it ignores the request's shaping; generating sources
+        honor it so pop-side governors (LoRA share caps, feature withholding) shape simulated traffic
+        exactly as they shape live traffic.
+        """
         if len(self._jobs) == 0 or self.exhausted:
             return make_empty_pop_response()
 
@@ -400,6 +408,14 @@ class SoakImageTemplate:
     post_processing: list[str] = field(default_factory=list)
     hires_fix: bool = False
     cfg_scale: float | None = None
+    loras: list[LorasPayloadEntry] = field(default_factory=list)
+    """LoRA references every job minted from this template carries.
+
+    The references are fixed on the template, so every job it mints requests the same files: jobs sharing
+    a template (or sharing a reference across templates) resolve to the same on-disk LoRA, which is what
+    lets a soak exercise the cache-reuse and download-dedup paths that pop-time prefetch depends on."""
+    tis: list[TIPayloadEntry] = field(default_factory=list)
+    """Textual-inversion references every job minted from this template carries (symmetric to ``loras``)."""
     weight: float = 1.0
     """Relative likelihood of this template being chosen on each pop."""
 
@@ -438,11 +454,73 @@ class GeneratingJobSource(CannedJobSource):
         """Unbounded; the soak watcher decides when to stop."""
         return None
 
-    def next_pop_response(self) -> ImageGenerateJobPopResponse:
-        """Generate a fresh job from a weighted-random template (or no-job once stopped)."""
+    @staticmethod
+    def _template_matches_pop_request(
+        template: SoakImageTemplate,
+        pop_request: ImageGenerateJobPopRequest,
+    ) -> bool:
+        """Return whether the simulated Horde may assign ``template`` for this pop request.
+
+        The generating source can only enforce requirements represented by :class:`SoakImageTemplate`.
+        Request properties requiring synthetic metadata or server-side knowledge (prompt blacklist, requester
+        kudos/IP, NSFW intent, painting mode, and model-average step limits) remain outside simulation;
+        fixed-list sources deliberately replay their scripts verbatim.
+        """
+        if template.model not in pop_request.models:
+            return False
+        if template.width * template.height > pop_request.max_pixels:
+            return False
+        if (template.loras or template.tis) and not pop_request.allow_lora:
+            return False
+        if template.post_processing and not pop_request.allow_post_processing:
+            return False
+
+        needs_source_image = template.control_type is not None or template.workflow is not None
+        needs_controlnet = template.control_type is not None or template.workflow in KNOWN_CONTROLNET_WORKFLOWS
+        if needs_controlnet and not pop_request.allow_controlnet:
+            return False
+        if template.control_type in EXTENDED_CONTROL_TYPES and not pop_request.allow_extended_controlnet:
+            return False
+        if template.workflow in KNOWN_CONTROLNET_WORKFLOWS and not pop_request.allow_sdxl_controlnet:
+            return False
+
+        # make_canned_job supplies a source image for ControlNet and every workflow template. The worker-side
+        # eligibility contract treats every source-image job as img2img-class in addition to any feature gate.
+        return not (needs_source_image and not pop_request.allow_img2img)
+
+    def _eligible_templates(
+        self,
+        pop_request: ImageGenerateJobPopRequest | None,
+    ) -> tuple[list[SoakImageTemplate], list[float]]:
+        """Return templates and normalized draw weights eligible for ``pop_request``."""
+        if pop_request is None:
+            return self._templates, self._weights
+
+        eligible = [
+            (template, weight)
+            for template, weight in zip(self._templates, self._weights, strict=True)
+            if self._template_matches_pop_request(template, pop_request)
+        ]
+        templates = [template for template, _weight in eligible]
+        weights = [weight for _template, weight in eligible]
+        if templates and sum(weights) <= 0:
+            weights = [1.0] * len(templates)
+        return templates, weights
+
+    def next_pop_response(self, pop_request: ImageGenerateJobPopRequest | None = None) -> ImageGenerateJobPopResponse:
+        """Generate a fresh job from a weighted-random template (or no-job once stopped).
+
+        The popper's request shaping is honored the way the live API honors it: ineligible templates are
+        excluded and their weight redistributes over the eligible templates. A mix with nothing suitable
+        reports no job available. This keeps pop-side governors (including LoRA intake caps, feature
+        withholding, multi-GPU targeting, and the idle-fill model/size ladder) load-bearing in simulation.
+        """
         if self._stopped:
             return make_empty_pop_response()
-        template = self._rng.choices(self._templates, weights=self._weights, k=1)[0]
+        templates, weights = self._eligible_templates(pop_request)
+        if not templates:
+            return make_empty_pop_response()
+        template = self._rng.choices(templates, weights=weights, k=1)[0]
         return make_canned_job(
             template.model,
             width=template.width,
@@ -456,6 +534,8 @@ class GeneratingJobSource(CannedJobSource):
             post_processing=template.post_processing or None,
             hires_fix=template.hires_fix,
             cfg_scale=template.cfg_scale,
+            loras=template.loras or None,
+            tis=template.tis or None,
         )
 
 
@@ -569,7 +649,7 @@ class TimedJobSource(CannedJobSource):
         self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
         self._start_time: float | None = None
 
-    def next_pop_response(self) -> ImageGenerateJobPopResponse:
+    def next_pop_response(self, pop_request: ImageGenerateJobPopRequest | None = None) -> ImageGenerateJobPopResponse:
         """Return the next job if its arrival time has passed, else a no-job response."""
         if self._start_time is None:
             self._start_time = self._clock()
@@ -581,7 +661,7 @@ class TimedJobSource(CannedJobSource):
         if elapsed < self._schedule.release_time_offset(self._next_index):
             return make_empty_pop_response()
 
-        return super().next_pop_response()
+        return super().next_pop_response(pop_request)
 
 
 # ---------------------------------------------------------------------------

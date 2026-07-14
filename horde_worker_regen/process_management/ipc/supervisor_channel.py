@@ -506,6 +506,17 @@ class DownloadItem(BaseModel):
     size_bytes: int | None = None
 
 
+FEATURE_LORA_ADHOC = "LoRa (job)"
+"""The ``feature`` label a job-driven ad-hoc LoRA prefetch download carries."""
+FEATURE_TI_ADHOC = "textual inversion (job)"
+"""The ``feature`` label a job-driven ad-hoc textual-inversion prefetch download carries."""
+ADHOC_PREFETCH_FEATURES = frozenset({FEATURE_LORA_ADHOC, FEATURE_TI_ADHOC})
+"""Download-feature labels for the job-driven ad-hoc prefetch pipeline (LoRA/TI placed on disk at job pop).
+
+These downloads are how a LoRA job becomes dispatchable, so they are excluded from the worker-wide
+LoRA-advertising suppression (which only bulk/default seeding and image/aux fetches should trigger)."""
+
+
 class CurrentDownloadStatus(BaseModel):
     """The download in progress right now, with live progress."""
 

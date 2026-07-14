@@ -87,6 +87,12 @@ def is_model_locally_unservable_for(
     """
     if model is None:
         return False
+    # A model on a conditional ceiling hold (its predicted demand is above the card's current achievable
+    # ceiling: total net of noise and the sustained foreign floor) is held back while that ceiling holds,
+    # independent of the over-budget fault streak. The hold lifts on its own once the ceiling recedes (the
+    # foreign floor dropped), so this is not a permanent exclusion.
+    if job_tracker.is_model_held_by_ceiling(model, device_index=device_index):
+        return True
     threshold = bridge_data.unservable_model_fault_threshold
     if not isinstance(threshold, int) or isinstance(threshold, bool):
         return False

@@ -141,7 +141,7 @@ def test_brief_silence_under_base_threshold_is_not_unresponsive() -> None:
 
 def test_download_in_flight_gets_a_longer_staleness_grace() -> None:
     """While a download/load is in flight the unresponsive alarm holds off past the base threshold."""
-    downloading = _snapshot(processes=[_process("DOWNLOADING_AUX_MODEL", loaded_horde_model_name="SomeModel")])
+    downloading = _snapshot(processes=[_process("DOWNLOADING_MODEL", loaded_horde_model_name="SomeModel")])
     # Past the 20s base budget but within the 90s download budget: not unresponsive (it is warming up).
     report = derive(downloading, SupervisorStatus.RUNNING, 45.0)
     assert report.phase is not WorkerPhase.UNRESPONSIVE

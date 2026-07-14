@@ -68,18 +68,18 @@ def get_single_job_magnitude(job: ImageGenerateJobPopResponse) -> int:
     return int(job_effective_pixel_steps / 1_000_000)
 
 
-def line_skip_candidate_emps_limit(
+def small_pop_emps_limit(
     *,
     high_performance_mode: bool,
     moderate_performance_mode: bool,
 ) -> int:
-    """Return the eMPS ceiling a job must fall under to line-skip a slot blocked on aux downloads.
+    """Return the eMPS ceiling bounding a small idle-fill (or flat-small) pop candidate.
 
-    A line-skip job fills an idle sibling process while another slot waits on an auxiliary-model
-    download. The ceiling is kept generous so that ordinary and moderately large resident jobs can absorb
-    the otherwise-idle GPU time rather than the card starving for the whole download: admission is still
-    enforced against measured device VRAM at dispatch, so this cap only bounds how large a tenant the skip
-    may introduce, not whether it can safely run. The ceiling widens with the worker's performance mode.
+    The idle-fill ladder feeds an otherwise-idle sibling process with quick-start work while another slot
+    waits on a load. The ceiling is kept generous so that ordinary and moderately large resident jobs can
+    absorb the otherwise-idle GPU time rather than the card starving: admission is still enforced against
+    measured device VRAM at dispatch, so this cap only bounds how large a tenant the fill may introduce, not
+    whether it can safely run. The ceiling widens with the worker's performance mode.
     """
     if high_performance_mode:
         return 400
@@ -88,30 +88,28 @@ def line_skip_candidate_emps_limit(
     return 100
 
 
-_LINE_SKIP_POP_NOMINAL_STEPS = 30
-"""Sampling-step count assumed when translating the line-skip eMPS ceiling into a pop ``max_power``.
+_SMALL_POP_NOMINAL_STEPS = 30
+"""Sampling-step count assumed when translating the small-pop eMPS ceiling into a pop ``max_power``.
 
-Real jobs vary in step count, so this only biases the horde toward returning a skippable job; it is not a
-guarantee. The scheduler re-checks each popped job's true eMPS against
-:func:`line_skip_candidate_emps_limit` before allowing it to skip, so a returned job that is larger than
-expected simply waits its turn in the queue instead of skipping."""
+Real jobs vary in step count, so this only biases the horde toward returning a small job; it is not a
+guarantee. The scheduler re-checks each popped job's true eMPS before dispatch, so a returned job that is
+larger than expected simply waits its turn in the queue."""
 
 
-def line_skip_pop_max_power(
+def small_pop_max_power(
     *,
     high_performance_mode: bool,
     moderate_performance_mode: bool,
 ) -> int:
-    """Return a ``max_power`` that biases a pop toward a job able to line-skip an aux-download-blocked slot.
+    """Return a ``max_power`` that biases a pop toward a small, quick-start job for the idle-fill ladder.
 
     The horde honours ``max_pixels`` (``max_power * 8 * 64 * 64``) as a hard cap on the resolution of
     returned jobs. Translating the perf-mode eMPS ceiling into an approximate resolution ceiling (assuming
-    a nominal step count) keeps the returned job small enough to slip past the blocked head and onto an
-    idle sibling process.
+    a nominal step count) keeps the returned job small enough to quick-start on an idle sibling process.
     """
-    emps_limit = line_skip_candidate_emps_limit(
+    emps_limit = small_pop_emps_limit(
         high_performance_mode=high_performance_mode,
         moderate_performance_mode=moderate_performance_mode,
     )
-    max_pixels = emps_limit * 1_000_000 // _LINE_SKIP_POP_NOMINAL_STEPS
+    max_pixels = emps_limit * 1_000_000 // _SMALL_POP_NOMINAL_STEPS
     return max(1, max_pixels // (8 * 64 * 64))

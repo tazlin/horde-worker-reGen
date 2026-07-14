@@ -45,7 +45,6 @@ _ACTIVE_STATES = frozenset(
         "ALCHEMY_STARTING",
         "PRELOADING_MODEL",
         "DOWNLOADING_MODEL",
-        "DOWNLOADING_AUX_MODEL",
         "JOB_RECEIVED",
         "EVALUATING_SAFETY",
     },
@@ -59,7 +58,6 @@ _EXPECTED_QUIET_STATES = frozenset(
         "PROCESS_STARTING",
         "PRELOADING_MODEL",
         "DOWNLOADING_MODEL",
-        "DOWNLOADING_AUX_MODEL",
     },
 )
 """States whose child-side work can block without emitting per-process heartbeats."""

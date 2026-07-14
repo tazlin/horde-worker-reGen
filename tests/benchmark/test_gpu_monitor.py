@@ -131,3 +131,13 @@ class TestUtilizationReaderDelegatesToHordelib:
         # Ensure the lazy `from hordelib.utils.nvml import ...` re-resolves against the patched module.
         monkeypatch.setitem(sys.modules, "hordelib.utils.nvml", nvml)
         assert _make_utilization_reader(0) is None
+
+    def test_dump_timeline_writes_valid_json(self, tmp_path) -> None:  # noqa: ANN001
+        """The diagnostics dump round-trips through JSON regardless of the internal buffer type."""
+        import json
+
+        sampler = GpuUtilizationSampler()
+        sampler._timeline.extend([(1000.0, 42), (1001.0, 7)])  # noqa: SLF001
+        target = tmp_path / "timeline.json"
+        sampler.dump_timeline(target)
+        assert json.loads(target.read_text(encoding="utf-8")) == [[1000.0, 42], [1001.0, 7]]

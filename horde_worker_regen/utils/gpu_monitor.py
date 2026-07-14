@@ -163,6 +163,6 @@ class GpuUtilizationSampler:
     def dump_timeline(self, path: str | Path) -> None:
         """Write the timestamped utilization series to ``path`` as JSON (diagnostics)."""
         try:
-            Path(path).write_text(json.dumps(self._timeline), encoding="utf-8")
+            Path(path).write_text(json.dumps(self.timeline()), encoding="utf-8")
         except OSError as write_error:  # noqa: BLE001 - a diagnostics dump must never break a run
             logger.debug(f"Could not write GPU utilization timeline to {path}: {write_error}")

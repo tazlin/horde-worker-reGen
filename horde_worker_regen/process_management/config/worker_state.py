@@ -12,7 +12,7 @@ import enum
 import time
 from collections import deque
 
-from horde_worker_regen.process_management.models.lora_download_backoff import LoraDownloadBackoff
+from horde_worker_regen.process_management.models.aux_download_backoff import AuxDownloadBackoff
 
 
 class PopPauseOwner(enum.StrEnum):
@@ -124,7 +124,7 @@ class WorkerState:
     ``_effective_allow_lora``) so it isn't handed jobs whose LoRAs it cannot download, and the TUI
     surfaces a prominent warning. Cleared automatically once free space recovers above the floor."""
 
-    lora_download_backoff: LoraDownloadBackoff = dataclasses.field(default_factory=LoraDownloadBackoff)
+    lora_download_backoff: AuxDownloadBackoff = dataclasses.field(default_factory=AuxDownloadBackoff)
     """Escalating suppression of LoRA pops after repeated ad-hoc download teardowns.
 
     The process lifecycle records a strike whenever it reaps an inference slot stuck downloading
@@ -132,19 +132,20 @@ class WorkerState:
     support (see ``_lora_disk_permits``) so the worker stops feeding jobs into a failing download
     path. Windows double per consecutive strike and reset after a healthy stretch."""
 
-    wants_line_skip_candidate: bool = False
-    """An aux-model download has been blocking dispatch past the configured threshold with no suitable
-    already-popped bypass job, so the line-skip in-progress cap may be bypassed to keep the GPU busy.
-    Cleared by the line-skip cap gate as soon as no aux download exceeds the threshold."""
+    ti_download_backoff: AuxDownloadBackoff = dataclasses.field(default_factory=AuxDownloadBackoff)
+    """Escalating reaction to repeated ad-hoc textual-inversion download teardowns.
+
+    Mirrors ``lora_download_backoff`` but for textual inversions, and influences fault classification only:
+    the pop request has no per-request textual-inversion capability flag to withhold, so an active window
+    cannot suppress that traffic at the pop. While it is in force a fresh textual-inversion prefetch failure
+    is classified terminal rather than retryable, so a job is not requeued into the same failing path."""
 
     wants_idle_fill_candidate: bool = False
     """The queue head has sat on an unfed device past the idle-fill threshold while a sibling inference
     process is free, so the popper should over-pop a small no-LoRA "fill" job up the sd15->sdxl ladder. The
     device may be waiting for a main model or have only mapped auxiliary downloads in progress; a sampler or
-    an unclassified in-progress job suppresses the arm. A sibling of ``wants_line_skip_candidate``, not the
-    same flag: that one is armed and cleared purely by the aux-download-past-threshold condition and biases a
-    flat small-non-LoRA pop, whereas this drives the escalating ``idle_fill_rung`` ladder. Idle-fill yields to
-    the aux line-skip when both would apply. Armed and cleared by the scheduler around head-starvation."""
+    an unclassified in-progress job suppresses the arm. This drives the escalating ``idle_fill_rung`` ladder.
+    Armed and cleared by the scheduler around head-starvation."""
 
     idle_fill_rung: int = 0
     """Index into the idle-fill ladder (small sd15 -> large sd15 -> small sdxl -> large sdxl), advanced by one
@@ -184,6 +185,13 @@ class WorkerState:
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0
+    consecutive_failed_jobs_pause_count: int = 0
+    """How many times the consecutive-failures backstop has armed a pop pause over this worker's run.
+
+    Monotonic (never reset when a pause lapses), so an observer that samples it after a run can tell
+    whether the backstop fired at all, and how often, without watching the transient
+    :attr:`too_many_consecutive_failed_jobs` flag. A soak's acceptance rests on this staying zero:
+    pop-time auxiliary prefetch is meant to keep unprepared-LoRA jobs from ever tripping it."""
     # Must match CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS in pop_throttler.py;
     # this field is used by the status reporter for display only.
     too_many_consecutive_failed_jobs_wait_time: float = 180

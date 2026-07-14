@@ -48,7 +48,7 @@ from horde_sdk.worker.chaining import (
 from horde_sdk.worker.consts import GENERATION_PROGRESS
 from loguru import logger
 
-from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+from horde_worker_regen.process_management.ipc.messages import AuxModelKind, AuxModelRef, HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
@@ -224,14 +224,22 @@ class JobFaultOrigin(enum.StrEnum):
     A terminal fault reported by the worker's generation flow (an inference failure exhausting its retries,
     an un-submittable result) is a verdict on the work itself and feeds the consecutive-failure pop pause. A
     fault issued by scheduling recovery (the save-our-ship give-up faulting a wedged backlog so the horde
-    reissues it) is a recovery action, not a generation outcome: it carries its own escalation ladder, so the
-    submit path must not also let it manufacture the consecutive-failure pause on top of that recovery.
+    reissues it) or by the auxiliary-prefetch pipeline (a job whose LoRA/TI could not be placed on disk before
+    any generation ran) is not a generation outcome: the submit path must not let either manufacture the
+    consecutive-failure pause.
     """
 
     GENERATION = enum.auto()
     """The default: a fault arising from generating, post-processing, safety-checking, or submitting the job."""
     SCHEDULING_RECOVERY = enum.auto()
-    """A fault issued by a scheduling-recovery action (save-our-ship give-up), excluded from the failure pause."""
+    """A fault issued by a scheduling-recovery action, excluded from the failure pause. Covers the
+    save-our-ship give-up faulting a wedged backlog and the scheduler proactively faulting an unroutable head
+    (a model whose measured demand exceeds every card's achievable ceiling): both are card-fit/recovery
+    verdicts the scheduling path owns, not generation outcomes, so neither may manufacture the pause."""
+    AUX_PREFETCH = enum.auto()
+    """A fault issued by the auxiliary-prefetch pipeline, excluded from the failure pause. A job faulted because
+    a LoRA or textual inversion it references could never be placed on disk was never generated for, so a fetch
+    the worker cannot satisfy is not a generation verdict and must not silence intake of unrelated work."""
 
 
 @dataclass
@@ -287,6 +295,20 @@ class TrackedJob:
 
     Keys this model's over-budget fault streak per card so a model unservable on a small card can still be
     advertised and run on a larger one. None on single-GPU keeps the streak worker-wide, exactly as before."""
+    measured_attempt: bool = False
+    """Set when the scheduler admitted this job through the arbiter's measured-load escape hatch: a starved head
+    at a converged-empty card whose demand missed the instantaneous reading by a within-band shortfall, admitted
+    for one real load so measured reality decides rather than the conservative static prediction.
+
+    A resource (OOM) fault of such a job is not the ordinary transient over-commit that earns a degraded retry:
+    it is the real attempt failing, the strongest possible evidence the demand does not fit this card now. The
+    fault path routes it to a terminal scheduling-recovery fault (excluded from the consecutive-failure pop
+    pause, so it does not manufacture a maintenance pause) and arms the model's conditional ceiling hold with the
+    attempted demand, so the model is not offered into the same wall until the ceiling recedes. A success clears
+    naturally when the job leaves the tracker and the learned-peak machinery records the true figure."""
+    measured_attempt_candidate_mb: float = 0.0
+    """The candidate demand (MB) the measured-load attempt was admitted under, recorded so a failing attempt
+    arms the ceiling hold against the demand the real load actually failed at rather than a re-derived estimate."""
     premade_control_map_bytes: bytes | None = None
     """The ControlNet control map (PNG bytes) the image-utilities lane annotated ahead of dispatch, or None.
 
@@ -327,10 +349,13 @@ class TrackedJob:
     monolithic (so it is charged its full footprint and never re-claimed into the pipeline). Cleared naturally
     when the job leaves the tracker. See :meth:`requeue_disaggregated_for_monolithic`."""
     aux_models_prepared: bool = False
-    """Whether this job's LoRAs completed the explicit pending-queue preparation pass.
+    """Whether every auxiliary file (LoRA/TI) this job references is known present on disk.
 
-    This is job-scoped rather than a general cache claim: it authorizes this same head to proceed to ordinary
-    dispatch, while line-skip candidates continue to use the stricter cache-residency policy.
+    Set by the prefetch pipeline once the job's full auxiliary set has been placed by the download
+    process; until then the job is invisible to dispatch and preload, holding no lane and no VRAM
+    reservation. Withdrawn (see :meth:`JobTracker.invalidate_job_aux_preparation`) when an inference
+    child later fails to resolve one of the files, so the prefetch is re-armed instead of the job being
+    re-dispatched into the same failure.
     """
     chain_context: ChainExecutionContext | None = None
     """The chain-stage state for this job's unit of work, or None for jobs registered outside the pop path.
@@ -412,6 +437,25 @@ class JobTracker:
         # the keying collapses to one entry per model, behaviourally identical to the prior model-only keys.
         self._model_overbudget_fault_counts: dict[tuple[str, int | None], int] = {}
         self._model_last_overbudget_fault_time: dict[tuple[str, int | None], float] = {}
+        # Models on a conditional ceiling hold: the measured arbiter found their predicted demand above the
+        # card's current achievable ceiling (total net of the noise buffer and the sustained foreign floor), so
+        # it is not servable *while that ceiling holds*. Keyed by (model, device_index) to the candidate demand
+        # (MB) recorded at hold time; consulted by is_model_locally_unservable_for so pop advertising and
+        # dispatch both stop offering the model. The hold is not permanent: is_model_held_by_ceiling re-reads
+        # the *current* ceiling via the injected provider and lifts the hold once the ceiling has receded past
+        # the hysteresis margin (the foreign floor dropped, e.g. the operator freed other-process VRAM), so the
+        # model becomes advertisable again with no operator action; a later shortfall re-arms it.
+        self._ceiling_held_models: dict[tuple[str, int | None], float] = {}
+        # Count of measured-load attempts that ended in a resource (OOM) fault: the real load the arbiter's
+        # escape hatch admitted failed, arming the ceiling hold on the strongest possible evidence. Counted here
+        # (where the OOM is observed) rather than on the arbiter, which is a pure per-cycle function that never
+        # sees a job's outcome; the arbiter counts attempts started. A successful attempt needs no counter: the
+        # job completes and the learned-peak machinery records the true figure.
+        self.measured_attempt_faults = 0
+        # Reads the current achievable ceiling (MB) for a card, injected at wiring time so the live predicate
+        # need not reach into the scheduler that owns the foreign-floor tracker. None until wired (or on a card
+        # with no ceiling read yet), in which case a hold cannot be proven lifted and is kept.
+        self._achievable_ceiling_provider: Callable[[int | None], float | None] | None = None
         self._recent_resource_fault_times: list[float] = []
         # Post-processing over-commit faults (the planner's unhostable-peak faults and watchdog-reaped
         # post-processing-stage stalls), for the feature-level circuit breaker that disables post-processing
@@ -422,12 +466,27 @@ class JobTracker:
         # like the fault streaks (device_index, None on a single-GPU host); monotonic across the session.
         self._card_inference_results: dict[int | None, int] = {}
 
-        # LoRA files known present on disk, keyed by (name, is_version), learned as jobs complete their aux
-        # downloads. A pending LoRA job may line-skip onto an idle sibling lane only when every LoRA it needs
-        # is already here: otherwise the skip would just move the blocking download to that lane. The
-        # scheduler consults this to keep an all-LoRA queue feeding the GPU without trading one download for
-        # another, and drops the set whenever files may be evicted underneath it (see clear_cached_loras).
+        # LoRA files known present on disk this session, keyed by (name, is_version), learned from the aux
+        # prefetch pipeline's per-file outcomes. Consulted to decide when a pending job's full auxiliary set
+        # is ready so its dispatch gate can clear, and to skip re-requesting files a prior job already placed.
+        # Entries contradicted by the disk (an inference child failed to resolve one) are withdrawn via
+        # invalidate_job_aux_preparation so the next readiness check goes through a fresh prefetch.
         self._cached_lora_keys: set[str] = set()
+
+        # Textual inversions known present on disk this session, kept in a namespace distinct from the LoRA
+        # cache (a LoRA and a TI may share a name yet resolve to different files). Learned from the aux
+        # prefetch pipeline; consulted alongside the LoRA cache to decide when a job's full auxiliary set is
+        # ready, so its dispatch gate can clear.
+        self._cached_ti_keys: set[str] = set()
+
+        # LoRA/TI files a job references that were terminally rejected from ad-hoc download (invalid, too
+        # large, or NSFW on an SFW-only worker) and so will never be on disk. Kept in a namespace distinct
+        # from the cached sets: a skipped file is NOT present, so the on-disk probes (is_lora_cached/
+        # is_ti_cached) keep reporting it absent, but a job's aux set counts as ready once every file is
+        # cached OR skipped, letting a bad LoRA's job dispatch (the generator skips it and records a fault)
+        # instead of faulting the job.
+        self._skipped_lora_keys: set[str] = set()
+        self._skipped_ti_keys: set[str] = set()
 
         # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
         # tracker faults terminally; the worker opts into bounded retry via set_retry_policy().
@@ -483,6 +542,71 @@ class JobTracker:
             self._model_last_overbudget_fault_time.pop(key, None)
         if cleared:
             logger.debug(f"Model {model} produced a result; clearing its over-budget fault streak.")
+
+    _CEILING_HOLD_LIFT_MARGIN_MB = 256.0
+    """Hysteresis margin (MB): a ceiling hold lifts only once the candidate fits the current ceiling with this
+    much to spare, so a ceiling hovering at the candidate's demand does not flap the hold on and off."""
+
+    def set_achievable_ceiling_provider(self, provider: Callable[[int | None], float | None]) -> None:
+        """Inject the reader of a card's current achievable ceiling (MB), used to lift ceiling holds live."""
+        self._achievable_ceiling_provider = provider
+
+    def hold_model_by_ceiling(
+        self,
+        model: str | None,
+        *,
+        device_index: int | None = None,
+        candidate_mb: float,
+    ) -> bool:
+        """Place (or refresh) a conditional ceiling hold on a model; return True when newly armed.
+
+        Records the candidate demand (MB) the hold was taken under, so :meth:`is_model_held_by_ceiling` can lift
+        it once the current ceiling recedes past the hysteresis margin. Returns True only when the hold was not
+        already present (a fresh arm, or a re-arm after an earlier lift), so a caller can edge-trigger its one
+        operator warning on each arm rather than on every evaluation. ``device_index`` is None on a single-GPU
+        host and the card index on a multi-GPU host.
+        """
+        if model is None:
+            return False
+        key = (model, device_index)
+        newly_armed = key not in self._ceiling_held_models
+        self._ceiling_held_models[key] = candidate_mb
+        return newly_armed
+
+    def is_model_held_by_ceiling(self, model: str | None, *, device_index: int | None = None) -> bool:
+        """Return whether ``model`` is currently held below a card's achievable ceiling, lifting stale holds.
+
+        A live predicate, not a latch: each matching hold is re-checked against the *current* achievable ceiling
+        read through the injected provider. A hold is lifted (and forgotten, so a later shortfall re-arms and may
+        re-warn) once the candidate fits the current ceiling with the hysteresis margin to spare
+        (``candidate <= ceiling - margin``); until then it stays held. When no current ceiling can be read (no
+        provider wired, or the card has no reading yet) the hold cannot be proven lifted and is kept. With
+        ``device_index`` given, the card's own hold and any worker-wide (None-keyed) hold are considered; with
+        None, every card's hold for the model is (so a single-GPU query, with one None-keyed entry, is
+        unchanged).
+        """
+        if model is None:
+            return False
+        if device_index is None:
+            candidate_keys = [key for key in self._ceiling_held_models if key[0] == model]
+        else:
+            candidate_keys = [
+                key for key in ((model, device_index), (model, None)) if key in self._ceiling_held_models
+            ]
+        held = False
+        for key in candidate_keys:
+            candidate_mb = self._ceiling_held_models[key]
+            current_ceiling_mb = (
+                self._achievable_ceiling_provider(key[1]) if self._achievable_ceiling_provider is not None else None
+            )
+            if current_ceiling_mb is None:
+                held = True
+                continue
+            if candidate_mb > current_ceiling_mb - self._CEILING_HOLD_LIFT_MARGIN_MB:
+                held = True
+            else:
+                del self._ceiling_held_models[key]
+        return held
 
     def get_model_overbudget_fault_count(self, model: str | None, *, device_index: int | None = None) -> int:
         """Return the consecutive terminal over-budget fault count for ``model`` (0 if none).
@@ -740,6 +864,18 @@ class JobTracker:
         """Return whether this job's terminal fault was issued by a scheduling-recovery action (give-up)."""
         tracked = self._tracked_by_id(job_id)
         return tracked is not None and tracked.fault_origin is JobFaultOrigin.SCHEDULING_RECOVERY
+
+    def was_faulted_by_non_generation_action(self, job_id: GenerationID) -> bool:
+        """Return whether this job's terminal fault came from an action other than the generation flow.
+
+        True for a scheduling-recovery give-up and for an auxiliary-prefetch failure: neither is a verdict on
+        generating the work, so the submit path excludes both from the consecutive-failure pop pause.
+        """
+        tracked = self._tracked_by_id(job_id)
+        return tracked is not None and tracked.fault_origin in (
+            JobFaultOrigin.SCHEDULING_RECOVERY,
+            JobFaultOrigin.AUX_PREFETCH,
+        )
 
     def tracked_jobs(self) -> tuple[TrackedJob, ...]:
         """Return active tracked jobs in lifecycle order for read-only observers."""
@@ -1475,18 +1611,6 @@ class JobTracker:
         tracked = self._tracked_for(job)
         return tracked.job_info if tracked is not None else None
 
-    async def set_job_time_to_download_aux_models(
-        self,
-        job: ImageGenerateJobPopResponse,
-        time_elapsed: float | None,
-    ) -> bool:
-        """Set the time it took to download auxiliary models for a job."""
-        tracked = self._tracked_for(job)
-        if tracked is None or tracked.job_info is None:
-            return False
-        tracked.job_info.time_to_download_aux_models = time_elapsed
-        return True
-
     @staticmethod
     def _lora_cache_key(lora: LorasPayloadEntry) -> str:
         """Identity of the on-disk file a LoRA payload entry resolves to.
@@ -1496,35 +1620,116 @@ class JobTracker:
         """
         return f"{lora.name}\x1f{bool(lora.is_version)}"
 
-    def mark_job_loras_cached(self, job: ImageGenerateJobPopResponse | None) -> None:
-        """Record that every LoRA ``job`` needs is now present on disk (its aux download completed).
-
-        Synchronous on purpose: the read side runs inside the scheduler's synchronous dispatch selection.
-        """
-        if job is None:
-            return
-        tracked = self._tracked_for(job)
-        if tracked is not None:
-            tracked.aux_models_prepared = True
-        for lora in job.payload.loras or []:
-            self._cached_lora_keys.add(self._lora_cache_key(lora))
-
     def are_job_aux_models_prepared(self, job: ImageGenerateJobPopResponse) -> bool:
         """Return whether this pending job completed its explicit auxiliary preparation pass."""
         tracked = self._tracked_for(job)
         return tracked is not None and tracked.aux_models_prepared
 
     def are_all_job_loras_cached(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Whether every LoRA ``job`` needs has been seen present on disk this session.
+        """Whether every LoRA the job references is cached on disk or terminally skipped (so it need not be)."""
+        return all(
+            self._lora_cache_key(lora) in self._cached_lora_keys
+            or self._lora_cache_key(lora) in self._skipped_lora_keys
+            for lora in job.payload.loras or []
+        )
 
-        Vacuously True for a job with no LoRAs. A caller avoiding a fresh blocking download checks this
-        before line-skipping a LoRA-carrying job onto an idle lane.
+    def is_lora_cached(self, lora: LorasPayloadEntry) -> bool:
+        """Whether the file this LoRA payload entry resolves to has been seen present on disk this session."""
+        return self._lora_cache_key(lora) in self._cached_lora_keys
+
+    def is_ti_cached(self, name: str) -> bool:
+        """Whether the textual inversion named ``name`` has been seen present on disk this session."""
+        return self._ti_cache_key(name) in self._cached_ti_keys
+
+    def is_lora_skipped(self, lora: LorasPayloadEntry) -> bool:
+        """Whether this LoRA was terminally rejected from ad-hoc download (so it must not be re-requested)."""
+        return self._lora_cache_key(lora) in self._skipped_lora_keys
+
+    def is_ti_skipped(self, name: str) -> bool:
+        """Whether this TI was terminally rejected from ad-hoc download (so it must not be re-requested)."""
+        return self._ti_cache_key(name) in self._skipped_ti_keys
+
+    def skipped_aux_for_job(self, job: ImageGenerateJobPopResponse) -> list[AuxModelRef]:
+        """The job's auxiliary refs that were terminally rejected, for the inference child to tolerate missing."""
+        refs: list[AuxModelRef] = []
+        for lora in job.payload.loras or []:
+            if self._lora_cache_key(lora) in self._skipped_lora_keys:
+                refs.append(AuxModelRef(kind=AuxModelKind.LORA, name=lora.name, is_version=bool(lora.is_version)))
+        for ti in job.payload.tis or []:
+            if self._ti_cache_key(ti.name) in self._skipped_ti_keys:
+                refs.append(AuxModelRef(kind=AuxModelKind.TI, name=ti.name))
+        return refs
+
+    @staticmethod
+    def _ti_cache_key(name: str) -> str:
+        """Identity of the on-disk file a textual-inversion payload entry resolves to (its reference name)."""
+        return f"ti\x1f{name}"
+
+    def are_all_job_tis_cached(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether every TI the job references is cached on disk or terminally skipped (so it need not be)."""
+        return all(
+            self._ti_cache_key(ti.name) in self._cached_ti_keys or self._ti_cache_key(ti.name) in self._skipped_ti_keys
+            for ti in job.payload.tis or []
+        )
+
+    def mark_aux_prefetched(self, name: str, *, is_version: bool, is_ti: bool) -> None:
+        """Record that one auxiliary file (LoRA or TI) is now present on disk, from the prefetch pipeline.
+
+        Keyed in the same namespaces the per-job readiness checks read, so a later prefetch completion (or a
+        second job sharing the file) can find it already cached.
         """
-        return all(self._lora_cache_key(lora) in self._cached_lora_keys for lora in job.payload.loras or [])
+        if is_ti:
+            self._cached_ti_keys.add(self._ti_cache_key(name))
+        else:
+            self._cached_lora_keys.add(f"{name}\x1f{bool(is_version)}")
 
-    def clear_cached_loras(self) -> None:
-        """Forget the cached-LoRA set, for when files may have been evicted underneath the worker."""
-        self._cached_lora_keys.clear()
+    def mark_aux_skipped(self, name: str, *, is_version: bool, is_ti: bool) -> None:
+        """Record a terminally-rejected auxiliary file so a job's readiness no longer waits on it.
+
+        Unlike ``mark_aux_prefetched`` this does not claim the file is on disk (it never will be); it only
+        removes the file from what a job's aux set must contain to be ready, so the job dispatches and the
+        generator proceeds without it.
+        """
+        if is_ti:
+            self._skipped_ti_keys.add(self._ti_cache_key(name))
+        else:
+            self._skipped_lora_keys.add(f"{name}\x1f{bool(is_version)}")
+
+    def mark_job_aux_prepared_if_ready(self, job_id: GenerationID) -> bool:
+        """Set a pending job's aux-prepared flag once every LoRA and TI it needs is cached; return the transition.
+
+        Returns True only on the transition to prepared (so a caller acts once), and False when the job is
+        gone, still missing an auxiliary file, or was already prepared. Keeping LoRA and TI keys distinct
+        means a job is not marked prepared until both categories are fully present.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.aux_models_prepared or tracked.stage != JobStage.PENDING_INFERENCE:
+            return False
+        job = tracked.sdk_api_job_info
+        if not self.are_all_job_loras_cached(job) or not self.are_all_job_tis_cached(job):
+            return False
+        tracked.aux_models_prepared = True
+        return True
+
+    def invalidate_job_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Withdraw a job's aux-prepared state after its files failed to resolve on disk.
+
+        A resolve failure means the disk contradicted the session cache (an eviction or disk error removed
+        a file previously seen present), so the cache entries for every auxiliary file the job references
+        are forgotten along with the job's prepared flag. The prefetch reconcile sweep then re-requests the
+        job's auxiliary files as a fresh pop would; sibling jobs sharing an entry are re-verified by the
+        download process's presence short-circuit rather than trusting the stale cache. Returns True when a
+        tracked job's prepared flag was actually withdrawn.
+        """
+        for lora in job.payload.loras or []:
+            self._cached_lora_keys.discard(self._lora_cache_key(lora))
+        for ti in job.payload.tis or []:
+            self._cached_ti_keys.discard(self._ti_cache_key(ti.name))
+        tracked = self._tracked_for(job)
+        if tracked is None or not tracked.aux_models_prepared:
+            return False
+        tracked.aux_models_prepared = False
+        return True
 
     async def get_time_popped(self, job: ImageGenerateJobPopResponse) -> float | None:
         """Get the time a job was popped from the queue."""
@@ -1614,6 +1819,31 @@ class JobTracker:
         tracked = self._tracked_for(job)
         if tracked is not None:
             tracked.admitted_over_budget = True
+
+    def mark_measured_attempt(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        candidate_mb: float,
+        device_index: int | None,
+    ) -> None:
+        """Record that the scheduler admitted this job through the arbiter's measured-load escape hatch.
+
+        Idempotent within an episode: re-tagging an already-tagged job (the preload -> dispatch continuation)
+        only refreshes the recorded candidate. See :attr:`TrackedJob.measured_attempt` for how a subsequent
+        resource fault is then routed to a terminal ceiling-hold fault rather than a degraded retry.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is not None:
+            tracked.measured_attempt = True
+            tracked.measured_attempt_candidate_mb = candidate_mb
+            if device_index is not None:
+                tracked.last_dispatched_device_index = device_index
+
+    def is_measured_attempt(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether this job was admitted through the arbiter's measured-load escape hatch (a peek)."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and tracked.measured_attempt
 
     def mark_admitted_exclusive(self, job: ImageGenerateJobPopResponse) -> None:
         """Record that this over-budget job must run with the device to itself.
@@ -1739,6 +1969,17 @@ class JobTracker:
         # over-committed slot that would only kill a second process.
         resource_failure = is_resource_failure or tracked.admitted_over_budget
 
+        # A job admitted through the arbiter's measured-load escape hatch that then faults on resources is the
+        # real load failing: the strongest evidence the demand does not fit this converged-empty card now. It is
+        # not the transient over-commit a degraded retry clears (there is nothing left to reclaim for it), so it
+        # is faulted terminally as a scheduling-recovery action (excluded from the consecutive-failure pop pause,
+        # like the unroutable-head fault) and its model is placed on the conditional ceiling hold below. Banging
+        # the same card again would only burn another dispatch on a wall measured reality just proved.
+        measured_attempt_oom = resource_failure and tracked.measured_attempt
+        if measured_attempt_oom:
+            retryable = False
+            fault_origin = JobFaultOrigin.SCHEDULING_RECOVERY
+
         # A job with no pop timestamp was never formally queued (registered late, e.g. mid-flight), so it
         # has no pending-inference position to return to; such a job is always faulted terminally.
         can_retry = (
@@ -1786,6 +2027,26 @@ class JobTracker:
             # on a single-GPU host keeps it worker-wide. The live process's index is not used for the key so
             # the fault and the success that clears it always agree on the card.
             self._record_resource_fault(faulted_job.model, device_index=tracked.last_dispatched_device_index)
+
+        if measured_attempt_oom:
+            # The measured load the arbiter admitted failed on resources: arm the model's conditional ceiling
+            # hold against the demand the real load actually failed at, so pop advertising and dispatch stop
+            # offering it into the same wall until the ceiling recedes (the foreign floor drops). Edge-triggered
+            # on the fresh arm so the real-attempt warning fires once per arm, not on every re-evaluation.
+            self.measured_attempt_faults += 1
+            newly_armed = self.hold_model_by_ceiling(
+                faulted_job.model,
+                device_index=tracked.last_dispatched_device_index,
+                candidate_mb=tracked.measured_attempt_candidate_mb,
+            )
+            if newly_armed:
+                logger.opt(ansi=True).warning(
+                    f"<fg #f0beff>VRAM: a real measured load of {faulted_job.model} "
+                    f"({tracked.measured_attempt_candidate_mb:.0f} MB) failed with a resource fault on an empty "
+                    "card; holding the model (not offering it) while other processes hold that VRAM, and "
+                    "faulting this job for reissue. The hold frees automatically once that VRAM is released "
+                    "(close other GPU apps), or you can remove the model from this worker's config.</>",
+                )
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
             # A crash/timeout-faulted job never produces an inference RESULT message, so the

@@ -298,6 +298,20 @@ class HarnessResult:
     """Number of whole-card residency safety-off-GPU pauses initiated during the run."""
     safety_gpu_restore_count: int = 0
     """Number of whole-card residency safety-on-GPU restores initiated during the run."""
+    num_jobs_completed_with_loras: int = 0
+    """Finalized jobs that carried LoRA references and completed successfully (auditor-derived; 0 when
+    auditing is off). The soak's LoRA traffic should complete at the same rate as the plain control group."""
+    num_jobs_completed_without_loras: int = 0
+    """Finalized plain (no-LoRA) jobs that completed successfully: the soak's liveness control group."""
+    num_jobs_faulted_with_loras: int = 0
+    """Finalized jobs that carried LoRA references and ended faulted. Any nonzero value on a LoRA-storm soak
+    points at the pop-time prefetch / auxiliary-preparation path rather than inference itself."""
+    num_jobs_faulted_without_loras: int = 0
+    """Finalized plain (no-LoRA) jobs that ended faulted."""
+    consecutive_failed_jobs_pause_count: int = 0
+    """How many times the consecutive-failures backstop armed a pop pause during the run. The acceptance
+    criterion for a scheduling-clean soak is that this stays zero: no scheduling-caused failure backoff
+    fired. Give-up faults tagged ``SCHEDULING_RECOVERY`` are already excluded from the count that arms it."""
 
     @property
     def all_jobs_accounted_for(self) -> bool:
@@ -358,6 +372,13 @@ class JobLifecycleAuditor:
         self.pop_counts: Counter[GenerationID] = Counter()
         self.finalize_counts: Counter[GenerationID] = Counter()
         self.num_jobs_submitted_faulted = 0
+        # Terminal jobs split by whether they carried LoRA references, classified at finalize by the
+        # submit state. These four counters partition every finalized job, so a soak can tell whether the
+        # LoRA-carrying traffic (the pop-time-prefetch path) completed as cleanly as the plain control group.
+        self.num_jobs_completed_with_loras = 0
+        self.num_jobs_completed_without_loras = 0
+        self.num_jobs_faulted_with_loras = 0
+        self.num_jobs_faulted_without_loras = 0
         self._manager: HordeWorkerProcessManager | None = None
 
     def attach(self, manager: HordeWorkerProcessManager) -> None:
@@ -377,6 +398,7 @@ class JobLifecycleAuditor:
             job_id = completed_job_info.sdk_api_job_info.id_
             if job_id is not None:
                 self.finalize_counts[job_id] += 1
+                self._record_terminal_lora_split(completed_job_info)
                 if completed_job_info.state == GENERATION_STATE.faulted:
                     self.num_jobs_submitted_faulted += 1
             return await original_finalize(completed_job_info)
@@ -384,6 +406,28 @@ class JobLifecycleAuditor:
         tracker.record_popped_job = record_popped_job  # type: ignore[method-assign]
         tracker.finalize_submitted = finalize_submitted  # type: ignore[method-assign]
         self._manager = manager
+
+    def _record_terminal_lora_split(self, completed_job_info: object) -> None:
+        """Tally one finalized job into the LoRA-carrying / plain, completed / faulted partition.
+
+        Classification reads the job's own submit payload (``payload.loras``) and its terminal state, so
+        the split is self-contained per finalize event and needs no correlation back to the pop. A job
+        finalized in the faulted state counts as faulted; anything else counts as completed.
+        """
+        from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+
+        if not isinstance(completed_job_info, HordeJobInfo):
+            return
+        has_loras = bool(completed_job_info.sdk_api_job_info.payload.loras)
+        faulted = completed_job_info.state == GENERATION_STATE.faulted
+        if faulted and has_loras:
+            self.num_jobs_faulted_with_loras += 1
+        elif faulted:
+            self.num_jobs_faulted_without_loras += 1
+        elif has_loras:
+            self.num_jobs_completed_with_loras += 1
+        else:
+            self.num_jobs_completed_without_loras += 1
 
     def verify(self) -> list[str]:
         """Return a list of invariant violations observed over the run (empty = clean)."""
@@ -421,7 +465,10 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         "models_to_load": models_in_scenario,
         "max_threads": 1,
         "queue_size": 1,
-        "safety_on_gpu": False,
+        # Real runs mirror the production posture (safety rides the GPU); fake/dry-run children manage no
+        # device, so safety must stay off it there. CPU-side safety in a real run distorts the measurement:
+        # a stream of fast jobs saturates the CPU with checks production would run on-device.
+        "safety_on_gpu": config.process_mode == "real",
         "cycle_process_on_model_change": False,
         "remove_maintenance_on_init": False,
         "exit_on_unhandled_faults": False,
@@ -434,6 +481,31 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
     }
     if config.alchemy_forms or config.soak_alchemy_templates:
         bridge_data_fields["alchemist"] = True
+    # A workload that carries LoRA/TI references needs the worker to advertise LoRA support, or the
+    # simulated pop matching (which honours the request exactly as the live API does) filters every
+    # auxiliary-bearing job out of the run and the harness silently measures only the control group.
+    carries_aux_references = any(bool(job.payload.loras) or bool(job.payload.tis) for job in scenario) or any(
+        bool(template.loras) or bool(template.tis) for template in config.soak_image_templates
+    )
+    if carries_aux_references:
+        bridge_data_fields["allow_lora"] = True
+    carries_post_processing = any(bool(job.payload.post_processing) for job in scenario) or any(
+        bool(template.post_processing) for template in config.soak_image_templates
+    )
+    if carries_post_processing:
+        bridge_data_fields["allow_post_processing"] = True
+    # max_power gates the largest resolution the pop request advertises (max_pixels = power * 8 * 64 * 64),
+    # so it must cover the workload's largest job or the simulated pop matching silently filters every
+    # heavier template and the run degrades to its smallest jobs.
+    max_pixels_needed = max(
+        [
+            *(int(job.payload.width or 0) * int(job.payload.height or 0) for job in scenario),
+            *(template.width * template.height for template in config.soak_image_templates),
+            0,
+        ],
+    )
+    if max_pixels_needed > 0:
+        bridge_data_fields["max_power"] = max(8, -(-max_pixels_needed // (8 * 64 * 64)))
     if config.process_mode == "real":
         startup_budget = max(_REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS, int(config.timeout_seconds))
         bridge_data_fields["preload_timeout"] = startup_budget
@@ -442,6 +514,11 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
     bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
     # Prevent the manager from watching/reloading a bridge data file from disk.
     bridge_data._loaded_from_env_vars = True
+    if config.process_mode == "real":
+        # Real child processes read their configuration transports from the environment exactly as a
+        # production worker's do (CivitAI download token, LoRA cache size and disk floor, cache home), and
+        # every export is skipped when the variable is already set, so this mirrors run_worker's startup.
+        bridge_data.load_env_vars()
     return bridge_data
 
 
@@ -625,8 +702,8 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         process_entry_points=entry_points,
         canned_job_source=canned_job_source,
         canned_alchemy_source=canned_alchemy_source,
-        enable_background_downloads=config.process_mode == "fake"
-        and config.fake_initially_available_models is not None,
+        enable_background_downloads=config.process_mode == "real"
+        or (config.process_mode == "fake" and config.fake_initially_available_models is not None),
     )
 
     return manager, len(scenario)
@@ -872,8 +949,15 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
 
     audit_failures: list[str] = []
     num_jobs_submitted_faulted = 0
+    lora_split = (0, 0, 0, 0)
     if auditor is not None:
         num_jobs_submitted_faulted = auditor.num_jobs_submitted_faulted
+        lora_split = (
+            auditor.num_jobs_completed_with_loras,
+            auditor.num_jobs_completed_without_loras,
+            auditor.num_jobs_faulted_with_loras,
+            auditor.num_jobs_faulted_without_loras,
+        )
         # An aborted (timed-out) run purges the tracker, so its invariants are meaningless.
         if not timed_out:
             audit_failures = auditor.verify()
@@ -925,6 +1009,11 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         failed_download_model_names=sorted(availability.failed),
         safety_gpu_pause_count=manager._process_lifecycle.safety_gpu_pause_count,
         safety_gpu_restore_count=manager._process_lifecycle.safety_gpu_restore_count,
+        num_jobs_completed_with_loras=lora_split[0],
+        num_jobs_completed_without_loras=lora_split[1],
+        num_jobs_faulted_with_loras=lora_split[2],
+        num_jobs_faulted_without_loras=lora_split[3],
+        consecutive_failed_jobs_pause_count=manager._state.consecutive_failed_jobs_pause_count,
     )
 
 

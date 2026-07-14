@@ -14,13 +14,11 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
 
 from horde_worker_regen.process_management.ipc.messages import (
-    HordeAuxModelStateChangeMessage,
     HordeControlFlag,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
-    HordePrepareAuxControlMessage,
     HordeProcessState,
     HordeProcessStateChangeMessage,
     HordeSafetyControlMessage,
@@ -153,27 +151,6 @@ class TestFakeInferenceProcess:
         assert (HordeProcessState.PRELOADING_MODEL, ModelLoadState.LOADING) in states
         assert (HordeProcessState.PRELOADED_MODEL, ModelLoadState.LOADED_IN_RAM) in states
         assert all(m.horde_model_name == "Deliberate" for m in model_messages)
-
-    def test_prepare_aux_reports_download_then_returns_idle_without_inference(self) -> None:
-        """Auxiliary preparation emits readiness and idles without producing an inference result."""
-        process, queue = make_fake_inference_process()
-        job = make_job_pop_response(model="Deliberate")
-        queue.messages.clear()
-
-        process._receive_and_handle_control_message(
-            HordePrepareAuxControlMessage(
-                horde_model_name="Deliberate",
-                sdk_api_job_info=job,
-            ),
-        )
-
-        aux_states = [message.process_state for message in queue.of_type(HordeAuxModelStateChangeMessage)]
-        assert aux_states == [
-            HordeProcessState.DOWNLOADING_AUX_MODEL,
-            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
-        ]
-        assert queue.state_changes()[-1] is HordeProcessState.WAITING_FOR_JOB
-        assert queue.of_type(HordeInferenceResultMessage) == []
 
     def test_preload_different_model_unloads_previous(self) -> None:
         """Preloading a second model must first report the previous model unloaded from RAM."""

@@ -1,15 +1,21 @@
-"""Exponential backoff that withholds LoRA job pops after repeated auxiliary-download stalls.
+"""Exponential backoff that escalates after repeated ad-hoc auxiliary-download stalls.
 
-When a worker's ad-hoc LoRA downloads keep stalling long enough for the orchestrator to tear down and
-replace the inference slot, popping more LoRA jobs only feeds the same failing download path: each job
-sits minutes in the aux-download phase, faults, and churns a process while the GPU goes idle. This
-backoff reacts to those teardowns by temporarily withholding LoRA support from job pops, doubling the
-withholding window on each successive strike so a persistent upstream outage escalates from a brief
-pause to a long one, then resetting once downloads have been healthy for a while.
+When a worker's ad-hoc auxiliary downloads (LoRAs, textual inversions) keep stalling long enough for the
+orchestrator to tear down and replace the inference slot, feeding more jobs into the same failing download
+path only churns processes: each job sits minutes in the aux-download phase, faults, and burns a slot while
+the GPU goes idle. This backoff reacts to those teardowns by doubling an escalation window on each successive
+strike so a persistent upstream outage escalates from a brief pause to a long one, then resets once downloads
+have been healthy for a while. While the window is active a fresh failure of the same class is classified as
+terminal rather than retryable, so a job is not requeued into the same failing path.
 
-The state is a plain container mutated only from the single-threaded main-process scheduling loop (the
-job popper reads it, the process lifecycle writes a strike when it reaps a stuck aux-download slot), so
-it needs no locking; the same convention the other ``WorkerState`` flags follow.
+One instance is held per auxiliary class (see ``WorkerState``). The LoRA instance additionally gates pop-time
+LoRA advertising, because the pop request carries an ``allow_lora`` capability flag the worker can withhold.
+The textual-inversion instance influences fault classification only: the pop request has no per-request
+textual-inversion capability flag, so a textual-inversion window cannot suppress that traffic at the pop.
+
+The state is a plain container mutated only from the single-threaded main-process scheduling loop (the job
+popper reads it, the process lifecycle writes a strike when it reaps a stuck aux-download slot), so it needs
+no locking; the same convention the other ``WorkerState`` flags follow.
 """
 
 from __future__ import annotations
@@ -33,14 +39,17 @@ A new strike arriving after this much trouble-free time is treated as the start 
 
 
 @dataclasses.dataclass
-class LoraDownloadBackoff:
-    """Escalating, self-decaying suppression of LoRA pops driven by aux-download teardowns."""
+class AuxDownloadBackoff:
+    """Escalating, self-decaying reaction to ad-hoc auxiliary-download teardowns for one auxiliary class."""
 
     strikes: int = 0
     """Consecutive aux-download teardowns in the current incident; 0 when healthy."""
 
     suppressed_until: float = 0.0
-    """Wall-clock time LoRA pops may resume; pops are withheld while ``now`` is below it."""
+    """Wall-clock time the active window ends; the escalation counts as in force while ``now`` is below it.
+
+    For the LoRA instance this is also the time pop-time LoRA advertising may resume; for a class with no
+    per-request capability flag it bounds fault classification only."""
 
     last_strike_at: float = 0.0
     """Wall-clock time of the most recent strike, used to decide when an incident has ended."""
@@ -62,7 +71,7 @@ class LoraDownloadBackoff:
         return window
 
     def pops_suppressed(self, now: float) -> bool:
-        """Whether LoRA pops are currently being withheld."""
+        """Whether the active window still covers ``now`` (LoRA pop advertising withheld while true)."""
         return now < self.suppressed_until
 
     def is_escalation_active(self, now: float) -> bool:
@@ -77,5 +86,5 @@ class LoraDownloadBackoff:
         return self.pops_suppressed(now) or (now - self.last_strike_at) <= STRIKE_DECAY_SECONDS
 
     def remaining_seconds(self, now: float) -> float:
-        """Seconds until LoRA pops may resume; 0 when not suppressed."""
+        """Seconds until the active window ends; 0 when not currently in force."""
         return max(0.0, self.suppressed_until - now)

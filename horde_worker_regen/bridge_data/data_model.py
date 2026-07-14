@@ -909,9 +909,11 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """How long a model flagged locally unservable is held back before the worker tries it again."""
 
     aux_model_download_line_skip_threshold_seconds: int | None = Field(default=3, ge=0)
-    """The number of seconds for a process to be downloading an auxiliary model, and with no non-lora
-    models available to skip the line, before the worker will attempt to pop a non-lora small job
-    to keep the GPU busy. Keep unset to disable the breaker."""
+    """Accepted for configuration compatibility and has no effect.
+
+    Auxiliary (LoRa/TI) files are placed on disk by the dedicated download process before a job is
+    dispatchable, so inference children never block on an auxiliary download and there is no aux-download
+    line-skip breaker to tune. Existing bridgeData files that set this key continue to load unchanged."""
 
     idle_fill_threshold_seconds: int | None = Field(default=5, ge=0)
     """Seconds the queue head may sit on an idle device (its model still downloading/loading) with a free

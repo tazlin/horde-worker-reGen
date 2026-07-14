@@ -269,34 +269,6 @@ class TestStartPostProcessing:
         sent = lane.pipe_connection.send.call_args.args[0]
         assert sent.job_id == fittable_job.sdk_api_job_info.id_
 
-    async def test_chain_dispatches_while_in_progress_job_is_only_downloading_aux(self) -> None:
-        """Aux downloads do not use the GPU, so pending post-processing drains before line-skip work."""
-        process_manager = make_testable_process_manager()
-        lane = _make_lane_process()
-        aux_process = make_mock_process_info(
-            3,
-            model_name="AlbedoBase XL (SDXL)",
-            state=HordeProcessState.DOWNLOADING_AUX_MODEL,
-        )
-        process_manager._process_map.clear()
-        process_manager._process_map.update({7: lane, 3: aux_process})
-        orchestrator = process_manager._post_process_orchestrator
-        orchestrator._sampling_coresidency_check = lambda reserve_mb: False
-        process_manager._state.wants_line_skip_candidate = True
-
-        aux_job = make_job_pop_response(model="AlbedoBase XL (SDXL)")
-        await track_popped_job_async(process_manager._job_tracker, aux_job)
-        await process_manager._job_tracker.mark_inference_started(aux_job, device_index=None)
-
-        job_info = _make_pp_job_info()
-        await process_manager._job_tracker.queue_for_post_processing(job_info)
-
-        await process_manager.start_post_processing()
-
-        assert job_info in process_manager._job_tracker.jobs_being_post_processed
-        assert str(job_info.sdk_api_job_info.id_) not in orchestrator._deferrals
-        assert lane.pipe_connection.send.call_count == 1
-
     async def test_chain_dispatches_when_coresidency_affordable(self) -> None:
         """On a card that can hold both peaks, sampling in progress does not delay the chain."""
         process_manager = make_testable_process_manager()

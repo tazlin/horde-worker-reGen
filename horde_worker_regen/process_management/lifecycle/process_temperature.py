@@ -51,7 +51,6 @@ _PRIMING_STATES = frozenset(
     {
         "PRELOADING_MODEL",
         "DOWNLOADING_MODEL",
-        "DOWNLOADING_AUX_MODEL",
         "PROCESS_STARTING",
     },
 )
@@ -108,7 +107,6 @@ _HOT_PHRASES = {
 _PRIMING_PHRASES = {
     "PRELOADING_MODEL": "loading",
     "DOWNLOADING_MODEL": "downloading",
-    "DOWNLOADING_AUX_MODEL": "aux dl",
     "PROCESS_STARTING": "starting",
 }
 

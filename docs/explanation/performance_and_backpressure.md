@@ -20,7 +20,7 @@
         - [Per-context overhead and the effective idle floor](#per-context-overhead-and-the-effective-idle-floor)
     - [Alchemy backpressure](#alchemy-backpressure)
     - [The LoRA cache and its disk floor](#the-lora-cache-and-its-disk-floor)
-    - [LoRA download stalls: backoff, cap, and fast-fault](#lora-download-stalls-backoff-cap-and-fast-fault)
+    - [LoRA download stalls: backoff, cap, and deadline](#lora-download-stalls-backoff-cap-and-deadline)
     - [Multi-GPU pop shaping](#multi-gpu-pop-shaping)
     - [See also](#see-also)
 
@@ -278,130 +278,59 @@ still usable. It is pure and table-testable, with no scheduler imports.
 ### The line-skip cache
 
 `get_next_job_and_process` is called twice per cycle: once to peek and once to
-launch. When a small job "skips" ahead of a larger job blocked on a LoRA
-download, the skip decision is cached in `_pending_line_skip` so the second call
-agrees with the first. Without this cache, the launch call could pick a
-different job, causing the block decision to be wasted.
+launch. It can let a later job skip ahead of the queue head for two healthy
+reasons: the head's model is still loading (or is resident only on a
+disaggregation-pinned lane it is waiting to reuse), so an already-resident
+distinct-model job runs on the free process in the meantime; or the head's own
+process is busy sampling, so a distinct already-resident model fills the
+otherwise-idle slot. Both decisions depend on transient process state, so the
+chosen skip is cached in `_pending_line_skip` and returned on the launch call.
+Without this cache the launch call could pick a different job and waste the
+peek's decision. The head keeps its queue position and dispatches once its
+process frees.
 
-An uncached-LoRA job whose base model is already resident is prepared before it is dispatched. The parent
-sends `PREPARE_AUX_MODELS`; the child runs the ordinary deadline-bounded, heartbeat-protected LoRA resolver
-and returns to `WAITING_FOR_JOB`. The job remains `PENDING_INFERENCE` throughout, so auxiliary I/O neither
-claims an inference-concurrency slot nor creates a future sampling reservation. `DOWNLOAD_AUX_COMPLETE`
-marks that same job ready for the normal `START_INFERENCE` path. This separation is important: a child that
-has already received `START_INFERENCE` can proceed directly from its download into sampling, so its dispatch
-reservation must remain charged and cannot safely be loaned to a line-skipper.
-If the preparation download reaches its deadline, the ordinary auxiliary-download backoff and bounded retry
-policy still applies; a retry leaves the job in `PENDING_INFERENCE` rather than requiring a stage self-transition.
+A line-skip is not the genuine head of queue, so it dispatches as a non-head
+request (`is_head_of_queue=False`): it is priced against measured physical VRAM
+but may not consume the room the true head needs, and it routes any reclaim
+through the non-head eviction path, so a skipper never displaces the head's
+claim on the card.
 
-#### Sourcing a skip job when none is queued
+A job whose LoRAs or textual inversions are not yet on disk is prepared before it is dispatched, and the
+pop-time prefetch pipeline is the only preparation path. At pop the parent asks the dedicated download
+process to place the files on disk while the job stays `PENDING_INFERENCE`, off the inference lanes, so
+dispatch finds them already cached (see
+[pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch)). While unprepared, the job is
+invisible to both dispatch selection and model preload: it is never chosen as the dispatch head, never
+preloaded or staged, and owns no inference-concurrency slot and no future sampling reservation. Nothing
+prices around it, so a fitting sibling behind it is preloaded and sampled while it waits rather than the card
+idling. Its dispatch gate clears via the prefetch outcome onto the normal `START_INFERENCE` path, where it
+then passes every ordinary VRAM, concurrency, and post-processing gate like any other job.
 
-A line-skip needs a small job that is already resident on an idle sibling process
-and that needs no fresh download to run. A candidate carrying LoRAs qualifies only
-when *every* LoRA it needs is already cached on disk: the job tracker learns which
-LoRAs are present as jobs complete their aux downloads (`mark_job_loras_cached` on
-each `DOWNLOAD_AUX_COMPLETE`), and the scheduler admits a LoRA candidate only when
-all of its LoRAs are in that set. This preserves the standing "don't trade one
-blocking download for another" contract exactly (an uncached LoRA candidate would
-only move the download to the borrowed lane) while still feeding the GPU from an
-all-LoRA queue whose files were already fetched by an earlier job. The cache is not
-trusted while the worker purges LoRAs on download (`purge_loras_on_download`) or its
-LoRA disk is exhausted (`WorkerState.lora_disk_exhausted`), since either can evict a
-file after it was recorded; in those modes the set is dropped and LoRA candidates are
-refused. A candidate sharing the blocked head's model qualifies too, as
-long as that model is resident on a *different* idle process than the downloading
-head (its own slot reads as able to accept work while it downloads aux models, so
-the skip is routed onto a sibling copy, never back onto the downloading slot).
-This keeps a mono-model queue from starving whenever its one head stalls on a
-LoRA download. Textual-inversion cache residency is not tracked, so a TI-bearing
-candidate remains ineligible; treating it as ready could replace one auxiliary
-download with another. Often a candidate is available: the queue holds a mix, or a cached
-LoRA, and the scheduler simply picks it. But when the blocked head sits behind an
-auxiliary-model download and *nothing queued qualifies* (every other queued job
-needs an uncached LoRA download, is too large, is not resident, or shares the head's
-model with no idle sibling copy to run it on), the GPU would idle for the whole download. `aux_model_download_line_skip_threshold_seconds` bounds how long the
-scheduler tolerates that before acting: once a slot has been in
-`DOWNLOADING_AUX_MODEL` past the threshold with no usable candidate, it arms
-`WorkerState.wants_line_skip_candidate`. Two things then happen:
+Two mechanisms keep this live. A per-job prefetch deadline (derived from the configured download timeout and
+checked in the periodic scheduling scan) faults a job whose files never land, so it is never left pending
+forever: the backstop. A reconcile sweep in the same periodic step re-requests any pending auxiliary-bearing
+job with no request in flight (a retryable-failure requeue, a lost result, or a restarted download process),
+and marks a job prepared outright when its files are already cached: the liveness that heals. Save-our-ship
+recovery defers to this: while the head-of-queue job is auxiliary-gated with its prefetch still in flight (its
+deadline present and unexpired), give-up holds off exactly as it does for a head whose model is still
+materialising, bounded by that deadline so a stalled prefetch still faults through the coordinator rather than
+deferring give-up forever.
 
-- The in-flight **count** cap is bypassed for that cycle, so a skip job that
-  materialises can dispatch even though the cap is nominally reached.
-- The job popper reads the flag and **biases its next pop** toward a small,
-  non-LoRA job: it stops advertising LoRA support (a LoRA candidate would only
-  block on its own download) and caps `max_power` down to the line-skip
-  resolution ceiling (`line_skip_pop_max_power`, derived from the same
-  per-performance-mode eMPS limit the scheduler uses to accept a skip candidate).
-
-Biasing the pop is not enough on its own: the situation that arms the flag is a
-*full* local queue whose head is stuck, so the popper's steady-state gates would
-otherwise refuse the pop before the bias could take effect. Because a skip job is
-expected to dispatch onto the idle sibling immediately rather than buffer, an
-armed flag also relaxes those throughput/pacing governors for that one pop: it is
-treated as **urgent** (skipping the inter-pop cadence gate), the megapixelstep
-wait is bypassed (the small skip job must not be held behind the very backlog it
-relieves), and the queue-depth cap is loosened by exactly one slot so a single
-skip job can be admitted past a full queue. Genuinely protective gates
-(shutdown, RAM-pressure and safety-backlog holds, the consecutive-failure pause,
-and requiring a free process) still apply. The per-model "one running plus one
-queued" cap is untouched by design: the queue is full of the head's model, so
-that cap simply steers the pop toward the *other* configured models a skip job
-would use.
-
-The freshly popped small job is preloaded onto the idle sibling on the next
-cycle, becomes a valid skip candidate, and keeps the GPU sampling while the
-download finishes. The scheduler clears the flag as soon as no aux download
-still exceeds the threshold, so the cap bypass and the pop bias last only as long
-as the stall does. Set `aux_model_download_line_skip_threshold_seconds` to unset
-to disable the breaker entirely.
-
-An already-popped candidate may need the same transition from nonresident to
-resident. Ordinarily preload admission reserves the model's future sampling
-footprint in VRAM as soon as its RAM preload is sent. That reservation prevents
-two independently admitted models from later materialising onto an overcommitted
-card, but it can also form a circular wait while the head is only downloading
-auxiliaries: the later model cannot line-skip until it is staged, while its staging
-is denied by VRAM that the head has not materialised.
-
-For that state, the scheduler may RAM-stage one quick, distinct-model backfill per
-blocked head. The candidate uses the line-skip size and auxiliary-readiness rules,
-must independently forecast as co-resident rather than requiring isolation, and
-must pass the normal RAM budget. Actual checkpoint loads remain serialized, and
-the dispatch-time measured-VRAM reconciliation remains authoritative before the
-staged model can materialise on the device. This is temporal sharing of an idle
-sampling window, not permission for concurrent overcommit. A genuine exclusive or
-degraded job, an uncached LoRA, any TI, RAM pressure, or an isolation-requiring
-candidate retains its existing hold. The one-candidate claim lasts until the head
-leaves `DOWNLOADING_AUX_MODEL`, preventing a multi-process worker from filling all
-of its idle slots with speculative models. Graceful shutdown applies the same rule
-to jobs already accepted into the drain; it still prevents new pops.
-
-At dispatch, a line-skip past a preparation-only head is priced against measured physical room without
-reserving enough leftover room for that pending head. This is narrower than the general line-skip rule: the
-prepared head cannot start on its own when the download completes, and must re-enter dispatch admission.
-The skipper immediately records its own dispatch reservation; if preparation finishes while it is still
-sampling, that reservation holds the head until the card is safe. Legacy/in-progress auxiliary downloads
-retain ordinary head protection because their child may proceed directly into sampling.
-If the prepared head retained its base weights in VRAM, only those weights are credited: while another job is
-in progress, the head's activation delta is still repriced against that job's reservation rather than taking
-the ordinary resident-dispatch no-op shortcut.
-
-Reclaim cannot evict from a busy inference lane, including a lane in `DOWNLOADING_AUX_MODEL`. Such an unload
-would be queued behind the active command, cannot improve the current admission reading, and would overwrite
-the parent's optimistic control marker before preparation completes. Reconciliation may evict idle siblings;
-the active preparation lane remains owned until it reports completion or lifecycle recovery replaces it.
+On the pop side, the same prefetch gate is what keeps an all-LoRA queue from starving the GPU. The job
+popper stops advertising LoRA support once the queue already holds its allowed share of LoRA jobs (the
+per-queue LoRA cap). Because a LoRA job stays `PENDING_INFERENCE` until its files finish prefetching,
+capping the LoRA share keeps non-LoRA work poppable while those jobs wait, so the card is never left with
+only prefetch-gated work it cannot dispatch.
 
 #### Idle-fill: over-popping a quick job up a size ladder when a card would idle
 
-The line-skip breaker above fires only when the idle cause is an *auxiliary*
-download. A card can also idle behind a main-model download or an empty queue: the
-head is parked on a device with a free sibling but its checkpoint is not yet
-resident. The head-starvation clock runs while nothing is sampling or conservatively
-unclassified as in-progress. Mapped jobs that are only downloading auxiliary files
-do not suppress it because they occupy concurrency without feeding the GPU; any
-actual sampler still resets it. Once it passes
-`idle_fill_threshold_seconds` with a free inference sibling, the scheduler arms
-`WorkerState.wants_idle_fill_candidate` and the popper over-pops a small no-LoRA
-**fill** job to run in the meantime. Unlike the flat line-skip bias, the fill climbs
-a smallest-fastest-first **ladder** so the card is fed the quickest work the horde
+A card can idle behind a main-model download or an empty queue: the head is parked on a device with a free
+sibling but its checkpoint is not yet resident. The head-starvation clock runs while nothing is sampling or
+conservatively unclassified as in-progress. Mapped jobs that are only downloading auxiliary files do not
+suppress it because they occupy concurrency without feeding the GPU; any actual sampler still resets it.
+Once it passes `idle_fill_threshold_seconds` with a free inference sibling, the scheduler arms
+`WorkerState.wants_idle_fill_candidate` and the popper over-pops a small no-LoRA **fill** job to run in the
+meantime. The fill climbs a smallest-fastest-first **ladder** so the card is fed the quickest work the horde
 currently has: (light=sd15, small) → (light, large) → (heavy=sdxl, small) →
 (heavy, large), narrowing both the offered models (by size tier, dropping the
 whole-card EXTRA_LARGE tier that can never quick-start) and the `max_power` per rung.
@@ -409,28 +338,20 @@ Rungs whose baseline the worker has no model for are skipped, and when model met
 is unavailable the fill degrades to a single flat small pop. The ladder advances one
 rung each time a fill pop finds no job at the current rung (so it tries the
 next-heaviest quick-start work only when the horde has nothing lighter) and resets to
-the smallest rung once a fill job is obtained or the card is fed. The same one-slot
-over-pop and gate relaxations as the line-skip apply, and the same protective gates
-(shutdown, RAM/safety backpressure, a free process) still hold. Idle-fill yields to
-the aux line-skip when both would apply, so a single pop is never double-shaped. It is
-armed only when a head is genuinely starved with a free sibling, so it is inert in
-steady state. Set `idle_fill_threshold_seconds` to unset to disable it.
+the smallest rung once a fill job is obtained or the card is fed. The fill pop is admitted one slot past the
+configured queue depth and is treated as **urgent**, so the inter-pop cadence gate and the megapixelstep
+wait do not hold it, while the protective gates (shutdown, RAM/safety backpressure, a free process) still
+hold. It is armed only when a head is genuinely starved with a free sibling, so it is inert in steady
+state. Set `idle_fill_threshold_seconds` to unset to disable it.
 
-The borrowing rule also covers an auxiliary download that has already entered the in-progress set. The
-concurrency cap normally counts that job, but `DOWNLOADING_AUX_MODEL` is not sampling; if the pending head is
-small, non-LoRA, and resident on another idle process, it dispatches immediately and records the active
-download as displaced. This avoids waiting for the threshold/pop-bias path when the usable job is already in
-the local queue.
-
-Already-popped post-processing work has priority over the line-skip dispatch while the blocked head is only
-downloading auxiliary models. The post-processing overlap gate waits for active sampling on the PP lane's
-card, not for the broader in-progress job stage, so a `DOWNLOADING_AUX_MODEL` slot does not make the PP lane
-idle. The control loop drains pending PP work first; the line-skip job is then free to use the card once the
-lane has no immediately admissible image post-processing work. When pending PP chains cannot co-run with
-sampling, the next sampler that would also be non-co-resident waits, including just after the current sampler
-finishes, so the lane gets the next drain window instead of extending the PP backlog. Speculative preloads
-yield to that pending chain as well; otherwise a later model load can consume the very headroom the chain is
-waiting for.
+Already-popped post-processing work has priority over a speculative dispatch while a head waits on its load.
+The post-processing overlap gate waits for active sampling on the PP lane's card, not for the broader
+in-progress job stage, so a lane that is not sampling does not make the PP lane idle. The control loop
+drains pending PP work first; a line-skip or fill job is then free to use the card once the lane has no
+immediately admissible image post-processing work. When pending PP chains cannot co-run with sampling, the
+next sampler that would also be non-co-resident waits, including just after the current sampler finishes, so
+the lane gets the next drain window instead of extending the PP backlog. Speculative preloads yield to that
+pending chain as well; otherwise a later model load can consume the very headroom the chain is waiting for.
 
 ### Concurrent-overlap gating
 
@@ -1019,6 +940,52 @@ as admission sees it, tracks NVML device-level truth within a stated tolerance; 
 two diverge persistently the worker recalibrates or escalates and never wedges admission
 on its own bookkeeping.
 
+### The achievable ceiling: a model that can never fit this card
+
+A fresh preload that does not fit the current device-free reading normally **defers** and drives reclaim:
+the arbiter evicts idle residents and the head re-asks once the room frees. But some demands cannot be
+served however much the worker reclaims, and deferring them forever is a wedge, not patience. The arbiter
+separates the two with an **achievable ceiling**: the most VRAM this card could *ever* offer one load, which
+is the card total minus the admission noise buffer minus the **sustained foreign floor** (the VRAM the
+OS/desktop/other applications hold, which no eviction of the worker's own residents can reclaim). The foreign
+floor is measured outside the arbiter, once per control tick, as `total - device-free - worker-committed`
+(the device VRAM used that the worker's own committed footprint does not explain), then smoothed into the
+minimum over a trailing two-minute window. Taking the minimum makes a transient spike (a game or browser
+briefly allocating) unable to raise the floor and so unable to wrongly condemn a servable model, while the
+window warm-up withholds any floor until a full window is observed, so the pre-foreign behaviour is preserved
+at cold start.
+
+When a candidate exceeds the achievable ceiling it cannot fit even an emptied card *at the card's current
+foreign usage*. For the true head of queue with no other card that could seat it (a single-device worker, or
+every other card equally impossible), the arbiter's verdict is a terminal **DENY**, not a defer: the
+scheduler faults the head so the horde reissues it to a worker that can serve it now (a job is time-bound, so
+faulting it while it cannot fit is correct), and places the model on a **conditional ceiling hold** so pop
+advertising and dispatch stop offering it while the ceiling holds. The fault is classified as a
+scheduling-recovery action, so it is excluded from the consecutive-failure pop pause: it is a card-fit
+verdict the scheduling path owns, not a generation failure. Because the head is resolved rather than parked,
+head protection releases and the queued siblings dispatch on the next cycles. Deferring instead would tear
+down every resident to make room the model still cannot use, idle the card, and wedge the whole queue behind
+a head no reclaim can admit and no reroute can rescue. On a multi-GPU worker where another card could seat
+the demand, the ordinary reroute path still applies.
+
+The hold is **conditional and self-lifting**, not a session-permanent quarantine, because the shortfall is a
+property of the box's *current* foreign usage rather than of the model: the same card that cannot fit a Flux
+fp8 checkpoint under a heavy desktop can fit it once the desktop's VRAM is released. The hold records the
+candidate demand it was taken under and is re-evaluated against the card's *current* achievable ceiling on
+every pop/dispatch check: it lifts automatically, with no operator action, once the candidate fits the
+current ceiling with a small hysteresis margin (256 MB, so a ceiling hovering at the demand does not flap the
+hold on and off). When the foreign floor recedes (the operator closes other GPU apps, or safety is demoted
+off-GPU), the sustained floor falls as its high samples age out of the trailing window, the ceiling rises,
+and the model becomes advertisable again; a later shortfall re-arms the hold and re-warns (edge-triggered on
+each arm). The operator warning names the arithmetic (the model's demand, the card's current achievable
+ceiling, and the foreign VRAM held by other processes) and the remedy (free the other-process VRAM, or remove
+the model from this worker's config).
+
+One honest limitation: the verdict prices the model's *predicted* candidate footprint, so a model whose
+prediction over-prices its true footprint can be held even though a real load would have fit. A
+measured-attempt escape hatch (letting a bounded real attempt correct an over-priced prediction) is future
+work; today the hold rests on the same estimate arithmetic the rest of admission uses.
+
 ### Per-context overhead and the effective idle floor
 
 The job-burden prediction above is *per job*. Sizing residency across several processes that share one
@@ -1243,18 +1210,28 @@ This division means a tight-but-recoverable disk quietly trims the cache and kee
 while a genuinely full disk stops the worker accepting LoRA jobs it could not fulfil, instead of
 crashing on a failed write.
 
-## LoRA download stalls: backoff, cap, and fast-fault
+## LoRA download stalls: backoff, cap, and deadline
 
-A full disk is not the only way LoRA work goes wrong. When the ad-hoc download source itself is slow or
-flaky (CivitAI `ReadTimeout`s, an over-loaded mirror), a LoRA-bearing job can sit minutes in
-`DOWNLOADING_AUX_MODEL` before the orchestrator's stuck-aux watchdog tears the slot down and requeues
-it. Three mechanisms keep one bad download path from collapsing worker throughput, since the
-[line-skip](#the-line-skip-cache) path deliberately rejects LoRA candidates (a skip job must be quick,
-not one that itself blocks on a download) and so cannot route around a LoRA job stuck at the head.
+A full disk is not the only way LoRA work goes wrong. The ad-hoc download source itself can be slow or
+flaky (CivitAI `ReadTimeout`s, an over-loaded mirror). Because every auxiliary file is fetched by the
+dedicated download process at pop time, a choking download never occupies a sampling lane: the affected
+job simply stays pending and invisible to dispatch (it holds no lane and no VRAM reservation) while
+non-LoRA and already-prepared work keeps flowing through ordinary admission. Three mechanisms bound the
+damage a bad download path can do to the jobs that depend on it:
 
+- **Per-job prefetch deadline**: the prefetch coordinator arms a deadline derived from the configured
+  download timeout when it requests a job's files, checked in the periodic scheduling scan. A job whose
+  prefetch never resolves is faulted at the deadline rather than waiting forever, and the download
+  process bounds each individual fetch as well. The deadline is a backstop, not the primary detector, so
+  an expiry that finds the job's file still in flight defers the fault by one download-timeout budget
+  rather than faulting a slow-but-alive transfer. Deferral is bounded at two extra budgets (three total),
+  and short-circuits sooner once the download reports byte progress that stops advancing between expiries,
+  so a genuinely wedged transfer still faults on time.
 - **Escalating pop backoff**
   ([`LoraDownloadBackoff`][horde_worker_regen.process_management.models.lora_download_backoff.LoraDownloadBackoff]):
-  every time the lifecycle reaps a slot stuck downloading aux models it registers a *strike*. While a
+  a failed prefetch download (or an expired prefetch deadline) registers a *strike*, once per failed
+  download rather than once per waiting job, and only while at least one requesting job is still
+  pending, so a shared failure or a late result does not compound into several strikes. While a
   strike's window is active the popper stops advertising LoRA support (folded into `_lora_disk_permits`
   alongside the disk guard), so the worker stops feeding jobs into a failing download path. The window
   starts at 60 s and doubles per consecutive strike up to 30 min, then resets after a trouble-free
@@ -1263,29 +1240,27 @@ not one that itself blocks on a download) and so cannot route around a LoRA job 
   withholds LoRA support once the local queue reaches
   `min(2, max(1, inference_processes - 1))` LoRA jobs. The process-relative term preserves at least one
   slot's worth of room for a non-LoRA job on small pools, while the absolute ceiling prevents wide pools
-  from accumulating a long serialized auxiliary-download backlog. A non-LoRA job can line-skip past a
-  LoRA job blocked at the head, so the GPU keeps working while a slot waits on a download.
-- **Child-side graceful abort (no teardown)**: the real cost of a stalled aux download was the response
-  to it - the parent's watchdog tearing the whole inference process down (losing its resident model and
-  paying a full hordelib re-init) just because one download was slow. Instead, the parent hands each
-  dispatched job an `aux_download_deadline_seconds` (its backoff-aware watchdog timeout minus a margin;
-  `ProcessLifecycleManager.aux_download_deadline_for_dispatch`). When the child's `download_aux_models`
-  blows that deadline it **cancels** the stalled downloads (a manager-scoped
-  `cancel_active_downloads()` in the engine that abandons the retry ladder without killing the shared
-  download pool) and faults the job back to the parent through the ordinary faulted-result path, then
-  returns to `WAITING_FOR_JOB` with its model intact. A whole-process teardown+respawn becomes a
-  slot-local fault. The parent's stuck-aux **watchdog stays as the backstop**: it only fires (and tears
-  down) if the child fails to self-abort in time (e.g. a genuinely wedged process).
-- **Backoff-aware fault, registered once**: the child-reported aux fault arms the same LoRA-download
-  backoff strike and the same retry policy as a watchdog teardown would have - not a resource/OOM
-  failure, and during an active outage dropped (handed back to the horde) rather than requeued straight
-  back into the same failing download. A lone transient stall (no active incident) keeps its one retry.
-  This is what stops one bad job from costing two process recoveries.
+  from accumulating a long serialized auxiliary-download backlog behind one slow source.
 
-Together these turn an all-LoRA queue facing a flaky source from a near-total stall (every slot idle
-behind one choking download, each stall costing a process teardown) into a graceful degradation: LoRA
-intake pauses and escalates, non-LoRA work keeps flowing, and a stalled download faults its single job
-and frees its slot with the model still resident - no teardown, no respawn, no doubled-up recoveries.
+Fault retryability follows the backoff state: a lone transient failure (no active incident) keeps its
+retry and the reconcile sweep re-arms a fresh prefetch, while a failure during an active outage is
+dropped (handed back to the horde) rather than requeued straight back into the same failing download.
+
+Together these turn an all-LoRA queue facing a flaky source into a graceful degradation: LoRA intake
+pauses and escalates, the affected jobs fault at a bounded deadline, and the sampling lanes never see
+any of it - the GPU keeps working the whole time.
+
+Two named soak mixes exercise this behaviour under sustained load. The **`lora_storm`** mix is the
+adversarial download-pressure probe: roughly two thirds of its pops carry LoRAs, cycling a broad pool of
+distinct references so first-time resolutions keep flowing while a small repeated pool interleaves cache
+hits, proving the dedicated download process (not the sampling lanes) absorbs the fetch cost and that plain
+jobs keep clearing the gate. The **`production_replay`** mix is the cadence-faithful acceptance probe: its
+template weights reproduce the shape of a real pop stream measured over thousands of pops (SDXL-family
+dominant with a small SD1.5 and a rare Flux minority, batch sizes and job magnitudes matching the observed
+distribution, LoRAs on a realistic minority of pops rather than the storm's majority, post-processing on
+about a third), so a worker is soaked under the traffic it will actually meet rather than a worst case. The
+storm answers "does the download path degrade gracefully under a flood"; the replay answers "does the
+configuration hold up under production's real mix".
 
 ## Multi-GPU pop shaping
 

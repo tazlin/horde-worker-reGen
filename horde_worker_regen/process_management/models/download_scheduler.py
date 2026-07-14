@@ -27,10 +27,25 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 __all__ = [
+    "LORA_MANAGER_KEY",
+    "LORA_VERSION_MANAGER_KEY",
+    "TI_MANAGER_KEY",
     "DownloadKind",
     "DownloadTask",
     "HostAwareDownloadScheduler",
 ]
+
+LORA_MANAGER_KEY = "lora"
+"""``manager_key`` for a name-resolved LoRA ad-hoc prefetch task."""
+LORA_VERSION_MANAGER_KEY = "lora_version"
+"""``manager_key`` for a version-id-resolved LoRA ad-hoc prefetch task.
+
+Distinct from :data:`LORA_MANAGER_KEY` so a name and a version id that share a string still dedup as two
+tasks: the dedup identity is ``(kind, manager_key, model_name)`` and the version bit rides in the key here
+rather than widening the tuple. It also lets the fetch path recover ``is_version`` without a separate field.
+"""
+TI_MANAGER_KEY = "ti"
+"""``manager_key`` for a textual-inversion ad-hoc prefetch task."""
 
 _DEFAULT_EXCLUSIVE_TIMEOUT_SECONDS = 1800.0
 """How long an exclusive task may hold exclusivity before the scheduler stops letting it block others.
@@ -58,6 +73,19 @@ class DownloadKind(enum.Enum):
 
     A full ComfyUI init, so it runs exclusively. On failure it re-downloads the detector checkpoints once and
     re-verifies; a second failure disables ControlNet and notifies the operator."""
+    LORA = enum.auto()
+    """A single ad-hoc LoRA fetched on demand for a popped job (short-circuits when already on disk)."""
+    TI = enum.auto()
+    """A single ad-hoc textual inversion fetched on demand for a popped job (short-circuits when present)."""
+
+
+HOST_LIMIT_EXEMPT_KINDS = frozenset({DownloadKind.LORA, DownloadKind.TI})
+"""Kinds admitted regardless of the per-host concurrency limit (the global limit still applies).
+
+The per-host limit exists to be polite to hosts served multi-connection segmented fetches (an image model
+already opens several sockets). Job-driven ad-hoc prefetches are single-stream, must not queue behind an
+unrelated slow transfer to the same host (a pending job's dispatch gate is waiting on them), and are
+additionally bounded by the ad-hoc engine's own worker pool, so exempting them cannot stampede a host."""
 
 
 @dataclass(frozen=True)
@@ -202,7 +230,10 @@ class HostAwareDownloadScheduler:
                 if task is None:
                     return None
             self._state.pending.remove(task)
-            self._state.in_flight_by_host[task.host] += 1
+            if task.kind not in HOST_LIMIT_EXEMPT_KINDS:
+                # Exempt kinds neither check nor consume a host slot: counting them would let a slow ad-hoc
+                # prefetch starve the host's ordinary (slot-checked) downloads in reverse.
+                self._state.in_flight_by_host[task.host] += 1
             self._state.in_flight_keys.add(task.dedup_key)
             self._state.active_count += 1
             if task.exclusive:
@@ -234,6 +265,8 @@ class HostAwareDownloadScheduler:
             pending_non_exclusive = True
             if exclusivity_active:
                 continue
+            if task.kind in HOST_LIMIT_EXEMPT_KINDS:
+                return task
             if self._state.in_flight_by_host[task.host] < self._per_host:
                 return task
         if first_exclusive is not None and not pending_non_exclusive and self._state.active_count == 0:
@@ -271,11 +304,12 @@ class HostAwareDownloadScheduler:
                     self._state.exclusive_started_at = None
                     self._state.exclusive_timeout_logged = False
             self._state.in_flight_keys.discard(task.dedup_key)
-            remaining = self._state.in_flight_by_host[task.host] - 1
-            if remaining > 0:
-                self._state.in_flight_by_host[task.host] = remaining
-            else:
-                self._state.in_flight_by_host.pop(task.host, None)
+            if task.kind not in HOST_LIMIT_EXEMPT_KINDS:
+                remaining = self._state.in_flight_by_host[task.host] - 1
+                if remaining > 0:
+                    self._state.in_flight_by_host[task.host] = remaining
+                else:
+                    self._state.in_flight_by_host.pop(task.host, None)
             self._cond.notify_all()
 
     @property

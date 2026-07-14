@@ -218,6 +218,16 @@ which lets canary simulations exercise representative volunteer-host topologies,
 cold-start model availability, and background-download queue pressure without
 touching the network or a GPU.
 
+The popper builds the same `ImageGenerateJobPopRequest` in live and dry-run modes and passes it to the
+synthetic source at the point where the live API call would occur. Fixed-list sources intentionally replay
+their scripted response verbatim, which keeps deterministic recovery and fault scenarios stable. Sustained-load
+`GeneratingJobSource` instances instead emulate the Horde's eligibility filtering over every request property
+they can resolve from a template alone: offered models, pixel limit, LoRA/TI support, post-processing, ControlNet
+variants, and source-image support. Server/account-dependent constraints such as prompt blacklists, requester kudos
+or IP, NSFW intent, and model-average step limiting are not synthesized. Consequently dynamic pop shaping such as
+multi-GPU targeting, LoRA intake suppression, and the idle-fill model/size ladder remains load-bearing in
+simulation rather than being bypassed by its job source.
+
 ## Where the code lives
 
 Almost all of the orchestration lives in

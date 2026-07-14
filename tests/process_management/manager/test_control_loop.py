@@ -217,3 +217,31 @@ class TestPeriodicUpdateCheckLoopShutdown:
         await asyncio.wait_for(process_manager._periodic_update_check_loop(), timeout=2.0)
 
         unexpected_check.assert_not_called()
+
+
+class TestSupervisorLivenessHeartbeat:
+    """Liveness must reflect the event loop's health, independent of control-loop tick length."""
+
+    async def test_heartbeats_between_ticks_and_stops_on_shutdown(self) -> None:
+        """The heartbeat task notes liveness repeatedly on its own cadence and exits once shut down."""
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+
+        manager = Mock(spec=HordeWorkerProcessManager)
+        manager._state = SimpleNamespace(shut_down=False)
+        supervisor = Mock()
+        manager._supervisor = supervisor
+
+        task = asyncio.get_event_loop().create_task(
+            HordeWorkerProcessManager._supervisor_liveness_heartbeat(manager),
+        )
+        # Two heartbeat periods pass while the (simulated) control loop is busy elsewhere: liveness
+        # keeps being noted anyway, which is exactly what distinguishes a busy tick from a dead loop.
+        await asyncio.sleep(2.2)
+        assert supervisor.note_alive.call_count >= 2
+
+        manager._state.shut_down = True
+        await asyncio.wait_for(task, timeout=3.0)

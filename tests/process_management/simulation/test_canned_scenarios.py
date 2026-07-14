@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopRequest
 
 from horde_worker_regen.benchmark.scenarios import (
     CannedAlchemyFormSpec,
@@ -21,6 +22,17 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_post_processing_scenario,
     make_ti_scenario,
 )
+
+
+def _restrictive_pop_request() -> ImageGenerateJobPopRequest:
+    """Build a request that rejects the feature carried by the fixed-source contract test."""
+    return ImageGenerateJobPopRequest(
+        apikey="0000000000",
+        name="test-worker",
+        models=["Deliberate"],
+        max_pixels=512 * 512,
+        allow_lora=False,
+    )
 
 
 class TestFeatureFactories:
@@ -68,6 +80,18 @@ class TestFeatureFactories:
             make_lora_scenario(1, [])
         with pytest.raises(ValueError):
             make_ti_scenario(1, [])
+
+    def test_fixed_source_replays_script_despite_pop_request(self) -> None:
+        """Deterministic fixed scenarios do not silently discard a scripted job on request shaping."""
+        source, _alchemy_source = Scenario(
+            name="fixed",
+            image_jobs=[CannedImageJobSpec(model="Deliberate", lora_names=["lora-a"])],
+        ).to_canned_sources()
+
+        response = source.next_pop_response(_restrictive_pop_request())
+
+        assert response.id_ is not None
+        assert response.payload.loras
 
 
 class TestAlchemyScenario:

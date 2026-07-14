@@ -35,7 +35,6 @@ from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
     HordeAlchemyControlMessage,
     HordeAlchemyResultMessage,
-    HordeAuxModelStateChangeMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeDownloadAvailabilityMessage,
@@ -49,7 +48,6 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordePostProcessControlMessage,
     HordePostProcessResultMessage,
     HordePreloadInferenceModelMessage,
-    HordePrepareAuxControlMessage,
     HordeProcessState,
     HordeSafetyControlMessage,
     HordeSafetyEvaluation,
@@ -474,25 +472,6 @@ class FakeInferenceProcess(HordeProcess):
             self._run_fake_alchemy(message.form)
         elif isinstance(message, HordePreloadInferenceModelMessage):
             self.preload_model(message.horde_model_name)
-        elif isinstance(message, HordePrepareAuxControlMessage):
-            for process_state, info in (
-                (HordeProcessState.DOWNLOADING_AUX_MODEL, "Resolving auxiliary models"),
-                (HordeProcessState.DOWNLOAD_AUX_COMPLETE, "Auxiliary models ready"),
-            ):
-                self.process_message_queue.put(
-                    HordeAuxModelStateChangeMessage(
-                        process_id=self.process_id,
-                        process_launch_identifier=self.process_launch_identifier,
-                        process_state=process_state,
-                        info=info,
-                        time_elapsed=0.0,
-                        sdk_api_job_info=message.sdk_api_job_info,
-                    ),
-                )
-            self.send_process_state_change_message(
-                process_state=HordeProcessState.WAITING_FOR_JOB,
-                info="Waiting for job",
-            )
         elif isinstance(message, HordeSampleControlMessage):
             self._run_fake_sample(message)
         elif isinstance(message, HordeInferenceControlMessage) and (
@@ -724,7 +703,6 @@ def start_fake_inference_process(
     pipe_connection: Connection,
     inference_semaphore: Semaphore,
     disk_lock: Lock,
-    aux_model_lock: Lock,
     vae_decode_semaphore: Semaphore,
     process_launch_identifier: int,
     *,

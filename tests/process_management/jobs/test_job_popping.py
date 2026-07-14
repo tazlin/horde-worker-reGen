@@ -34,7 +34,8 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
-from horde_worker_regen.utils.job_utils import line_skip_pop_max_power
+from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource, make_empty_pop_response
+from horde_worker_regen.utils.job_utils import small_pop_max_power
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -675,7 +676,7 @@ class TestPostProcessingBacklogOfferShaping:
         assert request.allow_post_processing is False
 
     async def test_urgent_pop_still_suppresses_post_processing_offer(self) -> None:
-        """The line-skip/urgent path may bypass cadence, but not the post-processing offer shape."""
+        """The idle-fill/urgent path may bypass cadence, but not the post-processing offer shape."""
         request, _state = await self._pop_and_capture_request(
             post_processing_backlog_depth=2,
             urgent=True,
@@ -976,6 +977,20 @@ class TestHandleConsecutiveFailures:
 
         assert result is True
         assert state.too_many_consecutive_failed_jobs is True
+
+    def test_arming_the_pause_increments_the_run_counter(self) -> None:
+        """Arming the pause bumps the monotonic run counter the soak result reads to detect any backoff."""
+        state = WorkerState(consecutive_failed_jobs=3)
+        popper = _make_popper(state=state)
+        bd = make_mock_bridge_data()
+
+        assert state.consecutive_failed_jobs_pause_count == 0
+        popper._handle_consecutive_failures(bd, time.time())
+        assert state.consecutive_failed_jobs_pause_count == 1
+
+        # A still-active pause on a later cycle must not double-count the same episode.
+        popper._handle_consecutive_failures(bd, time.time())
+        assert state.consecutive_failed_jobs_pause_count == 1
 
     def test_active_pause_returns_true_within_window(self) -> None:
         """When already in a failure pause, the method should return True to indicate the pause is still active."""
@@ -1355,6 +1370,36 @@ class TestEnqueuePoppedJob:
         assert job_tracker.jobs_pending_inference[1] is job2
 
 
+class TestDryRunPopRequestHandoff:
+    """Dry-run sources receive the same validated request that the live API would receive."""
+
+    async def test_constructed_request_is_passed_to_canned_source(self) -> None:
+        """The simulated API boundary receives dynamic model, size, and feature shaping."""
+        source = Mock(spec=CannedJobSource)
+        source.next_pop_response.return_value = make_empty_pop_response()
+        bridge_data = make_mock_bridge_data(
+            image_models_to_load=["stable_diffusion"],
+            max_power=32,
+            allow_lora=False,
+        )
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            bridge_data=bridge_data,
+            dry_run_skip_api=True,
+        )
+        popper.set_canned_job_source(source)
+
+        await popper.api_job_pop()
+
+        source.next_pop_response.assert_called_once()
+        request = source.next_pop_response.call_args.args[0]
+        assert isinstance(request, ImageGenerateJobPopRequest)
+        assert request.models == ["stable_diffusion"]
+        assert request.max_pixels == 32 * 8 * 64 * 64
+        assert request.allow_lora is False
+
+
 # Patch paths in the module under test to bypass SDK and telemetry dependencies
 _POP_REQUEST_PATH = "horde_worker_regen.process_management.jobs.job_popper.ImageGenerateJobPopRequest"
 _SPAN_POP_PATH = "horde_worker_regen.process_management.jobs.job_popper.span_job_pop"
@@ -1727,7 +1772,7 @@ class TestJobPopFrequency:
         assert popper._pop_throttler._error_pop_frequency == 5.0
 
 
-# region Aux-download line-skip aggressive pop
+# region Idle-fill ladder pop shaping
 
 
 async def _seed_completed_session(job_tracker: JobTracker) -> None:
@@ -1740,21 +1785,21 @@ async def _queue_head_model_jobs(job_tracker: JobTracker, n: int) -> None:
     """Queue ``n`` pending-inference jobs for the head model.
 
     Two or more of the same model trip the "one running plus one queued" per-model cap in
-    ``_select_models_for_pop``, standing in for the real line-skip situation where the queue is saturated
-    with jobs that all share (and so all block behind) the aux-download-stalled head model.
+    ``_select_models_for_pop``, standing in for a queue saturated with jobs that all share (and so all
+    block behind) the same head model.
     """
     for _ in range(n):
         await track_popped_job_async(job_tracker, make_mock_job(model="stable_diffusion"))
 
 
-def _make_line_skip_popper(
+def _make_fill_popper(
     *,
     state: WorkerState,
     job_tracker: JobTracker,
     process_map: ProcessMap | None = None,
     bridge_data: Mock | None = None,
 ) -> tuple[JobPopper, Mock]:
-    """Build a popper wired for line-skip pop scenarios plus the API session mock it will call.
+    """Build a popper wired for idle-fill pop scenarios plus the API session mock it will call.
 
     Unless a test overrides them, two models are configured (the head model plus a ``sibling_model``
     standing in for the model resident on the idle sibling process) and the process pool has a free
@@ -1782,412 +1827,10 @@ def _make_line_skip_popper(
     return popper, session
 
 
-def _armed_state() -> WorkerState:
-    """A worker state with the aux-download line-skip breaker armed."""
-    state = WorkerState()
-    state.wants_line_skip_candidate = True
-    return state
-
-
-class TestAuxDownloadLineSkipPopBias:
-    """When the scheduler arms ``wants_line_skip_candidate`` the pop biases toward a small non-LoRA job.
-
-    The scheduler sets the flag when a slot is blocked downloading auxiliary models past
-    ``aux_model_download_line_skip_threshold_seconds`` and nothing already queued can slip past the blocked
-    head. Biasing the next pop small and non-LoRA lets an idle sibling process pick up skippable work so
-    the GPU keeps sampling while the download finishes.
-    """
-
-    @staticmethod
-    async def _pop_and_capture_request(
-        *,
-        state: WorkerState,
-        **bridge_overrides: object,
-    ) -> ImageGenerateJobPopRequest:
-        """Drive one full pop with the given state and bridge overrides, returning the built pop request."""
-        job_tracker = JobTracker()
-        await track_popped_job_async(job_tracker, make_mock_job())
-        await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
-        session = Mock()
-        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
-        popper = _make_popper(
-            state=state,
-            job_tracker=job_tracker,
-            process_map=_make_process_map_with_available_processes(),
-            horde_client_session=session,
-            bridge_data=make_mock_bridge_data(**bridge_overrides),
-        )
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_awaited_once()
-        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
-        return request
-
-    async def test_armed_flag_withholds_lora(self) -> None:
-        """An armed flag stops the pop advertising LoRA support even when the config allows it."""
-        request = await self._pop_and_capture_request(state=_armed_state(), allow_lora=True)
-
-        assert request.allow_lora is False
-
-    async def test_armed_flag_caps_oversized_max_power(self) -> None:
-        """An armed flag caps a large configured max_power down to the line-skip resolution ceiling."""
-        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
-        request = await self._pop_and_capture_request(state=_armed_state(), max_power=ceiling + 1)
-
-        assert request.max_pixels == ceiling * 8 * 64 * 64
-
-    async def test_armed_flag_caps_extreme_max_power(self) -> None:
-        """Even a pathologically large configured max_power is pulled down to the default-mode ceiling."""
-        request = await self._pop_and_capture_request(state=_armed_state(), max_power=512)
-
-        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
-        assert request.max_pixels == ceiling * 8 * 64 * 64
-
-    async def test_armed_flag_ceiling_widens_in_high_performance_mode(self) -> None:
-        """The cap tracks the perf mode: high mode admits a larger skip job than the default mode."""
-        request = await self._pop_and_capture_request(
-            state=_armed_state(),
-            max_power=512,
-            high_performance_mode=True,
-        )
-
-        ceiling = line_skip_pop_max_power(high_performance_mode=True, moderate_performance_mode=False)
-        default_ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
-        assert ceiling > default_ceiling  # guards the premise: high mode really is a wider ceiling
-        assert request.max_pixels == ceiling * 8 * 64 * 64
-
-    async def test_armed_flag_ceiling_widens_in_moderate_performance_mode(self) -> None:
-        """Moderate mode sits between default and high: its ceiling is wider than default, narrower than high."""
-        request = await self._pop_and_capture_request(
-            state=_armed_state(),
-            max_power=512,
-            moderate_performance_mode=True,
-        )
-
-        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=True)
-        assert request.max_pixels == ceiling * 8 * 64 * 64
-
-    async def test_armed_flag_does_not_enlarge_a_small_max_power(self) -> None:
-        """A worker already configured for small jobs keeps its own (smaller) max_power under the bias."""
-        request = await self._pop_and_capture_request(state=_armed_state(), max_power=8)
-
-        assert request.max_pixels == 8 * 8 * 64 * 64
-
-    async def test_armed_flag_withholds_lora_even_with_room_in_the_lora_queue(self) -> None:
-        """LoRA is withheld purely because the flag is armed, independent of the per-queue LoRA cap.
-
-        The queue here is empty, so the LoRA-cap suppression path is not what clears LoRA; the armed flag is.
-        """
-        request = await self._pop_and_capture_request(state=_armed_state(), allow_lora=True)
-
-        assert request.allow_lora is False
-
-    async def test_unarmed_flag_leaves_pop_unbiased(self) -> None:
-        """With the flag clear (the default), LoRA support and max_power are advertised unchanged."""
-        request = await self._pop_and_capture_request(state=WorkerState(), allow_lora=True, max_power=64)
-
-        assert request.allow_lora is True
-        assert request.max_pixels == 64 * 8 * 64 * 64
-
-
-class TestAuxDownloadLineSkipGateRelaxation:
-    """An armed flag relaxes the steady-state throughput/pacing governors for that one pop.
-
-    The situation that arms the flag is a *full* local queue whose head is stalled, so the popper's normal
-    depth and cadence gates would refuse the pop before the bias could take effect. Because a skip job is
-    expected to dispatch onto the idle sibling immediately rather than buffer, the flag lets the pop slip
-    past those gates; each relaxation is paired with an unarmed control proving the gate is otherwise honoured.
-    """
-
-    async def test_armed_pops_through_full_queue(self) -> None:
-        """A queue at the configured depth does not block the skip pop (one extra slot is admitted)."""
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 2)  # queue_size=1, max_threads=1 -> depth cap is 2
-        await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_awaited_once()
-
-    async def test_full_queue_blocks_pop_when_unarmed(self) -> None:
-        """The same full queue blocks the pop when the flag is clear (the depth cap is otherwise honoured)."""
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 2)
-        await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=WorkerState(), job_tracker=job_tracker)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_armed_full_queue_pop_is_still_biased(self) -> None:
-        """The pop that slips past a full queue is itself the biased one: LoRA withheld and max_power capped."""
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 2)
-        await job_tracker.increment_jobs_completed()
-        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
-        bridge = make_mock_bridge_data(
-            image_models_to_load=["stable_diffusion", "sibling_model"],
-            allow_lora=True,
-            max_power=ceiling + 1,
-        )
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker, bridge_data=bridge)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_awaited_once()
-        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
-        assert request.allow_lora is False
-        assert request.max_pixels == ceiling * 8 * 64 * 64
-
-    async def test_armed_pops_through_megapixelstep_wait(self) -> None:
-        """An armed flag bypasses the megapixelstep governor so the small skip job is not held behind it."""
-        job_tracker = JobTracker()
-        await _seed_completed_session(job_tracker)
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker)
-        popper._pop_throttler.should_wait_for_megapixelsteps = Mock(return_value=True)  # type: ignore[method-assign]
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_awaited_once()
-
-    async def test_megapixelstep_wait_blocks_pop_when_unarmed(self) -> None:
-        """With the flag clear, the megapixelstep governor still holds the pop."""
-        job_tracker = JobTracker()
-        await _seed_completed_session(job_tracker)
-        popper, session = _make_line_skip_popper(state=WorkerState(), job_tracker=job_tracker)
-        popper._pop_throttler.should_wait_for_megapixelsteps = Mock(return_value=True)  # type: ignore[method-assign]
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_armed_pops_through_frequency_window(self) -> None:
-        """An armed flag makes the pop urgent, so the inter-pop cadence window does not hold it back."""
-        job_tracker = JobTracker()
-        await _seed_completed_session(job_tracker)
-        state = _armed_state()
-        state.last_job_pop_time = time.time()  # a non-urgent pop would be gated as "too soon"
-        popper, session = _make_line_skip_popper(state=state, job_tracker=job_tracker)
-
-        await popper.api_job_pop(urgent=False)  # caller does not mark it urgent; the armed flag must
-
-        session.submit_request.assert_awaited_once()
-
-    async def test_frequency_window_blocks_pop_when_unarmed(self) -> None:
-        """With the flag clear, a non-urgent pop inside the cadence window is skipped."""
-        job_tracker = JobTracker()
-        await _seed_completed_session(job_tracker)
-        state = WorkerState(last_job_pop_time=time.time())
-        popper, session = _make_line_skip_popper(state=state, job_tracker=job_tracker)
-
-        await popper.api_job_pop(urgent=False)
-
-        session.submit_request.assert_not_awaited()
-
-
-class TestAuxDownloadLineSkipProtectiveGatesStillApply:
-    """The aggressive pop relaxes throughput/pacing governors only; genuinely protective gates still block.
-
-    Each case arms the flag on a popper that would otherwise pop, then engages one protective gate and
-    asserts no pop is attempted. This locks in that the fix does not blanket-override every guard: it must
-    not start a job the degraded worker cannot promptly serve, nor pop during a hard stop.
-    """
-
-    async def _armed_popper(
-        self,
-        *,
-        state: WorkerState | None = None,
-        process_map: ProcessMap | None = None,
-    ) -> tuple[JobPopper, Mock]:
-        """An armed popper seeded so that, absent the gate under test, a pop would proceed."""
-        if state is None:
-            state = _armed_state()
-        else:
-            state.wants_line_skip_candidate = True
-        job_tracker = JobTracker()
-        await _seed_completed_session(job_tracker)
-        return _make_line_skip_popper(state=state, job_tracker=job_tracker, process_map=process_map)
-
-    async def test_shutting_down_still_blocks(self) -> None:
-        """A shutdown in progress blocks even an armed pop."""
-        popper, session = await self._armed_popper(state=WorkerState(shutting_down=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_supervisor_pause_still_blocks(self) -> None:
-        """An operator/supervisor pause blocks even an armed pop."""
-        popper, session = await self._armed_popper(state=WorkerState(supervisor_paused=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_self_throttle_pause_still_blocks(self) -> None:
-        """The worker's own self-throttle pause blocks even an armed pop."""
-        popper, session = await self._armed_popper(state=WorkerState(self_throttle_paused=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_ram_pressure_hold_still_blocks(self) -> None:
-        """The pre-floor RAM-pressure hold blocks even an armed pop: no new ttl clock under RAM danger."""
-        popper, session = await self._armed_popper(state=WorkerState(ram_pressure_pop_hold=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_downloads_only_hold_still_blocks(self) -> None:
-        """The pre-GO_LIVE download-only posture blocks even an armed pop."""
-        popper, session = await self._armed_popper(state=WorkerState(downloads_only_hold=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_gpu_torch_incompatible_still_blocks(self) -> None:
-        """A torch/GPU mismatch (every job would fail at kernel launch) blocks even an armed pop."""
-        popper, session = await self._armed_popper(state=WorkerState(gpu_torch_incompatible=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_cpu_only_torch_build_still_blocks(self) -> None:
-        """A CPU-only torch build (image generation disabled) blocks even an armed pop."""
-        popper, session = await self._armed_popper(state=WorkerState(torch_build_cpu_only=True))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_consecutive_failure_pause_still_blocks(self) -> None:
-        """An active consecutive-failure pause blocks even an armed pop."""
-        state = WorkerState(
-            too_many_consecutive_failed_jobs=True,
-            too_many_consecutive_failed_jobs_time=time.time(),
-        )
-        popper, session = await self._armed_popper(state=state)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_post_inference_backlog_still_blocks(self) -> None:
-        """A safety-stage backlog blocks even an armed pop: the skip job would only age out behind it."""
-        popper, session = await self._armed_popper()
-        popper._is_post_inference_backlogged = Mock(return_value=True)  # type: ignore[method-assign]
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_no_free_inference_process_still_blocks(self) -> None:
-        """With no inference process free to take a job, an armed pop does not proceed."""
-        busy_inference = make_mock_process_info(
-            0,
-            model_name="stable_diffusion",
-            state=HordeProcessState.INFERENCE_STARTING,
-        )
-        safety = make_mock_process_info(
-            10,
-            model_name=None,
-            state=HordeProcessState.WAITING_FOR_JOB,
-            process_type=HordeProcessType.SAFETY,
-        )
-        popper, session = await self._armed_popper(process_map=ProcessMap({0: busy_inference, 10: safety}))
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_no_free_safety_process_still_blocks(self) -> None:
-        """With no safety process available, an armed pop does not proceed."""
-        popper, session = await self._armed_popper(
-            process_map=_make_process_map_with_available_processes(num_safety=0),
-        )
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-
-class TestAuxDownloadLineSkipRelaxationBounds:
-    """The relaxation is bounded: it admits one extra job and never conjures a pop from nothing."""
-
-    async def test_queue_allowance_is_exactly_one_slot(self) -> None:
-        """One over the cap still blocks even when armed, so intake cannot run away tick after tick."""
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 3)  # cap is 2; one extra is allowed, so 3 is over the line
-        await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_allowance_rides_on_the_threads_adjusted_cap(self) -> None:
-        """The extra slot is relative to the true depth cap, which widens with max_threads (not an absolute)."""
-        # queue_size=1, max_threads=3 -> depth cap is 1 + 1 + (3 - 1) = 4; the armed allowance makes 5.
-        bridge = make_mock_bridge_data(
-            image_models_to_load=["stable_diffusion", "sibling_model"],
-            max_threads=3,
-        )
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 4)  # exactly at the (threads-adjusted) cap
-        await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker, bridge_data=bridge)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_awaited_once()
-
-    async def test_allowance_still_bounded_on_a_wide_cap(self) -> None:
-        """One past the threads-adjusted cap blocks even when armed, matching the one-slot allowance."""
-        bridge = make_mock_bridge_data(
-            image_models_to_load=["stable_diffusion", "sibling_model"],
-            max_threads=3,
-        )
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 5)  # cap 4 + one allowed slot -> 5 is over
-        await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker, bridge_data=bridge)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-    async def test_no_eligible_model_still_blocks_when_armed(self) -> None:
-        """An armed flag does not force a pop when nothing is offerable: it cannot invent a skippable job.
-
-        Only the head model is configured and it is over-queued (so ``_select_models_for_pop`` drops it),
-        while a deep queue keeps the depth gate from firing first. With no other model to offer, the pop is
-        correctly withheld despite the armed flag.
-        """
-        bridge = make_mock_bridge_data(
-            image_models_to_load=["stable_diffusion"],  # no sibling model to fall back to
-            queue_size=6,  # keep the depth gate from being the thing that blocks
-        )
-        job_tracker = JobTracker()
-        await _queue_head_model_jobs(job_tracker, 2)  # trips the per-model "one running plus one queued" cap
-        await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker, bridge_data=bridge)
-
-        await popper.api_job_pop()
-
-        session.submit_request.assert_not_awaited()
-
-
 _SD15_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
 _SDXL_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
 _FLUX_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
-_SMALL_CAP = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
+_SMALL_CAP = small_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
 
 
 class _FakeModelMetadata:
@@ -2275,7 +1918,7 @@ class TestIdleFillEscalationAndGates:
 
     async def test_no_lora_offered_on_fill(self) -> None:
         """A fill pop never advertises LoRA support (a LoRA job would itself block on a download)."""
-        popper, session = _make_line_skip_popper(
+        popper, session = _make_fill_popper(
             state=_idle_fill_state(0),
             job_tracker=JobTracker(),
             bridge_data=make_mock_bridge_data(allow_lora=True),
@@ -2287,7 +1930,7 @@ class TestIdleFillEscalationAndGates:
     async def test_no_job_advances_the_rung(self) -> None:
         """When the horde has no job at this rung, the ladder climbs one rung for the next fill tick."""
         state = _idle_fill_state(0)
-        popper, session = _make_line_skip_popper(state=state, job_tracker=JobTracker())
+        popper, session = _make_fill_popper(state=state, job_tracker=JobTracker())
         # The horde's "no jobs available" is a success response with id_=None (not an error response).
         session.submit_request = AsyncMock(return_value=ImageGenerateJobPopResponse(id=None, ids=[], payload={}))
         await popper.api_job_pop()
@@ -2296,7 +1939,7 @@ class TestIdleFillEscalationAndGates:
     async def test_rung_clamps_at_the_max(self) -> None:
         """The rung counter never runs away past the last ladder index on repeated no-jobs."""
         state = _idle_fill_state(3)
-        popper, session = _make_line_skip_popper(state=state, job_tracker=JobTracker())
+        popper, session = _make_fill_popper(state=state, job_tracker=JobTracker())
         session.submit_request = AsyncMock(return_value=ImageGenerateJobPopResponse(id=None, ids=[], payload={}))
         await popper.api_job_pop()
         assert state.idle_fill_rung == 3
@@ -2323,7 +1966,7 @@ class TestIdleFillEscalationAndGates:
         job_tracker = JobTracker()
         await _queue_head_model_jobs(job_tracker, 2)  # queue_size=1, max_threads=1 -> depth cap is 2
         await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=_idle_fill_state(0), job_tracker=job_tracker)
+        popper, session = _make_fill_popper(state=_idle_fill_state(0), job_tracker=job_tracker)
 
         await popper.api_job_pop()
 
@@ -2334,27 +1977,15 @@ class TestIdleFillEscalationAndGates:
         job_tracker = JobTracker()
         await _queue_head_model_jobs(job_tracker, 2)
         await job_tracker.increment_jobs_completed()
-        popper, session = _make_line_skip_popper(state=WorkerState(), job_tracker=job_tracker)
+        popper, session = _make_fill_popper(state=WorkerState(), job_tracker=job_tracker)
 
         await popper.api_job_pop()
 
         session.submit_request.assert_not_awaited()
 
-    async def test_yields_to_aux_line_skip(self) -> None:
-        """When both breakers are armed, the aux line-skip wins: the ladder is suppressed and does not climb."""
-        state = _idle_fill_state(1)
-        state.wants_line_skip_candidate = True
-        popper, session = _make_line_skip_popper(state=state, job_tracker=JobTracker())
-
-        await popper.api_job_pop()
-
-        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
-        assert request.allow_lora is False  # the line-skip bias still withholds LoRA
-        assert state.idle_fill_rung == 1  # the ladder did not advance: idle-fill yielded
-
     async def test_unarmed_leaves_pop_unbiased(self) -> None:
-        """With neither breaker armed, LoRA and max_power are advertised unchanged."""
-        popper, session = _make_line_skip_popper(
+        """With idle-fill not armed, LoRA and max_power are advertised unchanged."""
+        popper, session = _make_fill_popper(
             state=WorkerState(),
             job_tracker=JobTracker(),
             bridge_data=make_mock_bridge_data(allow_lora=True, max_power=64),

@@ -63,6 +63,14 @@ class HarnessSummary(BaseModel):
     audit_failures: list[str] = Field(default_factory=list)
     exit_reason: str = ""
     diagnostics: list[str] = Field(default_factory=list)
+    num_jobs_completed_with_loras: int = 0
+    num_jobs_completed_without_loras: int = 0
+    num_jobs_faulted_with_loras: int = 0
+    num_jobs_faulted_without_loras: int = 0
+    consecutive_failed_jobs_pause_count: int = 0
+    """Scheduling-backoff observability for a LoRA-storm soak: the LoRA-carrying vs plain terminal split
+    and how many times the consecutive-failures pop pause armed. A scheduling-clean soak keeps the two
+    faulted-with/without counts and the pause count at zero (see :class:`HarnessResult`)."""
 
 
 class MachineInfo(BaseModel):

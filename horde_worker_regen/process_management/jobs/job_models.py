@@ -49,8 +49,6 @@ class HordeJobInfo(BaseModel):
     time_to_generate: float | None = None
     """The time it took to generate the job. This is set by the inference process."""
 
-    time_to_download_aux_models: float | None = None
-
     @property
     def is_job_checked_for_safety(self) -> bool:
         """Return true if the safety process returned a verdict for this job's images."""

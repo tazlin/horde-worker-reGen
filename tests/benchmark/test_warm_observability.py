@@ -200,7 +200,6 @@ def test_fake_inference_entry_point_records_startup_crash(
             None,  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
-            None,  # type: ignore[arg-type]
             0,
         )
 

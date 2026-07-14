@@ -31,6 +31,10 @@ def _exclusive_task(model: str, host: str) -> DownloadTask:
     )
 
 
+def _lora_task(model: str, host: str) -> DownloadTask:
+    return DownloadTask(kind=DownloadKind.LORA, model_name=model, host=host, feature="LoRa (job)")
+
+
 class TestDownloadHostForUrl:
     """The host helper underpins per-host scheduling, so its parsing must be exact and forgiving."""
 
@@ -100,6 +104,50 @@ class TestHostAwareScheduler:
         assert scheduler.acquire(timeout=0.05) is not None
         assert scheduler.acquire(timeout=0.05) is not None
         assert scheduler.acquire(timeout=0.05) is None  # third same-host blocked at per_host=2
+
+    def test_adhoc_prefetch_bypasses_the_host_limit(self) -> None:
+        """A job-driven LoRA prefetch is admitted while an ordinary same-host download holds the host slot.
+
+        A pending job's dispatch gate waits on the prefetch, so it must not queue behind an unrelated slow
+        transfer to the same host; the global cap still applies.
+        """
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4, per_host_concurrency=1)
+        scheduler.enqueue_many([_task("bulk", "civitai.com"), _lora_task("123", "civitai.com")])
+
+        first = scheduler.acquire(timeout=0.05)
+        second = scheduler.acquire(timeout=0.05)
+        assert first is not None and second is not None
+        assert {first.model_name, second.model_name} == {"bulk", "123"}
+
+    def test_adhoc_prefetch_does_not_consume_the_host_slot(self) -> None:
+        """An in-flight LoRA prefetch leaves the host slot free for an ordinary download queued after it."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4, per_host_concurrency=1)
+        scheduler.enqueue(_lora_task("123", "civitai.com"))
+        prefetch = scheduler.acquire(timeout=0.05)
+        assert prefetch is not None and prefetch.model_name == "123"
+
+        scheduler.enqueue(_task("bulk", "civitai.com"))
+        bulk = scheduler.acquire(timeout=0.05)
+        assert bulk is not None and bulk.model_name == "bulk"
+
+        # Releasing the exempt task must not corrupt the ordinary task's host accounting: a second bulk
+        # download stays blocked until the first is released.
+        scheduler.release(prefetch)
+        scheduler.enqueue(_task("bulk2", "civitai.com"))
+        assert scheduler.acquire(timeout=0.05) is None
+        scheduler.release(bulk)
+        assert scheduler.acquire(timeout=0.05) is not None
+
+    def test_adhoc_prefetch_still_bounded_by_global_cap(self) -> None:
+        """Host exemption does not bypass the global ceiling."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=2, per_host_concurrency=1)
+        scheduler.enqueue_many(
+            [_lora_task("1", "civitai.com"), _lora_task("2", "civitai.com"), _lora_task("3", "civitai.com")],
+        )
+
+        assert scheduler.acquire(timeout=0.05) is not None
+        assert scheduler.acquire(timeout=0.05) is not None
+        assert scheduler.acquire(timeout=0.05) is None
 
     def test_admissible_task_jumps_ahead_of_blocked_host(self) -> None:
         """A different-host task starts ahead of one queued behind a busy host."""
