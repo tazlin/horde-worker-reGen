@@ -39,6 +39,7 @@ from loguru import logger
 from pydantic import ValidationError
 
 from horde_worker_regen.analysis.bundle import LogBundle
+from horde_worker_regen.analysis.log_ingest import IncrementalRecordReader
 from horde_worker_regen.analysis.watch import WatchState, watch_pass
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     DownloadPhase,
@@ -72,6 +73,9 @@ AUTO_GUARD_CONFIRM_SECONDS = 180.0
 STATE_LINE_MAX_BYTES = 2048
 """Hard cap on a single ``state.jsonl`` line; per-process rows are dropped to keep a line under it."""
 
+OVERRUN_INTERVAL_FACTOR = 2.0
+"""A poll cycle taking longer than this multiple of the interval self-alerts as an observation-loop overrun."""
+
 _SEVERITY_WARNING = "warning"
 _SEVERITY_CRITICAL = "critical"
 _SEVERITY_INFO = "info"
@@ -91,6 +95,125 @@ class WorkerController(Protocol):
 
     def request_graceful_stop(self, *, timeout: float = ...) -> None:
         """Begin a non-blocking, orphan-proof graceful shutdown of the worker."""
+
+    def is_alive(self) -> bool:
+        """Whether the worker process is currently running (False once a graceful stop has completed)."""
+
+
+class WatchPassRunner(Protocol):
+    """Runs live-log watch passes off the poll thread so a slow pass never delays observation or control."""
+
+    def submit(self, work: Callable[[], list[dict[str, object]]]) -> None:
+        """Begin ``work`` if idle; a no-op while a pass is already in flight."""
+
+    def drain(self) -> list[dict[str, object]]:
+        """Return the alerts of any completed pass and clear them; empty when none has completed."""
+
+    def in_flight(self) -> bool:
+        """Whether a pass is currently running."""
+
+    def shutdown(self) -> None:
+        """Stop the runner and release any worker thread it owns."""
+
+
+class SynchronousRunner:
+    """A :class:`WatchPassRunner` that runs each pass inline on submit; its alerts surface on the next drain.
+
+    Used where a real thread is unwanted (most unit tests). Its observable contract matches the threaded
+    runner (a pass's alerts arrive on a later poll), without the concurrency: the loop is never actually
+    blocked in tests because their injected passes are cheap.
+    """
+
+    def __init__(self) -> None:
+        """Start with no buffered results."""
+        self._results: list[dict[str, object]] = []
+
+    def submit(self, work: Callable[[], list[dict[str, object]]]) -> None:
+        """Run ``work`` now and buffer its alerts for the next :meth:`drain`."""
+        try:
+            self._results.extend(work())
+        except Exception:  # noqa: BLE001 - a watch pass failure must never break the caller
+            logger.exception("Live-log watch pass failed; skipping this interval.")
+
+    def drain(self) -> list[dict[str, object]]:
+        """Return and clear the buffered alerts."""
+        results = self._results
+        self._results = []
+        return results
+
+    def in_flight(self) -> bool:
+        """Never in flight: work runs synchronously on submit."""
+        return False
+
+    def shutdown(self) -> None:
+        """Nothing to release."""
+
+
+class ThreadedWatchRunner:
+    """A :class:`WatchPassRunner` backed by one daemon thread, running at most one pass at a time.
+
+    ``submit`` hands work to the thread and returns immediately, so the poll loop never blocks on the watch
+    cost; while a pass runs, further submits are dropped until it finishes. A pass that raises is logged and
+    yields no alerts, leaving the thread ready for the next submit.
+    """
+
+    def __init__(self) -> None:
+        """Start the idle worker thread."""
+        self._condition = threading.Condition()
+        self._pending: Callable[[], list[dict[str, object]]] | None = None
+        self._results: list[dict[str, object]] = []
+        self._busy = False
+        self._closed = False
+        self._thread = threading.Thread(target=self._loop, name="attach-watch", daemon=True)
+        self._thread.start()
+
+    def submit(self, work: Callable[[], list[dict[str, object]]]) -> None:
+        """Queue ``work`` for the thread unless one is already pending/running or the runner is closed."""
+        with self._condition:
+            if self._closed or self._busy or self._pending is not None:
+                return
+            self._pending = work
+            self._busy = True
+            self._condition.notify()
+
+    def drain(self) -> list[dict[str, object]]:
+        """Return and clear the alerts produced by completed passes."""
+        with self._condition:
+            results = self._results
+            self._results = []
+            return results
+
+    def in_flight(self) -> bool:
+        """Whether a pass is currently running (or queued for the thread to pick up)."""
+        with self._condition:
+            return self._busy
+
+    def shutdown(self) -> None:
+        """Signal the worker thread to exit and join it (bounded)."""
+        with self._condition:
+            self._closed = True
+            self._condition.notify()
+        self._thread.join(timeout=5.0)
+
+    def _loop(self) -> None:
+        """Wait for submitted work, run it, and buffer its alerts, until shutdown."""
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._closed and self._pending is None:
+                    return
+                work = self._pending
+                self._pending = None
+            alerts: list[dict[str, object]] = []
+            if work is not None:
+                try:
+                    alerts = work()
+                except Exception:  # noqa: BLE001 - a watch pass failure must not kill the runner thread
+                    logger.exception("Live-log watch pass failed; skipping this interval.")
+            with self._condition:
+                self._results.extend(alerts)
+                self._busy = False
 
 
 def _resolve_command(name: str) -> SupervisorCommand | None:
@@ -138,8 +261,13 @@ class AttachSupervisor:
 
     The loop is deliberately a pure state machine over an injected :class:`WorkerController`: each
     :meth:`poll_once` ticks the worker, applies any new inbox commands, writes one state line, and appends
-    the edge-triggered alerts (live-log findings plus snapshot threshold rules). All rule state lives here,
-    so a test can drive it with a fake controller and an explicit clock, no worker or GPU required.
+    the edge-triggered alerts (snapshot threshold rules plus the live-log findings). All rule state lives
+    here, so a test can drive it with a fake controller and an explicit clock, no worker or GPU required.
+
+    The live-log watch is the one part not run inline: it is dispatched to an injected
+    :class:`WatchPassRunner` so its parse cost cannot delay the tick, the inbox, or the state line. A poll
+    appends the findings of any completed pass and starts a new one only when none is in flight, and a cycle
+    that runs past :data:`OVERRUN_INTERVAL_FACTOR` times the interval appends an overrun self-alert.
     """
 
     def __init__(
@@ -150,8 +278,16 @@ class AttachSupervisor:
         log_dir: Path | None = None,
         interval: float = DEFAULT_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
+        watch_runner: WatchPassRunner | None = None,
     ) -> None:
-        """Bind the loop to a controller and a session directory (creating it); does not start ticking."""
+        """Bind the loop to a controller and a session directory (creating it); does not start ticking.
+
+        ``monotonic`` measures each poll cycle's duration for the overrun self-alert (separate from ``clock``,
+        which stamps records). ``watch_runner`` runs the live-log watch pass; it defaults to an in-thread
+        :class:`SynchronousRunner`, while the console entry point supplies a :class:`ThreadedWatchRunner` so
+        the (cold-cache) parse never blocks the poll cadence.
+        """
         self._controller = controller
         self._session_dir = session_dir
         self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -161,8 +297,11 @@ class AttachSupervisor:
         self._log_dir = log_dir
         self._interval = interval
         self._clock = clock
+        self._monotonic = monotonic
+        self._watch_runner = watch_runner if watch_runner is not None else SynchronousRunner()
 
         self._stop = threading.Event()
+        self._shutdown_requested = False
 
         self._watch_state = WatchState()
         self._fired: dict[str, bool] = {}
@@ -177,21 +316,43 @@ class AttachSupervisor:
     # region loop
 
     def run_forever(self) -> None:
-        """Poll on the interval until :meth:`stop`. A poll error is logged and the loop continues."""
+        """Poll on the interval until :meth:`stop` or an inbox-requested shutdown fully completes.
+
+        A poll error is logged and the loop continues. Once the command inbox has requested a graceful stop
+        and the worker has fully exited, one final state line is written and the loop returns: the process
+        exiting is the wake signal for the operator harness, and the launcher never relaunches after an
+        intentional stop.
+        """
         logger.info(f"Attach supervisor writing session files to {self._session_dir} (interval {self._interval}s).")
-        while not self._stop.is_set():
-            try:
-                self.poll_once()
-            except Exception:  # noqa: BLE001 - one bad poll must not tear the observation loop down
-                logger.exception("Attach supervisor poll failed; continuing.")
-            self._stop.wait(self._interval)
+        try:
+            while not self._stop.is_set():
+                try:
+                    self.poll_once()
+                except Exception:  # noqa: BLE001 - one bad poll must not tear the observation loop down
+                    logger.exception("Attach supervisor poll failed; continuing.")
+                if self._shutdown_requested and not self._controller.is_alive():
+                    self._write_state_line(None, None, self._clock())
+                    logger.info(
+                        "Inbox-requested shutdown complete and the worker has exited; stopping the supervisor."
+                    )
+                    return
+                self._stop.wait(self._interval)
+        finally:
+            self._watch_runner.shutdown()
 
     def stop(self) -> None:
         """Signal the loop to finish its current poll and return from :meth:`run_forever`."""
         self._stop.set()
 
     def poll_once(self, now: float | None = None) -> None:
-        """Run one observation/control cycle: tick, apply inbox, write state, append alerts."""
+        """Run one observation/control cycle: tick, apply inbox, write state, append alerts.
+
+        The live-log watch is dispatched to the :class:`WatchPassRunner` rather than run inline, so the cycle
+        (controller tick, command inbox, state line, threshold alerts, and the auto-guard) keeps its cadence
+        regardless of watch-parse cost. A cycle exceeding :data:`OVERRUN_INTERVAL_FACTOR` times the interval
+        appends an edge-triggered overrun self-alert.
+        """
+        cycle_start = self._monotonic()
         now = self._clock() if now is None else now
         self._controller.tick()
         self._process_command_inbox(now)
@@ -200,14 +361,42 @@ class AttachSupervisor:
         liveness = self._controller.last_liveness_wall_time
         self._write_state_line(snapshot, liveness, now)
 
-        alerts: list[dict[str, object]] = list(self._log_watch_alerts(now))
+        alerts: list[dict[str, object]] = list(self._watch_runner.drain())
         if snapshot is not None:
             alerts.extend(self._threshold_alerts(snapshot, liveness, now))
             guard_alert = self._evaluate_guard(snapshot, liveness, now)
             if guard_alert is not None:
                 alerts.append(guard_alert)
+        self._dispatch_watch_pass(now)
         for alert in alerts:
             self._append_jsonl(self._alerts_path, alert)
+
+        overrun_alert = self._overrun_alert(now, self._monotonic() - cycle_start)
+        if overrun_alert is not None:
+            self._append_jsonl(self._alerts_path, overrun_alert)
+
+    def _dispatch_watch_pass(self, now: float) -> None:
+        """Kick off a fresh live-log watch pass on the runner when none is in flight (and not shutting down)."""
+        if self._log_dir is None or self._shutdown_requested or self._watch_runner.in_flight():
+            return
+        captured_now = now
+        self._watch_runner.submit(lambda: self._run_watch_pass(captured_now))
+
+    def _overrun_alert(self, now: float, elapsed: float) -> dict[str, object] | None:
+        """Edge-triggered overrun self-alert when a poll cycle runs past the interval multiple."""
+        threshold = OVERRUN_INTERVAL_FACTOR * self._interval
+        if not self._edge("supervisor_overrun", elapsed > threshold):
+            return None
+        return {
+            "t": round(now, 3),
+            "rule": "supervisor_overrun",
+            "severity": _SEVERITY_WARNING,
+            "summary": f"A poll cycle took {elapsed:.1f}s (> {threshold:.1f}s, "
+            f"{OVERRUN_INTERVAL_FACTOR:.0f}x the {self._interval:.0f}s interval): the observation loop is "
+            "running behind and may be servicing the inbox and state writes late.",
+            "elapsed_seconds": round(elapsed, 2),
+            "interval_seconds": self._interval,
+        }
 
     # endregion
 
@@ -282,12 +471,21 @@ class AttachSupervisor:
             line = json.dumps(record, separators=(",", ":"), default=str)
         self._append_line(self._state_path, line)
 
-    def _log_watch_alerts(self, now: float) -> list[dict[str, object]]:
-        """Run one incremental live-log watch pass and turn its change-only strings into alert records."""
+    def _run_watch_pass(self, now: float) -> list[dict[str, object]]:
+        """Run one incremental live-log watch pass and turn its change-only strings into alert records.
+
+        Runs on the :class:`WatchPassRunner`'s worker, not the poll thread. The bundle reads only the active
+        current-session logs (rotation archives and timestamped rotations are skipped) through an
+        :class:`IncrementalRecordReader` bound to the watch state, so each pass parses only the bytes appended
+        since the last one and its session segmentation and detector scans stay bounded to the active tail
+        rather than the whole rotation history. This method owns all access to :attr:`_watch_state`; the poll
+        thread never touches it, so no lock is needed.
+        """
         if self._log_dir is None or not self._log_dir.exists():
             return []
         try:
-            bundle = LogBundle.from_path(self._log_dir)
+            reader = IncrementalRecordReader(self._watch_state.file_progress)
+            bundle = LogBundle.from_path(self._log_dir, active_only=True, record_reader=reader)
             messages, self._watch_state = watch_pass(bundle, self._watch_state)
         except Exception:  # noqa: BLE001 - a malformed/rotating log must not break the observation loop
             logger.exception("Live-log watch pass failed; skipping this interval.")
@@ -568,7 +766,10 @@ class AttachSupervisor:
 
         if command is SupervisorCommand.SHUTDOWN:
             # Route shutdown through the supervisor's orphan-proof graceful path rather than a raw command.
+            # Latch the intent so the loop returns once the worker has fully exited (the launcher does not
+            # relaunch after an intentional stop), signalling completion to the operator harness by exiting.
             logger.info("Command inbox requested a graceful shutdown.")
+            self._shutdown_requested = True
             self._controller.request_graceful_stop()
             return
 
@@ -696,7 +897,13 @@ def main(argv: list[str] | None = None) -> None:
         auto_restart=not args.no_auto_restart,
         owned_registry=owned_registry,
     )
-    attach = AttachSupervisor(supervisor, session_dir=session_dir, log_dir=Path("logs"), interval=args.interval)
+    attach = AttachSupervisor(
+        supervisor,
+        session_dir=session_dir,
+        log_dir=Path("logs"),
+        interval=args.interval,
+        watch_runner=ThreadedWatchRunner(),
+    )
 
     def _handle_signal(_signum: int, _frame: FrameType | None) -> None:
         logger.info("Attach supervisor received a stop signal; shutting down.")

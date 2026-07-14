@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 import ssl
 import time
 from asyncio import CancelledError, Task
@@ -45,6 +46,34 @@ _sslcontext = ssl.create_default_context(cafile=certifi.where())
 _async_client_exceptions: tuple[type[Exception], ...] = (TimeoutError, aiohttp.client_exceptions.ClientError, OSError)
 with contextlib.suppress(AttributeError):
     _async_client_exceptions = (asyncio.exceptions.TimeoutError, aiohttp.client_exceptions.ClientError, OSError)
+
+_SUBMIT_DEADLINE_SECONDS = 150.0
+"""Age since pop past which a finished generation's kudos are already forfeit server-side.
+
+The horde aborts a generation not submitted within this window of the pop, so once a job's age exceeds it the
+submit retries are burning effort on dead kudos. Such a job is faulted locally with a remote origin instead,
+freeing the submit loop to serve jobs still inside their window. Enforced only when the tracker holds a real
+(positive) pop time; a non-positive time is the tracker's unknown-pop sentinel and disables the deadline."""
+
+_SUBMIT_RETRY_BACKOFF_BASE_SECONDS = 1.0
+"""First-wave backoff scale for repeated submit attempts of one generation (full-jitter lower bound is zero)."""
+_SUBMIT_RETRY_BACKOFF_FACTOR = 2.0
+"""Per-wave growth of the submit-retry backoff ceiling, so a persistently stalling endpoint is hit less often."""
+_SUBMIT_RETRY_BACKOFF_CAP_SECONDS = 8.0
+"""Ceiling on the submit-retry backoff so the wait grows but a single submit pass stays bounded in wall time."""
+
+
+def _submit_retry_backoff_seconds(wave_index: int) -> float:
+    """Return a full-jitter exponential backoff for the ``wave_index``-th submit retry wave (zero-based).
+
+    The ceiling grows geometrically (capped) and the wait is drawn uniformly below it, so concurrent workers
+    retrying a recovering endpoint spread their attempts instead of synchronizing into a thundering herd.
+    """
+    ceiling = min(
+        _SUBMIT_RETRY_BACKOFF_CAP_SECONDS,
+        _SUBMIT_RETRY_BACKOFF_BASE_SECONDS * (_SUBMIT_RETRY_BACKOFF_FACTOR**wave_index),
+    )
+    return random.uniform(0.0, ceiling)
 
 
 class JobSubmitter:
@@ -126,6 +155,42 @@ class JobSubmitter:
         """Return the current stable diffusion reference, or None if it is not set."""
         return self._model_metadata.reference
 
+    @staticmethod
+    def _submit_deadline_exceeded(time_popped: float | None) -> bool:
+        """Return whether a job's age since pop has passed the server-side submit deadline.
+
+        A non-positive (or missing) pop time is the tracker's unknown-pop sentinel: the deadline cannot be
+        judged from it, so it is not enforced and only the per-generation retry cap bounds the retries.
+        """
+        if time_popped is None or time_popped <= 0:
+            return False
+        return (time.time() - time_popped) > _SUBMIT_DEADLINE_SECONDS
+
+    def _record_failed_submit_attempt(self) -> None:
+        """Count one failed submit attempt for the pop side's submit-health signal (:class:`WorkerState`)."""
+        self._state.consecutive_failed_submit_attempts += 1
+
+    def _reset_submit_health(self) -> None:
+        """Clear the submit-health signal after a delivered generation, so the pop side resumes full cadence."""
+        self._state.consecutive_failed_submit_attempts = 0
+
+    def _tag_remote_submit_fault(self, new_submit: PendingSubmitJob) -> None:
+        """Mark this generation's job remote-faulted so its fault stays out of the consecutive-failure pause."""
+        job_id = new_submit.completed_job_info.sdk_api_job_info.id_
+        if job_id is not None:
+            self._job_tracker.note_remote_submit_fault(job_id)
+
+    def _retry_after_remote_failure(self, new_submit: PendingSubmitJob) -> None:
+        """Retry after a transient/remote submit failure, tagging the job remote if the retry ceiling is reached.
+
+        A network error or an unreachable endpoint is not the worker's fault; when its retries are finally
+        exhausted the terminal fault carries the remote origin so it does not manufacture the failure pause.
+        """
+        new_submit.retry()
+        self._record_failed_submit_attempt()
+        if new_submit.is_faulted:
+            self._tag_remote_submit_fault(new_submit)
+
     @logger.catch(reraise=True)
     async def submit_single_generation(self, new_submit: PendingSubmitJob) -> PendingSubmitJob:
         """Tries to upload and submit a single image from a batch.
@@ -155,7 +220,9 @@ class JobSubmitter:
             new_submit.fault()
             return new_submit
 
-        if new_submit.image_result is not None:
+        # The image bytes are identical across this generation's submit retries, so a generation whose upload
+        # already landed re-attempts only the API submit below, never the bandwidth-heavy R2 upload again.
+        if new_submit.image_result is not None and not new_submit.upload_completed:
             image_in_buffer = image_bytes_to_stream_buffer(
                 new_submit.image_result.image_bytes,
             )
@@ -190,11 +257,9 @@ class JobSubmitter:
                             "Retrying upload to R2. This is a cloudflare issue and only is a concern if "
                             "you see this message 5 or more times a minute.",
                         )
-                        new_submit.retry()
                         return False
                     if response.status != 200:
                         logger.error(f"Failed to upload image to R2: {response}")
-                        new_submit.retry()
                         return False
                 return True
 
@@ -204,18 +269,20 @@ class JobSubmitter:
                     timeout=10 + 1,
                 )
                 if not submit_success:
+                    self._retry_after_remote_failure(new_submit)
                     return new_submit
             except _async_client_exceptions as e:
                 # Not always a timeout: connection/DNS failures land here too, and hiding the
                 # cause at debug level made an unreachable R2 endpoint look like a slow one.
                 logger.warning(f"Upload to AI Horde R2 failed ({type(e).__name__}: {e}). Will retry.")
-                new_submit.retry()
+                self._retry_after_remote_failure(new_submit)
                 return new_submit
             except Exception as e:
                 logger.error(f"Failed to upload image to R2: {e}")
                 logger.debug(f"{type(e).__name__}: {e}")
-                new_submit.retry()
+                self._retry_after_remote_failure(new_submit)
                 return new_submit
+            new_submit.upload_completed = True
         metadata: list[GenMetadataEntry] = []
         if new_submit.image_result is not None:
             metadata = new_submit.image_result.generation_faults
@@ -258,15 +325,17 @@ class JobSubmitter:
                     submit_job_request,
                     JobSubmitResponse,
                 ),
-                timeout=10 + 1,
+                # A slow-but-alive endpoint may answer well after ten seconds; cancelling that early throws
+                # away a submit that was about to land and forces a needless re-upload and re-submit.
+                timeout=30 + 1,
             )
         except _async_client_exceptions:
             logger.error(f"Job {new_submit.job_id} submission timed out")
-            new_submit.retry()
+            self._retry_after_remote_failure(new_submit)
             return new_submit
         except Exception as e:
             logger.error(f"Failed to submit job {new_submit.job_id}: {e}")
-            new_submit.retry()
+            self._retry_after_remote_failure(new_submit)
             return new_submit
 
         # If the job submit response is an error,
@@ -278,30 +347,44 @@ class JobSubmitter:
             ):
                 logger.warning(f"Job {new_submit.job_id} does not exist, removing from completed jobs")
                 new_submit.fault()
+                self._record_failed_submit_attempt()
                 return new_submit
 
-            if "already submitted" in job_submit_response.message:
+            # The horde confirming it already holds this result (a timed-out submit that actually landed) is a
+            # delivery, not a failure: the job leaves the queue without counting, and clears the submit-health
+            # signal. Both phrasings the server uses are matched, since one does not contain the other verbatim.
+            if "already submitted" in job_submit_response.message or "already been submitted" in (
+                job_submit_response.message
+            ):
                 logger.debug(
-                    f"Job {new_submit.job_id} has already been submitted, removing from completed jobs",
+                    f"Job {new_submit.job_id} was already submitted; treating as delivered and removing it",
                 )
-                new_submit.fault()
+                new_submit.succeed(0, 0.0)
+                self._reset_submit_health()
                 return new_submit
 
             if "Please check your worker speed" in job_submit_response.message:
+                # A server "took too long" force-fault during a submit stall is a symptom of the remote outage,
+                # not a verdict on this worker's generations, so it is faulted with the remote origin.
                 logger.error(job_submit_response.message)
+                self._tag_remote_submit_fault(new_submit)
                 new_submit.fault()
+                self._record_failed_submit_attempt()
                 return new_submit
 
             error_string = (
                 f"Failed to submit job (API Error) {new_submit.retry_attempts_string}: {job_submit_response}"
             )
             logger.error(error_string)
+            # A genuine payload/validation rejection is the worker's own fault; its retries stay origin-default
+            # (GENERATION) so an exhausted retry still counts toward the consecutive-failure pause.
             new_submit.retry()
+            self._record_failed_submit_attempt()
             return new_submit
 
         if job_submit_response is None:
             logger.error(f"Failed to submit job {new_submit.job_id}")
-            new_submit.retry()
+            self._retry_after_remote_failure(new_submit)
             return new_submit
 
         # Get the time the job was popped from the job deque
@@ -370,12 +453,18 @@ class JobSubmitter:
         self._state.note_first_kudos_event(submit_time)
         self._state.kudos_generated_this_session += job_submit_response.reward
         self._state.kudos_events.append((submit_time, job_submit_response.reward))
+        # A landed submit proves the endpoint is draining again, clearing the pop side's submit-health signal.
+        self._reset_submit_health()
         new_submit.succeed(new_submit.kudos_reward, new_submit.kudos_per_second)
         return new_submit
 
     async def api_submit_job(self) -> None:
         """Submit a job result to the API, if any are completed (safety checked too) and ready to be submitted."""
         if len(self._job_tracker.jobs_pending_submit) == 0:
+            # No finished work waiting means there is no submit stall to react to: clear the submit-health
+            # signal so a stall that has fully drained (every backlogged job delivered or aged out) lets the
+            # pop side resume, rather than leaving pops withheld against an endpoint nothing is probing.
+            self._reset_submit_health()
             return
 
         completed_job_info = self._job_tracker.jobs_pending_submit[0]
@@ -452,6 +541,13 @@ class JobSubmitter:
         for gen_iter in range(iterations):
             new_submit = PendingSubmitJob(completed_job_info=completed_job_info, gen_iter=gen_iter)
             submit_tasks.append(asyncio.create_task(self.submit_single_generation(new_submit)))
+
+        # The pop-relative deadline is read once against the tracker's recorded pop time; a non-positive value
+        # is the unknown-pop sentinel, which leaves the deadline unenforced (only the per-generation retry cap
+        # then bounds the retries).
+        deadline_pop_time = await self._job_tracker.get_time_popped(completed_job_info.sdk_api_job_info)
+
+        backoff_wave = 0
         while len(submit_tasks) > 0:
             retry_submits: list[PendingSubmitJob] = []
             results = await asyncio.gather(*submit_tasks, return_exceptions=True)
@@ -469,11 +565,28 @@ class JobSubmitter:
                     if highest_kudos_per_second < result.kudos_per_second:
                         highest_kudos_per_second = result.kudos_per_second
             submit_tasks = []
+            if not retry_submits:
+                break
+
+            # A generation past its pop deadline has already forfeited its kudos server-side, so retrying it is
+            # wasted effort that also starves the jobs behind it. It is faulted locally with the remote origin.
+            if self._submit_deadline_exceeded(deadline_pop_time):
+                for retry_submit in retry_submits:
+                    self._tag_remote_submit_fault(retry_submit)
+                    retry_submit.fault()
+                    self._record_failed_submit_attempt()
+                    finished_submit_jobs.append(retry_submit)
+                break
+
+            # Space the next retry wave by a growing, jittered backoff so a stalling endpoint is not amplified
+            # by back-to-back re-hits; the first attempt above is never delayed.
+            await asyncio.sleep(_submit_retry_backoff_seconds(backoff_wave))
+            backoff_wave += 1
             for retry_submit in retry_submits:
                 submit_tasks.append(asyncio.create_task(self.submit_single_generation(retry_submit)))
 
         # Get the time the job was popped from the job deque
-        time_popped = await self._job_tracker.get_time_popped(completed_job_info.sdk_api_job_info)
+        time_popped = deadline_pop_time
         if time_popped is None:
             logger.warning(
                 f"Failed to get time_popped for job {completed_job_info.sdk_api_job_info.id_}. This is likely a bug.",
@@ -500,7 +613,12 @@ class JobSubmitter:
         for submit_job in finished_submit_jobs:
             if submit_job.is_faulted:
                 job_faulted = True
-                self._state.consecutive_failed_jobs += 1
+                # A remote-imposed submit fault (endpoint stall, server "too slow", or a lapsed pop deadline)
+                # is not a verdict on the worker's generations, so it is excluded from the consecutive-failure
+                # pause exactly like the scheduling-recovery and auxiliary-prefetch faults. A genuine
+                # payload/validation fault keeps counting.
+                if job_info.id_ is None or not self._job_tracker.was_faulted_by_non_generation_action(job_info.id_):
+                    self._state.consecutive_failed_jobs += 1
                 break
         if not job_faulted:
             # If any of the submits failed, we consider the whole job failed

@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,6 +61,9 @@ class LogBundle:
     child_loop_paths: dict[int, list[Path]] = field(default_factory=dict)
     startup_paths: dict[int, list[Path]] = field(default_factory=dict)
     stderr_paths: dict[int, list[Path]] = field(default_factory=dict)
+    record_reader: Callable[..., list[LogRecord]] | None = field(default=None, repr=False, compare=False)
+    """Reader used to parse the grouped paths; None uses the default whole-file :func:`read_records`. A live
+    watch passes an incremental reader here so re-parses touch only each file's appended tail."""
     _orchestrator_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
     _active_orchestrator_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
     _child_cache: dict[int, list[LogRecord]] = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -67,30 +71,72 @@ class LogBundle:
     _ledger_cache: list[LedgerEvent] | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
-    def from_path(cls, path: Path) -> LogBundle:
-        """Build a bundle from a directory, a single log file, or a ``.zip`` of logs."""
+    def from_path(
+        cls,
+        path: Path,
+        *,
+        active_only: bool = False,
+        record_reader: Callable[..., list[LogRecord]] | None = None,
+    ) -> LogBundle:
+        """Build a bundle from a directory, a single log file, or a ``.zip`` of logs.
+
+        ``active_only`` defaults to False for offline forensics (every rotation is classified). A live watch
+        sets it True so only the active ``*.log`` files are classified: rotation archives (``*.zip``/``*.gz``)
+        and uncompressed rotations (``bridge.<timestamp>.log``) are skipped, since the current session lives in
+        the active files and the rotation history is the bulk of the parse, sort, and scan cost on a
+        long-running worker. ``record_reader`` overrides the default whole-file reader (e.g. with an
+        incremental one) for every role in the bundle.
+        """
         if path.is_file() and path.suffix.lower() == ".zip" and not _looks_like_rotation(path):
             extracted = Path(tempfile.mkdtemp(prefix="horde_log_bundle_"))
             with zipfile.ZipFile(path) as archive:
                 archive.extractall(extracted)
-            return cls._from_directory(extracted, ledger_root=path.parent)
+            return cls._from_directory(
+                extracted,
+                ledger_root=path.parent,
+                active_only=active_only,
+                record_reader=record_reader,
+            )
         if path.is_file():
-            bundle = cls(root=path.parent)
-            bundle._classify(path)
+            bundle = cls(root=path.parent, record_reader=record_reader)
+            bundle._classify(path, active_only=active_only)
             return bundle
-        return cls._from_directory(path, ledger_root=path)
+        return cls._from_directory(
+            path,
+            ledger_root=path,
+            active_only=active_only,
+            record_reader=record_reader,
+        )
 
     @classmethod
-    def _from_directory(cls, directory: Path, *, ledger_root: Path) -> LogBundle:
-        bundle = cls(root=ledger_root)
-        # Recurse one level so a bundle that preserved the ``logs/`` subdir (as the db0 captures do) is
-        # still found, without scanning an entire unrelated tree.
-        for candidate in [*directory.glob("*"), *directory.glob("*/*")]:
+    def _from_directory(
+        cls,
+        directory: Path,
+        *,
+        ledger_root: Path,
+        active_only: bool = False,
+        record_reader: Callable[..., list[LogRecord]] | None = None,
+    ) -> LogBundle:
+        bundle = cls(root=ledger_root, record_reader=record_reader)
+        # Offline forensics recurse one level so a capture that preserved the ``logs/`` subdir (as the db0
+        # captures do) is still found, without scanning an entire unrelated tree. A live watch stays at the
+        # top level: the running worker writes only there, and a nested capture directory would drag its own
+        # full-size logs (and duplicate role paths, forcing a per-pass merge sort) into every pass.
+        candidates = directory.glob("*") if active_only else [*directory.glob("*"), *directory.glob("*/*")]
+        for candidate in candidates:
             if candidate.is_file():
-                bundle._classify(candidate)
+                bundle._classify(candidate, active_only=active_only)
         return bundle
 
-    def _classify(self, path: Path) -> None:
+    def _read(self, *paths: Path) -> list[LogRecord]:
+        """Parse ``paths`` through the configured reader (defaulting to the whole-file :func:`read_records`)."""
+        reader = self.record_reader if self.record_reader is not None else read_records
+        return reader(*paths)
+
+    def _classify(self, path: Path, *, active_only: bool = False) -> None:
+        if active_only and (path.suffix.lower() in (".zip", ".gz") or _ROTATION_TS_RE.search(path.name)):
+            # Live watch: keep only the active current-session logs, not the rotation history.
+            return
         base = _base_name(path)
         if _ORCHESTRATOR_RE.match(base):
             self.orchestrator_paths.append(path)
@@ -114,7 +160,7 @@ class LogBundle:
     def orchestrator_records(self) -> list[LogRecord]:
         """All parsed orchestrator (``bridge.log``) records, active plus rotations, in time order."""
         if self._orchestrator_cache is None:
-            self._orchestrator_cache = read_records(*self.orchestrator_paths)
+            self._orchestrator_cache = self._read(*self.orchestrator_paths)
         return self._orchestrator_cache
 
     def active_orchestrator_paths(self) -> list[Path]:
@@ -132,19 +178,19 @@ class LogBundle:
     def active_orchestrator_records(self) -> list[LogRecord]:
         """Parsed records from only the live ``bridge.log`` (skips rotations); see ``active_orchestrator_paths``."""
         if self._active_orchestrator_cache is None:
-            self._active_orchestrator_cache = read_records(*self.active_orchestrator_paths())
+            self._active_orchestrator_cache = self._read(*self.active_orchestrator_paths())
         return self._active_orchestrator_cache
 
     def child_records(self, process_id: int) -> list[LogRecord]:
         """Parsed loop-log records for one slot, in time order (empty if that slot has no loop log)."""
         if process_id not in self._child_cache:
-            self._child_cache[process_id] = read_records(*self.child_loop_paths.get(process_id, []))
+            self._child_cache[process_id] = self._read(*self.child_loop_paths.get(process_id, []))
         return self._child_cache[process_id]
 
     def startup_records(self, process_id: int) -> list[LogRecord]:
         """Parsed startup-crash-backstop records for one slot (where pre-sink crashes land)."""
         if process_id not in self._startup_cache:
-            self._startup_cache[process_id] = read_records(*self.startup_paths.get(process_id, []))
+            self._startup_cache[process_id] = self._read(*self.startup_paths.get(process_id, []))
         return self._startup_cache[process_id]
 
     def ledger_events(self) -> list[LedgerEvent]:

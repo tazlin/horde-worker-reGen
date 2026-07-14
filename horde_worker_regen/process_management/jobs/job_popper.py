@@ -740,6 +740,25 @@ class JobPopper:
             self._state.consecutive_failed_jobs_pause_count += 1
             return True
 
+        # A run of failed submit attempts means the remote submit endpoint is stalled: withhold pops so the
+        # worker stops accepting work onto a backlog it cannot drain. This is deliberately softer than the
+        # consecutive-failure pause above: the stall is remote and self-healing (the in-flight submit retries
+        # are the probes; their first success clears the counter), so it neither latches the timed pause nor
+        # shuts the worker down under exit_on_unhandled_faults.
+        if self._state.consecutive_failed_submit_attempts >= 3:
+            if not self._submit_stall_withholding:
+                self._submit_stall_withholding = True
+                logger.warning(
+                    "Withholding job pops: the submit endpoint is not accepting finished generations "
+                    f"({self._state.consecutive_failed_submit_attempts} consecutive failed submit attempts). "
+                    "Pops resume as soon as a submit succeeds.",
+                )
+            return True
+
+        if self._submit_stall_withholding:
+            self._submit_stall_withholding = False
+            logger.info("Resuming job pops: the submit endpoint is accepting generations again.")
+
         return False
 
     def _is_queue_full(self, bridge_data: reGenBridgeData, *, extra_allowance: int = 0) -> bool:
@@ -773,6 +792,23 @@ class JobPopper:
     hysteretic rather than a bare threshold, so the worker does not flap in and out of backpressure while
     the backlog hovers near the cap."""
 
+    _submit_stall_withholding: bool = False
+    """Whether the pop side is currently withholding pops because the submit endpoint is stalled.
+
+    A state-change latch so the withhold/resume decision logs only on its edges, never re-emitted each
+    sub-second pop tick while the stall persists."""
+
+    _SUBMIT_BACKLOG_MIN = 6
+    """Floor on the pending-submit backlog that counts as post-inference backpressure.
+
+    A backlog this deep means finished generations are piling up faster than the submit stage can deliver
+    them, so admitting still more work only ages jobs toward their ttl. The effective threshold scales with
+    concurrency (see :meth:`_submit_backlog_cap`) but never drops below this floor, so a low-concurrency
+    worker still reacts before a modest backlog becomes a stampede."""
+
+    _submit_backpressure_engaged: bool = False
+    """Whether a deep pending-submit backlog is currently counted as post-inference backpressure (log latch)."""
+
     def _max_safe_safety_backlog(self) -> int:
         """How many jobs may wait for safety before a newly popped job would risk aging out.
 
@@ -789,8 +825,20 @@ class JobPopper:
         capacity = int(budget_seconds * num_safety / avg_safety)
         return max(_MIN_POST_INFERENCE_BACKLOG * num_safety, capacity)
 
+    def _submit_backlog_cap(self) -> int:
+        """How deep the pending-submit backlog may grow before it counts as post-inference backpressure.
+
+        Scales with the worker's concurrent-inference ceiling (a wider worker can keep more finished
+        generations in flight legitimately) but never falls below :data:`_SUBMIT_BACKLOG_MIN`.
+        """
+        return max(self._SUBMIT_BACKLOG_MIN, 3 * self._max_threads_ceiling)
+
+    def _is_submit_backlogged(self) -> bool:
+        """Return True if finished generations are piling up unsubmitted past the backlog cap."""
+        return len(self._job_tracker.jobs_pending_submit) >= self._submit_backlog_cap()
+
     def _is_post_inference_backlogged(self) -> bool:
-        """Return True if the post-inference (safety) backlog is too deep to admit more work.
+        """Return True if the post-inference (safety or submit) backlog is too deep to admit more work.
 
         This is the backpressure the worker previously lacked: inference completions pile into the
         ungated safety queue, so a safety stage even slightly slower than inference grows that queue until
@@ -799,12 +847,29 @@ class JobPopper:
         jobs out, throttling intake to the pipeline's slowest stage instead of spiralling into
         forced maintenance.
 
-        Hysteretic: the gate engages when the backlog reaches the cap and stays engaged until the backlog
-        drains below :data:`_SAFETY_BACKLOG_RELEASE_FRACTION` of that cap, so intake resumes only once the
-        slow stage has made real headway rather than the instant a single job clears. The latch is
+        The submit stage sits at the same tail: when the remote submit endpoint stalls, finished generations
+        pile up unsubmitted just as readily, so a pending-submit backlog past :meth:`_submit_backlog_cap`
+        counts as the same backpressure and withholds intake until it drains.
+
+        Hysteretic (safety term): the gate engages when the backlog reaches the cap and stays engaged until
+        the backlog drains below :data:`_SAFETY_BACKLOG_RELEASE_FRACTION` of that cap, so intake resumes only
+        once the slow stage has made real headway rather than the instant a single job clears. The latch is
         deterministic in the current backlog, so the several read sites that call this each tick (the pop
         gate, the hungry check, the orchestration-intent readback) all observe the same verdict.
         """
+        if self._is_submit_backlogged():
+            if not self._submit_backpressure_engaged:
+                self._submit_backpressure_engaged = True
+                logger.warning(
+                    f"Withholding job pops: {len(self._job_tracker.jobs_pending_submit)} finished generations "
+                    f"are waiting to submit (cap {self._submit_backlog_cap()}) and the submit stage is not "
+                    "draining them. Intake is paused so the backlog does not deepen.",
+                )
+            return True
+        if self._submit_backpressure_engaged:
+            self._submit_backpressure_engaged = False
+            logger.info("Resuming job pops: the pending-submit backlog has drained.")
+
         backlog = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
         cap = self._max_safe_safety_backlog()
         if self._safety_backpressure_engaged:

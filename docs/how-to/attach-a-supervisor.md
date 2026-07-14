@@ -27,6 +27,11 @@ horde-worker-attach --session-dir ./session
 Stop it with `Ctrl+C` (or `SIGTERM`); it shuts the worker down through the launcher's orphan-proof path,
 draining in-flight jobs before force-killing the tree if it overruns.
 
+A `GRACEFUL_SHUTDOWN` (or `SHUTDOWN`) command in the inbox is different: the supervisor drives the same
+orphan-proof drain and then, once the worker has fully exited, writes one final `state.jsonl` line and the
+process itself exits. The worker is never relaunched after an inbox-requested stop, so the supervisor
+process exiting is the reliable completion signal for an operator harness waiting on it.
+
 ## The three files
 
 ### `state.jsonl` (observe)
@@ -53,9 +58,16 @@ One compact JSON line per interval summarizing the latest worker snapshot. Each 
 Append-only, edge-triggered alerts worth an operator's attention. Each fires once per episode and re-arms
 only after its condition clears, so a steady problem does not spam. Two sources feed it:
 
-- **Live-log findings** -- an incremental `watch_pass` over the worker's `logs/` each interval, emitting a
-  line the first time a warning/critical diagnosis appears (the same detectors as `horde-log`).
-- **Snapshot threshold rules**:
+- **Live-log findings** -- a `watch_pass` over the worker's `logs/`, emitting a line the first time a
+  warning/critical diagnosis appears (the same detectors as `horde-log`). The pass runs on a background
+  thread so its parse cost never delays the poll cadence: each poll appends any completed pass's findings
+  and kicks off a fresh pass only when none is in flight. To stay cheap on a long-running worker it reads
+  only the active current-session logs (rotation archives and timestamped rotations are skipped, and its
+  session segmentation and detector scans stay bounded to that active tail rather than the whole rotation
+  history), and it is incremental, re-parsing only the bytes each active log gained since the previous pass
+  while still feeding the detectors the full record set. The first pass is still a full parse of the active
+  logs, but because it runs off the poll thread it does not stall observation or control.
+- **Snapshot threshold rules** (and one loop self-check):
 
 | Rule | Fires when |
 | --- | --- |
@@ -64,8 +76,11 @@ only after its condition clears, so a steady problem does not spam. Two sources 
 | `fault_burst` | 5 or more job faults landed in the last 10 minutes. |
 | `gpu_idle_with_pending` | Jobs are pending while every inference process has sat idle for over 120 s. |
 | `download_no_progress` | An active download's byte count has not advanced for over 120 s. |
+| `supervisor_overrun` | A single poll cycle took longer than twice the interval (the loop is running behind). |
 
-Each line carries a `severity` (`warning`/`critical`), a human `summary`, and the key numbers behind it.
+Each line carries a `severity` (`warning`/`critical`), a human `summary`, and the key numbers behind it. The
+`supervisor_overrun` self-alert is edge-triggered like the rest: it fires once when the loop falls behind and
+re-arms only after a cycle returns to time, so any regression that slows the poll loop announces itself here.
 
 ### `commands.jsonl` (control)
 

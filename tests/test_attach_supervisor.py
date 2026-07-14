@@ -8,12 +8,17 @@ once-only inbox command application (malformed skipped), and the single-shot, re
 from __future__ import annotations
 
 import json
+import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from horde_worker_regen.attach_supervisor import (
     AUTO_GUARD_CONFIRM_SECONDS,
+    OVERRUN_INTERVAL_FACTOR,
     STATE_LINE_MAX_BYTES,
     AttachSupervisor,
+    ThreadedWatchRunner,
     _resolve_command,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -38,6 +43,7 @@ class FakeController:
         self.sent: list[SupervisorControlMessage] = []
         self.graceful_stops = 0
         self.ticks = 0
+        self.alive = True
 
     def tick(self) -> None:
         """Record a tick (the fake has no worker to advance)."""
@@ -49,8 +55,13 @@ class FakeController:
         return True
 
     def request_graceful_stop(self, *, timeout: float = 150.0) -> None:
-        """Record a graceful-stop request."""
+        """Record a graceful-stop request; the fake worker is considered exited immediately."""
         self.graceful_stops += 1
+        self.alive = False
+
+    def is_alive(self) -> bool:
+        """Whether the fake worker is still running."""
+        return self.alive
 
 
 def _config() -> WorkerConfigSummary:
@@ -344,3 +355,122 @@ class TestAutoGuard:
             controller.last_liveness_wall_time = now  # keep liveness fresh
             attach.poll_once(now=now)
         assert _server_maintenance_commands(controller, enabled=True) == []
+
+
+class TestWatchOffThread:
+    """The live-log watch runs off the poll thread, so its cost cannot delay observation or control."""
+
+    def test_slow_watch_pass_does_not_block_inbox_or_state(self, tmp_path: Path) -> None:
+        """While a watch pass is blocked on the runner thread, a poll still applies inbox commands and writes state."""
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        session_dir = tmp_path / "session"
+        runner = ThreadedWatchRunner()
+        controller = FakeController()
+        attach = AttachSupervisor(
+            controller,
+            session_dir=session_dir,
+            log_dir=log_dir,
+            interval=5.0,
+            watch_runner=runner,
+        )
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _blocking_pass(now: float) -> list[dict[str, object]]:
+            started.set()
+            release.wait(10.0)
+            return [{"t": now, "rule": "log_watch", "severity": "info", "summary": "late"}]
+
+        attach._run_watch_pass = _blocking_pass  # type: ignore[assignment,method-assign]
+
+        try:
+            attach.poll_once(now=1.0)  # dispatches the blocking pass to the background thread
+            assert started.wait(3.0), "the watch pass never started on the runner thread"
+            assert runner.in_flight()
+
+            # A command lands while the watch pass is still blocked; the next poll must service it promptly.
+            (session_dir / "commands.jsonl").write_text(
+                json.dumps({"command": "PAUSE"}) + "\n",
+                encoding="utf-8",
+            )
+            wall_start = time.monotonic()
+            attach.poll_once(now=2.0)
+            elapsed = time.monotonic() - wall_start
+
+            assert elapsed < 2.0, "poll_once blocked on the in-flight watch pass"
+            assert runner.in_flight(), "the second poll should not have waited for the blocked pass"
+            assert any(command.command is SupervisorCommand.PAUSE for command in controller.sent)
+            state_lines = (session_dir / "state.jsonl").read_text(encoding="utf-8").splitlines()
+            assert len(state_lines) == 2  # one state line per poll, both written despite the blocked pass
+        finally:
+            release.set()
+            runner.shutdown()
+
+
+class TestOverrunSelfAlert:
+    """A poll cycle running past twice the interval self-alerts, edge-triggered."""
+
+    def test_overrun_alert_edge_triggered(self, tmp_path: Path) -> None:
+        """The overrun alert fires on entry, stays silent while it persists, and re-fires after it clears."""
+        over = OVERRUN_INTERVAL_FACTOR * 5.0 + 1.0
+        # Two monotonic reads per poll (cycle start, cycle end): craft the elapsed of each poll.
+        durations: Iterator[float] = iter(
+            [
+                0.0,
+                0.0,  # poll 1: fast
+                0.0,
+                over,  # poll 2: overrun -> fires
+                0.0,
+                over,  # poll 3: still overrun -> no re-fire
+                0.0,
+                0.0,  # poll 4: fast -> clears
+                0.0,
+                over,  # poll 5: overrun again -> re-fires
+            ],
+        )
+        controller = FakeController()
+        attach = AttachSupervisor(
+            controller,
+            session_dir=tmp_path,
+            log_dir=None,
+            interval=5.0,
+            monotonic=lambda: next(durations),
+        )
+
+        for now in (1.0, 2.0, 3.0, 4.0, 5.0):
+            attach.poll_once(now=now)
+
+        overruns = _alerts(tmp_path, "supervisor_overrun")
+        assert len(overruns) == 2
+        assert overruns[0]["severity"] == "warning"
+        assert overruns[0]["elapsed_seconds"] >= OVERRUN_INTERVAL_FACTOR * 5.0
+
+
+class TestInboxShutdownExit:
+    """An inbox-requested graceful shutdown, once the worker exits, returns from the run loop (no relaunch)."""
+
+    def test_run_forever_returns_after_inbox_shutdown_completes(self, tmp_path: Path) -> None:
+        """A GRACEFUL_SHUTDOWN inbox line drives a graceful stop and then exits the loop with a final state line."""
+        controller = FakeController()
+        (tmp_path / "commands.jsonl").write_text(
+            json.dumps({"command": "GRACEFUL_SHUTDOWN"}) + "\n",
+            encoding="utf-8",
+        )
+        attach = AttachSupervisor(controller, session_dir=tmp_path, log_dir=None, interval=0.0)
+
+        finished = threading.Event()
+
+        def _run() -> None:
+            attach.run_forever()
+            finished.set()
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        assert finished.wait(5.0), "run_forever did not return after the inbox shutdown completed"
+        assert controller.graceful_stops == 1
+        # The worker exited, so the launcher would not relaunch; the loop's return is the completion signal.
+        state_lines = (tmp_path / "state.jsonl").read_text(encoding="utf-8").splitlines()
+        assert json.loads(state_lines[-1])["worker_up"] is False

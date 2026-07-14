@@ -8,11 +8,13 @@ exception across the process boundary and distinguish "never gave up" (the bug) 
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from horde_worker_regen.analysis.bundle import LogBundle
 from horde_worker_regen.analysis.correlate import build_session_context
-from horde_worker_regen.analysis.detectors import Finding, Severity, run_detectors
+from horde_worker_regen.analysis.detectors import Finding, Severity, _records_in_window, run_detectors
+from horde_worker_regen.analysis.log_ingest import LogRecord
 from horde_worker_regen.analysis.sessions import segment_sessions
 
 
@@ -1013,3 +1015,56 @@ class TestPostProcessingDeferralStarvation:
         lines = self._defer_storm(4) + [self._finished("16:53:30.000", self._JOB)]
         findings = _diagnose(tmp_path, self._bridge(*lines))
         assert "post_processing_deferral_starvation" not in findings
+
+
+class TestSessionWindowBisect:
+    """The binary-search session-window slice must equal the naive per-record filter for the same input."""
+
+    @staticmethod
+    def _record(timestamp: datetime | None) -> LogRecord:
+        return LogRecord(
+            timestamp=timestamp,
+            level="INFO",
+            name="child",
+            function="loop",
+            lineno=1,
+            message="m",
+            source_path=Path("bridge_0.log"),
+            raw_lineno=1,
+        )
+
+    @staticmethod
+    def _naive(records: list[LogRecord], start: datetime | None, end: datetime | None) -> list[LogRecord]:
+        """The pre-bisect filter: exclude timestamp-less records and clamp inclusively to the open-ended window."""
+        kept: list[LogRecord] = []
+        for record in records:
+            if record.timestamp is None:
+                continue
+            if start is not None and record.timestamp < start:
+                continue
+            if end is not None and record.timestamp > end:
+                continue
+            kept.append(record)
+        return kept
+
+    def test_bisect_matches_naive_across_windows(self) -> None:
+        """Over a multi-session set with None-timestamp and on-boundary records, both slices agree exactly."""
+        base = datetime(2026, 6, 24, 18, 0, 0)
+        later = datetime(2026, 6, 24, 19, 0, 0)  # a second session an hour on
+        offsets = [0, 5, 10, 10, 15, 20]  # a duplicate exactly on a boundary candidate
+        # Ordered as read_records yields: timestamp-less records first, then ascending timestamps.
+        records = [self._record(None), self._record(None)]
+        records += [self._record(base + timedelta(seconds=s)) for s in offsets]
+        records += [self._record(later + timedelta(seconds=s)) for s in (0, 5, 10)]
+
+        windows: list[tuple[datetime | None, datetime | None]] = [
+            (None, None),
+            (base + timedelta(seconds=5), base + timedelta(seconds=15)),  # inclusive both ends, spans the dup
+            (None, base + timedelta(seconds=10)),  # open start
+            (later, None),  # open end into the second session
+            (base + timedelta(seconds=7), base + timedelta(seconds=12)),  # straddles the duplicate boundary
+            (base, base),  # a single instant, exactly on a record
+            (base - timedelta(seconds=1), base - timedelta(seconds=1)),  # empty window before any record
+        ]
+        for start, end in windows:
+            assert _records_in_window(records, start, end) == self._naive(records, start, end), (start, end)

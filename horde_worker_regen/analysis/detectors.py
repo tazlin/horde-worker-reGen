@@ -14,10 +14,12 @@ findings rather than aborting the report.
 
 from __future__ import annotations
 
+import bisect
 import enum
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
@@ -193,23 +195,40 @@ def _matching(records: list[LogRecord], pattern: re.Pattern[str]) -> list[LogRec
     return [record for record in records if pattern.search(record.message)]
 
 
-def _record_in_session(context: SessionContext, record: LogRecord) -> bool:
-    """Return whether ``record`` belongs to the session's wall-clock window."""
-    if record.timestamp is None:
-        return False
-    start, end = context.session.start_ts, context.session.end_ts
-    if start is not None and record.timestamp < start:
-        return False
-    return not (end is not None and record.timestamp > end)
+def _window_key(record: LogRecord) -> datetime:
+    """Time key for windowing records: a missing timestamp sorts first, as ``read_records`` orders it."""
+    return record.timestamp or datetime.min
+
+
+def _records_in_window(
+    records: list[LogRecord],
+    start: datetime | None,
+    end: datetime | None,
+) -> list[LogRecord]:
+    """Slice time-ordered ``records`` to those whose timestamp falls within ``[start, end]`` inclusive.
+
+    ``records`` must be ordered as ``read_records`` yields them (timestamp-less records first, then ascending
+    timestamps); the live incremental reader preserves that order for a single-process log. A record with no
+    timestamp is never inside a session window, and either bound is open when None. This is a binary-search
+    equivalent of filtering each record by ``start <= ts <= end``, so its cost is logarithmic in the cached
+    history rather than linear: on a long-running session the child logs grow without bound, and a per-pass
+    full scan of them dominated the live watch.
+    """
+    if start is None:
+        # Skip the timestamp-less prefix (it keys as datetime.min and is never inside a window).
+        lo = bisect.bisect_right(records, datetime.min, key=_window_key)
+    else:
+        lo = bisect.bisect_left(records, start, key=_window_key)
+    hi = len(records) if end is None else bisect.bisect_right(records, end, key=_window_key)
+    return records[lo:hi]
 
 
 def _child_records_in_session(context: SessionContext) -> list[LogRecord]:
-    """Return child loop records whose timestamps fall inside the diagnosed session."""
+    """Return child loop records whose timestamps fall inside the diagnosed session (windowed per slot)."""
+    start, end = context.session.start_ts, context.session.end_ts
     records: list[LogRecord] = []
     for process_id in context.bundle.process_ids():
-        records.extend(
-            record for record in context.bundle.child_records(process_id) if _record_in_session(context, record)
-        )
+        records.extend(_records_in_window(context.bundle.child_records(process_id), start, end))
     return records
 
 

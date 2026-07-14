@@ -122,6 +122,11 @@ class PendingSubmitJob(PendingJob):
     gen_iter: int
     kudos_reward: int = 0
     kudos_per_second: float = 0.0
+    upload_completed: bool = False
+    """Whether this generation's image already uploaded to R2 successfully.
+
+    The object is reused across the submit loop's inner retries, so once its (unchanged) image bytes have
+    landed in R2 the bandwidth-heavy upload is not repeated: a later retry re-attempts only the API submit."""
 
     @property
     def image_result(self) -> HordeImageResult | None:

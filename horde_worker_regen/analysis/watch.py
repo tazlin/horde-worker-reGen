@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from .bundle import LogBundle
 from .correlate import build_session_context
 from .detectors import Severity, run_detectors
+from .log_ingest import FileReadProgress
 from .sessions import segment_sessions
 
 
@@ -27,6 +29,11 @@ class WatchState:
     session_index: int | None = None
     seen_finding_ids: set[str] = field(default_factory=set)
     last_recovery_count: int = 0
+    file_progress: dict[Path, FileReadProgress] = field(default_factory=dict)
+    """Per-file incremental parse progress for a live incremental reader; empty for the whole-file reader.
+
+    Carried across passes so the reader re-parses only appended bytes. Unused by the default (offline)
+    reader, which re-reads each file in full."""
 
 
 def watch_pass(bundle: LogBundle, state: WatchState) -> tuple[list[str], WatchState]:
@@ -62,4 +69,5 @@ def watch_pass(bundle: LogBundle, state: WatchState) -> tuple[list[str], WatchSt
         session_index=session.index,
         seen_finding_ids=seen,
         last_recovery_count=max(baseline_recoveries, session.peak_process_recoveries),
+        file_progress=state.file_progress,
     )

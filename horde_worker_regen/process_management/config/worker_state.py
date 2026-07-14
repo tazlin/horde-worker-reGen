@@ -183,6 +183,15 @@ class WorkerState:
     verbatim to the TUI. Empty until the flag latches."""
 
     consecutive_failed_jobs: int = 0
+    consecutive_failed_submit_attempts: int = 0
+    """Run of failed submit attempts against the remote submit endpoint, the pop side's submit-health signal.
+
+    The job submitter is the only writer: it increments this once per failed submit attempt (a network error,
+    an endpoint stall, a server rejection) and resets it to zero on any successful submit or duplicate-delivery
+    acknowledgement. The popper reads it to withhold pops while the endpoint is not draining finished work, so
+    the worker stops deepening a backlog it cannot clear. Distinct from ``consecutive_failed_jobs``: a submit
+    stall is remote and self-healing (the in-flight retries are the probes; their first success clears this),
+    so it must not feed the consecutive-failure pause or the exit_on_unhandled_faults shutdown."""
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0
     consecutive_failed_jobs_pause_count: int = 0

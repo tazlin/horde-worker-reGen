@@ -147,16 +147,30 @@ def _read_physical_lines(path: Path) -> Iterator[str]:
     yield from text.replace("\x00", "").splitlines()
 
 
-def parse_lines(lines: Iterable[str], source_path: Path) -> list[LogRecord]:
-    """Parse physical lines into records, folding timestamp-less continuation lines into the prior record."""
+def parse_lines(
+    lines: Iterable[str],
+    source_path: Path,
+    *,
+    start_lineno: int = 1,
+    carry: LogRecord | None = None,
+) -> list[LogRecord]:
+    """Parse physical lines into records, folding timestamp-less continuation lines into the prior record.
+
+    ``start_lineno`` numbers the first physical line, so an incremental parse of a file's appended tail keeps
+    ``raw_lineno`` continuous with the lines already consumed. ``carry`` is the last record parsed from an
+    earlier chunk of the same file: a leading continuation line (this chunk began mid-traceback) folds into
+    it, reproducing exactly what a whole-file parse would have done across the chunk boundary.
+    """
     records: list[LogRecord] = []
-    for raw_lineno, line in enumerate(lines, start=1):
+    for raw_lineno, line in enumerate(lines, start=start_lineno):
         head = _HEAD_RE.match(line)
         if head is None:
             # No record head: a traceback/continuation line, or torn output. Attach it to the record in
             # progress so a crash's stack stays with its log line; drop only truly orphaned leading noise.
             if records:
                 records[-1].continuation.append(line)
+            elif carry is not None:
+                carry.continuation.append(line)
             continue
         name, function, lineno = _split_location(head.group("loc"))
         records.append(
@@ -193,3 +207,87 @@ def read_records(*paths: Path) -> list[LogRecord]:
 
     indexed = sorted(enumerate(all_records), key=_sort_key)
     return [record for _, record in indexed]
+
+
+def _read_region(path: Path, start_offset: int) -> tuple[list[str], int]:
+    """Read the whole lines appended to ``path`` at or after ``start_offset``; return them and the new offset.
+
+    Only bytes up to the final newline are consumed, so a trailing partial line (a writer caught mid-flush)
+    is left for a later pass rather than parsed as a torn record. NUL bytes are stripped after the
+    byte-offset arithmetic so the returned offset stays a true file position that a later ``seek`` can trust.
+    """
+    with path.open("rb") as handle:
+        handle.seek(start_offset)
+        data = handle.read()
+    last_newline = data.rfind(b"\n")
+    if last_newline == -1:
+        return [], start_offset
+    consumed = data[: last_newline + 1]
+    text = consumed.decode("utf-8", errors="replace").replace("\x00", "")
+    return text.splitlines(), start_offset + len(consumed)
+
+
+@dataclass
+class FileReadProgress:
+    """Per-file incremental parse state: the records settled so far and how far the file has been consumed."""
+
+    consumed_size: int = 0
+    """File size (bytes) observed at the last parse; a size below this signals truncation/rotation."""
+    consumed_offset: int = 0
+    """Byte offset up to which whole lines are parsed and settled; the next pass reads from here."""
+    line_count: int = 0
+    """Physical lines consumed up to ``consumed_offset`` (keeps ``raw_lineno`` continuous across passes)."""
+    records: list[LogRecord] = field(default_factory=list)
+    """Records parsed so far, in file order."""
+
+
+class IncrementalRecordReader:
+    """A :func:`read_records`-compatible reader that parses only each file's appended tail across passes.
+
+    Bound to a persistent per-path progress map, so re-reading a growing log re-parses only the bytes added
+    since the previous call: an unchanged file is not reopened at all, and one that shrank or is newly seen is
+    parsed from zero. The records handed on are identical to a whole-file parse, including continuation lines
+    that fold across a chunk boundary (via the carried last record), so detectors see the same input either
+    way. The first pass over a large file still parses it in full; only subsequent passes are incremental.
+    """
+
+    def __init__(self, progress: dict[Path, FileReadProgress]) -> None:
+        """Bind the reader to a caller-owned progress map that persists across passes."""
+        self._progress = progress
+
+    def __call__(self, *paths: Path) -> list[LogRecord]:
+        """Return the parsed records for ``paths`` (a single active file, or several merged in time order)."""
+        if len(paths) == 1:
+            return self._records_for(paths[0])
+        merged: list[LogRecord] = []
+        for path in paths:
+            merged.extend(self._records_for(path))
+        indexed = sorted(enumerate(merged), key=lambda item: (item[1].timestamp or datetime.min, item[0]))
+        return [record for _, record in indexed]
+
+    def _records_for(self, path: Path) -> list[LogRecord]:
+        """Parse only the bytes appended to ``path`` since the last pass, returning its full record set."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            progress = self._progress.get(path)
+            return progress.records if progress is not None else []
+
+        progress = self._progress.get(path)
+        if progress is None or size < progress.consumed_size:
+            # Newly seen, or shrank/rotated under us: parse from zero.
+            progress = FileReadProgress()
+            self._progress[path] = progress
+        elif size == progress.consumed_size:
+            # Unchanged since the last pass: reuse the cached records without reopening the file.
+            return progress.records
+
+        lines, next_offset = _read_region(path, progress.consumed_offset)
+        if lines:
+            carry = progress.records[-1] if progress.records else None
+            new_records = parse_lines(lines, path, start_lineno=progress.line_count + 1, carry=carry)
+            progress.records.extend(new_records)
+            progress.line_count += len(lines)
+            progress.consumed_offset = next_offset
+        progress.consumed_size = size
+        return progress.records

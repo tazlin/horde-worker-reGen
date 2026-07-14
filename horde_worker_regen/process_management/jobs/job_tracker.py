@@ -240,6 +240,12 @@ class JobFaultOrigin(enum.StrEnum):
     """A fault issued by the auxiliary-prefetch pipeline, excluded from the failure pause. A job faulted because
     a LoRA or textual inversion it references could never be placed on disk was never generated for, so a fetch
     the worker cannot satisfy is not a generation verdict and must not silence intake of unrelated work."""
+    REMOTE_SUBMIT = enum.auto()
+    """A fault the remote submit endpoint imposed, excluded from the failure pause. A generation whose result the
+    worker produced but could not deliver (the endpoint stalled, force-faulted it as too slow, or its pop deadline
+    lapsed before delivery) failed remotely, not at generating the work. Counting a run of these would let a
+    remote outage manufacture the consecutive-failure pause and, under exit_on_unhandled_faults, a shutdown, so a
+    condition the worker cannot influence would compound into a longer local outage."""
 
 
 @dataclass
@@ -868,14 +874,27 @@ class JobTracker:
     def was_faulted_by_non_generation_action(self, job_id: GenerationID) -> bool:
         """Return whether this job's terminal fault came from an action other than the generation flow.
 
-        True for a scheduling-recovery give-up and for an auxiliary-prefetch failure: neither is a verdict on
-        generating the work, so the submit path excludes both from the consecutive-failure pop pause.
+        True for a scheduling-recovery give-up, an auxiliary-prefetch failure, and a remote-submit fault: none is
+        a verdict on generating the work, so the submit path excludes all of them from the consecutive-failure
+        pop pause.
         """
         tracked = self._tracked_by_id(job_id)
         return tracked is not None and tracked.fault_origin in (
             JobFaultOrigin.SCHEDULING_RECOVERY,
             JobFaultOrigin.AUX_PREFETCH,
+            JobFaultOrigin.REMOTE_SUBMIT,
         )
+
+    def note_remote_submit_fault(self, job_id: GenerationID) -> None:
+        """Tag a job's terminal fault as imposed by the remote submit endpoint.
+
+        Read back through :meth:`was_faulted_by_non_generation_action`, this keeps a delivery failure the worker
+        cannot influence (a stalled endpoint, a server "too slow" force-fault, or a lapsed pop deadline) out of
+        the consecutive-failure pop pause. Idempotent; a no-op for a job the tracker no longer holds.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is not None:
+            tracked.fault_origin = JobFaultOrigin.REMOTE_SUBMIT
 
     def tracked_jobs(self) -> tuple[TrackedJob, ...]:
         """Return active tracked jobs in lifecycle order for read-only observers."""

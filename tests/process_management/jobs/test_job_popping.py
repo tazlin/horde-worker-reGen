@@ -887,11 +887,16 @@ class TestPostInferenceBackpressure:
 
 
 class _FakeBacklogTracker:
-    """A minimal stand-in exposing only the two safety-backlog lists the backpressure gate reads."""
+    """A minimal stand-in exposing the backlog surfaces the backpressure gate reads.
+
+    The pending-submit list is held empty so these cases isolate the safety-backlog hysteresis; the submit
+    backlog is exercised separately (see the submit-stall reproduction suite).
+    """
 
     def __init__(self) -> None:
         self.jobs_pending_safety_check: list[object] = []
         self.jobs_being_safety_checked: list[object] = []
+        self.jobs_pending_submit: list[object] = []
 
     def set_backlog(self, depth: int) -> None:
         """Set the pending-safety backlog to exactly ``depth`` placeholder entries."""
