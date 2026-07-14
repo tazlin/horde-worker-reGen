@@ -231,7 +231,13 @@ The reply (`HordeSafetyResultMessage`) is handled by `_handle_safety_result`:
 takes the head of `jobs_pending_submit` and fans out one `PendingSubmitJob` task per image: PUT the
 PNG to the job's `r2_upload` URL (10s timeout, retry on 500/timeouts), then a `JobSubmitRequest` to
 the API. `PendingSubmitJob` owns retry/fault bookkeeping. Kudos are recorded into `WorkerState`;
-consecutive-failure counters reset on success. Finally `ensure_submitted_job_info` +
+consecutive-failure counters reset on success. A terminal fault increments the
+consecutive-failure counter that drives the pop pause only when it is a generation
+outcome: a fault whose origin is scheduling recovery (a save-our-ship give-up reissuing a
+wedged backlog) or the auxiliary-prefetch pipeline (a job faulted because a LoRA or
+textual inversion it references could never be placed on disk, before any generation ran)
+is excluded, since neither is a verdict on generating the work and counting it would let an
+unrelated condition manufacture the pause. Finally `ensure_submitted_job_info` +
 `finalize_submitted` remove the job from the tracker entirely and stamp `last_job_submitted_time`.
 Dry-run short-circuits the whole method per image.
 

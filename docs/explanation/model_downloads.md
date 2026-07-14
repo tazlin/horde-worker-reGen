@@ -125,10 +125,26 @@ evicted to make room.
 
 The download process reports a per-file outcome back to the parent. A success marks
 the session auxiliary cache and, once every LoRA and textual inversion a pending job
-needs is present, clears that job's dispatch gate. A failure faults the affected
-pending job promptly (it holds no lane or reservation, so nothing in flight is
-disturbed) and feeds the LoRA-download backoff exactly as an inference-side aux
-failure does.
+needs is present, clears that job's dispatch gate. Failure handling is kind-agnostic
+across LoRAs and textual inversions. A terminal *rejection* (a file the fetch API
+permanently refuses: a LoRA that is invalid, too large, or NSFW on an SFW-only worker;
+a textual inversion the API rejects) is recorded as skipped so the job's auxiliary set
+counts as ready without it and the job dispatches rather than faulting, and a later job
+referencing the same file is neither re-requested nor re-faulted. A rejection arms no
+backoff (it is a property of that one file, not a sick download path). A plain
+*failure* (a transient transfer error) faults the affected pending job promptly (it
+holds no lane or reservation, so nothing in flight is disturbed) and arms that file's
+per-class download backoff, exactly as an inference-side aux failure does: once a class
+incident is active a fresh failure of that class is classified terminal rather than
+requeued into the same failing path.
+
+Each auxiliary class holds its own escalating download backoff. The LoRA backoff also
+gates pop-time LoRA advertising, because the pop request carries an `allow_lora`
+capability flag the worker can withhold. The pop request has no per-request
+textual-inversion capability flag (no textual-inversion analogue to `allow_lora`), so
+the textual-inversion backoff influences fault classification only: it cannot suppress
+textual-inversion traffic at the pop, and the popper's advertising logic gates on the
+LoRA backoff alone.
 
 The worker-wide LoRA-advertising suppression (`background_download_active`, which stops
 new LoRA pops while the download subsystem is transferring) is scoped away from this

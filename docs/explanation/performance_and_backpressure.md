@@ -1228,14 +1228,16 @@ damage a bad download path can do to the jobs that depend on it:
   and short-circuits sooner once the download reports byte progress that stops advancing between expiries,
   so a genuinely wedged transfer still faults on time.
 - **Escalating pop backoff**
-  ([`LoraDownloadBackoff`][horde_worker_regen.process_management.models.lora_download_backoff.LoraDownloadBackoff]):
-  a failed prefetch download (or an expired prefetch deadline) registers a *strike*, once per failed
-  download rather than once per waiting job, and only while at least one requesting job is still
-  pending, so a shared failure or a late result does not compound into several strikes. While a
-  strike's window is active the popper stops advertising LoRA support (folded into `_lora_disk_permits`
-  alongside the disk guard), so the worker stops feeding jobs into a failing download path. The window
-  starts at 60 s and doubles per consecutive strike up to 30 min, then resets after a trouble-free
-  stretch - a brief blip pauses LoRA work briefly, a sustained outage pauses it for a long time.
+  ([`AuxDownloadBackoff`][horde_worker_regen.process_management.models.aux_download_backoff.AuxDownloadBackoff]):
+  a failed prefetch download (or an expired prefetch deadline) registers a *strike* on that file's
+  per-class backoff, once per failed download rather than once per waiting job, and only while at least
+  one requesting job is still pending, so a shared failure or a late result does not compound into several
+  strikes. The LoRA class backoff also gates advertising: while its window is active the popper stops
+  advertising LoRA support (folded into `_lora_disk_permits` alongside the disk guard), so the worker stops
+  feeding jobs into a failing download path. The textual-inversion class backoff has no advertising flag to
+  withhold (the pop request carries no textual-inversion analogue to `allow_lora`), so it influences fault
+  classification only. Each window starts at 60 s and doubles per consecutive strike up to 30 min, then
+  resets after a trouble-free stretch - a brief blip pauses briefly, a sustained outage for a long time.
 - **Concurrent-LoRA cap** (`JobPopper._lora_queue_cap_reached`): independent of any stall, the popper
   withholds LoRA support once the local queue reaches
   `min(2, max(1, inference_processes - 1))` LoRA jobs. The process-relative term preserves at least one

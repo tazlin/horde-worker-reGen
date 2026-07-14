@@ -218,6 +218,31 @@ async def _submit_one_successful_generation(
     await submitter.api_submit_job()
 
 
+async def _fault_one_generation_job_through_submit(
+    tracker: JobTracker,
+    submitter: JobSubmitter,
+) -> None:
+    """Terminally fault one job with generation origin and report it through the real submit path.
+
+    The job is held by the tracker with the default (generation) fault origin and queued for submit in the
+    faulted state, so the submitter's failure-counter logic sees an ordinary generation fault, not a
+    scheduling-recovery or aux-prefetch one.
+    """
+    job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+    await track_popped_job_async(tracker, job, time_popped=0.0)
+    job_info = HordeJobInfo(
+        sdk_api_job_info=job,
+        state=GENERATION_STATE.faulted,
+        censored=None,
+        safety_evaluated=False,
+        time_popped=0.0,
+        time_to_generate=0.0,
+        job_image_results=None,
+    )
+    await queue_job_for_submit_async(tracker, job_info)
+    await submitter.api_submit_job()
+
+
 async def test_aux_prefetch_fault_streak_does_not_pause_pops() -> None:
     """A streak of aux-prefetch faults (a healthy worker, one bad file) must not latch the pop pause.
 
@@ -279,11 +304,15 @@ async def test_aux_prefetch_fault_streak_does_not_kill_worker_under_exit_on_unha
     shutdown_manager.shutdown.assert_not_called()
 
 
-async def test_successful_submits_between_aux_faults_reset_the_streak() -> None:
-    """Ordinary successful generations interleaved with aux faults keep the streak below the pause threshold.
+async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults() -> None:
+    """Aux faults are excluded from the failure counter while ordinary generation faults still count.
 
-    A worker still completing real work between aux faults is demonstrably healthy; each success resets the
-    counter through the production submit path, so the storm never latches the pause.
+    The exclusion must be scoped by fault origin, not blanket: a fault from the auxiliary-prefetch pipeline
+    never reaches the consecutive-failure counter, but a genuine generation-origin fault still increments it
+    (guarding against the widened exclusion swallowing real generation failures). A successful generation
+    resets the counter, and an aux fault interleaved between the generation fault and the success neither
+    increments nor resets it. Across the whole mixed-origin workload the counter never reaches the pause
+    threshold, so no pause latches.
     """
     state = WorkerState()
     tracker = JobTracker()
@@ -296,12 +325,23 @@ async def test_successful_submits_between_aux_faults_reset_the_streak() -> None:
         aiohttp_session=_r2_ok_session(),
     )
 
-    for index in range(3):
-        await _fault_one_ti_job_through_prefetch(tracker, coordinator, f"popular-ti-{index}")
-        await _submit_head_pending_job(submitter)
-        assert state.consecutive_failed_jobs >= 1, "arrange failed: the aux fault did not reach the failure counter"
-        await _submit_one_successful_generation(tracker, submitter)
-        assert state.consecutive_failed_jobs == 0
+    # An aux-prefetch-origin fault is reported through the real submit path but never reaches the counter.
+    await _fault_one_ti_job_through_prefetch(tracker, coordinator, "popular-ti")
+    await _submit_head_pending_job(submitter)
+    assert state.consecutive_failed_jobs == 0
+
+    # A genuine generation-origin fault does increment the counter (the over-exclusion guard).
+    await _fault_one_generation_job_through_submit(tracker, submitter)
+    assert state.consecutive_failed_jobs == 1
+
+    # An aux fault interleaved before the reset neither increments the counter nor clears it.
+    await _fault_one_ti_job_through_prefetch(tracker, coordinator, "another-popular-ti")
+    await _submit_head_pending_job(submitter)
+    assert state.consecutive_failed_jobs == 1
+
+    # A successful generation resets the counter through the production submit path.
+    await _submit_one_successful_generation(tracker, submitter)
+    assert state.consecutive_failed_jobs == 0
 
     popper = _make_popper(state, tracker, bridge_data=make_mock_bridge_data(), shutdown_manager=Mock())
     should_skip = popper._handle_consecutive_failures(make_mock_bridge_data(), time.time())

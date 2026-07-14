@@ -858,7 +858,7 @@ class JobPopper:
         if self._state.lora_disk_exhausted:
             return False
         # Repeated ad-hoc download teardowns withhold LoRA support for an escalating window; popping
-        # more LoRA jobs while the download path is failing only churns slots (see LoraDownloadBackoff).
+        # more LoRA jobs while the download path is failing only churns slots (see AuxDownloadBackoff).
         if self._state.lora_download_backoff.pops_suppressed(time.time()):
             return False
         return not (self._model_availability is not None and self._model_availability.background_download_active)
