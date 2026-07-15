@@ -12,6 +12,7 @@ from loguru import logger
 
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.update_check import NEWER_RELEASE_ENV_VAR
+from horde_worker_regen.utils import get_system_appropriate_updater
 
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, UserDetailsResponse
@@ -524,7 +525,7 @@ class StatusReporter:
         elif newer_release := os.getenv(NEWER_RELEASE_ENV_VAR):
             logger.warning(
                 f"A newer AI Worker release (v{newer_release}) is available. Update with "
-                "'update.cmd'/'update.sh', or re-run the installer (the same install command).",
+                f"'{get_system_appropriate_updater()}', or re-run the installer (the same install command).",
             )
 
         # Extra slow worker warnings

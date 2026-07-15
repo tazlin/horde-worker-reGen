@@ -2478,6 +2478,7 @@ class HordeWorkerProcessManager:
             current_version,
             update_check_disabled,
         )
+        from horde_worker_regen.utils import get_system_appropriate_updater
 
         # This is one of the worker's main-loop tasks, which the loop's done-callback expects to run for the
         # worker's whole lifetime: a task returning while the worker is live is treated as a fatal anomaly and
@@ -2504,7 +2505,7 @@ class HordeWorkerProcessManager:
             else:
                 logger.warning(
                     f"Update available: v{current_version()} -> v{info.latest_version}. Update with "
-                    "'update.cmd'/'update.sh', or by re-running the installer.",
+                    f"'{get_system_appropriate_updater()}', or by re-running the installer.",
                 )
 
     _SERVER_CAPABILITIES_POLL_SECONDS = 5.0

@@ -252,6 +252,7 @@ def _run_release_update_check() -> None:
     status report can re-nag. Any failure is swallowed: an update check must never affect the worker.
     """
     from horde_worker_regen.update_check import apply_update_check_result, check_for_update, current_version
+    from horde_worker_regen.utils import get_system_appropriate_updater
 
     try:
         info = check_for_update()
@@ -262,9 +263,10 @@ def _run_release_update_check() -> None:
     if info is None:
         logger.info(f"Worker v{current_version()} is up to date.")
         return
+
     logger.warning(
         f"Update available: v{current_version()} -> v{info.latest_version}. Update with "
-        "'update.cmd'/'update.sh', or by re-running the installer.",
+        f"'{get_system_appropriate_updater()}', or by re-running the installer.",
     )
 
 

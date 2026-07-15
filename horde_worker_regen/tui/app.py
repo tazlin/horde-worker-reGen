@@ -81,6 +81,7 @@ from horde_worker_regen.tui.widgets.overview_layout import OverviewLayoutModal, 
 from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
+from horde_worker_regen.utils import get_system_appropriate_updater
 
 if TYPE_CHECKING:
     # Imported for annotations only; the modal module is imported lazily at use (its subprocess plumbing
@@ -540,9 +541,10 @@ class HordeWorkerTUI(App[None]):
         self._refresh_title()
         with contextlib.suppress(Exception):
             self.query_one(OverviewView).set_update_available(info)
+
         self.notify(
             f"Update available: v{runtime_version()} -> v{info.latest_version}. Update with "
-            "'update.cmd'/'update.sh', or by re-running the installer.",
+            f"'{get_system_appropriate_updater()}', or by re-running the installer.",
             title="Update available",
             timeout=10,
         )
