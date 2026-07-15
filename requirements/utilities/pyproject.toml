@@ -22,7 +22,7 @@ dependencies = [
     # Accelerator-neutral core of the capability service. The rembg accelerator and torch build come from
     # the per-build extras below. Do NOT add mediapipe: the current release declares an OpenCV wheel
     # conflict between the mediapipe and annotator extras.
-    "horde-image-utilities[server,annotators]==0.2.1",
+    "horde-image-utilities[server,annotators]==0.2.2",
 ]
 
 [project.optional-dependencies]
@@ -30,10 +30,10 @@ dependencies = [
 # (onnxruntime-gpu); cpu takes rembg_cpu. torch/torchvision are listed (unpinned) so [tool.uv.sources] can
 # route them to the matching wheel index per extra; their VERSION is pinned globally by
 # constraint-dependencies below.
-cu126 = ["horde-image-utilities[rembg_cuda]==0.2.1", "torch", "torchvision"]
-cu130 = ["horde-image-utilities[rembg_cuda]==0.2.1", "torch", "torchvision"]
-cu132 = ["horde-image-utilities[rembg_cuda]==0.2.1", "torch", "torchvision"]
-cpu = ["horde-image-utilities[rembg_cpu]==0.2.1", "torch", "torchvision"]
+cu126 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision"]
+cu130 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision"]
+cu132 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision"]
+cpu = ["horde-image-utilities[rembg_cpu]==0.2.2", "torch", "torchvision"]
 
 [tool.uv]
 package = false
