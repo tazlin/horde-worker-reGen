@@ -28,6 +28,13 @@ def test_requirements_file_naming(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("token", ["cu126", "cu130", "cu132", "cpu"])
+def test_repo_has_a_bootstrap_seed_for_every_locked_full_backend(token: str) -> None:
+    """Every full build that wants utilities by default ships a provisionable requirements seed."""
+    root = Path(__file__).parents[2]
+    assert utilities_env.utilities_requirements_file(token=token, root=root).is_file()
+
+
 def test_plan_creates_then_installs_without_hashes(tmp_path: Path) -> None:
     """A plain (un-hashed) pin yields a venv-create then a pip install with no --require-hashes."""
     _write_requirements(tmp_path, "cu126", hashed=False)

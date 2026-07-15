@@ -227,6 +227,25 @@ def test_launch_skips_sync_when_stamp_matches_lock(env: tuple[Path, list]) -> No
     assert calls == [("run", ["horde-worker"])]
 
 
+def test_launch_provisions_utilities_when_main_venv_is_already_current(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch repairs the independent utilities venv even when it can skip the main sync."""
+    root, calls = env
+    _in_sync_venv(root)
+    _write_utilities_pin(root, "cu126")
+    provisioned: list[str] = []
+    monkeypatch.setattr(
+        cli.runner,
+        "provision_utilities",
+        lambda uv, *, backend_token, **kw: provisioned.append(backend_token),
+    )
+
+    assert cli.main(["launch", "terminal"]) == 0
+    assert provisioned == ["cu126"]
+    assert calls == [("run", ["horde-worker"])]
+
+
 def _in_sync_venv(root: Path) -> None:
     """A venv whose recorded sync stamp matches the current lock, so a launch would otherwise skip syncing."""
     _make_venv(root)

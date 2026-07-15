@@ -116,7 +116,7 @@ the utilities venv when:
 1. the resolved feature set is non-empty (the same `HORDE_WORKER_FEATURES` resolution used for the
    worker's own extras: NVIDIA/CPU want it by default, lean backends only when opted in, and `none` opts
    out), **and**
-2. a CI-compiled requirements pin exists for the resolved backend token.
+2. a checked-in requirements seed (or its CI-promoted hashed pin) exists for the resolved backend token.
 
 It creates the venv against the same pinned managed CPython and installs the pin into it, then records a
 stamp (the backend token plus the requirements-file SHA256) so a subsequent sync re-provisions only when
@@ -124,14 +124,17 @@ the pin or backend actually changes. A provisioning failure is non-fatal: the wo
 failure is warned, and the next sync retries it.
 
 **The requirements-file mechanism.** The pins live at `requirements/utilities.<backend_token>.txt` (one
-per locked torch build: `cu126`, `cu130`, `cu132`, `cpu`). Each is a fully-resolved, hashed
-`uv pip compile` output of `horde-image-utilities[server,annotators_<X>,rembg_<X>,mediapipe]` compiled in
-CI; when a pin carries `--hash=` lines the install enforces them with `--require-hashes`. A backend with
-no committed pin simply has nothing to provision yet (the step stays a no-op). See `requirements/README.md`
-for the naming and generation details.
+per locked torch build: `cu126`, `cu130`, `cu132`, `cpu`). A seed pins the service,
+`horde-image-utilities[server,annotators,rembg_<cpu|cuda>]`, and the matching torch/torchvision wheel
+pair so a fresh clone is provisionable. Release CI promotes that seed to a fully-resolved hashed
+`uv pip compile` output; when a pin carries `--hash=` lines the install enforces them with
+`--require-hashes`. A backend with no committed pin has nothing to provision yet (the step stays a no-op).
+See `requirements/README.md` for the naming and promotion details.
 
 **Controls.** `HORDE_WORKER_FEATURES` decides whether it is wanted (as above). To skip it for an emergency
 worker-only install, pass `--skip-utilities` to `sync`/`install` or set `HORDE_WORKER_SKIP_UTILITIES=1`.
+The same ensure step runs on a normal launch whose main `.venv` already matches `uv.lock`, so a developer
+who initially used `uv sync` directly is repaired at the next managed launch.
 
 ### Config coercion (advertised == runnable)
 

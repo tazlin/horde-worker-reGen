@@ -735,7 +735,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     The lane runs from its own virtual environment as a loopback HTTP service, so the native,
     accelerator-gated stack behind ControlNet annotation and background removal never enters the worker's
     main environment. When true, the worker starts and supervises that subprocess as an ordinary child.
-    Default false until the utilities venv is provisioned and the job-flow routing is wired."""
+    Defaults to true; startup remains guarded until the utilities venv is provisioned."""
 
     extended_controlnet: bool = Field(default=True)
     """Operator opt-in to the extended controlnet control types (everything beyond the classic set).

@@ -206,6 +206,32 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
     print("Image-utilities capability venv is ready.")
 
 
+def _ensure_utilities_for_current_backend(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> None:
+    """Ensure the utilities venv after a launch discovers an already-current worker venv.
+
+    A developer can create ``.venv`` with ``uv sync`` directly, and a managed install can retain a
+    matching worker venv while a utilities pin is added in a later release. In either case
+    :func:`_ensure_synced` correctly skips the main sync; it must not also skip the independent
+    image-utilities environment.
+
+    Provisioning stays best-effort: resolution failures and install failures are reported by the normal
+    bootstrap paths, while a worker that does not need the optional lane remains launchable.
+    """
+    token = backend_mod.resolve_backend(
+        cli_flag=cli_flag,
+        env_value=os.environ.get(_BACKEND_ENV),
+        file_value=backend_mod.read_backend_file(paths.backend_file(root)),
+        detected=_detected_backend(root),
+    )
+    if token == detect.AMD_UNSUPPORTED:
+        return
+    token = _reconcile_backend(root, token)
+    try:
+        _maybe_provision_utilities(uv, root, token, options)
+    except ValueError as error:
+        print(f"WARNING: could not resolve image-utilities provisioning: {error}", file=sys.stderr)
+
+
 def _is_headless() -> bool:
     """Return whether this run is non-interactive (no terminal) or consent was captured upstream."""
     return consent.consent_env_var() is not None or not consent.is_interactive()
@@ -570,7 +596,10 @@ def _ensure_synced(uv: str, root: Path, *, cli_flag: str | None, options: _SyncO
     """
     if paths.venv_dir(root).exists() and _venv_matches_lock(root):
         corrective_rc = _ensure_torch_runs_gpu(uv, root, cli_flag=cli_flag, options=options)
-        return 0 if corrective_rc is None else corrective_rc
+        if corrective_rc is not None:
+            return corrective_rc
+        _ensure_utilities_for_current_backend(uv, root, cli_flag=cli_flag, options=options)
+        return 0
     return _sync(uv, root, cli_flag=cli_flag, options=options)
 
 

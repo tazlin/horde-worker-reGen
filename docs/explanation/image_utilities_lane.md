@@ -35,7 +35,8 @@ process loop. A separate-venv subprocess cannot: it does not import the worker's
 The result is that the [process lifecycle](process_lifecycle.md), the process map, the message queue, and
 the dashboard all see a perfectly ordinary child. Job routing keys on the `IMAGE_UTILITIES` capability, not
 on the process type, so the lane is discovered the same way every other lane is. The lane is enabled by the
-`enable_image_utilities` config flag and is off by default.
+`enable_image_utilities` config flag, which defaults to true; the lifecycle still refuses to start it until
+the separate environment has been provisioned.
 
 ### Control verbs
 

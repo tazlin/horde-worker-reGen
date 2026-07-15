@@ -1,4 +1,9 @@
-horde-image-utilities[server,annotators,rembg_cpu]~=0.2.0
-# Resolution guards: without a numba floor the resolver backtracks numba (rembg -> pymatting -> numba)
-# to a pre-3.12 sdist that fails to build; the floor forces a numpy the modern numba accepts.
-numba>=0.60
+# Bootstrap seed for the image-utilities capability venv.
+#
+# This deliberately remains an unhashed input until the release build compiles it into a fully resolved
+# pin. worker_bootstrap accepts this bring-up form without --require-hashes; CI verifies the final pins.
+# Keep torch and torchvision aligned with the worker's cpu extra.
+--extra-index-url https://download.pytorch.org/whl/cpu
+horde-image-utilities[server,annotators,rembg_cpu]==0.2.0
+torch==2.12.1+cpu
+torchvision==0.27.1+cpu
