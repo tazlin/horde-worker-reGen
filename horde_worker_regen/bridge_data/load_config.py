@@ -17,7 +17,7 @@ from loguru import logger
 from ruamel.yaml import YAML
 from strenum import StrEnum
 
-from horde_worker_regen.bridge_data import AIWORKER_REGEN_PREFIX
+from horde_worker_regen.bridge_data import AIWORKER_ENV_PREFIXES, AIWORKER_REGEN_PREFIX
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
@@ -261,23 +261,34 @@ class BridgeDataLoader:
         *,
         horde_model_reference_manager: ModelReferenceManager | None = None,
     ) -> reGenBridgeData:
-        """Checks for AIWORKER_REGEN_* format environment variables and loads the config from them."""
-        config: dict[str, object] = {}
+        """Loads the config from environment variables.
 
-        for key, value in os.environ.items():
-            if key.startswith(AIWORKER_REGEN_PREFIX):
-                # Coverts the env var name to the attr name found in the reGenBridgeData model
-                attr_name = key[len(AIWORKER_REGEN_PREFIX) :].lower()
-                if value.lower() in ("true", "false"):
-                    config[attr_name] = value.lower() == "true"
-                elif any(delimiter in value for delimiter in ["[", ",", ";"]):
-                    if "[" in value and "]" not in value:
-                        raise ValueError(f"Invalid list format for {attr_name}. Missing closing bracket.")
-                    value_as_list = re.split(r"[\[\],;]", value.strip("[]"))
-                    config[attr_name] = [item.strip().strip("'").strip('"') for item in value_as_list]
-                    logger.debug(f"Converted {attr_name} to list: {config[attr_name]} from {value}")
-                else:
-                    config[attr_name] = value
+        Both the documented ``AIWORKER_REGEN_<FIELD>`` prefix and the historical ``AIWORKER_<FIELD>`` prefix
+        are accepted. Each key is matched against its most specific prefix, and the documented form wins when
+        a field is supplied under both.
+        """
+        raw_env: dict[str, str] = {}
+        for prefix in reversed(AIWORKER_ENV_PREFIXES):
+            prefix_length = len(prefix)
+            for key, value in os.environ.items():
+                if not key.startswith(prefix):
+                    continue
+                if any(len(longer) > prefix_length and key.startswith(longer) for longer in AIWORKER_ENV_PREFIXES):
+                    continue
+                raw_env[key[prefix_length:].lower()] = value
+
+        config: dict[str, object] = {}
+        for attr_name, value in raw_env.items():
+            if value.lower() in ("true", "false"):
+                config[attr_name] = value.lower() == "true"
+            elif any(delimiter in value for delimiter in ["[", ",", ";"]):
+                if "[" in value and "]" not in value:
+                    raise ValueError(f"Invalid list format for {attr_name}. Missing closing bracket.")
+                value_as_list = re.split(r"[\[\],;]", value.strip("[]"))
+                config[attr_name] = [item.strip().strip("'").strip('"') for item in value_as_list]
+                logger.debug(f"Converted {attr_name} to list: {config[attr_name]} from {value}")
+            else:
+                config[attr_name] = value
 
         for field_name, field_info in reGenBridgeData.model_fields.items():
             if field_info.alias is not None and field_name in config:
