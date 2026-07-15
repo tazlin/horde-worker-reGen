@@ -158,6 +158,64 @@ def test_transparent_jobs_are_not_disaggregation_eligible() -> None:
     assert pm._disaggregation_class_eligible(opaque_job) is True
 
 
+def test_inpainting_checkpoint_is_not_disaggregation_eligible() -> None:
+    """An inpainting-variant checkpoint routes monolithic; its UNet needs the masked-image input channels.
+
+    The staged sample graph builds a standard txt2img latent, which the inpainting UNet cannot consume, so
+    an inpainting model must run whole. A model whose record does not mark inpainting stays eligible, and a
+    record with no inpainting field at all (incomplete reference data) is treated as not inpainting.
+    """
+    inpainting_model = "SDXL Inpainting"
+    ref = {
+        _MODEL: make_mock_model_reference_record(
+            _MODEL,
+            baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+        ),
+        inpainting_model: make_mock_model_reference_record(
+            inpainting_model,
+            baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+            inpainting=True,
+        ),
+    }
+    pm = make_testable_process_manager(
+        enable_pipeline_disaggregation=True,
+        post_processing_lane_enabled=False,
+        stable_diffusion_reference=ref,  # type: ignore[arg-type]
+    )
+    pm._model_metadata.set_reference(ref)  # type: ignore[arg-type]
+
+    inpainting_job = _make_source_job(
+        source_processing="inpainting",
+        source_image=None,
+        model=inpainting_model,
+    )
+    assert pm._disaggregation_class_eligible(inpainting_job) is False
+
+    # Control: the same unusable-source pop on a non-inpainting checkpoint resolves to txt2img and is eligible.
+    non_inpainting_job = _make_source_job(source_processing="inpainting", source_image=None, model=_MODEL)
+    assert pm._disaggregation_class_eligible(non_inpainting_job) is True
+
+
+def test_record_without_inpainting_field_stays_eligible() -> None:
+    """A record whose inpainting field is absent/``None`` (incomplete data) is not excluded from the class."""
+    ref = {
+        _MODEL: make_mock_model_reference_record(
+            _MODEL,
+            baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            inpainting=None,
+        ),
+    }
+    pm = make_testable_process_manager(
+        enable_pipeline_disaggregation=True,
+        post_processing_lane_enabled=False,
+        stable_diffusion_reference=ref,  # type: ignore[arg-type]
+    )
+    pm._model_metadata.set_reference(ref)  # type: ignore[arg-type]
+
+    job = _make_source_job(source_processing="txt2img", source_image=None, model=_MODEL)
+    assert pm._disaggregation_class_eligible(job) is True
+
+
 @pytest.mark.asyncio
 async def test_mislabeled_img2img_registers_at_conditioning_stage_without_source_latent() -> None:
     """A pop tagged img2img with no source image routes needs_source_latent=False and enters at conditioning."""

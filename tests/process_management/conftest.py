@@ -532,6 +532,7 @@ def make_mock_model_reference_record(
     description: str = "A test model",
     baseline: KNOWN_IMAGE_GENERATION_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
     nsfw: bool = False,
+    inpainting: bool | None = False,
 ) -> ImageGenerationModelRecord:
     """Create a mock ImageGenerationModelRecord with the given name."""
     return ImageGenerationModelRecord(
@@ -539,6 +540,7 @@ def make_mock_model_reference_record(
         baseline=baseline,
         nsfw=nsfw,
         description=description,
+        inpainting=inpainting,
     )
 
 

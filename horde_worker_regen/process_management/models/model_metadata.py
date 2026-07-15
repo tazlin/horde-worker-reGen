@@ -61,3 +61,17 @@ class ModelMetadata:
         if record is None:
             return None
         return record.baseline
+
+    def is_inpainting(self, model_name: str) -> bool:
+        """Return whether ``model_name``'s record marks it an inpainting-variant checkpoint.
+
+        An inpainting checkpoint's UNet takes the masked-image-plus-mask input channels, so it cannot run
+        the standard txt2img graph a disaggregated sample stage builds. A missing record or an absent/``None``
+        inpainting field is reported as not inpainting, so incomplete reference data never excludes a model.
+        """
+        if self._reference is None:
+            return False
+        record = self._reference.get(model_name)
+        if record is None:
+            return False
+        return bool(record.inpainting)
