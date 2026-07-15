@@ -614,6 +614,10 @@ class WorkerRecoveryCoordinator:
         is_wedged = self.assess_wedge()
         made_progress = self.made_progress_since_episode()
         head_recovery_in_flight = self._head_recovery_in_flight()
+        # A replacement child that is alive and still booting is capacity in flight: give-up must not fault the
+        # jobs the finishing boot will serve. The liveness-aware count excludes a child that died mid-boot (it
+        # still reports PROCESS_STARTING until reaped), so a dead boot does not hold the give-up backstop.
+        boot_in_progress = self._process_map.num_starting_processes_alive() > 0
         if self.is_inference_pool_unrecoverable() or self.is_safety_pool_unrecoverable():
             self.episode_saw_unrecoverable_pool = True
         if self.episode_saw_unrecoverable_pool:
@@ -626,6 +630,7 @@ class WorkerRecoveryCoordinator:
             pool_ready=self.is_inference_pool_ready(),
             made_progress=made_progress,
             head_recovery_in_flight=head_recovery_in_flight,
+            boot_in_progress=boot_in_progress,
         )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:

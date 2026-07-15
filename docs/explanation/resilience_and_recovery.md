@@ -8,6 +8,7 @@
     - [Stranded safety-check jobs](#stranded-safety-check-jobs)
     - [Stranded post-processing jobs](#stranded-post-processing-jobs)
     - [Layer 3: save-our-ship (SOS) escalation](#layer-3-save-our-ship-sos-escalation)
+    - [The background download process](#the-background-download-process)
     - [The action ledger](#the-action-ledger)
     - [The owned-PID registry](#the-owned-pid-registry)
     - [Fault injection and chaos testing](#fault-injection-and-chaos-testing)
@@ -191,8 +192,9 @@ manager-side **actions**:
   is the policy. It tracks how long the worker has been wedged, whether its
   rebuilt pool has become ready, and returns a
   [`RecoveryAction`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoveryAction].
-  Keeping it pure (it takes a wedge boolean, a pool-ready boolean, and a clock)
-  makes the escalation timing unit-testable with a fake clock.
+  Keeping it pure (it takes wedge, pool-ready, and live-boot-in-progress booleans
+  and a clock, reading no process map or dispatcher itself) makes the escalation
+  timing unit-testable with a fake clock.
 - [`WorkerRecoveryCoordinator`][horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator.WorkerRecoveryCoordinator]
   owns the wedge **assessment** and the **actions**; `HordeWorkerProcessManager` calls it directly from the control loop. `assess_wedge()` decides the worker is wedged only on definitive signals: every
   inference slot quarantined, the safety pool crash-looping with no healthy
@@ -201,7 +203,15 @@ manager-side **actions**:
   between jobs), or a recurring [orphaned-job](#stranded-in-progress-jobs) punt
   storm. A busy, slow, replacing, or model-loading worker is never wedged, and a
   queue deliberately held while a heavy model establishes whole-card residency is
-  excused by a bounded grace. The same grace covers lifecycle's deferred
+  excused by a bounded grace. A pending job whose
+  [auxiliary prefetch](model_downloads.md#job-driven-auxiliary-prefetch) is still
+  in flight is likewise excused: it holds no inference lane by design while its
+  LoRAs or textual inversions download, so the deadlock detector excludes it from
+  both the queue- and general-deadlock conditions rather than reading "pending plus
+  every process idle" as a wedge. That exclusion is bounded by the coordinator's
+  per-job prefetch deadline, so a genuinely stalled download stops shielding the
+  queue the moment its deadline lapses (and the job then faults or fuels detection
+  as any other stuck job would). The same grace covers lifecycle's deferred
   GPU-process starts: a slot killed for recovery or RAM reclamation may be absent
   from `ProcessMap` while its respawn waits for device-free headroom, but SOS
   treats that as recoverable capacity while the wait is young or free-VRAM
@@ -273,9 +283,17 @@ The escalation, in order:
    while the pool is still booting: give-up fires only once an inference lane has
    reached an accepting state (`is_inference_pool_ready()`, the same accepting-state
    fact whose absence the queue-deadlock detector reports as "some processes are
-   starting. Waiting.") *and* the wedge has then persisted for a further grace. A
-   pool whose children never come up is bounded by a boot allowance so give-up is
-   still reachable. Give-up is also **latched once per cycle** (repeat wedged ticks
+   starting. Waiting.") *and* the wedge has then persisted for a further grace. Two
+   backstops bound the boot so a pool that never comes up still escalates: a boot
+   **allowance** for an *absent* boot (no replacement child is alive and
+   progressing), and a larger boot **hard cap** for a *hung* boot. While a
+   replacement child is alive and still `PROCESS_STARTING` (the coordinator passes a
+   liveness-aware `boot_in_progress` fact, so a child that died mid-boot does not
+   count), the allowance is suppressed up to the hard cap: a merely slow-but-healthy
+   boot has been observed to outlast the allowance yet still succeed, and faulting
+   there would drop the very jobs the finishing boot serves. Past the hard cap even a
+   still-live boot is deemed hung and the allowance applies again, so a permanently
+   stuck boot still escalates. Give-up is also **latched once per cycle** (repeat wedged ticks
    are no-ops, so the ledger is not spammed), and its `recovery_abandoned` ledger
    record is written only when the pass actually did something (faulted at least
    one job, or made a terminal abort decision), never a `jobs_faulted=0` no-op. If
@@ -353,6 +371,41 @@ complement that keeps the breaker from being needed in the first place: its
 fixed resident footprint replaces the transient per-job peak that caused the
 over-commits.
 
+## The background download process
+
+The singleton [download process](model_downloads.md) lives **outside** the process
+map: it serves no jobs, so the Layer 2 hung-process sweep deliberately never
+touches it. That exclusion leaves a gap the parent closes separately, because a
+hard termination of the downloader mid-fetch is otherwise invisible: nothing reads
+its liveness, and its last status snapshot stays frozen, forever reporting a
+transfer that will never complete.
+
+A liveness sweep on the periodic loop detects when the owned download process is
+no longer alive. On the first tick that sees the death it reports it once (with
+the exit code), forgets the corpse, and restarts the process, bounded as a
+crash-loop: at most three automatic restarts in a rolling ten-minute window. Past
+the bound the loss is reported once and the process is left down until an operator
+revives it (see below), rather than spinning restarts forever.
+
+Two knock-on effects follow the death immediately, so a frozen snapshot can never
+strand work:
+
+- The [auxiliary-prefetch](model_downloads.md#job-driven-auxiliary-prefetch)
+  in-flight view yields nothing while the downloader is dead, so a job's prefetch
+  deadline faults on its **first** budget instead of deferring against a process
+  that can no longer make progress. On a restart the coordinator's deadlines are
+  reset, so each still-pending auxiliary job is re-requested against the fresh
+  downloader within a single download-timeout budget rather than waiting out the
+  full deferral cap.
+- LoRA and auxiliary feature advertising is withheld while no downloader exists:
+  with nothing able to place a job's LoRAs or textual inversions on disk, offering
+  the capability would only pop work the worker cannot serve.
+
+An operator can force a revival of a dead or stuck downloader with the
+`RESTART_PROCESS` supervisor command targeting the download process id, which
+routes to the dedicated download-restart path (the command otherwise addresses
+inference slots).
+
 ## The action ledger
 
 [`ActionLedger`][horde_worker_regen.process_management.ipc.action_ledger.ActionLedger]
@@ -390,6 +443,17 @@ still match. The file lives at `.horde_worker_regen/owned_pids.json`; reads neve
 raise and writes are atomic, so it can never block startup. An `atexit` handler
 (`_kill_owned_children_on_exit`) is the in-process backstop for the cases that do
 unwind cleanly.
+
+That same handler also **detaches the parent's status-queue feeder** before
+multiprocessing's own exit finalizers run. The parent both owns and (through the
+in-parent image-utilities lane adapter) produces to the single cross-process status
+queue, which spins up a feeder thread. Once the parent stops draining that queue at
+teardown, a feeder mid-send toward a child whose read end is already gone would
+block indefinitely, and multiprocessing's own atexit join of that feeder has no
+timeout: the whole exit hangs until an external watchdog force-kills the tree.
+Cancelling the feeder's join (the buffered bytes are never read again once the
+parent is exiting) makes shutdown bounded. The same detach runs at the end of a
+forced hard-kill, so both the clean and the aborted exit paths are covered.
 
 ## Fault injection and chaos testing
 

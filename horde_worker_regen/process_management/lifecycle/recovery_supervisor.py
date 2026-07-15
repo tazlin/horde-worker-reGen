@@ -19,8 +19,12 @@ time booting (importing torch) before they can accept a job. During that boot wi
 "alive" (the replacement processes exist) but is not yet *ready* (no lane has reached an accepting
 state). Escalating to give-up in that window faults jobs the just-rebuilt pool was about to serve. So
 the give-up clock does not advance while the pool is still booting: give-up may fire only once the pool
-has reached an accepting state (or a bounded boot allowance has elapsed for a pool that never does) and
-the wedge has then persisted for a further grace. The manager supplies the readiness fact each tick.
+has reached an accepting state (or a boot backstop has elapsed) and the wedge has then persisted for a
+further grace. Two backstops bound the boot so a pool that never comes up still escalates: a boot
+*allowance* for an absent boot (no live child progressing), and a larger boot *hard cap* for a hung boot
+(a child alive and still booting but never accepting). While a replacement child is alive and booting the
+allowance is suppressed up to the hard cap, so a merely slow-but-healthy boot is not cut off. The manager
+supplies the readiness fact and whether a live boot is in progress each tick.
 
 This module is *only the policy*: it tracks how long the worker has been wedged, whether its pool is
 ready, and returns an action. The manager owns the wedge assessment (what "wedged" means in terms of
@@ -34,6 +38,8 @@ import enum
 import math
 import time
 from collections.abc import Callable
+
+from loguru import logger
 
 _DEFAULT_WEDGE_GRACE_SECONDS = 1.5
 """How long a wedge must persist continuously before the first soft reset, to ride out brief blips."""
@@ -56,13 +62,24 @@ about to drain the queue" (the wedge clears within a tick or two of readiness, s
 satisfied) from "the pool is ready and the work still cannot move" (a genuine structural wedge)."""
 
 _DEFAULT_BOOT_ALLOWANCE_SECONDS = 30.0
-"""Bounded time a rebuilt pool may spend not-yet-ready before it is treated as ready for escalation.
+"""Backstop for an *absent* boot: how long a pool with no live booting child may sit not-yet-ready.
 
 A pool whose replacement children come up healthy reaches an accepting state well within this window, so
-the allowance never gates it (the accepting-state signal fires first). The allowance exists only to bound
-the pathological case where children never leave PROCESS_STARTING (a child wedged importing torch): give-up
-would otherwise be held off forever. Set comfortably above the observed replacement boot time so a merely
-slow boot is not cut off (a boot that eventually succeeds clears the wedge and give-up never fires anyway)."""
+the allowance never gates it (the accepting-state signal fires first). The allowance exists to bound the
+case where no replacement child is progressing at all (none ever entered PROCESS_STARTING, or the one that
+did has died) so give-up stays reachable. It is deliberately *not* the bound for a child that is still
+alive and booting: a live-but-slow boot can outlast this allowance yet still succeed, and faulting there
+would drop the very jobs the finishing boot serves. A live boot suppresses this allowance up to the
+separate boot hard cap below."""
+
+_DEFAULT_BOOT_HARD_CAP_MULTIPLE = 4.0
+"""Boot hard cap default, as a multiple of the boot allowance, when no explicit cap is given.
+
+The hard cap is the backstop for a *hung* boot: a replacement child that stays alive and PROCESS_STARTING
+but never reaches an accepting state. While a live boot is in progress the ordinary boot allowance is held
+off (a slow-but-healthy boot must not be cut short), so a second, larger bound is needed or a permanently
+hung boot would defer give-up forever. Defaulted generously above observed healthy replacement boot times
+(which have reached well past the allowance) so only a genuinely stuck boot trips it."""
 
 _DEFAULT_GIVE_UP_COOLDOWN_SECONDS = 10.0
 """Cool-down after a give-up before one further soft-reset cycle is permitted for a still-persisting wedge.
@@ -107,10 +124,18 @@ class RecoverySupervisor:
 
     Drive it once per control-loop tick with :meth:`evaluate`, passing whether the worker is currently
     wedged (pending work it structurally cannot make progress on), whether its inference pool is ready
-    (a lane has reached an accepting state), and whether accepted work has moved forward since the most
-    recent soft reset. The returned :class:`RecoveryAction` tells the manager what to do; :attr:`limp_by_level`
-    is the number of soft resets done in the current cycle (an escalation counter, not a settings reduction);
-    :attr:`give_up_is_terminal` marks the give-up that should abandon ship.
+    (a lane has reached an accepting state), whether accepted work has moved forward since the most recent
+    soft reset, and whether a replacement child is still alive and booting. The returned
+    :class:`RecoveryAction` tells the manager what to do; :attr:`limp_by_level` is the number of soft resets
+    done in the current cycle (an escalation counter, not a settings reduction); :attr:`give_up_is_terminal`
+    marks the give-up that should abandon ship.
+
+    Give-up readiness has two backstops, not one. The **boot allowance** bounds an *absent* boot (no live
+    child is progressing) so a pool that never comes up still escalates. The **boot hard cap** bounds a
+    *hung* boot: while a replacement child is alive and still booting the allowance is suppressed (a slow but
+    healthy boot must not be faulted), and the hard cap is the larger bound past which even a live-but-stuck
+    boot lets the allowance apply again. Both are backstops; a boot that actually completes clears the wedge
+    and give-up never fires.
 
     Progress, not merely a quiet wedge signal, ends an escalation. Once a soft reset has been attempted the
     counter resets only when the clean streak is backed by real forward progress, so a pool that keeps
@@ -125,17 +150,40 @@ class RecoverySupervisor:
         max_soft_resets: int = _DEFAULT_MAX_SOFT_RESETS,
         pool_ready_grace_seconds: float = _DEFAULT_POOL_READY_GRACE_SECONDS,
         boot_allowance_seconds: float = _DEFAULT_BOOT_ALLOWANCE_SECONDS,
+        boot_hard_cap_seconds: float | None = None,
         give_up_cooldown_seconds: float = _DEFAULT_GIVE_UP_COOLDOWN_SECONDS,
         max_give_up_cycles: int = _DEFAULT_MAX_GIVE_UP_CYCLES,
         clean_streak_seconds: float = _DEFAULT_CLEAN_STREAK_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Initialize the supervisor's thresholds and (injectable) clock."""
+        """Initialize the supervisor's thresholds and (injectable) clock.
+
+        Args:
+            wedge_grace_seconds: How long a wedge must persist before the first soft reset.
+            reset_interval_seconds: Minimum spacing between soft resets.
+            max_soft_resets: Soft resets attempted in one cycle before give-up becomes eligible.
+            pool_ready_grace_seconds: How long the wedge must persist after the pool is ready before give-up.
+            boot_allowance_seconds: Backstop for an *absent* boot (no live booting child) before the pool is
+                treated as ready for escalation. Suppressed while a live boot is in flight (see
+                ``boot_hard_cap_seconds``).
+            boot_hard_cap_seconds: Backstop for a *hung* boot: the larger bound past which a still-live but
+                never-completing boot stops suppressing the allowance, so give-up stays reachable. Defaults to
+                ``boot_allowance_seconds`` times :data:`_DEFAULT_BOOT_HARD_CAP_MULTIPLE` when not given.
+            give_up_cooldown_seconds: Cool-down before a continuation soft-reset cycle is permitted.
+            max_give_up_cycles: Give-ups permitted in one episode before the escalation is terminal.
+            clean_streak_seconds: Continuous non-wedge time (with progress) required to end an episode.
+            clock: Injectable monotonic clock.
+        """
         self._wedge_grace_seconds = wedge_grace_seconds
         self._reset_interval_seconds = reset_interval_seconds
         self._max_soft_resets = max(0, max_soft_resets)
         self._pool_ready_grace_seconds = pool_ready_grace_seconds
         self._boot_allowance_seconds = boot_allowance_seconds
+        self._boot_hard_cap_seconds = (
+            boot_hard_cap_seconds
+            if boot_hard_cap_seconds is not None
+            else _DEFAULT_BOOT_HARD_CAP_MULTIPLE * boot_allowance_seconds
+        )
         self._give_up_cooldown_seconds = give_up_cooldown_seconds
         self._max_give_up_cycles = max(1, max_give_up_cycles)
         self._clean_streak_seconds = clean_streak_seconds
@@ -159,6 +207,8 @@ class RecoverySupervisor:
         self._gave_up_at: float | None = None
         self._give_up_cycles = 0
         self._give_up_is_terminal = False
+        # Edge latch so the live-boot give-up deferral is logged once per hold engagement, not every tick.
+        self._boot_hold_deferral_logged = False
 
     @property
     def limp_by_level(self) -> int:
@@ -192,6 +242,7 @@ class RecoverySupervisor:
         self._gave_up_at = None
         self._give_up_cycles = 0
         self._give_up_is_terminal = False
+        self._boot_hold_deferral_logged = False
 
     def yield_give_up(self) -> None:
         """Un-count the give-up just returned because the caller deferred it to an in-flight remedy.
@@ -216,6 +267,7 @@ class RecoverySupervisor:
         pool_ready: bool,
         made_progress: bool = False,
         head_recovery_in_flight: bool = False,
+        boot_in_progress: bool = False,
     ) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 
@@ -224,7 +276,7 @@ class RecoverySupervisor:
                 (no live process of the kind the pending work needs, or a sustained structural deadlock).
             pool_ready: Whether the inference pool has reached an accepting state (a lane can take a job).
                 False while a just-rebuilt pool's replacement children are still booting; the give-up clock
-                does not advance until this is True or the bounded boot allowance has elapsed.
+                does not advance until this is True or a boot backstop (allowance/hard cap) has elapsed.
             made_progress: Whether accepted work has moved forward (a job completed, an inference started, or
                 post-processing advanced) since the most recent soft reset. Gates the episode close once a soft
                 reset has been spent: the clean streak alone cannot reset the escalation counter, because a
@@ -236,6 +288,13 @@ class RecoverySupervisor:
                 loading is capacity in flight, not a wedge over a healthy pool, so the ready-wedged give-up
                 anchor is held while this is True: give-up must not fault a job the pool is loading. The caller
                 bounds this by the preload budget, so a load that never lands still anchors and escalates.
+            boot_in_progress: Whether a replacement child is alive and still booting (state PROCESS_STARTING
+                with a live OS process). A live boot is capacity in flight, so it suppresses the boot
+                *allowance* backstop: the allowance would otherwise treat a merely slow-but-healthy boot as
+                ready and fault the jobs the finishing boot serves. The suppression is bounded by the boot
+                hard cap, past which even a still-live boot is deemed hung and the allowance applies again, so
+                a permanently stuck boot still escalates. A dead boot must report False here (the caller uses a
+                liveness-aware count) so it does not hold give-up. Defaults to False for an unwired caller.
         """
         now = self._clock()
         self._give_up_is_terminal = False
@@ -271,12 +330,33 @@ class RecoverySupervisor:
         if self._episode_start is None:
             return RecoveryAction.NONE
 
-        # The pool counts as ready for escalation once a lane is accepting, or once a bounded boot allowance
-        # has elapsed since it last began rebuilding (so a pool whose children never come up still terminates).
-        boot_allowance_elapsed = (
-            self._pool_rebuilt_at is not None and (now - self._pool_rebuilt_at) >= self._boot_allowance_seconds
-        )
+        # The pool counts as ready for escalation once a lane is accepting, or once a boot backstop has
+        # elapsed since it last began rebuilding (so a pool whose boot never lands still terminates). There are
+        # two backstops: the allowance bounds an *absent* boot (no live child progressing), and the larger hard
+        # cap bounds a *hung* boot. While a replacement child is alive and still booting the allowance is
+        # suppressed up to the hard cap: a slow-but-healthy boot can outlast the allowance yet still succeed,
+        # and faulting there drops the jobs the finishing boot serves. Past the hard cap even a still-live boot
+        # is deemed hung, so the allowance applies again and a permanently stuck boot escalates.
+        boot_elapsed = 0.0 if self._pool_rebuilt_at is None else now - self._pool_rebuilt_at
+        boot_hard_cap_reached = self._pool_rebuilt_at is not None and boot_elapsed >= self._boot_hard_cap_seconds
+        live_boot_holds = boot_in_progress and not boot_hard_cap_reached
+        boot_allowance_reached = self._pool_rebuilt_at is not None and boot_elapsed >= self._boot_allowance_seconds
+        boot_allowance_elapsed = boot_allowance_reached and not live_boot_holds
         effective_ready = pool_ready or boot_allowance_elapsed
+
+        # Edge-triggered: log once when a live boot first suppresses an allowance that would otherwise have
+        # marked the pool ready for give-up, so the deferral is visible without a per-tick repeat.
+        if is_wedged and live_boot_holds and boot_allowance_reached:
+            if not self._boot_hold_deferral_logged:
+                logger.info(
+                    "Save-our-ship: deferring give-up while a replacement child is still alive and booting "
+                    f"(boot elapsed {boot_elapsed:.0f}s, allowance {self._boot_allowance_seconds:.0f}s, hard "
+                    f"cap {self._boot_hard_cap_seconds:.0f}s). The finishing boot is expected to serve the "
+                    "queued work rather than have it faulted.",
+                )
+                self._boot_hold_deferral_logged = True
+        else:
+            self._boot_hold_deferral_logged = False
 
         # A ready lane whose head-of-queue model is still materialising is capacity in flight, not a wedge
         # over a healthy pool: hold the ready-wedged anchor so give-up cannot fault a job the pool is loading.

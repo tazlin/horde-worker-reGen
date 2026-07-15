@@ -889,6 +889,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
+    def num_starting_processes_alive(self) -> int:
+        """Return the number of processes that are booting *and* demonstrably alive.
+
+        Unlike :meth:`num_starting_processes`, a slot counts here only when its OS process is still alive
+        (``is_process_alive()``): a child that died mid-boot still reports ``PROCESS_STARTING`` until it is
+        reaped, but it is not booting capacity. Callers that treat a live boot as a reason to wait (rather
+        than escalate) must use this liveness-aware count so a dead boot is not mistaken for one in flight.
+        """
+        count = 0
+        for p in self.values():
+            if p.last_process_state == HordeProcessState.PROCESS_STARTING and p.is_process_alive():
+                count += 1
+        return count
+
     def keep_single_inference(
         self,
         *,
