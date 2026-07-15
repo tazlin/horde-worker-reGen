@@ -608,8 +608,8 @@ class ModelPickerModal(ModalScreen[ModelPickerResult | list[str] | None]):
             self._on_clear_marks_confirmed,
         )
 
-    def _on_clear_marks_confirmed(self, confirmed: bool) -> None:
-        """Clear marks only after confirmation."""
+    def _on_clear_marks_confirmed(self, confirmed: bool | None) -> None:
+        """Clear marks only after confirmation. A dismissed modal delivers None, treated as not confirmed."""
         if confirmed:
             self._clear_marks()
 

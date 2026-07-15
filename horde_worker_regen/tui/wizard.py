@@ -32,7 +32,7 @@ from textual.widgets import Button, Input, Static
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
 from horde_worker_regen.tui.horde_validation import AdvisoryStatus, check_worker_name_available, verify_api_key
 from horde_worker_regen.tui.model_catalog import MetaKind, build_meta_instruction, is_meta_instruction
-from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal
+from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal, ModelPickerResult
 
 DEFAULT_API_KEY = "0000000000"
 """The placeholder key shipped in bridgeData_template.yaml; treated as "not set"."""
@@ -510,8 +510,10 @@ class SetupWizardModal(ModalScreen["WizardOutcome | None"]):
         exclude = {name for name in self._models if not is_meta_instruction(name)}
         self.app.push_screen(ModelPickerModal(exclude=exclude), self._on_models_chosen)
 
-    def _on_models_chosen(self, chosen: list[str] | None) -> None:
+    def _on_models_chosen(self, chosen: ModelPickerResult | list[str] | None) -> None:
         """Apply the picker result, keeping any existing meta commands alongside picked models."""
+        if isinstance(chosen, ModelPickerResult):
+            chosen = chosen.add
         if not chosen:
             return
         metas = [name for name in self._models if is_meta_instruction(name)]

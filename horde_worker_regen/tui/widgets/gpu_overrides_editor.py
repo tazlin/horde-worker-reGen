@@ -608,7 +608,9 @@ class GpuOverridesEditor(Vertical):
         with contextlib.suppress(Exception):
             raw_threshold = self.query_one("#gpucfg-gpu_pop_balance_threshold", Input).value
             try:
-                threshold = float(coerce_value(_POP_BALANCE_FIELD, raw_threshold))
+                coerced_threshold = coerce_value(_POP_BALANCE_FIELD, raw_threshold)
+                if isinstance(coerced_threshold, int | float):
+                    threshold = float(coerced_threshold)
             except ValueError as error:
                 errors.append((_POP_BALANCE_FIELD, str(error)))
 

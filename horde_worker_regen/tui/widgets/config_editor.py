@@ -12,6 +12,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Checkbox,
@@ -533,7 +534,7 @@ class ConfigEditorView(Vertical):
             )
         elif field.kind in (FieldKind.STR_LIST, FieldKind.YAML):
             text = format_yaml_value(value) if field.kind is FieldKind.YAML else "\n".join(str(item) for item in value)
-            children: list[object] = [
+            children: list[Widget] = [
                 Label(label_text),
                 Static(field.help, classes="config-help"),
                 TextArea(text=text, id=widget_id),
@@ -964,8 +965,9 @@ class ConfigEditorView(Vertical):
         if field is None:
             return
         if field.kind is FieldKind.MODEL_LIST:
+            items = value if isinstance(value, list) else []
             with contextlib.suppress(Exception):
-                self.query_one(f"#mle-root-{key}", ModelListEditor).set_values([str(item) for item in value])
+                self.query_one(f"#mle-root-{key}", ModelListEditor).set_values([str(item) for item in items])
             return
         if field.kind is FieldKind.SELECT_MULTI:
             selected = {str(item) for item in value} if isinstance(value, list) else {str(value)}
@@ -979,9 +981,11 @@ class ConfigEditorView(Vertical):
         elif isinstance(widget, Select):
             widget.value = str(value)
         elif isinstance(widget, TextArea):
-            widget.text = (
-                format_yaml_value(value) if field.kind is FieldKind.YAML else "\n".join(str(item) for item in value)
-            )
+            if field.kind is FieldKind.YAML:
+                widget.text = format_yaml_value(value)
+            else:
+                items = value if isinstance(value, list) else []
+                widget.text = "\n".join(str(item) for item in items)
         elif isinstance(widget, Input):
             widget.value = "" if value is None else str(value)
 
@@ -1104,7 +1108,8 @@ class ConfigEditorView(Vertical):
         else:
             role = "nothing enabled"
 
-        load_rules = [str(item) for item in state.get(MODELS_TO_LOAD_KEY, []) or []]
+        raw_load = state.get(MODELS_TO_LOAD_KEY)
+        load_rules = [str(item) for item in raw_load] if isinstance(raw_load, list) else []
         model_text = "default TOP 2" if not load_rules else ", ".join(load_rules[:2])
         if len(load_rules) > 2:
             model_text += f" +{len(load_rules) - 2}"
@@ -1182,8 +1187,11 @@ class ConfigEditorView(Vertical):
     @staticmethod
     def _state_int(state: dict[str, object], key: str, default: int) -> int:
         """Read an int-ish value from live state."""
+        raw = state.get(key, default) or default
+        if not isinstance(raw, int | float | str):
+            return default
         try:
-            return int(state.get(key, default) or default)
+            return int(raw)
         except (TypeError, ValueError):
             return default
 

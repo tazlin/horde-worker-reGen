@@ -283,8 +283,8 @@ class ModelListEditor(Vertical):
             self._on_clear_confirmed,
         )
 
-    def _on_clear_confirmed(self, confirmed: bool) -> None:
-        """Clear only after confirmation."""
+    def _on_clear_confirmed(self, confirmed: bool | None) -> None:
+        """Clear only after confirmation. A dismissed modal delivers None, treated as not confirmed."""
         if confirmed:
             self.set_values([])
 
