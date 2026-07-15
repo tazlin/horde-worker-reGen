@@ -19,6 +19,7 @@ conflicts = [[
 [manifest]
 constraints = [
     { name = "numba", specifier = ">=0.60" },
+    { name = "onnxruntime-gpu", specifier = "==1.27.0" },
     { name = "torch", specifier = "==2.12.1" },
     { name = "torchvision", specifier = "==0.27.1" },
 ]
@@ -570,7 +571,8 @@ rembg-cpu = [
     { name = "rembg", extra = ["cpu"], marker = "extra == 'extra-22-horde-worker-utilities-cpu' or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
 ]
 rembg-cuda = [
-    { name = "onnxruntime-gpu" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/" }, marker = "extra == 'extra-22-horde-worker-utilities-cu126' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132')" },
     { name = "rembg", extra = ["gpu"], marker = "extra == 'extra-22-horde-worker-utilities-cu126' or extra == 'extra-22-horde-worker-utilities-cu130' or extra == 'extra-22-horde-worker-utilities-cu132'" },
 ]
 server = [
@@ -595,16 +597,19 @@ cpu = [
 ]
 cu126 = [
     { name = "horde-image-utilities", extra = ["rembg-cuda"], marker = "extra == 'extra-22-horde-worker-utilities-cu126' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/" } },
     { name = "torch", version = "2.12.1+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" } },
     { name = "torchvision", version = "0.27.1+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" } },
 ]
 cu130 = [
     { name = "horde-image-utilities", extra = ["rembg-cuda"], marker = "extra == 'extra-22-horde-worker-utilities-cu130' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra != 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://pypi.org/simple" } },
     { name = "torch", version = "2.12.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
     { name = "torchvision", version = "0.27.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
 ]
 cu132 = [
     { name = "horde-image-utilities", extra = ["rembg-cuda"], marker = "(extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://pypi.org/simple" } },
     { name = "torch", version = "2.12.1+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" } },
     { name = "torchvision", version = "0.27.1+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" } },
 ]
@@ -616,6 +621,9 @@ requires-dist = [
     { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu130'", specifier = "==0.2.2" },
     { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu132'", specifier = "==0.2.2" },
     { name = "horde-image-utilities", extras = ["server", "annotators"], specifier = "==0.2.2" },
+    { name = "onnxruntime-gpu", marker = "extra == 'cu126'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/", conflict = { package = "horde-worker-utilities", extra = "cu126" } },
+    { name = "onnxruntime-gpu", marker = "extra == 'cu130'" },
+    { name = "onnxruntime-gpu", marker = "extra == 'cu132'" },
     { name = "torch", marker = "extra == 'cpu'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "horde-worker-utilities", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu126'", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "horde-worker-utilities", extra = "cu126" } },
     { name = "torch", marker = "extra == 'cu130'", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "horde-worker-utilities", extra = "cu130" } },
@@ -1433,12 +1441,27 @@ wheels = [
 [[package]]
 name = "onnxruntime-gpu"
 version = "1.27.0"
+source = { registry = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/" }
+dependencies = [
+    { name = "flatbuffers", marker = "extra == 'extra-22-horde-worker-utilities-cu126' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-22-horde-worker-utilities-cu126' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "packaging", marker = "extra == 'extra-22-horde-worker-utilities-cu126' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "protobuf", marker = "extra == 'extra-22-horde-worker-utilities-cu126' or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+]
+wheels = [
+    { url = "https://aiinfra.pkgs.visualstudio.com/2692857e-05ef-43b4-ba9c-ccf1c22c437c/_packaging/9387c3aa-d9ad-4513-968c-383f6f7f53b8/pypi/download/onnxruntime-gpu/1.27/onnxruntime_gpu-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:152a422eda304b6c24c28fca5613544763937bd77918d7b3ce4a49d563d8a4c5" },
+    { url = "https://aiinfra.pkgs.visualstudio.com/2692857e-05ef-43b4-ba9c-ccf1c22c437c/_packaging/9387c3aa-d9ad-4513-968c-383f6f7f53b8/pypi/download/onnxruntime-gpu/1.27/onnxruntime_gpu-1.27.0-cp312-cp312-win_amd64.whl", hash = "sha256:2fd30cb4efb10ebe5fae7d9dad7a40cd7f87ee5dbde76bffe0a5b34ba19283eb" },
+]
+
+[[package]]
+name = "onnxruntime-gpu"
+version = "1.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "flatbuffers" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "packaging" },
-    { name = "protobuf" },
+    { name = "flatbuffers", marker = "(extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "packaging", marker = "(extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "protobuf", marker = "(extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra != 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/23/9b/2f31fa1d95dbe4e16522d76ec4d6db7f05ae7fb2c59f40bac414203aa0f8/onnxruntime_gpu-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b2b8d6afabf3c23c2c698639a16388816dc7298f388a9ddddf504b283990ea01", size = 220305746, upload-time = "2026-06-18T18:27:22.319Z" },
@@ -1761,7 +1784,8 @@ cpu = [
     { name = "onnxruntime" },
 ]
 gpu = [
-    { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin'" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/" }, marker = "(sys_platform != 'darwin' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
+    { name = "onnxruntime-gpu", version = "1.27.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'darwin' and extra == 'extra-22-horde-worker-utilities-cu130') or (sys_platform != 'darwin' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu126') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cpu' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu130') or (extra == 'extra-22-horde-worker-utilities-cu126' and extra == 'extra-22-horde-worker-utilities-cu132') or (extra == 'extra-22-horde-worker-utilities-cu130' and extra == 'extra-22-horde-worker-utilities-cu132')" },
 ]
 
 [[package]]

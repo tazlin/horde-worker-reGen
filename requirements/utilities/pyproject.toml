@@ -26,13 +26,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# One extra per locked torch build, mirroring the root pyproject. A CUDA build takes rembg_cuda
-# (onnxruntime-gpu); cpu takes rembg_cpu. torch/torchvision are listed (unpinned) so [tool.uv.sources] can
-# route them to the matching wheel index per extra; their VERSION is pinned globally by
-# constraint-dependencies below.
-cu126 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision"]
-cu130 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision"]
-cu132 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision"]
+# One extra per locked torch build, mirroring the root pyproject. A CUDA build takes rembg_cuda; cpu takes
+# rembg_cpu. torch/torchvision AND onnxruntime-gpu are listed directly (unpinned here) so [tool.uv.sources]
+# can route each to the wheel index matching that build's CUDA major; their VERSIONS are pinned globally by
+# constraint-dependencies below. onnxruntime-gpu is declared directly rather than left to rembg_cuda's
+# transitive pull because a [tool.uv.sources] route only applies to a project's own dependencies. Its CUDA
+# major MUST match torch's or its native library cannot open libcudart: PyPI ships the CUDA-13 build (right
+# for cu130/cu132), while cu126 is CUDA 12 and needs the CUDA-12 build from onnxruntime's own index.
+cu126 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision", "onnxruntime-gpu"]
+cu130 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision", "onnxruntime-gpu"]
+cu132 = ["horde-image-utilities[rembg_cuda]==0.2.2", "torch", "torchvision", "onnxruntime-gpu"]
 cpu = ["horde-image-utilities[rembg_cpu]==0.2.2", "torch", "torchvision"]
 
 [tool.uv]
@@ -49,7 +52,9 @@ python-preference = "managed"
 # guards against Python 3.12 at build time (`only versions >=3.6,<3.10 are supported`) and has no 3.12 wheel.
 # numba >=0.60 is the first line with cp312 wheels, so the floor keeps the utilities venv installable on the
 # pinned 3.12 interpreter (llvmlite follows numba up to a 3.12-wheel version automatically).
-constraint-dependencies = ["torch==2.12.1", "torchvision==0.27.1", "numba>=0.60"]
+# onnxruntime-gpu is pinned to one version so the CUDA-12 (cu126) and CUDA-13 (cu130/cu132) builds stay on
+# the same release; both onnxruntime's CUDA-12 index and PyPI carry 1.27.0.
+constraint-dependencies = ["torch==2.12.1", "torchvision==0.27.1", "numba>=0.60", "onnxruntime-gpu==1.27.0"]
 # The build extras are mutually exclusive, exactly like the root pyproject, so one lock carries all four.
 conflicts = [
     [
@@ -75,6 +80,13 @@ torchvision = [
     {index = "pytorch-cu132", extra = "cu132"},
     {index = "pytorch-cpu", extra = "cpu"},
 ]
+# onnxruntime-gpu is routed like torch: its CUDA major must match the torch build or its native library
+# cannot open libcudart. PyPI ships the CUDA-13 build, correct for cu130/cu132, so those resolve from the
+# default index and need no entry here; cu126 is CUDA 12 and takes onnxruntime's own CUDA-12 index. The cpu
+# extra uses rembg_cpu (plain onnxruntime, no CUDA runtime), so it has no onnxruntime-gpu at all.
+onnxruntime-gpu = [
+    {index = "onnxruntime-cuda12", extra = "cu126"},
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
@@ -94,4 +106,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# onnxruntime's own package index carries the CUDA-12 onnxruntime-gpu build (PyPI now ships CUDA 13). Marked
+# explicit so it is consulted only for the onnxruntime-gpu route above, never for general resolution.
+[[tool.uv.index]]
+name = "onnxruntime-cuda12"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
 explicit = true
