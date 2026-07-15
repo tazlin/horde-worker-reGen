@@ -286,14 +286,18 @@ used when a whole-card model cannot fit beside even the post-processing lane's
 bare GPU context; in that case the worker logs an operator warning and the TUI
 health view shows post-processing as disabled until restart.
 
-### Dormant experimental flags
+### Pipeline disaggregation (experimental)
 
-`enable_pipeline_disaggregation` is currently accepted for config compatibility
-but forced off during `reGenBridgeData` validation. Setting it in
-`bridgeData.yaml` or through `AIWORKER_REGEN_ENABLE_PIPELINE_DISAGGREGATION`
-does not start the component/VAE lane processes or route jobs through the
-disaggregated path. The config editor keeps the field in the Advanced catalog
-but hides it until the pipeline is ready to expose again.
+`enable_pipeline_disaggregation` opts the worker into the disaggregated stage
+pipeline. It is experimental and off by default. When on (in `bridgeData.yaml`
+or through `AIWORKER_REGEN_ENABLE_PIPELINE_DISAGGREGATION`), an eligible job is
+split across processes rather than run whole: a dedicated text-encode service
+produces the conditioning, the inference processes run UNet-only sampling, a
+dedicated VAE lane handles encode and decode, and post-processing is forced onto
+the dedicated post-processing lane. A job is only eligible when it is an
+SD1.5/SDXL txt2img, img2img, or remix job with no ControlNet; anything else falls
+back to the whole-job path. The config editor exposes the toggle under the
+Advanced catalog, and changing it needs a worker restart.
 
 ### Alchemy
 

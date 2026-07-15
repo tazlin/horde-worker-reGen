@@ -156,11 +156,11 @@ def test_template_matches_ram_safety_defaults() -> None:
     assert parsed.ram_per_process_max_mb == 18432
 
 
-def test_pipeline_disaggregation_config_is_forced_off() -> None:
-    """The disaggregation flag remains accepted but cannot enable the pipeline from config."""
+def test_pipeline_disaggregation_config_enables_flag() -> None:
+    """A config setting `enable_pipeline_disaggregation: true` is honoured on the loaded model."""
     bridge_data = reGenBridgeData.model_validate({"enable_pipeline_disaggregation": True})
 
-    assert bridge_data.enable_pipeline_disaggregation is False
+    assert bridge_data.enable_pipeline_disaggregation is True
 
 
 def test_bridge_data_loader_yaml_template() -> None:

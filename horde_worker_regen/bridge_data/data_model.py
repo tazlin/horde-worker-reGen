@@ -702,32 +702,24 @@ class reGenBridgeData(CombinedHordeBridgeData):
     restore the prior availability-only behavior (not recommended on a shared/consumer GPU)."""
 
     enable_pipeline_disaggregation: bool = Field(default=False)
-    """Run eligible jobs as a disaggregated pipeline (text-encode service + UNet-only samplers + image lane).
+    """Route eligible jobs through the disaggregated stage pipeline instead of the monolithic path.
 
-    Temporarily forced off by validation even when a config file or environment variable sets it true. The
-    field remains in the model so existing config files keep loading and the pipeline can be re-enabled later
-    without a config-schema break.
-
-    When true, a job is split into stages that run in separate processes exchanging small activations
-    rather than one process running the whole job: a dedicated text-encode service produces the
-    conditioning, UNet-only samplers produce latents, and the image lane VAE-decodes (and post-processes).
-    Because the sampler holds only the UNet, its VRAM peak is a fraction of the whole job's, which keeps two
-    samplers co-resident on a card the whole-job footprint would collapse to one, and moves the VAE decode
-    spike off the sampler onto the image lane.
+    Experimental. When true, an eligible job is split into stages that run in separate processes exchanging
+    small activations rather than one process running the whole job: a dedicated text-encode service process
+    produces the conditioning, the inference processes run UNet-only sampling to produce latents, a dedicated
+    VAE lane handles the encode and decode, and post-processing is forced onto the dedicated post-processing
+    lane. Because a sampler holds only the UNet, its VRAM peak is a fraction of the whole job's, which keeps
+    two samplers co-resident on a card the whole-job footprint would collapse to one, and moves the VAE spike
+    off the sampler.
 
     A job is disaggregated only when every condition holds: this flag is on; its source processing is
     txt2img, img2img, or remix; it requests no control_type; its model's baseline is an SD1.5 or SDXL family
-    (resolved from the loaded model reference, the only v1 families validated); and both the encode-service
+    (resolved from the loaded model reference, the only v1 families supported); and both the encode-service
     (component) process and the image lane are live and healthy. Any condition failing leaves the job on the
     monolithic path, where it is charged and dispatched whole; that IS the fallback (there is no
     re-queue-on-stall), so a stage-service outage, an ineligible family, or a control/inpaint job simply runs
     monolithically. A role dying after a job is claimed is backstopped by the pipeline's per-stage patience,
-    which faults the job for horde reissue rather than parking it forever.
-
-    The pipeline's VAE-encode/decode stage runs on the dedicated VAE lane (a separate process the worker
-    starts when this flag is on), not on the post-processing lane. Enabling disaggregation therefore does not
-    force the post-processing lane on: that lane follows its own configuration and only carries the
-    upscale/face-fix work. Default false (the monolithic path) until validated on the operator's card."""
+    which faults the job for horde reissue rather than parking it forever."""
 
     enable_image_utilities: bool = Field(default=True)
     """Run the dedicated image-utilities lane (the ``horde_image_utilities`` capability service).
@@ -1026,16 +1018,6 @@ class reGenBridgeData(CombinedHordeBridgeData):
             log=True,
         )
 
-        return self
-
-    @model_validator(mode="after")
-    def disable_pipeline_disaggregation(self) -> Self:
-        """Keep the disaggregated pipeline unavailable while preserving the config field."""
-        if self.enable_pipeline_disaggregation:
-            logger.warning(
-                "Pipeline disaggregation is temporarily disabled; ignoring enable_pipeline_disaggregation=true.",
-            )
-            self.enable_pipeline_disaggregation = False
         return self
 
     @model_validator(mode="after")
