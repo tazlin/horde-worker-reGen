@@ -106,6 +106,8 @@ class _PrefetchScript:
             whose files were not cached at pop. Ignored when ``on_disk`` is set or when the job is left to its
             download deadline.
         succeeds: Whether the delivered outcome reports the files placed (True) or a download failure (False).
+            A reported failure is terminal and serves the job without the file (it becomes dispatchable at
+            ``resolve_cycle``), so only a deadline case leaves the job undispatchable.
         by_deadline: No outcome is ever delivered; the job is left to its per-job download deadline, which
             faults it from the periodic deadline scan.
     """
@@ -117,10 +119,15 @@ class _PrefetchScript:
 
     @property
     def completion_cycle(self) -> int | None:
-        """The cycle by which the job becomes dispatchable, or ``None`` if it never does (fails/deadline)."""
+        """The cycle by which the job becomes dispatchable, or ``None`` if it never does (the deadline case).
+
+        A reported download failure is served without the file rather than faulted, so a failed prefetch makes
+        the job dispatchable at the cycle its outcome lands, exactly as a success does. Only the deadline case,
+        where no outcome is ever delivered, leaves the job to fault undispatchable.
+        """
         if self.on_disk:
             return 0
-        if self.by_deadline or not self.succeeds:
+        if self.by_deadline:
             return None
         return self.resolve_cycle
 
@@ -148,7 +155,9 @@ class _AuxLivenessWorld:
         self.cycle = 0
         self._process_map = process_map
         self._model_map = model_map
-        self._job_tracker = JobTracker()
+        # The tracker shares the world clock so a time-scoped auxiliary skip verdict (a served-without-file head)
+        # is evaluated against the same synthetic time the coordinator stamped it with, not the wall clock.
+        self._job_tracker = JobTracker(clock=lambda: self.now)
         bridge_data = make_mock_bridge_data(max_threads=max_threads, download_timeout=int(download_timeout))
         self._scheduler = InferenceScheduler(
             state=WorkerState(),
@@ -541,8 +550,9 @@ async def test_bounded_idleness_across_matrix(cell: _Cell) -> None:
 
     Across every matrix cell the sibling (when one exists and can fit) reaches sampling within a bound while
     the head is gated; the gated head never seizes a lane before its files are on disk; and once its prefetch
-    completes the head reaches sampling within a bound. When the prefetch fails or its deadline expires the
-    head faults terminally and its sibling still samples, so the queue keeps draining.
+    resolves the head reaches sampling within a bound. A prefetch that fails serves the head without the file,
+    so it still reaches sampling; only when its deadline expires does the head fault terminally, and either way
+    its sibling still samples, so the queue keeps draining.
     """
     world, head, sibling = await _build_world(cell)
 
@@ -559,15 +569,16 @@ async def test_bounded_idleness_across_matrix(cell: _Cell) -> None:
 
     completion_cycle = cell.head_script.completion_cycle
     if completion_cycle is None:
-        # Failure and deadline cells: the head faults terminally and leaves the pending-inference queue; it
-        # must never have sampled, and its sibling work is unaffected.
-        assert not world.sampled(head), f"{cell.id}: a head with no successful prefetch must never sample"
+        # Deadline cell: no outcome is ever delivered, so the head faults from the deadline backstop and leaves
+        # the pending-inference queue; it must never have sampled, and its sibling work is unaffected.
+        assert not world.sampled(head), f"{cell.id}: a head left to its deadline must never sample"
         assert world.stage(head) == JobStage.PENDING_SUBMIT, f"{cell.id}: the faulted head did not drain to submit"
         assert head not in world.job_tracker.jobs_in_progress
         return
 
-    # Success cells: the head must reach sampling, and never before its files were on disk.
-    assert world.sampled(head), f"{cell.id}: the head never reached sampling after its prefetch completed"
+    # Resolved cells (files placed, or a failure served without them): the head reaches sampling, never before
+    # its outcome landed.
+    assert world.sampled(head), f"{cell.id}: the head never reached sampling after its prefetch resolved"
     first = world.first_sampled_cycle(head)
     assert first is not None
     assert first >= max(1, completion_cycle), f"{cell.id}: the head sampled before its prefetch completed"

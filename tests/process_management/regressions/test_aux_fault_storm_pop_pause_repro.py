@@ -1,17 +1,15 @@
-"""Reproduction tests for the auxiliary-prefetch fault storm silencing the whole worker.
+"""The auxiliary-prefetch fault origin is excluded from the consecutive-failure pop pause.
 
-A single permanently-unfetchable auxiliary file (a popular textual inversion, a LoRA) that only some jobs
-reference faults each of those jobs before any generation is attempted. Each such fault is reported to the
-horde as a faulted job and, through the ordinary submit path, increments the worker's consecutive-failure
-counter. Once three land in a row the pop gauntlet latches a global pop pause (and, under
-``exit_on_unhandled_faults``, shuts the worker down), so one bad remote file silences a worker that is itself
-perfectly healthy.
-
-These encode the desired contract: a fault whose origin is the auxiliary-prefetch pipeline (the worker never
-ran a generation for it) must not count toward the consecutive-failure pop pause, mirroring the existing
-exclusion for scheduling-recovery give-ups. The arrangement is authentic end to end: real jobs are faulted
-through the prefetch coordinator's failure path and reported through a real submitter, all sharing one
-``WorkerState``, so the counter the popper reads is only ever mutated by production code.
+A fault whose origin is the auxiliary-prefetch pipeline (the worker never ran a generation for it) must not
+count toward the consecutive-failure pop pause, or one bad remote file silences a worker that is itself
+perfectly healthy. A not-found reference no longer faults a waiting job at all (it is served without the file),
+so the aux-origin fault under test here is the deadline backstop: a prefetch that never resolves and is never
+skipped, faulted once its per-job deadline expires. These assert that such faults are excluded from the pause
+and never trip ``exit_on_unhandled_faults``, that a genuine generation-origin fault still counts (the exclusion
+is scoped by origin, not blanket), and that a shared not-found outcome adds no faults because it salvages every
+co-waiter. The arrangement is authentic end to end: real jobs are faulted through the prefetch coordinator's
+deadline path and reported through a real submitter, all sharing one ``WorkerState``, so the counter the popper
+reads is only ever mutated by production code.
 """
 
 from __future__ import annotations
@@ -48,19 +46,37 @@ from tests.process_management.conftest import (
 )
 
 
-def _make_coordinator(tracker: JobTracker, state: WorkerState) -> AuxPrefetchCoordinator:
+class _Clock:
+    """A hand-advanceable clock so the prefetch deadline that produces an aux-origin fault is deterministic."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _make_coordinator(
+    tracker: JobTracker,
+    state: WorkerState,
+    *,
+    clock: _Clock | None = None,
+    download_timeout: float = 120.0,
+) -> AuxPrefetchCoordinator:
     """Build a real prefetch coordinator whose control-message senders are inert.
 
     The senders and downloader-status probe are irrelevant here: the test only drives the coordinator's
-    completion/failure wiring, which mutates the shared tracker and worker state.
+    completion/failure/deadline wiring, which mutates the shared tracker and worker state. An injected clock and
+    short download timeout let a test expire a job's prefetch deadline to produce a genuine aux-origin fault.
     """
     return AuxPrefetchCoordinator(
         job_tracker=tracker,
         state=state,
         prefetch_sender=lambda _entries, _pins: None,
-        download_timeout_provider=lambda: 120.0,
+        download_timeout_provider=lambda: download_timeout,
         pin_sender=lambda _pins: None,
         in_flight_provider=dict,
+        clock=(clock if clock is not None else time.time),
     )
 
 
@@ -155,10 +171,11 @@ def _ti_job(name: str) -> ImageGenerateJobPopResponse:
     )
 
 
-def _ti_failure_message(name: str, job_ids: list[object]) -> HordeAuxPrefetchResultMessage:
-    """A prefetch result reporting that a textual inversion is unfetchable for every named job.
+def _ti_terminal_failure_message(name: str, job_ids: list[object]) -> HordeAuxPrefetchResultMessage:
+    """A prefetch result reporting a textual inversion as terminally unfetchable for every named job.
 
-    Not a rejection (no ``rejection_reason``): a download failure the coordinator faults its pending jobs on.
+    Not a rejection (no ``rejection_reason``): a plain download failure classified terminal. Under the salvage
+    contract the coordinator dispatches every named job without the file rather than faulting it.
     """
     return HordeAuxPrefetchResultMessage(
         process_id=9000,
@@ -180,15 +197,23 @@ def _ti_failure_message(name: str, job_ids: list[object]) -> HordeAuxPrefetchRes
 async def _fault_one_ti_job_through_prefetch(
     tracker: JobTracker,
     coordinator: AuxPrefetchCoordinator,
+    clock: _Clock,
     ti_name: str,
 ) -> ImageGenerateJobPopResponse:
-    """Pop a TI job, fail its prefetch, and confirm the coordinator faulted it to PENDING_SUBMIT."""
+    """Pop a TI job and fault it through the prefetch deadline backstop, confirming it reaches PENDING_SUBMIT.
+
+    A not-found reference no longer faults a waiting job (it is served without the file), so the aux-origin fault
+    these tests exclude from the pop pause now comes from the deadline backstop: a prefetch that never resolves
+    and is never skipped. Popping the job arms its deadline; advancing the injected clock past it and scanning
+    faults the job with the aux-prefetch origin, since no download is in flight and the reference is not skipped.
+    """
     job = _ti_job(ti_name)
     await track_popped_job_async(tracker, job)
     coordinator.on_job_popped(job)
-    coordinator.on_prefetch_result(_ti_failure_message(ti_name, [job.id_]))
+    clock.now += 121.0
+    coordinator.scan_deadlines()
     assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT, (
-        "arrange failed: prefetch fault did not fault the job"
+        "arrange failed: prefetch deadline did not fault the job"
     )
     return job
 
@@ -253,7 +278,8 @@ async def test_aux_prefetch_fault_streak_does_not_pause_pops() -> None:
     state = WorkerState()
     tracker = JobTracker()
     tracker.set_retry_policy(1)
-    coordinator = _make_coordinator(tracker, state)
+    clock = _Clock()
+    coordinator = _make_coordinator(tracker, state, clock=clock)
     submitter = _make_submitter(
         state,
         tracker,
@@ -262,7 +288,7 @@ async def test_aux_prefetch_fault_streak_does_not_pause_pops() -> None:
     )
 
     for index in range(3):
-        await _fault_one_ti_job_through_prefetch(tracker, coordinator, f"popular-ti-{index}")
+        await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, f"popular-ti-{index}")
     for _ in range(3):
         await _submit_head_pending_job(submitter)
 
@@ -282,7 +308,8 @@ async def test_aux_prefetch_fault_streak_does_not_kill_worker_under_exit_on_unha
     state = WorkerState()
     tracker = JobTracker()
     tracker.set_retry_policy(1)
-    coordinator = _make_coordinator(tracker, state)
+    clock = _Clock()
+    coordinator = _make_coordinator(tracker, state, clock=clock)
     submitter = _make_submitter(
         state,
         tracker,
@@ -291,7 +318,7 @@ async def test_aux_prefetch_fault_streak_does_not_kill_worker_under_exit_on_unha
     )
 
     for index in range(3):
-        await _fault_one_ti_job_through_prefetch(tracker, coordinator, f"popular-ti-{index}")
+        await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, f"popular-ti-{index}")
     for _ in range(3):
         await _submit_head_pending_job(submitter)
 
@@ -317,7 +344,8 @@ async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults
     state = WorkerState()
     tracker = JobTracker()
     tracker.set_retry_policy(1)
-    coordinator = _make_coordinator(tracker, state)
+    clock = _Clock()
+    coordinator = _make_coordinator(tracker, state, clock=clock)
     submitter = _make_submitter(
         state,
         tracker,
@@ -326,7 +354,7 @@ async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults
     )
 
     # An aux-prefetch-origin fault is reported through the real submit path but never reaches the counter.
-    await _fault_one_ti_job_through_prefetch(tracker, coordinator, "popular-ti")
+    await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, "popular-ti")
     await _submit_head_pending_job(submitter)
     assert state.consecutive_failed_jobs == 0
 
@@ -335,7 +363,7 @@ async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults
     assert state.consecutive_failed_jobs == 1
 
     # An aux fault interleaved before the reset neither increments the counter nor clears it.
-    await _fault_one_ti_job_through_prefetch(tracker, coordinator, "another-popular-ti")
+    await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, "another-popular-ti")
     await _submit_head_pending_job(submitter)
     assert state.consecutive_failed_jobs == 1
 
@@ -350,38 +378,31 @@ async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults
     assert state.too_many_consecutive_failed_jobs is False
 
 
-async def test_shared_outcome_faulting_multiple_jobs_counts_toward_pause() -> None:
-    """One deduplicated outcome naming three jobs faults all three, and still must not latch the pop pause.
+async def test_shared_terminal_outcome_salvages_all_cowaiters_and_adds_no_faults() -> None:
+    """A shared terminal outcome dispatches every co-waiter without the file, so it contributes no faults at all.
 
-    The downloader reports a single outcome per file, so one unfetchable textual inversion faults every job
-    waiting on it in one delivery. This exercises the shared-outcome arrange shape (distinct from the
-    per-job failures above), and asserts the same desired exclusion: none of these aux-origin faults may
-    silence the worker.
+    The downloader reports a single deduplicated outcome per file, so one unfetchable textual inversion names
+    every job waiting on it in one delivery. Under the salvage contract none of those jobs is faulted: each is
+    dispatched without the file, exactly as it would be at inference. A shared not-found outcome therefore cannot
+    move the consecutive-failure counter or latch the pop pause, because it produces no fault to count.
     """
     state = WorkerState()
     tracker = JobTracker()
     tracker.set_retry_policy(1)
     coordinator = _make_coordinator(tracker, state)
-    submitter = _make_submitter(
-        state,
-        tracker,
-        horde_client_session=_fault_report_session(),
-        aiohttp_session=Mock(),
-    )
 
     shared_ti = "shared-popular-ti"
     jobs = [_ti_job(shared_ti) for _ in range(3)]
     for job in jobs:
         await track_popped_job_async(tracker, job)
         coordinator.on_job_popped(job)
-    coordinator.on_prefetch_result(_ti_failure_message(shared_ti, [job.id_ for job in jobs]))
-    for job in jobs:
-        assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT, (
-            "arrange failed: shared outcome did not fault a job"
-        )
+    coordinator.on_prefetch_result(_ti_terminal_failure_message(shared_ti, [job.id_ for job in jobs]))
 
-    for _ in jobs:
-        await _submit_head_pending_job(submitter)
+    faulted = [job for job in jobs if tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT]
+    assert faulted == [], "a shared not-found outcome must salvage every co-waiter, not fault any"
+    for job in jobs:
+        assert tracker.are_job_aux_models_prepared(job) is True
+        assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
     popper = _make_popper(state, tracker, bridge_data=make_mock_bridge_data(), shutdown_manager=Mock())
     should_skip = popper._handle_consecutive_failures(make_mock_bridge_data(), time.time())

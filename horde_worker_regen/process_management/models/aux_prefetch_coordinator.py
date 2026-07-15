@@ -250,6 +250,11 @@ class AuxPrefetchCoordinator:
                 continue
             if self._defer_deadline_if_in_flight(tracked.sdk_api_job_info, in_flight=in_flight, now=reference):
                 continue
+            # A reference this job waited on may have been memoized skipped by a reported terminal failure since
+            # its deadline was armed. Honor that here so the backstop dispatches the job without the file rather
+            # than faulting it for a reference the incident already resolved.
+            if self._salvage_via_skip(job_id):
+                continue
             # A deadline is per-job, so each expiry is its own incident: arm the backoff (once) for each
             # auxiliary class the job carries, then fault it. A job carrying both classes arms both. Retryability
             # follows the combined backoff state exactly as a reported failure does; both arms always run (their
@@ -516,22 +521,25 @@ class AuxPrefetchCoordinator:
                 self._forget_deferral_state(job_id)
 
     def _fault_failed_outcome(self, outcome: AuxPrefetchOutcome, *, now: float) -> None:
-        """Fault the still-pending jobs waiting on one failed prefetch outcome, arming its class backoff once.
+        """Resolve the still-pending jobs waiting on one failed prefetch outcome, arming its class backoff once.
 
         The download process reports one deduplicated outcome per file, so a single failed download can name
         several jobs. The escalating backoff for that file's class (LoRA or textual inversion) is armed once for
         that download (not once per waiting job), and every named job gets the same retryability verdict, so a
         shared failure neither over-counts backoff strikes nor treats co-waiting jobs inconsistently. A failure
-        feeds the same class backoff the inference-side aux-download fault does; once an incident is active a job
-        is faulted terminally rather than requeued into the same failing download path.
+        feeds the same class backoff the inference-side aux-download fault does; once an incident is active a
+        fresh failure is terminal, so its jobs are served without the file rather than requeued into the same
+        failing download path.
 
-        A terminal (non-retryable) failure additionally memoizes the reference as skipped, exactly as a surfaced
-        rejection does: retrying it is futile, so already-queued and later jobs referencing the same file
-        dispatch without it rather than each faulting in turn. This bounds the damage of one doomed reference
-        (a not-found laundered into a plain failure) to a single terminal fault per incident: a subsequent
-        failure for a reference already memoized takes the skip path below instead of manufacturing more faults.
-        Every fault is stamped with the aux-prefetch origin so a terminal one is excluded from the
-        consecutive-failure pop pause.
+        A terminal (non-retryable) failure memoizes the reference as skipped and dispatches every waiting job
+        without it, exactly as a surfaced rejection and the inference path do. A prefetch that cannot obtain a
+        reference must not change a job's outcome versus reaching inference (which serves the job without the
+        missing file), so no waiting job is faulted no matter how many shared the deduplicated download: the fault
+        count does not scale with queue depth, and a job that also obtained valid files is served with them. A
+        subsequent failure for an already-memoized reference takes the same skip path. A retryable failure instead
+        requeues each waiter for another attempt; a job whose own attempts are exhausted faults through the retry
+        policy exactly as any transient does, and such a fault is stamped with the aux-prefetch origin so it is
+        excluded from the consecutive-failure pop pause.
         """
         live = [job_id for job_id in outcome.requesting_job_ids if self._is_pending(job_id)]
         if not live:
@@ -544,9 +552,7 @@ class AuxPrefetchCoordinator:
             # A prior terminal failure already memoized this reference: let its still-pending jobs dispatch
             # without it rather than arming the backoff again or faulting work a skip has already salvaged.
             for job_id in live:
-                if self._job_tracker.mark_job_aux_prepared_if_ready(job_id):
-                    self._deadlines.pop(job_id, None)
-                    self._forget_deferral_state(job_id)
+                self._salvage_via_skip(job_id)
             return
         detail = outcome.detail or "aux prefetch failed"
         if outcome.kind is AuxModelKind.LORA:
@@ -554,11 +560,10 @@ class AuxPrefetchCoordinator:
         else:
             retryable = outcome.retryable and self._arm_ti_backoff(now=now, reference=outcome.name)
         if not retryable:
-            # Terminal: the download will not resolve by retrying, so memoize the reference so co-queued and
-            # later jobs skip it instead of each faulting. The job(s) actively waiting on this download are
-            # still faulted below (one bounded incident). Unlike a surfaced rejection (a permanent property
-            # of the file), a plain failure is an incident verdict: the verdict lapses with the incident's
-            # decay window so a fetchable-again reference is retried rather than silently omitted forever.
+            # Terminal: the download will not resolve by retrying, so memoize the reference as skipped and
+            # dispatch every waiting job without it, faulting none. Unlike a surfaced rejection (a permanent
+            # property of the file), a plain failure is an incident verdict: the skip lapses with the incident's
+            # decay window so a fetchable-again reference is retried later rather than silently omitted forever.
             self._job_tracker.mark_aux_skipped(
                 outcome.name,
                 is_version=outcome.is_version,
@@ -567,13 +572,29 @@ class AuxPrefetchCoordinator:
             )
             # The skip supersedes any re-fetch cooldown (a skipped reference is never re-requested anyway).
             self._reference_cooldowns.pop(self._outcome_key(outcome), None)
-        else:
-            # Retryable: the requeued job will be revisited by the pop/reconcile path, so hold the reference in
-            # a cooldown first, or a sub-second failure is re-requested at once and its instant re-failure burns
-            # the job's remaining attempt.
-            self._arm_reference_cooldown(outcome, now=now)
+            for job_id in live:
+                self._salvage_via_skip(job_id)
+            return
+        # Retryable: the requeued job will be revisited by the pop/reconcile path, so hold the reference in a
+        # cooldown first, or a sub-second failure is re-requested at once and its instant re-failure burns the
+        # job's remaining attempt. A waiter whose own attempts are exhausted faults through the retry policy.
+        self._arm_reference_cooldown(outcome, now=now)
         for job_id in live:
-            self._fault_pending_job(job_id, retryable=retryable, detail=detail)
+            self._fault_pending_job(job_id, retryable=True, detail=detail)
+
+    def _salvage_via_skip(self, job_id: GenerationID) -> bool:
+        """Dispatch a job without a now-skipped reference, dropping its deadline; return whether it dispatched.
+
+        Once the reference a job is waiting on is recorded skipped, the job can dispatch without the file: it is
+        prepared and its deadline and deferral bookkeeping are cleared. A job still missing some other auxiliary
+        file is not prepared by this and keeps waiting on that file, so salvaging one reference never dispatches a
+        job whose remaining set is incomplete. Returns True only when the job was prepared and so needs no fault.
+        """
+        if self._job_tracker.mark_job_aux_prepared_if_ready(job_id):
+            self._deadlines.pop(job_id, None)
+            self._forget_deferral_state(job_id)
+            return True
+        return False
 
     def _is_pending(self, job_id: GenerationID) -> bool:
         """Whether the job is still tracked and awaiting inference (so a fault would actually affect it)."""

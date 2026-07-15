@@ -159,12 +159,13 @@ async def test_after_cooldown_reference_is_re_requested_and_success_dispatches()
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
 
-async def test_after_cooldown_second_genuine_failure_faults_terminally() -> None:
-    """A second genuine failure after a real cooldown gap still faults terminally (incident still active).
+async def test_after_cooldown_second_genuine_failure_is_terminal_and_salvages() -> None:
+    """A second genuine failure after a real cooldown gap is terminal and serves the job without the file.
 
     The cooldown defers the retry; it does not soften the terminal-on-second-failure semantics. Once the
     cooldown lapses the reference is re-requested, and because the class incident is still in force a fresh
-    failure is classified terminal and faults the job.
+    failure is classified terminal: under the salvage contract it memoizes the reference and dispatches the job
+    without it rather than faulting it.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
@@ -181,7 +182,9 @@ async def test_after_cooldown_second_genuine_failure_faults_terminally() -> None
     coordinator.reconcile_and_refresh_pins()
     coordinator.on_prefetch_result(_result(_laundered_failure("ghost", job.id_)))
 
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.is_lora_skipped(_lora("ghost")) is True
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
 
 async def test_cooling_job_stays_bounded_and_deadline_still_faults_it() -> None:

@@ -323,6 +323,36 @@ def test_terminal_rejection_reports_non_retryable_outcome_with_reason(monkeypatc
     assert [str(j) for j in outcomes[0].requesting_job_ids] == [_JOB_A]
 
 
+def test_two_jobs_sharing_an_unfetchable_lora_get_one_shared_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two jobs sharing a LoRA the manager laundered as no-key-no-reason yield one plain-retryable outcome.
+
+    When the fetch returns neither a key nor a rejection reason (an unfetchable reference the upstream surfaced
+    no reason for), the deduplicated download reports a single failure outcome naming both jobs, marked
+    retryable with no rejection reason. This is the shared-outcome shape the parent coordinator consumes: the
+    reason string is absent here precisely because the manager gave the process nothing to classify the
+    reference as terminal, so the terminal decision and its co-waiter handling fall to the parent.
+    """
+    lora = _FakeLoraManager(present=set(), fetch_succeeds=False, reject_reason=None)
+    process = _make_process(monkeypatch, lora=lora, ti=None)
+
+    process._handle_aux_prefetch_request(
+        HordeAuxPrefetchControlMessage(
+            entries=[_entry("ghost", job=_JOB_A), _entry("ghost", job=_JOB_B)],
+        ),
+    )
+    _drain_scheduler(process)
+
+    assert lora.fetch_calls == [("ghost", False)]
+    outcomes = [o for o in _collect_prefetch_outcomes(process) if o.name == "ghost"]
+    assert len(outcomes) == 1
+    assert outcomes[0].ok is False
+    assert outcomes[0].retryable is True
+    assert outcomes[0].rejection_reason is None
+    assert {str(j) for j in outcomes[0].requesting_job_ids} == {_JOB_A, _JOB_B}
+
+
 def test_present_ti_short_circuits_without_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     """An already-present textual inversion reports success immediately and never fetches."""
     ti = _FakeTiManager(present={"emb-1"})

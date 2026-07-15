@@ -9,10 +9,11 @@ that the not-found is laundered into a plain retryable failure (``ok=False``, ``
 backoff once per job, because nothing memoizes the doomed reference.
 
 These encode the desired contract at the coordinator seam (which repo the fix lands in is left open): a
-repeated terminal-condition failure for one LoRA must not fault more than one job; a surfaced terminal
-rejection dispatches its jobs without the file and is memoized; a genuine transient failure still requeues and
-arms the backoff once; and the LoRA backoff withholds LoRA support on the next pop without disturbing
-already-queued jobs. The exploratory matrix probes mixed, concurrent, decay-boundary, and cross-kind shapes.
+terminal-condition failure for one LoRA serves every job waiting on it without the file rather than faulting
+them, exactly as a surfaced rejection and the inference path do; a surfaced terminal rejection likewise
+dispatches its jobs without the file and is memoized; a genuine transient failure still requeues and arms the
+backoff once; and the LoRA backoff withholds LoRA support on the next pop without disturbing already-queued
+jobs. The exploratory matrix probes mixed, concurrent, decay-boundary, and cross-kind shapes.
 """
 
 from __future__ import annotations
@@ -169,13 +170,13 @@ def _lora_entries_for(sender: _SenderSpy, job_id: GenerationID | None, name: str
     return found
 
 
-async def test_repeated_laundered_lora_failure_faults_at_most_one_job() -> None:
-    """The laundered not-found shape arriving for one LoRA across many jobs must not fault more than one.
+async def test_repeated_laundered_lora_failure_faults_no_job() -> None:
+    """The laundered not-found shape arriving for one LoRA across many jobs must not fault any of them.
 
     A not-found reference is a terminal condition, so the doomed verdict must be reached once and remembered:
-    the same laundered outcome landing for a fresh job each time must not fault every one of them. Absent
-    memoization, each job is faulted (the first requeued, then escalation makes the rest terminal), so a single
-    bad reference silences work across many jobs.
+    the same laundered outcome landing for a fresh job each time serves that job without the file rather than
+    faulting it. Absent the salvage contract, each job is faulted (the first requeued, then escalation makes the
+    rest terminal), so a single bad reference silences work across many jobs.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
@@ -189,7 +190,7 @@ async def test_repeated_laundered_lora_failure_faults_at_most_one_job() -> None:
         coordinator.on_prefetch_result(_result(_lora_laundered_failure("ghost", job.id_)))
 
     faulted = [job for job in jobs if tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT]
-    assert len(faulted) <= 1
+    assert faulted == []
 
 
 async def test_terminally_rejected_lora_dispatches_and_is_memoized_across_jobs() -> None:
@@ -259,20 +260,24 @@ async def test_single_transient_lora_failure_requeues_and_arms_backoff_once() ->
     assert tracker.is_lora_skipped(_lora("net")) is False
 
 
-async def test_terminal_aux_prefetch_fault_excluded_from_consecutive_failure_pause() -> None:
-    """A terminally faulted aux-prefetch job carries the aux-prefetch origin, excluded from the failure pause.
+async def test_aux_prefetch_deadline_fault_excluded_from_consecutive_failure_pause() -> None:
+    """A job faulted by the aux-prefetch deadline carries the aux-prefetch origin, excluded from the pause.
 
-    A fault the worker never ran a generation for must not count toward the consecutive-failure pop pause.
-    Guards the origin stamping the fault-storm reproduction relies on end to end.
+    A not-found reference is served without the file rather than faulted, so the aux-origin fault that must be
+    excluded from the consecutive-failure pop pause is the deadline backstop: a prefetch that never resolves and
+    is never skipped. Popping the job arms its deadline; expiring it with no download in flight faults the job
+    with the aux-prefetch origin. Guards the origin stamping the fault-storm reproduction relies on end to end.
     """
-    tracker = JobTracker()
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(1)
-    coordinator, _sender, _state, _clock = _make(tracker)
+    coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=30.0)
 
     job = _job(loras=[_lora("net")])
     await track_popped_job_async(tracker, job)
     coordinator.on_job_popped(job)
-    coordinator.on_prefetch_result(_result(_lora_plain_failure("net", False, job.id_)))
+    clock.now += 31.0
+    coordinator.scan_deadlines()
 
     assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
     assert tracker.was_faulted_by_non_generation_action(job.id_) is True
@@ -285,8 +290,8 @@ async def test_mixed_job_with_laundered_lora_should_dispatch_with_only_valid() -
     too-large one, so all three of the mixed job's LoRAs resolve to a terminal verdict in one result: the valid
     one caches, and both the too-large and the not-found ones are skipped, leaving the job prepared to dispatch
     without them. The earlier laundered shape (a retryable not-found failure) is exercised separately by
-    ``test_repeated_laundered_lora_failure_bounds_damage_to_one_fault``, which asserts bounded damage rather
-    than immediate dispatch (a single retryable failure requeues the job, it does not prepare it).
+    ``test_repeated_laundered_lora_failure_salvages_via_memoized_skip``, where a single retryable failure
+    requeues the job before the terminal one memoizes the reference and serves the job without it.
     """
     tracker = JobTracker()
     tracker.set_retry_policy(2)
@@ -308,15 +313,15 @@ async def test_mixed_job_with_laundered_lora_should_dispatch_with_only_valid() -
     assert tracker.are_job_aux_models_prepared(job) is True
 
 
-async def test_repeated_laundered_lora_failure_bounds_damage_to_one_fault() -> None:
-    """The laundered (retryable) not-found shape bounds its damage: one terminal fault, then later jobs dispatch.
+async def test_repeated_laundered_lora_failure_salvages_via_memoized_skip() -> None:
+    """The laundered (retryable) not-found shape serves its job without the file once the reference is memoized.
 
     Contract: the coordinator is the defense in depth for a not-found the root cause still laundered into a
     plain retryable failure. First-failure semantics are preserved: the first laundered failure requeues its
     job (it stays pending, one backoff strike). A second laundered failure for the same reference, arriving
-    while the incident is active, is terminal: it faults that job and memoizes the reference as skipped. A
-    subsequent job referencing the now-memoized reference then dispatches without it rather than faulting, so a
-    single doomed reference costs at most one terminal fault per incident.
+    while the incident is active, is terminal: it memoizes the reference as skipped and dispatches that job
+    without it rather than faulting it. A subsequent job referencing the now-memoized reference is likewise
+    served without it, so a single doomed reference costs no faults.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
@@ -331,8 +336,9 @@ async def test_repeated_laundered_lora_failure_bounds_damage_to_one_fault() -> N
     assert tracker.is_lora_skipped(_lora("ghost")) is False
 
     coordinator.on_prefetch_result(_result(_lora_laundered_failure("ghost", job_a.id_)))
-    assert tracker.get_stage(job_a.id_) == JobStage.PENDING_SUBMIT
     assert tracker.is_lora_skipped(_lora("ghost")) is True
+    assert tracker.are_job_aux_models_prepared(job_a) is True
+    assert tracker.get_stage(job_a.id_) == JobStage.PENDING_INFERENCE
 
     job_b = _job(loras=[_lora("ghost")])
     await track_popped_job_async(tracker, job_b)
@@ -460,16 +466,18 @@ def test_lora_backoff_strike_decay_boundary_resets_incident() -> None:
     assert backoff.strikes == 1
 
 
-async def test_second_same_lora_failure_is_terminal_while_escalation_active() -> None:
-    """While a LoRA incident is active a second failure for the same reference is classified terminal.
+async def test_second_same_lora_failure_is_terminal_and_salvages_while_escalation_active() -> None:
+    """While a LoRA incident is active a second failure for the same reference is terminal and salvages its job.
 
-    Once the backoff escalation is in force, requeuing into the same failing download path is futile, so a
-    fresh failure faults its job terminally rather than requeuing it. Documents the escalation-active
-    classification the laundered-failure storm reproduction builds on.
+    Once the backoff escalation is in force, requeuing into the same failing download path is futile, so a fresh
+    failure is classified terminal. Under the salvage contract a terminal classification memoizes the reference
+    and dispatches its job without the file rather than faulting it. Documents the escalation-active
+    classification the laundered-failure salvage reproduction builds on.
     """
-    tracker = JobTracker()
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(5)
-    coordinator, _sender, state, clock = _make(tracker)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock)
 
     job_a = _job(loras=[_lora("net")])
     await track_popped_job_async(tracker, job_a)
@@ -482,7 +490,9 @@ async def test_second_same_lora_failure_is_terminal_while_escalation_active() ->
     coordinator.on_job_popped(job_b)
     coordinator.on_prefetch_result(_result(_lora_plain_failure("net", True, job_b.id_)))
 
-    assert tracker.get_stage(job_b.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.is_lora_skipped(_lora("net")) is True
+    assert tracker.are_job_aux_models_prepared(job_b) is True
+    assert tracker.get_stage(job_b.id_) == JobStage.PENDING_INFERENCE
 
 
 @pytest.mark.parametrize("kind", [AuxModelKind.LORA, AuxModelKind.TI])

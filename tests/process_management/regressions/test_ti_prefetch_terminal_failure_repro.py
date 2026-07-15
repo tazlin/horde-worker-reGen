@@ -192,28 +192,30 @@ async def test_failed_ti_is_memoized_across_jobs() -> None:
     assert tracker.get_stage(job_b.id_) != JobStage.PENDING_SUBMIT
 
 
-async def test_repeated_ti_plain_failure_is_terminal_and_arms_backoff() -> None:
-    """A TI whose plain download fails repeatedly is faulted terminally and arms the TI backoff.
+async def test_repeated_ti_plain_failure_is_terminal_and_salvages_arming_backoff() -> None:
+    """A TI whose plain download fails repeatedly is served without it terminally and arms the TI backoff.
 
-    A permanent rejection skips the file, but a repeated plain (non-rejection) download failure means the
-    download path is presumed sick, exactly as a LoRA does: silently generating without a requested embedding is
-    not acceptable for a transient-class failure, so the job ends terminally faulted (PENDING_SUBMIT) rather than
-    skipped. The second identical failure lands while the first strike still holds an active window, so it is
-    classified terminal and the TI download backoff is armed. The fault carries the aux-prefetch origin, so it
-    never counts toward the consecutive-failure pop pause (covered end to end by the storm repro suite).
+    A repeated plain (non-rejection) download failure means the download path is presumed sick, so retrying is
+    futile and the reference is classified terminal, exactly as a LoRA does. Under the salvage contract a
+    terminal classification memoizes the reference and dispatches the job without the embedding rather than
+    faulting it, mirroring the inference path. The second identical failure lands while the first strike still
+    holds an active window, so it is terminal and the TI download backoff is armed to withhold further attempts.
     """
-    tracker = JobTracker()
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(2)
     job = _job(tis=[TIPayloadEntry(name="X")])
     await track_popped_job_async(tracker, job)
-    coordinator, _sender, state, clock = _make(tracker)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock)
     coordinator.on_job_popped(job)
 
     coordinator.on_prefetch_result(_result(_ti_failure("X", job.id_)))
     coordinator.reconcile_and_refresh_pins()
     coordinator.on_prefetch_result(_result(_ti_failure("X", job.id_)))
 
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.is_ti_skipped("X") is True
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
     assert state.ti_download_backoff.is_escalation_active(clock.now) is True
 
 
