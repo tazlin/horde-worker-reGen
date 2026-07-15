@@ -1040,7 +1040,7 @@ class MessageDispatcher:
 
         else:
             logger.info(f"Inference finished for job {message.sdk_api_job_info.id_}")
-            logger.debug(f"Job didn't include time_elapsed: {message.sdk_api_job_info}")
+            logger.debug(f"Job didn't include time_elapsed: {message.sdk_api_job_info.id_}")
 
         job_info.state = message.state
         job_info.time_to_generate = message.time_elapsed
