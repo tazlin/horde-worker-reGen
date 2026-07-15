@@ -615,13 +615,23 @@ def test_sync_provisions_utilities_when_wanted_and_pinned(
     assert provisioned == ["cu126"]
 
 
-def test_sync_skips_utilities_when_no_pin(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no committed pin for the backend, the wire-in stays a no-op (nothing to provision yet)."""
+def test_sync_warns_and_skips_when_full_backend_seed_is_missing(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A full backend whose seed is absent warns (it should ship one) and provisions nothing.
+
+    This is the broken-install signal: the default token (cu126) ships a seed by policy, so a missing one
+    means the tree never received requirements/ (the release-bundle omission this guards). It must be
+    diagnosable, not a silent lane-disable, while never failing the completed worker sync.
+    """
     _, _ = env
     called: list[bool] = []
     monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
     assert cli.main(["sync"]) == 0
     assert called == []
+    err = capsys.readouterr().err
+    assert "image-utilities lane is enabled" in err
+    assert "requirements/utilities.cu126.txt" in err
 
 
 def test_sync_skip_utilities_flag_suppresses_provision(
@@ -672,6 +682,31 @@ def test_sync_utilities_provision_failure_is_non_fatal(
     assert cli.main(["sync"]) == 0  # the worker sync succeeded; the utilities failure is post-success
     assert calls == [("sync", "cu126")]
     assert "could not create the utilities venv" in capsys.readouterr().err
+
+
+def test_maybe_provision_lean_backend_missing_seed_is_silent(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lean backend opted into a feature it ships no seed for stays a quiet no-op (no spurious warning).
+
+    Unlike a full build, a lean backend (e.g. rocm) is not expected to ship a utilities seed, so an absent
+    one is the benign "no pin published yet" case, not a broken install: provision nothing and say nothing.
+    """
+    root, _ = env
+    monkeypatch.setenv("HORDE_WORKER_FEATURES", "controlnet")  # opts the lean backend into wanting the lane
+    called: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
+    options = cli._SyncOptions(
+        preview=False,
+        hold=False,
+        confirm_threshold_bytes=0,
+        headless_policy="proceed",
+        prune=False,
+        skip_utilities=False,
+    )
+    cli._maybe_provision_utilities("UV", root, "rocm", options)
+    assert called == []
+    assert capsys.readouterr().err == ""
 
 
 # --- preview / hold / prune path (existing .venv, so the dry-run preview runs) ---------------------

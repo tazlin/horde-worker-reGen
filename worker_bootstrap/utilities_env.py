@@ -127,11 +127,20 @@ def plan_utilities_provision(
 ) -> list[list[str]]:
     """Return the argv command lists that create and populate the utilities venv, without running them.
 
-    Two commands are produced: ``uv venv <utilities-venv> --python <version>`` to create the environment
-    against the pinned managed CPython, then ``uv pip install --python <interpreter> [--require-hashes]
-    -r <requirements>`` to install the CI-compiled pin into it. This is a pure builder (it runs nothing),
-    mirroring the builder/runner split in :mod:`worker_bootstrap.runner`;
+    Two commands are produced: ``uv venv --clear <utilities-venv> --python <version>`` to create the
+    environment against the pinned managed CPython, then ``uv pip install --python <interpreter>
+    [--require-hashes] -r <requirements>`` to install the CI-compiled pin into it. This is a pure builder
+    (it runs nothing), mirroring the builder/runner split in :mod:`worker_bootstrap.runner`;
     :func:`worker_bootstrap.runner.provision_utilities` executes the result.
+
+    ``--clear`` keeps the create step fully managed and non-interactive: uv >=0.8 prompts before replacing
+    an existing venv and uv >=0.10 requires ``--clear`` to replace one at all, so without it a reprovision
+    would hang on a "replace it?" prompt. Provisioning only runs when the venv is absent or stale (a
+    backend or pin change), where a clean venv is exactly what is wanted, so clearing never discards a
+    healthy up-to-date environment. The install reuses the worker's peered uv cache and managed CPython
+    because :func:`worker_bootstrap.runner.run_uv` runs every command through
+    :func:`worker_bootstrap.runner.build_child_env`, so the utilities venv shares the same cache and
+    ``uv cache prune`` as the main ``.venv`` rather than re-downloading torch into a private cache.
 
     Args:
         uv: The uv executable to invoke.
@@ -147,6 +156,7 @@ def plan_utilities_provision(
     create_command = [
         uv,
         "venv",
+        "--clear",
         str(paths.utilities_venv_dir(root)),
         "--python",
         UTILITIES_PYTHON_VERSION,

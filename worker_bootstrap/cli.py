@@ -186,14 +186,32 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
     The utilities venv is a separate environment for the ``horde-image-utilities`` capability service; the
     worker runs without it, so its provisioning is post-success and non-fatal (a failure warns but never
     turns an otherwise-complete install into a reported failure, mirroring :func:`_maybe_prune`). It is
-    skipped entirely when the resolved feature set is empty (nothing wants it), when no CI-compiled
-    requirements pin exists for the token yet, when a matching stamp shows it is already current, or when
-    it is disabled via ``--skip-utilities`` / ``HORDE_WORKER_SKIP_UTILITIES``.
+    skipped entirely when the resolved feature set is empty (nothing wants it), when a matching stamp shows
+    it is already current, or when it is disabled via ``--skip-utilities`` /
+    ``HORDE_WORKER_SKIP_UTILITIES``.
+
+    A wanted-but-absent requirements seed is reported rather than silently skipped when the backend is one
+    that ships a seed by policy (see :func:`worker_bootstrap.backend.expects_utilities_seed`): its absence
+    is a broken install (most often a tree that never received the ``requirements/`` directory), which
+    otherwise disables the lane with no clue as to why. A lean backend opted into a feature it has no seed
+    for stays a quiet no-op, as before.
     """
     if options.skip_utilities:
         return
     env_value = os.environ.get(_FEATURES_ENV)
     if not utilities_env.utilities_provision_wanted(token=token, env_value=env_value):
+        return
+    requirements = utilities_env.utilities_requirements_file(token=token, root=root)
+    if not requirements.is_file():
+        if backend_mod.expects_utilities_seed(token):
+            print(
+                f"WARNING: the image-utilities lane is enabled for backend '{token}', but its requirements "
+                f"seed is missing at {requirements}. The lane cannot be provisioned and will be unavailable "
+                f"(the worker still runs; capabilities that need the lane are disabled). This usually means "
+                f"the install did not receive the requirements/ directory; reinstall, or restore "
+                f"requirements/utilities.{token}.txt, then re-run the sync.",
+                file=sys.stderr,
+            )
         return
     if not utilities_env.needs_provision(backend_token=token, root=root):
         return

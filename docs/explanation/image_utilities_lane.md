@@ -20,6 +20,28 @@ The service is a small uvicorn server bound to a loopback ephemeral port. The wo
 loopback HTTP, so the consuming side stays lean: the worker's main environment carries a dependency-free
 client, never the server's stack.
 
+### How the venv is provisioned
+
+The bootstrap brain (`worker_bootstrap`) builds and maintains the utilities venv; the worker process only
+checks that its interpreter exists and never creates it. Provisioning runs after a successful worker sync
+and is also repaired on a launch that finds the main `.venv` already current, so an install that gained a
+utilities pin in a later release still converges without a forced resync. It is best-effort: a failure
+warns but never turns an otherwise-complete worker install into a reported failure.
+
+The install list is a per-backend seed committed at `requirements/utilities.<backend_token>.txt` and shipped
+in the release bundle alongside the worker. Provisioning is skipped for a backend whose resolved feature set
+is empty (a lean build that did not opt in), and when a stamp shows the venv already matches the current
+pin. When the lane *is* wanted for a full build but its seed is absent (an install that never received the
+`requirements/` directory), the bootstrap warns and disables the lane rather than skipping silently, so the
+cause is diagnosable instead of surfacing only as a missing interpreter at start.
+
+The venv is created and populated through the same hardened child environment as every other uv call, so it
+shares the worker's peered uv cache and managed CPython and participates in the same `uv cache prune`: the
+utilities install reuses the torch/CUDA wheels the main sync already cached rather than re-downloading them
+into a private cache. The create step passes `--clear`, keeping it fully managed and non-interactive (uv
+otherwise prompts before replacing an existing venv); a reprovision only runs when the venv is absent or
+stale, where a clean environment is exactly what is wanted.
+
 ## The adapter bridge
 
 Every other worker child speaks the [IPC message vocabulary](ipc_and_messaging.md) from inside its own

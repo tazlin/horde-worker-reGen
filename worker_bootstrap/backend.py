@@ -152,6 +152,18 @@ def desired_feature_extras(token: str, *, env_value: str | None = None) -> tuple
     return ()
 
 
+def expects_utilities_seed(token: str) -> bool:
+    """Return whether a committed image-utilities requirements seed is expected for *token*.
+
+    The full builds (:data:`_FULL_FEATURE_BUILDS`) default the utilities lane on and each ships a seed
+    under ``requirements/utilities.<token>.txt`` (pinned by
+    ``tests/bootstrap/test_utilities_env.py``), so for them a *missing* seed is a broken or incomplete
+    install rather than the benign "no pin published yet" case a feature-opted-in lean backend hits. This
+    lets the provisioner distinguish the two and warn only on the former.
+    """
+    return token in _FULL_FEATURE_BUILDS
+
+
 def validate_locked_extra(token: str, pyproject_path: Path) -> None:
     """Raise ValueError with actionable guidance when ``token`` is not a locked build extra."""
     available = locked_extras(pyproject_path) or list(_LOCKED_HINT)

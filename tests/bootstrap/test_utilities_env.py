@@ -36,12 +36,19 @@ def test_repo_has_a_bootstrap_seed_for_every_locked_full_backend(token: str) -> 
 
 
 def test_plan_creates_then_installs_without_hashes(tmp_path: Path) -> None:
-    """A plain (un-hashed) pin yields a venv-create then a pip install with no --require-hashes."""
+    """A plain (un-hashed) pin yields a clean venv-create then a pip install with no --require-hashes."""
     _write_requirements(tmp_path, "cu126", hashed=False)
     commands = utilities_env.plan_utilities_provision(uv="UV", backend_token="cu126", root=tmp_path)
 
     assert commands == [
-        ["UV", "venv", str(paths.utilities_venv_dir(tmp_path)), "--python", utilities_env.UTILITIES_PYTHON_VERSION],
+        [
+            "UV",
+            "venv",
+            "--clear",
+            str(paths.utilities_venv_dir(tmp_path)),
+            "--python",
+            utilities_env.UTILITIES_PYTHON_VERSION,
+        ],
         [
             "UV",
             "pip",
@@ -52,6 +59,18 @@ def test_plan_creates_then_installs_without_hashes(tmp_path: Path) -> None:
             str(utilities_env.utilities_requirements_file(token="cu126", root=tmp_path)),
         ],
     ]
+
+
+def test_plan_venv_create_is_non_interactive(tmp_path: Path) -> None:
+    """The venv-create step passes --clear so a reprovision never hangs on uv's 'replace it?' prompt.
+
+    uv >=0.8 prompts before replacing an existing venv (and uv >=0.10 requires --clear to replace one), so
+    without this flag a stale-venv reprovision would block on stdin. The utilities lane must stay fully
+    managed.
+    """
+    _write_requirements(tmp_path, "cu126")
+    create, _install = utilities_env.plan_utilities_provision(uv="UV", backend_token="cu126", root=tmp_path)
+    assert "--clear" in create
 
 
 def test_plan_adds_require_hashes_when_pin_is_hashed(tmp_path: Path) -> None:

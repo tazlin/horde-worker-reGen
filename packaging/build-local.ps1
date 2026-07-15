@@ -194,6 +194,12 @@ try {
     $bootstrapPkg = Join-Path $RepoRoot 'worker_bootstrap'
     if (-not (Test-Path $bootstrapPkg)) { throw "Bootstrap package not found: $bootstrapPkg" }
     Copy-Item -Recurse -Path $bootstrapPkg -Destination (Join-Path $stageDir 'worker_bootstrap')
+    # The image-utilities capability venv seeds the bootstrap installs from at
+    # requirements/utilities.<token>.txt. Copied as a directory (not via the manifest, which flattens
+    # entries to the bundle root) so the provisioner's path is preserved; matches release.yml.
+    $reqDir = Join-Path $RepoRoot 'requirements'
+    if (-not (Test-Path $reqDir)) { throw "requirements directory not found: $reqDir" }
+    Copy-Item -Recurse -Path $reqDir -Destination (Join-Path $stageDir 'requirements')
 
     # Drop build noise that CI also prunes so the zip matches the published one.
     Get-ChildItem -Path $stageDir -Recurse -Directory -ErrorAction SilentlyContinue |
