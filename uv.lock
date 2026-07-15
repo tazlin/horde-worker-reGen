@@ -1134,7 +1134,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "6.3.2"
+version = "6.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1200,9 +1200,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/42/a4/b87115f1ebdcec77f0448845efca13e33f31392157c02efade618b6edfd5/horde_engine-6.3.2.tar.gz", hash = "sha256:e3b5e7b8bcf59bbc77a9352441ba978e170d777dac16cfc2e5804669e282a9fd", size = 461996, upload-time = "2026-07-12T04:15:35.564Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/67/1c257e83af827dfc9ff551e2a9cdb58581cc316f1cb14b598b5f21007ef0/horde_engine-6.3.4.tar.gz", hash = "sha256:d90f8ee22916e5274ca7210c6b4427605268d49c4b0dc7eec6825c10b1f38fa4", size = 468239, upload-time = "2026-07-15T02:20:58.618Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/6b/e43da249efb621348110d92d96e7ef2f49bd66f0b6e5589ed5d5ba936b49/horde_engine-6.3.2-py3-none-any.whl", hash = "sha256:5ec45b213fb668f13b9ece301aeed3cbae1b2ba02aa7a044def26edd97074185", size = 588623, upload-time = "2026-07-12T04:15:33.783Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/75/e0ca3b945ffb676e8c18a2937a46d636473571e9f23ea0462ebce5f9ec19/horde_engine-6.3.4-py3-none-any.whl", hash = "sha256:2f9bddecd0abdd2423882f6912c8f43a38c50fc638c435af530f44a75dc1b1e6", size = 594765, upload-time = "2026-07-15T02:20:56.937Z" },
 ]
 
 [package.optional-dependencies]
@@ -1398,7 +1398,7 @@ requires-dist = [
     { name = "blurhash", specifier = ">=1.1.5" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=6.3.2,<7.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=6.3.3,<7.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-model-reference", specifier = ">=7.5.0,<8.0.0" },
     { name = "horde-safety", specifier = "~=0.3.0" },
@@ -4317,14 +4317,14 @@ wheels = [
 
 [[package]]
 name = "tifffile"
-version = "2026.6.1"
+version = "2026.7.14"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b7/38/5e2ecef5af2f4fd4a89bb8d6240de9458bab4d51a4cbd97aeb3a0cd618e2/tifffile-2026.6.1.tar.gz", hash = "sha256:626c892c0e899d959b9438e7c0e1491dc154a7fead1f1f37a991724a50eceba9", size = 429694, upload-time = "2026-05-31T23:57:12.165Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/2f/e5fe51c8f782241d86fdf7251594b195f0d6c2fcf9d389079de212599246/tifffile-2026.7.14.tar.gz", hash = "sha256:ce2703e5ef22c868f1528d5f5b4ef75eefb019cf628a1c9ec0d17e0afeca8ef5", size = 437660, upload-time = "2026-07-14T23:41:31.737Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/59/208f71d70ddc6184f79b8c6d87d46eb7d7b12c19186a817dec9c9c3f3693/tifffile-2026.6.1-py3-none-any.whl", hash = "sha256:0d7382d2769b855b81ce358528e2b40c16d48aa39031746efa81215205332a8d", size = 267108, upload-time = "2026-05-31T23:57:10.597Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/e8/d381de4a3cc4e3682cba0338f43250893508aad0b310af1d0635f7b04413/tifffile-2026.7.14-py3-none-any.whl", hash = "sha256:4eb20372e76edf2c9fed922b1e3a0a0567be3560bd2008336115763bb1f3c034", size = 270614, upload-time = "2026-07-14T23:41:30.078Z" },
 ]
 
 [[package]]
