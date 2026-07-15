@@ -27,6 +27,7 @@ from horde_worker_regen.analysis.detectors import DETECTORS, Detector, Severity
 from tests.analysis.test_detectors import (
     _DISPATCH_BUG_REASON,
     _DISPATCH_NONHEAD_REASON,
+    _DISPATCH_RECONCILE_REASON,
     _DISPATCH_WHOLE_CARD_REASON,
     _STARTUP,
     _TRACEBACK,
@@ -247,6 +248,14 @@ CONTRACTS: dict[str, Contract] = {
     "detect_head_dispatch_stall": Contract(
         bridge=_bridge(_dispatch_stall("13:01:00.000", reason=_DISPATCH_BUG_REASON)),
         severity=Severity.CRITICAL,
+    ),
+    "detect_residency_reconciliation_holds": Contract(
+        # A single reconcile hold over a ~10-minute session: low rate, small parked share, so informational.
+        bridge=_bridge(
+            _dispatch_stall("18:30:00.000", reason=_DISPATCH_RECONCILE_REASON, parked=11),
+            "2026-06-24 18:40:00.000 | INFO | x:y:1 - Submitted generation abcd1234 for 50.00 kudos.",
+        ),
+        severity=Severity.INFO,
     ),
     "detect_whole_card_convergence_wedge": Contract(
         bridge=_bridge(

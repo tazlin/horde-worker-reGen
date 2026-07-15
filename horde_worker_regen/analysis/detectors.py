@@ -100,6 +100,14 @@ _LOST_SAFETY_RESULT_RE = re.compile(r"Expected to find a completed job .* none w
 # it, yet nothing dispatched).
 _DISPATCH_STALL_RE = re.compile(r"Inference dispatch stalled: head ")
 _DISPATCH_STALL_BUG_RE = re.compile(r"dispatch was withheld with no matching gate")
+# The dispatch residency-reconciliation hold: the scheduler is holding a resident-idle head while it evicts
+# an idle sibling's VRAM so the head's on-device materialisation fits the card. This is a benign, self-
+# clearing swap-churn wait, not a scheduler bug, so it is excluded from the gate-less-stall detector and
+# surfaced on its own as a GPU-uptime duty cost. The model and parked seconds ride the stall wrapper.
+_DISPATCH_STALL_RECONCILE_RE = re.compile(r"held to reconcile residency")
+_DISPATCH_STALL_FIELDS_RE = re.compile(
+    r"Inference dispatch stalled: head \S+ \((?P<model>.+?)\) has been parked (?P<parked>\d+)s:",
+)
 # The whole-card residency convergence deadlock: a heavy head is pre-staged and waiting for sole residency,
 # but an idle sibling holds a model that is still queued behind it, so the scale-down guard protects that
 # sibling from the teardown and the residency never collapses. The head is parked until the recovery
@@ -135,15 +143,32 @@ _DEDICATED_POST_PROCESS_RE = re.compile(
     r"\bPOST_PROCESS(?:\)|ING\b)|Post-processing (?:job|for job|finished)|dedicated post-process",
     re.IGNORECASE,
 )
-_LOW_VRAM_STREAM_RE = re.compile(
-    r"Free VRAM: \d+ MB.*(?:below .*inference reserve|reclaimable torch cache|stream|til)",
-    re.IGNORECASE,
-)
+# The routine device-wide free-VRAM readout hordelib emits on *every* log_free_ram call. Its
+# "reclaimable torch cache" note is present on almost all of them, so matching that note counted the whole
+# session's readouts as warnings; the leading "Free VRAM: N MB" value is the only signal of an actually low
+# reading. The genuinely-alarming below-reserve streaming warning is a distinct, throttled WARNING line with
+# no colon after "Free VRAM" (see :data:`_LOW_VRAM_RESERVE_WARN_RE`).
+_LOW_VRAM_READOUT_RE = re.compile(r"Free VRAM: (?P<free_mb>\d+) MB")
+# hordelib's throttled warning that measured free VRAM fell below the inference working-set reserve, so a
+# sampling step must stream activations over the bus and run several times slower. This is the alarming
+# signal (it fires only under the reserve, already rate-limited), so it counts directly.
+_LOW_VRAM_RESERVE_WARN_RE = re.compile(r"Free VRAM \d+ MB is below the \d+ MB inference reserve")
+# A free-VRAM readout at or below this counts as a genuine low-VRAM dip. Chosen against the 16GB cards this
+# lane runs on: their steady-state readouts sit near 9-10GB free, and a sampling working set needs a few GB,
+# so a reading under 4GB free is approaching the driver's streaming cliff rather than routine headroom. This
+# is a reporting contract, not a scheduling threshold: it only decides which readouts the overlap detector
+# treats as evidence.
+_LOW_FREE_VRAM_MB_THRESHOLD = 4096
 # The feature-level circuit breaker disabling post-processing after a run of over-commit faults. Its trip
 # line is the operator advisory: it confirms the spiral reached the self-protective latch (post-processing is
 # now off until restart), so a session carrying it is escalated and the remediation points at the restart +
 # downgrade. The phrase is the worker's verbatim breaker-trip line (process_manager).
 _POST_PROCESSING_BREAKER_RE = re.compile(r"Post-processing fault breaker tripped")
+# The parent's measured WDDM demand-paging verdict: worker child allocations demoted to system memory. This is
+# the direct proof that co-resident work drove the device past its real headroom, so it corroborates a
+# post-processing/inference overlap as a genuine stall rather than admitted co-residency. The phrase is the
+# inference scheduler's verbatim rising-edge line (note_wddm_paging).
+_WDDM_PAGING_RE = re.compile(r"WDDM demand-paging detected on worker processes")
 
 # A median pop->submit latency this many times the median generation time means jobs are aging in the
 # pipeline queue, not in generation (the post-inference safety-backlog signature).
@@ -193,6 +218,25 @@ Detector = Callable[[SessionContext], "list[Finding]"]
 def _matching(records: list[LogRecord], pattern: re.Pattern[str]) -> list[LogRecord]:
     """Orchestrator records whose message matches ``pattern``."""
     return [record for record in records if pattern.search(record.message)]
+
+
+def _low_free_vram_records(records: list[LogRecord]) -> list[LogRecord]:
+    """Records reporting a genuinely low free-VRAM condition, not the routine full-headroom readout flood.
+
+    A routine readout counts only when its parsed ``Free VRAM: N MB`` value is under
+    :data:`_LOW_FREE_VRAM_MB_THRESHOLD`; the below-inference-reserve streaming warning always counts (it fires
+    only under the reserve). Order-preserving over the input.
+    """
+    low: list[LogRecord] = []
+    for record in records:
+        readout = _LOW_VRAM_READOUT_RE.search(record.message)
+        if readout is not None:
+            if int(readout.group("free_mb")) < _LOW_FREE_VRAM_MB_THRESHOLD:
+                low.append(record)
+            continue
+        if _LOW_VRAM_RESERVE_WARN_RE.search(record.message):
+            low.append(record)
+    return low
 
 
 def _window_key(record: LogRecord) -> datetime:
@@ -395,11 +439,25 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
 
 
 def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
-    """Post-processing overlapped with generation until ComfyUI fell back to low-VRAM streaming.
+    """Post-processing overlapped with generation, distinguishing an admitted co-residency from a real stall.
 
     The dedicated post-processing lane keeps the upscaler/face-fixer work out of the inference process, but
-    it still allocates on the same GPU. A low-free-VRAM warning while that lane is active means the
-    post-processing peak and concurrent inference residency were admitted against the same device headroom.
+    it still allocates on the same GPU. The scheduler admits sampling and post-processing co-residency when
+    measured device truth affords it, so a low-free-VRAM reading while that lane is active is a tight-but-
+    healthy overlap by default, not an over-commit. Bare co-occurrence therefore surfaces as an
+    informational, audit-only finding.
+
+    It escalates to a warning only when a corroborating signal confirms the overlap actually cost the
+    device its headroom: a post-processing watchdog reap in the window, a parent WDDM demand-paging verdict
+    (worker allocations demoted to system memory), or a child free-VRAM reading below the configured
+    inference reserve (not merely low). Dropped jobs, forced maintenance, or a tripped fault breaker escalate
+    it further to critical.
+
+    "Low" is a genuine dip, not the routine readout flood: the child logs a free-VRAM readout on every
+    heartbeat, so a reading counts only when its parsed free VRAM is under
+    :data:`_LOW_FREE_VRAM_MB_THRESHOLD` (or it is the throttled below-inference-reserve streaming warning,
+    which is alarming by construction and is itself a corroborating signal). The verdict's count is of those
+    genuine readings, not of every readout.
     """
     stalls = _matching(context.session.records, _POST_PROCESSING_STALL_RE)
     breaker_trips = _matching(context.session.records, _POST_PROCESSING_BREAKER_RE)
@@ -408,7 +466,7 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
         child_records,
         _DEDICATED_POST_PROCESS_RE,
     )
-    low_vram_warnings = _matching(child_records, _LOW_VRAM_STREAM_RE)
+    low_vram_warnings = _low_free_vram_records(child_records)
     if not stalls and not breaker_trips and not (dedicated_activity and low_vram_warnings):
         return []
     post_processing_recoveries = [
@@ -417,6 +475,35 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
     dropped = _total_dropped_jobs(context.session.records)
     forced_maintenance = bool(_matching(context.session.records, _MAINTENANCE_POP_RE))
     escalated = dropped > 0 or forced_maintenance or bool(breaker_trips)
+
+    # Corroboration that the overlap was a genuine stall rather than admitted co-residency: a watchdog reap,
+    # the parent's measured WDDM paging verdict, or a reading below the inference reserve (streaming fallback).
+    below_reserve = [r for r in child_records if _LOW_VRAM_RESERVE_WARN_RE.search(r.message)]
+    wddm_paging = _matching(context.session.records, _WDDM_PAGING_RE)
+    corroborated = bool(stalls) or bool(wddm_paging) or bool(below_reserve)
+    if not escalated and not corroborated:
+        return [
+            Finding(
+                id="post_processing_vram_stall",
+                severity=Severity.INFO,
+                title="Post-processing co-resident with sampling (admitted)",
+                verdict=(
+                    f"Dedicated post-processing activity coincided with {len(low_vram_warnings)} child "
+                    "low-free-VRAM reading(s), but nothing corroborated a stall: no post-processing watchdog "
+                    "reap, no WDDM demand-paging, and no reading below the inference reserve. The scheduler "
+                    "admits sampling and post-processing co-residency when measured device truth affords it, "
+                    "so this is admitted co-residency operating as intended, not a stall. Recorded for audit."
+                ),
+                remediation=(
+                    "No action needed: this is admitted co-residency, not an over-commit. If throughput "
+                    "actually degrades, look for a corroborating signal (a post-processing watchdog reap, a "
+                    "WDDM demand-paging verdict, or a below-inference-reserve streaming warning), which "
+                    "escalates this finding to a warning."
+                ),
+                evidence=[_evidence(r) for r in (dedicated_activity[:2] + low_vram_warnings[:2])],
+                see_also="vram_ram_budget_subsystem",
+            ),
+        ]
     verdict = (
         f"{len(stalls)} post-processing watchdog reap(s), {len(low_vram_warnings)} child low-free-VRAM "
         "warning(s), and dedicated post-processing activity were observed in the same session. The "
@@ -459,6 +546,13 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
             see_also="vram_ram_budget_subsystem",
         ),
     ]
+
+
+# Residency-reconciliation holds are benign at low volume; sustained, they are a real swap-churn duty cost.
+# A rate past this many holds per hour, or a cumulative parked share past this fraction of the session, is
+# worth a warning rather than the informational default.
+_RECONCILE_HOLD_RATE_WARNING_PER_HOUR = 30.0
+_RECONCILE_HOLD_PARKED_FRACTION_WARNING = 0.05
 
 
 _PP_DEFER_RE = re.compile(r"Deferring post-processing for job ([0-9a-f][0-9a-f-]{7,35})")
@@ -1345,13 +1439,16 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     leave no record of *why* the head was parked. The new dispatch-stall log names the blocking gate; the
     "no matching gate" variant is the genuinely anomalous case (the head's model is resident and idle, no
     gate is holding it, yet nothing dispatched) and is reported as critical, the rest as a warning. The
-    whole-card convergence wedge (:func:`detect_whole_card_convergence_wedge`) and the non-head residency
-    starvation (:func:`detect_whole_card_nonhead_residency_starvation`) have their own detectors, so their
-    lines are excluded here to avoid double-reporting the same stall as a generic warning.
+    whole-card convergence wedge (:func:`detect_whole_card_convergence_wedge`), the non-head residency
+    starvation (:func:`detect_whole_card_nonhead_residency_starvation`), and the residency-reconciliation
+    holds (:func:`detect_residency_reconciliation_holds`) have their own detectors, so their lines are
+    excluded here to avoid double-reporting the same stall as a generic warning. A reconcile hold in
+    particular is a benign swap-churn wait, not a gate-less scheduler stall, and must never read as the bug.
     """
-    excluded = _matching(context.session.records, _WHOLE_CARD_WEDGE_RE) + _matching(
-        context.session.records,
-        _WHOLE_CARD_NONHEAD_RE,
+    excluded = (
+        _matching(context.session.records, _WHOLE_CARD_WEDGE_RE)
+        + _matching(context.session.records, _WHOLE_CARD_NONHEAD_RE)
+        + _matching(context.session.records, _DISPATCH_STALL_RECONCILE_RE)
     )
     stalls = [r for r in _matching(context.session.records, _DISPATCH_STALL_RE) if r not in excluded]
     if not stalls:
@@ -1394,6 +1491,78 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
                 "overlap-headway behaviour, or the VRAM budget that is deferring the preload."
             ),
             evidence=[_evidence(r) for r in stalls[:3]],
+        ),
+    ]
+
+
+def detect_residency_reconciliation_holds(context: SessionContext) -> list[Finding]:
+    """The dispatch residency-reconciliation gate holding a resident head while it evicts idle VRAM.
+
+    When a resident-idle head's on-device materialisation would over-commit the card, the scheduler holds its
+    dispatch for a few ticks while it evicts an idle sibling's VRAM, then dispatches once the room is freed.
+    This is not a scheduler bug: it is the swap-churn cost of packing more models onto one card than fit at
+    peak. Reported so that cost is visible and not mistaken for a wedge. Benign (informational) at low volume;
+    a warning when the holds are frequent (past :data:`_RECONCILE_HOLD_RATE_WARNING_PER_HOUR`) or when their
+    cumulative parked time is a meaningful share of the session (past
+    :data:`_RECONCILE_HOLD_PARKED_FRACTION_WARNING`). The per-hold parked seconds are read off the stall
+    wrapper; because the parked-head log is throttled, the cumulative figure is a sample of the true parked
+    time, not an exact total.
+    """
+    holds = [
+        r
+        for r in _matching(context.session.records, _DISPATCH_STALL_RE)
+        if _DISPATCH_STALL_RECONCILE_RE.search(r.message)
+    ]
+    if not holds:
+        return []
+
+    per_model: dict[str, int] = {}
+    parked_seconds_total = 0.0
+    for record in holds:
+        fields = _DISPATCH_STALL_FIELDS_RE.search(record.message)
+        if fields is None:
+            continue
+        per_model[fields.group("model")] = per_model.get(fields.group("model"), 0) + 1
+        parked_seconds_total += float(fields.group("parked"))
+
+    duration = context.session.duration_seconds
+    holds_per_hour = (len(holds) / duration * 3600.0) if duration else 0.0
+    parked_fraction = (parked_seconds_total / duration) if duration else 0.0
+    escalated = (
+        holds_per_hour > _RECONCILE_HOLD_RATE_WARNING_PER_HOUR
+        or parked_fraction > _RECONCILE_HOLD_PARKED_FRACTION_WARNING
+    )
+
+    model_breakdown = ", ".join(
+        f"{model} x{count}" for model, count in sorted(per_model.items(), key=lambda kv: -kv[1])
+    )
+    return [
+        Finding(
+            id="residency_reconciliation_holds",
+            severity=Severity.WARNING if escalated else Severity.INFO,
+            title="Dispatch held to reconcile residency (idle-VRAM eviction swap-churn)",
+            verdict=(
+                f"The scheduler held a resident head's dispatch to reconcile residency {len(holds)} time(s) "
+                f"(~{holds_per_hour:.0f}/hour), evicting an idle sibling's VRAM so the head's materialisation "
+                f"fit the card before it committed. Per model: {model_breakdown}. Roughly {parked_seconds_total:.0f}s "
+                f"of head parking was observed across these holds"
+                + (f" (~{parked_fraction:.0%} of the session)." if duration else ".")
+                + " This is the swap-churn cost of packing more models onto the card than fit at peak, not a "
+                "scheduler wedge: each hold self-clears once the eviction frees room."
+                + (
+                    " Sustained at this volume it is a real throughput and GPU-uptime drag."
+                    if escalated
+                    else " At this volume it is a benign, low-cost duty note."
+                )
+            ),
+            remediation=(
+                "If this volume is high, reduce the co-resident model pressure that forces the evictions: lower "
+                "the served model set or concurrency for this VRAM size, or confirm the per-context VRAM cost is "
+                "measured so the card is not over-packed at peak. A handful of holds is normal headroom "
+                "management and needs no action."
+            ),
+            evidence=[_evidence(r) for r in holds[:3]],
+            see_also="head_dispatch_stall",
         ),
     ]
 
@@ -1518,6 +1687,7 @@ DETECTORS: list[Detector] = [
     detect_whole_card_nonhead_residency_starvation,
     detect_whole_card_residency_churn,
     detect_head_dispatch_stall,
+    detect_residency_reconciliation_holds,
     detect_consecutive_failure_pause,
     detect_pop_governor_dominance,
     detect_stuck_inference_step,

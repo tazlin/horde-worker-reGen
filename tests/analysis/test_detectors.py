@@ -670,6 +670,23 @@ _DISPATCH_BUG_REASON = (
     "its model is resident and idle on process 1 but dispatch was withheld with no matching gate; this is a "
     "scheduler stall worth reporting"
 )
+# The dispatch residency-reconciliation attribution (inference_scheduler._classify_dispatch_stall): the head
+# is resident and idle but the dispatch gate is holding it while it evicts idle VRAM so the head's on-device
+# materialisation fits. A benign, self-clearing swap-churn wait, not the gate-less scheduler-bug stall.
+_DISPATCH_RECONCILE_REASON = (
+    "its model is resident and idle on process 1, but dispatch is held to reconcile residency (evicting idle "
+    "VRAM): its materialisation would over-commit the card until an idle resident is evicted, and it "
+    "dispatches once that eviction frees room"
+)
+# The post-processing co-residency defer attribution (inference_scheduler._classify_dispatch_stall): the head
+# is resident and idle but an in-flight post-processing chain's committed VRAM and this job's sampling peak
+# cannot share the card, so dispatch is held until the chain finishes. A real named head-park (worth seeing as
+# a warning), not the gate-less scheduler-bug stall.
+_DISPATCH_POST_PROCESSING_REASON = (
+    "its model is resident and idle on process 1, but dispatch is held while an in-flight post-processing "
+    "chain finishes: the chain's committed VRAM and this job's sampling peak cannot share the card, and it "
+    "dispatches once the chain releases the device"
+)
 # The whole-card residency convergence attribution (inference_scheduler._diagnose_dispatch_stall): the head is
 # resident and idle, but an idle sibling holding a still-queued model was not torn down by the convergence.
 _DISPATCH_WHOLE_CARD_REASON = (
@@ -895,6 +912,104 @@ class TestHeadDispatchStall:
         )
         assert "head_dispatch_stall" not in _diagnose(tmp_path, bridge)
 
+    def test_post_processing_defer_is_a_warning_not_critical(self, tmp_path: Path) -> None:
+        """A post-processing co-residency defer is a named gate: a parked-head warning, never the bug-critical.
+
+        The PP-defer line names its gate, so it must not match the gate-less ``no matching gate`` bug phrase.
+        It is kept as a named-gate warning (real head-parked time worth seeing), not excluded like the benign
+        reconcile hold.
+        """
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_POST_PROCESSING_REASON),
+                _dispatch_stall("13:01:40.000", reason=_DISPATCH_POST_PROCESSING_REASON),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "head_dispatch_stall" in findings
+        assert findings["head_dispatch_stall"].severity is Severity.WARNING
+
+    def test_reconcile_hold_is_not_a_head_dispatch_stall(self, tmp_path: Path) -> None:
+        """A residency-reconciliation hold must not masquerade as the gate-less scheduler-bug stall.
+
+        The reconcile-hold line carries its own attribution now; it is a benign swap-churn wait, so it must
+        neither trip the CRITICAL ``no matching gate`` finding nor the generic parked-head warning.
+        """
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_RECONCILE_REASON, parked=11),
+                _dispatch_stall("13:01:40.000", reason=_DISPATCH_RECONCILE_REASON, parked=11),
+            ],
+        )
+        assert "head_dispatch_stall" not in _diagnose(tmp_path, bridge)
+
+
+class TestResidencyReconciliationHolds:
+    """The dispatch residency-reconciliation gate holding a resident head while it evicts idle VRAM.
+
+    This is a real GPU-uptime signal (swap-churn duty cost), not a scheduler bug: benign at low volume,
+    worth a warning when the holds pile up (by rate or by the share of the session spent parked).
+    """
+
+    def _reconcile(self, ts: str, *, model: str = "AlbedoBase XL (SDXL)", parked: int = 11) -> str:
+        return _dispatch_stall(ts, reason=_DISPATCH_RECONCILE_REASON, model=model, parked=parked)
+
+    def test_low_volume_reconcile_holds_are_info(self, tmp_path: Path) -> None:
+        """A handful of reconcile holds across a long session is a benign, informational swap-churn note."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                self._reconcile("13:10:00.000"),
+                self._reconcile("13:30:00.000", model="CyberRealistic Pony"),
+                self._reconcile("13:50:00.000"),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "residency_reconciliation_holds" in findings
+        assert findings["residency_reconciliation_holds"].severity is Severity.INFO
+        verdict = findings["residency_reconciliation_holds"].verdict
+        assert "AlbedoBase XL (SDXL)" in verdict
+        assert "CyberRealistic Pony" in verdict
+
+    def test_high_rate_reconcile_holds_are_warning(self, tmp_path: Path) -> None:
+        """Many reconcile holds per hour is a throughput-shaping swap-churn cost worth a warning."""
+        lines = [f"2026-06-25 14:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}"]
+        # 40 holds inside a ~20 minute window is ~120/hour, well past the rate threshold.
+        for i in range(40):
+            minute, second = divmod(i * 30, 60)
+            lines.append(self._reconcile(f"14:{minute:02d}:{second:02d}.000"))
+        findings = _diagnose(tmp_path, "\n".join(lines))
+        assert "residency_reconciliation_holds" in findings
+        assert findings["residency_reconciliation_holds"].severity is Severity.WARNING
+
+    def test_high_parked_share_reconcile_holds_are_warning(self, tmp_path: Path) -> None:
+        """Few holds, but each parked long enough that they dominate a share of the session, is a warning."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 15:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                self._reconcile("15:02:00.000", parked=90),
+                self._reconcile("15:04:00.000", parked=90),
+                self._reconcile("15:06:00.000", parked=90),
+                self._reconcile("15:08:00.000", parked=90),
+                self._reconcile("15:10:00.000", parked=90),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "residency_reconciliation_holds" in findings
+        assert findings["residency_reconciliation_holds"].severity is Severity.WARNING
+
+    def test_silent_without_reconcile_holds(self, tmp_path: Path) -> None:
+        """A session with no reconcile-hold stall lines produces no finding."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_GATE_REASON),
+            ],
+        )
+        assert "residency_reconciliation_holds" not in _diagnose(tmp_path, bridge)
+
 
 class TestPostProcessingVramStall:
     """A slot reaped silent in post-processing, plus the breaker advisory that escalates the session.
@@ -903,6 +1018,13 @@ class TestPostProcessingVramStall:
     advisory and any forced maintenance escalate it to critical. The detector must also fire on a
     breaker-only session, since the planner's unhostable-peak faults can trip the breaker with no watchdog
     stall line of their own.
+
+    Bare co-occurrence of dedicated post-processing activity and child low-free-VRAM readings is no longer
+    a warning on its own: the scheduler now admits sampling/post-processing co-residency when measured
+    device truth affords it, so a tight-but-healthy overlap is an admitted operating mode. Such a case
+    downgrades to an informational, audit-only finding unless a corroborating signal is present: a
+    post-processing watchdog reap, WDDM demand-paging in the window, or a reading below the inference
+    reserve (not merely low). Any of those keeps the warning semantics and text.
     """
 
     def _bridge(self, *lines: str) -> str:
@@ -947,8 +1069,14 @@ class TestPostProcessingVramStall:
         assert "post_processing_vram_stall" in findings
         assert findings["post_processing_vram_stall"].severity is Severity.CRITICAL
 
-    def test_dedicated_lane_low_vram_warning_fires(self, tmp_path: Path) -> None:
-        """Dedicated post-processing plus Comfy low-free-VRAM warnings is enough to diagnose the overlap."""
+    def test_uncorroborated_co_residency_is_info(self, tmp_path: Path) -> None:
+        """Dedicated post-processing plus a low readout, with nothing corroborating, is admitted co-residency.
+
+        This is the live false-positive: post-processing active, a low child free-VRAM reading, but no
+        watchdog reap, no WDDM paging, and nothing below the inference reserve. The scheduler admits this
+        overlap deliberately, so the finding must downgrade to an informational, audit-only note rather than
+        a warning, and its text must name it as admitted co-residency.
+        """
         child = "\n".join(
             [
                 "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
@@ -958,8 +1086,116 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         findings = _diagnose(tmp_path, bridge, {"bridge_1.log": child})
         finding = findings["post_processing_vram_stall"]
-        assert finding.severity is Severity.WARNING
+        assert finding.severity is Severity.INFO
+        assert "admitted co-residency" in finding.verdict
         assert "low-free-VRAM" in finding.verdict
+
+    def test_wddm_paging_corroborates_warning(self, tmp_path: Path) -> None:
+        """A WDDM demand-paging verdict in the window corroborates the overlap and keeps the warning."""
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
+                "2026-06-28 16:53:14.000 | WARNING | comfy.model_management:free_memory:1110 - Free VRAM: 316 MB (+5272 MB reclaimable torch cache; comfy sees 5588)",
+            ],
+        )
+        bridge = self._bridge(self._wddm_paging("16:53:20.000"))
+        finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
+        assert finding.severity is Severity.WARNING
+
+    def test_no_finding_without_post_processing_activity(self, tmp_path: Path) -> None:
+        """Low child free-VRAM readings without any dedicated post-processing activity produce no finding."""
+        child = "\n".join(
+            [
+                self._free_vram_readout("16:53:13.000", free_mb=316),
+                self._free_vram_readout("16:53:14.000", free_mb=800),
+            ],
+        )
+        bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
+        assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge, {"bridge_1.log": child})
+
+    @staticmethod
+    def _free_vram_readout(ts: str, *, free_mb: int) -> str:
+        """The routine device-wide free-VRAM readout hordelib emits on every log_free_ram call (DEBUG)."""
+        return (
+            f"2026-06-28 {ts} | DEBUG | hordelib.comfy_horde:log_free_ram:600 - "
+            f"Free VRAM: {free_mb} MB (+5272 MB reclaimable torch cache; comfy sees {free_mb + 5272}), "
+            "Free RAM: 40000 MB"
+        )
+
+    @staticmethod
+    def _wddm_paging(ts: str, *, pid: int = 1234, shared_mb: int = 640) -> str:
+        """inference_scheduler.note_wddm_paging: the parent's WDDM demand-paging verdict (bridge WARNING)."""
+        return (
+            f"2026-06-28 {ts} | WARNING | horde_worker_regen.process_management.scheduling.inference_scheduler:note_wddm_paging:6964 - "
+            f"WDDM demand-paging detected on worker processes (pid {pid}: {shared_mb}MB shared); the driver "
+            "demoted their VRAM allocations to system memory. Denying model retention and reclaiming idle "
+            "resident VRAM (newest idle resident first)."
+        )
+
+    @staticmethod
+    def _reserve_warning(ts: str, *, free_mb: int = 316, reserve_mb: int = 2048) -> str:
+        """The throttled, genuinely-alarming below-inference-reserve streaming warning (WARNING)."""
+        return (
+            f"2026-06-28 {ts} | WARNING | hordelib.comfy_horde:log_free_ram:624 - "
+            f"Free VRAM {free_mb} MB is below the {reserve_mb} MB inference reserve: sampling activations will "
+            "stream from host RAM and run several times slower (ComfyUI reports no offload, so the GPU driver's "
+            "system-memory fallback is the likely cause)."
+        )
+
+    def test_benign_high_vram_readouts_do_not_count(self, tmp_path: Path) -> None:
+        """Routine ~9.8GB-free readouts must not be counted as low-VRAM warnings (the miscount bug).
+
+        Every log_free_ram readout carries the ``reclaimable torch cache`` note, so counting readouts flagged
+        the whole session; only readings that are genuinely low should count. With dedicated activity but no
+        genuinely-low reading, the overlap detector must stay silent.
+        """
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
+                self._free_vram_readout("16:53:13.000", free_mb=9800),
+                self._free_vram_readout("16:53:14.000", free_mb=9820),
+                self._free_vram_readout("16:53:15.000", free_mb=9790),
+                self._free_vram_readout("16:53:16.000", free_mb=9805),
+            ],
+        )
+        bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
+        assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge, {"bridge_1.log": child})
+
+    def test_low_vram_dips_counted_not_readouts(self, tmp_path: Path) -> None:
+        """The summary reports the count of genuinely-low readings, not the flood of routine readouts.
+
+        The low readings here are merely-low readouts (above the inference reserve), so nothing corroborates
+        a stall and the finding is the audit-only informational note; the count must still be surfaced.
+        """
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
+                self._free_vram_readout("16:53:13.000", free_mb=9800),
+                self._free_vram_readout("16:53:14.000", free_mb=9820),
+                self._free_vram_readout("16:53:15.000", free_mb=9790),
+                self._free_vram_readout("16:53:16.000", free_mb=316),
+                self._free_vram_readout("16:53:17.000", free_mb=800),
+            ],
+        )
+        bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
+        finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
+        assert finding.severity is Severity.INFO
+        assert "2 child low-free-VRAM" in finding.verdict
+
+    def test_reserve_warning_is_alarming_and_counts(self, tmp_path: Path) -> None:
+        """The below-inference-reserve streaming warning corroborates the overlap and keeps the warning."""
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
+                self._free_vram_readout("16:53:13.000", free_mb=9800),
+                self._free_vram_readout("16:53:14.000", free_mb=9820),
+                self._reserve_warning("16:53:15.000"),
+            ],
+        )
+        bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
+        finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
+        assert finding.severity is Severity.WARNING
+        assert "1 child low-free-VRAM" in finding.verdict
 
     def test_silent_without_signals(self, tmp_path: Path) -> None:
         """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
