@@ -44,6 +44,7 @@ _KNOWN_SAMPLES: dict[str, list[str]] = {
     "child_stderr": ["stderr_0.log", "stderr_2.log"],
     "supervisor_loop": ["bridge_tui.log", "bridge_host.log", "bridge_tui.2026-06-22_00-55-59.log.zip"],
     "main_console": ["bridge_main_console.log"],
+    "utilities_console": ["bridge_utilities_0.log", "bridge_utilities_3.log"],
     "startup_crash": [
         "bridge_main_startup.log",
         "bridge_inference_1_startup.log",

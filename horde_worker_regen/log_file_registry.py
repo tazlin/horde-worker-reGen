@@ -119,6 +119,14 @@ WORKER_LOG_FILE_SPECS: tuple[LogFileSpec, ...] = (
         description="A supervised worker's console redirect, kept out of the TUI's own screen.",
     ),
     LogFileSpec(
+        name="utilities_console",
+        pattern=re.compile(r"bridge_utilities_\d+\.log"),
+        kind="raw_stream",
+        writer="horde_image_utilities.launcher.CapabilityServerProcess (utilities lane subprocess redirect)",
+        description="The out-of-venv image-utilities lane subprocess's stdout/stderr (uvicorn + native stack), "
+        "keyed by lane slot; it is not a hordelib child, so it has no per-slot HordeLog sinks.",
+    ),
+    LogFileSpec(
         name="startup_crash",
         pattern=re.compile(r"bridge_.+_startup\.log"),
         kind="startup_crash",

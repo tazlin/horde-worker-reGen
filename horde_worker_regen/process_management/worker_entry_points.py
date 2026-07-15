@@ -1081,6 +1081,7 @@ class UtilitiesAdapterFactory(Protocol):
         device_index: int,
         python_executable: str,
         child_env: dict[str, str],
+        log_path: str | None = None,
     ) -> "UtilitiesLaneAdapter":
         """Build the image-utilities lane adapter over a capability service run by ``python_executable``."""
 
@@ -1094,17 +1095,23 @@ def create_utilities_adapter(
     device_index: int,
     python_executable: str,
     child_env: dict[str, str],
+    log_path: str | None = None,
 ) -> "UtilitiesLaneAdapter":
     """Build the real image-utilities lane adapter over a ``CapabilityServerProcess``.
 
     The heavy imports (``horde_image_utilities`` and the adapter module) are deferred to call time so this
     default is safe to reference from the torch-free orchestrator even when the utilities venv is absent.
+
+    ``log_path`` redirects the out-of-venv service's stdout/stderr to a dedicated file. The service is not a
+    hordelib child, so it never gets the per-slot ``HordeLog`` sinks the other lanes do; without this its
+    only output (uvicorn's stream logs plus the native stack) would be commingled into the orchestrator's
+    console redirect or, unsupervised, lost to the terminal.
     """
     from horde_image_utilities.launcher import CapabilityServerProcess
 
     from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesProcessAdapter
 
-    server = CapabilityServerProcess(python_executable=python_executable, env=child_env)
+    server = CapabilityServerProcess(python_executable=python_executable, env=child_env, log_path=log_path)
     return UtilitiesProcessAdapter(
         process_id=process_id,
         process_message_queue=process_message_queue,

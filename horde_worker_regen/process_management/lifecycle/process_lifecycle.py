@@ -1209,6 +1209,21 @@ class ProcessLifecycleManager:
         env.update(self._utilities_device_pin_env(lane_card))
         return env
 
+    def _utilities_lane_log_path(self, process_id: int) -> str:
+        """Return the dedicated console-log path for the utilities lane occupying ``process_id``.
+
+        The lane is an out-of-venv subprocess, not a hordelib child, so it never receives the per-slot
+        ``HordeLog`` sinks; the launcher redirects its stdout/stderr here instead. Keyed by the lane's slot
+        so a multi-GPU deployment (one lane per device) does not interleave two lanes into one file. Matches
+        the ``bridge_utilities_<slot>.log`` family declared in :mod:`horde_worker_regen.log_file_registry`.
+        """
+        from pathlib import Path
+
+        log_dir = Path("logs")
+        with contextlib.suppress(Exception):
+            log_dir.mkdir(exist_ok=True)
+        return str(log_dir / f"bridge_utilities_{process_id}.log")
+
     def _utilities_interpreter_available(self) -> bool:
         """Return whether the real utilities venv interpreter exists (always True for an injected factory).
 
@@ -1261,6 +1276,7 @@ class ProcessLifecycleManager:
         pid = self._allocate_inference_pid()
         pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
         child_env = self._build_utilities_child_env(lane_card)
+        log_path = self._utilities_lane_log_path(pid)
 
         try:
             adapter = self._entry_points.utilities_adapter_factory(
@@ -1271,6 +1287,7 @@ class ProcessLifecycleManager:
                 device_index=lane_card.device_index,
                 python_executable=str(paths.utilities_python()),
                 child_env=child_env,
+                log_path=log_path,
             )
             adapter.start()
         except Exception as e:

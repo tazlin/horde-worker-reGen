@@ -105,6 +105,20 @@ message carries it as `reported_os_pid`. The parent adopts that value over its h
 per-PID telemetry (WDDM paging attribution, the owned-PID registry) attributes the utilities subprocess
 correctly. Teardown is still driven through the control pipe and the handle's terminate/kill.
 
+## Logging
+
+The lane is not a hordelib child, so it never receives the per-slot `HordeLog` sinks (`bridge_<n>.log`,
+`trace_<n>.log`, `stdout_<n>.log`, `stderr_<n>.log`) every spawned child gets, and the service itself
+configures no logging of its own. Left alone its only output (uvicorn's stream logs plus whatever the
+native stack writes) would inherit the orchestrator's file descriptors: commingled into
+`bridge_main_console.log` when supervised, or lost to the terminal when not. To give it a durable,
+attributable home, the launcher redirects the subprocess's stdout and stderr to a dedicated
+`logs/bridge_utilities_<slot>.log`, keyed by the lane's process slot so a per-device multi-GPU deployment
+keeps each lane's output separate. The file is opened append (a crash-reaper restart reuses the slot and
+its path, so the prior run's tail survives) and is declared as a `raw_stream` family in the
+[log-file registry][horde_worker_regen.log_file_registry], so the startup purge, the TUI Logs tab, and the
+support bundle all recognize and group it.
+
 ## Job flow: pre-annotation, strip rerouting, pop gating
 
 ### ControlNet pre-annotation (availability-driven, in-graph fallthrough)

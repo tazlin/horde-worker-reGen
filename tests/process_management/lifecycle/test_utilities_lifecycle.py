@@ -98,6 +98,7 @@ def _make_utilities_plm(
         device_index: int,
         python_executable: str,
         child_env: dict[str, str],
+        log_path: str | None = None,
     ) -> _FakeAdapter:
         adapter = _FakeAdapter()
         constructed.append(adapter)

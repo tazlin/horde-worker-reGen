@@ -40,7 +40,7 @@ dependencies = [
     # Base package only (pillow/pydantic deps): the parent-side lane adapter and entry points import its
     # client and launcher in THIS venv. The heavy annotator/server stacks stay out of this resolution; they
     # are provisioned into the separate utilities venv from requirements/utilities/uv.lock.
-    "horde-image-utilities~=0.2.0",
+    "horde-image-utilities~=0.2.1",
     "python-dotenv",
     "ruamel.yaml",
     "semver",
