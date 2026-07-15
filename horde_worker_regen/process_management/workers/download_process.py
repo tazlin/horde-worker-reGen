@@ -795,6 +795,7 @@ class HordeDownloadProcess(HordeProcess):
             if manager.is_lora_available(task.model_name, is_version=is_version):
                 return True
             self._enforce_lora_disk_floor(manager)
+        fetch_started = time.monotonic()
         try:
             key, rejected_reason = manager.fetch_adhoc_lora_with_reason(
                 task.model_name,
@@ -808,6 +809,7 @@ class HordeDownloadProcess(HordeProcess):
             # spurious failure. The parent's per-job deadline remains the backstop for a truly-absent file.
             key = None
             rejected_reason = None
+        fetch_elapsed = time.monotonic() - fetch_started
         if key is not None:
             logger.success(f"Download process: prefetched LoRA {task.model_name}")
             return True
@@ -821,6 +823,15 @@ class HordeDownloadProcess(HordeProcess):
             logger.info(
                 f"Download process: LoRA {task.model_name!r} rejected from ad-hoc download ({rejected_reason}); "
                 "requesting job(s) will proceed without it.",
+            )
+        else:
+            # The plain-failure path: the fetch returned no key, surfaced no rejection reason, and the file is
+            # not on disk. Logged so a laundered transient failure is not silent (the success and rejection
+            # paths already log); the parent treats it as retryable within its per-job deadline.
+            logger.warning(
+                f"Download process: LoRA {task.model_name!r} (is_version={is_version}) not fetched after "
+                f"{fetch_elapsed:.1f}s: no key returned, no rejection surfaced, file not on disk. Transient/"
+                "retryable failure (no rejection reason to report); the parent's per-job deadline is the backstop.",
             )
         return False
 
@@ -840,6 +851,7 @@ class HordeDownloadProcess(HordeProcess):
         with self._manager_lock(TI_MANAGER_KEY):
             if manager.fuzzy_find_ti_key(task.model_name) is not None:
                 return True
+        fetch_started = time.monotonic()
         try:
             key, rejected_reason = manager.fetch_adhoc_ti_with_reason(
                 task.model_name,
@@ -851,6 +863,7 @@ class HordeDownloadProcess(HordeProcess):
             # through to the availability re-check rather than reporting a failure for a file now present.
             key = None
             rejected_reason = None
+        fetch_elapsed = time.monotonic() - fetch_started
         if key is not None:
             logger.success(f"Download process: prefetched TI {task.model_name}")
             return True
@@ -865,6 +878,15 @@ class HordeDownloadProcess(HordeProcess):
             logger.info(
                 f"Download process: TI {task.model_name!r} rejected from ad-hoc download ({rejected_reason}); "
                 "requesting job(s) will proceed without it.",
+            )
+        else:
+            # The plain-failure path: no key, no surfaced rejection, and the embedding is not on disk. Logged
+            # so a laundered transient failure is not silent (the success and rejection paths already log); the
+            # parent treats it as retryable within its per-job deadline.
+            logger.warning(
+                f"Download process: TI {task.model_name!r} not fetched after {fetch_elapsed:.1f}s: no key "
+                "returned, no rejection surfaced, file not on disk. Transient/retryable failure (no rejection "
+                "reason to report); the parent's per-job deadline is the backstop.",
             )
         return False
 

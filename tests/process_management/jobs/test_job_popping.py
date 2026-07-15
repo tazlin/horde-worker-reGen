@@ -1875,34 +1875,40 @@ class TestIdleFillLadderShaping:
         return popper._apply_idle_fill_ladder(set(baselines), max_power, make_mock_bridge_data())
 
     def test_rung0_offers_light_at_small_cap(self) -> None:
+        """Rung 0 is the first rung, offering light at small cap."""
         models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 0)
         assert models == {"sd15a"}
         assert cap == _SMALL_CAP
 
     def test_rung1_offers_light_at_large_cap(self) -> None:
+        """Rung 1 is the last light rung, offering light at large cap."""
         large = _SMALL_CAP * 4
         models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 1, max_power=large)
         assert models == {"sd15a"}
         assert cap == large
 
     def test_rung2_offers_heavy_at_small_cap(self) -> None:
+        """Rung 2 is the first heavy rung, offering heavy at small cap."""
         models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 2)
         assert models == {"sdxlA"}
         assert cap == _SMALL_CAP
 
     def test_rung3_offers_heavy_at_large_cap(self) -> None:
+        """Rung 3 is the last rung, offering heavy at large cap."""
         large = _SMALL_CAP * 4
         models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 3, max_power=large)
         assert models == {"sdxlA"}
         assert cap == large
 
     def test_absent_light_baseline_skips_to_heavy(self) -> None:
+        """Rung 0 is light, but if the worker has no light models, it should skip to the heavy rung."""
         # A worker with only SDXL models has no sd15 rungs, so rung 0 is the sdxl-small rung.
         models, cap = self._ladder({"sdxlA": _SDXL_BASELINE, "sdxlB": _SDXL_BASELINE}, 0)
         assert models == {"sdxlA", "sdxlB"}
         assert cap == _SMALL_CAP
 
     def test_extra_large_never_offered_as_fill(self) -> None:
+        """The EXTRA_LARGE tier is never offered as a fill rung, even if the worker has a model for it."""
         baselines = {"sd15a": _SD15_BASELINE, "fluxA": _FLUX_BASELINE}
         low, _ = self._ladder(baselines, 0)
         high, _ = self._ladder(baselines, 3)  # clamps to the last existing (light) rung
@@ -1910,6 +1916,10 @@ class TestIdleFillLadderShaping:
         assert "fluxA" not in high
 
     def test_metadata_none_falls_back_to_flat_small(self) -> None:
+        """When the popper has no model metadata, the rung logic cannot narrow by baseline.
+
+        It should fall back to the small-cap slice of all models.
+        """
         large = _SMALL_CAP * 4
         popper = _make_popper(state=_idle_fill_state(0), image_models_to_load=["m1", "m2"])
         popper._model_metadata = None  # type: ignore[assignment]

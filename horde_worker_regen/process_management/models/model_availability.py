@@ -39,6 +39,7 @@ class ModelAvailability:
     _sdxl_controlnet_present: bool | None
     _post_processing_present: bool | None
     _controlnet_failed: bool
+    _downloader_lost: bool
 
     def __init__(self) -> None:
         """Initialise with availability unknown (no report received yet)."""
@@ -54,6 +55,7 @@ class ModelAvailability:
         self._sdxl_controlnet_present = None
         self._post_processing_present = None
         self._controlnet_failed = False
+        self._downloader_lost = False
 
     @property
     def is_known(self) -> bool:
@@ -126,6 +128,24 @@ class ModelAvailability:
         )
 
     @property
+    def downloader_lost(self) -> bool:
+        """Whether the background download process is currently known to be gone (dead, not restarting).
+
+        Set when the parent gives up restarting a silently-dead download process, so LoRA/auxiliary
+        advertising is withheld: with no downloader there is no path to place a job's LoRAs or TIs on disk.
+        Cleared the moment the download process reports again (a fresh report means a live downloader).
+        """
+        return self._downloader_lost
+
+    def mark_downloader_lost(self) -> None:
+        """Record that no live download process exists, so LoRA/auxiliary advertising is withheld."""
+        self._downloader_lost = True
+
+    def note_downloader_present(self) -> None:
+        """Record that a download process is (again) present, restoring LoRA/auxiliary advertising."""
+        self._downloader_lost = False
+
+    @property
     def present(self) -> set[str] | None:
         """The models present on disk, or ``None`` if not yet reported."""
         return set(self._present) if self._present is not None else None
@@ -162,6 +182,8 @@ class ModelAvailability:
         controlnet_failed: bool = False,
     ) -> None:
         """Replace the availability snapshot with a fresh report from the download process."""
+        # A fresh report is proof of a live downloader: clear any prior lost verdict so advertising recovers.
+        self._downloader_lost = False
         self._present = set(present)
         self._currently_downloading = currently_downloading
         self._pending = pending

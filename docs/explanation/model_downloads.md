@@ -127,16 +127,29 @@ The download process reports a per-file outcome back to the parent. A success ma
 the session auxiliary cache and, once every LoRA and textual inversion a pending job
 needs is present, clears that job's dispatch gate. Failure handling is kind-agnostic
 across LoRAs and textual inversions. A terminal *rejection* (a file the fetch API
-permanently refuses: a LoRA that is invalid, too large, or NSFW on an SFW-only worker;
-a textual inversion the API rejects) is recorded as skipped so the job's auxiliary set
-counts as ready without it and the job dispatches rather than faulting, and a later job
-referencing the same file is neither re-requested nor re-faulted. A rejection arms no
-backoff (it is a property of that one file, not a sick download path). A plain
-*failure* (a transient transfer error) faults the affected pending job promptly (it
-holds no lane or reservation, so nothing in flight is disturbed) and arms that file's
+permanently refuses: a LoRA that is invalid, too large, NSFW on an SFW-only worker, or
+definitively not found upstream; a textual inversion the API rejects or reports missing)
+is recorded as skipped so the job's auxiliary set counts as ready without it and the job
+dispatches rather than faulting, and a later job referencing the same file is neither
+re-requested nor re-faulted. A rejection arms no backoff (it is a property of that one
+file, not a sick download path). The fetch layer surfaces a definitive upstream not-found
+(a metadata `401`/`404`) as its own terminal reason, distinct from a transient outage
+(an exhausted retry budget), so a reference that can never exist is skipped once rather
+than retried into a fault storm.
+
+A plain *failure* (a transient transfer error) faults the affected pending job promptly
+(it holds no lane or reservation, so nothing in flight is disturbed) and arms that file's
 per-class download backoff, exactly as an inference-side aux failure does: once a class
 incident is active a fresh failure of that class is classified terminal rather than
-requeued into the same failing path.
+requeued into the same failing path. When a plain failure is classified *terminal* (out
+of retries, or arriving while its class incident is active), the coordinator also memoizes
+the reference as skipped: retrying it is futile, so co-queued and later jobs referencing
+the same file dispatch without it rather than each faulting in turn. This bounds a single
+doomed reference to at most one terminal fault per incident even when the root cause could
+not classify it as a rejection. Unlike a surfaced rejection, whose skip is permanent (the
+file can never become usable), a plain-failure skip is incident-scoped: it lapses with the
+backoff's decay window, so a reference that merely failed during an outage is retried once
+the incident passes instead of being silently omitted for the rest of the session.
 
 Each auxiliary class holds its own escalating download backoff. The LoRA backoff also
 gates pop-time LoRA advertising, because the pop request carries an `allow_lora`
@@ -164,8 +177,17 @@ flight, the coordinator extends that job's deadline by one download-timeout budg
 instead of faulting. Deferral is bounded at two extra budgets (three total) so a wedged
 transfer still faults, and short-circuits earlier when the download reports byte progress
 that stops advancing between expiries (a file reporting no bytes cannot show progress, so
-it defers up to the cap). The first deferral per job is logged once; later deferrals of
-the same job stay silent. The download process itself keeps a slow-but-alive transfer
+it defers up to the cap). That byte-stall check compares a file's reported count across the
+consecutive expiries of the job waiting on it, and the remembered count is keyed by that
+live deadline rather than by whatever the downloader happens to report on any single tick:
+a tick on which the in-flight view momentarily reports nothing can no longer wipe the memory
+and reset the file to "progressing by default", so frozen bytes defer at most once. A dead
+download process makes the in-flight view empty outright (a process that has exited cannot be
+advancing any transfer), so its frozen final snapshot never defers a deadline against a
+corpse and the job faults on its first budget; the parent's
+[download-process liveness sweep](resilience_and_recovery.md#the-background-download-process)
+then restarts the downloader and re-requests the pending job. The first deferral per job is
+logged once; later deferrals of the same job stay silent. The download process itself keeps a slow-but-alive transfer
 running well past any per-job deadline (its own fetch bound exists only to reclaim the
 executor slot from an implausibly long transfer): abandoning it would discard the
 progress, and the completed file serves the faulted job's retry, and every later job,

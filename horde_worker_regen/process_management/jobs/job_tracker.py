@@ -417,8 +417,14 @@ class JobTracker:
     single synchronous operation; there is no internal actor or queue.
     """
 
-    def __init__(self) -> None:
-        """Initialize the job tracker."""
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        """Initialize the job tracker.
+
+        Args:
+            clock: Injectable time source (defaults to the wall clock); read for time-scoped auxiliary skip
+                verdicts so a caller driving the tracker on a synthetic clock stays deterministic.
+        """
+        self._clock = clock
         self._jobs: dict[GenerationID, TrackedJob] = {}
         self._job_faults: dict[GenerationID, list[GenMetadataEntry]] = {}
 
@@ -485,14 +491,16 @@ class JobTracker:
         # ready, so its dispatch gate can clear.
         self._cached_ti_keys: set[str] = set()
 
-        # LoRA/TI files a job references that were terminally rejected from ad-hoc download (invalid, too
-        # large, or NSFW on an SFW-only worker) and so will never be on disk. Kept in a namespace distinct
+        # LoRA/TI files a job references whose ad-hoc download was ruled out. Kept in a namespace distinct
         # from the cached sets: a skipped file is NOT present, so the on-disk probes (is_lora_cached/
         # is_ti_cached) keep reporting it absent, but a job's aux set counts as ready once every file is
         # cached OR skipped, letting a bad LoRA's job dispatch (the generator skips it and records a fault)
-        # instead of faulting the job.
-        self._skipped_lora_keys: set[str] = set()
-        self._skipped_ti_keys: set[str] = set()
+        # instead of faulting the job. The value is the verdict's expiry: None for a permanent verdict (a
+        # surfaced rejection such as invalid, too large, or NSFW on an SFW-only worker; the file will never
+        # be usable) and an absolute timestamp for an incident-scoped verdict (a terminal plain download
+        # failure; the file may become fetchable again once the incident passes).
+        self._skipped_lora_keys: dict[str, float | None] = {}
+        self._skipped_ti_keys: dict[str, float | None] = {}
 
         # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
         # tracker faults terminally; the worker opts into bounded retry via set_retry_policy().
@@ -1631,24 +1639,36 @@ class JobTracker:
         return tracked.job_info if tracked is not None else None
 
     @staticmethod
-    def _lora_cache_key(lora: LorasPayloadEntry) -> str:
+    def _lora_name_key(name: str, is_version: bool) -> str:
+        """Identity of the on-disk file a LoRA reference resolves to, from its raw name/version fields."""
+        return f"{name}\x1f{bool(is_version)}"
+
+    @classmethod
+    def _lora_cache_key(cls, lora: LorasPayloadEntry) -> str:
         """Identity of the on-disk file a LoRA payload entry resolves to.
 
         Only the reference (``name``) and whether it names a specific version (``is_version``) select the
         file; the per-job strengths and trigger injection do not change what is downloaded.
         """
-        return f"{lora.name}\x1f{bool(lora.is_version)}"
+        return cls._lora_name_key(lora.name, bool(lora.is_version))
 
     def are_job_aux_models_prepared(self, job: ImageGenerateJobPopResponse) -> bool:
         """Return whether this pending job completed its explicit auxiliary preparation pass."""
         tracked = self._tracked_for(job)
         return tracked is not None and tracked.aux_models_prepared
 
+    def _skip_live(self, skips: dict[str, float | None], key: str) -> bool:
+        """Whether a skip verdict for ``key`` is in force (permanent, or time-scoped and not yet expired)."""
+        if key not in skips:
+            return False
+        expires_at = skips[key]
+        return expires_at is None or self._clock() < expires_at
+
     def are_all_job_loras_cached(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether every LoRA the job references is cached on disk or terminally skipped (so it need not be)."""
         return all(
             self._lora_cache_key(lora) in self._cached_lora_keys
-            or self._lora_cache_key(lora) in self._skipped_lora_keys
+            or self._skip_live(self._skipped_lora_keys, self._lora_cache_key(lora))
             for lora in job.payload.loras or []
         )
 
@@ -1661,21 +1681,32 @@ class JobTracker:
         return self._ti_cache_key(name) in self._cached_ti_keys
 
     def is_lora_skipped(self, lora: LorasPayloadEntry) -> bool:
-        """Whether this LoRA was terminally rejected from ad-hoc download (so it must not be re-requested)."""
-        return self._lora_cache_key(lora) in self._skipped_lora_keys
+        """Whether this LoRA's download is currently ruled out (so it must not be re-requested)."""
+        return self._skip_live(self._skipped_lora_keys, self._lora_cache_key(lora))
 
     def is_ti_skipped(self, name: str) -> bool:
-        """Whether this TI was terminally rejected from ad-hoc download (so it must not be re-requested)."""
-        return self._ti_cache_key(name) in self._skipped_ti_keys
+        """Whether this TI's download is currently ruled out (so it must not be re-requested)."""
+        return self._skip_live(self._skipped_ti_keys, self._ti_cache_key(name))
+
+    def is_aux_skipped(self, name: str, *, is_version: bool, is_ti: bool) -> bool:
+        """Whether an auxiliary file (identified by name/version/kind) has a live skip verdict.
+
+        The name-keyed counterpart to :meth:`mark_aux_skipped`, for a caller that holds an outcome's fields
+        rather than a payload entry (the prefetch coordinator deciding whether a failed reference was already
+        memoized terminal).
+        """
+        if is_ti:
+            return self._skip_live(self._skipped_ti_keys, self._ti_cache_key(name))
+        return self._skip_live(self._skipped_lora_keys, self._lora_name_key(name, is_version))
 
     def skipped_aux_for_job(self, job: ImageGenerateJobPopResponse) -> list[AuxModelRef]:
-        """The job's auxiliary refs that were terminally rejected, for the inference child to tolerate missing."""
+        """The job's auxiliary refs under a live skip verdict, for the inference child to tolerate missing."""
         refs: list[AuxModelRef] = []
         for lora in job.payload.loras or []:
-            if self._lora_cache_key(lora) in self._skipped_lora_keys:
+            if self._skip_live(self._skipped_lora_keys, self._lora_cache_key(lora)):
                 refs.append(AuxModelRef(kind=AuxModelKind.LORA, name=lora.name, is_version=bool(lora.is_version)))
         for ti in job.payload.tis or []:
-            if self._ti_cache_key(ti.name) in self._skipped_ti_keys:
+            if self._skip_live(self._skipped_ti_keys, self._ti_cache_key(ti.name)):
                 refs.append(AuxModelRef(kind=AuxModelKind.TI, name=ti.name))
         return refs
 
@@ -1687,7 +1718,8 @@ class JobTracker:
     def are_all_job_tis_cached(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether every TI the job references is cached on disk or terminally skipped (so it need not be)."""
         return all(
-            self._ti_cache_key(ti.name) in self._cached_ti_keys or self._ti_cache_key(ti.name) in self._skipped_ti_keys
+            self._ti_cache_key(ti.name) in self._cached_ti_keys
+            or self._skip_live(self._skipped_ti_keys, self._ti_cache_key(ti.name))
             for ti in job.payload.tis or []
         )
 
@@ -1700,19 +1732,34 @@ class JobTracker:
         if is_ti:
             self._cached_ti_keys.add(self._ti_cache_key(name))
         else:
-            self._cached_lora_keys.add(f"{name}\x1f{bool(is_version)}")
+            self._cached_lora_keys.add(self._lora_name_key(name, is_version))
 
-    def mark_aux_skipped(self, name: str, *, is_version: bool, is_ti: bool) -> None:
-        """Record a terminally-rejected auxiliary file so a job's readiness no longer waits on it.
+    def mark_aux_skipped(self, name: str, *, is_version: bool, is_ti: bool, expires_at: float | None = None) -> None:
+        """Record an auxiliary file whose download is ruled out so a job's readiness no longer waits on it.
 
-        Unlike ``mark_aux_prefetched`` this does not claim the file is on disk (it never will be); it only
-        removes the file from what a job's aux set must contain to be ready, so the job dispatches and the
-        generator proceeds without it.
+        Unlike ``mark_aux_prefetched`` this does not claim the file is on disk; it only removes the file from
+        what a job's aux set must contain to be ready, so the job dispatches and the generator proceeds
+        without it.
+
+        Args:
+            name: The auxiliary reference name (or version id) as the download pipeline keys it.
+            is_version: Whether the LoRA name identifies a specific version (ignored for TIs).
+            is_ti: Whether the reference is a textual inversion rather than a LoRA.
+            expires_at: When the verdict lapses. None records a permanent verdict (a surfaced rejection: the
+                file can never be used). A timestamp records an incident-scoped verdict (a terminal plain
+                download failure: the file may become fetchable once the incident passes), after which the
+                reference is eligible for prefetch again. A permanent verdict is never downgraded by a later
+                scoped one, and overlapping scoped verdicts keep the later expiry.
         """
-        if is_ti:
-            self._skipped_ti_keys.add(self._ti_cache_key(name))
-        else:
-            self._skipped_lora_keys.add(f"{name}\x1f{bool(is_version)}")
+        skips = self._skipped_ti_keys if is_ti else self._skipped_lora_keys
+        key = self._ti_cache_key(name) if is_ti else self._lora_name_key(name, is_version)
+        if key in skips:
+            existing = skips[key]
+            if existing is None:
+                return
+            if expires_at is not None:
+                expires_at = max(existing, expires_at)
+        skips[key] = expires_at
 
     def mark_job_aux_prepared_if_ready(self, job_id: GenerationID) -> bool:
         """Set a pending job's aux-prepared flag once every LoRA and TI it needs is cached; return the transition.

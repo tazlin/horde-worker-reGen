@@ -113,6 +113,11 @@ any normal model-load / churn window before it drives save-our-ship restores the
 definitive-signal assumption, so a head whose model is merely loading is not faulted as unrecoverable."""
 
 
+def _no_aux_holds() -> set[GenerationID]:
+    """Default aux-hold provider: report no jobs holding a lane open for prefetch (dispatcher wired alone)."""
+    return set()
+
+
 @dataclass(frozen=True)
 class DeadlockSnapshot:
     """Represents the currently observed scheduler deadlock state."""
@@ -158,6 +163,7 @@ class MessageDispatcher:
     _action_ledger: ActionLedger
     _reserve_ledger: CommittedReserveLedger
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
+    _aux_hold_provider: Callable[[], set[GenerationID]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
     _on_annotation_result: Callable[[HordeAnnotationResultMessage], None] | None = None
     """Invoked when the image-utilities lane reports a ControlNet annotation result (map bytes or a fault)."""
@@ -208,6 +214,7 @@ class MessageDispatcher:
         reserve_ledger: CommittedReserveLedger,
         on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]],
         state: WorkerState,
+        aux_hold_provider: Callable[[], set[GenerationID]] | None = None,
     ) -> None:
         """Initialize the dispatcher with references to shared state and the message queue.
 
@@ -227,6 +234,11 @@ class MessageDispatcher:
                 processes that have it loaded, if the current bridge configuration requires aggressive VRAM management.
             state (WorkerState): The shared worker state, which tracks various flags and timestamps related to the
                 worker's operation, such as whether it's currently in a deadlock, when the last job was popped, etc.
+            aux_hold_provider: Returns the ids of pending-inference jobs whose auxiliary (LoRA/TI) prefetch is
+                still in flight, so deadlock detection excludes them from both deadlock conditions: such a job
+                intentionally holds no lane while its files download, so "pending plus every process idle" is the
+                prefetch gate working, not a wedge. A default reporting no holds keeps the detector unchanged for
+                a dispatcher wired without a coordinator.
         """
         self._process_map = process_map
         self._horde_model_map = horde_model_map
@@ -238,6 +250,7 @@ class MessageDispatcher:
         self._reserve_ledger = reserve_ledger
         self._on_unload_vram = on_unload_vram
         self._state = state
+        self._aux_hold_provider = aux_hold_provider if aux_hold_provider is not None else _no_aux_holds
         self._safety_verdicts_known_lost: set[GenerationID] = set()
         """Jobs whose safety verdict was dropped because its producing launch was retired.
 
@@ -1389,10 +1402,18 @@ class MessageDispatcher:
             self._queue_deadlock_process_id = None
             return
 
+        # A pending job whose auxiliary prefetch is still in flight is holding no lane on purpose (its
+        # dispatch is gated until its LoRA/TI files land in the background download process). Exclude those
+        # jobs from every deadlock term: "pending plus every process idle" is that gate working as designed,
+        # not a wedge. The hold is bounded by the coordinator's per-job deadline, so a genuinely stalled
+        # prefetch stops shielding the queue once its deadline lapses.
+        aux_held = self._aux_hold_provider()
+        unheld_pending = tuple(job for job in self._job_tracker.jobs_pending_inference if job.id_ not in aux_held)
+
         queue_deadlock_condition = (
             self._process_map.all_waiting_for_job()
-            and len(self._job_tracker.jobs_pending_inference) > 0
-            and not any(job in self._job_tracker.jobs_in_progress for job in self._job_tracker.jobs_pending_inference)
+            and len(unheld_pending) > 0
+            and not any(job in self._job_tracker.jobs_in_progress for job in unheld_pending)
         )
         if (
             self._in_queue_deadlock
@@ -1416,7 +1437,7 @@ class MessageDispatcher:
                     currently_loaded_models.add(process.loaded_horde_model_name)
                     model_process_map[process.loaded_horde_model_name] = process.process_id
 
-            for job in self._job_tracker.jobs_pending_inference:
+            for job in unheld_pending:
                 if job.model is not None and job.model in currently_loaded_models:
                     self._in_queue_deadlock = True
                     self._last_queue_deadlock_detected_time = time.time()
@@ -1428,7 +1449,7 @@ class MessageDispatcher:
                 self._print_deadlock_info()
                 self._in_queue_deadlock = True
                 self._last_queue_deadlock_detected_time = time.time()
-                self._queue_deadlock_model = self._job_tracker.jobs_pending_inference[0].model
+                self._queue_deadlock_model = unheld_pending[0].model
 
         elif self._in_queue_deadlock and (self._last_queue_deadlock_detected_time + 30) < time.time():
             if self._process_map.num_starting_processes() > 0:
@@ -1450,9 +1471,9 @@ class MessageDispatcher:
             # Keep the flag set so the recovery supervisor can act on a sustained deadlock.
 
         deadlock_condition = (
-            len(self._job_tracker.jobs_pending_inference) > 0
+            len(unheld_pending) > 0
             or len(self._job_tracker.jobs_in_progress) > 0
-            or len(self._job_tracker.jobs_lookup) > 0
+            or any(job.id_ not in aux_held for job in self._job_tracker.jobs_lookup)
         ) and self._process_map.num_busy_processes() == 0
 
         if (not self._in_deadlock) and deadlock_condition:

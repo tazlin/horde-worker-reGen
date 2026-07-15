@@ -23,7 +23,10 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAuxPrefetchResultMessage,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.models.aux_prefetch_coordinator import (
+    _AUX_REFETCH_COOLDOWN_SECONDS,
+    AuxPrefetchCoordinator,
+)
 from tests.process_management.conftest import make_job_pop_response, track_popped_job_async
 
 
@@ -215,25 +218,32 @@ async def test_repeated_ti_plain_failure_is_terminal_and_arms_backoff() -> None:
 
 
 async def test_ti_transient_failure_recovers_via_reconcile_and_dispatches_with_file() -> None:
-    """A transient TI failure is healed by the parent's reconcile loop, then dispatches with the file.
+    """A transient TI failure is healed by the parent's reconcile loop after a cooldown, then dispatches.
 
-    In-process download retries are not owned here: a single (retryable) plain failure leaves the job pending,
-    the periodic reconcile sweep re-issues a fresh prefetch request for it, and a later success outcome prepares
-    the job with the file present. This documents that transient-failure recovery is driven by the parent's
-    reconcile-and-pin-refresh loop, not by the coordinator re-downloading in place.
+    In-process download retries are not owned here: a single (retryable) plain failure leaves the job pending.
+    The reference is held in its post-failure cooldown, so a reconcile within that window does not re-enter the
+    failing download path; once the cooldown lapses the periodic reconcile sweep re-issues a fresh prefetch
+    request, and a later success outcome prepares the job with the file present. Recovery is driven by the
+    parent's reconcile-and-pin-refresh loop, not by the coordinator re-downloading in place.
     """
-    tracker = JobTracker()
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(2)
     job = _job(tis=[TIPayloadEntry(name="emb")])
     await track_popped_job_async(tracker, job)
-    coordinator, sender, _state, _clock = _make(tracker)
+    coordinator, sender, _state, _clock = _make(tracker, clock=clock)
     coordinator.on_job_popped(job)
 
     coordinator.on_prefetch_result(_result(_ti_failure("emb", job.id_)))
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
-    # The reconcile loop re-requests the aux-bearing job left without an in-flight prefetch request.
+    # A reconcile within the reference's cooldown must not re-enter the failing path yet.
     requests_before = len(_ti_entries_for(sender, job.id_, "emb"))
+    coordinator.reconcile_and_refresh_pins()
+    assert len(_ti_entries_for(sender, job.id_, "emb")) == requests_before
+
+    # Once the cooldown lapses the reconcile loop re-requests the aux-bearing job.
+    clock.now += _AUX_REFETCH_COOLDOWN_SECONDS + 1.0
     coordinator.reconcile_and_refresh_pins()
     assert len(_ti_entries_for(sender, job.id_, "emb")) == requests_before + 1
 

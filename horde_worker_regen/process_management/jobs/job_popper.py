@@ -469,6 +469,11 @@ class JobPopper:
         self._api_call_loop_interval = 1
         self._fast_pop_interval = 0.05
 
+        # Last (effective allow_lora, withholding cause) actually logged, so the per-pop advertising line is
+        # edge-triggered: it fires only when the outgoing capability (or the reason it is withheld) changes,
+        # never once per pop at steady state.
+        self._last_logged_lora_advertise: tuple[bool, str] | None = None
+
     @property
     def _max_concurrent_inference_processes(self) -> int:
         """The live concurrent-inference cap (effective ``max_threads``) advertised to the API."""
@@ -920,6 +925,10 @@ class JobPopper:
             # No background downloader means no path to place a job's LoRAs on disk, so LoRA support must not
             # be advertised regardless of the per-card config flag.
             return False
+        if self._model_availability is not None and self._model_availability.downloader_lost:
+            # The download process died and the parent has stopped restarting it: with no downloader there is
+            # no path to place LoRAs on disk, exactly as if background downloads were never enabled.
+            return False
         if self._state.lora_disk_exhausted:
             return False
         # Repeated ad-hoc download teardowns withhold LoRA support for an escalating window; popping
@@ -931,6 +940,47 @@ class JobPopper:
     def _effective_allow_lora(self, bridge_data: reGenBridgeData) -> bool:
         """Return whether this pop should advertise LoRA support (config flag and the worker-wide disk guard)."""
         return bool(bridge_data.allow_lora) and self._lora_disk_permits
+
+    def _lora_advertise_cause(self, bridge_data: reGenBridgeData, *, idle_fill: bool, queue_cap: bool) -> str:
+        """Return the first reason this pop is withholding LoRA advertising, or ``"offered"`` if it is not.
+
+        Names the cause the forensics of a LoRA-download-backoff incident needs to read from the logs (the
+        outgoing ``allow_lora`` and, when it is off, the specific gate withholding it), in priority order so
+        the download backoff is called out distinctly from a plain config opt-out or a full disk.
+        """
+        if not bridge_data.allow_lora:
+            return "config_opt_out"
+        if not self._background_downloads_enabled:
+            return "no_background_downloader"
+        if self._model_availability is not None and self._model_availability.downloader_lost:
+            return "no_background_downloader"
+        if self._state.lora_disk_exhausted:
+            return "disk_exhausted"
+        if self._state.lora_download_backoff.pops_suppressed(time.time()):
+            return "download_backoff"
+        if self._model_availability is not None and self._model_availability.background_download_active:
+            return "background_download_active"
+        if idle_fill:
+            return "idle_fill"
+        if queue_cap:
+            return "queue_cap"
+        return "offered"
+
+    def _log_lora_advertising(self, bridge_data: reGenBridgeData, *, pop_allow_lora: bool, idle_fill: bool) -> None:
+        """Emit one edge-triggered debug line for the outgoing pop's effective LoRA advertising.
+
+        Coalesced against the last line actually logged so an unchanged verdict is never repeated pop after
+        pop; it fires only when the effective ``allow_lora`` or the reason it is withheld changes.
+        """
+        cause = self._lora_advertise_cause(bridge_data, idle_fill=idle_fill, queue_cap=self._lora_queue_cap_reached())
+        current = (pop_allow_lora, cause)
+        if current == self._last_logged_lora_advertise:
+            return
+        self._last_logged_lora_advertise = current
+        if pop_allow_lora:
+            logger.debug("Pop advertising LoRA support (allow_lora=True).")
+        else:
+            logger.debug(f"Pop withholding LoRA support (allow_lora=False); cause: {cause}.")
 
     def _lora_queue_cap_reached(self) -> bool:
         """Whether the local queue already holds the most concurrently-queued LoRA jobs we allow.
@@ -1277,6 +1327,10 @@ class JobPopper:
             # work the horde currently has, escalating only when it has nothing lighter.
             models, pop_max_power = self._apply_idle_fill_ladder(models, pop_max_power, bridge_data)
             pop_allow_lora = False
+
+        # The effective allow_lora is now settled for this pop; surface it (and, when withheld, why) so a
+        # LoRA-download-backoff incident is verifiable from the logs. Edge-triggered, so steady state is quiet.
+        self._log_lora_advertising(bridge_data, pop_allow_lora=pop_allow_lora, idle_fill=idle_fill_wanted)
 
         # First-class feature readiness: withhold a gated feature (ControlNet, SDXL-ControlNet,
         # post-processing) until its models/annotators are actually on disk, so the worker never
