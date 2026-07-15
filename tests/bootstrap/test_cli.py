@@ -706,12 +706,12 @@ def test_sync_utilities_provision_failure_is_non_fatal(
     assert "could not create the utilities venv" in capsys.readouterr().err
 
 
-def test_maybe_provision_lean_backend_missing_seed_is_silent(
+def test_maybe_provision_lean_backend_missing_lock_is_silent(
     env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A lean backend opted into a feature it ships no seed for stays a quiet no-op (no spurious warning).
+    """A lean backend opted into a feature it ships no utilities lock for stays a quiet no-op (no warning).
 
-    Unlike a full build, a lean backend (e.g. rocm) is not expected to ship a utilities seed, so an absent
+    Unlike a full build, a lean backend (e.g. rocm) is not expected to ship a utilities lock, so an absent
     one is the benign "no pin published yet" case, not a broken install: provision nothing and say nothing.
     """
     root, _ = env
