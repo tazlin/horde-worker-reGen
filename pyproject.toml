@@ -35,7 +35,7 @@ dependencies = [
     # (SharedModelManager.load_model_managers adhoc_read_only) that inference children construct with, and the
     # streamed adhoc fetch surface (fetch_adhoc_lora/fetch_adhoc_ti progress_callback + per-record completion)
     # the download process passes its live progress callback into.
-    "horde_engine[layerdiffuse,upscale-extra]>=6.3.3,<7.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=6.3.5,<7.0.0",
     "horde_model_reference>=7.5.0,<8.0.0",
     # Base package only (pillow/pydantic deps): the parent-side lane adapter and entry points import its
     # client and launcher in THIS venv. The heavy annotator/server stacks stay out of this resolution; they
