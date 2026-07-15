@@ -1,6 +1,4 @@
-# Dev-local placeholder pin (unhashed) for utilities-venv bring-up on this machine only.
-# Not CI output: references the local horde-image-utilities checkout by path. Do not commit.
-horde-image-utilities[server,annotators,rembg_cpu] @ file:///G:/mxd-ai/python/github_repo_clones/horde-image-utilities
+horde-image-utilities[server,annotators,rembg_cpu]~=0.2.0
 # Resolution guards: without a numba floor the resolver backtracks numba (rembg -> pymatting -> numba)
 # to a pre-3.12 sdist that fails to build; the floor forces a numpy the modern numba accepts.
 numba>=0.60
