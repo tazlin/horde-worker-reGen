@@ -113,6 +113,13 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceWaiter,
 )
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
+    _AFFINITY_MAX_SKIPS,
+    AffinitySkipState,
+    affinity_budget_seconds,
+    affinity_skip_allowed,
+    record_affinity_skip,
+)
 from horde_worker_regen.process_management.scheduling.governance import (
     AdmissionDecision,
     CardProcessSnapshot,
@@ -623,6 +630,14 @@ class InferenceScheduler:
         self._dispatch_reconciliation_released_by_reclaim = 0
         self._dispatch_reconciliation_released_by_natural_free = 0
 
+        # The bounded affinity line-skip window for the currently-tracked displaced head. Resident-model jobs
+        # may pass a cold FIFO head only while it is inside this window (a wall-clock budget derived from the
+        # job ttl plus a hard skip ceiling). The window advances only on committed dispatch (see
+        # :meth:`start_inference`), so the information_only look-ahead never mutates it; dispatch selection reads
+        # it purely. When the window is spent the head reclaims the slot via the same fall-through as a
+        # non-forecast head. Calibration visibility only.
+        self._affinity_skip_state = AffinitySkipState()
+
         # The set of job ids whose dispatch the post-processing co-residency gate held on the pass that last
         # evaluated them. The gate computes this verdict during dispatch (``_should_defer_dispatch_for_post_
         # processing``); recording it here lets the read-only stall classifier name the same hold instead of
@@ -663,6 +678,14 @@ class InferenceScheduler:
         # keep the classifier's disaggregation branch inert for standalone tests that never wire them.
         self._disaggregation_pin_owner: Callable[[int], str | None] = lambda _pid: None
         self._disaggregation_sampling_peaks: Callable[[], dict[str, float]] = dict
+        # How many disaggregated jobs currently need the VAE lane for a decode (queued or dispatched to it),
+        # wired by the manager from the orchestrator. The reclaim-ladder VAE-lane pause reads it so the lane is
+        # not stopped out from under a decode whose sample already finished (which would reroute the job
+        # monolithic and discard that sampling). Defaults to zero so a standalone scheduler never withholds a
+        # pause for a decode it has no orchestrator to see. ``_vae_pause_deferred_for_decode`` edge-latches the
+        # one INFO line so a sustained pressure run logs the deferral once, re-arming when a pause next proceeds.
+        self._vae_decode_pending_count: Callable[[], int] = lambda: 0
+        self._vae_pause_deferred_for_decode = False
 
         # Runtime safety-placement policy hysteresis (see _reconcile_runtime_safety_placement). ``wants_off``
         # latches the policy's current verdict; the two streaks count consecutive cycles the safety charge did
@@ -814,6 +837,7 @@ class InferenceScheduler:
         register_disaggregated: Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]],
         pin_owner: Callable[[int], str | None] | None = None,
         sampling_peaks: Callable[[], dict[str, float]] | None = None,
+        vae_decode_pending_count: Callable[[], int] | None = None,
     ) -> None:
         """Wire the pipeline-disaggregation predicates and router (see the ``_is_disaggregatable_job`` attr).
 
@@ -826,7 +850,10 @@ class InferenceScheduler:
 
         ``pin_owner`` maps a process id to the job pinning it as its sampler, and ``sampling_peaks`` returns the
         in-flight sampling peaks; both are read-only, used only by the dispatch-stall classifier to name a head
-        held behind a pinned sampler lane. They are optional so standalone tests need not wire the orchestrator.
+        held behind a pinned sampler lane. ``vae_decode_pending_count`` returns how many disaggregated jobs need
+        the VAE lane for a decode now, read by the reclaim-ladder VAE-lane pause so the lane is not stopped out
+        from under a queued or in-flight decode. All three are optional so standalone tests need not wire the
+        orchestrator.
         """
         self._is_disaggregatable_job = is_disaggregatable
         self._is_disaggregation_class_eligible = is_disaggregation_class_eligible
@@ -835,6 +862,8 @@ class InferenceScheduler:
             self._disaggregation_pin_owner = pin_owner
         if sampling_peaks is not None:
             self._disaggregation_sampling_peaks = sampling_peaks
+        if vae_decode_pending_count is not None:
+            self._vae_decode_pending_count = vae_decode_pending_count
 
     def _disaggregation_sibling_charge_mb(
         self,
@@ -2703,8 +2732,25 @@ class InferenceScheduler:
         """
         process = self._resident_process_for_job(head)
         if process is None:
+            # A cold head is the case resident-model jobs bypass under the affinity skip budget. When this head
+            # is the one the window is tracking, name how many skips it has taken and how much budget remains, so
+            # the parked-head record shows the head is being fed past, not silently stuck.
+            affinity_suffix = ""
+            if (
+                head.id_ is not None
+                and str(head.id_) == self._affinity_skip_state.head_job_id
+                and self._affinity_skip_state.skip_count > 0
+            ):
+                affinity_budget = affinity_budget_seconds(self._state.recent_job_ttl)
+                affinity_suffix = (
+                    f"; bypassed by {self._affinity_skip_state.skip_count} affinity line-skips over "
+                    f"{self.latest_affinity_skip_seconds():.0f}s (budget {affinity_budget:.0f}s)"
+                )
             if head.model is not None and self._horde_model_map.is_model_loading(head.model):
-                return SlotDutyBucket.MODEL_LOADING, "its model is loading (a preload is in progress)"
+                return (
+                    SlotDutyBucket.MODEL_LOADING,
+                    "its model is loading (a preload is in progress)" + affinity_suffix,
+                )
             # The head's model can be resident only on a disaggregation-pinned sampler lane, which the dispatch
             # query excludes. That is not a budget defer: the head is deliberately held for the pin to release
             # (rather than funding a second copy), so name the pin, the job holding it, and the in-flight
@@ -2723,6 +2769,7 @@ class InferenceScheduler:
                     f"its model is resident only on process {pinned_lane.process_id}, pinned as a disaggregation "
                     f"sampler{owner_text}; the head waits for that pin to release and dispatch onto the resident "
                     f"lane rather than fund a second copy that cannot fit beside the pinned residents{peaks_text}"
+                    + affinity_suffix
                 )
             # A whole-card residency held for a *different* model reserves the card and tore its siblings down,
             # so a head of another model cannot load until that residency restores. Name it: otherwise this
@@ -2740,11 +2787,11 @@ class InferenceScheduler:
                 return SlotDutyBucket.WHOLE_CARD_RESERVED, (
                     f"its model is not resident because a whole-card residency is held for non-head model "
                     f"{nonhead_residency_model!r}: the card is reserved for that model and its siblings were "
-                    f"torn down, so this head cannot load until that residency restores"
+                    f"torn down, so this head cannot load until that residency restores" + affinity_suffix
                 )
             return SlotDutyBucket.PRELOAD_DEFERRED, (
                 "its model is not resident and no preload has been admitted "
-                "(usually a VRAM/RAM budget defer; see the budget lines above)"
+                "(usually a VRAM/RAM budget defer; see the budget lines above)" + affinity_suffix
             )
         if not process.can_accept_job():
             return SlotDutyBucket.RESIDENT_SLOT_BUSY, (
@@ -5747,7 +5794,26 @@ class InferenceScheduler:
         return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
     def pause_vae_lane(self, device_index: int | None) -> bool:
-        """Pause the VAE lane off the GPU to reclaim its context (reclaim-ladder actuator)."""
+        """Pause the VAE lane off the GPU to reclaim its context (reclaim-ladder actuator).
+
+        Reports no-op (does not pause) while the disaggregation orchestrator has jobs awaiting a VAE-lane
+        decode. Pausing the lane out from under a queued or in-flight decode strands a job whose sampling
+        already finished: it reroutes monolithic and discards that sampling, to free room for a dispatch the
+        decode itself clears within seconds. Both reclaim paths that stop this lane (the governor's saturation
+        rung and a post-processing borrow) route through here, so a no-op makes each move to its next relief
+        option exactly as any rung whose target has gone away does; the pause is simply not eligible this tick.
+        """
+        pending_decodes = self._vae_decode_pending_count()
+        if pending_decodes > 0:
+            if not self._vae_pause_deferred_for_decode:
+                self._vae_pause_deferred_for_decode = True
+                logger.info(
+                    f"Reclaim ladder: holding the VAE-lane pause while {pending_decodes} disaggregated "
+                    "decode(s) are queued or in flight on it; the decode frees the lane sooner than the "
+                    "monolithic reroute a pause would force, which discards the finished sampling.",
+                )
+            return False
+        self._vae_pause_deferred_for_decode = False
         return self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
     def pause_component_lane(self, device_index: int | None) -> bool:
@@ -6504,19 +6570,37 @@ class InferenceScheduler:
             # than fund a second copy that cannot fit beside the pinned residents.
             pinned_resident = self._pinned_lane_resident_for_job(next_job)
 
-            # The head's model is not resident on any dispatchable process. If it is forecast to load (a preload
-            # is already on the way), or its only resident copy is on a pinned lane it is waiting to reuse, let a
-            # later already-resident job bypass it so the GPU is not idle while the head waits; this reduces
-            # churn versus evicting to run the head right now. If it is NOT forecast to load and not pin-waiting,
-            # do not bypass: fall through so the head is the one that gets a process (and the budget gate makes
-            # room for it), rather than being starved behind perpetual bypassers.
-            if pinned_resident is not None or self._is_model_forecast_to_load(next_job.model):
+            # The head's model is not resident on any dispatchable process. Let a later already-resident job
+            # bypass it so the card is not idle while the head is cold, but only within a bound: the affinity
+            # skip window (a wall-clock budget from the job ttl plus a hard skip ceiling), keyed to the head's
+            # identity and advanced only on committed dispatch. This covers both the forecast case (a preload is
+            # already on the way) and the plain cold head during a preload-defer window; both are now bounded so
+            # a head cannot age past its ttl behind a stream of resident work. The old perpetual-bypasser fear is
+            # answered by the bound, not by refusing to bypass a non-forecast head. A pin-wait (the head's only
+            # copy is on a disaggregation-pinned lane it is waiting to reuse) stays exempt: it is not funding a
+            # fresh copy, so it bypasses unconditionally until the pin releases. When the window is spent (and no
+            # pin-wait), the loop is skipped and dispatch falls through exactly as a non-forecast head does
+            # today: the head keeps its slot claim and the room-making machinery runs, with no skips until it
+            # dispatches.
+            head_job_id = str(next_job.id_) if next_job.id_ is not None else None
+            affinity_budget = affinity_budget_seconds(self._state.recent_job_ttl)
+            within_affinity_budget = affinity_skip_allowed(
+                self._affinity_skip_state,
+                head_job_id,
+                time.time(),
+                affinity_budget,
+                _AFFINITY_MAX_SKIPS,
+            )
+            if pinned_resident is not None or within_affinity_budget:
                 for candidate_job in next_n_jobs:
                     if candidate_job.model is None or candidate_job.model == next_job.model:
                         continue
+                    # A degraded retry must run isolated (see the diversity path), so it is never a bypass target.
+                    if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
+                        continue
                     candidate_process = self._resident_process_for_job(candidate_job)
                     if candidate_process is not None and candidate_process.can_accept_job():
-                        line_skip = LineSkip(displaced_job=next_job)
+                        line_skip = LineSkip(displaced_job=next_job, reason="resident_bypass")
                         next_job = candidate_job
                         process_with_model = candidate_process
                         break
@@ -6553,7 +6637,7 @@ class InferenceScheduler:
             if diversity is None:
                 return None
             diversity_job, diversity_process = diversity
-            line_skip = LineSkip(displaced_job=next_job)
+            line_skip = LineSkip(displaced_job=next_job, reason="diversity")
             next_job = diversity_job
             process_with_model = diversity_process
 
@@ -7801,6 +7885,16 @@ class InferenceScheduler:
         """Return the count of held dispatches released by the card recovering on its own (calibration)."""
         return self._dispatch_reconciliation_released_by_natural_free
 
+    def latest_affinity_skips(self) -> int:
+        """Return the committed affinity line-skips the currently-tracked displaced head has taken (visibility)."""
+        return self._affinity_skip_state.skip_count
+
+    def latest_affinity_skip_seconds(self) -> float:
+        """Return the wall-clock seconds since the tracked displaced head's first affinity skip (0 if none)."""
+        if self._affinity_skip_state.skip_count == 0:
+            return 0.0
+        return time.time() - self._affinity_skip_state.first_skip_time
+
     def latest_safety_placement_demotions(self) -> int:
         """Return how many times the runtime safety-placement policy moved safety off-GPU this run."""
         return self._safety_placement_demotions
@@ -7887,11 +7981,35 @@ class InferenceScheduler:
             # neither the preload nor the second-sampler admission consult.
             return False
 
-        if next_job_and_process.line_skip is not None:
+        # Every hold gate above is passed, so this dispatch is committed: advance the affinity skip window here
+        # (never in get_next_job_and_process, which runs twice a cycle and must stay pure for information_only).
+        # A resident_bypass skip is counted against the displaced head; a direct head dispatch (no line-skip)
+        # closes the window. A diversity line-skip leaves the window untouched: the head is still pending, its
+        # process merely busy, so it is not being aged by the affinity path.
+        if line_skip is not None and line_skip.reason == "resident_bypass":
+            displaced_head_id = str(line_skip.displaced_job.id_) if line_skip.displaced_job.id_ is not None else None
+            if displaced_head_id is not None:
+                self._affinity_skip_state = record_affinity_skip(
+                    self._affinity_skip_state,
+                    displaced_head_id,
+                    time.time(),
+                )
+        elif line_skip is None:
+            self._affinity_skip_state = AffinitySkipState()
+
+        if line_skip is not None:
+            if line_skip.reason == "resident_bypass":
+                budget_seconds = affinity_budget_seconds(self._state.recent_job_ttl)
+                remaining_budget = max(0.0, budget_seconds - self.latest_affinity_skip_seconds())
+                skip_detail = (
+                    f"affinity line-skip {self.latest_affinity_skips()}/{_AFFINITY_MAX_SKIPS}, "
+                    f"remaining budget {remaining_budget:.0f}s"
+                )
+            else:
+                skip_detail = "the displaced job's process is busy sampling its own model"
             logger.info(
-                f"Job {next_job_and_process.next_job.id_} skipped the line and will be run on process "
-                f"{process_with_model.process_id} before job {next_job_and_process.line_skip.displaced_job.id_}"
-                " which is currently downloading extra models.",
+                f"Job {next_job.id_} skipped the line ({line_skip.reason}) and will run on process "
+                f"{process_with_model.process_id} ahead of job {line_skip.displaced_job.id_}: {skip_detail}.",
             )
 
         if bridge_data.unload_models_from_vram_often:

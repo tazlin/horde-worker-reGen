@@ -451,6 +451,64 @@ async def test_resource_fault_reroutes_job_to_monolithic_and_it_does_not_reenter
 
 
 @pytest.mark.asyncio
+async def test_structural_sample_fault_declines_disaggregation_and_retries_monolithic() -> None:
+    """A non-resource-class sample fault declines the pipeline for the retry, which then runs monolithic.
+
+    The disaggregated sample stage faulting for a structural reason (e.g. an inpainting UNet fed a txt2img
+    latent) is not device pressure, so it is not deferred: the parent-synthesized fault flows through the
+    ordinary requeue seam, latches the job monolithic (disaggregation-declined), and attempt 2 dispatches on
+    the whole-job path rather than bouncing back into the pipeline that just failed it.
+    """
+    pm, inference = _make_manager_with_roles()
+    pm._job_tracker.set_retry_policy(2)
+    job = make_job_pop_response(model=_MODEL)
+    await pm._job_tracker.record_popped_job(job)
+    await pm._inference_scheduler._dispatch_disaggregated(
+        job,
+        inference,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+    assert pm._process_map.is_reserved_for_disaggregation(0) is True
+
+    orchestrator = pm._disaggregation_orchestrator
+    orchestrator.tick()  # dispatch text-encode to the component process
+    await orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.id_,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    orchestrator.tick()  # dispatch the sample stage to the pinned sampler (process 0)
+
+    # A structural (non-resource-class) sample fault: not deferred, forfeits the disaggregated attempt.
+    await orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=0,
+            process_launch_identifier=0,
+            info="",
+            results=[SampleSliceResult(job_id=job.id_, latent_bytes=None, state=GENERATION_STATE.faulted)],
+            fault_is_resource_class=False,
+        ),
+    )
+    # Route the synthesized fault completion through the dispatcher's requeue seam.
+    await pm.drive_disaggregation()
+
+    tracked = pm._job_tracker.get_tracked_job(job.id_)
+    assert tracked is not None and tracked.job_info is not None
+    # Requeued (not faulted), latched monolithic so attempt 2 cannot re-route into the pipeline.
+    assert tracked.stage == JobStage.PENDING_INFERENCE
+    assert tracked.job_info.state != GENERATION_STATE.faulted
+    assert pm._job_tracker.is_disaggregation_declined(job) is True
+    assert pm._disaggregation_class_eligible(job) is False
+
+
+@pytest.mark.asyncio
 async def test_disaggregated_flow_pins_releases_and_completes() -> None:
     """Route -> encode -> sample (slot released on the sample result) -> decode -> safety, with a freed slot."""
     pm, inference = _make_manager_with_roles()
@@ -638,6 +696,37 @@ async def test_disaggregated_job_without_post_processing_flows_straight_to_safet
 
 
 @pytest.mark.asyncio
+async def test_disaggregated_completion_carries_a_positive_generation_span() -> None:
+    """A completed disaggregated job reports a positive time_to_generate (registration-to-completion span).
+
+    The synthetic result the parent builds carries the orchestrator's measured span, so submit accounting, the
+    slowdown grader, and the inference-duration histogram see a real duration. Without it every disaggregated
+    job completed with a None span: the submitter logged a 0.00s generation, reported 0.00 kudos/second, and
+    fired the spurious slowdown warning on every job.
+    """
+    pm, inference = _make_manager_with_roles()
+    orchestrator = pm._disaggregation_orchestrator
+    # An advancing virtual clock makes the registration-to-completion span deterministically positive: register
+    # (inside the dispatch helper) stamps an earlier tick than the completion in drive_disaggregation reads.
+    clock_value = [0.0]
+
+    def _advancing_clock() -> float:
+        clock_value[0] += 1.0
+        return clock_value[0]
+
+    orchestrator._clock = _advancing_clock  # type: ignore[method-assign]
+
+    job = make_job_pop_response(model=_MODEL)
+    await _run_disaggregated_job_through_decode(pm, inference, job)
+    await pm.drive_disaggregation()
+
+    tracked = pm._job_tracker.get_tracked_job(job.id_)
+    assert tracked is not None and tracked.job_info is not None
+    assert isinstance(tracked.job_info.time_to_generate, float)
+    assert tracked.job_info.time_to_generate > 0.0
+
+
+@pytest.mark.asyncio
 async def test_decoding_job_not_reaped_by_orphan_watchdog_and_faults_not_vanishes() -> None:
     """A job in the decoding stage is not punted by the in-progress watchdog; a give-up faults it (not lost)."""
     pm, inference = _make_manager_with_roles()
@@ -687,7 +776,7 @@ async def test_decoding_job_not_reaped_by_orphan_watchdog_and_faults_not_vanishe
     still_tracked.inference_attempts = 99
     await pm.drive_disaggregation()  # no completions yet; the orchestrator still holds the job
     pm._disaggregated_completions.append(
-        (still_tracked.job_info, [], GENERATION_STATE.faulted, DisaggregatedFault(reason="sample faulted")),
+        (still_tracked.job_info, [], GENERATION_STATE.faulted, DisaggregatedFault(reason="sample faulted"), 1.0),
     )
     await pm.drive_disaggregation()
 
@@ -781,6 +870,9 @@ async def test_faulted_disaggregated_completion_carries_reason_and_faulting_proc
     assert result.state == GENERATION_STATE.faulted
     assert result.process_id == 1  # the faulting child, not 0/safety
     assert f"Model: {_MODEL}. Error: RuntimeError: CUDA out of memory" in result.info  # detector-shaped, not blank
+    # A fault completion carries the measured registration-to-completion span, mirroring a monolithic fault
+    # (which also stamps time_elapsed), so the submitter never sees the missing duration it saw before.
+    assert result.time_elapsed is not None
 
 
 class _RecordingQueue:

@@ -1002,7 +1002,11 @@ class MessageDispatcher:
         # Faults are resolved before the success bookkeeping: a retryable failure is requeued (and must
         # not be counted as completed), and the retry brain owns the stage move for both outcomes.
         if message.state == GENERATION_STATE.faulted:
-            await self._handle_faulted_inference_result(message, job_info)
+            await self._handle_faulted_inference_result(
+                message,
+                job_info,
+                is_disaggregated_completion=is_disaggregated_completion,
+            )
             return
 
         released = await self._job_tracker.release_in_progress(message.sdk_api_job_info)
@@ -1173,6 +1177,8 @@ class MessageDispatcher:
         self,
         message: HordeInferenceResultMessage,
         job_info: HordeJobInfo,
+        *,
+        is_disaggregated_completion: bool = False,
     ) -> None:
         """Resolve a faulted inference result: requeue it for another attempt, or fault it terminally.
 
@@ -1180,6 +1186,11 @@ class MessageDispatcher:
         recognized from the result's diagnostic ``info``, earns one degraded, isolated retry. On exhaustion
         the tracker has already moved the job to ``PENDING_SUBMIT`` and counted it; here we only emit the
         telemetry, audit, and VRAM cleanup the success path would otherwise have done.
+
+        ``is_disaggregated_completion`` is the parent-synthesized fault of a disaggregated job. The
+        orchestrator only synthesizes such a completion for a non-resource-class stage fault (a resource-class
+        one defers then re-routes upstream, never reaching here), so it is exactly the structural-fault signal
+        that latches the job monolithic on requeue.
         """
         job_id = str(message.sdk_api_job_info.id_) if message.sdk_api_job_info.id_ is not None else None
 
@@ -1198,6 +1209,7 @@ class MessageDispatcher:
             process_timeout=message.time_elapsed if message.time_elapsed is not None else 0.0,
             is_resource_failure=resource_failure,
             retryable=True,
+            was_disaggregated_structural_fault=is_disaggregated_completion,
         )
 
         if resolution is not InferenceFailureResolution.FAULTED:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import random
 from enum import auto
-from typing import override
+from typing import Literal, override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -222,6 +222,9 @@ class LineSkip(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     displaced_job: ImageGenerateJobPopResponse
     """The earlier-queued job that the chosen job jumped ahead of."""
+    reason: Literal["diversity", "resident_bypass"]
+    """Why the displaced job was passed: ``diversity`` (its process is busy sampling) or ``resident_bypass``
+    (its model is not yet resident and a resident-model job passed it under the affinity skip budget)."""
 
 
 class NextJobAndProcess(BaseModel):

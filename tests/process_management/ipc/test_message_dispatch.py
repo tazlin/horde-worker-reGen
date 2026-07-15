@@ -577,6 +577,39 @@ class TestHandleInferenceResult:
         assert job not in job_tracker.jobs_in_progress
         assert job_info in job_tracker.jobs_pending_safety_check
 
+    async def test_synthetic_inference_result_sets_time_to_generate_from_message(self) -> None:
+        """A synthetic disaggregated completion records its time_elapsed as the job's generation duration.
+
+        The disaggregation orchestrator measures a job's end-to-end span and carries it on the synthetic
+        result; the completion handler records it as ``job_info.time_to_generate`` for submit accounting,
+        rather than leaving it None (which logged a 0.00s generation and fired a spurious slowdown warning).
+        """
+        process_info = make_mock_process_info(0)
+        process_info.process_launch_identifier = 0
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response(model="stable_diffusion")
+        job_info = await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+
+        message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
+
+        msg = Mock(spec=HordeInferenceResultMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.sdk_api_job_info = job
+        msg.time_elapsed = 7.5
+        msg.info = "done"
+        msg.state = Mock()
+        msg.state.__eq__ = lambda self, other: False  # pyrefly: ignore - not testing state handling here
+        msg.job_image_results = [Mock()]
+        msg.faults_count = 0
+
+        await message_dispatcher.handle_synthetic_inference_result(msg)
+
+        assert job_info.time_to_generate == 7.5
+
     async def test_faulted_inference_result_moves_to_pending_submit(self) -> None:
         """If an inference result is faulted, it should be moved to pending submit."""
         from horde_sdk.ai_horde_api import GENERATION_STATE

@@ -174,7 +174,7 @@ def _make_harness(
         find_sampler=lambda _model: by_id.get(_SAMPLER_PID),  # type: ignore[arg-type,return-value]
         find_image_lane=lambda: image_lane,  # type: ignore[arg-type]
         loader_identity=_identity,  # type: ignore[arg-type]
-        on_images_ready=lambda ji, imgs, st, fault: completed.append((ji, imgs, st, fault)),
+        on_images_ready=lambda ji, imgs, st, fault, _elapsed: completed.append((ji, imgs, st, fault)),
         find_process_by_id=lambda pid: by_id.get(pid),  # type: ignore[arg-type,return-value]
         reserve_sampler_process=reserved.add,
         release_sampler_process=reserved.discard,

@@ -82,6 +82,18 @@ class PauseOwner(enum.StrEnum):
     """The verified reclaim ladder stopped the lane; the ladder's episode-end unwind owns the restore."""
 
 
+def _pause_owner_phrase(owner: PauseOwner) -> str:
+    """Return the human-readable subsystem name for a lane pause/restore log line.
+
+    The pause and restore log lines name the actual initiator rather than a fixed phrase, so a reclaim-ladder
+    pause is never mislabelled as a whole-card residency (they have different restore paths, and an honest
+    label is what an operator reads to tell a transient pressure pause from a heavy-model residency).
+    """
+    if owner is PauseOwner.WHOLE_CARD:
+        return "Whole-card residency"
+    return "Reclaim ladder"
+
+
 @dataclass(frozen=True)
 class _PendingGpuStart:
     """Represents a GPU-bearing child process start waiting for device headroom."""
@@ -1506,7 +1518,7 @@ class ProcessLifecycleManager:
             self._component_lane_replacement_intentional = True
             self._initiate_component_replacement()
         logger.info(
-            "Whole-card residency: stopping the component lane to free its VRAM context for the heavy model.",
+            f"{_pause_owner_phrase(owner)}: stopping the component lane to free its VRAM context.",
         )
         return True
 
@@ -1531,7 +1543,7 @@ class ProcessLifecycleManager:
         self._component_gpu_paused = False
         self._component_pause_owner = None
         self._component_gpu_restore_count += 1
-        logger.info("Whole-card residency complete: restarting the component lane.")
+        logger.info(f"{_pause_owner_phrase(owner)}: restarting the component lane after releasing the card.")
         self.start_component_processes()
         return True
 
@@ -1721,7 +1733,7 @@ class ProcessLifecycleManager:
             self._vae_lane_replacement_intentional = True
             self._initiate_vae_lane_replacement()
         logger.info(
-            "Whole-card residency: stopping the VAE lane to free its VRAM context for the heavy model.",
+            f"{_pause_owner_phrase(owner)}: stopping the VAE lane to free its VRAM context.",
         )
         return True
 
@@ -1746,7 +1758,7 @@ class ProcessLifecycleManager:
         self._vae_lane_gpu_paused = False
         self._vae_lane_pause_owner = None
         self._vae_lane_gpu_restore_count += 1
-        logger.info("Whole-card residency complete: restarting the VAE lane.")
+        logger.info(f"{_pause_owner_phrase(owner)}: restarting the VAE lane after releasing the card.")
         self.start_vae_lane_processes()
         return True
 
@@ -2501,7 +2513,7 @@ class ProcessLifecycleManager:
             self._post_process_replacement_intentional = True
             self._initiate_post_process_replacement()
         logger.info(
-            "Whole-card residency: stopping the post-processing lane to free its VRAM context for the heavy model.",
+            f"{_pause_owner_phrase(owner)}: stopping the post-processing lane to free its VRAM context.",
         )
         return True
 
@@ -2527,7 +2539,7 @@ class ProcessLifecycleManager:
         self._post_process_gpu_paused = False
         self._post_process_pause_owner = None
         self._post_process_gpu_restore_count += 1
-        logger.info("Whole-card residency complete: restarting the post-processing lane.")
+        logger.info(f"{_pause_owner_phrase(owner)}: restarting the post-processing lane after releasing the card.")
         self.start_post_process_processes()
         return True
 

@@ -117,7 +117,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Job
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
@@ -163,7 +163,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     RunMetricsSnapshot,
     WorkerRunMetrics,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
+from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommandKind, VramArbiter
 from horde_worker_regen.process_management.resources.vram_attribution import (
     _REPORT_STALENESS_SECONDS,
     DriftObservation,
@@ -1280,6 +1280,15 @@ class HordeWorkerProcessManager:
         # Monotonic time each card most recently entered continuous SATURATION (device-free below the hard
         # floor), or absent when the card is not currently saturated. The last-rung kill reads its duration.
         self._saturated_since_by_device: dict[int, float] = {}
+        # Monotonic time each card most recently returned (and has stayed) HEALTHY, or absent when it is not
+        # currently HEALTHY. The stranded-lane self-heal backstop reads its duration: a reclaim-ladder lane
+        # pause with no live claimant is only restored once the card has been debounced-HEALTHY this long.
+        self._healthy_since_by_device: dict[int, float] = {}
+        # Silence-breaker for disaggregation routing: the monotonic instant disaggregation last became
+        # continuously unavailable (roles not live) while enabled, and whether that outage has already been
+        # warned. The edge-latched warning fires once per outage and re-arms when routing returns.
+        self._disaggregation_unavailable_since: float | None = None
+        self._disaggregation_unavailable_logged: bool = False
         # The per-step floor: a fast crawl detector. On INFERENCE_STEP heartbeats the parent compares each
         # slot's observed per-step time to its expected per-step time; two consecutive steps each at or above
         # the floor multiple, while the card is at PRESSURE or SATURATED, force the reclaim ladder to run this
@@ -1436,7 +1445,7 @@ class HordeWorkerProcessManager:
         # Disaggregated jobs whose decode completed; drained each loop into the safety pipeline (the
         # orchestrator's completion callback is sync, but safety routing is async).
         self._disaggregated_completions: list[
-            tuple[HordeJobInfo, list[HordeImageResult], GENERATION_STATE, DisaggregatedFault | None]
+            tuple[HordeJobInfo, list[HordeImageResult], GENERATION_STATE, DisaggregatedFault | None, float | None]
         ] = []
         self._disaggregation_orchestrator = DisaggregationOrchestrator(
             find_encode_service=self._process_map.get_component_process,
@@ -1451,6 +1460,7 @@ class HordeWorkerProcessManager:
             reroute_monolithic=self._reroute_disaggregated_job_monolithic,
             encode_lane_paused=lambda: self._process_lifecycle.is_component_gpu_paused,
             image_lane_paused=lambda: self._process_lifecycle.is_vae_lane_gpu_paused,
+            image_lane_pause_owner=lambda: self._process_lifecycle.vae_lane_pause_owner,
             estimate_sampling_peak_mb=self._inference_scheduler.estimate_disaggregated_sampling_peak_mb,
             estimate_decode_spike_mb=self._inference_scheduler.estimate_disaggregated_decode_spike_mb,
             observe_sampling_peak=self._inference_scheduler.observe_disaggregated_sampling_peak,
@@ -1463,6 +1473,7 @@ class HordeWorkerProcessManager:
             register_disaggregated=self._register_disaggregated_job,
             pin_owner=self._disaggregation_orchestrator.pinned_job_id_for_process,
             sampling_peaks=self._disaggregation_orchestrator.active_sampling_peaks_snapshot,
+            vae_decode_pending_count=self._disaggregation_orchestrator.pending_vae_decode_count,
         )
 
         self._recovery_coordinator = WorkerRecoveryCoordinator(
@@ -2006,15 +2017,18 @@ class HordeWorkerProcessManager:
         images: list[HordeImageResult],
         state: GENERATION_STATE,
         fault: DisaggregatedFault | None,
+        time_elapsed: float | None,
     ) -> None:
         """Queue a completed disaggregated job's images for routing into the safety pipeline.
 
         Called synchronously from the orchestrator; the async safety hand-off runs in the control loop
         (:meth:`drive_disaggregation`) so decode completion never blocks the orchestrator. ``fault`` carries
         the reason and faulting process id when the job faulted (None on success), so the synthetic result
-        the parent builds is not blank and does not misattribute the process.
+        the parent builds is not blank and does not misattribute the process. ``time_elapsed`` is the job's
+        end-to-end generation span (None when the orchestrator recorded no registration timestamp), carried
+        onto the synthetic result so a disaggregated completion reports a real duration for submit accounting.
         """
-        self._disaggregated_completions.append((job_info, images, state, fault))
+        self._disaggregated_completions.append((job_info, images, state, fault, time_elapsed))
 
     def _on_disaggregation_sampling_complete(self, job_info: HordeJobInfo) -> None:
         """Free the sampler slot the instant a disaggregated job's sampling finishes.
@@ -2050,9 +2064,11 @@ class HordeWorkerProcessManager:
         Class membership is a property of the job and the worker config alone: pipeline disaggregation is
         enabled; the job's effective (post-fallback) source processing is txt2img/img2img/remix with no
         control_type and no transparency (the layerdiffuse decode graph is not identity-validated on the
-        staged path); its model's baseline is an SD1.5 or SDXL family (the only v1-validated families, resolved
-        from the loaded model reference, never guessed from the name); and the job has not been re-routed out
-        of the pipeline. Effective source processing is the SDK's single-truth resolution: a source-requiring
+        staged path); its model is not an inpainting-variant checkpoint (whose UNet takes the masked-image
+        input channels the txt2img sample graph does not supply, so the staged sampler would fault); its
+        model's baseline is an SD1.5 or SDXL family (the only v1-validated families, resolved from the loaded
+        model reference, never guessed from the name); and the job has not been re-routed out of the pipeline.
+        Effective source processing is the SDK's single-truth resolution: a source-requiring
         mode (img2img/inpainting/outpainting/remix) whose source image is unusable resolves to txt2img, so
         such a pop is class-eligible as the txt2img job it will actually run. It deliberately does not
         consult live role processes or transient residency state, so residency forecasting charges a job that
@@ -2069,6 +2085,11 @@ class HordeWorkerProcessManager:
         if sdk_job.payload.transparent:
             return False
         if sdk_job.model is None:
+            return False
+        # An inpainting-variant checkpoint's UNet takes the masked-image-plus-mask input; the txt2img sample
+        # graph the staged path builds does not supply it, so the sampler faults on the first slice. Route
+        # such a model whole, where its graph construction accommodates the inpainting input.
+        if self._model_metadata.is_inpainting(sdk_job.model):
             return False
         # A job re-routed to the monolithic path (its disaggregated stage kept failing resource-class past the
         # defer window) is monolithic in every respect from then on: charged its full footprint and never
@@ -2090,6 +2111,66 @@ class HordeWorkerProcessManager:
         if self._process_map.num_loaded_component_processes() < 1:
             return False
         return self._process_map.num_loaded_vae_lane_processes() >= 1
+
+    _DISAGGREGATION_UNAVAILABLE_WARN_SECONDS = 60.0
+    """How long disaggregation routing stays continuously unavailable before the silence-breaker warns once.
+
+    Brief unavailability is normal (a lane cycling, a whole-card residency holding the card), so the warning is
+    withheld until the outage has persisted past this window, then emitted once. Without it a lane that fails to
+    return leaves every job silently routing monolithic with no signal that the advertised disaggregation is
+    dead."""
+
+    def _note_disaggregation_availability(self) -> None:
+        """Emit one edge-latched WARNING when enabled disaggregation routing stays unavailable too long.
+
+        When pipeline disaggregation is enabled but its role processes are not live (a lane paused off the GPU
+        or absent), every job silently routes monolithic. This surfaces that: once the outage has persisted for
+        :attr:`_DISAGGREGATION_UNAVAILABLE_WARN_SECONDS` a single WARNING names which role is down and why (pause
+        owner or process absence). The latch clears when routing returns, re-arming the warning for the next
+        outage, so a flapping lane does not spam the log.
+        """
+        if not self.bridge_data.enable_pipeline_disaggregation:
+            self._disaggregation_unavailable_since = None
+            self._disaggregation_unavailable_logged = False
+            return
+        if self._disaggregation_roles_live():
+            self._disaggregation_unavailable_since = None
+            self._disaggregation_unavailable_logged = False
+            return
+
+        now = time.monotonic()
+        if self._disaggregation_unavailable_since is None:
+            self._disaggregation_unavailable_since = now
+            return
+        if self._disaggregation_unavailable_logged:
+            return
+        elapsed = now - self._disaggregation_unavailable_since
+        if elapsed < self._DISAGGREGATION_UNAVAILABLE_WARN_SECONDS:
+            return
+
+        self._disaggregation_unavailable_logged = True
+        logger.warning(
+            f"Pipeline disaggregation has been unavailable for {elapsed:.0f}s: all jobs are routing monolithic. "
+            f"component lane: {self._service_lane_availability_note(HordeProcessType.COMPONENT)}; "
+            f"VAE lane: {self._service_lane_availability_note(HordeProcessType.VAE_LANE)}.",
+        )
+
+    def _service_lane_availability_note(self, process_type: HordeProcessType) -> str:
+        """Describe why a disaggregation role lane is or is not live, for the silence-breaker warning."""
+        lifecycle = self._process_lifecycle
+        if process_type is HordeProcessType.COMPONENT:
+            live = self._process_map.num_loaded_component_processes() >= 1
+            paused = lifecycle.is_component_gpu_paused
+            owner = lifecycle.component_pause_owner
+        else:
+            live = self._process_map.num_loaded_vae_lane_processes() >= 1
+            paused = lifecycle.is_vae_lane_gpu_paused
+            owner = lifecycle.vae_lane_pause_owner
+        if live:
+            return "live"
+        if paused:
+            return f"down (paused off-GPU by {owner.value if owner is not None else 'unknown'})"
+        return "down (no live process)"
 
     def _is_disaggregatable_sdk_job(self, sdk_job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``sdk_job`` should be dispatched down the disaggregated pipeline right now.
@@ -2155,7 +2236,7 @@ class HordeWorkerProcessManager:
         self._disaggregated_completions = []
         lane = self._process_map.get_first_available_vae_lane_process()
         lane_pid = lane.process_id if lane is not None else 0
-        for job_info, images, state, fault in completions:
+        for job_info, images, state, fault, time_elapsed in completions:
             if fault is None:
                 info = ""
                 process_id = lane_pid
@@ -2169,6 +2250,7 @@ class HordeWorkerProcessManager:
                 process_launch_identifier=0,
                 info=info,
                 state=state,
+                time_elapsed=time_elapsed,
                 job_image_results=images if images else None,
                 sdk_api_job_info=job_info.sdk_api_job_info,
             )
@@ -2586,6 +2668,13 @@ class HordeWorkerProcessManager:
             else:
                 self._saturated_since_by_device.pop(device_index, None)
 
+            # Track continuous HEALTHY so the stranded-lane backstop only reclaims an orphaned reclaim-ladder
+            # pause once the card has been debounced-HEALTHY for a bounded interval.
+            if sample.state == GovernorState.HEALTHY:
+                self._healthy_since_by_device.setdefault(device_index, time.monotonic())
+            else:
+                self._healthy_since_by_device.pop(device_index, None)
+
             # The per-step floor forces the ladder to run even under PRESSURE (before full saturation) when a
             # slot is crawling: the latch is set on the crawling heartbeat and consumed here. It clears when the
             # card recovers to HEALTHY, so the ladder returns to being SATURATED-driven.
@@ -2610,6 +2699,11 @@ class HordeWorkerProcessManager:
                 ),
             )
 
+            # Defence in depth: restore a reclaim-ladder service-lane pause that has lost its restore owner (no
+            # live saturation episode, no PP-borrow receipt) once the card has been HEALTHY long enough that
+            # holding the lane off can no longer be justified by pressure.
+            self._reclaim_stranded_service_lane_pauses(device_index)
+
             # The reclaim episode as a coalesced decision: while a card is saturated the recorder emits one
             # opening record plus bounded heartbeats, and one resolving record when the card recovers, rather
             # than one per governed tick. NO_OP on a card that was never saturated is dropped by the recorder.
@@ -2627,6 +2721,75 @@ class HordeWorkerProcessManager:
                     "saturation_unresolved": self._reclaim_ladder.is_saturation_unresolved(device_index),
                 },
             )
+
+    _STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS = 60.0
+    """How long a card must have been continuously HEALTHY before the backstop reclaims an orphaned lane pause.
+
+    The self-heal backstop is a last resort behind the two responsible restore owners (a live saturation
+    episode's LIFO unwind and the post-processing drain's borrow receipt). Requiring a debounced-HEALTHY card
+    keeps it from racing those owners or lifting a lane while the card is still tight: only a pause that has
+    outlived both owners on a card that no longer needs the memory is reclaimed."""
+
+    def _reclaim_stranded_service_lane_pauses(self, device_index: int) -> None:
+        """Restore a reclaim-ladder service-lane pause on ``device_index`` that has lost its restore owner.
+
+        A service-lane off-GPU pause owned by the reclaim ladder has exactly one responsible restore path: the
+        saturation episode's LIFO unwind when the card returns HEALTHY, or (for a lane the post-processing drain
+        borrowed) that drain's receipt-based release. If both are gone while the pause is still held, the lane
+        is stranded off the GPU with no one to bring it back, silently disabling the disaggregation it serves.
+
+        This backstop reclaims exactly that orphan: for each service lane paused by
+        :attr:`PauseOwner.RECLAIM_LADDER` with no live saturation episode holding a lane pause and no
+        post-processing borrow receipt, once the card has been HEALTHY for
+        :attr:`_STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS`, it restores the lane through the same owner-guarded
+        actuator and logs a WARNING naming what was stranded. A whole-card residency pause (a different owner)
+        and a pause a live claimant still holds are never touched.
+        """
+        if device_index != self._process_lifecycle.vae_lane_card_index():
+            return
+        healthy_since = self._healthy_since_by_device.get(device_index)
+        if healthy_since is None:
+            return
+        if (time.monotonic() - healthy_since) < self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS:
+            return
+        if self._reclaim_ladder.episode_holds_paused_lane(device_index):
+            # A live saturation episode owns its own lane pauses; its LIFO unwind is the responsible restore.
+            return
+
+        lifecycle = self._process_lifecycle
+        scheduler = self._inference_scheduler
+        orchestrator = self._post_process_orchestrator
+
+        if (
+            lifecycle.is_vae_lane_gpu_paused
+            and lifecycle.vae_lane_pause_owner is PauseOwner.RECLAIM_LADDER
+            and not orchestrator.is_service_lane_borrowed(ActuatorCommandKind.PAUSE_VAE_LANE)
+        ):
+            logger.warning(
+                f"Restoring a stranded VAE lane on device {device_index}: the reclaim ladder paused it, but no "
+                "saturation episode or post-processing borrow still claims it and the card has been healthy. "
+                "Disaggregation was disabled for as long as it stayed paused.",
+            )
+            scheduler.restore_vae_lane(device_index)
+
+        if (
+            lifecycle.is_component_gpu_paused
+            and lifecycle.component_pause_owner is PauseOwner.RECLAIM_LADDER
+            and not orchestrator.is_service_lane_borrowed(ActuatorCommandKind.PAUSE_COMPONENT_LANE)
+        ):
+            logger.warning(
+                f"Restoring a stranded component lane on device {device_index}: the reclaim ladder paused it, "
+                "but no saturation episode or post-processing borrow still claims it and the card has been "
+                "healthy. Disaggregation was disabled for as long as it stayed paused.",
+            )
+            scheduler.restore_component_lane(device_index)
+
+        if lifecycle.is_post_process_gpu_paused and lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER:
+            logger.warning(
+                f"Restoring a stranded post-processing lane on device {device_index}: the reclaim ladder paused "
+                "it, but no saturation episode still claims it and the card has been healthy.",
+            )
+            scheduler.restore_post_process_lane(device_index)
 
     def latest_device_free_mb(self, device_index: int = 0) -> float | None:
         """Return the last NVML device-level free VRAM (MB) the governor sampled for a card (calibration)."""
@@ -3040,6 +3203,8 @@ class HordeWorkerProcessManager:
 
             if len(self._job_tracker.jobs_pending_post_processing) > 0:
                 await self._start_post_processing_with_fresh_vram_snapshot()
+
+            self._note_disaggregation_availability()
 
             if self.bridge_data.enable_pipeline_disaggregation:
                 await self.drive_disaggregation()

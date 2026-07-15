@@ -218,7 +218,7 @@ async def test_terminally_rejected_lora_dispatches_and_is_memoized_across_jobs()
     assert tracker.get_stage(job_b.id_) != JobStage.PENDING_SUBMIT
 
 
-@pytest.mark.parametrize("reason", ["too_large", "nsfw", "invalid"])
+@pytest.mark.parametrize("reason", ["too_large", "nsfw", "invalid", "mismatch"])
 async def test_lora_rejection_skips_dispatches_and_memoizes(reason: str) -> None:
     """Any terminal LoRA rejection skips the file, dispatches the job, and memoizes the verdict (control).
 

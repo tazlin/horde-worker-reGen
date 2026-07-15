@@ -403,6 +403,18 @@ class VerifiedReclaimLadder:
         episode = self._episodes.get(device_index)
         return episode is not None and episode.unresolved
 
+    def episode_holds_paused_lane(self, device_index: int) -> bool:
+        """Whether a live saturation episode on ``device_index`` currently owns one or more lane pauses.
+
+        A caller reasoning about whether a ladder-owned lane pause has a live claimant reads this: while an
+        episode is recorded with paused lanes, that episode's own LIFO unwind (on the card returning HEALTHY)
+        is the responsible restore path, so no external backstop should lift the pause. A card that has already
+        returned HEALTHY has had its episode restored and removed, so this reports False and the pause, if still
+        held, is an orphan the backstop may reclaim.
+        """
+        episode = self._episodes.get(device_index)
+        return episode is not None and bool(episode.paused_lanes)
+
     def _verify(
         self,
         episode: _Episode,

@@ -57,6 +57,19 @@ _DEFER_LOG_INTERVAL_SECONDS = 30.0
 A long unfittable wait should leave a few diagnostic lines, not one per scheduling tick; the reclaim
 request and the aging decision are governed separately so this throttle only bounds log volume."""
 
+_BORROW_IDLE_RELEASE_SECONDS = 30.0
+"""How long a borrowed service lane may stay held with no post-processing job actively using it before it is
+restored, even while other post-processing jobs remain queued.
+
+The loan is taken to make room for a post-processing dispatch. Holding it across *adjacent dispatched* jobs
+avoids pause/restore churn (a job that fits with the loan dispatches within a tick, keeping the lane in use).
+But a borrowed lane is a disaggregation lane, and pausing it disables disaggregation, which routes jobs
+monolithic, which raises card pressure and sustains post-processing backlog: the queue then never fully drains
+and the loan, gated only on a full drain, would be held indefinitely. This bound releases the lane once no job
+has been actively post-processed for this window, so a stalled queue (jobs that defer and age out without ever
+dispatching) can no longer hold a disaggregation lane hostage. Sits below the admission-patience window so the
+lane is returned well before a stranded job ages out."""
+
 
 def _round_or_none(value: float | None) -> float | None:
     """Round a measured MB figure to one decimal, passing ``None`` through for absent telemetry."""
@@ -151,9 +164,18 @@ class PostProcessOrchestrator:
         self._deferrals: dict[str, _DeferralRecord] = {}
         # Service-lane pauses this PP drain actually acquired through the shared reclaim actuator. The receipt
         # from execute_arbiter_commands excludes no-ops, so restoring these can never lift a same-owner pause an
-        # independent governor episode already held. Kept across individual jobs and released once the accepted
-        # PP queue and active lane both drain, avoiding pause/restore churn between adjacent PP jobs.
+        # independent governor episode already held. Kept across adjacent dispatched jobs (avoiding pause/restore
+        # churn), and released when the PP queue fully drains or when no job has been actively post-processed for
+        # the idle-release window, so a borrowed disaggregation lane is not held hostage by a stalled queue.
         self._borrowed_service_lane_actuations: set[ActuatorCommandKind] = set()
+        # Monotonic time the borrowed service lane(s) last had no post-processing job actively using them, or
+        # None when a job is being post-processed (or nothing is borrowed). Anchors the idle-release window that
+        # returns a borrowed disaggregation lane a stalled post-processing queue would otherwise hold forever.
+        self._borrow_idle_since: float | None = None
+        # Latched True once a borrow was released for idleness (the loan never led to a dispatch), so the same
+        # stalled episode does not immediately re-borrow the lane it just returned; cleared when the accepted PP
+        # queue fully drains and a fresh episode may borrow again.
+        self._service_lane_borrow_suppressed: bool = False
         # The single VRAM arbiter, injected by the manager. It is the deciding authority for the lane's memory
         # admission question (replacing the banned free-VRAM read). None until wired (and in tests), where the
         # gate admits on missing telemetry.
@@ -199,6 +221,7 @@ class PostProcessOrchestrator:
                     record is not None
                     and record.admission_reclaim_attempted
                     and not self._borrowed_service_lane_actuations
+                    and not self._service_lane_borrow_suppressed
                 ),
             ),
         )
@@ -299,6 +322,9 @@ class PostProcessOrchestrator:
                     ActuatorCommandKind.PAUSE_COMPONENT_LANE,
                 ):
                     self._borrowed_service_lane_actuations.add(actuation.kind)
+                    # A borrow is only taken for a job that is deferring (not yet dispatched), so the lane is
+                    # idle from the instant it is acquired; anchor the idle-release window here.
+                    self._borrow_idle_since = now
             reclaim_action_available = bool(applied_actuations)
             issued_reclaim = True
         elif not record.reclaim_requested:
@@ -387,7 +413,7 @@ class PostProcessOrchestrator:
         - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation
           episode, not once per scheduling tick.
         """
-        self._restore_borrowed_service_lanes_if_drained()
+        self._release_borrowed_service_lanes_when_unused()
         pending = self._job_tracker.jobs_pending_post_processing
         self._prune_deferrals(pending)
         if not pending:
@@ -441,23 +467,62 @@ class PostProcessOrchestrator:
         # busy or unfittable head must never hold a long-waiting job past its patience window.
         await self._age_out_unfittable(now=now)
 
-    def _restore_borrowed_service_lanes_if_drained(self) -> None:
-        """Restore service lanes this PP drain borrowed once no accepted PP work remains.
+    def is_service_lane_borrowed(self, kind: ActuatorCommandKind) -> bool:
+        """Whether this PP drain currently holds a receipt for a service-lane pause of ``kind``.
 
-        A pause stays in place while a PP job is queued or active, because restoring its CUDA context before the
-        chain allocates would recreate the exact non-fit the pause resolved. Adjacent PP jobs share the same
-        bounded loan. The owner-guarded actuator restore is idempotent; a pause already restored elsewhere is a
-        harmless False, and the receipt-based set ensures this path never attempts to lift a pause it did not
+        The self-heal backstop reads this to decide whether a reclaim-ladder lane pause has a live claimant: a
+        pause this orchestrator borrowed has a responsible restore owner here and must not be lifted from under
+        it, so the backstop only reclaims a ladder-owned pause that no receipt (and no saturation episode)
+        claims.
+        """
+        return kind in self._borrowed_service_lane_actuations
+
+    def _release_borrowed_service_lanes_when_unused(self) -> None:
+        """Restore service lanes this PP drain borrowed once no post-processing job is actively using them.
+
+        The loan makes room for a post-processing *dispatch*. While a job is being post-processed the pause
+        stays in place (restoring its CUDA context before the chain allocates would recreate the exact non-fit
+        the pause resolved), and adjacent dispatched jobs share the one bounded loan. A full drain (nothing
+        queued and nothing active) restores immediately, as before.
+
+        The added escape is for a stalled queue: a borrowed lane is a disaggregation lane, so holding it
+        disables disaggregation, which routes work monolithic and sustains post-processing backlog the queue
+        never fully drains. When no job has been actively post-processed for :data:`_BORROW_IDLE_RELEASE_SECONDS`
+        the lane is restored even though jobs remain queued, so a disaggregation lane is never held hostage by
+        post-processing work that only defers and ages out without ever dispatching. The owner-guarded actuator
+        restore is idempotent, and the receipt-based set ensures this path never lifts a pause it did not
         acquire.
         """
+        if not self._job_tracker.jobs_pending_post_processing and not self._job_tracker.jobs_being_post_processed:
+            # The starvation episode is over: a future episode may borrow a service lane again.
+            self._service_lane_borrow_suppressed = False
+
         if not self._borrowed_service_lane_actuations:
-            return
-        if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+            self._borrow_idle_since = None
             return
         actuator = self._vram_actuator
         if actuator is None:
             return
 
+        if self._job_tracker.jobs_being_post_processed:
+            # A job is actively using the borrowed room; hold the loan and reset the idle clock so the release
+            # window measures only uninterrupted idleness after the last dispatched job.
+            self._borrow_idle_since = None
+            return
+
+        drained = not self._job_tracker.jobs_pending_post_processing
+        if not drained:
+            now = self._clock()
+            if self._borrow_idle_since is None:
+                self._borrow_idle_since = now
+                return
+            if (now - self._borrow_idle_since) < _BORROW_IDLE_RELEASE_SECONDS:
+                return
+            # The loan never led to a dispatch and the queue is stalled: return the disaggregation lane and do
+            # not let this same episode re-borrow it, so the lane is not thrashed pause/restore every window.
+            self._service_lane_borrow_suppressed = True
+
+        self._borrow_idle_since = None
         # Reverse the reclaim order. The current drain contract borrows at most one lane, and retaining the
         # canonical unwind order keeps this robust if the eligible lane order grows later.
         for kind in (ActuatorCommandKind.PAUSE_COMPONENT_LANE, ActuatorCommandKind.PAUSE_VAE_LANE):

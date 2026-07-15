@@ -62,12 +62,13 @@ def test_custom_models_yaml_validation() -> None:
         coerce_value(_BY_KEY["custom_models"], '- name: "bad"\n  baseline: "stable_diffusion_1"\n')
 
 
-def test_pipeline_disaggregation_field_is_hidden_advanced() -> None:
-    """The dormant disaggregation option stays catalogued under Advanced but is not rendered."""
+def test_pipeline_disaggregation_field_is_visible_advanced() -> None:
+    """The experimental disaggregation option is catalogued under Advanced and rendered for the operator."""
     field = _BY_KEY["enable_pipeline_disaggregation"]
 
     assert field.section == "Other"
-    assert field.hidden is True
+    assert field.hidden is False
+    assert field.requires_restart is True
 
 
 def test_alchemy_forms_include_worker_default_forms() -> None:

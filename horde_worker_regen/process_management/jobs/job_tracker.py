@@ -1951,6 +1951,7 @@ class JobTracker:
         fault_reason: str | None = None,
         recovery_requeue: bool = False,
         fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
+        was_disaggregated_structural_fault: bool = False,
     ) -> InferenceFailureResolution:
         """Resolve a faulted job: requeue it for another (possibly degraded) attempt, or fault it.
 
@@ -1961,6 +1962,9 @@ class JobTracker:
         "locally unservable" streak, since it is not a verdict on whether the model fits the card.
         ``recovery_requeue`` marks a requeue granted by a save-our-ship pool rebuild, protecting the retry
         from a same-cycle give-up; ``fault_origin`` records what kind of action a *terminal* fault was.
+        ``was_disaggregated_structural_fault`` marks a fault that surfaced from a job's disaggregated stage
+        for a non-resource-class (structural) reason, latching the job monolithic on the requeue so the retry
+        does not re-route into the pipeline that just failed it structurally.
         """
         return self._resolve_inference_failure_impl(
             faulted_job,
@@ -1972,6 +1976,7 @@ class JobTracker:
             fault_reason=fault_reason,
             recovery_requeue=recovery_requeue,
             fault_origin=fault_origin,
+            was_disaggregated_structural_fault=was_disaggregated_structural_fault,
         )
 
     def handle_job_fault_now(
@@ -1986,6 +1991,7 @@ class JobTracker:
         fault_reason: str | None = None,
         recovery_requeue: bool = False,
         fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
+        was_disaggregated_structural_fault: bool = False,
     ) -> InferenceFailureResolution:
         """Synchronous fault path for sync callers (e.g. process crash handling). See :meth:`handle_job_fault`."""
         return self._resolve_inference_failure_impl(
@@ -1998,6 +2004,7 @@ class JobTracker:
             fault_reason=fault_reason,
             recovery_requeue=recovery_requeue,
             fault_origin=fault_origin,
+            was_disaggregated_structural_fault=was_disaggregated_structural_fault,
         )
 
     def _resolve_inference_failure_impl(
@@ -2012,6 +2019,7 @@ class JobTracker:
         fault_reason: str | None = None,
         recovery_requeue: bool = False,
         fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
+        was_disaggregated_structural_fault: bool = False,
     ) -> InferenceFailureResolution:
         tracked = self._tracked_for(faulted_job)
 
@@ -2064,6 +2072,11 @@ class JobTracker:
                 # A pool rebuild granted this attempt; the same recovery cycle's give-up must not fault it
                 # before the rebuilt pool has had a dispatch opportunity (cleared at mark_inference_started).
                 tracked.retry_granted_by_recovery = True
+            if was_disaggregated_structural_fault:
+                # The disaggregated pipeline faulted this job for a structural (non-resource-class) reason, so
+                # the same staged path would fault it again. Latch it monolithic so the eligibility predicate
+                # keeps the retry off the pipeline and the whole-job graph (which accommodates the job) runs.
+                tracked.disaggregation_declined = True
             degraded = resource_failure and not tracked.degraded_retry_used
             if degraded:
                 tracked.degraded_retry_used = True

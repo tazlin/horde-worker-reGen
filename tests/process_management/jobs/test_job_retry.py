@@ -83,6 +83,64 @@ async def test_resource_failure_earns_one_degraded_retry(job_tracker: JobTracker
     assert job_tracker.is_degraded_dispatch_pending(job) is False  # type: ignore[arg-type]
 
 
+async def test_disaggregated_structural_fault_latches_job_monolithic_on_requeue(job_tracker: JobTracker) -> None:
+    """A structural disaggregated stage fault requeues the job with the disaggregation-declined latch set.
+
+    The latch is what keeps attempt 2 off the pipeline that structurally failed the job: the scheduler's
+    eligibility predicate reads it and dispatches the retry monolithically instead of re-routing disagg.
+    """
+    job_tracker.set_retry_policy(2)
+    job = await _pop_and_start(job_tracker)
+
+    first = await job_tracker.handle_job_fault(  # pyrefly: ignore
+        faulted_job=job,
+        was_disaggregated_structural_fault=True,
+    )
+
+    assert first is InferenceFailureResolution.RETRY
+    assert job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE  # type: ignore[union-attr]
+    assert job_tracker.is_disaggregation_declined(job) is True  # type: ignore[arg-type]
+
+
+async def test_ordinary_fault_does_not_latch_disaggregation_declined(job_tracker: JobTracker) -> None:
+    """A fault not flagged as a structural disaggregated fault leaves the disaggregation latch untouched.
+
+    Control for the structural-decline behaviour: a resource (OOM) failure keeps its existing degraded-retry
+    path and does not force the job monolithic, so the pipeline is free to admit it again.
+    """
+    job_tracker.set_retry_policy(2)
+    job = await _pop_and_start(job_tracker)
+
+    resolution = await job_tracker.handle_job_fault(  # pyrefly: ignore
+        faulted_job=job,
+        is_resource_failure=True,
+    )
+
+    assert resolution is InferenceFailureResolution.RETRY_DEGRADED
+    assert job_tracker.is_disaggregation_declined(job) is False  # type: ignore[arg-type]
+
+
+async def test_disaggregated_structural_fault_still_faults_terminally_on_exhaustion(
+    job_tracker: JobTracker,
+) -> None:
+    """When the attempt budget is spent, a structural disaggregated fault still faults terminally.
+
+    The decline latch only redirects a *retry*; once no retry remains the job faults for the horde to
+    reissue, exactly as any other exhausted job.
+    """
+    job_tracker.set_retry_policy(1)
+    job = await _pop_and_start(job_tracker)
+
+    resolution = await job_tracker.handle_job_fault(  # pyrefly: ignore
+        faulted_job=job,
+        was_disaggregated_structural_fault=True,
+    )
+
+    assert resolution is InferenceFailureResolution.FAULTED
+    assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT  # type: ignore[union-attr]
+    assert job_tracker.total_num_completed_jobs == 1
+
+
 async def test_terminal_fault_records_one_diagnostic(job_tracker: JobTracker) -> None:
     """A terminal fault attaches exactly one diagnostic entry naming the attempts and reason."""
     job = await _pop_and_start(job_tracker)

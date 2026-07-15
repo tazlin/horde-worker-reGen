@@ -28,6 +28,11 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
+    _AFFINITY_MAX_SKIPS,
+    AffinitySkipState,
+    record_affinity_skip,
+)
 from horde_worker_regen.process_management.scheduling.governance import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
@@ -539,17 +544,210 @@ class TestGetNextJobAndProcess:
         assert result.line_skip is not None
         assert result.line_skip.displaced_job is head_job
 
-    async def test_non_forecast_head_does_not_bypass(self) -> None:
-        """When the head's model is not forecast to load, no bypass occurs so the head gets priority."""
+    async def test_non_forecast_head_bypassed_within_budget(self) -> None:
+        """Within the affinity budget a resident-model job now passes a cold non-forecast head (card stays fed).
+
+        Previously a non-forecast head was never bypassed; the head's preload-defer window left a resident job
+        idle behind it. The affinity skip budget inverts that inside the window: the resident job dispatches and
+        the head keeps its queue position via a ``resident_bypass`` line-skip.
+        """
         holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
         process_map = ProcessMap({1: holder})
 
         job_tracker = JobTracker()
-        await track_popped_job_async(job_tracker, make_job_pop_response("big_a"))
-        await track_popped_job_async(job_tracker, make_job_pop_response("resident_b"))
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
 
         sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        result = await sched.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.process_with_model is holder
+        assert result.line_skip is not None
+        assert result.line_skip.displaced_job is head_job
+        assert result.line_skip.reason == "resident_bypass"
+
+    async def test_non_forecast_head_reclaims_after_skip_budget_exhausted(self) -> None:
+        """Once the skip ceiling is hit the cold head is no longer bypassed and reclaims the fall-through path.
+
+        This is the old non-forecast protection, its precondition moved: the head is protected once the bound is
+        spent, not unconditionally. With no bypass and its model neither resident nor loading, dispatch defers so
+        the room-making machinery runs for the head.
+        """
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
         assert await sched.get_next_job_and_process() is None
+
+    async def test_non_forecast_head_reclaims_after_budget_window_elapses(self) -> None:
+        """Once the wall-clock window elapses the cold head reclaims, even under the skip ceiling."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time() - 3600.0,
+            skip_count=1,
+        )
+        assert await sched.get_next_job_and_process() is None
+
+    async def test_forecast_head_bypass_is_bounded_by_budget(self) -> None:
+        """The forecast-to-load bypass is now bounded too: an exhausted budget stops it (was unbounded before).
+
+        This closes the latent ttl-aging hole where a forecast head could be bypassed forever. With the budget
+        spent and the head's model still loading, no bypass occurs and the head keeps its position.
+        """
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+        hmm = HordeModelMap(root={})
+        hmm.update_entry(horde_model_name="big_a", load_state=ModelLoadState.LOADING, process_id=1)
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, horde_model_map=hmm, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+        assert await sched.get_next_job_and_process() is None
+
+    async def test_pin_wait_head_bypasses_regardless_of_budget(self) -> None:
+        """Control: a pin-waiting head bypasses even with the affinity budget spent (it funds no fresh copy)."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+        sched._pinned_lane_resident_for_job = Mock(return_value=Mock())  # type: ignore[method-assign]
+
+        result = await sched.get_next_job_and_process()
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.line_skip is not None
+        assert result.line_skip.reason == "resident_bypass"
+
+    async def test_information_only_does_not_advance_affinity_window(self) -> None:
+        """The look-ahead call surfaces the bypass but must not advance the skip window (only dispatch does)."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        before = sched._affinity_skip_state
+
+        result = await sched.get_next_job_and_process(information_only=True)
+        assert result is not None
+        assert result.line_skip is not None
+        assert sched._affinity_skip_state is before
+        assert sched.latest_affinity_skips() == 0
+
+    async def test_resident_head_dispatches_immediately_even_mid_budget(self) -> None:
+        """A head whose model is resident dispatches directly, regardless of an in-progress affinity window."""
+        head_holder = make_mock_process_info(0, model_name="big_a", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({0: head_holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        await track_popped_job_async(job_tracker, head_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=3,
+        )
+
+        result = await sched.get_next_job_and_process()
+        assert result is not None
+        assert result.next_job is head_job
+        assert result.line_skip is None
+
+    async def test_cold_head_reclaims_against_a_steady_resident_stream(self) -> None:
+        """Liveness: a cold head passed by a steady resident stream still reclaims the slot within the bound.
+
+        An unbounded bypass would starve the cold head forever behind never-ending resident work. Each cycle the
+        resident job would bypass the head; a committed bypass advances the skip window exactly as
+        ``start_inference`` does. After the bound is spent the stream can no longer bypass, and once the head's
+        model is made resident the head itself dispatches. The ``_pending_line_skip`` cache is cleared each
+        iteration to model the per-cycle re-evaluation ``run_scheduling_cycle`` performs.
+        """
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        head_id = str(head_job.id_)
+        now = time.time()
+
+        for _ in range(_AFFINITY_MAX_SKIPS):
+            sched._pending_line_skip = None
+            result = await sched.get_next_job_and_process()
+            assert result is not None
+            assert result.next_job is bypass_job
+            assert result.line_skip is not None
+            assert result.line_skip.reason == "resident_bypass"
+            sched._affinity_skip_state = record_affinity_skip(sched._affinity_skip_state, head_id, now)
+            now += 1.0
+
+        # The bound is spent: the stream can no longer bypass, so the head reclaims the fall-through path.
+        sched._pending_line_skip = None
+        assert await sched.get_next_job_and_process() is None
+
+        # Once room is made and the head's model becomes resident, the head itself dispatches (not the stream).
+        head_holder = make_mock_process_info(0, model_name="big_a", state=HordeProcessState.PRELOADED_MODEL)
+        sched._process_map = ProcessMap({0: head_holder, 1: holder})
+        sched._pending_line_skip = None
+        reclaimed = await sched.get_next_job_and_process()
+        assert reclaimed is not None
+        assert reclaimed.next_job is head_job
+        assert reclaimed.line_skip is None
 
     async def test_max_concurrent_reached_returns_none(self) -> None:
         """get_next_job_and_process should return None if the maximum number of concurrent jobs is reached."""

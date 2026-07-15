@@ -461,10 +461,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Pipeline disaggregation",
         FieldKind.BOOL,
         "Other",
-        "Run eligible SD1.5/SDXL jobs as text-encode + UNet-sample + VAE-decode stages. Experimental; "
-        "temporarily disabled and ignored by the worker even when set in YAML or environment config.",
+        "Experimental. Route eligible SD1.5/SDXL txt2img/img2img/remix jobs through disaggregated stages: a "
+        "text-encode service, UNet-only sampling, a dedicated VAE lane, and the post-processing lane. "
+        "Ineligible jobs fall back to the whole-job path.",
         requires_restart=True,
-        hidden=True,
     ),
     ConfigField(
         "allow_controlnet",

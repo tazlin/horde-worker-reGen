@@ -40,6 +40,12 @@ ladder) is a routing decision, not a failure: the job is rerouted to the monolit
 normal claim/dispatch queue arbitrates waiting on the card, instead of parking against a pause whose restore
 may be minutes away and forfeiting the job at the patience fault.
 
+Because that reroute is silent (every job simply takes the monolithic path), a **silence-breaker** guards
+against an outage going unnoticed: when disaggregation is enabled but its role lanes stay unavailable (paused
+or absent) continuously past a short window, the parent emits one edge-latched WARNING naming which role is
+down and why, re-armed when routing returns. This surfaces a lane that fails to come back rather than leaving
+the advertised disaggregation silently dead.
+
 When safety runs on GPU, only CLIP remains resident while the lane is idle. DeepDanbooru stages from CPU for a
 conditional anime check; BLIP captioning and the aesthetic head are also offloaded after use, and completion
 trims the allocator before `WAITING_FOR_JOB`. This bounds the lane's fixed card cost without making every
@@ -97,11 +103,110 @@ behaviors keep an unfittable chain from parking the queue:
   measured re-check still does not fit and those softer actions are exhausted may the drain borrow one idle VAE
   or component lane context. That one-context loan is the episode limit; a continuing non-fit falls through to
   normal admission aging and recovery instead of stacking lane teardown. Busy service lanes are never
-  candidates; the borrowed pause is kept while PP work remains and restored only after the pending and active
-  PP sets drain. An applied-action receipt and the existing pause-owner guard ensure this path restores only a
+  candidates. An applied-action receipt and the existing pause-owner guard ensure this path restores only a
   pause it acquired. Safety may move off-GPU only under the operator's existing policy. This gives accepted lane
   work a path to measured room without repeatedly churning inference residency or weakening the recovery
   fences.
+
+### Restore ownership: every lane pause has exactly one responsible owner
+
+A service-lane off-GPU pause frees a real CUDA context, so it has no external trigger to bring it back: whoever
+paused it must own its restore. There are two responsible owners, keyed by `PauseOwner` at pause time so
+neither lifts the other's hold:
+
+- a **whole-card residency** pause is restored by the residency completion loop when the residency drains; and
+- a **reclaim-ladder** pause is restored by the ladder's LIFO unwind when the card's saturation episode ends,
+  or, for a lane the post-processing drain borrowed, by that drain's applied-action receipt.
+
+The borrowed lane's release is not gated on the *whole* PP queue draining, because a borrowed lane is a
+disaggregation lane: pausing it disables disaggregation, which routes work monolithic, raises card pressure,
+and sustains a PP backlog that never fully drains. A queue gate alone would then hold the lane hostage
+forever. Instead the loan is held while a job is actively being post-processed (adjacent dispatched jobs share
+the one loan), and returned once no job has been actively post-processed for a bounded idle window, even while
+jobs remain queued. A loan released this way is not re-borrowed for the same stalled episode (so the lane is
+not thrashed), and re-borrowing is re-enabled once the queue fully drains.
+
+Behind both owners sits a conservative **self-heal backstop** in the parent's governor tick: a reclaim-ladder
+lane pause that no live saturation episode and no PP-borrow receipt still claims is restored once the card has
+been governor-`HEALTHY` for a debounced interval, with a WARNING naming what was stranded. It never lifts a
+whole-card pause or a pause a live claimant holds; it exists only to reclaim an orphan neither responsible
+owner will.
+
+### Decode-drain eligibility: a VAE-lane pause defers to a queued decode
+
+The arbiter guarantees a lane it names for a pause is *idle* at the instant of the pause (its process is not
+busy), but a lane being idle this instant does not mean it has no imminent work: the disaggregation
+orchestrator holds jobs at `AWAITING_LATENT_DECODE` whose sampling already finished and whose only remaining
+step is a ~1-2s VAE decode on that same lane. Pausing the lane out from under such a job strands the finished
+sample, since the job then reroutes monolithic and re-runs whole, discarding the completed sampling to free
+room for a dispatch the decode itself would have cleared within seconds.
+
+So the reclaim-ladder VAE-lane pause is **decode-drain-aware**: it reports no-op while the orchestrator has any
+job needing the lane for a decode (queued or dispatched to it but not yet resulted). Both reclaim paths that
+stop this lane, the governor's saturation rung and a post-processing borrow, execute through the one reclaim
+owner, so a single no-op there makes each move to its next relief option exactly as any rung whose target has
+gone away does; the pause is simply not eligible this tick and pressure logic proceeds. The eligibility reads a
+cheap orchestrator accessor (the count of jobs at the decode stage) injected into the scheduler as a callable,
+and emits one edge-latched INFO line naming the pending-decode count when it withholds a pause, so the lever is
+visible in live forensics.
+
+A job that is *merely sampling* does not withhold the pause. Rerouting an unfinished sample discards no
+completed work, the existing defer window already covers a sampler whose lane a pause outlasts, and relieving
+device pressure matters more than protecting a sample that has not yet produced a latent. The mirror case for
+the component/text-encode lane is deliberately left ungated: encode sits at the front of the pipeline, so
+rerouting an `AWAITING_CONDITIONING` job monolithic discards nothing, and the wasted-work argument that
+motivates the VAE-lane gate does not apply.
+
+### Owner-aware decode hold: waiting out a bounded pause instead of rerouting
+
+The decode-drain eligibility gate only stops a *new* pause from executing while a decode is already pending. It
+cannot cover the window where the pause lands earlier: because a job merely sampling does not withhold the
+pause, a reclaim-ladder pause can execute while a job is still sampling, and that job then finishes sampling and
+reaches `AWAITING_LATENT_DECODE` a few ticks later to find the lane already paused off-GPU. The general rule for
+a deliberately-paused role lane is an immediate monolithic reroute (waiting on the card is arbitrated by the
+monolithic queue, and parking the job only ages it toward a patience fault). At the decode stage that rule is
+made **owner-aware**, because the two pause owners differ in how long they last:
+
+- a **reclaim-ladder** pause is bounded by construction (its idle-release restores the lane within seconds of
+  the borrower going idle, and the self-heal backstop covers an orphan), so a job whose sampling has already
+  finished **holds** at `AWAITING_LATENT_DECODE` for the restore rather than discarding that sampling to a
+  reroute. The hold is kept clear of the no-role patience clock, so a legitimate wait never ages toward a fault,
+  and the next tick re-attempts the decode dispatch with no manual kick, dispatching the moment the lane returns.
+  Should the lane not restore within the bounded hold window, the job reroutes monolithically as a backstop, so a
+  pause that never lifts can never strand it. One edge-latched INFO names the held-job count for live forensics.
+- a **whole-card residency** pause (or an unknown or absent owner while paused) lasts a heavy model's whole
+  residency (minutes), so the instant reroute remains correct: waiting is not worth protecting the finished
+  sample.
+
+The owner reaches the orchestrator through the same injected-predicate seam as the lane-paused check: lifecycle
+exposes the VAE-lane pause owner and the manager injects an accessor callable alongside the paused predicate.
+Only the decode stage holds; encode and source-latent stages keep the instant reroute, since rerouting them
+discards nothing worth waiting on.
+
+### Class eligibility: which jobs the pipeline accepts
+
+A job is class-eligible for disaggregation only when disaggregation is enabled and the job is one the staged
+graph can build faithfully: its effective (post-fallback) source processing is txt2img/img2img/remix; it
+carries no control_type; it is not transparent (the layerdiffuse decode graph is not identity-validated on the
+staged path); its model is **not an inpainting-variant checkpoint**; its model's baseline is an SD1.5 or SDXL
+family; and it has not already been re-routed out of the pipeline. An inpainting checkpoint's UNet takes the
+masked-image-plus-mask input channels, which the txt2img sample graph the staged path builds does not supply,
+so a staged sampler would fault it on the first slice. The inpainting flag is read from the loaded model
+reference record (the same lookup that resolves the baseline); an absent or `None` flag is treated as not
+inpainting, so incomplete reference data never excludes a model.
+
+### Structural stage fault: decline the pipeline for the retry
+
+A disaggregated stage can fault for two distinct reasons, handled differently. A **resource-class** fault
+(the stage was denied device VRAM under pressure) defers, and re-routes monolithically only if the pressure
+does not clear within the defer window, since the demand may simply not fit the card right now. A
+**structural** fault (a non-resource-class error the whole-job graph would not hit, such as a checkpoint the
+staged graph cannot faithfully build) is not device pressure and re-sampling on the pipeline would fault it
+again. So a structural stage fault latches the job **disaggregation-declined** as it requeues: the retry is
+kept off the pipeline by the class-eligibility predicate and runs on the whole-job path, whose graph
+construction accommodates the job. The terminal path is unchanged: if the monolithic retry also fails, the job
+faults for the horde to reissue. Only the fault reason authoritative to the orchestrator drives this; a
+resource-class fault keeps its existing defer-then-reroute behavior.
 
 Pending post-processing work also owns lane liveness. If the queue is non-empty and no `POST_PROCESS` process
 exists, the orchestrator asks lifecycle to start the lane; lifecycle still owns the actual admission checks

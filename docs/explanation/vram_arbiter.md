@@ -67,6 +67,30 @@ device-level truth, never on the per-PID paging-victim map, which the LRU physic
 unsatisfiable. The full mechanics live in
 [Performance and backpressure](performance_and_backpressure.md#the-truthful-signal-hierarchy-and-the-device-free-governor).
 
+A lane pause among the ladder's rungs (post-processing, VAE, or component lane off-GPU) frees a real CUDA
+context that no external trigger restores, so each executed lane pause must have exactly one responsible restore
+owner. A pause the governor's saturation episode issued is restored by that episode's LIFO unwind when the card
+returns `HEALTHY`; a lane the per-cycle post-processing DEFER path borrowed is restored by that drain's
+applied-action receipt (see
+[Process lanes and chaining](process_lanes_and_chaining.md#restore-ownership-every-lane-pause-has-exactly-one-responsible-owner)).
+The `execute_arbiter_commands` receipt returns exactly the pauses whose actuator reported it acted, so the
+borrow restores only a pause it truly acquired, never a same-owner pause an independent episode already held. A
+conservative self-heal backstop in the governor tick reclaims any reclaim-ladder lane pause that has outlived
+both owners (no live episode, no borrow receipt) once the card has been debounced-`HEALTHY`, so a lost claimant
+can never strand a lane off the GPU indefinitely.
+
+The VAE-lane pause carries one further eligibility rule the arbiter's idle-target guarantee cannot express.
+The arbiter only names a lane whose process is idle this instant, but an idle VAE lane may still have imminent
+work: the disaggregation orchestrator holds jobs at the decode stage whose sampling already finished and whose
+only remaining step is a short VAE decode on that lane. Pausing the lane out from under such a job reroutes it
+monolithic and discards the finished sampling, to make room for a dispatch the decode itself would clear in
+seconds. So the executing actuator reports the VAE-lane pause as a no-op while any disaggregated decode is
+queued or in flight on the lane, and both reclaim paths (the governor rung and the post-processing borrow) then
+move to their next relief option, exactly as they do for any rung whose target has gone away. A job merely
+sampling does not withhold the pause, and the component/text-encode lane is not gated, because rerouting a job
+that has not yet finished sampling discards no completed work (see
+[Process lanes and chaining](process_lanes_and_chaining.md#decode-drain-eligibility-a-vae-lane-pause-defers-to-a-queued-decode)).
+
 ## The four layers
 
 The arbiter keeps four concerns deliberately separate:

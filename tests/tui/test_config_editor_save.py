@@ -189,8 +189,8 @@ async def test_live_gpu_detection_does_not_make_config_dirty(tmp_path: Path) -> 
 
 
 @pytest.mark.e2e
-async def test_save_succeeds_with_hidden_advanced_field_present(tmp_path: Path) -> None:
-    """A hidden catalogued field in a rendered section is preserved without a widget."""
+async def test_save_preserves_rendered_experimental_field(tmp_path: Path) -> None:
+    """The experimental disaggregation toggle renders as a widget and round-trips its value on save."""
     app, path = await _mount(
         tmp_path,
         'api_key: "x"\ndreamer_name: "n"\nmax_threads: 1\nenable_pipeline_disaggregation: true\n',
@@ -198,7 +198,7 @@ async def test_save_succeeds_with_hidden_advanced_field_present(tmp_path: Path) 
     async with app.run_test() as pilot:
         editor = app.query_one(ConfigEditorView)
         await pilot.pause()
-        assert not editor.query("#cfg-enable_pipeline_disaggregation")
+        assert editor.query("#cfg-enable_pipeline_disaggregation")
         editor.query_one("#cfg-max_threads", Input).value = "4"
         assert editor._save() is True
         await pilot.pause()
