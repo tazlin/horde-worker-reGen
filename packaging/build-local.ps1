@@ -194,9 +194,10 @@ try {
     $bootstrapPkg = Join-Path $RepoRoot 'worker_bootstrap'
     if (-not (Test-Path $bootstrapPkg)) { throw "Bootstrap package not found: $bootstrapPkg" }
     Copy-Item -Recurse -Path $bootstrapPkg -Destination (Join-Path $stageDir 'worker_bootstrap')
-    # The image-utilities capability venv seeds the bootstrap installs from at
-    # requirements/utilities.<token>.txt. Copied as a directory (not via the manifest, which flattens
-    # entries to the bundle root) so the provisioner's path is preserved; matches release.yml.
+    # The image-utilities capability venv is provisioned with `uv sync --locked` against the self-contained
+    # uv project at requirements/utilities/ (pyproject.toml + uv.lock). Copied as a directory (not via the
+    # manifest, which flattens entries to the bundle root) so the project layout `uv sync --project` reads is
+    # preserved; matches release.yml.
     $reqDir = Join-Path $RepoRoot 'requirements'
     if (-not (Test-Path $reqDir)) { throw "requirements directory not found: $reqDir" }
     Copy-Item -Recurse -Path $reqDir -Destination (Join-Path $stageDir 'requirements')
@@ -233,10 +234,20 @@ try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
         try {
-            $hasLock = $archive.Entries | Where-Object { $_.FullName -eq 'uv.lock' -or $_.Name -eq 'uv.lock' }
+            $entryPaths = $archive.Entries | ForEach-Object { $_.FullName -replace '\\', '/' }
         } finally { $archive.Dispose() }
-        if (-not $hasLock) { throw "uv.lock is missing from the bundle; the installer's 'uv sync --locked' would fail." }
+        if (-not ($entryPaths | Where-Object { $_ -eq 'uv.lock' -or $_ -like '*/uv.lock' })) {
+            throw "uv.lock is missing from the bundle; the installer's 'uv sync --locked' would fail."
+        }
         Write-Note 'uv.lock present in bundle: OK'
+        # The image-utilities lane is provisioned from its own locked uv project; without it the lane silently
+        # fails to provision. Mirrors the release.yml zip check so the local build fails just as loudly.
+        foreach ($needed in @('requirements/utilities/pyproject.toml', 'requirements/utilities/uv.lock')) {
+            if (-not ($entryPaths | Where-Object { $_ -eq $needed -or $_ -like "*/$needed" })) {
+                throw "$needed is missing from the bundle; the image-utilities lane would fail to provision."
+            }
+        }
+        Write-Note 'image-utilities uv project present in bundle: OK'
     }
 
     # --- 4. Installer ----------------------------------------------------------------------

@@ -66,10 +66,11 @@ jobs:
           cp -r horde_worker_regen "$stage/"
           # The stdlib-only bootstrap brain bootstrap.py imports (copied as a package, like the worker).
           cp -r worker_bootstrap "$stage/"
-          # The image-utilities capability venv seeds the bootstrap installs from at
-          # requirements/utilities.<token>.txt. Copied as a directory (not via the manifest, which flattens
-          # entries to the bundle root) so the path the provisioner reads is preserved; without this the
-          # utilities lane silently fails to provision on every install built from the zip.
+          # The image-utilities capability venv is provisioned with `uv sync --locked` against the
+          # self-contained uv project at requirements/utilities/ (pyproject.toml + uv.lock). Copied as a
+          # directory (not via the manifest, which flattens entries to the bundle root) so the project layout
+          # `uv sync --project` reads is preserved; without this the utilities lane silently fails to
+          # provision on every install built from the zip.
           cp -r requirements "$stage/"
           find "$stage" -type d -name "__pycache__" -prune -exec rm -rf {} +
           find "$stage" -type d -name "*.egg-info" -prune -exec rm -rf {} +

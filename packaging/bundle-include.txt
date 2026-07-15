@@ -1,6 +1,9 @@
 # Files bundled into the release zip, read by .github/workflows/release.yml.
 # One path or glob per line; blank lines and lines starting with '#' are ignored.
-# The horde_worker_regen/ and worker_bootstrap/ packages are copied (recursively) separately by the workflow.
+# The horde_worker_regen/ and worker_bootstrap/ packages, and the requirements/ directory (which carries the
+# image-utilities uv project the bootstrap provisions the capability venv from: requirements/utilities/
+# pyproject.toml + uv.lock), are copied recursively by the workflow, separately from this flat manifest
+# (which flattens every entry to the bundle root and so cannot preserve their nested layout).
 # A test (tests/test_bundle_manifest.py) asserts every root .cmd/.sh launcher is listed here, so a new
 # launcher fails CI until added, and that no listed path is stale (e.g. a removed script).
 pyproject.toml
