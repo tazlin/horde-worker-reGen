@@ -217,12 +217,10 @@ async def test_bridge_data_loader_yaml_local_if_present() -> None:
     assert len(bridge_data.image_models_to_load) > 0
 
 
-async def test_bridge_data_load_from_env_vars() -> None:
+async def test_bridge_data_load_from_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that the bridge data can be loaded from environment variables."""
-    import os
-
-    os.environ["AIWORKER_REGEN_HORDE_URL"] = "https://localhost:8080"
-    os.environ["AIWORKER_REGEN_MODELS_TO_LOAD"] = "['model1', 'model2']"
+    monkeypatch.setenv("AIWORKER_REGEN_HORDE_URL", "https://localhost:8080")
+    monkeypatch.setenv("AIWORKER_REGEN_MODELS_TO_LOAD", "['model1', 'model2']")
 
     if not ModelReferenceManager.has_instance():
         horde_model_reference_manager = ModelReferenceManager(
@@ -241,6 +239,42 @@ async def test_bridge_data_load_from_env_vars() -> None:
     )
     assert bridge_data is not None
     assert bridge_data._loaded_from_env_vars is True
+    # The documented `AIWORKER_REGEN_<FIELD>` prefix must actually set the field (it previously did not).
+    assert bridge_data.horde_url == "https://localhost:8080"
+
+
+@pytest.mark.parametrize("prefix", ["AIWORKER_", "AIWORKER_REGEN_"])
+def test_env_var_prefix_sets_string_field(monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
+    """Both the legacy `AIWORKER_` prefix and the documented `AIWORKER_REGEN_` prefix set a string field."""
+    monkeypatch.delenv("AIWORKER_HORDE_URL", raising=False)
+    monkeypatch.delenv("AIWORKER_REGEN_HORDE_URL", raising=False)
+    monkeypatch.setenv(f"{prefix}HORDE_URL", "https://example.invalid")
+
+    bridge_data = BridgeDataLoader.load_from_env_vars()
+
+    assert bridge_data.horde_url == "https://example.invalid"
+
+
+@pytest.mark.parametrize("prefix", ["AIWORKER_", "AIWORKER_REGEN_"])
+def test_env_var_prefix_sets_bool_field(monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
+    """Both prefixes set a bool field; the disaggregation flag reaches the model set to true."""
+    monkeypatch.delenv("AIWORKER_ENABLE_PIPELINE_DISAGGREGATION", raising=False)
+    monkeypatch.delenv("AIWORKER_REGEN_ENABLE_PIPELINE_DISAGGREGATION", raising=False)
+    monkeypatch.setenv(f"{prefix}ENABLE_PIPELINE_DISAGGREGATION", "true")
+
+    bridge_data = BridgeDataLoader.load_from_env_vars()
+
+    assert bridge_data.enable_pipeline_disaggregation is True
+
+
+def test_env_var_regen_prefix_wins_over_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a field is set under both prefixes, the documented `AIWORKER_REGEN_` value wins."""
+    monkeypatch.setenv("AIWORKER_HORDE_URL", "https://legacy.invalid")
+    monkeypatch.setenv("AIWORKER_REGEN_HORDE_URL", "https://regen.invalid")
+
+    bridge_data = BridgeDataLoader.load_from_env_vars()
+
+    assert bridge_data.horde_url == "https://regen.invalid"
 
 
 def test_bridge_data_to_dot_env_file() -> None:

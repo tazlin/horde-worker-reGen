@@ -51,6 +51,12 @@ case of env var config (e.g. Docker), where dynamic updates are less common and
 file-watching would add complexity for little benefit. Operators who want live
 config changes should run from `bridgeData.yaml` rather than environment variables.
 
+Each field maps to an environment variable named for the field in upper case
+under either the documented `AIWORKER_REGEN_<FIELD>` prefix or the historical
+`AIWORKER_<FIELD>` prefix (both are accepted; the `AIWORKER_REGEN_` form wins if a
+field is set under both). For example, `AIWORKER_REGEN_HORDE_URL` and
+`AIWORKER_HORDE_URL` both set `horde_url`.
+
 ## Config tab save checks and presets
 
 The dashboard's **Config** tab is the preferred editor for operator-facing
