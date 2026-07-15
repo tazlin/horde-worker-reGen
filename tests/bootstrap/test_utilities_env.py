@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,29 @@ def test_repo_has_a_bootstrap_seed_for_every_locked_full_backend(token: str) -> 
     """Every full build that wants utilities by default ships a provisionable requirements seed."""
     root = Path(__file__).parents[2]
     assert utilities_env.utilities_requirements_file(token=token, root=root).is_file()
+
+
+@pytest.mark.parametrize("token", ["cu126", "cu130", "cu132", "cpu"])
+@pytest.mark.parametrize("package", ["torch", "torchvision"])
+def test_seed_torch_build_matches_lock(token: str, package: str) -> None:
+    """Each seed pins the exact torch/torchvision build uv.lock resolves for that backend.
+
+    The utilities venv installs from the seed and hardlinks its wheels from the same peered uv cache the
+    main ``.venv`` uses, so it only avoids re-downloading the multi-GB torch stack when it requests the
+    *identical* build the main sync already fetched. If a lock bump moved torch and a seed did not follow
+    (or vice versa), the utilities install would resolve a divergent build the cache cannot serve. Pinning
+    this equality keeps the two environments cache-shareable.
+    """
+    root = Path(__file__).parents[2]
+    seed = utilities_env.utilities_requirements_file(token=token, root=root).read_text(encoding="utf-8")
+    match = re.search(rf"^{package}==(\S+)$", seed, re.MULTILINE)
+    assert match, f"seed for {token} does not pin {package}=="
+    build = match.group(1)  # e.g. 2.12.1+cu132
+    lock = (root / "uv.lock").read_text(encoding="utf-8")
+    assert f'version = "{build}"' in lock, (
+        f"seed utilities.{token}.txt pins {package}=={build}, which uv.lock does not resolve; the utilities "
+        f"venv would download a {package} build the main .venv's cache cannot serve"
+    )
 
 
 def test_plan_creates_then_installs_without_hashes(tmp_path: Path) -> None:

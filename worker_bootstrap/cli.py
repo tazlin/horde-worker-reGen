@@ -471,9 +471,14 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
         # Verify the prediction against ground truth now that torch is on disk: an arch mismatch here
         # means the build map is stale, which the user cannot fix by reinstalling the same build.
         _verify_installed_torch_arch(uv, root, token)
-        _maybe_prune(uv, root, options)
         _write_sync_stamp(root)
+        # Build the utilities venv while the uv cache is still warm, then prune once. `uv cache prune`
+        # reclaims the reusable unpacked wheels the main sync just fetched (torch and its multi-GB CUDA
+        # stack among them); pruning before the second venv is created would strip exactly those wheels and
+        # force it to re-download them, since a venv's own hardlinks survive a prune but can no longer serve
+        # a fresh install. Provision first so both environments share one download, then prune to tidy both.
         _maybe_provision_utilities(uv, root, token, options)
+        _maybe_prune(uv, root, options)
     return rc
 
 

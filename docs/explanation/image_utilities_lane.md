@@ -36,11 +36,16 @@ pin. When the lane *is* wanted for a full build but its seed is absent (an insta
 cause is diagnosable instead of surfacing only as a missing interpreter at start.
 
 The venv is created and populated through the same hardened child environment as every other uv call, so it
-shares the worker's peered uv cache and managed CPython and participates in the same `uv cache prune`: the
-utilities install reuses the torch/CUDA wheels the main sync already cached rather than re-downloading them
-into a private cache. The create step passes `--clear`, keeping it fully managed and non-interactive (uv
-otherwise prompts before replacing an existing venv); a reprovision only runs when the venv is absent or
-stale, where a clean environment is exactly what is wanted.
+shares the worker's peered uv cache and managed CPython rather than a private cache. Provisioning runs
+*before* the post-sync `uv cache prune`, while that cache is still warm: a prune reclaims the reusable
+unpacked wheels (torch and its multi-GB CUDA stack among them), and a venv's own hardlinks survive a prune
+but can no longer serve a fresh install, so pruning first would force the utilities venv to re-download the
+exact wheels the main sync just fetched. Building it first lets both environments share one download; the
+prune then tidies both. This reuse holds only while the seed pins the same torch/torchvision build `uv.lock`
+resolves (a guard test enforces that equality), so a divergent build cannot silently reintroduce the double
+download. The create step passes `--clear`, keeping it fully managed and non-interactive (uv otherwise
+prompts before replacing an existing venv); a reprovision only runs when the venv is absent or stale, where
+a clean environment is exactly what is wanted.
 
 ## The adapter bridge
 

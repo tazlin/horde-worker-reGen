@@ -615,6 +615,28 @@ def test_sync_provisions_utilities_when_wanted_and_pinned(
     assert provisioned == ["cu126"]
 
 
+def test_sync_provisions_utilities_before_pruning_cache(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The utilities venv is built before `uv cache prune`, so it reuses the wheels the main sync fetched.
+
+    `uv cache prune` reclaims the reusable unpacked wheels (torch and its multi-GB CUDA stack among them),
+    and a venv's own hardlinks survive a prune but can no longer serve a fresh install. Pruning before the
+    second venv is created would therefore force it to re-download torch; provisioning must come first so
+    both environments share one download.
+    """
+    root, _ = env
+    # Make the cache "owned" so the auto-prune actually fires (mirrors test_sync_prunes_only_when_cache_owned).
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("HORDE_WORKER_UV_CACHE_MODE", raising=False)
+    _write_utilities_pin(root, "cu126")
+    order: list[str] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: order.append("provision"))
+    monkeypatch.setattr(cli.runner, "uv_cache_prune", lambda uv, **kw: (order.append("prune"), (0, 0))[1])
+    assert cli.main(["sync"]) == 0
+    assert order == ["provision", "prune"]
+
+
 def test_sync_warns_and_skips_when_full_backend_seed_is_missing(
     env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
