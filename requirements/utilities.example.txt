@@ -1,4 +1,0 @@
-# Illustrative skeleton only. The `example` token is never a real backend, so the bootstrap never installs
-# this file. A real requirements/utilities.<backend_token>.txt starts with a backend-matched torch and
-# torchvision pair plus horde-image-utilities[server,annotators,rembg_<cpu|cuda|rocm>]==<version>, then is
-# promoted to a fully-resolved hashed `uv pip compile` output for release.

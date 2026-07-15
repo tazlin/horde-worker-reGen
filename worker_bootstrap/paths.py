@@ -67,13 +67,28 @@ def utilities_python(root: Path | None = None) -> Path:
     return venv / "bin" / "python"
 
 
+def utilities_project_dir(root: Path | None = None) -> Path:
+    """Return the self-contained uv project that locks the utilities venv's dependencies.
+
+    Holds a ``pyproject.toml`` and ``uv.lock`` (one lock, per-build extras) that the bootstrap provisions
+    the utilities venv from with ``uv sync --locked``. Lives under the install root's ``requirements/`` so it
+    ships in the release bundle alongside the worker.
+    """
+    return (root or install_root()) / "requirements" / "utilities"
+
+
+def utilities_lock_file(root: Path | None = None) -> Path:
+    """Return the utilities uv.lock, the pinned resolution the utilities venv is synced from."""
+    return utilities_project_dir(root) / "uv.lock"
+
+
 def utilities_stamp_file(root: Path | None = None) -> Path:
     """Return the stamp recording what the utilities venv was last provisioned against.
 
-    Holds the backend token and the SHA256 of the requirements file the venv was installed from. It lives
+    Holds the backend token and the SHA256 of the utilities ``uv.lock`` the venv was synced from. It lives
     inside the utilities venv so it is discarded whenever that venv is recreated, keeping the recorded
     fingerprint and the actually-installed packages consistent, and so a matching stamp lets a launch skip
-    a redundant reinstall.
+    a redundant re-sync.
     """
     return utilities_venv_dir(root) / ".horde-utilities-stamp"
 

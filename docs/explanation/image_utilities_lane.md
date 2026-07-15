@@ -24,28 +24,34 @@ client, never the server's stack.
 
 The bootstrap brain (`worker_bootstrap`) builds and maintains the utilities venv; the worker process only
 checks that its interpreter exists and never creates it. Provisioning runs after a successful worker sync
-and is also repaired on a launch that finds the main `.venv` already current, so an install that gained a
-utilities pin in a later release still converges without a forced resync. It is best-effort: a failure
+and is also repaired on a launch that finds the main `.venv` already current, so an install that gained the
+utilities project in a later release still converges without a forced resync. It is best-effort: a failure
 warns but never turns an otherwise-complete worker install into a reported failure.
 
-The install list is a per-backend seed committed at `requirements/utilities.<backend_token>.txt` and shipped
-in the release bundle alongside the worker. Provisioning is skipped for a backend whose resolved feature set
-is empty (a lean build that did not opt in), and when a stamp shows the venv already matches the current
-pin. When the lane *is* wanted for a full build but its seed is absent (an install that never received the
-`requirements/` directory), the bootstrap warns and disables the lane rather than skipping silently, so the
-cause is diagnosable instead of surfacing only as a missing interpreter at start.
+The dependency set is a self-contained uv project committed at `requirements/utilities/` (a `pyproject.toml`
+plus a checked-in `uv.lock`, one lock with a build extra per locked torch build), shipped in the release
+bundle alongside the worker. The bootstrap provisions the venv with `uv sync --locked --extra <build>`,
+pointing `UV_PROJECT_ENVIRONMENT` at the peered utilities venv. Provisioning is skipped for a backend whose
+resolved feature set is empty (a lean build that did not opt in), and when a stamp shows the venv already
+matches the committed lock. When the lane *is* wanted for a full build but the lock is absent (an install
+that never received the `requirements/utilities/` directory), the bootstrap warns and disables the lane
+rather than skipping silently, so the cause is diagnosable instead of surfacing only as a missing interpreter
+at start.
 
-The venv is created and populated through the same hardened child environment as every other uv call, so it
-shares the worker's peered uv cache and managed CPython rather than a private cache. Provisioning runs
-*before* the post-sync `uv cache prune`, while that cache is still warm: a prune reclaims the reusable
-unpacked wheels (torch and its multi-GB CUDA stack among them), and a venv's own hardlinks survive a prune
-but can no longer serve a fresh install, so pruning first would force the utilities venv to re-download the
-exact wheels the main sync just fetched. Building it first lets both environments share one download; the
-prune then tidies both. This reuse holds only while the seed pins the same torch/torchvision build `uv.lock`
-resolves (a guard test enforces that equality), so a divergent build cannot silently reintroduce the double
-download. The create step passes `--clear`, keeping it fully managed and non-interactive (uv otherwise
-prompts before replacing an existing venv); a reprovision only runs when the venv is absent or stale, where
-a clean environment is exactly what is wanted.
+Provisioning from a lock is what makes the two environments share a single download. A locked sync installs
+strictly from the lockfile's recorded sources and never re-resolves, so it is deterministic (identical wheels
+on every machine), reuses the main `.venv`'s already-cached torch/CUDA stack from the peered uv cache, and
+can never be pulled onto a box's ambient extra-index (the failure a floating `uv pip install -r
+requirements.txt` is prone to: re-resolving torch's CUDA dependencies onto a different, sometimes unreachable,
+index). The lock pins `torch`/`torchvision` to the same build the root worker's `uv.lock` resolves, so the
+cached wheels actually match; a guard test fails if the two drift. The sync runs through the same hardened
+child environment as every other uv call, so it shares the worker's peered cache and managed CPython, and it
+runs *before* the post-sync `uv cache prune` while that cache is still warm: a prune reclaims the reusable
+unpacked wheels, and a venv's own hardlinks survive a prune but can no longer serve a fresh install, so
+pruning first would force the utilities venv to re-download the exact wheels the main sync just fetched.
+Building it first lets both environments share one download; the prune then tidies both. `uv sync` is
+inherently non-interactive and idempotent, so a reprovision (only when the venv is absent or the lock
+changed) reconciles the environment without prompting.
 
 ## The adapter bridge
 

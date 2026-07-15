@@ -17,6 +17,7 @@ on:
       - 'bridgeData_template.yaml'
       - 'pyproject.toml'
       - 'uv.lock'
+      - 'requirements/**'
       - 'Dockerfiles/**'
 jobs:
   pre-commit:
@@ -61,6 +62,10 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
+      # The image-utilities capability venv is provisioned with `uv sync --locked` against its own project,
+      # so a lock that has drifted from requirements/utilities/pyproject.toml would fail every provision.
+      - name: Verify the image-utilities lock is current
+        run: uv lock --check --project requirements/utilities
       # The default sweep skips the opt-in `slow` band (real subprocess spawns) so it stays fast; the
       # separate step below runs that band so CI coverage of the full-lifecycle tests is not lost.
       - name: Run unit tests (fast sweep)

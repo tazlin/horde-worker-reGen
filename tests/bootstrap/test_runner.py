@@ -256,16 +256,16 @@ def test_uv_run_no_sync_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     assert captured["cmd"] == ["UV", "run", "--no-sync", "horde-worker-web", "--host", "0.0.0.0"]
 
 
-def _write_utilities_requirements(root: Path, token: str) -> None:
-    """Write a minimal utilities requirements pin for *token* so provisioning has something to install."""
-    path = utilities_env.utilities_requirements_file(token=token, root=root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("horde-image-utilities==1.0.0\n", encoding="utf-8")
+def _write_utilities_lock(root: Path) -> None:
+    """Write a stand-in utilities uv.lock so a provision's stamp has a real digest to record."""
+    lock = paths.utilities_lock_file(root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("utilities-lock\n", encoding="utf-8")
 
 
 def test_provision_utilities_runs_plan_then_stamps(tmp_path: Path) -> None:
-    """A successful provision runs each planned command in order and only then writes the stamp."""
-    _write_utilities_requirements(tmp_path, "cu126")
+    """A successful provision runs the planned sync and only then writes the stamp."""
+    _write_utilities_lock(tmp_path)
     ran: list[list[str]] = []
 
     def fake_runner(argv: list[str]) -> int:
@@ -281,8 +281,8 @@ def test_provision_utilities_runs_plan_then_stamps(tmp_path: Path) -> None:
 
 
 def test_provision_utilities_raises_and_does_not_stamp_on_failure(tmp_path: Path) -> None:
-    """A non-zero step aborts with an actionable error and leaves no stamp (so it retries next sync)."""
-    _write_utilities_requirements(tmp_path, "cu126")
+    """A non-zero sync aborts with an actionable error and leaves no stamp (so it retries next launch)."""
+    _write_utilities_lock(tmp_path)
 
     def failing_runner(argv: list[str]) -> int:
         return 3
@@ -293,19 +293,20 @@ def test_provision_utilities_raises_and_does_not_stamp_on_failure(tmp_path: Path
     assert utilities_env.read_utilities_stamp(tmp_path) is None
 
 
-def test_provision_utilities_stops_at_first_failure(tmp_path: Path) -> None:
-    """The install step is not attempted when the venv-create step fails."""
-    _write_utilities_requirements(tmp_path, "cu126")
+def test_provision_utilities_does_not_stamp_when_sync_fails(tmp_path: Path) -> None:
+    """A failed sync runs the one planned command and never reaches the stamp."""
+    _write_utilities_lock(tmp_path)
     ran: list[list[str]] = []
 
-    def failing_first(argv: list[str]) -> int:
+    def failing(argv: list[str]) -> int:
         ran.append(argv)
-        return 1  # the create step fails
+        return 1
 
     with pytest.raises(utilities_env.UtilitiesProvisionError):
-        runner.provision_utilities("UV", backend_token="cu126", root=tmp_path, command_runner=failing_first)
+        runner.provision_utilities("UV", backend_token="cu126", root=tmp_path, command_runner=failing)
 
-    assert len(ran) == 1  # stopped before the pip install step
+    assert len(ran) == 1
+    assert utilities_env.read_utilities_stamp(tmp_path) is None
 
 
 def test_run_uv_keeps_waiting_through_keyboard_interrupt(

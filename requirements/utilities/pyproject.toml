@@ -1,0 +1,97 @@
+# Self-contained uv project whose ONLY purpose is to lock the image-utilities capability venv.
+#
+# The worker's `horde-image-utilities` capability service runs from a second virtual environment
+# (worker_bootstrap.paths.utilities_venv_dir) so its native, accelerator-gated stack never co-resolves with
+# the worker's own `.venv`. This project pins that stack the same way the main worker pins torch: one thin
+# extra per locked build routes torch/torchvision to the matching PyTorch wheel index and selects the rembg
+# accelerator. `uv lock` produces `uv.lock`; the bootstrap provisions the utilities venv with
+# `uv sync --locked --extra <build>`, so every machine resolves the identical wheels from the identical
+# sources. That determinism is the point: a locked sync installs from the lockfile's recorded sources and
+# never re-resolves, so it reuses the main `.venv`'s cached torch/CUDA wheels and can never be pulled onto a
+# box's ambient extra-index (the failure a floating `uv pip install -r requirements.txt` is prone to).
+#
+# `package = false` keeps this a virtual project: only its dependencies are installed, never the project
+# itself. Keep the torch/torchvision routing and index list identical to the root pyproject so the two
+# environments resolve the same build.
+[project]
+name = "horde-worker-utilities"
+version = "0.0.0"
+description = "Locked dependency set for the horde-worker-reGen image-utilities capability venv."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Accelerator-neutral core of the capability service. The rembg accelerator and torch build come from
+    # the per-build extras below. Do NOT add mediapipe: the current release declares an OpenCV wheel
+    # conflict between the mediapipe and annotator extras.
+    "horde-image-utilities[server,annotators]==0.2.0",
+]
+
+[project.optional-dependencies]
+# One extra per locked torch build, mirroring the root pyproject. A CUDA build takes rembg_cuda
+# (onnxruntime-gpu); cpu takes rembg_cpu. torch/torchvision are listed (unpinned) so [tool.uv.sources] can
+# route them to the matching wheel index per extra; their VERSION is pinned globally by
+# constraint-dependencies below.
+cu126 = ["horde-image-utilities[rembg_cuda]==0.2.0", "torch", "torchvision"]
+cu130 = ["horde-image-utilities[rembg_cuda]==0.2.0", "torch", "torchvision"]
+cu132 = ["horde-image-utilities[rembg_cuda]==0.2.0", "torch", "torchvision"]
+cpu = ["horde-image-utilities[rembg_cpu]==0.2.0", "torch", "torchvision"]
+
+[tool.uv]
+package = false
+python-preference = "managed"
+# Pin torch/torchvision to the SAME version the root worker's uv.lock resolves, so the utilities venv
+# installs byte-identical wheels and reuses the main `.venv`'s cached torch/CUDA stack instead of
+# re-downloading it. The root worker leaves these unpinned but is capped lower by horde-engine's torchvision
+# range; the service has no such cap and would otherwise float ahead (to 2.13.x). A constraint pins the
+# version across every resolution (base and each extra) while [tool.uv.sources] still routes the build. A
+# guard test (tests/bootstrap/test_utilities_env.py) fails if this drifts from the root lock, so a torch bump
+# there is a deliberate re-pin + re-lock here.
+# numba floor: rembg -> pymatting -> numba, and the resolver otherwise lands on numba 0.53.1, whose sdist
+# guards against Python 3.12 at build time (`only versions >=3.6,<3.10 are supported`) and has no 3.12 wheel.
+# numba >=0.60 is the first line with cp312 wheels, so the floor keeps the utilities venv installable on the
+# pinned 3.12 interpreter (llvmlite follows numba up to a 3.12-wheel version automatically).
+constraint-dependencies = ["torch==2.12.1", "torchvision==0.27.1", "numba>=0.60"]
+# The build extras are mutually exclusive, exactly like the root pyproject, so one lock carries all four.
+conflicts = [
+    [
+        {extra = "cu126"},
+        {extra = "cu130"},
+        {extra = "cu132"},
+        {extra = "cpu"},
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    {index = "pytorch-cu126", extra = "cu126"},
+    {index = "pytorch-cu130", extra = "cu130"},
+    {index = "pytorch-cu132", extra = "cu132"},
+    {index = "pytorch-cpu", extra = "cpu"},
+]
+# torchvision is routed alongside torch so the pair always shares one build (a torchvision left to resolve
+# from generic PyPI pulls a different build and breaks the install).
+torchvision = [
+    {index = "pytorch-cu126", extra = "cu126"},
+    {index = "pytorch-cu130", extra = "cu130"},
+    {index = "pytorch-cu132", extra = "cu132"},
+    {index = "pytorch-cpu", extra = "cpu"},
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -113,14 +113,14 @@ jobs:
             fi
           done
 
-      - name: Verify the bundle ships the image-utilities seeds
-        # Without these the bootstrap's utilities-venv provisioning silently no-ops (no seed to install
-        # from) and the worker disables the image-utilities lane. Every full backend must ship its seed.
+      - name: Verify the bundle ships the image-utilities uv project
+        # Without the utilities project (pyproject + lock) the bootstrap's `uv sync --locked` provisioning
+        # silently no-ops and the worker disables the image-utilities lane.
         run: |
           set -eu
-          for token in cpu cu126 cu130 cu132; do
-            if ! unzip -l horde-worker-reGen.zip | grep -q "requirements/utilities.$token.txt"; then
-              echo "::error::requirements/utilities.$token.txt is missing from the bundle; the image-utilities lane would fail to provision."
+          for needed in requirements/utilities/pyproject.toml requirements/utilities/uv.lock; do
+            if ! unzip -l horde-worker-reGen.zip | grep -q "$needed"; then
+              echo "::error::$needed is missing from the bundle; the image-utilities lane would fail to provision."
               exit 1
             fi
           done

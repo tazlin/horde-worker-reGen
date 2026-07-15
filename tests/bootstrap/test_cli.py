@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from worker_bootstrap import backend, cli, detect, utilities_env
+from worker_bootstrap import backend, cli, detect, paths, utilities_env
 
 
 def _decision(token: str) -> detect.BackendDecision:
@@ -233,7 +233,7 @@ def test_launch_provisions_utilities_when_main_venv_is_already_current(
     """A launch repairs the independent utilities venv even when it can skip the main sync."""
     root, calls = env
     _in_sync_venv(root)
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
     provisioned: list[str] = []
     monkeypatch.setattr(
         cli.runner,
@@ -592,11 +592,11 @@ def test_sync_amd_windows_profile_uses_rocm_path(
 # --- utilities-venv provisioning wire-in (after a successful sync) ---------------------------------
 
 
-def _write_utilities_pin(root: Path, token: str) -> None:
-    """Write a CI-style utilities requirements pin so provisioning has a file to install from."""
-    pin = utilities_env.utilities_requirements_file(token=token, root=root)
-    pin.parent.mkdir(parents=True, exist_ok=True)
-    pin.write_text("horde-image-utilities==1.0.0\n", encoding="utf-8")
+def _write_utilities_lock(root: Path) -> None:
+    """Write a stand-in utilities uv.lock so provisioning has a lock to sync from."""
+    lock = paths.utilities_lock_file(root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("utilities-lock\n", encoding="utf-8")
 
 
 def test_sync_provisions_utilities_when_wanted_and_pinned(
@@ -604,7 +604,7 @@ def test_sync_provisions_utilities_when_wanted_and_pinned(
 ) -> None:
     """A successful sync provisions the utilities venv when features are wanted and a pin exists."""
     root, _ = env
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
     provisioned: list[str] = []
     monkeypatch.setattr(
         cli.runner,
@@ -629,7 +629,7 @@ def test_sync_provisions_utilities_before_pruning_cache(
     # Make the cache "owned" so the auto-prune actually fires (mirrors test_sync_prunes_only_when_cache_owned).
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("HORDE_WORKER_UV_CACHE_MODE", raising=False)
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
     order: list[str] = []
     monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: order.append("provision"))
     monkeypatch.setattr(cli.runner, "uv_cache_prune", lambda uv, **kw: (order.append("prune"), (0, 0))[1])
@@ -637,14 +637,14 @@ def test_sync_provisions_utilities_before_pruning_cache(
     assert order == ["provision", "prune"]
 
 
-def test_sync_warns_and_skips_when_full_backend_seed_is_missing(
+def test_sync_warns_and_skips_when_full_backend_lock_is_missing(
     env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A full backend whose seed is absent warns (it should ship one) and provisions nothing.
+    """A full backend whose utilities lock is absent warns (it should ship one) and provisions nothing.
 
-    This is the broken-install signal: the default token (cu126) ships a seed by policy, so a missing one
-    means the tree never received requirements/ (the release-bundle omission this guards). It must be
-    diagnosable, not a silent lane-disable, while never failing the completed worker sync.
+    This is the broken-install signal: the default token (cu126) ships the utilities project by policy, so a
+    missing lock means the tree never received requirements/utilities/ (the release-bundle omission this
+    guards). It must be diagnosable, not a silent lane-disable, while never failing the completed worker sync.
     """
     _, _ = env
     called: list[bool] = []
@@ -653,7 +653,7 @@ def test_sync_warns_and_skips_when_full_backend_seed_is_missing(
     assert called == []
     err = capsys.readouterr().err
     assert "image-utilities lane is enabled" in err
-    assert "requirements/utilities.cu126.txt" in err
+    assert "dependency lock is missing" in err
 
 
 def test_sync_skip_utilities_flag_suppresses_provision(
@@ -661,7 +661,7 @@ def test_sync_skip_utilities_flag_suppresses_provision(
 ) -> None:
     """--skip-utilities suppresses provisioning even when it would otherwise run."""
     root, _ = env
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
     called: list[bool] = []
     monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
     assert cli.main(["sync", "--skip-utilities"]) == 0
@@ -671,7 +671,7 @@ def test_sync_skip_utilities_flag_suppresses_provision(
 def test_sync_skip_utilities_env_suppresses_provision(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
     """HORDE_WORKER_SKIP_UTILITIES=1 suppresses provisioning (the emergency env guard)."""
     root, _ = env
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
     monkeypatch.setenv("HORDE_WORKER_SKIP_UTILITIES", "1")
     called: list[bool] = []
     monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
@@ -682,7 +682,7 @@ def test_sync_skip_utilities_env_suppresses_provision(env: tuple[Path, list], mo
 def test_sync_features_none_does_not_want_utilities(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
     """HORDE_WORKER_FEATURES=none strips the feature set, so the utilities venv is not wanted."""
     root, _ = env
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
     monkeypatch.setenv("HORDE_WORKER_FEATURES", "none")
     called: list[bool] = []
     monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
@@ -695,7 +695,7 @@ def test_sync_utilities_provision_failure_is_non_fatal(
 ) -> None:
     """A utilities-provision failure warns but never turns a completed worker sync into a failure."""
     root, calls = env
-    _write_utilities_pin(root, "cu126")
+    _write_utilities_lock(root)
 
     def boom(uv: str, *, backend_token: str, **kw: object) -> None:
         raise utilities_env.UtilitiesProvisionError("could not create the utilities venv (exit code 2).")

@@ -59,21 +59,21 @@ def test_bootstrap_package_is_staged_by_workflows() -> None:
     assert "worker_bootstrap" in build_local, "build-local.ps1 must stage the worker_bootstrap package"
 
 
-def test_utilities_seeds_are_staged_by_workflows() -> None:
-    """Both staging scripts must recursively copy requirements/, and every full backend must ship a seed.
+def test_utilities_project_is_staged_by_workflows() -> None:
+    """Both staging scripts must recursively copy requirements/, which carries the utilities uv project.
 
-    The bootstrap provisions the image-utilities capability venv from requirements/utilities.<token>.txt.
-    Those seeds ride in as a directory (not via the flat manifest, which would flatten them to the bundle
-    root and break the path the provisioner reads), so if a staging script drops the recursive copy, or a
-    full backend loses its seed, an install built from the zip silently fails to provision the lane.
+    The bootstrap provisions the image-utilities capability venv with `uv sync --locked` against
+    requirements/utilities/ (its pyproject.toml + uv.lock). That directory rides in as a recursive copy (not
+    via the flat manifest, which would flatten it to the bundle root and break `uv sync --project`), so if a
+    staging script drops the recursive copy, or the project/lock is missing, an install built from the zip
+    silently fails to provision the lane.
     """
-    for token in ("cpu", "cu126", "cu130", "cu132"):
-        seed = REPO_ROOT / "requirements" / f"utilities.{token}.txt"
-        assert seed.is_file(), f"missing image-utilities seed for a full backend: {seed}"
+    assert (REPO_ROOT / "requirements" / "utilities" / "pyproject.toml").is_file(), "utilities pyproject missing"
+    assert (REPO_ROOT / "requirements" / "utilities" / "uv.lock").is_file(), "utilities uv.lock missing"
     release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     build_local = (REPO_ROOT / "packaging" / "build-local.ps1").read_text(encoding="utf-8")
-    assert "cp -r requirements" in release, "release.yml must recursively stage the requirements/ seeds"
-    assert "'requirements'" in build_local, "build-local.ps1 must recursively stage the requirements/ seeds"
+    assert "cp -r requirements" in release, "release.yml must recursively stage requirements/"
+    assert "'requirements'" in build_local, "build-local.ps1 must recursively stage requirements/"
 
 
 def test_detect_backend_script_is_bundled() -> None:

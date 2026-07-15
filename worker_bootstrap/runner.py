@@ -52,7 +52,7 @@ def build_child_env(root: Path | None = None) -> dict[str, str]:
     return env
 
 
-def run_uv(uv: str, args: list[str], *, root: Path | None = None) -> int:
+def run_uv(uv: str, args: list[str], *, root: Path | None = None, env_overrides: dict[str, str] | None = None) -> int:
     """Run uv with ``args`` in the install dir and the hardened env; return its exit code.
 
     Ctrl+C is delivered by the OS to the whole foreground process group, so the child (uv and,
@@ -60,9 +60,16 @@ def run_uv(uv: str, args: list[str], *, root: Path | None = None) -> int:
     We therefore swallow ``KeyboardInterrupt`` and keep waiting for the child to exit rather than
     letting ``subprocess.run`` SIGKILL it and unwind with a traceback, which would orphan the worker
     mid-drain. Repeated Ctrl+C simply loops here while the worker's handler escalates its own exit.
+
+    ``env_overrides`` are merged over the hardened child env for this one call (e.g. the utilities
+    provisioning points ``UV_PROJECT_ENVIRONMENT`` at the peered utilities venv), so the shared cache and
+    isolation still apply while a single call can retarget uv.
     """
     root = root or paths.install_root()
-    process = subprocess.Popen([uv, *args], cwd=str(root), env=build_child_env(root))
+    env = build_child_env(root)
+    if env_overrides:
+        env.update(env_overrides)
+    process = subprocess.Popen([uv, *args], cwd=str(root), env=env)
     while True:
         try:
             return process.wait()
@@ -255,32 +262,35 @@ def provision_utilities(
     root: Path | None = None,
     command_runner: Callable[[list[str]], int] | None = None,
 ) -> None:
-    """Create and populate the image-utilities venv for *backend_token*, stamping it on full success.
+    """Sync the image-utilities venv from its lock for *backend_token*, stamping it on full success.
 
-    Runs the argv command lists from
-    :func:`worker_bootstrap.utilities_env.plan_utilities_provision` through the same hardened child
-    environment as every other uv call (via :func:`run_uv`), so the utilities venv is built against the
-    peered uv cache and managed CPython the worker uses. The stamp is written only after every command
-    succeeds, so an interrupted or failed provision is retried on the next sync rather than recorded as
-    complete.
+    Runs the argv command from :func:`worker_bootstrap.utilities_env.plan_utilities_provision` through the
+    same hardened child environment as every other uv call (via :func:`run_uv`), with
+    ``UV_PROJECT_ENVIRONMENT`` pointed at the peered utilities venv so ``uv sync`` targets it rather than a
+    ``.venv`` under the project dir. Because it shares the worker's peered uv cache and managed CPython and
+    installs strictly from the committed lock, the utilities venv reuses the main ``.venv``'s cached
+    torch/CUDA wheels instead of re-downloading them. The stamp is written only after the sync succeeds, so
+    an interrupted or failed provision is retried on the next launch rather than recorded as complete.
 
     Args:
         uv: The uv executable to invoke.
-        backend_token: The locked torch-build token whose requirements pin to install.
+        backend_token: The locked torch-build token whose build extra to sync (e.g. ``cu132``).
         root: The install root (defaults to :func:`worker_bootstrap.paths.install_root`).
         command_runner: Executes one argv list and returns its exit code (injectable for tests). Defaults
-            to running it through :func:`run_uv` in the install dir with the hardened env.
+            to running it through :func:`run_uv` in the install dir with the hardened env plus
+            ``UV_PROJECT_ENVIRONMENT``.
 
     Raises:
-        UtilitiesProvisionError: When any provisioning command exits non-zero, naming the failed step.
+        UtilitiesProvisionError: When the sync exits non-zero, naming the failed command.
     """
     root = root or paths.install_root()
-    run_command = command_runner or (lambda argv: run_uv(uv, argv[1:], root=root))
+    env_overrides = {"UV_PROJECT_ENVIRONMENT": str(paths.utilities_venv_dir(root))}
+    run_command = command_runner or (lambda argv: run_uv(uv, argv[1:], root=root, env_overrides=env_overrides))
     for command in utilities_env.plan_utilities_provision(uv=uv, backend_token=backend_token, root=root):
         exit_code = run_command(command)
         if exit_code != 0:
             raise utilities_env.UtilitiesProvisionError(
-                f"the utilities-venv step `{' '.join(command)}` failed (exit code {exit_code}). "
+                f"the utilities-venv sync `{' '.join(command)}` failed (exit code {exit_code}). "
                 f"Re-run the sync to retry, or set HORDE_WORKER_SKIP_UTILITIES=1 to skip the utilities "
                 f"venv for now (the worker still runs; capabilities that need it are unavailable).",
             )
