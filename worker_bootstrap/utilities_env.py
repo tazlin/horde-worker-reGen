@@ -107,16 +107,25 @@ def plan_utilities_provision(
 ) -> list[list[str]]:
     """Return the argv command that syncs the utilities venv from its lock, without running it.
 
-    One command is produced: ``uv sync --locked --project <requirements/utilities> --extra <build>
-    --python <version>``. Run with ``UV_PROJECT_ENVIRONMENT`` pointed at the peered utilities venv (see
-    :func:`worker_bootstrap.runner.provision_utilities`), this creates the venv if absent and reconciles it
-    to the committed lock: deterministic, non-interactive, and cache-shared with the main ``.venv``. This is
-    a pure builder (it runs nothing), mirroring the builder/runner split in :mod:`worker_bootstrap.runner`.
+    One command is produced: ``uv sync --locked --reinstall --project <requirements/utilities> --extra
+    <build> --python <version>``. Run with ``UV_PROJECT_ENVIRONMENT`` pointed at the peered utilities venv
+    (see :func:`worker_bootstrap.runner.provision_utilities`), this creates the venv if absent and reconciles
+    it to the committed lock: deterministic, non-interactive, and cache-shared with the main ``.venv``. This
+    is a pure builder (it runs nothing), mirroring the builder/runner split in :mod:`worker_bootstrap.runner`.
 
     ``--locked`` is deliberate: it asserts the lock is current and installs strictly from it, so the utilities
     resolution can never diverge from the committed one (the property that keeps it off a box's ambient
-    extra-index and sharing the main venv's cached wheels). The result is returned as a one-element list of
-    commands so the runner's execute-each loop stays uniform.
+    extra-index and sharing the main venv's cached wheels).
+
+    ``--reinstall`` is deliberate too. Provisioning runs only when the venv is stale (a changed lock digest or
+    backend token, per :func:`needs_provision`), and a plain ``uv sync`` reconciles by package name and
+    version: it leaves an already-installed distribution untouched even when the lock now points the same
+    version at a different source. The utilities lock does exactly that (onnxruntime-gpu keeps one version but
+    routes per build to a CUDA-matched index), so without ``--reinstall`` a re-provision would keep the old
+    wheel and then stamp success, wedging the venv until it was deleted by hand. Reinstalling reconciles the
+    actual wheels to the lock; cached wheels re-link rather than re-download, and the cost stays bounded
+    because this fires only on a genuine change. The result is returned as a one-element list of commands so
+    the runner's execute-each loop stays uniform.
 
     Args:
         uv: The uv executable to invoke.
@@ -128,6 +137,7 @@ def plan_utilities_provision(
         uv,
         "sync",
         "--locked",
+        "--reinstall",
         "--project",
         str(paths.utilities_project_dir(root)),
         "--extra",

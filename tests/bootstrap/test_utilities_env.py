@@ -79,6 +79,7 @@ def test_plan_syncs_from_lock(tmp_path: Path) -> None:
             "UV",
             "sync",
             "--locked",
+            "--reinstall",
             "--project",
             str(paths.utilities_project_dir(tmp_path)),
             "--extra",
@@ -94,6 +95,18 @@ def test_plan_is_locked_and_non_interactive(tmp_path: Path) -> None:
     (command,) = utilities_env.plan_utilities_provision(uv="UV", backend_token="cu132", root=tmp_path)
     assert "--locked" in command
     assert command[1] == "sync"
+
+
+def test_plan_forces_reinstall(tmp_path: Path) -> None:
+    """The sync passes --reinstall so a re-provision reconciles actual wheels, not just name+version.
+
+    Provisioning fires only on a stale venv, and a plain ``uv sync`` leaves an already-installed distribution
+    in place when the lock repoints the same version at a different source (as the utilities lock does for
+    onnxruntime-gpu's per-build CUDA index). Without --reinstall the old wheel would survive and a success
+    stamp would wedge the venv until it was deleted by hand.
+    """
+    (command,) = utilities_env.plan_utilities_provision(uv="UV", backend_token="cu126", root=tmp_path)
+    assert "--reinstall" in command
 
 
 def test_plan_routes_the_requested_build_extra(tmp_path: Path) -> None:
