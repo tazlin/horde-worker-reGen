@@ -46,6 +46,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     SampleSliceResult,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
+from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 
 
 def inject_premade_control_map(
@@ -149,7 +150,7 @@ class HordeInferenceProcess(HordeProcess):
         device_index: int = 0,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
-        gpu_sampling_lease: Semaphore | None = None,
+        gpu_sampling_lease: ClearanceLeaseProxy | None = None,
         expect_image_models: bool = True,
     ) -> None:
         """Initialise the HordeInferenceProcess.
@@ -166,8 +167,10 @@ class HordeInferenceProcess(HordeProcess):
             dry_run_skip_inference (bool, optional): Skip real inference and return a dummy image. Defaults to False.
             dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. \
                 Defaults to 1.0.
-            gpu_sampling_lease (Semaphore | None, optional): Shared lease registered with hordelib to \
-                serialize the GPU denoising loop across processes. None disables coordination. Defaults to None.
+            gpu_sampling_lease (ClearanceLeaseProxy | None, optional): This process's own GPU denoise \
+                clearance proxy, registered with hordelib so the process blocks at the sample call until the \
+                parent clears it into its weight-load-plus-denoise window. None disables coordination. \
+                Defaults to None.
             device_index (int, optional): The stable index of the GPU this process is pinned to. Defaults to 0.
             expect_image_models (bool, optional): Whether this worker is configured to serve image \
                 generation. False for an alchemist-only (e.g. CPU) worker that loads no image models, where \
@@ -188,6 +191,9 @@ class HordeInferenceProcess(HordeProcess):
 
         self._inference_semaphore = inference_semaphore
         self._vae_decode_semaphore = vae_decode_semaphore
+        # The per-process GPU denoise clearance proxy (hordelib's sampling lease), or None when the lease is
+        # disabled. Retained so each job can reset its per-job grant at start (see :meth:`start_inference`).
+        self._gpu_sampling_lease = gpu_sampling_lease
 
         if dry_run_skip_inference:
             logger.info("Dry-run mode: skipping HordeLib/SharedModelManager initialisation")
@@ -219,13 +225,24 @@ class HordeInferenceProcess(HordeProcess):
             self._report_if_cpu_only_build()
 
             if gpu_sampling_lease is not None:
-                # Coordinate the GPU denoising loop across inference processes: this process
-                # samples only while holding the shared lease, but stages its pipeline (model
-                # load, prompt encode) freely, so the GPU stays busy back-to-back across jobs.
+                # Coordinate the GPU denoise loop across inference processes: this process stages its
+                # pipeline (checkpoint load, prompt encode) freely, then blocks at the sample call until the
+                # parent clears it into its weight-load-plus-denoise window, so the GPU stays busy
+                # back-to-back across jobs without heavy pairs co-loading weights.
                 from hordelib.api import set_gpu_sampling_lease
 
-                set_gpu_sampling_lease(gpu_sampling_lease)
-                logger.info("Registered GPU sampling lease for cross-process pipelining")
+                from horde_worker_regen.process_management.scheduling.clearance_lease import (
+                    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+                )
+
+                # A shorter acquire timeout than the inference step-timeout kill deadline: a clearance-starved
+                # child degrades into unpriced sampling (resuming step heartbeats) well before the hung-process
+                # watchdog could mistake its clearance wait for a hang.
+                set_gpu_sampling_lease(
+                    gpu_sampling_lease,
+                    acquire_timeout_seconds=CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+                )
+                logger.info("Registered GPU denoise clearance proxy for cross-process pipelining")
 
             # Subprocesses never download model references: the parent process owns downloading and
             # has already written the converted files to disk. Pre-build an offline reference manager
@@ -877,6 +894,11 @@ class HordeInferenceProcess(HordeProcess):
         Returns:
             list[Image] | None: The generated images, or None if inference failed.
         """
+        # Reset the clearance grant for this job before the pipeline runs: one grant covers a whole job (a
+        # multi-sample workflow passes through after the first), and the next job must wait for its own grant.
+        if self._gpu_sampling_lease is not None:
+            self._gpu_sampling_lease.begin_job()
+
         logger.info("Checking if too many inference jobs are already running...")
         self._inference_semaphore.acquire()
         logger.info("Acquired inference semaphore.")

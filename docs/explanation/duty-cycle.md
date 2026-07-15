@@ -198,9 +198,33 @@ classification that explains a parked head
 so the attribution line and the `Inference dispatch stalled` text never name different causes. Gate buckets
 include the disaggregation-specific causes: `disagg_pin_wait` (the head's model is resident only on a
 disaggregation-pinned sampler lane, so the head waits for that pin to release rather than fund a second copy)
-and `degraded_isolation_pending` (the head must run isolated and waits for the card to clear). `unexplained`
-growing is itself a finding: an empty slot with queued work that no gate claims is the
-scheduler-bug-shaped case. The cumulative totals also ride every stats sample (`slot_duty_totals`),
+and `degraded_isolation_pending` (the head must run isolated and waits for the card to clear). A
+`residency_reconciliation` slot is a resident-idle head the dispatch gate is holding for a few ticks while
+it evicts an idle sibling's VRAM so the head's on-device materialisation fits: a benign, self-clearing
+swap-churn wait, deliberately distinct from `unexplained`. A `post_processing_defer` slot is a resident-idle
+head the co-residency defer gate is holding because an in-flight (or imminent) post-processing chain's
+committed VRAM and this job's sampling peak cannot share the card; it dispatches once the chain finishes,
+so like the other gate buckets it is a named, real head-park worth seeing, not the gate-less scheduler stall.
+That gate prices co-residency statically against the card's reported total (the driver's free figure is
+untrustworthy under WDDM demand-paging, the exact regime the static test guards); when the static test
+withholds, a second admission path consults the parent's measured device-free reading, which during an
+active chain already reflects the chain's real allocations and so admits overlaps the ledger's worst-case
+reserve would needlessly hold. The measured path is used only while the driver is not paging and only when
+the measured free, net of the reserve and the sampling peak (and a pending chain's predicted reserve),
+clears a fixed margin, so a `post_processing_defer` slot now reflects a hold both the static *and* the
+measured tests refused to admit.
+
+A `clearance_hold` slot appears only when the GPU denoise clearance lease is enabled. Under the lease a
+dispatch stages the next job (checkpoint disk load, prompt encode) while another samples, and the diffusion
+weights load at **clearance**, the moment the parent admits the child into its sample window against measured
+device truth. A busy slot is therefore an *actively sampling* child, not merely an in-progress one: a staged
+child whose clearance the parent is holding (its full materialisation does not yet fit, so the single reclaim
+owner evicts idle residents first) is an empty sampling slot attributed to `clearance_hold`. It clears once
+eviction frees room, or the child samples anyway through its bounded lease-acquire timeout (liveness over
+pricing), so like the other gate buckets it is a named, real head-park rather than the gate-less stall.
+`unexplained`
+growing is itself a finding: an empty slot with queued work that no gate claims (and no reconcile hold
+explains) is the scheduler-bug-shaped case. The cumulative totals also ride every stats sample (`slot_duty_totals`),
 so `horde-log duty` reports the same breakdown per session offline, alongside a **concurrency
 occupancy** line (share of wall at each in-flight count) computed from the samples' `jobs_in_progress`,
 which works even on stats files predating the slot-duty fields.
@@ -336,6 +360,17 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
     hardware without CUDA MPS (e.g. Windows WDDM), where concurrent denoise loops merely time-slice the
     GPU: there, one denoise loop plus staged-ahead siblings is the efficient shape and raising the count
     only inflates the coverage-based duty number without lifting throughput.
+  - **`gpu_sampling_lease_tail_overlap`** (on by default when the lease is enabled) closes the *last* gap
+    the lease leaves at one slot: because the lease brackets the diffusion model's VRAM load as well as the
+    denoise loop, the incoming job's load otherwise serializes behind the outgoing job's denoise and the
+    GPU idles through the handoff. The lease carries one extra permit the parent holds, so processes still
+    see exactly `gpu_sampling_lease_slots` denoise slots in steady state; when the outgoing sampler nears
+    the end of its loop and a staged sibling is primed and waiting, and the card measurably has room with
+    the driver not demand-paging, the parent hands the permit over for one handoff window so the sibling
+    begins sampling before the outgoing job finishes. The parent takes the permit back the moment the
+    outgoing sampler leaves its loop, restoring the steady-state slot count. It shrinks the inter-sampling
+    gap without paying for sustained concurrent denoise, so it is the right shape even on no-MPS hardware;
+    disable it only to restore the strict per-slot denoise gate.
 
 ## See also
 

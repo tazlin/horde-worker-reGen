@@ -35,6 +35,7 @@ def test_primitives_bind_to_passed_spawn_context() -> None:
                 inference_semaphore_size=1,
                 vae_decode_semaphore_size=1,
                 gpu_sampling_lease_slots=1,
+                gpu_sampling_lease_tail_overlap=False,
             ),
         },
     )
@@ -45,7 +46,6 @@ def test_primitives_bind_to_passed_spawn_context() -> None:
     assert primitives.disk_lock._is_fork_ctx is False  # noqa: SLF001
     assert primitives.inference_semaphores[0]._is_fork_ctx is False  # noqa: SLF001
     assert primitives.vae_decode_semaphores[0]._is_fork_ctx is False  # noqa: SLF001
-    assert primitives.gpu_sampling_leases[0]._is_fork_ctx is False  # noqa: SLF001
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fork start method is POSIX-only; the bug cannot occur on Windows")

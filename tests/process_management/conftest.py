@@ -224,6 +224,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.unload_models_from_vram_often = False
     bd.gpu_sampling_lease_enabled = False
     bd.gpu_sampling_lease_slots = None
+    bd.gpu_sampling_lease_tail_overlap = True
     # Multi-GPU config: default to the single-GPU shape (no per-card overrides, auto-detect all). An empty
     # dict (not a Mock) is required so the effective-config resolver returns the base config unchanged.
     bd.gpu_overrides = {}
@@ -402,12 +403,13 @@ def make_test_mp_primitives(device_indices: tuple[int, ...] = (0,)) -> Multiproc
     The GPU-concurrency semaphores are per-card maps; the default single fake card (index 0) mirrors the
     single-GPU test path. Pass more indices to exercise a multi-card layout.
     """
+    process_message_queue = Mock()
     return MultiprocessingPrimitives(
-        process_message_queue=Mock(),
+        process_message_queue=process_message_queue,
+        child_facing_queues=[process_message_queue],
         inference_semaphores={index: Mock() for index in device_indices},
         disk_lock=Mock(),
         vae_decode_semaphores={index: Mock() for index in device_indices},
-        gpu_sampling_leases={index: Mock() for index in device_indices},
         download_bandwidth_semaphore=Mock(),
     )
 
@@ -438,7 +440,6 @@ def make_test_card_runtimes(
             total_vram_mb=total_vram_mb,
             inference_semaphore=Mock(),
             vae_decode_semaphore=Mock(),
-            gpu_sampling_lease=Mock(),
             target_process_count=target_process_count,
             max_concurrent_inference=max_concurrent_inference,
             mask_kind=mask_kind,

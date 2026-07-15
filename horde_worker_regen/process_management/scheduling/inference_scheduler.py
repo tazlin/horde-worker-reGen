@@ -98,6 +98,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramDisposition,
     VramRequest,
     VramRequestKind,
+    VramVerdict,
 )
 from horde_worker_regen.process_management.resources.vram_attribution import _REPORT_STALENESS_SECONDS
 from horde_worker_regen.process_management.resources.vram_footprints import (
@@ -105,6 +106,11 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+)
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    ActiveSampler,
+    ClearanceInputs,
+    ClearanceWaiter,
 )
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
 from horde_worker_regen.process_management.scheduling.governance import (
@@ -177,11 +183,13 @@ class LatestPreloadAdmission:
     """Worker wall-clock time when the decision was recorded."""
 
 
-_SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB = 3000.0
-"""Minimum device-wide free VRAM required to dispatch a job to a spare process *ahead* of a
-sampling slot opening (speculative pre-staging under the GPU sampling lease). Staging a job loads
-its model and encodes conditioning into VRAM before it can sample; this headroom guards against
-over-committing the GPU when pre-staging. Below it, dispatch falls back to the sampling-slot cap."""
+_STAGING_ENCODE_VRAM_MB = 2048.0
+"""VRAM a staged (dispatched but not-yet-cleared) job actually charges the device under the clearance
+lease: the text-encoder footprint plus the conditioning working set for the largest supported family
+(SDXL's dual CLIP encode lands near 1.5-2GB). Under the clearance lease the diffusion weights load
+*inside* the leased sample call, at clearance, not at dispatch, so a staged job's device footprint is
+only this encode working set until it is cleared. Dispatch admits staging while measured device free net
+of the reserve covers this charge; the full materialisation is priced at clearance instead."""
 
 _RESIDENCY_GRACE_SECONDS = 30.0
 """How long a model stays protected from RAM eviction after its last live demand, in the
@@ -192,6 +200,16 @@ been popped."""
 _DEFAULT_VRAM_RESERVE_MB = 2048.0
 """Fallback VRAM reserve (MB) used until the live config value is read. Matches the
 ``vram_reserve_mb`` config default; covers transient spikes such as tiled VAE decode."""
+
+_PP_OVERLAP_MEASURED_MARGIN_MB = 1024.0
+"""Measured free-VRAM margin (MB) the post-processing/sampling co-residency admission path holds back on
+top of the reserve and the sampling peak (and, for a not-yet-allocated pending chain, its predicted
+reserve). The static co-residency gate prices against the card's reported total (safe under WDDM
+demand-paging, which falsifies the driver's free figure); when it withholds, this second path consults the
+parent's measured device-free reading, which during an active chain already reflects the chain's real
+allocations and so is more accurate than the ledger's worst-case reserve. The margin absorbs allocator
+fragmentation and foreign churn so the measured admission does not over-commit the card. Only consulted when
+the driver is not paging: under active paging the measured free is a lie and the static fence stands."""
 
 _DEFAULT_RAM_RESERVE_MB = 4096.0
 """Fallback system-RAM reserve (MB) used until the live config value is read. Matches the
@@ -407,6 +425,23 @@ class _PreloadActuation:
     max_resident: int | None
 
 
+@dataclass(frozen=True)
+class _MaterializationOutcome:
+    """The result of pricing a job's VRAM materialisation through the MONOLITHIC_DISPATCH arbiter identity.
+
+    Returned by :meth:`InferenceScheduler._evaluate_materialization_admission` so the dispatch and clearance
+    gates share one admission core while each keeps its own hold bookkeeping and diagnostics. Carries the
+    arbiter verdict plus the terms the callers' decision-sink lines report, and whether the non-admit path
+    already routed an eviction through the single reclaim owner (so the caller attributes the hold's release to
+    reclaim versus the card freeing on its own).
+    """
+
+    verdict: VramVerdict
+    candidate_delta_mb: float | None
+    device_index: int | None
+    actuations_requested: bool
+
+
 def _preload_outcome_from_admission(decision: AdmissionDecision) -> _PreloadJobOutcome:
     """Map the public admission decision vocabulary onto the scheduler pass control enum."""
     match decision:
@@ -588,6 +623,21 @@ class InferenceScheduler:
         self._dispatch_reconciliation_released_by_reclaim = 0
         self._dispatch_reconciliation_released_by_natural_free = 0
 
+        # The set of job ids whose dispatch the post-processing co-residency gate held on the pass that last
+        # evaluated them. The gate computes this verdict during dispatch (``_should_defer_dispatch_for_post_
+        # processing``); recording it here lets the read-only stall classifier name the same hold instead of
+        # re-deriving the PP arithmetic, so the classifier and the gate can never disagree. Membership is set
+        # or cleared each time the gate is consulted for a head, and abandoned entries (jobs no longer pending)
+        # are pruned alongside the reconciliation holds.
+        self._post_processing_defer_holds: set[str] = set()
+
+        # The set of in-progress (staged, primed) job ids the clearance gate is currently holding: their
+        # diffusion weights would over-commit the card at the clearance VRAM moment, so the parent withholds
+        # the clearance grant while the single reclaim owner evicts idle residents. Recorded so the slot-duty
+        # classifier attributes the empty sampling slot to ``CLEARANCE_HOLD`` and pruned by omission once a job
+        # leaves the in-progress set. Only used under the clearance lease; empty otherwise.
+        self._clearance_hold_ids: set[str] = set()
+
         # The learned-footprint store, injected by the manager (one shared instance, the same the message
         # dispatcher observes into). Admission pricing of a job's sampling peak reads it so a measured
         # activation high-water raises the static per-model seed the predictor returns; a static seed
@@ -717,6 +767,10 @@ class InferenceScheduler:
         self._wddm_paging_victims_updated_monotonic: float = 0.0
         # Edge-log throttle for the post-processing/sampling time-slice hold on dispatch.
         self._pp_mutex_hold_logged: bool = False
+        # Edge-log throttle for a dispatch admitted via the measured-truth co-residency path that the
+        # static reported-total gate would have held. Sibling of _pp_mutex_hold_logged so the two never
+        # both fire and neither repeats per tick.
+        self._pp_mutex_measured_admit_logged: bool = False
 
         # Capacity-normalized wall-clock accounting: every scheduler tick attributes each configured
         # inference slot's elapsed time to SAMPLING or to the gate/supply state that kept it empty, so
@@ -2763,6 +2817,31 @@ class InferenceScheduler:
                 f"degraded/isolated and is waiting for the card to clear of other work"
             )
 
+        # The post-processing co-residency defer gate holds an already-resident head while an in-flight (or
+        # imminent) post-processing chain's committed VRAM would collide with this job's sampling peak on the
+        # card. The dispatch path records that verdict in ``_post_processing_defer_holds`` on the pass it
+        # computes it, so this reads the gate's own truthful state rather than re-deriving the PP fit (the two
+        # must never disagree). The head dispatches once the chain finishes, so this is a real named head-park,
+        # not the gate-less scheduler stall the fall-through reports.
+        if head.id_ is not None and str(head.id_) in self._post_processing_defer_holds:
+            return SlotDutyBucket.POST_PROCESSING_DEFER, (
+                f"its model is resident and idle on process {process.process_id}, but dispatch is held while an "
+                "in-flight post-processing chain finishes: the chain's committed VRAM and this job's sampling "
+                "peak cannot share the card, and it dispatches once the chain releases the device"
+            )
+
+        # The dispatch-time residency-reconciliation gate holds an already-resident head while it evicts idle
+        # sibling VRAM so the head's on-device materialisation fits before it commits. The gate stamps the held
+        # job in ``_dispatch_hold_since`` and self-clears within a few ticks once the eviction frees room, so a
+        # head parked here is a benign swap-churn wait, not the gate-less scheduler stall the fall-through
+        # reports. Read the hold ledger directly rather than re-deriving the fit so the two never disagree.
+        if head.id_ is not None and str(head.id_) in self._dispatch_hold_since:
+            return SlotDutyBucket.RESIDENCY_RECONCILIATION, (
+                f"its model is resident and idle on process {process.process_id}, but dispatch is held to "
+                "reconcile residency (evicting idle VRAM): its materialisation would over-commit the card until "
+                "an idle resident is evicted, and it dispatches once that eviction frees room"
+            )
+
         return SlotDutyBucket.UNEXPLAINED, (
             f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
             "matching gate; this is a scheduler stall worth reporting"
@@ -2843,14 +2922,60 @@ class InferenceScheduler:
         derivation that explains a parked head, but priced every tick instead of only after a multi-second
         park); with no waiting work they accrue ``NO_LOCAL_WORK``. The classification is a read-only
         diagnostic: any failure inside it degrades to ``UNEXPLAINED`` rather than touching scheduling.
+
+        Under the clearance lease a slot is productive only while its child is *actively sampling*: a staged
+        child holds an in-progress job but its sampling slot is empty until the parent clears it. So busy is
+        counted from processes in their denoise loop, and a staged-but-uncleared child (the clearance gate
+        holding it, or waiting its turn for a slot) attributes the empty sampling slot to ``CLEARANCE_HOLD``.
+        Without the lease dispatch is the sampling moment, so busy is the in-progress count exactly as before.
         """
         capacity = max(int(self._max_concurrent_inference_processes or 0), 0)
         in_progress = self._job_tracker.jobs_in_progress
+
+        if self._clearance_lease_active():
+            sampling_count = 0
+            primed_count = 0
+            for process_info in self._process_map.values():
+                if process_info.process_type != HordeProcessType.INFERENCE:
+                    continue
+                if process_info.last_process_state == HordeProcessState.INFERENCE_STARTING:
+                    sampling_count += 1
+                elif process_info.last_process_state == HordeProcessState.INFERENCE_PRIMED:
+                    primed_count += 1
+            # Prune clearance-hold records for jobs that have left the in-progress set (self-healing).
+            in_progress_ids = {str(job.id_) for job in in_progress if job.id_ is not None}
+            self._clearance_hold_ids &= in_progress_ids
+
+            busy = min(sampling_count, capacity)
+            hold: SlotDutyBucket | None = None
+            if busy < capacity and primed_count > 0:
+                # A staged child not yet sampling is waiting on the clearance gate (held for VRAM fit, or its
+                # turn for a slot): the empty sampling slot is the clearance gate's, not the gate-less stall.
+                hold = SlotDutyBucket.CLEARANCE_HOLD
+                waiting = primed_count
+            else:
+                head = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress), None)
+                waiting = len(self._job_tracker.jobs_pending_inference) - len(in_progress)
+                if head is not None and busy < capacity:
+                    try:
+                        hold = self._classify_dispatch_stall(head, stable_diffusion_reference)[0]
+                    except Exception:  # noqa: BLE001 - a diagnostic must never crash the scheduling cycle
+                        hold = SlotDutyBucket.UNEXPLAINED
+            self._slot_duty_current_hold = hold
+            self._slot_duty.observe(
+                time.time(),
+                capacity=capacity,
+                busy_slots=busy,
+                waiting_jobs=max(waiting, 0),
+                hold=hold,
+            )
+            return
+
         busy = len(in_progress)
         head = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress), None)
         waiting = len(self._job_tracker.jobs_pending_inference) - busy
 
-        hold: SlotDutyBucket | None = None
+        hold = None
         if head is not None and busy < capacity:
             try:
                 hold = self._classify_dispatch_stall(head, stable_diffusion_reference)[0]
@@ -4091,6 +4216,15 @@ class InferenceScheduler:
                 return process_info
         return fallback
 
+    def _clearance_lease_active(self) -> bool:
+        """Whether the per-process GPU denoise clearance lease governs this worker's sampling.
+
+        When true, dispatch stages a job (its diffusion weights load at clearance, inside the leased sample
+        call) and the parent's clearance controller admits each child into its load-and-sample window; when
+        false the whole-job inference semaphore is the sole denoise gate and dispatch is the VRAM moment.
+        """
+        return bool(self._runtime_config.bridge_data.gpu_sampling_lease_enabled)
+
     def _max_jobs_in_progress_allowed(
         self,
         *,
@@ -4134,15 +4268,15 @@ class InferenceScheduler:
         if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
             return base
 
-        # Floor the speculative-staging headroom at the budget's reserve when it is active, so
-        # pre-staging never eats into the VRAM the budget is holding back for the in-flight job's
-        # transient spikes; otherwise keep the standalone staging threshold.
-        staging_floor = _SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB
-        if self._budget_active():
-            staging_floor = max(staging_floor, self._vram_budget.reserve_mb)
-
+        # Under the clearance lease a staged job only charges its encode working set to the device until it
+        # is cleared (the diffusion weights load inside the leased sample call, at clearance). Admit staging
+        # while measured device free net of the reserve covers that encode charge, rather than gating on a
+        # flat multi-GB device-free floor that mid-sampling almost never clears (which is what stranded spare
+        # processes idle while jobs queued). The full materialisation is priced at clearance, so speculation
+        # here never over-commits the device: it only funds the encode footprint the staging actually incurs.
+        reserve_mb = self._vram_budget.reserve_mb if self._budget_active() else 0.0
         free_vram_mb = self._process_map.get_free_vram_mb()
-        if free_vram_mb is None or free_vram_mb < staging_floor:
+        if free_vram_mb is None or free_vram_mb - reserve_mb < _STAGING_ENCODE_VRAM_MB:
             return base
 
         return process_ceiling
@@ -4179,16 +4313,13 @@ class InferenceScheduler:
                 return process_info
         return None
 
-    def _in_flight_progress_fraction(self, job: ImageGenerateJobPopResponse) -> float:
-        """How far along the in-flight job's sampling is, in ``[0.0, 1.0]``.
+    @staticmethod
+    def _progress_fraction_of_process(process_info: HordeProcessInfo) -> float:
+        """Denoise progress in ``[0.0, 1.0]`` for a process, from its last reported step or heartbeat.
 
-        A freshly dispatched job that has not yet reported a step reads as ``0.0`` (the slot's progress
-        fields are unset), which is exactly when a heavy overlap is most dangerous.
+        A process that has not yet reported a step reads as ``0.0`` (its progress fields are unset), which is
+        exactly when a heavy overlap is most dangerous.
         """
-        process_info = self._process_running_job(job)
-        if process_info is None:
-            return 0.0
-
         total_steps = process_info.last_total_steps
         current_step = process_info.last_current_step
         if total_steps is not None and total_steps > 0 and current_step is not None:
@@ -4199,6 +4330,167 @@ class InferenceScheduler:
             return max(0.0, min(1.0, percent_complete / 100.0))
 
         return 0.0
+
+    def _in_flight_progress_fraction(self, job: ImageGenerateJobPopResponse) -> float:
+        """How far along the in-flight job's sampling is, in ``[0.0, 1.0]``.
+
+        A freshly dispatched job that has not yet reported a step reads as ``0.0`` (the slot's progress
+        fields are unset), which is exactly when a heavy overlap is most dangerous.
+        """
+        process_info = self._process_running_job(job)
+        if process_info is None:
+            return 0.0
+        return self._progress_fraction_of_process(process_info)
+
+    def build_clearance_inputs(self, *, device_index: int) -> ClearanceInputs:
+        """Snapshot the per-tick truth the clearance controller reads for ``device_index``.
+
+        A child that has staged and primed its next job (:attr:`HordeProcessState.INFERENCE_PRIMED`) is a
+        clearance waiter: it holds the job and its encode-staging reservation and is waiting for the parent to
+        clear it into its load-and-sample window. A child inside its denoise loop
+        (:attr:`HordeProcessState.INFERENCE_STARTING`) is an active sampler. The controller owns each child's
+        grant state and derives the held-slot count and tail-overlap sampler from these populations plus the
+        measured free/reserve/paging truth. Waiter priority is dispatch order (earlier-dispatched first), so
+        queue position decides who samples next; the process id breaks ties deterministically.
+        """
+        waiters: list[ClearanceWaiter] = []
+        samplers: list[ActiveSampler] = []
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.device_index != device_index:
+                continue
+            state = process_info.last_process_state
+            referenced = process_info.last_job_referenced
+            if state == HordeProcessState.INFERENCE_PRIMED:
+                # Earlier dispatch time sorts closer to the head; a process with no stamp yet sorts last.
+                dispatched_at = process_info.current_inference_started_at or float("inf")
+                primed_job_id = str(referenced.id_) if referenced is not None and referenced.id_ is not None else None
+                waiters.append(
+                    ClearanceWaiter(
+                        process_id=process_info.process_id,
+                        priority=int(dispatched_at * 1000.0) if dispatched_at != float("inf") else 2**62,
+                        job_id=primed_job_id,
+                    ),
+                )
+            elif state == HordeProcessState.INFERENCE_STARTING:
+                if referenced is None or referenced.id_ is None:
+                    continue
+                samplers.append(
+                    ActiveSampler(
+                        process_id=process_info.process_id,
+                        job_id=str(referenced.id_),
+                        progress_fraction=self._progress_fraction_of_process(process_info),
+                    ),
+                )
+        return ClearanceInputs(
+            staged_waiters=tuple(waiters),
+            active_grants=tuple(samplers),
+            device_free_mb=self._measured_device_free_mb(device_index),
+            vram_reserve_mb=self._vram_budget.reserve_mb,
+            paging_active=self._wddm_paging_active,
+        )
+
+    def clearance_admit_process(self, process_id: int) -> bool:
+        """Full-price fit-or-evict for a staged child's job at the clearance VRAM moment.
+
+        The injected ``admit_fn`` the clearance controller calls before granting a child its load-and-sample
+        window: it prices the child's primed job's full materialisation (weights plus activation peak) against
+        measured device truth through the shared MONOLITHIC_DISPATCH admission core, running the single reclaim
+        owner's eviction on a non-fit exactly as the dispatch residency gate does. On a fit it upgrades the
+        job's dispatch reservation from the encode-only staging charge to the full peak (so a second grant sees
+        it) and clears the clearance-hold record; on a non-fit it records the hold for slot-duty attribution and
+        withholds the grant, so the child stays staged until eviction frees room (or degrades into unpriced
+        sampling via hordelib's lease-acquire timeout, liveness over pricing). The co-residency mutex is applied
+        here too, since clearance, not dispatch, is now the VRAM moment for a leased job.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is None:
+            return False
+        job = process_info.last_job_referenced
+        if job is None or job.model is None:
+            # Nothing priceable to hold on; let the child proceed rather than wedge it.
+            return True
+
+        # The co-residency mutex protection moves with the VRAM moment: a leased job's weights land at
+        # clearance, so the post-processing chain fit is checked here (the dispatch-side check still guards the
+        # non-lease path). A deferral withholds the grant without faulting the job.
+        if self._should_defer_dispatch_for_post_processing(job, process_with_model=process_info):
+            self._note_clearance_hold(job, reclaim_requested=False)
+            self._log_clearance_hold(process_id, job, reason="post_processing_coresidency", verdict=None)
+            return False
+
+        outcome = self._evaluate_materialization_admission(
+            job,
+            process_info,
+            is_head_of_queue=True,
+            head_outstanding_mb=None,
+        )
+        if outcome.verdict.admits:
+            self._resolve_clearance_hold(job)
+            self._upgrade_dispatch_reservation_to_full(
+                job,
+                process_info,
+                baseline=self._model_metadata.get_baseline(job.model),
+            )
+            return True
+
+        self._note_clearance_hold(job, reclaim_requested=outcome.actuations_requested)
+        self._log_clearance_hold(process_id, job, reason=outcome.verdict.disposition.value, verdict=outcome.verdict)
+        return False
+
+    def _log_clearance_hold(
+        self,
+        process_id: int,
+        job: ImageGenerateJobPopResponse,
+        *,
+        reason: str,
+        verdict: VramVerdict | None,
+    ) -> None:
+        """Edge-log a clearance hold with its concrete denial arithmetic, coalesced per distinct cause.
+
+        A persistent clearance hold starving a card is otherwise opaque: the slot-duty line names the bucket
+        but not why admission refused this specific child. This names the disposition and the measured terms
+        (device free, reserve, candidate charge, outstanding reservations) once per distinct ``(process, reason)``
+        rather than every tick, so a held card's cause is always readable without per-tick spam.
+        """
+        suppressed = self._scheduler_diagnostic_suppressed_count("clearance_hold", (str(process_id), reason))
+        if suppressed is None:
+            return
+        if verdict is not None:
+            measured = verdict.measured
+            free = "n/a" if measured.device_free_mb is None else f"{measured.device_free_mb:.0f}MB"
+            avail = "n/a" if measured.available_mb is None else f"{measured.available_mb:.0f}MB"
+            detail = (
+                f"device free {free}, available {avail}, reserve {self._vram_budget.reserve_mb:.0f}MB, "
+                f"outstanding reservations {measured.outstanding_reservations_mb:.0f}MB, "
+                f"noise buffer {measured.noise_buffer_mb:.0f}MB"
+            )
+        else:
+            detail = "post-processing co-residency mutex held the card for an in-flight or pending chain"
+        logger.info(
+            f"Clearance held for process {process_id} ({job.model}): {reason}; {detail}. The staged child waits "
+            f"for room (or samples via its lease-acquire timeout); this repeats at most once per distinct cause.",
+        )
+
+    def _note_clearance_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_requested: bool) -> None:
+        """Record that ``job``'s clearance was withheld this pass, so the empty sampling slot is attributed.
+
+        The clearance counterpart of :meth:`_note_dispatch_hold`, keyed on the primed in-progress job rather
+        than a pending head. ``reclaim_requested`` (unused for now beyond symmetry) notes that this pass emitted
+        eviction commands, matching the dispatch gate's release attribution.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        self._clearance_hold_ids.add(job_id)
+
+    def _resolve_clearance_hold(self, job: ImageGenerateJobPopResponse) -> None:
+        """Clear any clearance hold on ``job`` now that its materialisation fits (idempotent)."""
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        self._clearance_hold_ids.discard(job_id)
 
     @staticmethod
     def _required_overlap_headway(running_tier: _ModelSizeTier, candidate_tier: _ModelSizeTier) -> float:
@@ -4911,8 +5203,17 @@ class InferenceScheduler:
         process_info: HordeProcessInfo,
         *,
         baseline: str | None,
+        staging_only: bool = False,
     ) -> None:
         """Register the outstanding reservation for a dispatch the moment it is sent inference.
+
+        Under the clearance lease a dispatch stages the job (checkpoint disk load, prompt encode) without
+        loading the diffusion weights to VRAM, which happens inside the leased sample call at clearance. With
+        ``staging_only`` the reservation is booked at the encode charge (:data:`_STAGING_ENCODE_VRAM_MB`)
+        rather than the full activation-inclusive peak, so a staged job holds only the device footprint it
+        actually incurs. :meth:`_upgrade_dispatch_reservation_to_full` re-books it at the full peak when the
+        job is cleared (``set_planned`` refreshes the same ``(flow, unit)`` entry in place, re-charging in full
+        and resetting its materialisation watermark, so the encode charge is upgraded, never double-booked).
 
         A dispatch onto an already-resident model materialises the job's activation-inclusive peak (net of the
         resident-weight credit the model already holds) over the sampling window the device-free reading does
@@ -4925,12 +5226,15 @@ class InferenceScheduler:
         """
         if job.id_ is None:
             return
-        charge_mb = self._measured_admission_candidate_delta_mb(
-            job,
-            baseline,
-            process_id=process_info.process_id,
-            disaggregated=False,
-        )
+        if staging_only:
+            charge_mb: float | None = _STAGING_ENCODE_VRAM_MB
+        else:
+            charge_mb = self._measured_admission_candidate_delta_mb(
+                job,
+                baseline,
+                process_id=process_info.process_id,
+                disaggregated=False,
+            )
         self._reserve_ledger.set_planned(
             DISPATCH_ADMISSION_FLOW,
             str(job.id_),
@@ -4938,6 +5242,23 @@ class InferenceScheduler:
             target_process_id=process_info.process_id,
             reserved_at_admit_mb=float(process_info.process_reserved_mb or 0),
         )
+
+    def _upgrade_dispatch_reservation_to_full(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_info: HordeProcessInfo,
+        *,
+        baseline: str | None,
+    ) -> None:
+        """Re-book a staged job's dispatch reservation at its full materialisation peak when it is cleared.
+
+        Called at clearance (the VRAM moment) so the ledger reflects the weights-plus-activation peak the
+        leased sample call is about to materialise, rather than the encode-only staging charge. Re-registering
+        the same ``(DISPATCH_ADMISSION_FLOW, job id)`` entry through :meth:`_record_dispatch_reservation`
+        refreshes it in place: the full charge replaces the encode charge and the target's materialisation
+        watermark resets, so the upgrade is not a second, additive booking.
+        """
+        self._record_dispatch_reservation(job, process_info, baseline=baseline, staging_only=False)
 
     def release_dispatch_reservation(self, job: ImageGenerateJobPopResponse) -> None:
         """Drop a dispatch's outstanding reservation on clean finalization (a latency tightener over omission).
@@ -6667,6 +6988,95 @@ class InferenceScheduler:
             return 0.0
         return min(estimates_mb)
 
+    def _measured_device_free_mb(self, device_index: int | None) -> float | None:
+        """Return the parent's measured device-free VRAM (MB) for this card, or None when unread.
+
+        A None ``device_index`` (single-GPU default) resolves to card 0, matching how the scheduler keys
+        its per-card admission state. With no provider wired or no reading yet the answer is None, so the
+        measured admission path is unavailable and the caller keeps the static verdict.
+        """
+        if self._device_free_mb_provider is None:
+            return None
+        return self._device_free_mb_provider(0 if device_index is None else device_index)
+
+    def _pp_overlap_measured_admits(
+        self,
+        *,
+        sampling_peak_mb: float | None,
+        pending_pp_reserve_mb: float,
+        device_index: int | None,
+    ) -> bool:
+        """Whether measured device truth admits a sampling/post-processing overlap the static gate withheld.
+
+        Consulted only after :meth:`pp_sampling_coresidency_affordable` (static accounting against the
+        card's reported total) has said the two cannot share the card. The measured device-free reading
+        already reflects an active chain's real allocations, so it is a more accurate second admission path
+        than the ledger's worst-case reserve. It admits when the measured free, net of the reserve, the
+        sampling peak, and any not-yet-allocated pending chain's predicted reserve, clears
+        :data:`_PP_OVERLAP_MEASURED_MARGIN_MB`.
+
+        The path is unavailable (returns False, so the static fence stands) whenever the driver is
+        demand-paging (its free figure is then untrustworthy, the exact regime the static gate guards), the
+        sampling peak is unpriceable, or no measured reading exists. ``pending_pp_reserve_mb`` is zero for an
+        active chain (whose allocations the measured free already reflects) and the predicted reserve for a
+        pending chain (which has not allocated yet, so its cost must still be charged).
+        """
+        if self._wddm_paging_active:
+            return False
+        if sampling_peak_mb is None:
+            return False
+        device_free_mb = self._measured_device_free_mb(device_index)
+        if device_free_mb is None:
+            return False
+        headroom_mb = device_free_mb - self._vram_budget.reserve_mb - sampling_peak_mb - pending_pp_reserve_mb
+        return headroom_mb >= _PP_OVERLAP_MEASURED_MARGIN_MB
+
+    def _resolve_pp_coresidency_hold(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        *,
+        static_affordable: bool,
+        sampling_peak_mb: float | None,
+        pending_pp_reserve_mb: float,
+        device_index: int | None,
+        static_hold_message: str,
+    ) -> bool:
+        """Resolve one co-residency branch to a hold/admit verdict, consulting the measured path on a static miss.
+
+        When the static gate admits, dispatch proceeds and both edge-log latches clear. When it withholds,
+        the measured-truth path (:meth:`_pp_overlap_measured_admits`) gets a second say: if it admits, the
+        dispatch proceeds and the admission is edge-logged once with its arithmetic; otherwise the hold
+        stands and is edge-logged once with ``static_hold_message``.
+        """
+        if static_affordable:
+            self._pp_mutex_hold_logged = False
+            self._pp_mutex_measured_admit_logged = False
+            return False
+
+        if self._pp_overlap_measured_admits(
+            sampling_peak_mb=sampling_peak_mb,
+            pending_pp_reserve_mb=pending_pp_reserve_mb,
+            device_index=device_index,
+        ):
+            if not self._pp_mutex_measured_admit_logged:
+                self._pp_mutex_measured_admit_logged = True
+                device_free_mb = self._measured_device_free_mb(device_index)
+                logger.info(
+                    f"Admitting dispatch of {next_job.model} via measured device truth that static "
+                    f"co-residency held: {device_free_mb:.0f}MB free, {self._vram_budget.reserve_mb:.0f}MB "
+                    f"reserve, {(sampling_peak_mb or 0.0):.0f}MB sampling peak, "
+                    f"{pending_pp_reserve_mb:.0f}MB pending chain reserve, "
+                    f"{_PP_OVERLAP_MEASURED_MARGIN_MB:.0f}MB margin.",
+                )
+            self._pp_mutex_hold_logged = False
+            return False
+
+        self._pp_mutex_measured_admit_logged = False
+        if not self._pp_mutex_hold_logged:
+            self._pp_mutex_hold_logged = True
+            logger.info(static_hold_message)
+        return True
+
     def _should_defer_dispatch_for_post_processing(
         self,
         next_job: ImageGenerateJobPopResponse,
@@ -6680,6 +7090,12 @@ class InferenceScheduler:
         result lands. Pending chains can also hold dispatch before the next sampler starts; otherwise a
         fresh sampler can keep the card never-idle and prevent the pending lane work from ever getting its
         turn.
+
+        Each branch first prices co-residency statically against the card's reported total, then, on a
+        static miss, gives the parent's measured device-free reading a second say (see
+        :meth:`_pp_overlap_measured_admits`): measured truth reflects an active chain's real allocations and
+        so admits overlaps the ledger's worst-case reserve would needlessly hold, without over-committing
+        the card or trusting the driver's free figure while it is paging.
         """
         device_index = process_with_model.device_index if process_with_model is not None else None
 
@@ -6699,19 +7115,24 @@ class InferenceScheduler:
                 pp_reserve_mb=pp_committed_mb,
                 device_index=device_index,
             )
-            if not affordable and not self._pp_mutex_hold_logged:
-                self._pp_mutex_hold_logged = True
-                logger.info(
+            return self._resolve_pp_coresidency_hold(
+                next_job,
+                static_affordable=affordable,
+                sampling_peak_mb=sampling_peak_mb,
+                # The active chain has already allocated, so the measured free reflects it: charge no extra.
+                pending_pp_reserve_mb=0.0,
+                device_index=device_index,
+                static_hold_message=(
                     f"Holding dispatch of {next_job.model}: an in-flight post-processing chain "
                     f"({pp_committed_mb:.0f}MB committed) and this job's sampling peak cannot share the card; "
-                    "dispatching when the chain finishes.",
-                )
-            if affordable:
-                self._pp_mutex_hold_logged = False
-            return not affordable
+                    "dispatching when the chain finishes."
+                ),
+            )
 
         pending_pp_reserve_mb = self._pending_post_processing_reserve_mb(device_index=device_index)
         if pending_pp_reserve_mb <= 0:
+            self._pp_mutex_hold_logged = False
+            self._pp_mutex_measured_admit_logged = False
             return False
 
         sampling_peak_mb = self._sampling_peak_mb(next_job)
@@ -6720,16 +7141,19 @@ class InferenceScheduler:
             pp_reserve_mb=pending_pp_reserve_mb,
             device_index=device_index,
         )
-        if not affordable and not self._pp_mutex_hold_logged:
-            self._pp_mutex_hold_logged = True
-            logger.info(
+        return self._resolve_pp_coresidency_hold(
+            next_job,
+            static_affordable=affordable,
+            sampling_peak_mb=sampling_peak_mb,
+            # The pending chain has not allocated yet, so its predicted reserve must still be charged.
+            pending_pp_reserve_mb=pending_pp_reserve_mb,
+            device_index=device_index,
+            static_hold_message=(
                 f"Holding dispatch of {next_job.model}: pending post-processing "
                 f"({pending_pp_reserve_mb:.0f}MB estimated) needs the next drain window and this job's "
-                "sampling peak cannot share the card; dispatching after the lane gets its turn.",
-            )
-        if affordable:
-            self._pp_mutex_hold_logged = False
-        return not affordable
+                "sampling peak cannot share the card; dispatching after the lane gets its turn."
+            ),
+        )
 
     def note_wddm_paging(self, elevated_shared_mb_by_pid: dict[int, float], *, active: bool) -> None:
         """Record the parent's WDDM demand-paging verdict and reclaim idle VRAM on its rising edge.
@@ -6966,7 +7390,14 @@ class InferenceScheduler:
         ):
             await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
             horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
-            self._record_dispatch_reservation(next_job, process_with_model, baseline=horde_model_baseline)
+            # Under the clearance lease a dispatch only stages the job: its weights load at clearance, so book
+            # the encode-only charge now and upgrade to the full materialisation peak when the parent clears it.
+            self._record_dispatch_reservation(
+                next_job,
+                process_with_model,
+                baseline=horde_model_baseline,
+                staging_only=self._clearance_lease_active(),
+            )
 
             dispatch_detail: dict[str, str | int | float | bool | None] = {
                 "model": next_job.model,
@@ -7036,6 +7467,7 @@ class InferenceScheduler:
             self._dispatch_hold_since.pop(held_id, None)
             self._dispatch_hold_reclaim_requested.discard(held_id)
             self._resolve_dispatch_decision(held_id, reason="left_pending_queue")
+        self._post_processing_defer_holds.intersection_update(pending_ids)
 
     def _note_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_requested: bool) -> None:
         """Record that the dispatch of ``job`` was held this pass, stamping the first hold and its cause.
@@ -7075,6 +7507,21 @@ class InferenceScheduler:
         else:
             self._dispatch_reconciliation_released_by_natural_free += 1
         self._resolve_dispatch_decision(job_id, reason="dispatch_admitted")
+
+    def _note_post_processing_defer(self, job: ImageGenerateJobPopResponse, *, deferred: bool) -> None:
+        """Record whether the post-processing co-residency gate held ``job``'s dispatch on this pass.
+
+        The dispatch path already computed this verdict; caching it lets the read-only stall classifier name
+        the same hold without re-deriving the PP arithmetic. A held job is remembered; a job that cleared the
+        gate is forgotten, so the cache tracks only heads the gate is actively deferring right now.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        if deferred:
+            self._post_processing_defer_holds.add(job_id)
+        else:
+            self._post_processing_defer_holds.discard(job_id)
 
     def _resolve_dispatch_decision(self, job_id: str, *, reason: str) -> None:
         """Close any open dispatch-hold decision for ``job_id`` with a final resolving record.
@@ -7131,6 +7578,87 @@ class InferenceScheduler:
         if next_job.model is None:
             return False
 
+        # Under the clearance lease a dispatch only stages the job (weights load at clearance), so price the
+        # encode charge here rather than the full materialisation: the full fit-or-evict runs at clearance.
+        # Head protection is preserved either way (the head's outstanding charge still reserves room), and the
+        # full-price gate that used to park staging on materialisation grounds moves to the clearance VRAM
+        # moment. Without the lease this is the VRAM moment, so the full materialisation is priced as before.
+        staging_charge_override = _STAGING_ENCODE_VRAM_MB if self._clearance_lease_active() else None
+
+        outcome = self._evaluate_materialization_admission(
+            next_job,
+            process_with_model,
+            is_head_of_queue=is_head_of_queue,
+            head_outstanding_mb=head_outstanding_mb,
+            candidate_delta_override_mb=staging_charge_override,
+        )
+        verdict = outcome.verdict
+        candidate_delta_mb = outcome.candidate_delta_mb
+        device_index = outcome.device_index
+
+        if verdict.admits:
+            self._resolve_dispatch_hold(next_job)
+            return False
+
+        self._note_dispatch_hold(next_job, reclaim_requested=outcome.actuations_requested)
+
+        if self._decision_sink is not None and next_job.id_ is not None:
+            measured = verdict.measured
+            self._decision_sink(
+                decision_kind=DecisionKind.INFERENCE_DISPATCH,
+                subject=str(next_job.id_),
+                verdict=DecisionVerdict.DEFER,
+                reason=verdict.reason or verdict.disposition.value,
+                inputs={
+                    "model": str(next_job.model),
+                    "device_index": device_index,
+                    "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
+                    "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
+                    "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
+                    "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
+                    "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
+                    "is_head_of_queue": is_head_of_queue,
+                    "reclaim_requested": outcome.actuations_requested,
+                },
+            )
+
+        suppressed = self._scheduler_diagnostic_suppressed_count(
+            "dispatch_residency_hold",
+            (str(next_job.id_), verdict.disposition.value),
+        )
+        if suppressed is not None:
+            logger.opt(ansi=True).warning(
+                f"<fg #f0beff>Holding dispatch of {next_job.model} to reconcile residency: {verdict.reason}. "
+                "Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM.</>",
+            )
+        return True
+
+    def _evaluate_materialization_admission(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        *,
+        is_head_of_queue: bool,
+        head_outstanding_mb: float | None,
+        candidate_delta_override_mb: float | None = None,
+    ) -> _MaterializationOutcome:
+        """Price a job's VRAM materialisation through the single MONOLITHIC_DISPATCH arbiter identity.
+
+        The reusable core shared by the dispatch residency-reconciliation gate and the clearance gate: it
+        builds the arbiter request against measured device truth (net of outstanding reservations and the
+        noise buffer), evaluates it, and on a non-admit routes the described idle-resident eviction through the
+        one reclaim owner (:meth:`_execute_preload_actuations`), protecting the head's own target slot. It owns
+        no hold bookkeeping or logging: each caller records its own hold state (dispatch-pending versus
+        clearance) and emits its own diagnostics from the returned outcome.
+
+        ``candidate_delta_override_mb`` prices a smaller charge than the job's full materialisation peak (the
+        encode-only staging charge under the clearance lease, where the weights have not yet loaded); ``None``
+        prices the full activation-inclusive peak (the non-lease dispatch VRAM moment and the clearance moment).
+
+        Both callers guarantee a non-None model before pricing (an unmodelled job is not materialisable).
+        """
+        if next_job.model is None:
+            raise ValueError("materialisation admission requires a job with a model")
         device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
         baseline = self._model_metadata.get_baseline(next_job.model)
         has_reclaimable_idle_model = self._has_reclaimable_idle_model(
@@ -7138,11 +7666,15 @@ class InferenceScheduler:
             for_head_of_queue=is_head_of_queue,
             device_index=device_index,
         )
-        candidate_delta_mb = self._measured_admission_candidate_delta_mb(
-            next_job,
-            baseline,
-            process_id=process_with_model.process_id,
-            disaggregated=self._is_disaggregation_class_eligible(next_job),
+        candidate_delta_mb = (
+            candidate_delta_override_mb
+            if candidate_delta_override_mb is not None
+            else self._measured_admission_candidate_delta_mb(
+                next_job,
+                baseline,
+                process_id=process_with_model.process_id,
+                disaggregated=self._is_disaggregation_class_eligible(next_job),
+            )
         )
         forecast = self._forecast_streaming(next_job, baseline, device_index=device_index)
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
@@ -7217,12 +7749,16 @@ class InferenceScheduler:
         if verdict.admits:
             if verdict.measured_attempt:
                 self._mark_measured_attempt(next_job, request, device_index=device_index)
-            self._resolve_dispatch_hold(next_job)
-            return False
+            return _MaterializationOutcome(
+                verdict=verdict,
+                candidate_delta_mb=candidate_delta_mb,
+                device_index=device_index,
+                actuations_requested=False,
+            )
 
-        # The dispatch cannot land yet. Route the described idle-resident eviction through the single reclaim
-        # owner, protecting the head's own slot, then hold. The job re-asks next pass and releases once the
-        # arbiter verdicts FITS (the governor's device-free reading having verified the reclaimed room).
+        # The materialisation cannot land yet. Route the described idle-resident eviction through the single
+        # reclaim owner, protecting the head's own slot. The caller holds (dispatch or clearance) and re-asks
+        # next pass, releasing once the arbiter verdicts FITS (the governor having verified the reclaimed room).
         actuations = verdict.required_actuations
         self._preload_actuation = _PreloadActuation(
             job=next_job,
@@ -7238,38 +7774,12 @@ class InferenceScheduler:
             )
         finally:
             self._preload_actuation = None
-        self._note_dispatch_hold(next_job, reclaim_requested=bool(actuations))
-
-        if self._decision_sink is not None and next_job.id_ is not None:
-            measured = verdict.measured
-            self._decision_sink(
-                decision_kind=DecisionKind.INFERENCE_DISPATCH,
-                subject=str(next_job.id_),
-                verdict=DecisionVerdict.DEFER,
-                reason=verdict.reason or verdict.disposition.value,
-                inputs={
-                    "model": str(next_job.model),
-                    "device_index": device_index,
-                    "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
-                    "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
-                    "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
-                    "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
-                    "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
-                    "is_head_of_queue": is_head_of_queue,
-                    "reclaim_requested": bool(actuations),
-                },
-            )
-
-        suppressed = self._scheduler_diagnostic_suppressed_count(
-            "dispatch_residency_hold",
-            (str(next_job.id_), verdict.disposition.value),
+        return _MaterializationOutcome(
+            verdict=verdict,
+            candidate_delta_mb=candidate_delta_mb,
+            device_index=device_index,
+            actuations_requested=bool(actuations),
         )
-        if suppressed is not None:
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>Holding dispatch of {next_job.model} to reconcile residency: {verdict.reason}. "
-                "Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM.</>",
-            )
-        return True
 
     def latest_dispatch_reconciliation_holds(self) -> int:
         """Return the count of dispatches held for residency reconciliation this run (calibration visibility)."""
@@ -7343,7 +7853,12 @@ class InferenceScheduler:
             # head-of-queue position, so it dispatches the moment the residency converges.
             return False
 
-        if self._should_defer_dispatch_for_post_processing(next_job, process_with_model=process_with_model):
+        post_processing_deferred = self._should_defer_dispatch_for_post_processing(
+            next_job,
+            process_with_model=process_with_model,
+        )
+        self._note_post_processing_defer(next_job, deferred=post_processing_deferred)
+        if post_processing_deferred:
             # Post-processing either holds the card or is waiting for the active sampler to drain, and this
             # job's sampling peak cannot share the card with it.
             return False

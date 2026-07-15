@@ -809,6 +809,9 @@ class TestStartInference:
             horde_model_map=horde_model_map,
             job_tracker=job_tracker,
             max_concurrent=2,
+            # A pressured card: the measured-truth second admission path also withholds, so the hold is
+            # genuine (both the static reported-total gate and the measured reading refuse the overlap).
+            device_free_mb=10000.0,
         )
         inference_scheduler.pp_sampling_coresidency_affordable = Mock(return_value=False)  # type: ignore[method-assign]
 
@@ -867,6 +870,9 @@ class TestStartInference:
             horde_model_map=horde_model_map,
             job_tracker=job_tracker,
             max_concurrent=2,
+            # A pressured card: the measured-truth second admission path also withholds, so the hold is
+            # genuine (both the static reported-total gate and the measured reading refuse the overlap).
+            device_free_mb=10000.0,
         )
         inference_scheduler.pp_sampling_coresidency_affordable = Mock(return_value=False)  # type: ignore[method-assign]
 

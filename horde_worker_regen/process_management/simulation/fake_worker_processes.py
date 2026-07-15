@@ -70,6 +70,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
+from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 from horde_worker_regen.process_management.simulation.fault_injection import (
     FAULT_INFO_PREFIX,
@@ -714,7 +715,7 @@ def start_fake_inference_process(
     vram_heavy_models: bool = False,
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
-    gpu_sampling_lease: Semaphore | None = None,
+    gpu_sampling_lease: ClearanceLeaseProxy | None = None,
     expect_image_models: bool = True,
     comfy_smart_memory: bool = True,
     fail_every_n: int = 0,

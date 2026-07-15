@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
     write_startup_crash,
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
+from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesLaneAdapter
@@ -301,7 +302,7 @@ def start_inference_process(
     vram_heavy_models: bool = False,
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
-    gpu_sampling_lease: Semaphore | None = None,
+    gpu_sampling_lease: ClearanceLeaseProxy | None = None,
     expect_image_models: bool = True,
     comfy_smart_memory: bool = False,
 ) -> None:

@@ -13,6 +13,8 @@ empty. Its value rests on two invariants pinned here:
 
 from __future__ import annotations
 
+import time
+
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -185,6 +187,70 @@ class TestSchedulerClassifierBuckets:
 
         assert bucket is SlotDutyBucket.EXCLUSIVE_ISOLATION
         assert "exclusively-admitted over-budget job" in text
+
+    async def test_reconcile_held_head_classifies_residency_reconciliation(self) -> None:
+        """A reconcile-held resident head is named RESIDENCY_RECONCILIATION, not gate-less UNEXPLAINED.
+
+        The reconcile gate stamps the held job in ``_dispatch_hold_since`` while it evicts idle VRAM so the
+        job's materialisation fits the card. That is a benign, self-clearing swap-churn wait, so the stall
+        text must name it rather than reporting the ``no matching gate`` scheduler-bug phrase.
+        """
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        holder = make_mock_process_info(1, model_name="model-a", state=HordeProcessState.PRELOADED_MODEL)
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
+        scheduler._dispatch_hold_since[str(head.id_)] = time.time()
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
+        assert "reconcile residency" in text
+        assert "no matching gate" not in text
+
+    async def test_post_processing_deferred_head_classifies_post_processing_defer(self) -> None:
+        """A PP-deferred resident head is named POST_PROCESSING_DEFER, not gate-less UNEXPLAINED.
+
+        The dispatch path records the post-processing co-residency defer verdict in
+        ``_post_processing_defer_holds`` on the pass it computes it. The stall classifier reads that hold
+        directly, so a head parked while an in-flight post-processing chain holds the card names the gate
+        rather than reporting the ``no matching gate`` scheduler-bug phrase.
+        """
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        holder = make_mock_process_info(1, model_name="model-a", state=HordeProcessState.PRELOADED_MODEL)
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
+        scheduler._post_processing_defer_holds.add(str(head.id_))
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.POST_PROCESSING_DEFER
+        assert "post-processing chain" in text
+        assert "no matching gate" not in text
+
+    async def test_resident_idle_head_without_hold_classifies_unexplained(self) -> None:
+        """The same resident-idle head with no reconciliation hold still falls through to UNEXPLAINED.
+
+        Control for the reconcile bucket: an idle-resident head that no gate (and no reconcile hold) claims
+        is the genuinely inexplicable scheduler stall, and must keep the ``no matching gate`` attribution.
+        """
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        holder = make_mock_process_info(1, model_name="model-a", state=HordeProcessState.PRELOADED_MODEL)
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.UNEXPLAINED
+        assert "no matching gate" in text
 
 
 class TestRecordSlotDutyIntegration:

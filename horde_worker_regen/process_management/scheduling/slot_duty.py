@@ -57,6 +57,20 @@ class SlotDutyBucket(StrEnum):
     that pin to release rather than fund a second copy that could not fit beside the pinned residents."""
     DEGRADED_ISOLATION_PENDING = "degraded_isolation_pending"
     """The next job needed a degraded/isolated dispatch and waited for the card to clear of other work."""
+    RESIDENCY_RECONCILIATION = "residency_reconciliation"
+    """The dispatch residency-reconciliation gate held the resident-idle head while it evicted idle VRAM so
+    the job's materialisation fits the card. A benign, self-clearing swap-churn wait, distinct from the
+    gate-less ``UNEXPLAINED`` scheduler stall."""
+    POST_PROCESSING_DEFER = "post_processing_defer"
+    """The post-processing co-residency defer gate held the resident-idle head because an in-flight (or
+    imminent) post-processing chain's committed VRAM and this job's sampling peak cannot share the card. The
+    head dispatches once the chain finishes; a real, nameable head-park, distinct from the gate-less
+    ``UNEXPLAINED`` scheduler stall."""
+    CLEARANCE_HOLD = "clearance_hold"
+    """The GPU denoise clearance lease held a staged waiter at the VRAM moment because its full
+    materialisation did not yet fit measured device truth. The waiter is cleared once eviction makes room (or
+    it degrades into unpriced sampling via the lease-acquire timeout); a real, nameable slot-park attributed to
+    the clearance gate rather than the gate-less ``UNEXPLAINED`` scheduler stall."""
     UNEXPLAINED = "unexplained"
     """No gate claimed the empty slot: the scheduler-stall-shaped case worth reporting."""
 

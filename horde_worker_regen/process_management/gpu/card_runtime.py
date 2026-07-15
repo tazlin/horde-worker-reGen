@@ -42,8 +42,6 @@ class CardRuntime:
     """This card's concurrent-inference gate. Distinct per card so one card's sampling cannot block another's."""
     vae_decode_semaphore: Semaphore
     """This card's concurrent-VAE-decode gate."""
-    gpu_sampling_lease: Semaphore
-    """This card's GPU sampling lease (denoise-loop pipelining), independent of other cards' leases."""
     target_process_count: int
     """How many inference processes to run on this card (its ``queue_size`` + concurrency ceiling)."""
     max_concurrent_inference: int

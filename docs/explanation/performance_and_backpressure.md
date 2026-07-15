@@ -395,6 +395,39 @@ shrunk headway never admits an over-committing overlap.
 A blocked candidate is never dropped; it keeps its queue position and dispatches the moment the in-flight
 jobs progress past the headway threshold or finish.
 
+### GPU denoise clearance lease
+
+The overlap gate above governs whether a *new sampler* may join a busy card. The optional GPU denoise
+clearance lease (`gpu_sampling_lease_enabled`) governs the finer seam *inside* a job: a job's pipeline is
+GPU-light everywhere except its diffusion-weight VRAM load and its denoise loop, which hordelib brackets
+around `comfy.sample.sample`. The lease lets a spare inference process **stage** its next job (checkpoint
+disk load, prompt encode) while another process samples, then hold at the sample call until the parent
+clears it into the weight-load-plus-denoise window. Left to grab a freed slot autonomously (the earlier
+shared per-card semaphore), a staged child would load 8-10GB of weights while the outgoing job's weights were
+still resident and tip a heavy pair into WDDM demand-paging; the per-process clearance handshake gives the
+parent a checkpoint at the true VRAM moment.
+
+Two admission consequences follow. First, staging is cheap: a staged job's device footprint is only its
+encode working set (`_STAGING_ENCODE_VRAM_MB`, the text-encoder plus conditioning working set for the largest
+supported family), because its weights have not loaded yet. So `_max_jobs_in_progress_allowed` admits a spare
+process to stage ahead whenever measured free net of the reserve covers that encode charge, rather than
+gating on a flat multi-GB device-free floor that mid-sampling rarely cleared (which stranded the spare
+process idle through nearly every sampling window despite queued work). The dispatch reservation books only
+the encode charge while staged; siblings staging ahead therefore never reserve the head's
+full-materialisation room. Second, the full-price fit-or-evict moves to **clearance**: before clearing a
+child the scheduler prices its job's full weights-plus-activation peak against measured device truth through
+the same `MONOLITHIC_DISPATCH` admission identity the dispatch residency gate uses, running the single reclaim
+owner's eviction on a non-fit and upgrading the reservation from the encode charge to the full peak on a
+grant. The post-processing co-residency mutex is applied at clearance too, since clearance, not dispatch, is
+now the VRAM moment for a leased job. A clearance held for VRAM fit is attributed to the `clearance_hold`
+slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
+clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
+unpriced window once rather than ever wedging the pool. When `gpu_sampling_lease_tail_overlap` is set the
+controller clears one extra child early once the outgoing sampler passes 80% progress and measured free
+clears a margin, so the next sampling window opens before the current one closes (one early clear per
+outgoing sampler). With the lease disabled the whole-job inference semaphore is the sole denoise gate and
+dispatch is the VRAM moment exactly as before.
+
 On a multi-GPU worker both this gate and the in-flight **count** cap (`_max_jobs_in_progress_allowed`) are
 scoped to the card the candidate would run on: each card is its own sampling and VRAM domain, so the count
 is taken against that card's own in-progress jobs and its own concurrency ceiling, and the headway check

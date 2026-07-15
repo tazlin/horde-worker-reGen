@@ -78,7 +78,6 @@ class TestMultiCardPools:
         card0, card1 = manager._card_runtimes[0], manager._card_runtimes[1]
         assert card0.inference_semaphore is not card1.inference_semaphore
         assert card0.vae_decode_semaphore is not card1.vae_decode_semaphore
-        assert card0.gpu_sampling_lease is not card1.gpu_sampling_lease
 
     def test_multi_card_enables_masking_with_each_card_kind(self) -> None:
         """Driving more than one card masks every process, each to its own backend kind."""

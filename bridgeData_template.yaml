@@ -544,6 +544,14 @@ gpu_sampling_lease_enabled: false
 # the lease is enabled.
 # gpu_sampling_lease_slots: 1
 
+# Admit the next job's sampling window during the current one's tail so the GPU never idles between
+# sampling windows. Only meaningful when `gpu_sampling_lease_enabled` is true. The lease carries one
+# extra permit the parent holds; when the outgoing sampler nears the end of its denoise loop and a
+# staged sibling is primed and waiting (with measured VRAM room and no demand-paging), the parent hands
+# the permit over for one handoff window so the sibling starts sampling before the outgoing job
+# finishes. Defaults to true; set false to keep a strict per-slot denoise gate with no overlap.
+# gpu_sampling_lease_tail_overlap: true
+
 #############################
 ## VRAM / RAM Budget       ##
 #############################

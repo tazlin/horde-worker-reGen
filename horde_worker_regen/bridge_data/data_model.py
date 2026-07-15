@@ -518,6 +518,20 @@ class reGenBridgeData(CombinedHordeBridgeData):
     the current denoise without paying for time-sliced concurrent sampling). Values above 1 permit
     that many concurrent denoise loops. No effect unless `gpu_sampling_lease_enabled` is true."""
 
+    gpu_sampling_lease_tail_overlap: bool = Field(default=True)
+    """Admit the next job's sampling window during the current one's tail so the GPU never idles between
+    sampling windows. Only meaningful when `gpu_sampling_lease_enabled` is true.
+
+    The lease brackets each job's diffusion-model VRAM load and its denoise loop, so at one slot the
+    incoming job's VRAM load serializes behind the outgoing job's denoise and the GPU idles through the
+    handoff. With tail overlap the lease carries one extra permit the parent holds, so processes still see
+    exactly `gpu_sampling_lease_slots` denoise slots in steady state. When the outgoing sampler nears the end
+    of its denoise loop and a staged sibling is primed and waiting, and the card measurably has room with the
+    driver not demand-paging, the parent hands the extra permit over for one handoff window: the sibling
+    begins sampling while the outgoing job finishes, then the parent takes the permit back once the outgoing
+    sampler leaves its loop. Leave enabled to keep the GPU busy across job boundaries; disable to restore the
+    strict per-slot denoise gate with no handoff overlap."""
+
     capture_kudos_training_data: bool = Field(default=False)
 
     kudos_training_data_file: str | None = Field(default=None)

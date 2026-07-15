@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
+from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
 from typing import TYPE_CHECKING
@@ -50,6 +51,10 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
 from horde_worker_regen.process_management.resources.resource_budget import ram_pressure_floor_mb
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    ClearanceLeaseProxy,
+)
 from horde_worker_regen.process_management.scheduling.performance_model import (
     BatchBucket,
     ResolutionBucket,
@@ -228,6 +233,7 @@ class ProcessLifecycleManager:
     _horde_model_map: HordeModelMap
     _job_tracker: JobTracker
     _process_message_queue: ProcessQueue
+    _child_facing_queues: list[ProcessQueue]
     _card_runtimes: dict[int, CardRuntime]
     _disk_lock: Lock_MultiProcessing
     _download_bandwidth_semaphore: Semaphore
@@ -270,6 +276,7 @@ class ProcessLifecycleManager:
         horde_model_map: HordeModelMap,
         job_tracker: JobTracker,
         process_message_queue: ProcessQueue,
+        child_facing_queues: list[ProcessQueue] | None = None,
         card_runtimes: dict[int, CardRuntime],
         disk_lock: Lock_MultiProcessing,
         download_bandwidth_semaphore: Semaphore,
@@ -290,6 +297,8 @@ class ProcessLifecycleManager:
         device_total_vram_mb_provider: Callable[[int], float | None] | None = None,
         device_governor_state_provider: Callable[[int], GovernorState] | None = None,
         gpu_start_context_mb_provider: Callable[[], float] | None = None,
+        clearance_proxy_registrar: Callable[[int, int, ClearanceLeaseProxy], None] | None = None,
+        clearance_child_replaced_notifier: Callable[[int, int], None] | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         # All child processes are created from this context (ctx.Process/ctx.Pipe), not the bare
@@ -308,6 +317,12 @@ class ProcessLifecycleManager:
         self._horde_model_map = horde_model_map
         self._job_tracker = job_tracker
         self._process_message_queue = process_message_queue
+        # Every parent-created child-facing queue to neutralize at teardown. Falls back to the single status
+        # queue when a caller (e.g. a standalone test) does not thread the registry through, preserving the
+        # historical single-queue behavior.
+        self._child_facing_queues: list[ProcessQueue] = (
+            child_facing_queues if child_facing_queues is not None else [process_message_queue]
+        )
         self._card_runtimes = card_runtimes
         self._disk_lock = disk_lock
         self._download_bandwidth_semaphore = download_bandwidth_semaphore
@@ -363,6 +378,20 @@ class ProcessLifecycleManager:
         )
         self._gpu_start_context_mb_provider: Callable[[], float] = (
             gpu_start_context_mb_provider if gpu_start_context_mb_provider is not None else (lambda: 0.0)
+        )
+        # Register a freshly spawned inference child's clearance proxy with its card's controller, and notify
+        # the controller when a child is replaced so it discards that child's grant state. Bound lazily through
+        # the parent because the controllers are built after this manager; the no-op defaults keep the manager
+        # usable standalone in tests and on cards without the clearance lease.
+        self._clearance_proxy_registrar: Callable[[int, int, ClearanceLeaseProxy], None] = (
+            clearance_proxy_registrar
+            if clearance_proxy_registrar is not None
+            else (lambda _device_index, _process_id, _proxy: None)
+        )
+        self._clearance_child_replaced_notifier: Callable[[int, int], None] = (
+            clearance_child_replaced_notifier
+            if clearance_child_replaced_notifier is not None
+            else (lambda _device_index, _process_id: None)
         )
 
         self.num_processes_launched = 0
@@ -2032,6 +2061,19 @@ class ProcessLifecycleManager:
         if card.mask_kind == "directml" and self._directml is None:
             directml_index = card.device_index
 
+        # Under the clearance lease each child owns its own clearance handshake: the parent creates the child's
+        # clearance semaphore held-empty (its single permit acquired now, so the child blocks until the parent
+        # clears it) and a done semaphore the child signals on release, wraps them in a picklable proxy shared
+        # into the child by spawn inheritance, and registers it with the card's controller so the parent can
+        # grant and observe this child specifically. Disabled: no proxy is created and the child gets None.
+        gpu_sampling_lease: ClearanceLeaseProxy | None = None
+        if self._gpu_sampling_lease_enabled:
+            clearance_semaphore = BoundedSemaphore_MultiProcessing(1, ctx=self._ctx)
+            clearance_semaphore.acquire(block=False)  # hold it empty: the child waits for the parent's grant
+            done_semaphore = Semaphore(0, ctx=self._ctx)
+            gpu_sampling_lease = ClearanceLeaseProxy(clearance=clearance_semaphore, done=done_semaphore)
+            self._clearance_proxy_registrar(card.device_index, pid, gpu_sampling_lease)
+
         pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
         process = self._new_process(
             target=self._entry_points.inference_entry_point,
@@ -2052,7 +2094,7 @@ class ProcessLifecycleManager:
                 "vram_heavy_models": vram_heavy_models,
                 "dry_run_skip_inference": bridge_data.dry_run_skip_inference,
                 "dry_run_inference_delay": bridge_data.dry_run_inference_delay,
-                "gpu_sampling_lease": card.gpu_sampling_lease if self._gpu_sampling_lease_enabled else None,
+                "gpu_sampling_lease": gpu_sampling_lease,
                 # An alchemist-only worker (no image models configured, e.g. a CPU install) must not
                 # treat an empty image-model database as a fatal error in the child.
                 "expect_image_models": bool(card.config.image_models_to_load),
@@ -2642,6 +2684,12 @@ class ProcessLifecycleManager:
         worker before. Releasing unconditionally is safe because every one of these is bounded (the
         semaphores are BoundedSemaphores, a Lock is bound to one), so releasing one the child did not
         hold raises ValueError, which we swallow as a harmless no-op rather than inflating a limit.
+
+        The GPU denoise clearance lease is not among these blind-released primitives: each child owns its own
+        per-process clearance/done semaphores (its :class:`ClearanceLeaseProxy`), which die with the process,
+        so there is no shared permit for a dead child to strand and nothing for the parent to release on its
+        behalf. Its reconciliation is a state discard handed to the card's clearance controller (the grant's
+        owner), so a replaced child's grant slot reopens without a compensating release.
         """
         # Release the dead child's own card's GPU semaphores (single-GPU = the one card), plus the shared
         # disk lock. A child with an unknown device falls back to the lowest configured card.
@@ -2652,7 +2700,9 @@ class ProcessLifecycleManager:
             ("vae_decode_semaphore", card.vae_decode_semaphore),
         ]
         if self._gpu_sampling_lease_enabled:
-            candidates.append(("gpu_sampling_lease", card.gpu_sampling_lease))
+            # The clearance grant is per-child state, not a shared permit: discard it in the controller rather
+            # than blind-release anything (the child's own semaphores die with it).
+            self._clearance_child_replaced_notifier(card.device_index, process_info.process_id)
 
         released: list[str] = []
         for name, primitive in candidates:
@@ -3122,6 +3172,27 @@ class ProcessLifecycleManager:
         self._horde_model_map.root.clear()
         if self._owned_registry is not None:
             self._owned_registry.clear()
+        self.neutralize_message_queue_feeder()
+
+    def neutralize_message_queue_feeder(self) -> None:
+        """Abandon buffered puts on every parent-owned child-facing queue so interpreter exit cannot wedge.
+
+        A parent-owned cross-process ``Queue`` spins up a ``QueueFeederThread`` in the parent (the status
+        queue is fed both directly and through the in-parent image-utilities lane adapter). Once the parent
+        stops draining at teardown, a feeder mid-send toward a child whose read end is already gone blocks in
+        ``_send_bytes`` forever, and multiprocessing's atexit ``_finalize_join`` then joins it with no timeout,
+        hanging the whole exit until an external watchdog force-kills the tree. Detaching each feeder (the
+        buffered bytes are never read again once the parent is exiting) and closing each queue makes the exit
+        bounded. Every parent-created child-facing queue is neutralized, not just the status queue, so a queue
+        added later cannot reintroduce the wedge. Idempotent and best-effort: teardown must never raise here,
+        and one queue failing to close must not skip the rest.
+        """
+        for queue in self._child_facing_queues:
+            try:
+                queue.cancel_join_thread()
+                queue.close()
+            except Exception as e:  # noqa: BLE001 - shutdown must proceed even if the queue is already torn down
+                logger.debug(f"Failed to neutralize a child-facing queue feeder: {type(e).__name__}: {e}")
 
     def _check_and_replace_process(
         self,
@@ -3333,6 +3404,30 @@ class ProcessLifecycleManager:
         self._replace_inference_process(process_info, resource_fault_reason=reason)
         return True
 
+    def _effective_first_step_timeout(
+        self,
+        bridge_data: reGenBridgeData,
+        process_info: HordeProcessInfo,
+        first_step_timeout: int,
+    ) -> int:
+        """Widen the pre-first-step grace for a clearance-held child so the parent never kills what it holds.
+
+        Under the GPU denoise clearance lease a dispatched child sits in ``INFERENCE_PRIMED`` emitting no step
+        beat until the parent clears it into its load-and-sample window, which the parent may legitimately hold
+        while it evicts VRAM to make room. That silent wait is not a hang, so a child that has not yet taken a
+        step gets its first-step grace extended by the lease acquire timeout (the child self-degrades into
+        unpriced sampling by then, resuming heartbeats). The extension is bounded to that one window and applies
+        only to a pre-first-step primed child under the lease; a sampling child or the no-lease path is
+        unchanged.
+        """
+        if (
+            bridge_data.gpu_sampling_lease_enabled
+            and process_info.last_process_state == HordeProcessState.INFERENCE_PRIMED
+            and process_info.last_current_step is None
+        ):
+            return int(first_step_timeout + CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS)
+        return first_step_timeout
+
     def _effective_inference_step_timeout(self, bridge_data: reGenBridgeData, process_info: HordeProcessInfo) -> int:
         """Per-step hang timeout for a slot, widened when it is doing legitimate heartbeat-silent heavy work.
 
@@ -3458,7 +3553,7 @@ class ProcessLifecycleManager:
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
                 self._effective_inference_step_timeout(bridge_data, process_info),
-                first_step_timeout,
+                self._effective_first_step_timeout(bridge_data, process_info, first_step_timeout),
             ):
                 logger.error(f"{process_info} seems to be stuck mid inference, replacing it")
                 self._action_ledger.record(
