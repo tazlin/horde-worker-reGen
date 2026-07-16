@@ -147,6 +147,23 @@ per-slot breaker. This count is the equivalent signal for safety: a pool that ha
 this many times in the window is failing (e.g. a safety process that crashes on every start), which the
 recovery supervisor escalates rather than rebuilding the pool forever."""
 
+INFERENCE_END_GRACE_SECONDS: float = 5.0
+"""How long a single inference-slot end waits for the child to exit cleanly before killing it, when not
+shutting down. A busy child mid-sampling holds the GPU and cannot answer END_PROCESS until its current
+operation yields, so a curt grace kills it mid-put and risks tearing a frame on the shared status queue.
+A few seconds lets the common case exit on its own; a genuinely stuck child is still killed and reaped.
+Shutdown keeps the shorter grace: there the whole tree is coming down promptly regardless."""
+
+INFERENCE_SHUTDOWN_END_GRACE_SECONDS: float = 1.0
+"""End grace during shutdown: brief, since the tree is coming down promptly and a clean per-slot exit no
+longer matters."""
+
+SOFT_RESET_POOL_END_GRACE_SECONDS: float = 10.0
+"""Total wall-clock budget for ending every victim of a soft-reset pool rebuild. Each victim is signalled
+to end first (a parallel head start), then reaped against this one shared deadline, so a busy child gets
+several seconds to exit cleanly while the whole batch stays prompt rather than paying a serial grace per
+slot. Stragglers past the deadline are killed."""
+
 UTILITIES_PROCESS_EXPECTED_VRAM_MB: float = 1024.0
 """Provisional expected device footprint (MB) charged when admitting the image-utilities lane.
 
@@ -610,6 +627,18 @@ class ProcessLifecycleManager:
     def has_pending_safety_starts(self) -> bool:
         """Return whether the safety process is intentionally waiting for device headroom."""
         return any(pending.process_type is HordeProcessType.SAFETY for pending in self._pending_gpu_starts.values())
+
+    def pending_safety_start_device_indices(self) -> set[int]:
+        """Return the cards on which a safety GPU start is intentionally waiting for device headroom.
+
+        Lets the scheduler scope its safety-recovery admission hold to the card whose safety start is
+        deferred, so a preload bound for an unrelated card on a multi-GPU host is not held.
+        """
+        return {
+            pending.device_index
+            for pending in self._pending_gpu_starts.values()
+            if pending.process_type is HordeProcessType.SAFETY
+        }
 
     def pending_gpu_starts_backing_off(self) -> bool:
         """Return whether deferred starts are still an active, bounded backoff rather than a hard wedge.
@@ -2357,8 +2386,25 @@ class ProcessLifecycleManager:
         if process_info is not None:
             self._end_inference_process(process_info)
 
-    def _end_inference_process(self, process_info: HordeProcessInfo) -> None:
-        """Ends an inference process."""
+    def _end_inference_process(self, process_info: HordeProcessInfo, *, join_deadline: float | None = None) -> None:
+        """Ends an inference process.
+
+        Signals the child to end, then reaps it: joins against a grace, killing and reaping a straggler that
+        does not exit in time. The grace is longer when not shutting down (a busy child mid-sampling deserves a
+        few seconds to yield the GPU and exit cleanly rather than being killed mid-put, which risks tearing a
+        frame on the shared status queue). When ``join_deadline`` is a monotonic timestamp, the reap joins
+        against that shared batch deadline instead, so a pool rebuild can end its victims in parallel under one
+        bounded budget rather than a serial per-slot grace.
+        """
+        self._signal_inference_process_end(process_info)
+        self._reap_inference_process(process_info, join_deadline=join_deadline)
+
+    def _signal_inference_process_end(self, process_info: HordeProcessInfo) -> None:
+        """Mark the end as intended and ask the child to exit, without waiting for it.
+
+        Split from the reap so a batch of victims can be signalled first (a parallel head start) and reaped
+        together. Idempotent: re-signalling an already-ending or already-dead child is a caught no-op.
+        """
         # Mark the end as supervisor-intended *before* doing anything else, so the crash reaper does not
         # mistake this slot's imminent exit for an unexpected death and try to "recover" (and re-count) it.
         process_info.end_intended = True
@@ -2371,8 +2417,38 @@ class ProcessLifecycleManager:
         except BrokenPipeError:
             if not self._state.shutting_down:
                 logger.debug(f"Process {process_info.process_id} control channel vanished")
+
+    def _broadcast_inference_end_request(self, process_info: HordeProcessInfo) -> None:
+        """Ask a child to begin exiting without touching its tracked state, for a parallel batch head start.
+
+        Deliberately lighter than :meth:`_signal_inference_process_end`: it marks the end intended and sends
+        END_PROCESS, but does *not* run the ``on_process_ending`` bookkeeping (which nulls the slot's in-flight
+        job reference). That lets a whole batch be nudged toward exit up front while each slot's job is still
+        captured and requeued by its own :meth:`_replace_inference_process` pass afterward. Best-effort: a child
+        already gone is a caught no-op.
+        """
+        process_info.end_intended = True
         try:
-            process_info.mp_process.join(timeout=1)
+            process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+        except BrokenPipeError:
+            if not self._state.shutting_down:
+                logger.debug(f"Process {process_info.process_id} control channel vanished")
+
+    def _reap_inference_process(self, process_info: HordeProcessInfo, *, join_deadline: float | None = None) -> None:
+        """Wait a bounded grace for a signalled child to exit, then kill and reap a straggler.
+
+        The grace is the time remaining until ``join_deadline`` when one is given (a shared batch budget),
+        otherwise the single-end grace: brief while shutting down, several seconds otherwise.
+        """
+        if join_deadline is not None:
+            grace = max(0.0, join_deadline - time.monotonic())
+        elif self._state.shutting_down:
+            grace = INFERENCE_SHUTDOWN_END_GRACE_SECONDS
+        else:
+            grace = INFERENCE_END_GRACE_SECONDS
+
+        try:
+            process_info.mp_process.join(timeout=grace)
             if process_info.mp_process.is_alive():
                 process_info.mp_process.kill()
                 process_info.mp_process.join(timeout=1)
@@ -2888,11 +2964,19 @@ class ProcessLifecycleManager:
         self._quarantined_inference_slots.clear()
 
         live = [p for p in self._process_map.values() if p.process_type == HordeProcessType.INFERENCE]
+        # Nudge every victim toward exit first (a parallel head start), then reap them against one shared
+        # deadline inside each replacement. A busy child mid-sampling then exits cleanly during the batch
+        # window instead of being killed mid-put, which is what tears a frame on the shared status queue; the
+        # single budget keeps the whole reset prompt rather than paying a serial per-slot grace.
+        for process_info in live:
+            self._broadcast_inference_end_request(process_info)
+        end_deadline = time.monotonic() + SOFT_RESET_POOL_END_GRACE_SECONDS
         for process_info in live:
             self._replace_inference_process(
                 process_info,
                 intentional_reason=f"soft reset: {reason}",
                 recovery_requeue=True,
+                end_join_deadline=end_deadline,
             )
 
         for slot_id in revived:
@@ -2968,6 +3052,7 @@ class ProcessLifecycleManager:
         intentional_reason: str | None = None,
         resource_fault_reason: str | None = None,
         recovery_requeue: bool = False,
+        end_join_deadline: float | None = None,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -2999,6 +3084,9 @@ class ProcessLifecycleManager:
                 requeued in-flight job is a retry the recovery cycle granted. Marking it lets the same
                 cycle's give-up leave the job queued for a dispatch opportunity instead of terminally
                 faulting the retry it just granted.
+            end_join_deadline: A shared monotonic reap deadline for a batched pool rebuild. When set, this
+                slot's end joins against that one budget rather than the per-slot grace, so a whole batch of
+                victims already sent END_PROCESS can be reaped in parallel under a single bounded window.
         """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
@@ -3070,7 +3158,7 @@ class ProcessLifecycleManager:
                     "ram_usage_bytes": process_info.ram_usage_bytes,
                 },
             )
-            self._end_inference_process(process_info)
+            self._end_inference_process(process_info, join_deadline=end_join_deadline)
             self._process_map.retire_process(process_info, reason)
             self._request_inference_process_start(
                 process_info.process_id,
@@ -3146,7 +3234,7 @@ class ProcessLifecycleManager:
         )
         self._notify_process_recovery(process_info, recovery_reason)
 
-        self._end_inference_process(process_info)
+        self._end_inference_process(process_info, join_deadline=end_join_deadline)
         self._num_process_recoveries += 1
 
         if will_quarantine:
