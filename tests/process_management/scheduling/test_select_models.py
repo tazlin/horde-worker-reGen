@@ -153,6 +153,72 @@ class TestDuplicateModelFiltering:
         assert "model_a" not in result
 
 
+class TestResidentModelPopCapRaise:
+    """A model resident on a sampler slot may hold one more queued job than a cold model."""
+
+    async def test_resident_model_kept_at_cold_cap(self) -> None:
+        """A resident model with two queued jobs is still offered (its cap is three, not two)."""
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name="model_a")})
+        job_tracker = JobTracker()
+
+        for _ in range(2):
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
+
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+        )
+
+        assert result is not None
+        assert "model_a" in result
+
+    async def test_resident_model_excluded_at_raised_cap(self) -> None:
+        """A resident model with three queued jobs reaches its raised cap and is withheld."""
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name="model_a")})
+        job_tracker = JobTracker()
+
+        for _ in range(3):
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
+
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+        )
+
+        assert result is not None
+        assert "model_a" not in result
+
+    async def test_non_resident_model_keeps_cold_cap(self) -> None:
+        """A non-resident model with two queued jobs is withheld while the resident one is kept."""
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        # model_a resident, model_b cold.
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name="model_a")})
+        job_tracker = JobTracker()
+
+        for _ in range(2):
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
+        for _ in range(2):
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_b"))
+
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+        )
+
+        assert result == {"model_a"}
+
+
 class TestStickyModels:
     """Model stickiness: prefer already-loaded models to avoid disk I/O."""
 

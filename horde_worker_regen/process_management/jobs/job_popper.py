@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
     advertised_capabilities,
     under_fed_card,
 )
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
@@ -56,6 +57,11 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable_for,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.scheduling.pop_affinity import (
+    ResidencyBiasDecision,
+    ResidencyBiasState,
+    decide_residency_advertising,
+)
 from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
@@ -73,6 +79,7 @@ from horde_worker_regen.utils.job_utils import get_single_job_magnitude, small_p
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+    from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
     from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
     from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 
@@ -119,6 +126,15 @@ The process-count reserve still lowers this ceiling on small pools so at least o
 queue capacity remains available for non-LoRA work. Wide pools must not scale LoRA intake without bound:
 auxiliary downloads are serialized and can occupy concurrency slots without feeding the GPU.
 """
+
+_MODEL_POP_QUEUE_CAP = 2
+"""Concurrently-queued jobs (running plus queued) a single non-resident model may hold before the popper
+stops advertising it. Caps how much of the shallow local queue any one cold model can occupy."""
+
+_RESIDENT_MODEL_POP_QUEUE_CAP = 3
+"""Raised per-model queue cap for a model currently resident on a sampler slot. A resident model can absorb
+one more queued job than a cold one because it runs without a swap, so keeping the card fed with resident
+work is cheaper than admitting a cold model that forces an unload+stage+preload."""
 
 
 def _select_models_for_pop(
@@ -199,13 +215,15 @@ def _select_models_for_pop(
         elif bridge_data.horde_model_stickiness > 0:
             logger.debug("Models unstuck: asking to pop for all available models.")
 
-    # Only allow one running plus one queued for a given model
+    # Cap how many jobs any one model may hold in the shallow local queue. A resident model gets a higher
+    # cap than a cold one: it runs without a swap, so keeping the card fed with resident work is cheaper
+    # than admitting a cold model that forces an unload+stage+preload.
     models_to_remove = {
         model
         for model, count in collections.Counter(
             [job.model for job in job_tracker.jobs_pending_inference],
         ).items()
-        if count >= 2
+        if count >= (_RESIDENT_MODEL_POP_QUEUE_CAP if model in loaded_models else _MODEL_POP_QUEUE_CAP)
     }
     if len(models_to_remove) > 0:
         models = models.difference(models_to_remove)
@@ -379,6 +397,8 @@ class JobPopper:
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
+        staged_models_provider: Callable[[], frozenset[str]] | None = None,
+        action_ledger: ActionLedger | None = None,
         on_job_popped: Callable[[ImageGenerateJobPopResponse], None] | None = None,
         background_downloads_enabled: bool = True,
     ) -> None:
@@ -411,6 +431,15 @@ class JobPopper:
         right now. It is ANDed with the operator's `extended_controlnet` flag to decide the per-pop
         `allow_extended_controlnet` offer, so a fresh install advertises extended only once its annotators
         land. It defaults to "never ready", keeping the offer fail-closed when a popper is wired without it.
+
+        `staged_models_provider` reports the models staged in RAM (loadable without a fresh download/stage).
+        It widens the residency-bias floor beyond the VRAM-resident set so a narrowed pop can also offer work
+        the card can start cheaply from RAM. It defaults to "nothing staged", so the floor is the resident set
+        alone (still safe: a narrowed offer never empties, falling back to the full offered set).
+
+        `action_ledger`, when provided, records the edge-triggered engage/release of residency advertising
+        narrowing for offline diagnosis. It defaults to None (in-memory logging only), so a directly
+        constructed popper (and the tests) records no ledger events.
         """
         self._state = state
         self._process_map = process_map
@@ -435,6 +464,16 @@ class JobPopper:
         self._extended_controlnet_ready_provider = (
             extended_controlnet_ready_provider if extended_controlnet_ready_provider is not None else (lambda: False)
         )
+        self._staged_models_provider = (
+            staged_models_provider if staged_models_provider is not None else (lambda: frozenset())
+        )
+        self._action_ledger = action_ledger
+        # Duty-cycle state for residency-biased advertising, advanced once per built pop request. The
+        # narrowing latch is the edge-log/ledger anchor (only offer-narrowing transitions are surfaced), and
+        # the last-offered count is the readable status snapshot.
+        self._residency_bias_state = ResidencyBiasState()
+        self._residency_bias_narrowing = False
+        self._residency_bias_offered_count = 0
         self._large_model_pop_governor = LargeModelPopGovernor()
         # Notified once per popped job. With background downloads enabled this is the aux-prefetch
         # coordinator's pop trigger (place the job's LoRAs/TIs on disk while it is still pending); without
@@ -667,6 +706,97 @@ class JobPopper:
             )
             return models.difference(decision.withheld)
         return models
+
+    def _resident_model_names(self) -> frozenset[str]:
+        """The models currently resident on a sampler slot (loaded in VRAM on some inference process)."""
+        return frozenset(
+            process.loaded_horde_model_name
+            for process in self._process_map.values()
+            if process.loaded_horde_model_name is not None
+        )
+
+    def _residency_swap_backlog(self, resident_models: frozenset[str]) -> bool:
+        """Whether the worker is currently paying model swaps: a queued job needs a non-resident model.
+
+        Requires at least one resident model (nothing to bias toward on a cold start) and at least one queued
+        job whose model is not resident (the direct evidence of an imminent unload+stage+preload). An empty
+        local queue is not a backlog: the worker should take any work when idle rather than narrow itself.
+        """
+        if not resident_models:
+            return False
+        return any(
+            job.model is not None and job.model not in resident_models
+            for job in self._job_tracker.jobs_pending_inference
+        )
+
+    def _apply_residency_advertising_bias(self, models: set[str]) -> set[str]:
+        """Narrow the offered set toward residents while a swap backlog persists, duty-cycled.
+
+        Delegates the decision to :func:`decide_residency_advertising` (pure, duty-cycled, floored) and
+        advances the stored duty-cycle state. Never returns an empty set when ``models`` was non-empty, and
+        never adds a model the worker does not already offer.
+        """
+        resident = self._resident_model_names()
+        staged = self._staged_models_provider()
+        decision = decide_residency_advertising(
+            self._residency_bias_state,
+            swap_backlog=self._residency_swap_backlog(resident),
+            resident_models=resident,
+            staged_models=staged,
+            offered_models=frozenset(models),
+        )
+        self._residency_bias_state = decision.next_state
+        self._residency_bias_offered_count = len(decision.advertised_models)
+        self._log_residency_bias_edge(decision)
+        return set(decision.advertised_models)
+
+    def _log_residency_bias_edge(self, decision: ResidencyBiasDecision) -> None:
+        """Emit the edge-triggered engage/release log line and ledger event for offer narrowing.
+
+        Coalesced against the last narrowing state actually surfaced, so a steady narrow (or steady full)
+        offer is never re-logged pop after pop; only a transition in whether the offer is narrowed fires.
+        """
+        if decision.narrowed_offer == self._residency_bias_narrowing:
+            return
+        self._residency_bias_narrowing = decision.narrowed_offer
+        if decision.narrowed_offer:
+            logger.info(
+                "Residency advertising bias engaged: narrowing the pop offer to "
+                f"{len(decision.advertised_models)} resident/staged model(s) while a model-swap backlog "
+                "persists.",
+            )
+            self._record_residency_bias_ledger(
+                LedgerEventType.RESIDENCY_ADVERTISING_NARROWED,
+                reason="model_swap_backlog",
+                offered_count=len(decision.advertised_models),
+            )
+        else:
+            logger.info("Residency advertising bias released: re-advertising the full offered model set.")
+            self._record_residency_bias_ledger(
+                LedgerEventType.RESIDENCY_ADVERTISING_RELEASED,
+                reason="backlog_cleared_or_duty_open",
+                offered_count=len(decision.advertised_models),
+            )
+
+    def _record_residency_bias_ledger(
+        self,
+        event_type: LedgerEventType,
+        *,
+        reason: str,
+        offered_count: int,
+    ) -> None:
+        """Record a residency-advertising edge to the action ledger when one is wired (never raises)."""
+        if self._action_ledger is None:
+            return
+        self._action_ledger.record(event_type, reason=reason, detail={"offered_models": offered_count})
+
+    def latest_residency_bias_narrowing(self) -> bool:
+        """Whether the most recent pop actually narrowed its offer toward residents (status snapshot)."""
+        return self._residency_bias_narrowing
+
+    def latest_residency_bias_offered_count(self) -> int:
+        """The model count advertised on the most recent residency-bias decision (status snapshot)."""
+        return self._residency_bias_offered_count
 
     def large_model_governor_status(self, *, now: float, residency_active: bool) -> LargeModelGovernorStatus:
         """Report the live engagement of the two large-model limiters, for the governor registry.
@@ -1291,6 +1421,13 @@ class JobPopper:
         models = self._apply_large_model_pop_limits(models, bridge_data)
         if len(models) == 0:
             return
+
+        # Residency-biased advertising: while the worker is paying model swaps (a queued head needs a
+        # non-resident model), narrow the offer toward the resident+staged set so the horde returns work the
+        # card can run without a swap. Duty-cycled so the full set is periodically re-advertised, and skipped
+        # entirely on an idle-fill pop, whose job is to grab the quickest available work regardless of model.
+        if not idle_fill_wanted:
+            models = self._apply_residency_advertising_bias(models)
 
         pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw
         pop_threads = advertised.threads if advertised is not None else self._max_concurrent_inference_processes
