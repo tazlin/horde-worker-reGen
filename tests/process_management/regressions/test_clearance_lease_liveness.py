@@ -10,7 +10,10 @@ slot cap holds the next grant until a window retires).
 
 from __future__ import annotations
 
+import pytest
+
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState
+from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ActiveSampler,
     ClearanceController,
@@ -106,6 +109,57 @@ class TestDispatchReservationCharge:
         # A single entry upgraded in place: the reserved total is the full peak, not encode + full (double-book).
         assert upgraded == full_mb
         assert upgraded != _ENCODE_MB + full_mb
+
+
+class TestDispatchReservationDisaggregationPricing:
+    """A class-eligible dispatch's full charge is priced sampler-only, matching the other measured-admission sites.
+
+    The upgrade at clearance re-books the dispatch reservation at the full materialisation charge. A
+    disaggregation-class-eligible job loads its weights and runs its decode off the sampling process, so that
+    full charge is the UNet-only sampler figure, not the monolithic whole-job peak. This pins that the charge
+    tracks the job's class eligibility rather than an unconditional monolithic price.
+    """
+
+    _WHOLE_JOB_MB = 9000.0
+    _SAMPLER_ONLY_MB = 4000.0
+
+    def _pin_predictors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: self._WHOLE_JOB_MB)
+        monkeypatch.setattr(
+            _sched_mod,
+            "predict_job_sampler_only_vram_mb",
+            lambda _job, _baseline: self._SAMPLER_ONLY_MB,
+        )
+
+    def _reserved_vram_mb(self, scheduler: object) -> float:
+        ledger = scheduler._reserve_ledger  # type: ignore[attr-defined]
+        return ledger.effective_planned_vram_mb_for_flow(DISPATCH_ADMISSION_FLOW, {})
+
+    def test_class_eligible_full_charge_uses_sampler_only_pricing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A disaggregation-class-eligible job books its full charge at the sampler-only figure, not whole-job."""
+        self._pin_predictors(monkeypatch)
+        scheduler = _make_inference_scheduler(
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        scheduler._is_disaggregation_class_eligible = lambda _job: True
+        proc = make_mock_process_info(0, model_name="stable_diffusion")
+        job = make_job_pop_response("stable_diffusion")
+
+        scheduler._record_dispatch_reservation(job, proc, baseline=None, staging_only=False)
+        assert self._reserved_vram_mb(scheduler) == self._SAMPLER_ONLY_MB
+
+    def test_monolithic_job_full_charge_uses_whole_job_pricing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A job that will not run disaggregated still books the whole-job peak (the predicate governs)."""
+        self._pin_predictors(monkeypatch)
+        scheduler = _make_inference_scheduler(
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        scheduler._is_disaggregation_class_eligible = lambda _job: False
+        proc = make_mock_process_info(0, model_name="stable_diffusion")
+        job = make_job_pop_response("stable_diffusion")
+
+        scheduler._record_dispatch_reservation(job, proc, baseline=None, staging_only=False)
+        assert self._reserved_vram_mb(scheduler) == self._WHOLE_JOB_MB
 
 
 class TestHeadNotStarvedBySiblingStaging:

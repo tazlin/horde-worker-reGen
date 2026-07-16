@@ -721,6 +721,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     monolithically. A role dying after a job is claimed is backstopped by the pipeline's per-stage patience,
     which faults the job for horde reissue rather than parking it forever."""
 
+    pp_overlap_margin_mb_disaggregated: float | None = Field(default=None, ge=0)
+    """Override (MB) for the post-processing co-residency measured second-say margin, disaggregation jobs only.
+
+    Experimental tuning lever. The post-processing/sampling co-residency gate, on a static-accounting miss,
+    gives the parent's measured device-free reading a second say and admits only when the free (net of the
+    reserve, the sampling peak, and any pending chain reserve) clears a fixed margin (1024MB by default). A
+    disaggregation-class-eligible job holds only its UNet-only sampler peak, so its true overlap headroom
+    differs from a monolithic whole-job dispatch; setting a positive value here applies that margin in place of
+    the default *only* when the candidate job is disaggregation-class-eligible. Monolithic-path jobs always
+    keep the 1024MB default regardless of this setting. None (the default) leaves the behavior unchanged. Only
+    used when `enable_pipeline_disaggregation` and `enable_vram_budget` are true."""
+
     enable_image_utilities: bool = Field(default=True)
     """Run the dedicated image-utilities lane (the ``horde_image_utilities`` capability service).
 

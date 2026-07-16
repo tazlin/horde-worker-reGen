@@ -404,6 +404,7 @@ class ClearanceController:
                     cleared.append(process_id)
                     if plan.tail_cleared_for_job_id is not None and process_id == plan.clear_process_ids[-1]:
                         self._tail_cleared_job_ids.add(plan.tail_cleared_for_job_id)
+                        self._log_tail_overlap_clear(inputs, outgoing_job_id=plan.tail_cleared_for_job_id)
             else:
                 held.append(process_id)
 
@@ -435,6 +436,27 @@ class ClearanceController:
             f"load-and-sample window.",
         )
         return True
+
+    def _log_tail_overlap_clear(self, inputs: ClearanceInputs, *, outgoing_job_id: str) -> None:
+        """Emit the dedicated INFO signal for a tail-overlap early clear so its firing rate is measurable.
+
+        The ordinary steady-state grant and the tail-overlap bonus grant share :meth:`_clear`'s debug line, so
+        without this the bonus firing rate is invisible in the logs. Bound to the semaphore edge where the bonus
+        is actually issued and gated by the one-per-job dedup, so it fires exactly once per outgoing sampler.
+        Reports the outgoing sampler's denoise progress and the measured headroom (device free minus reserve)
+        the bonus was granted against, the two quantities that decide whether the handoff window is well-tuned.
+        """
+        outgoing = next(
+            (grant for grant in inputs.active_grants if grant.job_id == outgoing_job_id),
+            None,
+        )
+        progress_fraction = outgoing.progress_fraction if outgoing is not None else 0.0
+        headroom_mb = inputs.device_free_mb - inputs.vram_reserve_mb if inputs.device_free_mb is not None else 0.0
+        logger.info(
+            f"Clearance lease on device {self._device_index}: tail-overlap early clear granted behind outgoing "
+            f"sampler {outgoing_job_id[:8]} at progress {progress_fraction:.2f} with {headroom_mb:.0f}MB measured "
+            f"headroom.",
+        )
 
     def _drain_done_discard(self) -> None:
         """Empty each child's done semaphore without using it to retire grants (bounded hygiene only).

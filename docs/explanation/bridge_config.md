@@ -299,6 +299,17 @@ SD1.5/SDXL txt2img, img2img, or remix job with no ControlNet; anything else fall
 back to the whole-job path. The config editor exposes the toggle under the
 Advanced catalog, and changing it needs a worker restart.
 
+`pp_overlap_margin_mb_disaggregated` is an experimental tuning lever for the
+post-processing co-residency gate under disaggregation. When the static
+co-residency check withholds an overlap, the worker gives its measured
+device-free reading a second say and admits only when the free (net of the VRAM
+reserve, the sampling peak, and any pending chain reserve) clears a fixed margin
+(1024MB by default). A disaggregation-class-eligible job holds only its UNet-only
+sampler peak, so setting a positive value here applies that margin in place of
+the default for those jobs only. Monolithic-path jobs always keep the 1024MB
+default. Leave it unset (the default) to keep today's behavior. Only meaningful
+when `enable_pipeline_disaggregation` and the VRAM budget are on.
+
 ### Alchemy
 
 `alchemist: true` opts the worker into **alchemy** jobs (`/v2/interrogate/pop`) in

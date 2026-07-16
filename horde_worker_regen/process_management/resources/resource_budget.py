@@ -119,11 +119,20 @@ class BudgetVerdict:
     fits: bool
     """Whether the job's predicted cost plus the reserve fits the measured available resource."""
     predicted_mb: float | None
-    """The job's predicted cost (MB) for this resource, or None when no estimate could be produced."""
+    """The effective predicted cost (MB) the fit was decided against, or None when no estimate could be
+    produced. For a RAM verdict that credited a staging target's reusable retained pages this is the
+    credited (reduced) charge, not the raw model cost; ``uncredited_predicted_mb`` carries the raw figure."""
     available_mb: float | None
     """The measured available resource (MB) at check time, or None when no telemetry exists yet."""
     reserve_mb: float
     """The reserve (MB) required on top of the prediction."""
+    uncredited_predicted_mb: float | None = None
+    """The raw model cost (MB) before any marginal reuse credit, when a credit was applied. None when no
+    credit was in play, in which case ``predicted_mb`` is already the raw figure. RAM-only; the VRAM budget
+    never credits and leaves this unset."""
+    reusable_credit_mb: float = 0.0
+    """The marginal RAM credit (MB) actually applied to ``predicted_mb`` for a reusable staging target
+    (0.0 when no credit was granted, including when a floor-safety gate withdrew it). RAM-only."""
 
     def reason(self) -> str:
         """Return a short human-readable explanation, for logging an admit/defer decision."""
@@ -1500,6 +1509,34 @@ class VramBudget:
         )
 
 
+_MARGINAL_STAGING_CREDIT_FRACTION = 0.7
+"""Fraction of a staging target's retained reusable RSS the RAM budget trusts as truly reusable.
+
+When a preload lands on an idle process that has already unloaded its prior model (or swaps a resident model
+in place), the allocator keeps the freed model's pages resident and the new weights reuse them: the measured
+system-RAM growth is a fraction of a cold load, not the full model cost (measured net growth 25MB-3.3GB for an
+in-place swap versus +6.4-7.3GB for a cold successor). Crediting the *whole* retained figure would price the
+swap at nearly zero and admit into memory the allocator cannot actually recycle byte-for-byte; the fraction is
+held below one so allocator fragmentation and the pages the new model genuinely cannot reuse stay charged. The
+paired :data:`_MARGINAL_STAGING_CHARGE_FLOOR_MB` puts a hard lower bound under the credited charge so the
+verdict never prices a reuse at zero regardless of how large the retained figure is."""
+
+_MARGINAL_STAGING_CHARGE_FLOOR_MB = 3500.0
+"""Lower bound (MB) on the credited RAM charge for a reusable staging target, whatever the credit computes.
+
+Covers the worst in-place-swap growth measured (a 3.3GB SD1.5-to-SDXL swap) plus transient churn, so even a
+target retaining more than a model's worth of pages is never admitted as if the swap were free. The credit
+reduces the charge toward this floor but never below it: ``effective = max(floor, predicted - credit)``."""
+
+_MARGINAL_STAGING_TRANSIENT_HEADROOM_MB = 1024.0
+"""Transient RAM spike (MB) a reuse load briefly touches over its settled cost, held back from the credit.
+
+Even a swap that settles to a small net growth momentarily touches ~1GB over steady state as the new weights
+are read and the reused pages are rewritten. The floor-safety gate keeps this spike above the host danger
+floor: a credit is honored only when the credited charge *and* this transient headroom still leave available
+RAM above the floor, so the budget never credits itself into an OS-OOM-adjacent breach."""
+
+
 class RamBudget:
     """Decides whether measured available system RAM can absorb another job's predicted RAM cost.
 
@@ -1529,16 +1566,31 @@ class RamBudget:
         baseline: str | None,
         available_ram_mb: float | None,
         committed_reserve_mb: float = 0.0,
+        *,
+        reusable_credit_mb: float = 0.0,
+        danger_floor_mb: float | None = None,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured available system RAM.
 
         Admits (fits=True) when no measurement or estimate is available, so the budget never wedges a
-        worker; otherwise requires ``available - committed_reserve >= predicted + reserve``.
+        worker; otherwise requires ``available - committed_reserve >= effective_predicted + reserve``.
 
         ``committed_reserve_mb`` is RAM already spoken for by in-flight work whose cost is not yet
         reflected in the measured available figure (the RAM analogue of the VRAM committed reserve;
         chiefly other flows' just-admitted weight loads). It defaults to 0.0 so callers that do not
         track it keep the prior instantaneous behavior.
+
+        Marginal reuse contract: ``reusable_credit_mb`` is the staging target's retained, reusable resident
+        RSS (the pages an idle process kept after unloading its prior model, which a new load reuses rather
+        than allocating afresh). When positive it discounts the charge:
+        ``effective_predicted = max(floor, predicted - reusable_credit_mb * fraction)``, so an in-place swap
+        onto a retaining slot is priced at its real marginal growth rather than a full cold load. The credit
+        never prices a reuse at zero (:data:`_MARGINAL_STAGING_CHARGE_FLOOR_MB`) and never raises the charge
+        above the raw prediction. ``danger_floor_mb``, when given, gates the credit against the host RAM
+        danger floor: the credit is honored only if the credited charge plus a transient load-spike headroom
+        still leave available RAM above that floor, so the budget never credits itself into a floor breach;
+        otherwise the raw charge stands (and ordinarily defers). Callers that pass neither keep the prior
+        full-charge behavior.
         """
         if available_ram_mb is None:
             return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
@@ -1553,12 +1605,28 @@ class RamBudget:
                 reserve_mb=self._reserve_mb,
             )
 
-        fits = effective_available_mb >= predicted + self._reserve_mb
+        effective_predicted = predicted
+        applied_credit_mb = 0.0
+        if reusable_credit_mb > 0.0:
+            credit = reusable_credit_mb * _MARGINAL_STAGING_CREDIT_FRACTION
+            candidate_charge = max(_MARGINAL_STAGING_CHARGE_FLOOR_MB, predicted - credit)
+            # The credit only ever reduces the charge; a target retaining less than the floor never inflates it.
+            candidate_charge = min(candidate_charge, predicted)
+            floor_safe = danger_floor_mb is None or (
+                effective_available_mb - candidate_charge - _MARGINAL_STAGING_TRANSIENT_HEADROOM_MB >= danger_floor_mb
+            )
+            if floor_safe and candidate_charge < predicted:
+                applied_credit_mb = predicted - candidate_charge
+                effective_predicted = candidate_charge
+
+        fits = effective_available_mb >= effective_predicted + self._reserve_mb
         return BudgetVerdict(
             fits=fits,
-            predicted_mb=predicted,
+            predicted_mb=effective_predicted,
             available_mb=effective_available_mb,
             reserve_mb=self._reserve_mb,
+            uncredited_predicted_mb=predicted if applied_credit_mb > 0.0 else None,
+            reusable_credit_mb=applied_credit_mb,
         )
 
 

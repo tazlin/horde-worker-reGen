@@ -343,6 +343,53 @@ class TestControllerClearing:
         assert controller.grant_state(2) is GrantState.SAMPLING
 
 
+class TestTailOverlapObservability:
+    """A tail-overlap early clear emits its own INFO signal exactly once per outgoing sampler."""
+
+    def _drive_tail_bonus(self, controller: ClearanceController) -> None:
+        """Clear an outgoing sampler, advance it into its tail, and clear one extra waiter on the bonus slot."""
+        outgoing = _StubProxy()
+        incoming = _StubProxy()
+        controller.register(1, outgoing)
+        controller.register(2, incoming)
+        # Clear the outgoing sampler and advance it to a tailing denoise progress the bonus keys on.
+        controller.step(
+            _inputs(staged=(ClearanceWaiter(process_id=1, priority=0, job_id="job-a"),)),
+            admit_fn=_always_admit,
+        )
+        active = (ActiveSampler(process_id=1, job_id="job-a", progress_fraction=0.9),)
+        # The outgoing sampler holds the only steady slot, so the incoming waiter can only clear on the bonus.
+        controller.step(
+            _inputs(staged=(ClearanceWaiter(process_id=2, priority=1),), active=active),
+            admit_fn=_always_admit,
+        )
+
+    def test_tail_bonus_clear_emits_dedicated_info_line_once(self) -> None:
+        """The bonus clear logs one dedicated INFO line carrying the outgoing token, progress, and headroom."""
+        from loguru import logger
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda record: messages.append(record), level="INFO")
+        try:
+            controller = _controller(slot_cap=1, tail=True)
+            self._drive_tail_bonus(controller)
+            # A further tick for the same outgoing sampler must not re-emit (one-per-job dedup).
+            active = (ActiveSampler(process_id=1, job_id="job-a", progress_fraction=0.95),)
+            controller.step(
+                _inputs(staged=(ClearanceWaiter(process_id=3, priority=2),), active=active),
+                admit_fn=_always_admit,
+            )
+        finally:
+            logger.remove(sink_id)
+
+        tail_lines = [m for m in messages if "tail-overlap early clear" in m]
+        assert len(tail_lines) == 1
+        line = tail_lines[0]
+        assert "job-a" in line  # the outgoing sampler's job id token
+        assert "0.90" in line  # the outgoing sampler's denoise progress fraction
+        assert "17952MB" in line  # measured headroom: 20000 device-free minus the 2048 reserve
+
+
 class TestControllerLiveness:
     """A controller that never clears must not wedge the pool: children still sample via the timeout path."""
 

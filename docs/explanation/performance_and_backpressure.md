@@ -140,6 +140,34 @@ slower CPU path. On multi-GPU workers the same headroom-aware card choice is use
 second card with room can take the safety context; on single-GPU workers the same rule
 applies to the one card.
 
+### Safety-recovery admission hold
+
+The placement policy above yields safety onto a card that has room; it cannot help when the card has **no**
+room and the safety process is dying on every start. A safety child that crashes is reaped and respawned, but
+when the card is saturated the device-free governor defers its GPU start, so a safety child that keeps
+crashing respawns straight back into a start that keeps deferring. The crash-loop signal
+(`ProcessLifecycleManager.safety_pool_failing`) trips, yet on its own nothing makes the inference side give
+the card back, so the card stays full of inference work and the safety pool never comes up.
+
+The **safety-recovery admission hold** closes that. When the safety pool is crash-looping *and* a safety GPU
+start is deferred for want of headroom, the scheduler holds new preload admissions on that card (the same
+`_admit_preload_under_budget` seam every other admission gate runs through) and nudges the existing idle
+reclaim toward the card, so it drains enough for the deferred safety start to succeed. The hold is
+edge-triggered: it announces once on engage (with a ledger event), and releases the moment the safety pool
+starts (its pending start satisfied) or its crash-loop signal clears. On a multi-GPU worker the hold is scoped
+to the card whose safety start is deferred, so a preload bound for an unrelated card is not held; a
+single-GPU worker holds worker-wide.
+
+It is bounded by a TTL (`_SAFETY_RECOVERY_HOLD_TTL_SECONDS`, 120s): if safety still cannot start that long
+after the hold engaged, holding inference longer only starves the card without helping, so the hold releases
+and logs `CRITICAL` plus a ledger event to surface the stuck condition. It does not itself escalate further,
+because the give-up machinery already watches safety-pool health. The expiry **latches the episode**: while the
+same crash-loop condition persists the hold does not re-engage, so a permanently stuck safety pool admits
+inference normally rather than re-holding one preload per TTL window (and re-logging the `CRITICAL`) forever.
+The latch clears only when the condition clears (the release path runs), so a later recurrence is a fresh
+episode that may hold and expire again. This composes with every other admission gate: a preload must clear the
+safety-recovery hold and the VRAM/RAM budget alike before it is admitted.
+
 ## Post-processing offer shaping
 
 The post-processing lane is also downstream of inference, but its pressure is not a reason
@@ -313,8 +341,8 @@ job with no request in flight (a retryable-failure requeue, a lost result, or a 
 and marks a job prepared outright when its files are already cached: the liveness that heals. Save-our-ship
 recovery defers to this: while the head-of-queue job is auxiliary-gated with its prefetch still in flight (its
 deadline present and unexpired), give-up holds off exactly as it does for a head whose model is still
-materialising, bounded by that deadline so a stalled prefetch still faults through the coordinator rather than
-deferring give-up forever.
+materialising, bounded by that deadline so the coordinator resolves the head the moment it lapses (served
+without its never-in-flight file, or faulted if its transfer stalled) rather than deferring give-up forever.
 
 On the pop side, the same prefetch gate is what keeps an all-LoRA queue from starving the GPU. The job
 popper stops advertising LoRA support once the queue already holds its allowed share of LoRA jobs (the
@@ -793,6 +821,34 @@ so the budget never wedges a worker that has not yet reported memory. Set
 `enable_vram_budget: false` to restore the prior availability-only behavior (not
 recommended on a shared or consumer GPU).
 
+The system-RAM side of that marginal check carries a **staging credit** so a
+reload onto a warm slot is not priced as a cold one. An inference process that
+unloads a model keeps the freed weights' pages resident (its RSS does not drop),
+and a subsequent preload onto that same idle slot reuses those pages: the measured
+net RAM growth of such an in-place swap is a fraction of a cold successor's cost.
+Charging the full per-job estimate against system-available RAM ignores this and
+defers a swap that would in fact fit, and the deferral's own last resort then
+cycles the retaining process, forcing the very cold reload the swap avoided. To
+break that defer-cycle-cold-load loop, when the staging target is a reusable
+(idle) slot the RAM verdict credits the prediction with a conservative fraction of
+the target's retained resident RSS above a fresh child's baseline. The credited
+charge is floored (a swap is never priced below a hard minimum that covers the
+worst measured in-place growth) and gated on the danger floor below: a credit is
+honored only if the credited charge and a transient load-spike headroom still leave
+available RAM above the floor, so the accounting never credits a load into an
+OOM-adjacent breach. A busy or fresh target retains nothing reusable and earns no
+credit, collapsing the check to the ordinary full charge. When even the credited
+verdict cannot fit, the reclaim cycle still runs, but it **spares the staging
+target** (cycling it would destroy the pages the credit priced against) and cycles
+a different allocator-stuck idle slot instead. Cycling is retargeted, not removed:
+an idle slot whose RSS climbs past a creep ceiling (above any single resident model
+plus its runtime) is cycled regardless of its unload state or resident model, since
+that footprint is per-job creep the allocator will not otherwise return and reusing
+it would only carry the leak forward. Each credited admission is reconciled against
+measured truth once the target settles: a target that grew past the charge by a wide
+margin logs that the credit was too generous, the signal for retuning the credit
+constants against field data.
+
 Separately from the *marginal* fit check above, an **absolute system-RAM danger
 floor** guards against the kernel OOM-killer. It is evaluated **every scheduling
 tick**, not only when a new model needs preloading: a steady-state worker whose
@@ -1095,6 +1151,39 @@ rather than reserving the card for it; on a smaller card the same checkpoint *is
 there remains available. It is the difference between a teardown justified by measured contention and one
 conjured by an unmeasured over-count.
 
+### The head-priority dispatch barrier
+
+The RAM branch's only escape from an indefinite defer is the best-effort admit, and it is gated on *no live
+job holding memory anywhere on the card*. That gate is exactly right for a genuinely over-committed host, but
+it leaves a gap: a head-of-queue preload whose system-RAM verdict keeps failing while a **sibling job is in
+progress** can never reach the escape on its own. Reclaim frees nothing (the idle residents are gone, or are
+other queued jobs' models), a sibling holds the memory the head needs, and the head defers every cycle. The
+head-starvation clock cannot see this either, because it is forced to zero whenever any job is in progress, so
+without help the head waits until the horde faults its job.
+
+The **head-priority dispatch barrier** resolves it without blind over-admission. When a head-of-queue preload
+has been continuously RAM-deferred behind live work past `_HEAD_RAM_DEFER_BARRIER_SECONDS` (60s) with reclaim
+freeing nothing, the scheduler latches a barrier: `start_inference` withholds new dispatch to every slot but
+the head's own, so the running siblings drain rather than being immediately refilled with fresh work. As each
+sibling finishes and none is dispatched to replace it, the card empties; when the last one completes the
+existing no-live-consumer best-effort admit seats the head. The barrier changes only *what may start*, never
+what is already sampling: in-flight work is left alone to finish.
+
+The barrier is edge-triggered and its continuous-defer clock starts at the head's first such defer, restarting
+on reclaim progress or a change of head (only a head that keeps deferring with nothing freed is starving). It
+releases the moment the head is admitted, dispatched, faulted, or departs the queue front, so it can never
+outlive its head. It is suppressed while a deliberate RAM-reclaim process cycle is still inside its bounded
+grace (`ram_reclaim_cycle_grace_active`), so an actively-resolving defer is never mistaken for starvation. And
+it is hard-capped: barring dispatch normally drains the siblings well inside the window, but if one never
+completes the barrier would otherwise hold forever, so a barrier that has held past
+`_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS` (180s, three times the engage bound) without admitting the head declines
+it, faulting the head for reissue through the existing retryable, resource-classed fault machinery (no model
+quarantine or ceiling hold, since the block is transient host-RAM pressure, not an unroutable model). Failing
+fast beats leaving the head to rot. Engage, release, and hard-cap decline each emit a distinct log line and a
+ledger event. This composes with the safety-recovery hold and the VRAM/RAM budget: a job admitted must clear
+every gate, and the barrier gates *dispatch* while those gate *admission*, so the two never contend for the
+same decision.
+
 ### Large-model pop limiters
 
 Whole-card residency is disruptive even when correctly sized: a queue that *alternates* distinct very-large
@@ -1253,17 +1342,21 @@ non-LoRA and already-prepared work keeps flowing through ordinary admission. Thr
 damage a bad download path can do to the jobs that depend on it:
 
 - **Per-job prefetch deadline**: the prefetch coordinator arms a deadline derived from the configured
-  download timeout when it requests a job's files, checked in the periodic scheduling scan. A job whose
-  prefetch never resolves is faulted at the deadline rather than waiting forever, and the download
-  process bounds each individual fetch as well. The deadline is a backstop, not the primary detector, so
-  an expiry that finds the job's file still in flight defers the fault by one download-timeout budget
-  rather than faulting a slow-but-alive transfer. Deferral is bounded at two extra budgets (three total),
-  and short-circuits sooner once the download reports byte progress that stops advancing between expiries,
-  so a genuinely wedged transfer still faults on time.
+  download timeout when it requests a job's files, checked in the periodic scheduling scan. It bounds how
+  long a job waits, not the job's fate: a job whose outstanding references have no in-flight download by
+  the deadline (a starved lane, a cooling reference, a dead downloader) is served without them rather than
+  waiting forever, since the inference child fetches the file itself and the prefetch lane's own
+  unavailability must not manufacture a fault. Only a stalled in-flight transfer is faulted at the
+  deadline, and the download process bounds each individual fetch as well. The deadline is a backstop, not
+  the primary detector, so an expiry that finds the job's file still in flight defers the fault by one
+  download-timeout budget rather than faulting a slow-but-alive transfer. Deferral is bounded at two extra
+  budgets (three total), and short-circuits sooner once the download reports byte progress that stops
+  advancing between expiries, so a genuinely wedged transfer still faults on time.
 - **Escalating pop backoff**
   ([`AuxDownloadBackoff`][horde_worker_regen.process_management.models.aux_download_backoff.AuxDownloadBackoff]):
-  a failed prefetch download (or an expired prefetch deadline) registers a *strike* on that file's
-  per-class backoff, once per failed download rather than once per waiting job, and only while at least
+  a failed prefetch download (or a stalled in-flight transfer faulted at its deadline) registers a
+  *strike* on that file's per-class backoff, once per failed download rather than once per waiting job, and
+  only while at least
   one requesting job is still pending, so a shared failure or a late result does not compound into several
   strikes. The LoRA class backoff also gates advertising: while its window is active the popper stops
   advertising LoRA support (folded into `_lora_disk_permits` alongside the disk guard), so the worker stops
@@ -1282,8 +1375,9 @@ retry and the reconcile sweep re-arms a fresh prefetch, while a failure during a
 dropped (handed back to the horde) rather than requeued straight back into the same failing download.
 
 Together these turn an all-LoRA queue facing a flaky source into a graceful degradation: LoRA intake
-pauses and escalates, the affected jobs fault at a bounded deadline, and the sampling lanes never see
-any of it - the GPU keeps working the whole time.
+pauses and escalates, the affected jobs are served without the unfetchable file (or, for a genuinely
+stalled transfer, fault at a bounded deadline), and the sampling lanes never see any of it - the GPU keeps
+working the whole time.
 
 Two named soak mixes exercise this behaviour under sustained load. The **`lora_storm`** mix is the
 adversarial download-pressure probe: roughly two thirds of its pops carry LoRAs, cycling a broad pool of

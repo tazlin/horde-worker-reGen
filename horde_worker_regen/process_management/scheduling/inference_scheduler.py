@@ -83,6 +83,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
     predict_job_weight_mb,
+    ram_pressure_floor_mb,
 )
 from horde_worker_regen.process_management.resources.run_metrics import (
     ChurnKind,
@@ -225,6 +226,65 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 _STALE_RAM_UNLOAD_REPLACE_BYTES = 1024 * 1024 * 1024
 """RSS threshold above which a model-less idle process is still materially holding RAM after unload."""
 
+_FRESH_INFERENCE_CHILD_BASELINE_MB = 1100.0
+"""Resident RSS (MB) a just-spawned inference child holds before it loads any model weights.
+
+The interpreter, torch/CUDA import allocations, and IPC scaffolding a cold child carries (measured ~1.03-1.1GB
+fresh). An idle process's RSS above this baseline is retained model pages the allocator kept after an unload,
+which a subsequent preload onto that slot reuses rather than allocating anew; the excess is what the marginal
+RAM credit is computed from. Erring toward the high end of the measured range keeps the credit conservative
+(less RSS is treated as reusable) so the budget under-credits rather than over-admits."""
+
+_CREEP_CONTAINMENT_RSS_BYTES = 18432 * 1024 * 1024
+"""Idle-slot RSS above which a process is cycled for creep containment regardless of its unload state.
+
+An inference child creeps ~400MB/job with the model unchanged; left unchecked it grows unbounded (observed
+8->19.8GB) and cycling is the only containment. The ceiling mirrors the ``ram_per_process_max_mb`` default
+(18432 MB), the figure the danger-floor reclaim already treats as a single process's balloon limit, so the two
+reclaim paths agree on what "too big" means; unlike that path (which fires only under the danger floor) this
+containment runs whenever a reclaim is attempted, so a genuine leak is bounded before the host reaches the
+floor. It sits well above any single resident XL checkpoint plus its runtime, so a legitimate single-model
+reuse target never trips it, but a genuinely crept slot does. Above this figure the retained RSS is leak, not
+clean reusable pages, so creep containment overrides the reuse protection that otherwise spares the head's
+staging target: such a slot is cycled and cold-loaded rather than reused, which is the correct trade when
+reusing it would only perpetuate the leak. A slot that was just routed a preload is still spared (reaping it
+mid-stage would fault the head's load), matching the stale-unload path's own mid-preload guard."""
+
+_REUSE_CREDIT_RECONCILE_SETTLE_SECONDS = 30.0
+"""How long after a credited admission the target's RSS must settle before the credit is reconciled.
+
+A credited preload's real RAM growth is only truthful once the load completes and transient churn subsides.
+This grace lets the target reach steady state before the measured-truth check compares its actual growth to
+the charged amount, so the reconciliation reads settled RSS rather than a mid-load spike."""
+
+_REUSE_CREDIT_RECONCILE_SLACK_MB = 2048.0
+"""How far a credited admission's measured RSS growth may exceed its charge before it is flagged too generous.
+
+The measured-truth check on the marginal credit: if a target's settled RSS grew by more than the effective
+charge plus this slack, the credit under-priced the swap and the discrepancy is logged once so the credit
+constants can be retuned against field truth. Slack absorbs ordinary per-job creep and measurement noise so
+only a materially over-generous credit is reported."""
+
+
+@dataclass(frozen=True)
+class _ReuseCreditRecord:
+    """A credited RAM admission awaiting the measured-truth check against its target's settled RSS.
+
+    Records what the marginal credit assumed at admit time so the reconciliation can compare the target's
+    real RSS growth to the effective charge once the load settles. Held per target process; superseded if
+    that slot is credited again before it settles.
+    """
+
+    model: str
+    """The model the credited preload was staging onto the target."""
+    rss_at_admit_mb: float
+    """The target's resident RSS (MB) at admit time, the baseline the settled growth is measured against."""
+    effective_charge_mb: float
+    """The credited charge (MB) the admission priced the swap at; the growth is reconciled against this."""
+    admitted_at: float
+    """Wall-clock time of the credited admission, gating the settle grace before reconciliation."""
+
+
 _PRELOAD_FIRST_REPORT_GRACE_SECONDS = 5.0
 """How long a just-sent preload may still look idle before its first child state report arrives.
 
@@ -322,6 +382,33 @@ a structural wedge, soft-resetting the pools and faulting the perfectly-servable
 sole-process configuration this drops every queued job over a window the worker itself created).
 Covers the respawn + preload window; bounded so a cycle that genuinely never recovers still trips the
 supervisor."""
+
+_HEAD_RAM_DEFER_BARRIER_SECONDS = 60.0
+"""How long the head-of-queue preload may be continuously system-RAM-deferred behind live work before the
+scheduler latches the head-priority dispatch barrier. Below this the head is treated as ordinarily queued: a
+running sibling legitimately holds the memory the head needs, and the RAM branch keeps reclaiming and
+re-asking each cycle. Past it, with reclaim freeing nothing and a sibling still holding memory, the head can
+never reach the no-live-consumer best-effort admit on its own, so the barrier withholds new dispatch to other
+slots and lets the running jobs drain to that escape. Chosen above a normal reclaim-and-retry settle and above
+``_RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a deliberate reclaim cycle is never mistaken for starvation, and short
+enough that a genuinely wedged head is unblocked in seconds rather than only when the horde faults its job."""
+
+_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS = 180.0
+"""How long the head-priority dispatch barrier may hold before the head is declined outright. New dispatch is
+barred while the barrier holds, so the running siblings drain and the head normally admits well inside this
+window; if it still cannot be admitted this long after the barrier engaged (a sibling that never completes, or
+a head that will not fit even as the card empties), the head is faulted for reissue with retryable semantics
+rather than left to rot, and the barrier releases. Three times the engage bound: long enough that draining
+siblings win the race in practice, bounded so a permanently unfittable head fails fast."""
+
+_SAFETY_RECOVERY_HOLD_TTL_SECONDS = 120.0
+"""How long the safety-recovery admission hold may keep new preloads off a saturated card while the safety
+pool crash-loops before it releases. The hold exists to let the card drain so a deferred safety GPU start can
+succeed; if the safety pool still cannot start this long after the hold engaged, holding inference longer only
+starves the card without helping, so the hold releases and logs CRITICAL plus a ledger event to surface the
+stuck condition (the give-up machinery already watches safety-pool health, so this does not re-escalate).
+Chosen above a normal drain-and-respawn window and bounded so a permanently stuck safety pool cannot wedge
+inference intake."""
 
 _SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS = 30.0
 """Minimum cadence for unchanged high-frequency scheduler diagnostics.
@@ -716,6 +803,10 @@ class InferenceScheduler:
         self._vram_budget_defer_notified = False
         self._ram_budget_defer_notified = False
         self._ram_pressure_notified = False
+        # Credited RAM admissions awaiting the measured-truth reconciliation, keyed by target process id.
+        self._pending_reuse_credits: dict[int, _ReuseCreditRecord] = {}
+        # Last credited-admission log key, so an unchanged credited admit is not re-logged (edge-triggered).
+        self._last_credited_admission_key: tuple[int, str | None, int] | None = None
         self._scheduler_diagnostic_log_state = {}
         self._last_preload_admission = None
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
@@ -769,6 +860,33 @@ class InferenceScheduler:
         # live job takes the device.
         self._head_starvation_job_id: str | None = None
         self._head_starvation_since: float = 0.0
+
+        # Head-of-queue RAM-defer starvation clock and the dispatch barrier it latches. The clock tracks the
+        # head job whose preload the system-RAM verdict is continuously deferring behind live work, and when
+        # that defer began; the head-starvation clock above is forced to zero whenever any job is in progress,
+        # so it cannot see this behind-a-busy-sibling case. Once the continuous defer outlives
+        # _HEAD_RAM_DEFER_BARRIER_SECONDS with reclaim freeing nothing, the barrier latches (its job id and
+        # latch time recorded): new inference dispatch to other slots is withheld so the running siblings drain
+        # to the no-live-consumer best-effort admit that seats the head. Both clear on the head's admission,
+        # dispatch, fault, or departure. See _apply_ram_verdict, start_inference, and _reconcile_head_priority_barrier.
+        self._head_ram_defer_job_id: str | None = None
+        self._head_ram_defer_since: float = 0.0
+        self._head_priority_barrier_job_id: str | None = None
+        self._head_priority_barrier_since: float = 0.0
+        self._head_priority_barrier_withhold_logged: bool = False
+
+        # Safety-recovery admission hold. When the safety pool is crash-looping while a safety GPU start stays
+        # deferred on a saturated card, new preload admissions on that card are held and idle reclaim is nudged
+        # so the card can drain and the safety pool can start. Records when the hold engaged (0.0 when inactive)
+        # and whether its engage notice has been emitted, so the edge is announced once. Bounded by
+        # _SAFETY_RECOVERY_HOLD_TTL_SECONDS. See _safety_recovery_hold_active.
+        self._safety_recovery_hold_since: float = 0.0
+        self._safety_recovery_hold_logged: bool = False
+        # Per-episode latch set when the hold gives up at its TTL. While set (and the crash-loop condition
+        # still persists) the hold does not re-engage or re-log, so a stuck safety pool admits normally rather
+        # than re-holding one preload per TTL window forever. Cleared by _release_safety_recovery_hold once the
+        # condition clears, so a later recurrence is a fresh episode that may hold and expire again.
+        self._safety_recovery_hold_expired: bool = False
 
         # Dispatch-stall diagnostic throttle. When the queue has work but nothing dispatches, the scheduler
         # would otherwise return None silently; this records the last reason logged and when, so the
@@ -4609,12 +4727,40 @@ class InferenceScheduler:
 
         return expired
 
-    def _replace_stale_ram_unload_process(self) -> bool:
-        """Cycle an idle inference process that did not actually release RAM after a RAM-unload request."""
+    def _replace_stale_ram_unload_process(self, *, protect_process_id: int | None = None) -> bool:
+        """Cycle an idle inference process to return retained RAM to the OS; return whether one was cycled.
+
+        Two triggers, in priority order:
+
+        - Creep containment: any idle inference slot whose RSS exceeds :data:`_CREEP_CONTAINMENT_RSS_BYTES` is
+          cycled regardless of its unload state or resident model. A child creeps ~400MB/job and cycling is the
+          only containment; RSS this high is leak, not clean reusable pages, so this override even cycles the
+          protected staging target (reusing a crept slot would only perpetuate the leak).
+        - Stale-unload reclaim (the RAM-verdict last resort): a model-less idle slot that did not actually
+          release RAM after an ``UNLOAD_MODELS_FROM_RAM`` request. ``protect_process_id`` spares one slot here,
+          the current head's staging target, so the reclaim does not destroy the retained pages the marginal
+          RAM credit priced the head's preload against (which would force the very cold load the credit avoids).
+
+        Creep victims are preferred over stale victims so an unbounded leak is contained ahead of an ordinary
+        retained-page reclaim.
+        """
+        creep_victim: HordeProcessInfo | None = None
+        stale_victim: HordeProcessInfo | None = None
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
             if process_info.is_process_busy():
+                continue
+            # A slot the admission pipeline just routed a preload onto is mid-stage: reaping it would fault the
+            # head's load. Spared from both triggers, exactly as the stale-unload path spares a non-UNLOAD flag.
+            if process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL:
+                continue
+            if creep_victim is None and process_info.ram_usage_bytes >= _CREEP_CONTAINMENT_RSS_BYTES:
+                creep_victim = process_info
+                continue
+            if stale_victim is not None:
+                continue
+            if process_info.process_id == protect_process_id:
                 continue
             if process_info.loaded_horde_model_name is not None:
                 continue
@@ -4622,25 +4768,37 @@ class InferenceScheduler:
                 continue
             if process_info.ram_usage_bytes < _STALE_RAM_UNLOAD_REPLACE_BYTES:
                 continue
+            stale_victim = process_info
 
+        victim = creep_victim if creep_victim is not None else stale_victim
+        if victim is None:
+            return False
+
+        if creep_victim is not None:
             logger.warning(
-                f"Idle process {process_info.process_id} still holds {process_info.ram_usage_bytes} bytes "
+                f"Idle process {victim.process_id} holds {victim.ram_usage_bytes} bytes "
+                "(above the creep-containment ceiling); cycling it to return the crept RAM to the OS.",
+            )
+        else:
+            logger.warning(
+                f"Idle process {victim.process_id} still holds {victim.ram_usage_bytes} bytes "
                 "after a RAM unload (the allocator retains the freed model's pages); cycling it to return "
                 "the RAM to the OS.",
             )
-            # A deliberate reclaim of a healthy idle slot, not a crash/hang: keep it out of the crash
-            # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
-            # quarantine a perfectly healthy slot.
-            self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
-            # Open the bounded reclaim-cycle grace: the slot now respawns and the next head must preload
-            # onto it, a window in which the queue is unservable by the worker's own deliberate action, not
-            # a wedge. ram_reclaim_cycle_grace_active() reads this so the recovery supervisor does not
-            # soft-reset the pools and fault the servable backlog mid-reclaim.
-            self._ram_reclaim_cycle_at = time.time()
-            self._record_churn("process_cycle")
-            return True
-
-        return False
+        # A deliberate reclaim of a healthy idle slot, not a crash/hang: keep it out of the crash
+        # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
+        # quarantine a perfectly healthy slot.
+        self._process_lifecycle._replace_inference_process(victim, intentional_reclaim=True)
+        # A cycled slot's pending reuse credit is void: its successor cold-loads, so the recorded swap will
+        # never settle and must not be reconciled against the fresh process.
+        self._pending_reuse_credits.pop(victim.process_id, None)
+        # Open the bounded reclaim-cycle grace: the slot now respawns and the next head must preload
+        # onto it, a window in which the queue is unservable by the worker's own deliberate action, not
+        # a wedge. ram_reclaim_cycle_grace_active() reads this so the recovery supervisor does not
+        # soft-reset the pools and fault the servable backlog mid-reclaim.
+        self._ram_reclaim_cycle_at = time.time()
+        self._record_churn("process_cycle")
+        return True
 
     def _preload_blocked_by_ram_pressure(self, job: ImageGenerateJobPopResponse) -> bool:
         """Return whether the host's absolute RAM danger floor forces this preload to defer.
@@ -4892,31 +5050,132 @@ class InferenceScheduler:
             return
         self.unload_models(under_pressure=True, for_head_of_queue=True)
 
+    def _staging_reuse_credit_mb(self, target: HordeProcessInfo) -> float:
+        """The retained, reusable resident RSS (MB) a preload onto ``target`` can reuse instead of allocating.
+
+        An idle inference slot keeps the freed model's pages resident after an unload (its RSS stays above a
+        fresh child's baseline); a preload onto it reuses those pages, so its real system-RAM growth is a
+        fraction of a cold load. This returns the retained excess over :data:`_FRESH_INFERENCE_CHILD_BASELINE_MB`
+        that the marginal RAM credit is computed from. A busy target's pages are in live use and are not
+        reusable, so it earns no credit; a fresh slot (RSS at baseline) yields zero, collapsing the verdict to
+        the ordinary full charge.
+        """
+        if target.is_process_busy():
+            return 0.0
+        target_rss_mb = max(0, target.ram_usage_bytes) / (1024 * 1024)
+        return max(0.0, target_rss_mb - _FRESH_INFERENCE_CHILD_BASELINE_MB)
+
+    def _ram_danger_floor_mb(self) -> float:
+        """The absolute available-RAM danger floor (MB) below which the host must degrade rather than load.
+
+        The same floor the whole-host RAM-pressure governor uses, read here so the marginal RAM credit never
+        credits a preload into a floor breach (see :meth:`_apply_ram_verdict`).
+        """
+        pause_pct, min_free_mb = self._ram_pressure_floor_config()
+        return ram_pressure_floor_mb(
+            self._measured_total_ram_mb(),
+            pause_percent=pause_pct,
+            min_free_mb=min_free_mb,
+        )
+
+    def _note_credited_admission(
+        self,
+        job: ImageGenerateJobPopResponse,
+        target: HordeProcessInfo,
+        verdict: BudgetVerdict,
+    ) -> None:
+        """Log a credited RAM admission (edge-triggered) and record it for the measured-truth reconciliation.
+
+        Emitted once per distinct credited admission (target, model, rounded charge) so the sub-second loop
+        cannot spam an unchanged decision. The record lets :meth:`_reconcile_reuse_credit` later compare the
+        target's settled RSS growth to the charge the credit priced the swap at.
+        """
+        retained_mb = self._staging_reuse_credit_mb(target)
+        charge_key = int(verdict.predicted_mb) if verdict.predicted_mb is not None else 0
+        key = (target.process_id, job.model, charge_key)
+        if key != self._last_credited_admission_key:
+            uncredited = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
+            logger.opt(ansi=True).info(
+                f"<fg #8fd6a0>RAM credit admitting preload of {job.model} onto process {target.process_id}: "
+                f"predicted ~{uncredited:.0f} MB, credit {verdict.reusable_credit_mb:.0f} MB "
+                f"(retained reusable {retained_mb:.0f} MB), effective charge ~{charge_key:.0f} MB.</>",
+            )
+            self._last_credited_admission_key = key
+        if job.model is not None:
+            self._pending_reuse_credits[target.process_id] = _ReuseCreditRecord(
+                model=job.model,
+                rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
+                effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
+                admitted_at=time.time(),
+            )
+
+    def _reconcile_reuse_credit(self) -> None:
+        """Compare each settled credited admission's real RSS growth to its charge (the measured-truth check).
+
+        Once a credited target has settled past :data:`_REUSE_CREDIT_RECONCILE_SETTLE_SECONDS` with the staged
+        model resident, its measured RSS growth is known. Growth exceeding the charge by more than
+        :data:`_REUSE_CREDIT_RECONCILE_SLACK_MB` means the credit was too generous (the retained pages were not
+        as reusable as assumed); log it once so the credit constants can be retuned. Records for vanished or
+        re-tasked slots are dropped so the map does not accumulate.
+        """
+        now = time.time()
+        for process_id, record in list(self._pending_reuse_credits.items()):
+            process_info = self._process_map.get(process_id)
+            if process_info is None:
+                del self._pending_reuse_credits[process_id]
+                continue
+            settled = (
+                now - record.admitted_at >= _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+                and process_info.loaded_horde_model_name == record.model
+                and not process_info.is_process_busy()
+            )
+            if not settled:
+                continue
+            del self._pending_reuse_credits[process_id]
+            growth_mb = max(0, process_info.ram_usage_bytes) / (1024 * 1024) - record.rss_at_admit_mb
+            if growth_mb > record.effective_charge_mb + _REUSE_CREDIT_RECONCILE_SLACK_MB:
+                logger.opt(ansi=True).warning(
+                    f"<fg #f0beff>RAM reuse credit for {record.model} on process {process_id} was too generous: "
+                    f"measured RSS grew ~{growth_mb:.0f} MB against an effective charge of "
+                    f"~{record.effective_charge_mb:.0f} MB; the retained pages were less reusable than priced.</>",
+                )
+
     def _apply_ram_verdict(
         self,
         job: ImageGenerateJobPopResponse,
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        available_process: HordeProcessInfo,
         *,
         is_head_blocker: bool,
         no_live_resource_consumer: bool,
     ) -> bool:
         """Apply the system-RAM budget verdict for a preload: reclaim idle RAM or best-effort admit.
 
-        When the predicted RAM cost fits, returns True immediately. Otherwise runs the reclaim attempts
-        (gentle eviction, escalated for the head, then cycling an allocator-stuck idle slot) and
-        dispatches on
+        When the predicted RAM cost fits, returns True immediately. The charge is credited for a reusable
+        staging target: an idle ``available_process`` that retains its unloaded model's pages (or swaps a model
+        in place) reuses those pages, so the verdict prices the swap at its marginal growth rather than a full
+        cold load (see :meth:`_staging_reuse_credit_mb` and :meth:`RamBudget.check_job`). The credit is gated on
+        the host RAM danger floor so it never admits into a floor breach. Otherwise runs the reclaim attempts
+        (gentle eviction, escalated for the head, then cycling an allocator-stuck idle slot that is *not* this
+        target) and dispatches on
         [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome]:
         reclaim progress is always worth waiting for, and only a head-of-queue blocker with no live job
         holding memory is admitted best-effort once nothing more can be reclaimed.
         """
+        self._reconcile_reuse_credit()
         ram_verdict = self._ram_budget.check_job(
             job,
             baseline,
             self._measured_available_ram_mb(),
             committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
+            reusable_credit_mb=self._staging_reuse_credit_mb(available_process),
+            danger_floor_mb=self._ram_danger_floor_mb(),
         )
         if ram_verdict.fits:
             self._ram_budget_defer_notified = False
+            if ram_verdict.reusable_credit_mb > 0.0:
+                self._note_credited_admission(job, available_process, ram_verdict)
+            self._resolve_head_ram_defer(job, reason="admitted")
             return True
 
         if not self._ram_budget_defer_notified:
@@ -4930,7 +5189,14 @@ class InferenceScheduler:
             # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a queued
             # model's RAM before falling back to cycling an allocator-stuck idle slot.
             reclaimed = self.unload_models(under_pressure=True, for_head_of_queue=True)
-        cycled = False if reclaimed else self._replace_stale_ram_unload_process()
+        # Spare the staging target from the cycle: its retained pages are the reuse the credited verdict
+        # priced against, and cycling it would force the very cold load the credit exists to avoid. A
+        # genuinely crept slot is still cycled by the creep-containment override inside the callee.
+        cycled = (
+            False
+            if reclaimed
+            else self._replace_stale_ram_unload_process(protect_process_id=available_process.process_id)
+        )
 
         outcome = decide_ram_reclaim_outcome(
             reclaimed=reclaimed,
@@ -4939,6 +5205,8 @@ class InferenceScheduler:
             no_live_resource_consumer=no_live_resource_consumer,
         )
         if outcome is RamReclaimOutcome.DEFER:
+            if is_head_blocker:
+                self._govern_head_ram_defer(job, made_reclaim_progress=reclaimed or cycled)
             return False
 
         logger.opt(ansi=True).warning(
@@ -4946,7 +5214,247 @@ class InferenceScheduler:
             "reclaiming all idle RAM, and no live job holds memory; admitting it best-effort "
             "rather than wedging the queue.</>",
         )
+        self._resolve_head_ram_defer(job, reason="admitted best-effort")
         return True
+
+    def _govern_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, made_reclaim_progress: bool) -> None:
+        """Advance the head RAM-defer starvation clock and latch or hard-cap the head-priority barrier.
+
+        Reached only when the head-of-queue preload cannot fit system RAM and the RAM branch resolved to defer
+        while a live job still holds memory (with no live consumer the caller best-effort admits instead, so
+        the head never starves there). The continuous-defer clock starts at this head's first such defer and
+        restarts on reclaim progress or a change of head, since only a head that keeps deferring with nothing
+        freed is starving. Once the clock outlives ``_HEAD_RAM_DEFER_BARRIER_SECONDS`` the dispatch barrier
+        latches so the running siblings drain to the best-effort escape; a barrier that has held past
+        ``_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS`` without admitting the head declines it for reissue. The barrier
+        is suppressed while a deliberate RAM-reclaim process cycle is still inside its bounded grace, so an
+        actively-resolving defer is never mistaken for starvation.
+        """
+        now = time.time()
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+
+        if made_reclaim_progress or job_id != self._head_ram_defer_job_id:
+            self._head_ram_defer_job_id = job_id
+            self._head_ram_defer_since = now
+            if made_reclaim_progress and self._head_priority_barrier_job_id == job_id:
+                self._release_head_priority_barrier(reason="reclaim progress")
+            return
+
+        if (
+            self._head_priority_barrier_job_id == job_id
+            and (now - self._head_priority_barrier_since) >= _HEAD_RAM_DEFER_BARRIER_CAP_SECONDS
+        ):
+            self._decline_head_priority_barrier(job)
+            return
+
+        if (
+            now - self._head_ram_defer_since
+        ) < _HEAD_RAM_DEFER_BARRIER_SECONDS or self.ram_reclaim_cycle_grace_active():
+            return
+
+        self._engage_head_priority_barrier(job)
+
+    def _resolve_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, reason: str) -> None:
+        """Clear the RAM-defer clock and release the barrier once this head's preload is admitted."""
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        if job_id == self._head_ram_defer_job_id:
+            self._head_ram_defer_job_id = None
+            self._head_ram_defer_since = 0.0
+        if job_id == self._head_priority_barrier_job_id:
+            self._release_head_priority_barrier(reason=reason)
+
+    def _engage_head_priority_barrier(self, job: ImageGenerateJobPopResponse) -> None:
+        """Latch the head-priority dispatch barrier for a starved head (edge-triggered).
+
+        While latched, :meth:`start_inference` withholds new dispatch to every slot but the head's own, so the
+        running jobs drain to the no-live-consumer best-effort admit that finally seats the head.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None or self._head_priority_barrier_job_id == job_id:
+            return
+        self._head_priority_barrier_job_id = job_id
+        self._head_priority_barrier_since = time.time()
+        self._head_priority_barrier_withhold_logged = False
+        logger.opt(ansi=True).warning(
+            f"<fg #f0beff>Head-of-queue model {job.model} has been RAM-deferred behind live work for over "
+            f"{_HEAD_RAM_DEFER_BARRIER_SECONDS:.0f}s with reclaim freeing nothing; withholding new dispatch to "
+            "other slots so the running jobs drain and the head can load.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.HEAD_PRIORITY_BARRIER_ENGAGED,
+            job_id=job_id,
+            reason="head RAM-deferred behind live work past the starvation bound",
+            detail={"model": job.model},
+        )
+
+    def _release_head_priority_barrier(self, *, reason: str) -> None:
+        """Release the head-priority dispatch barrier (edge-triggered) so normal dispatch resumes."""
+        released_id = self._head_priority_barrier_job_id
+        if released_id is None:
+            return
+        self._head_priority_barrier_job_id = None
+        self._head_priority_barrier_since = 0.0
+        self._head_priority_barrier_withhold_logged = False
+        logger.opt(ansi=True).info(
+            f"<fg #f0beff>Head-priority dispatch barrier released ({reason}); resuming normal dispatch.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.HEAD_PRIORITY_BARRIER_RELEASED,
+            job_id=released_id,
+            reason=reason,
+        )
+
+    def _decline_head_priority_barrier(self, job: ImageGenerateJobPopResponse) -> None:
+        """Fault a head the barrier could not unblock within the cap, then release the barrier.
+
+        The fault is retryable and resource-classed through the existing job fault machinery so the horde
+        reissues the job promptly, the least-destructive terminal path: no model quarantine and no ceiling
+        hold, because the block is transient host-RAM pressure behind live work, not an unroutable model.
+        """
+        logger.opt(ansi=True).warning(
+            f"<fg #f0beff>Head-of-queue model {job.model} could not be admitted within "
+            f"{_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding the dispatch barrier; faulting it for "
+            "reissue and releasing the barrier.</>",
+        )
+        self._job_tracker.handle_job_fault_now(
+            job,
+            is_resource_failure=True,
+            retryable=True,
+            fault_reason=(
+                f"head-of-queue preload could not fit system RAM within "
+                f"{_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding new dispatch; reissuing"
+            ),
+            fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY,
+        )
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is not None and job_id == self._head_ram_defer_job_id:
+            self._head_ram_defer_job_id = None
+            self._head_ram_defer_since = 0.0
+        self._release_head_priority_barrier(reason="hard-cap decline")
+
+    def _reconcile_head_priority_barrier(self, head_job: ImageGenerateJobPopResponse | None) -> None:
+        """Clear the RAM-defer clock and release the barrier when their head is no longer the queue front.
+
+        A head that dispatched, faulted, or was cancelled by the horde is no longer at the front, so its
+        barrier must not outlive it and hold dispatch for a job that has departed.
+        """
+        head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
+        if self._head_ram_defer_job_id is not None and self._head_ram_defer_job_id != head_id:
+            self._head_ram_defer_job_id = None
+            self._head_ram_defer_since = 0.0
+        if self._head_priority_barrier_job_id is not None and self._head_priority_barrier_job_id != head_id:
+            self._release_head_priority_barrier(reason="head departed")
+
+    def _head_priority_barrier_withholds_dispatch(self, next_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether the barrier withholds dispatching ``next_job`` so running siblings drain for the head.
+
+        The barred head keeps its own path to dispatch; every other job is withheld so the card drains to the
+        no-live-consumer best-effort admit that seats the head. Inert (returns False) when no barrier is held.
+        """
+        if self._head_priority_barrier_job_id is None:
+            return False
+        job_id = str(next_job.id_) if next_job.id_ is not None else None
+        return job_id != self._head_priority_barrier_job_id
+
+    def _safety_recovery_hold_active(self, target_device_index: int | None) -> bool:
+        """Whether a crash-looping safety pool on a saturated card is holding new preload admissions here.
+
+        Engages (edge-triggered) when the safety pool is crash-looping and a safety GPU start is deferred for
+        want of device headroom, for a preload that would land on the same card as that deferred start (a
+        single-GPU worker holds worker-wide). While held it nudges idle reclaim toward the card so it can drain
+        and the safety pool can start. Releases when the safety pool starts or its crash-loop signal clears, or
+        when the hold outlives ``_SAFETY_RECOVERY_HOLD_TTL_SECONDS`` (logged CRITICAL so a stuck safety pool is
+        loud). A TTL expiry latches the episode: the hold does not re-engage while the same condition persists,
+        so a permanently stuck safety pool no longer re-holds one preload per TTL window forever; it may hold
+        again only once the condition clears and a fresh episode arises. The lifecycle reads are
+        ``is True``-guarded so a mocked lifecycle never trips the hold.
+        """
+        failing = self._process_lifecycle.safety_pool_failing is True
+        pending = self._process_lifecycle.has_pending_safety_starts() is True
+        if not (failing and pending):
+            self._release_safety_recovery_hold(reason="safety pool started or recovered")
+            return False
+
+        if (
+            target_device_index is not None
+            and target_device_index not in self._process_lifecycle.pending_safety_start_device_indices()
+        ):
+            return False
+
+        if self._safety_recovery_hold_expired:
+            # The TTL already gave up on this episode; do not re-hold or re-log while the same condition
+            # persists. A fresh episode is possible only after the condition clears (the release path runs).
+            return False
+
+        now = time.time()
+        if self._safety_recovery_hold_since == 0.0:
+            self._safety_recovery_hold_since = now
+            self._engage_safety_recovery_hold(target_device_index)
+
+        if (now - self._safety_recovery_hold_since) >= _SAFETY_RECOVERY_HOLD_TTL_SECONDS:
+            self._expire_safety_recovery_hold(target_device_index)
+            return False
+        return True
+
+    def _engage_safety_recovery_hold(self, target_device_index: int | None) -> None:
+        """Announce the safety-recovery admission hold once and nudge idle reclaim so the card can drain."""
+        self._safety_recovery_hold_logged = True
+        logger.opt(ansi=True).warning(
+            "<fg #f0beff>Safety pool is crash-looping while its GPU start is deferred on a saturated card; "
+            "holding new inference preloads and reclaiming idle VRAM so the card can drain for safety.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.SAFETY_RECOVERY_HOLD_ENGAGED,
+            reason="safety pool crash-looping with a deferred GPU start on a saturated card",
+            detail={"device_index": target_device_index},
+        )
+        self.unload_models(under_pressure=True)
+
+    def _release_safety_recovery_hold(self, *, reason: str) -> None:
+        """Release the safety-recovery admission hold (edge-triggered) when safety can proceed.
+
+        Also clears the per-episode expiry latch: once the crash-loop condition has cleared, a later
+        recurrence is a fresh episode that may hold and expire again. A hold that had already given up at its
+        TTL emits no second release notice (the expiry already logged one), so the edge stays single.
+        """
+        was_engaged = self._safety_recovery_hold_since != 0.0 or self._safety_recovery_hold_logged
+        self._safety_recovery_hold_since = 0.0
+        self._safety_recovery_hold_logged = False
+        self._safety_recovery_hold_expired = False
+        if not was_engaged:
+            return
+        logger.opt(ansi=True).info(
+            f"<fg #f0beff>Safety-recovery admission hold released ({reason}); resuming inference preloads.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED,
+            reason=reason,
+        )
+
+    def _expire_safety_recovery_hold(self, target_device_index: int | None) -> None:
+        """Release the safety-recovery hold at its TTL and latch the episode, logging CRITICAL once.
+
+        The latch keeps the hold from re-engaging while the same crash-loop condition persists, so inference is
+        not re-held one preload per TTL window; :meth:`_release_safety_recovery_hold` clears it when the
+        condition finally clears.
+        """
+        self._safety_recovery_hold_since = 0.0
+        self._safety_recovery_hold_logged = False
+        self._safety_recovery_hold_expired = True
+        logger.opt(ansi=True).critical(
+            "<fg #ff5f5f>Safety pool still cannot start "
+            f"{_SAFETY_RECOVERY_HOLD_TTL_SECONDS:.0f}s after the safety-recovery admission hold engaged; "
+            "releasing the hold so inference is not starved. The safety pool needs operator attention.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED,
+            reason="ttl expired: safety pool still not started",
+            detail={"device_index": target_device_index},
+        )
 
     def _admit_preload_under_budget(
         self,
@@ -4978,6 +5486,12 @@ class InferenceScheduler:
             no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
         else:
             no_live_resource_consumer = len(self._jobs_in_progress_on_card(target_device_index)) == 0
+
+        # Yield the card to a crash-looping safety pool whose GPU start is deferred for want of headroom on it:
+        # holding new inference off the card (and nudging idle reclaim toward it) is the only way the card
+        # drains enough for the safety pool to come up. Held whatever the arbiter's own verdict would be.
+        if self._safety_recovery_hold_active(target_device_index):
+            return False
 
         forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
         # Trace the forecast for every budget-gated load so the logs show the residency dynamics, not just the
@@ -5055,6 +5569,7 @@ class InferenceScheduler:
             return self._apply_ram_verdict(
                 job,
                 baseline,
+                available_process,
                 is_head_blocker=is_head_blocker,
                 no_live_resource_consumer=no_live_resource_consumer,
             )
@@ -5270,6 +5785,10 @@ class InferenceScheduler:
         process's own reservation materialises the activation, and drops by omission once the job leaves the
         in-progress set (finalised, faulted, or process-dead). An unpriceable job reserves nothing rather than
         pinning the overlay at a fabricated figure.
+
+        The full charge is priced sampler-only for a disaggregation-class-eligible job (its weights load and
+        decode run off the sampling process), matching how every other measured-admission site prices the same
+        job, so the upgrade never over-books a disaggregated job's peak at the monolithic whole-job figure.
         """
         if job.id_ is None:
             return
@@ -5280,7 +5799,7 @@ class InferenceScheduler:
                 job,
                 baseline,
                 process_id=process_info.process_id,
-                disaggregated=False,
+                disaggregated=self._is_disaggregation_class_eligible(job),
             )
         self._reserve_ledger.set_planned(
             DISPATCH_ADMISSION_FLOW,
@@ -5914,6 +6433,7 @@ class InferenceScheduler:
             None,
         )
         self._update_head_starvation_timer(head_job)
+        self._reconcile_head_priority_barrier(head_job)
         if self._resident_head_should_dispatch_before_preload(head_job):
             return False
 
@@ -7083,12 +7603,28 @@ class InferenceScheduler:
             return None
         return self._device_free_mb_provider(0 if device_index is None else device_index)
 
+    def _pp_overlap_margin_mb(self, next_job: ImageGenerateJobPopResponse) -> float:
+        """Return the co-residency measured second-say margin (MB) that applies to this candidate job.
+
+        Defaults to :data:`_PP_OVERLAP_MEASURED_MARGIN_MB`. A disaggregation-class-eligible job holds only its
+        UNet-only sampler peak, so its true overlap headroom differs from a monolithic dispatch; when the
+        operator has set ``pp_overlap_margin_mb_disaggregated`` to a real number and this job is class-eligible,
+        that override is used in its place. The setting is read with explicit None/float coercion (never bare
+        truthiness), so a partially-mocked or unset config falls back to the default. Monolithic-path jobs
+        always use the default regardless of the setting.
+        """
+        override_mb = config_number(self._runtime_config.bridge_data.pp_overlap_margin_mb_disaggregated)
+        if override_mb is not None and self._is_disaggregation_class_eligible(next_job):
+            return override_mb
+        return _PP_OVERLAP_MEASURED_MARGIN_MB
+
     def _pp_overlap_measured_admits(
         self,
         *,
         sampling_peak_mb: float | None,
         pending_pp_reserve_mb: float,
         device_index: int | None,
+        margin_mb: float,
     ) -> bool:
         """Whether measured device truth admits a sampling/post-processing overlap the static gate withheld.
 
@@ -7096,8 +7632,8 @@ class InferenceScheduler:
         card's reported total) has said the two cannot share the card. The measured device-free reading
         already reflects an active chain's real allocations, so it is a more accurate second admission path
         than the ledger's worst-case reserve. It admits when the measured free, net of the reserve, the
-        sampling peak, and any not-yet-allocated pending chain's predicted reserve, clears
-        :data:`_PP_OVERLAP_MEASURED_MARGIN_MB`.
+        sampling peak, and any not-yet-allocated pending chain's predicted reserve, clears ``margin_mb`` (the
+        default :data:`_PP_OVERLAP_MEASURED_MARGIN_MB`, or the disaggregation override the caller resolved).
 
         The path is unavailable (returns False, so the static fence stands) whenever the driver is
         demand-paging (its free figure is then untrustworthy, the exact regime the static gate guards), the
@@ -7113,7 +7649,7 @@ class InferenceScheduler:
         if device_free_mb is None:
             return False
         headroom_mb = device_free_mb - self._vram_budget.reserve_mb - sampling_peak_mb - pending_pp_reserve_mb
-        return headroom_mb >= _PP_OVERLAP_MEASURED_MARGIN_MB
+        return headroom_mb >= margin_mb
 
     def _resolve_pp_coresidency_hold(
         self,
@@ -7137,10 +7673,12 @@ class InferenceScheduler:
             self._pp_mutex_measured_admit_logged = False
             return False
 
+        margin_mb = self._pp_overlap_margin_mb(next_job)
         if self._pp_overlap_measured_admits(
             sampling_peak_mb=sampling_peak_mb,
             pending_pp_reserve_mb=pending_pp_reserve_mb,
             device_index=device_index,
+            margin_mb=margin_mb,
         ):
             if not self._pp_mutex_measured_admit_logged:
                 self._pp_mutex_measured_admit_logged = True
@@ -7150,7 +7688,7 @@ class InferenceScheduler:
                     f"co-residency held: {device_free_mb:.0f}MB free, {self._vram_budget.reserve_mb:.0f}MB "
                     f"reserve, {(sampling_peak_mb or 0.0):.0f}MB sampling peak, "
                     f"{pending_pp_reserve_mb:.0f}MB pending chain reserve, "
-                    f"{_PP_OVERLAP_MEASURED_MARGIN_MB:.0f}MB margin.",
+                    f"{margin_mb:.0f}MB margin.",
                 )
             self._pp_mutex_hold_logged = False
             return False
@@ -7158,7 +7696,7 @@ class InferenceScheduler:
         self._pp_mutex_measured_admit_logged = False
         if not self._pp_mutex_hold_logged:
             self._pp_mutex_hold_logged = True
-            logger.info(static_hold_message)
+            logger.info(f"{static_hold_message} (measured second-say margin {margin_mb:.0f}MB)")
         return True
 
     def _should_defer_dispatch_for_post_processing(
@@ -7924,6 +8462,18 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
+
+        if self._head_priority_barrier_withholds_dispatch(next_job):
+            # A starved head has latched the head-priority barrier: withhold every dispatch but the head's own
+            # so the running jobs drain and the head reaches its best-effort admit. The head keeps its queue
+            # position and dispatches the moment the barrier releases.
+            if not self._head_priority_barrier_withhold_logged:
+                logger.opt(ansi=True).info(
+                    f"<fg #7b7d7d><i>Holding dispatch of job {str(next_job.id_)[:8]} behind the head-priority "
+                    "barrier so running jobs drain for the starved head.</i></>",
+                )
+                self._head_priority_barrier_withhold_logged = True
+            return False
 
         if next_job_and_process.line_skip is None and self._job_requires_aux_preparation(next_job):
             # An unprepared aux job is not dispatchable: it holds no lane and no VRAM reservation while the

@@ -46,6 +46,12 @@ class LedgerEventType(enum.StrEnum):
     GOVERNANCE_RESET = "governance_reset"
     POP_PAUSE_ARMED = "pop_pause_armed"
     POP_PAUSE_LAPSED = "pop_pause_lapsed"
+    HEAD_PRIORITY_BARRIER_ENGAGED = "head_priority_barrier_engaged"
+    HEAD_PRIORITY_BARRIER_RELEASED = "head_priority_barrier_released"
+    SAFETY_RECOVERY_HOLD_ENGAGED = "safety_recovery_hold_engaged"
+    SAFETY_RECOVERY_HOLD_RELEASED = "safety_recovery_hold_released"
+    RESIDENCY_ADVERTISING_NARROWED = "residency_advertising_narrowed"
+    RESIDENCY_ADVERTISING_RELEASED = "residency_advertising_released"
 
 
 class LedgerEvent(BaseModel):
