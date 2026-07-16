@@ -1230,6 +1230,10 @@ class HordeWorkerProcessManager:
             state=self._state,
             aux_hold_provider=self._aux_prefetch_coordinator.job_ids_with_live_deadlines,
         )
+        # A shared child-to-parent channel that has wedged a physical read (a torn frame, a stalled writer
+        # lock) is unrecoverable in place because every child inherits the same queue; the only correct
+        # terminal is a loud abort and restart onto a fresh channel.
+        self._message_dispatcher.set_channel_corruption_handler(lambda reason: self._abort())
 
         self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
 
@@ -1520,6 +1524,7 @@ class HordeWorkerProcessManager:
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             admission_baseline_provider=self.latest_baseline_estimate_mb,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
+            action_ledger=self._action_ledger,
             post_processing_lane_commitments_provider=lambda: getattr(
                 getattr(self, "_alchemy_coordinator", None),
                 "num_graph_forms_waiting_or_running",
@@ -3198,6 +3203,9 @@ class HordeWorkerProcessManager:
                 logger.info("Clearing cached worker-details maintenance: a new job was popped successfully.")
                 self._worker_details_maintenance = False
             self.detect_deadlock()
+            # A drain read wedged past its threshold with backlog present is a corrupt shared channel: the
+            # dispatcher logs it and escalates to a terminal restart, since no in-place recovery can clear it.
+            self._message_dispatcher.check_message_channel_health()
 
             if len(self._job_tracker.jobs_pending_safety_check) > 0:
                 await self.start_evaluate_safety()
