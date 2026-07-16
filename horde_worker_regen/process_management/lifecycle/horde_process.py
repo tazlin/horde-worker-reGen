@@ -289,6 +289,12 @@ class HordeProcess(abc.ABC):
                 # Parent gone / pipe closed: ask the main loop to exit, then stop draining.
                 self._end_process = True
                 return
+            # Quiesce the side-thread status writer the instant an end is requested, even while the main loop
+            # is still busy mid-operation and has not yet drained the inbox. That closes the window in which the
+            # memory reporter keeps putting onto the shared status queue right up to a kill, where a put caught
+            # mid-frame is what leaves a torn frame on the queue the whole process tree shares.
+            if isinstance(message, HordeControlMessage) and message.control_flag == HordeControlFlag.END_PROCESS:
+                self._memory_reporter_stop.set()
             self._control_inbox.put(message)
 
     def _start_memory_reporter_thread(self) -> None:

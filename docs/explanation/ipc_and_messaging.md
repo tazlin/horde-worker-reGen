@@ -9,6 +9,7 @@
     - [Model load states](#model-load-states)
     - [The optimistic-send pattern](#the-optimistic-send-pattern)
     - [Discarding stale messages](#discarding-stale-messages)
+    - [Bounded off-thread drain](#bounded-off-thread-drain)
     - [See also](#see-also)
 
 The worker's parent process and its children communicate through a two-channel
@@ -25,7 +26,9 @@ optimistic-send pattern is essential for debugging state drift between parent an
 The parent sends **control messages** (`HordeControlMessage` subclasses) over
 each child's dedicated pipe. All children send **status messages**
 (`HordeProcessMessage` subclasses) into the same shared queue. The
-`MessageDispatcher` drains this queue twice per control-loop iteration.
+`MessageDispatcher` drains this queue each control-loop iteration, through a
+dedicated reader thread so a read that cannot return never freezes the loop (see
+[Bounded off-thread drain](#bounded-off-thread-drain)).
 
 ## Message type hierarchy
 
@@ -184,6 +187,39 @@ When the discarded message is an inference *result*, the job it belonged to woul
 be left marked in-progress with no completion signal. That case is not silently
 lost: it is recovered by the
 [orphaned-job backstops](resilience_and_recovery.md#stranded-in-progress-jobs).
+
+## Bounded off-thread drain
+
+The shared child-to-parent queue is drained on a dedicated daemon reader thread,
+not directly on the control loop. The parent runs one asyncio control loop on one
+thread; if that thread performed the physical queue reads, a read that cannot
+return would freeze deadlock detection, the recovery supervisor, and even
+signal-driven shutdown. A read can fail to return even though the queue's readable
+poll said a frame was present: a writer killed mid-put (an inference-slot end, a
+soft-reset pool rebuild, the shutdown sweep) can leave a torn length-prefixed frame
+whose body never arrives, and can die holding the queue's shared writer lock.
+
+Each control-loop tick asks the reader to drain the current backlog, waits a
+bounded time for it to report the queue drained, then handles everything buffered
+so far **on the loop thread** (all process-map, model-map, and job-tracker mutation
+stays single-threaded, exactly as before). Only the raw read moved off-thread. A
+read still in flight when the bound elapses simply leaves its remaining messages
+for the next tick, in order, so the loop stays live and no message is lost or
+reordered.
+
+A read that stays stuck past a threshold while the queue still reports a backlog is
+a **corrupt shared channel**, which cannot be repaired in place because every child
+inherits the same queue. The dispatcher's health check (run from the same
+maintenance point as deadlock detection) logs this at `CRITICAL` and escalates once
+through the worker's terminal abort/restart machinery, the correct response to an
+unrecoverable channel rather than a silent hang.
+
+To make torn frames rarer in the first place, ends give a busy child more grace to
+exit cleanly before it is killed: a single slot end waits several seconds (not
+shutdown), and a soft-reset pool rebuild signals every victim to end first, then
+reaps them in parallel under one shared budget. A child also stops its side-thread
+status writer the instant it sees an end request, closing the window in which a
+report could be caught mid-put by a kill.
 
 ## See also
 

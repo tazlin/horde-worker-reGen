@@ -3,7 +3,9 @@ from __future__ import annotations
 import enum
 import queue
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from multiprocessing import Queue
@@ -201,6 +203,22 @@ class MessageDispatcher:
     wedge persists. The recurring "still detected" branches run every control-loop tick, so without this
     throttle a sustained wedge floods the log with thousands of identical dumps."""
 
+    _READER_TICK_DRAIN_BUDGET_SECONDS = 0.5
+    """Longest a single control-loop drain tick waits for the reader thread to quiesce (report the queue
+    drained, or block on a read that cannot return) before it handles what has buffered so far and returns.
+    A healthy drain of a handful of frames quiesces in well under a millisecond, so the bound only takes
+    effect when a physical read cannot complete: there it keeps the single control-loop thread live rather
+    than letting the read freeze deadlock detection, the recovery supervisor, and shutdown. A read still in
+    flight when the bound elapses leaves its remaining messages for the next tick, so no message is lost."""
+
+    _CHANNEL_STUCK_READ_THRESHOLD_SECONDS = 45.0
+    """How long the reader may remain inside one physical queue read, while the queue still reports a
+    backlog, before the shared child-to-parent channel is judged corrupt. A non-blocking ``get`` on a healthy
+    queue returns promptly; a read that cannot return this long can only be a torn length-prefixed frame or a
+    stalled shared writer lock, neither of which clears in place because every child inherits the same queue.
+    Set well above any legitimate single-frame read latency so a merely slow host never trips it, yet bounded
+    so the terminal restart is reached in tens of seconds rather than never."""
+
     def __init__(
         self,
         *,
@@ -266,6 +284,21 @@ class MessageDispatcher:
         The post-processing analogue of ``_safety_verdicts_known_lost``: positive evidence the result will
         never arrive, drained by the recovery coordinator to skip the orphan watchdog's grace.
         """
+
+        self._reader_buffer: deque[HordeProcessMessage] = deque()
+        """Messages the reader thread has drained from the shared queue, awaiting handling on the loop thread."""
+        self._reader_lock = threading.Lock()
+        self._reader_thread: threading.Thread | None = None
+        self._reader_drain_request = threading.Event()
+        self._reader_quiescent = threading.Event()
+        self._reader_stop = threading.Event()
+        self._reader_error: BaseException | None = None
+        """An error raised by a physical ``empty()``/``get()`` in the reader, surfaced on the next tick."""
+        self._reader_read_started_at: float | None = None
+        """Monotonic stamp of the read the reader is currently inside, or None between reads. A value that
+        stays set is a read that cannot return, which the corruption watchdog reads."""
+        self._on_channel_corrupt: Callable[[str], None] | None = None
+        self._channel_corruption_reported = False
 
     def take_safety_verdicts_known_lost(self) -> set[GenerationID]:
         """Return and clear the jobs whose safety verdict was dropped with their launch retired."""
@@ -354,149 +387,296 @@ class MessageDispatcher:
         self._footprint_store = store
 
     async def receive_and_handle_process_messages(self) -> None:
-        """Receive and handle any messages from the child processes."""
-        while not self._process_message_queue.empty():
-            try:
-                message: HordeProcessMessage = self._process_message_queue.get(block=False)
-            except queue.Empty:
-                logger.debug("Queue was empty, breaking")
-                break
+        """Drain and handle any messages the child processes have queued.
 
-            # The download process lives outside the process map, so its messages must be handled
-            # (or ignored) before any of the process-map lookups below, which would otherwise raise.
-            if message.process_id == DOWNLOAD_PROCESS_ID:
-                if (
-                    isinstance(message, HordeDownloadAvailabilityMessage)
-                    and self._on_download_availability is not None
-                ):
-                    self._on_download_availability(message)
-                elif isinstance(message, HordeAuxPrefetchResultMessage) and self._on_aux_prefetch_result is not None:
-                    self._on_aux_prefetch_result(message)
-                continue
+        The physical queue reads run on a dedicated daemon reader thread (:meth:`_run_message_reader`), so a
+        read that cannot return (a torn length-prefixed frame, a stalled shared writer lock) can never freeze
+        this single control-loop thread. Each tick asks the reader to drain the current backlog, waits a
+        bounded time for it to quiesce, then handles everything buffered so far on this thread in arrival
+        order. All process-map, model-map, and job-tracker mutation stays single-threaded here, exactly as when
+        the read happened inline; only the raw read has moved off-thread. A read still in flight when the bound
+        elapses leaves its remaining messages for the next tick, so no message is lost or reordered.
+        """
+        self._ensure_message_reader_running()
+        self._request_reader_drain_and_wait()
+        for message in self._take_buffered_messages():
+            await self._dispatch_buffered_message(message)
+        self._raise_pending_reader_error()
 
-            if not isinstance(message, HordeProcessMessage):
-                raise ValueError(f"Received a message that is not a HordeProcessMessage: {message}")
+    async def _dispatch_buffered_message(self, message: HordeProcessMessage) -> None:
+        """Handle one message the reader thread drained from the shared queue.
 
-            retired_launch_action = self._classify_retired_launch_message(message)
-            if retired_launch_action is _RetiredLaunchMessageAction.IGNORE:
-                continue
-            if retired_launch_action is _RetiredLaunchMessageAction.ACCEPT_POST_PROCESS_RESULT:
-                if isinstance(message, HordePostProcessResultMessage):
-                    await self._handle_post_process_result(message)
-                else:
-                    logger.error(
-                        f"Retired-launch classifier accepted an unexpected message type: {type(message).__name__}",
-                    )
-                continue
+        Returns early once a message is fully handled, the off-thread-read equivalent of the inline drain's
+        per-message ``continue``.
+        """
+        # The download process lives outside the process map, so its messages must be handled
+        # (or ignored) before any of the process-map lookups below, which would otherwise raise.
+        if message.process_id == DOWNLOAD_PROCESS_ID:
+            if isinstance(message, HordeDownloadAvailabilityMessage) and self._on_download_availability is not None:
+                self._on_download_availability(message)
+            elif isinstance(message, HordeAuxPrefetchResultMessage) and self._on_aux_prefetch_result is not None:
+                self._on_aux_prefetch_result(message)
+            return
 
-            if message.process_id not in self._process_map:
-                # A late IPC message from a process the map no longer knows. This is expected after an
-                # intentional scale-down (whole-card residency teardown, RAM-reclaim cycling): the slot is
-                # popped from the map, yet its already-queued terminal messages (PROCESS_ENDING, a final
-                # memory report) still arrive. The retired-launch tombstone above normally absorbs these,
-                # but it is keyed on the exact launch id and bounded by a TTL, so a message from an older
-                # launch, or one arriving after the tombstone is pruned, can slip through. Dropping it is
-                # always safe (the process is gone); raising here would crash the control loop and take the
-                # whole worker down over a stale status update, which is exactly the fragility that stopping
-                # processes mid-session must not introduce.
-                logger.warning(
-                    f"Ignoring message from process {message.process_id} that is no longer in the process map "
-                    f"(launch {message.process_launch_identifier}); it was most likely intentionally stopped: "
-                    f"{type(message).__name__}",
+        if not isinstance(message, HordeProcessMessage):
+            raise ValueError(f"Received a message that is not a HordeProcessMessage: {message}")
+
+        retired_launch_action = self._classify_retired_launch_message(message)
+        if retired_launch_action is _RetiredLaunchMessageAction.IGNORE:
+            return
+        if retired_launch_action is _RetiredLaunchMessageAction.ACCEPT_POST_PROCESS_RESULT:
+            if isinstance(message, HordePostProcessResultMessage):
+                await self._handle_post_process_result(message)
+            else:
+                logger.error(
+                    f"Retired-launch classifier accepted an unexpected message type: {type(message).__name__}",
                 )
-                continue
+            return
 
-            known_launch_identifier = self._process_map[message.process_id].process_launch_identifier
+        if message.process_id not in self._process_map:
+            # A late IPC message from a process the map no longer knows. This is expected after an
+            # intentional scale-down (whole-card residency teardown, RAM-reclaim cycling): the slot is
+            # popped from the map, yet its already-queued terminal messages (PROCESS_ENDING, a final
+            # memory report) still arrive. The retired-launch tombstone above normally absorbs these,
+            # but it is keyed on the exact launch id and bounded by a TTL, so a message from an older
+            # launch, or one arriving after the tombstone is pruned, can slip through. Dropping it is
+            # always safe (the process is gone); raising here would crash the control loop and take the
+            # whole worker down over a stale status update, which is exactly the fragility that stopping
+            # processes mid-session must not introduce.
+            logger.warning(
+                f"Ignoring message from process {message.process_id} that is no longer in the process map "
+                f"(launch {message.process_launch_identifier}); it was most likely intentionally stopped: "
+                f"{type(message).__name__}",
+            )
+            return
 
-            if message.process_launch_identifier != known_launch_identifier:
-                # An in-flight message from a since-replaced process generation. This is expected and
-                # handled (we ignore it), so it is a WARNING, not an ERROR: a single process reload can
-                # leave many queued messages behind, and logging each as an error floods the errors-only
-                # trace with benign noise that makes a routine replacement (e.g. a maintenance-mode pool
-                # reload) look like an error storm in the recovery diagnostics.
-                logger.warning(
-                    f"Ignoring a stale message from process {message.process_id} (launch identifier "
-                    f"{message.process_launch_identifier}, expected {known_launch_identifier}); the process "
-                    f"was replaced. Message: {message}",
-                )
-                continue
+        known_launch_identifier = self._process_map[message.process_id].process_launch_identifier
 
-            # Adopt the child's self-reported pid (the real interpreter's os.getpid()) as the authoritative
-            # os_pid, overriding the parent's spawn-handle guess, so per-PID telemetry addresses the process
-            # that actually holds the GPU context even when a launcher stub sits between them. An older child
-            # that does not carry the field reports None and keeps the handle-derived value.
-            self._process_map.reconcile_reported_os_pid(
-                message.process_id,
-                getattr(message, "reported_os_pid", None),
+        if message.process_launch_identifier != known_launch_identifier:
+            # An in-flight message from a since-replaced process generation. This is expected and
+            # handled (we ignore it), so it is a WARNING, not an ERROR: a single process reload can
+            # leave many queued messages behind, and logging each as an error floods the errors-only
+            # trace with benign noise that makes a routine replacement (e.g. a maintenance-mode pool
+            # reload) look like an error storm in the recovery diagnostics.
+            logger.warning(
+                f"Ignoring a stale message from process {message.process_id} (launch identifier "
+                f"{message.process_launch_identifier}, expected {known_launch_identifier}); the process "
+                f"was replaced. Message: {message}",
+            )
+            return
+
+        # Adopt the child's self-reported pid (the real interpreter's os.getpid()) as the authoritative
+        # os_pid, overriding the parent's spawn-handle guess, so per-PID telemetry addresses the process
+        # that actually holds the GPU context even when a launcher stub sits between them. An older child
+        # that does not carry the field reports None and keeps the handle-derived value.
+        self._process_map.reconcile_reported_os_pid(
+            message.process_id,
+            getattr(message, "reported_os_pid", None),
+        )
+
+        if isinstance(message, HordeProcessHeartbeatMessage):
+            self._handle_heartbeat(message)
+        else:
+            logger.debug(
+                f"Received {type(message).__name__} from process {message.process_id}: {message.info}",
             )
 
-            if isinstance(message, HordeProcessHeartbeatMessage):
-                self._handle_heartbeat(message)
+        if isinstance(message, HordeProcessMemoryMessage):
+            self._handle_memory_report(message)
+            return
+
+        if isinstance(message, HordeJobMetricsMessage):
+            self._process_map.on_job_metrics(message.process_id, message.phase_metrics)
+            if self._on_job_metrics is not None:
+                self._on_job_metrics(message)
+            return
+
+        if isinstance(message, HordeDownloadMetricsMessage):
+            self._process_map.on_download_metrics(message.process_id, message.events)
+            if self._on_download_metrics is not None:
+                self._on_download_metrics(message)
+            return
+
+        if isinstance(message, HordeProcessStateChangeMessage):
+            self._handle_process_state_change(message)
+
+        if isinstance(message, HordeModelStateChangeMessage):
+            self._handle_model_state_change(message)
+
+        if isinstance(message, HordeInferenceResultMessage):
+            self._record_completed_job(message.process_id)
+            await self._handle_inference_result(message)
+        elif isinstance(message, HordePostProcessResultMessage):
+            self._record_completed_job(message.process_id)
+            await self._handle_post_process_result(message)
+        elif isinstance(message, HordeSafetyResultMessage):
+            self._record_completed_job(message.process_id)
+            await self._handle_safety_result(message)
+        elif isinstance(message, HordeAlchemyResultMessage):
+            self._record_completed_job(message.process_id)
+            if self._on_alchemy_result is not None:
+                self._on_alchemy_result(message)
             else:
-                logger.debug(
-                    f"Received {type(message).__name__} from process {message.process_id}: {message.info}",
-                )
+                logger.error(f"Received alchemy result with no handler registered: {message.form_id}")
+        elif isinstance(message, _STAGE_RESULT_MESSAGE_TYPES):
+            self._record_completed_job(message.process_id)
+            if self._on_stage_result is not None:
+                await self._on_stage_result(message)
+            else:
+                logger.error(f"Received {type(message).__name__} with no stage-result handler registered")
+        elif isinstance(message, HordeAnnotationResultMessage):
+            # An annotation is a pre-inference stage, not a job completion, so it is deliberately not
+            # counted by ``_record_completed_job``; the handler releases the parked job back to inference.
+            if self._on_annotation_result is not None:
+                self._on_annotation_result(message)
+            else:
+                logger.error(f"Received annotation result with no handler registered: {message.job_id}")
+        elif isinstance(message, HordeAnnotatorAvailabilityMessage):
+            if self._on_annotator_availability is not None:
+                self._on_annotator_availability(message)
+        elif isinstance(message, HordeStripResultMessage):
+            # The strip is a post-inference stage, not a fresh job completion (inference already counted
+            # the job), so it is deliberately not passed to ``_record_completed_job``.
+            if self._on_strip_result is not None:
+                await self._on_strip_result(message)
+            else:
+                logger.error(f"Received background-strip result with no handler registered: {message.job_id}")
 
-            if isinstance(message, HordeProcessMemoryMessage):
-                self._handle_memory_report(message)
-                continue
+    def set_channel_corruption_handler(self, handler: Callable[[str], None]) -> None:
+        """Register the callback fired once when the shared child-to-parent channel is judged corrupt.
 
-            if isinstance(message, HordeJobMetricsMessage):
-                self._process_map.on_job_metrics(message.process_id, message.phase_metrics)
-                if self._on_job_metrics is not None:
-                    self._on_job_metrics(message)
-                continue
+        The handler escalates through the worker's terminal machinery (a loud abort and restart). A corrupt
+        shared channel cannot be repaired in place, since every child inherits the same queue, so the only
+        correct terminal is to bring the worker down and let it return on a fresh channel.
+        """
+        self._on_channel_corrupt = handler
 
-            if isinstance(message, HordeDownloadMetricsMessage):
-                self._process_map.on_download_metrics(message.process_id, message.events)
-                if self._on_download_metrics is not None:
-                    self._on_download_metrics(message)
-                continue
+    def _ensure_message_reader_running(self) -> None:
+        """Start the daemon reader thread on first use.
 
-            if isinstance(message, HordeProcessStateChangeMessage):
-                self._handle_process_state_change(message)
+        Lazy, so a dispatcher exercised only through direct handler calls never spawns a thread. The thread is
+        a daemon: a read that can never return leaves an abandoned thread that dies with the interpreter rather
+        than blocking shutdown.
+        """
+        if self._reader_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._run_message_reader,
+            name="horde-message-queue-reader",
+            daemon=True,
+        )
+        self._reader_thread = thread
+        thread.start()
 
-            if isinstance(message, HordeModelStateChangeMessage):
-                self._handle_model_state_change(message)
+    def _run_message_reader(self) -> None:
+        """Drain the shared queue into the buffer whenever a tick requests it, until stopped.
 
-            if isinstance(message, HordeInferenceResultMessage):
-                self._record_completed_job(message.process_id)
-                await self._handle_inference_result(message)
-            elif isinstance(message, HordePostProcessResultMessage):
-                self._record_completed_job(message.process_id)
-                await self._handle_post_process_result(message)
-            elif isinstance(message, HordeSafetyResultMessage):
-                self._record_completed_job(message.process_id)
-                await self._handle_safety_result(message)
-            elif isinstance(message, HordeAlchemyResultMessage):
-                self._record_completed_job(message.process_id)
-                if self._on_alchemy_result is not None:
-                    self._on_alchemy_result(message)
-                else:
-                    logger.error(f"Received alchemy result with no handler registered: {message.form_id}")
-            elif isinstance(message, _STAGE_RESULT_MESSAGE_TYPES):
-                self._record_completed_job(message.process_id)
-                if self._on_stage_result is not None:
-                    await self._on_stage_result(message)
-                else:
-                    logger.error(f"Received {type(message).__name__} with no stage-result handler registered")
-            elif isinstance(message, HordeAnnotationResultMessage):
-                # An annotation is a pre-inference stage, not a job completion, so it is deliberately not
-                # counted by ``_record_completed_job``; the handler releases the parked job back to inference.
-                if self._on_annotation_result is not None:
-                    self._on_annotation_result(message)
-                else:
-                    logger.error(f"Received annotation result with no handler registered: {message.job_id}")
-            elif isinstance(message, HordeAnnotatorAvailabilityMessage):
-                if self._on_annotator_availability is not None:
-                    self._on_annotator_availability(message)
-            elif isinstance(message, HordeStripResultMessage):
-                # The strip is a post-inference stage, not a fresh job completion (inference already counted
-                # the job), so it is deliberately not passed to ``_record_completed_job``.
-                if self._on_strip_result is not None:
-                    await self._on_strip_result(message)
-                else:
-                    logger.error(f"Received background-strip result with no handler registered: {message.job_id}")
+        Parks on the drain request between ticks so it consumes the queue no faster than the control loop asks
+        for it, which keeps a scripted test double that hands out a finite ``empty()``/``get()`` sequence
+        exact. A physical read that cannot return blocks only this thread; the requesting tick observes the
+        missing quiescence and returns without it.
+        """
+        while True:
+            self._reader_drain_request.wait()
+            if self._reader_stop.is_set():
+                return
+            self._reader_drain_request.clear()
+            self._drain_backlog_into_buffer()
+            self._reader_quiescent.set()
+
+    def _drain_backlog_into_buffer(self) -> None:
+        """Move every currently-available message from the queue into the buffer, in arrival order.
+
+        Uses the same ``empty()``-gated non-blocking ``get()`` the inline drain used, so the readable poll and
+        the framed body read stay one operation against either the real queue or a test double. A read that
+        blocks on a torn frame never returns here, leaving :attr:`_reader_read_started_at` stamped for the
+        corruption watchdog. Any error other than an empty queue is captured and surfaced on the next tick
+        rather than lost in the thread, matching how an inline read failure would have propagated.
+        """
+        while True:
+            try:
+                if self._process_message_queue.empty():
+                    return
+            except BaseException as exc:  # noqa: BLE001 - relayed to the control-loop thread verbatim
+                self._reader_error = exc
+                return
+            self._reader_read_started_at = time.monotonic()
+            try:
+                message = self._process_message_queue.get(block=False)
+            except queue.Empty:
+                self._reader_read_started_at = None
+                return
+            except BaseException as exc:  # noqa: BLE001 - relayed to the control-loop thread verbatim
+                self._reader_read_started_at = None
+                self._reader_error = exc
+                return
+            self._reader_read_started_at = None
+            with self._reader_lock:
+                self._reader_buffer.append(message)
+
+    def _request_reader_drain_and_wait(self) -> None:
+        """Ask the reader to drain the current backlog and wait a bounded time for it to quiesce."""
+        self._reader_quiescent.clear()
+        self._reader_drain_request.set()
+        self._reader_quiescent.wait(timeout=self._READER_TICK_DRAIN_BUDGET_SECONDS)
+
+    def _take_buffered_messages(self) -> list[HordeProcessMessage]:
+        """Remove and return everything buffered so far, in arrival order."""
+        with self._reader_lock:
+            messages = list(self._reader_buffer)
+            self._reader_buffer.clear()
+        return messages
+
+    def _raise_pending_reader_error(self) -> None:
+        """Re-raise on the control-loop thread any error the reader captured, matching an inline read failure."""
+        error = self._reader_error
+        if error is None:
+            return
+        self._reader_error = None
+        raise error
+
+    def stop_message_reader(self) -> None:
+        """Signal the reader thread to exit; a thread wedged in a read stays abandoned as a harmless daemon."""
+        self._reader_stop.set()
+        self._reader_drain_request.set()
+
+    def check_message_channel_health(self) -> bool:
+        """Judge the shared channel corrupt when a read has been stuck past the threshold with backlog present.
+
+        A read stuck this long cannot clear in place, so on the first detection this logs CRITICAL and fires
+        the registered escalation handler exactly once (a loud abort and restart). Returns whether the channel
+        is judged corrupt. Called from the same control-loop maintenance point as deadlock detection.
+        """
+        started_at = self._reader_read_started_at
+        if started_at is None:
+            return False
+        stuck_seconds = time.monotonic() - started_at
+        if stuck_seconds < self._CHANNEL_STUCK_READ_THRESHOLD_SECONDS:
+            return False
+        if not self._queue_reports_backlog():
+            return False
+        if self._channel_corruption_reported:
+            return True
+        self._channel_corruption_reported = True
+        logger.critical(
+            f"Shared child-to-parent message channel is corrupt: a queue read has not returned in "
+            f"{stuck_seconds:.0f}s while a backlog remains. The channel cannot be repaired in place "
+            "(children inherit it); escalating to a terminal restart.",
+        )
+        if self._on_channel_corrupt is not None:
+            self._on_channel_corrupt(f"shared message channel read stuck {stuck_seconds:.0f}s with backlog")
+        return True
+
+    def _queue_reports_backlog(self) -> bool:
+        """Whether the queue can confirm pending items. A queue that cannot report depth cannot deny a backlog."""
+        try:
+            return self._process_message_queue.qsize() > 0
+        except NotImplementedError:
+            # Platforms without a shared counter (e.g. macOS) cannot report depth; a read stuck this long is
+            # itself evidence of an unconsumed frame, so a missing count must not veto the corruption verdict.
+            return True
+        except Exception:  # noqa: BLE001 - a queue that cannot answer its own depth is treated as backlogged
+            return True
 
     def _classify_retired_launch_message(self, message: HordeProcessMessage) -> _RetiredLaunchMessageAction:
         """Classify a message that may belong to an intentionally retired launch."""
