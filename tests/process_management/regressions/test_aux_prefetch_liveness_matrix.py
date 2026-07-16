@@ -11,8 +11,9 @@ Three contracts are held:
 
 - Bounded idleness: while a pending job waits on auxiliary prefetch, any dispatchable work that physically
   fits reaches sampling within a bounded number of scheduling cycles, and once the waiting job's prefetch
-  completes that job itself reaches sampling within a bound (no permanent shadow). When the prefetch fails or
-  its deadline expires the job faults and the queue keeps draining, its sibling work unaffected.
+  completes that job itself reaches sampling within a bound (no permanent shadow). When the prefetch fails, or
+  its deadline expires with nothing in flight, the job is served without the file and still reaches sampling, so
+  the queue keeps draining, its sibling work unaffected.
 - Admit implies dispatchable: a job the scheduler admits to a lane is one it actually dispatches to sampling
   in the same act. The scheduler never selects a job it cannot dispatch while another job's outstanding
   demand is priced in, so no job is admitted into a lane it can never be released from.
@@ -77,6 +78,11 @@ _SAMPLING_BOUND = 4
 # seconds maps directly onto a cycle count.
 _CYCLE_SECONDS = 1.0
 
+# The short per-job download timeout a deadline cell runs under, so its head reaches its deadline within the run
+# (a resolved cell uses an ample timeout its outcome always beats). Its value in cycles is the cycle at which the
+# deadline serves the head without its never-in-flight reference.
+_DEADLINE_TIMEOUT_SECONDS = 3.0
+
 # An ample per-card free-VRAM reading, sized to fit two concurrent SDXL sampling peaks plus their
 # reservations, so the measured-truth VRAM gate never withholds a dispatch these scenarios are not about.
 # The capacity axis is carried by the concurrency cap, not a starved card: head-of-queue VRAM protection and
@@ -108,8 +114,8 @@ class _PrefetchScript:
         succeeds: Whether the delivered outcome reports the files placed (True) or a download failure (False).
             A reported failure is terminal and serves the job without the file (it becomes dispatchable at
             ``resolve_cycle``), so only a deadline case leaves the job undispatchable.
-        by_deadline: No outcome is ever delivered; the job is left to its per-job download deadline, which
-            faults it from the periodic deadline scan.
+        by_deadline: No outcome is ever delivered; the job is left to its per-job download deadline, which serves
+            it without the file from the periodic deadline scan when nothing is in flight for it.
     """
 
     on_disk: bool = False
@@ -119,11 +125,12 @@ class _PrefetchScript:
 
     @property
     def completion_cycle(self) -> int | None:
-        """The cycle by which the job becomes dispatchable, or ``None`` if it never does (the deadline case).
+        """The cycle a delivered outcome makes the job dispatchable, or ``None`` when none is delivered.
 
         A reported download failure is served without the file rather than faulted, so a failed prefetch makes
-        the job dispatchable at the cycle its outcome lands, exactly as a success does. Only the deadline case,
-        where no outcome is ever delivered, leaves the job to fault undispatchable.
+        the job dispatchable at the cycle its outcome lands, exactly as a success does. The deadline case delivers
+        no outcome at all; it is instead served without the file when its per-job deadline expires with nothing in
+        flight, at a cycle the caller derives from the download timeout.
         """
         if self.on_disk:
             return 0
@@ -137,8 +144,9 @@ class _AuxLivenessWorld:
 
     Each cycle mirrors the control loop's ordering at the grain these liveness claims live at: a lane freed by
     a completed job becomes available, the scripted download process delivers any due prefetch outcome (or a
-    deadline faults an unresolved job), one preload pass may bring a cold model resident, and dispatch feeds
-    sampling. A model preloaded in one cycle materialises (becomes resident) at the start of the next, modelling
+    deadline serves an unresolved job without its file), one preload pass may bring a cold model resident, and
+    dispatch feeds sampling. A model preloaded in one cycle materialises (becomes resident) at the start of the
+    next, modelling
     the child's load latency. Every dispatch is checked for the admit-implies-dispatchable invariant.
     """
 
@@ -524,7 +532,7 @@ async def _build_world(
         model_map=model_map,
         reference=reference,
         max_threads=cell.lanes,
-        download_timeout=3.0 if cell.head_script.by_deadline else 120.0,
+        download_timeout=_DEADLINE_TIMEOUT_SECONDS if cell.head_script.by_deadline else 120.0,
     )
 
     head = _small_job(_HEAD_MODEL, lora_names=("head-lora",))
@@ -550,9 +558,9 @@ async def test_bounded_idleness_across_matrix(cell: _Cell) -> None:
 
     Across every matrix cell the sibling (when one exists and can fit) reaches sampling within a bound while
     the head is gated; the gated head never seizes a lane before its files are on disk; and once its prefetch
-    resolves the head reaches sampling within a bound. A prefetch that fails serves the head without the file,
-    so it still reaches sampling; only when its deadline expires does the head fault terminally, and either way
-    its sibling still samples, so the queue keeps draining.
+    resolves the head reaches sampling within a bound. A prefetch that fails, or a reference that never enters a
+    download by the deadline, serves the head without the file, so it still reaches sampling; its sibling still
+    samples either way, so the queue keeps draining.
     """
     world, head, sibling = await _build_world(cell)
 
@@ -569,11 +577,19 @@ async def test_bounded_idleness_across_matrix(cell: _Cell) -> None:
 
     completion_cycle = cell.head_script.completion_cycle
     if completion_cycle is None:
-        # Deadline cell: no outcome is ever delivered, so the head faults from the deadline backstop and leaves
-        # the pending-inference queue; it must never have sampled, and its sibling work is unaffected.
-        assert not world.sampled(head), f"{cell.id}: a head left to its deadline must never sample"
-        assert world.stage(head) == JobStage.PENDING_SUBMIT, f"{cell.id}: the faulted head did not drain to submit"
-        assert head not in world.job_tracker.jobs_in_progress
+        # Deadline cell: no outcome is ever delivered, so when the head's per-job deadline expires with nothing in
+        # flight it is served without its reference and reaches sampling, its sibling unaffected. The deadline
+        # bounds the wait, not the job's fate, so the salvage keeps the queue draining rather than faulting.
+        expiry_cycle = int(_DEADLINE_TIMEOUT_SECONDS / _CYCLE_SECONDS)
+        assert world.sampled(head), f"{cell.id}: a head served at its deadline must reach sampling"
+        assert world.stage(head) != JobStage.PENDING_SUBMIT, f"{cell.id}: the salvaged head must not fault"
+        first = world.first_sampled_cycle(head)
+        assert first is not None
+        assert first >= expiry_cycle, f"{cell.id}: the head sampled before its deadline could serve it"
+        assert first <= expiry_cycle + _SAMPLING_BOUND, (
+            f"{cell.id}: the head reached sampling {first - expiry_cycle} cycles after its deadline salvage, "
+            f"exceeding the bound of {_SAMPLING_BOUND}"
+        )
         return
 
     # Resolved cells (files placed, or a failure served without them): the head reaches sampling, never before

@@ -31,7 +31,10 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAuxPrefetchResultMessage,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.models.aux_prefetch_coordinator import (
+    _MAX_DEADLINE_DEFERRALS,
+    AuxPrefetchCoordinator,
+)
 from tests.process_management.conftest import make_job_pop_response, track_popped_job_async
 
 
@@ -476,25 +479,37 @@ async def test_deadline_backstop_salvages_a_cowaiter_whose_reference_was_skipped
     assert _prepared(tracker, job_b)
 
 
-async def test_deadline_backstop_still_faults_a_job_whose_reference_never_resolved() -> None:
-    """The backstop still faults a timed-out job whose reference was never skipped (control for the salvage guard).
+async def test_deadline_backstop_faults_only_a_stalled_in_flight_reference() -> None:
+    """The deadline is two-sided: a reference never in flight salvages, a stalled in-flight one still faults.
 
-    The salvage guard must be scoped to references an incident actually memoized skipped: a job whose reference
-    never resolved and never got skipped still reaches its deadline unprepared and is faulted, so the backstop
-    keeps bounding a genuinely stuck prefetch rather than silently dispatching it without a file no verdict cleared.
+    A reference the downloader never began fetching is the prefetch lane's own unavailability, so at the deadline
+    the job is served without it (the inference path would run without the file), not faulted. The one remaining
+    deadline fault is a genuinely stuck transfer: a reference that is in flight but whose reported bytes never
+    advance is deferred a bounded number of times and then faults, so the backstop keeps bounding a sick download
+    while never converting a never-started fetch into a fault.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(1)
-    coordinator, _sender, _state = _make(tracker, clock=clock, timeout=30.0, in_flight={})
+    # Only the stalled reference is ever in flight; the other job's reference never enters a download.
+    in_flight: dict[str, tuple[int, int]] = {"stalled": (50, 100)}
+    coordinator, _sender, _state = _make(tracker, clock=clock, timeout=30.0, in_flight=in_flight)
 
-    job = await _job_of(tracker, coordinator, loras=[_lora("never-resolves")])
+    unstarted = await _job_of(tracker, coordinator, loras=[_lora("never-resolves")])
+    stalled = await _job_of(tracker, coordinator, loras=[_lora("stalled")])
+    assert unstarted.id_ is not None
+    assert stalled.id_ is not None
     assert tracker.is_lora_skipped(_lora("never-resolves")) is False
 
-    clock.now += 31.0
-    coordinator.scan_deadlines()
+    # The stalled reference's reported bytes never advance, so it defers a bounded number of times and only then
+    # faults; the never-in-flight reference is served without the file at its first expiry.
+    for _ in range(_MAX_DEADLINE_DEFERRALS + 1):
+        clock.now += 31.0
+        coordinator.scan_deadlines()
 
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(unstarted.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(unstarted) is True
+    assert tracker.get_stage(stalled.id_) == JobStage.PENDING_SUBMIT
 
 
 async def test_downloader_reset_before_terminal_still_salvages_cowaiters() -> None:

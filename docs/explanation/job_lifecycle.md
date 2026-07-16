@@ -172,8 +172,10 @@ depend on this queue-gated cycle running; see
    is invisible to both dispatch selection and preload: it is never chosen as the dispatch head, never
    preloaded or staged, and owns no lane and no VRAM reservation, so a fitting sibling behind it is fed
    instead. Once its prepared flag is set it re-enters the ordinary dispatch gates like any other job. A
-   per-job prefetch deadline is the backstop (a job whose files never land faults rather than waiting
-   forever); the periodic reconcile sweep is the liveness that heals a lost or dropped request.
+   per-job prefetch deadline is the backstop (a job whose outstanding files have no in-flight download is
+   served without them rather than waiting forever, since the inference path would run without them; only a
+   stalled in-flight transfer faults); the periodic reconcile sweep is the liveness that heals a lost or
+   dropped request.
 5. **`start_inference()`**: sends `START_INFERENCE` with the full `ImageGenerateJobPopResponse`; on
    success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. By the
    [dual-presence rule](job_state_machine.md#the-stage-dual-presence-rule) it stays visible in the
@@ -235,7 +237,7 @@ consecutive-failure counters reset on success. A terminal fault increments the
 consecutive-failure counter that drives the pop pause only when it is a generation
 outcome: a fault whose origin is scheduling recovery (a save-our-ship give-up reissuing a
 wedged backlog) or the auxiliary-prefetch pipeline (a job faulted because a LoRA or
-textual inversion it references could never be placed on disk, before any generation ran)
+textual inversion it references stalled in flight at its deadline, before any generation ran)
 is excluded, since neither is a verdict on generating the work and counting it would let an
 unrelated condition manufacture the pause. Finally `ensure_submitted_job_info` +
 `finalize_submitted` remove the job from the tracker entirely and stamp `last_job_submitted_time`.

@@ -8,8 +8,9 @@ contracts that close the gap:
 
 - the parent detects the death, reports it once (with the exit code), forgets the corpse, and restarts within
   a crash-loop bound, giving up loudly (and withholding LoRA/aux advertising) past the bound;
-- the in-flight provider yields nothing while the downloader is dead, so a deadline faults on its first budget
-  rather than deferring against a process that can never progress;
+- the in-flight provider yields nothing while the downloader is dead, so a deadline serves the job without the
+  reference on its first budget (the death detection and restart are separately owned) rather than deferring
+  against a process that can never progress;
 - a file whose reported bytes have not advanced between two consecutive deadline expiries defers at most once,
   regardless of any in-flight-provider flicker between those expiries (the stall-memory hole);
 - a pending aux job survives the downloader's death and is re-fetched against the fresh downloader within a
@@ -185,8 +186,14 @@ def test_dead_download_process_yields_empty_in_flight() -> None:
     assert manager._aux_prefetch_in_flight_downloads() == {}
 
 
-async def test_expired_deadline_faults_now_when_downloader_dead() -> None:
-    """With the downloader dead the in-flight set is empty, so an expired deadline faults on its first budget."""
+async def test_expired_deadline_salvages_now_when_downloader_dead() -> None:
+    """With the downloader dead the in-flight set is empty, so an expired deadline serves the job without the file.
+
+    A dead download process is the prefetch lane's own unavailability, not evidence the reference is bad, and the
+    inference child fetches the file itself, so on the first budget the deadline dispatches the job without the
+    reference rather than faulting it. Detecting the death and restarting the downloader is separately owned
+    machinery this salvage neither performs nor replaces; the salvage announces itself on its own log line.
+    """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
     in_flight = _InFlightSpy()  # empty, as the parent's provider yields for a dead downloader
@@ -198,9 +205,13 @@ async def test_expired_deadline_faults_now_when_downloader_dead() -> None:
     coordinator.on_job_popped(job)
 
     clock.now += 61.0
-    coordinator.scan_deadlines()
+    with _LogCapture(level="INFO") as logs:
+        coordinator.scan_deadlines()
 
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
+    assert logs.containing("never in flight"), "deadline salvage must emit its own distinguishable signal"
 
 
 # --- (#3) the stall-memory hole: provider flicker between expiries must not license a second deferral -----
@@ -252,7 +263,8 @@ async def test_pending_aux_job_refetched_within_one_budget_after_reset() -> None
 
     A job already deferred once against the (now dead) downloader must not have to wait out the remaining
     deferral cap. After the reset the periodic reconcile re-requests it exactly as a fresh pop would, arming
-    one fresh budget, and that fresh budget faults on a single expiry (no inherited deferral debt).
+    one fresh budget, and that fresh budget resolves the job on a single expiry with no inherited deferral debt:
+    with nothing in flight it is served without the reference rather than deferring again against a dead transfer.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
@@ -282,10 +294,12 @@ async def test_pending_aux_job_refetched_within_one_budget_after_reset() -> None
     assert len(sender.calls) == requests_before + 1
     assert coordinator.has_live_deadline(job.id_) is True
 
-    # The fresh budget carries no inherited deferral debt: a single expiry with nothing in flight faults it.
+    # The fresh budget carries no inherited deferral debt: a single expiry with nothing in flight resolves the
+    # job, serving it without the reference rather than deferring again against a transfer that never resumed.
     clock.now += 61.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
 
 
 def test_sweep_detects_death_reports_once_and_restarts() -> None:

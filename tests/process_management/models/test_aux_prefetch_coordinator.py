@@ -2,8 +2,9 @@
 
 These exercise the three seams the coordinator owns without a live download process: the pop-time request
 (correct entries and pin set), the completion path (a job's dispatch gate clears once its whole auxiliary set
-is present, and two jobs sharing a file are both prepared), and the failure/deadline paths (a pending job is
-faulted, the LoRA-download backoff is armed, and a late outcome for a job that has moved on is a no-op).
+is present, and two jobs sharing a file are both prepared), and the failure/deadline paths (a reported failure
+faults or salvages its waiters and arms the LoRA-download backoff, a deadline serves a job whose reference never
+went in flight and faults only a stalled in-flight transfer, and a late outcome for a moved-on job is a no-op).
 """
 
 from __future__ import annotations
@@ -411,24 +412,34 @@ async def test_shared_lora_failure_arms_backoff_once_and_faults_both_jobs() -> N
     assert state.lora_download_backoff.strikes == 1
 
 
-async def test_deadline_expiry_faults_unresolved_job() -> None:
-    """A job whose prefetch never resolves is faulted once its deadline passes."""
-    tracker = JobTracker()
+async def test_deadline_expiry_salvages_unresolved_job() -> None:
+    """A job whose reference never enters an in-flight download is served without it once its deadline passes.
+
+    The deadline bounds how long the job waits on the prefetch lane, not the job's fate: with nothing in flight
+    the reference is recorded skipped and the job dispatches, since the inference child would fetch the file
+    itself and the prefetch lane's own unavailability must not manufacture a fault. No download backoff strike is
+    armed for a reference the lane simply never started.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     job = _job(loras=[_lora("styleA")])
     await track_popped_job_async(tracker, job)
-    coordinator, _sender, state, clock = _make(tracker, timeout=60.0)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=60.0)
     coordinator.on_job_popped(job)
 
     # Before the deadline, the job is untouched.
     clock.now += 30.0
     coordinator.scan_deadlines()
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is False
 
-    # Past the deadline, it is faulted and the backoff is armed.
+    # Past the deadline with nothing in flight, the job is dispatched without the reference, faulting none.
     clock.now += 40.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
-    assert state.lora_download_backoff.strikes == 1
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
+    assert state.lora_download_backoff.strikes == 0
 
 
 async def test_ti_job_gates_and_prepares_like_loras() -> None:
@@ -547,11 +558,17 @@ async def test_reconcile_re_requests_a_pending_job_with_no_in_flight_request_the
 
 
 async def test_reconcile_does_not_re_arm_a_job_with_a_live_deadline() -> None:
-    """A job whose result never arrives is faulted at its deadline exactly once; the sweep never re-arms it."""
-    tracker = JobTracker()
+    """A job whose result never arrives is resolved at its deadline exactly once; the sweep never re-arms it.
+
+    While its deadline is live the reconcile sweep must not issue a second request for the same job. Once the
+    deadline resolves the job (served without its never-in-flight reference), it is prepared, so a follow-up
+    sweep neither re-requests nor resurrects it: a prepared job is out of the sweep's scope.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     job = _job(loras=[_lora("styleA")])
     await track_popped_job_async(tracker, job)
-    coordinator, sender, _state, clock = _make(tracker, timeout=60.0)
+    coordinator, sender, _state, _clock = _make(tracker, clock=clock, timeout=60.0)
     coordinator.on_job_popped(job)
     assert len(sender.calls) == 1
 
@@ -561,11 +578,12 @@ async def test_reconcile_does_not_re_arm_a_job_with_a_live_deadline() -> None:
     coordinator.reconcile_and_refresh_pins()
     assert len(sender.calls) == 1
 
-    # The result never arrives; the deadline faults the job exactly once.
+    # The result never arrives; the deadline serves the job without the reference exactly once.
     clock.now += 40.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
-    # A follow-up sweep does not resurrect or re-request the now-faulted job.
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    # A follow-up sweep does not re-request the now-prepared job.
     coordinator.reconcile_and_refresh_pins()
     assert len(sender.calls) == 1
 
@@ -685,21 +703,29 @@ async def test_deadline_defers_once_then_faults_when_reported_bytes_stall() -> N
     assert state.lora_download_backoff.strikes == 1
 
 
-async def test_deadline_faults_when_no_matching_file_in_flight() -> None:
-    """An expiry with no matching in-flight file faults immediately, exactly as before deferral existed."""
-    tracker = JobTracker()
+async def test_deadline_salvages_when_no_matching_file_in_flight() -> None:
+    """An expiry with no matching in-flight file serves the job without the reference rather than faulting it.
+
+    Another file downloading does not defer this job's deadline (it is not the file this job needs), and with
+    the job's own reference absent from the in-flight set the deadline serves the job without it. The stalled
+    backstop fault is reserved for a reference that is itself in flight and not advancing, so a job with nothing
+    of its own in flight is dispatched, not struck.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     job = _job(loras=[_lora("styleA")])
     await track_popped_job_async(tracker, job)
     in_flight = _InFlightSpy()
-    coordinator, _sender, state, clock = _make(tracker, timeout=60.0, in_flight=in_flight)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=60.0, in_flight=in_flight)
     coordinator.on_job_popped(job)
 
-    # A different file is downloading, but not the one this job needs, so nothing defers its fault.
+    # A different file is downloading, but not the one this job needs, so this job has nothing in flight.
     in_flight.map = {"other-file": (500, 1_000)}
     clock.now += 61.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
-    assert state.lora_download_backoff.strikes == 1
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert state.lora_download_backoff.strikes == 0
 
 
 async def test_deferral_never_resurrects_a_job_that_moved_on() -> None:

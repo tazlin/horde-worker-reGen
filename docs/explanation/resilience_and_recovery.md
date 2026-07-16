@@ -210,8 +210,9 @@ manager-side **actions**:
   both the queue- and general-deadlock conditions rather than reading "pending plus
   every process idle" as a wedge. That exclusion is bounded by the coordinator's
   per-job prefetch deadline, so a genuinely stalled download stops shielding the
-  queue the moment its deadline lapses (and the job then faults or fuels detection
-  as any other stuck job would). The same grace covers lifecycle's deferred
+  queue the moment its deadline lapses (the job is then served without its
+  never-in-flight file, or faulted if its transfer stalled in flight, and either way
+  stops fuelling the shield as any resolved job would). The same grace covers lifecycle's deferred
   GPU-process starts: a slot killed for recovery or RAM reclamation may be absent
   from `ProcessMap` while its respawn waits for device-free headroom, but SOS
   treats that as recoverable capacity while the wait is young or free-VRAM
@@ -392,10 +393,12 @@ strand work:
 
 - The [auxiliary-prefetch](model_downloads.md#job-driven-auxiliary-prefetch)
   in-flight view yields nothing while the downloader is dead, so a job's prefetch
-  deadline faults on its **first** budget instead of deferring against a process
-  that can no longer make progress. On a restart the coordinator's deadlines are
-  reset, so each still-pending auxiliary job is re-requested against the fresh
-  downloader within a single download-timeout budget rather than waiting out the
+  deadline resolves on its **first** budget instead of deferring against a process
+  that can no longer make progress: with nothing in flight the job is served without
+  its reference (the inference child fetches it) rather than faulted, the death
+  detection and restart being separately owned. On a restart the coordinator's
+  deadlines are reset, so each still-pending auxiliary job is re-requested against the
+  fresh downloader within a single download-timeout budget rather than waiting out the
   full deferral cap.
 - LoRA and auxiliary feature advertising is withheld while no downloader exists:
   with nothing able to place a job's LoRAs or textual inversions on disk, offering

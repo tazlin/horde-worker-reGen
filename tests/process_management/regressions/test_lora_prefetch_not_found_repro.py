@@ -37,7 +37,10 @@ from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.aux_download_backoff import STRIKE_DECAY_SECONDS, AuxDownloadBackoff
-from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.models.aux_prefetch_coordinator import (
+    _MAX_DEADLINE_DEFERRALS,
+    AuxPrefetchCoordinator,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -73,8 +76,13 @@ def _make(
     state: WorkerState | None = None,
     clock: _Clock | None = None,
     timeout: float = 120.0,
+    in_flight: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[AuxPrefetchCoordinator, _SenderSpy, WorkerState, _Clock]:
-    """Build a coordinator over the given tracker, sharing ``state`` when supplied so a popper can read it."""
+    """Build a coordinator over the given tracker, sharing ``state`` when supplied so a popper can read it.
+
+    ``in_flight`` seeds the downloader's in-flight view read live on each deadline scan (mutate it between scans
+    to model a transfer starting, advancing, or stalling); the default reports nothing downloading.
+    """
     the_state = state if state is not None else WorkerState()
     sender = _SenderSpy()
     the_clock = clock if clock is not None else _Clock()
@@ -84,7 +92,7 @@ def _make(
         prefetch_sender=sender,
         download_timeout_provider=lambda: timeout,
         pin_sender=lambda _pins: None,
-        in_flight_provider=dict,
+        in_flight_provider=(lambda: dict(in_flight)) if in_flight is not None else dict,
         clock=the_clock,
     )
     return coordinator, sender, the_state, the_clock
@@ -263,21 +271,25 @@ async def test_single_transient_lora_failure_requeues_and_arms_backoff_once() ->
 async def test_aux_prefetch_deadline_fault_excluded_from_consecutive_failure_pause() -> None:
     """A job faulted by the aux-prefetch deadline carries the aux-prefetch origin, excluded from the pause.
 
-    A not-found reference is served without the file rather than faulted, so the aux-origin fault that must be
-    excluded from the consecutive-failure pop pause is the deadline backstop: a prefetch that never resolves and
-    is never skipped. Popping the job arms its deadline; expiring it with no download in flight faults the job
-    with the aux-prefetch origin. Guards the origin stamping the fault-storm reproduction relies on end to end.
+    A not-found reference is served without the file, and a reference that never enters a download is likewise
+    served without it, so the one aux-origin fault that must be excluded from the consecutive-failure pop pause
+    is the remaining deadline fault: a stalled in-flight transfer whose reported bytes never advance. Its
+    reference is in flight but frozen, so after the bounded deferrals the deadline faults the job with the
+    aux-prefetch origin. Guards the origin stamping the fault-storm reproduction relies on end to end.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(1)
-    coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=30.0)
+    in_flight: dict[str, tuple[int, int]] = {"net": (50, 100)}
+    coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=30.0, in_flight=in_flight)
 
     job = _job(loras=[_lora("net")])
     await track_popped_job_async(tracker, job)
     coordinator.on_job_popped(job)
-    clock.now += 31.0
-    coordinator.scan_deadlines()
+    # The reference is in flight but its bytes never advance, so it defers a bounded number of times then faults.
+    for _ in range(_MAX_DEADLINE_DEFERRALS + 1):
+        clock.now += 31.0
+        coordinator.scan_deadlines()
 
     assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
     assert tracker.was_faulted_by_non_generation_action(job.id_) is True

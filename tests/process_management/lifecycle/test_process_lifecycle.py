@@ -1457,9 +1457,15 @@ class TestGiveUpDefersToAuxPrefetch:
         )
 
     async def test_pending_lora_job_is_not_given_up_before_its_prefetch_deadline(self) -> None:
-        """The head LoRA job survives the whole in-flight window, then faults via the coordinator's deadline."""
+        """The head LoRA job survives the in-flight window, then progresses when the deadline serves it.
+
+        Give-up defers to the coordinator's live deadline throughout the in-flight window. Once the deadline is
+        reached with nothing in flight, the coordinator serves the job without its never-in-flight reference
+        (prepared and dispatchable), a strictly stronger liveness outcome than a fault: give-up must never fault a
+        job the deadline scan just salvaged.
+        """
         clock = _FakeClock()
-        tracker = JobTracker()
+        tracker = JobTracker(clock=clock)
         job = make_job_pop_response(
             "resident_model",
             loras=[LorasPayloadEntry(name="styleA", model=1.0, clip=1.0, is_version=False)],
@@ -1498,10 +1504,14 @@ class TestGiveUpDefersToAuxPrefetch:
             assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE, "give-up faulted a job still prefetching"
         assert coordinator._head_recovery_in_flight() is True
 
-        # Past the deadline the coordinator (not give-up) faults the job, and the deferral predicate clears.
+        # Past the deadline the coordinator serves the job without its never-in-flight reference. Mirroring the
+        # production tick (deadline scan, then give-up), the job progresses (prepared and dispatchable) and
+        # give-up does not fault the job the scan just salvaged.
         clock.now = 1_000.0 + 101.0
         aux.scan_deadlines()
-        assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+        coordinator.run_recovery_supervisor()
+        assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+        assert tracker.are_job_aux_models_prepared(job) is True
         assert coordinator._head_recovery_in_flight() is False
 
     async def test_give_up_faults_the_head_when_no_prefetch_is_in_flight(self) -> None:

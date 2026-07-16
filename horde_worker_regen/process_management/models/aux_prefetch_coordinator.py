@@ -9,8 +9,11 @@ download process:
   every file any tracked job still references) and sends one prefetch request;
 - the completion/failure wiring, which marks each cached file, clears a job's dispatch gate once its full
   auxiliary set is present, and faults a job promptly when a file it needs cannot be fetched; and
-- a per-job deadline (derived from the configured download timeout) that faults a job whose prefetch never
-  resolves, so a job is never left pending forever; and
+- a per-job deadline (derived from the configured download timeout) that bounds how long a job waits on its
+  prefetch: a job whose outstanding references have no in-flight download by the deadline is served without them
+  (the inference child performs its own ad-hoc fetch, so the prefetch lane's unavailability must not become a
+  fault the inference path would not have produced), and only a stalled in-flight download that never advances is
+  faulted, so a job is never left pending forever; and
 - a periodic reconcile-and-pin-refresh step that re-requests any aux-bearing pending job left without an
   in-flight request (a retryable requeue, a lost result message, a restarted downloader) and sends a
   pins-only update whenever the set of still-referenced files changes, coalesced so an unchanged set is never
@@ -229,14 +232,21 @@ class AuxPrefetchCoordinator:
             self._fault_failed_outcome(outcome, now=now)
 
     def scan_deadlines(self, now: float | None = None) -> None:
-        """Fault any job whose prefetch has not resolved by its deadline (run from the periodic loop).
+        """Resolve any job whose prefetch has not landed by its deadline (run from the periodic loop).
 
-        A deadline is a backstop, not the primary failure detector: the downloader reports a genuine failure
-        through the result path. So an expiry that finds the job's file still in flight defers the fault by one
-        download-timeout budget rather than punishing a slow-but-alive transfer, bounded at
-        ``_MAX_DEADLINE_DEFERRALS`` extra budgets and short-circuited earlier if the download reports bytes that
-        stop advancing. Only a job with no in-flight file, or one out of deferral budget or observed stalled, is
-        faulted, exactly as before the deferral existed.
+        A deadline bounds how long a job waits on the prefetch lane, not the job's fate: the inference child
+        performs its own ad-hoc fetch independent of that lane, so a job dispatched without a prefetched file
+        still gets an independent resolution attempt at inference. Two outcomes follow at expiry:
+
+        - A job whose outstanding references have no in-flight download (a starved lane, a cooling reference, a
+          dead download process) is served without them. The prefetch lane's own unavailability must never
+          convert into a fault the inference path would not have produced, so the job is dispatched with the
+          missing references recorded skipped, exactly as the rejection and terminal-plain-failure paths serve a
+          job the fetch could not satisfy.
+        - A job whose reference is present in the downloader's in-flight set defers while that transfer advances
+          (bounded at ``_MAX_DEADLINE_DEFERRALS`` extra download-timeout budgets), and is faulted only once the
+          transfer's reported bytes stop advancing or the budget is spent. A stalled in-flight download is the
+          one remaining deadline fault: a genuinely sick transfer that neither completes nor progresses.
         """
         reference = self._clock() if now is None else now
         in_flight = self._in_flight_provider()
@@ -255,11 +265,16 @@ class AuxPrefetchCoordinator:
             # than faulting it for a reference the incident already resolved.
             if self._salvage_via_skip(job_id):
                 continue
-            # A deadline is per-job, so each expiry is its own incident: arm the backoff (once) for each
-            # auxiliary class the job carries, then fault it. A job carrying both classes arms both. Retryability
-            # follows the combined backoff state exactly as a reported failure does; both arms always run (their
-            # strike is a side effect) so a class window escalates even when another class already made the fault
-            # terminal.
+            # A job whose outstanding references never entered an in-flight download is served without them: the
+            # prefetch lane's unavailability is not evidence the references are bad, and the inference path would
+            # have run without them, so a fault here would drop otherwise-servable work.
+            if self._salvage_never_started(tracked.sdk_api_job_info, in_flight=in_flight, now=reference):
+                continue
+            # Only a stalled in-flight transfer reaches here. A deadline is per-job, so each expiry is its own
+            # incident: arm the backoff (once) for each auxiliary class the job carries, then fault it. A job
+            # carrying both classes arms both. Retryability follows the combined backoff state exactly as a
+            # reported failure does; both arms always run (their strike is a side effect) so a class window
+            # escalates even when another class already made the fault terminal.
             payload = tracked.sdk_api_job_info.payload
             retryable = True
             if payload.loras:
@@ -581,6 +596,63 @@ class AuxPrefetchCoordinator:
         self._arm_reference_cooldown(outcome, now=now)
         for job_id in live:
             self._fault_pending_job(job_id, retryable=True, detail=detail)
+
+    def _salvage_never_started(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        in_flight: dict[str, tuple[int, int]],
+        now: float,
+    ) -> bool:
+        """Serve a job whose outstanding references have no in-flight download; return whether it dispatched.
+
+        The inference child performs its own ad-hoc fetch independent of the parent's prefetch lane, so a job
+        dispatched without a prefetched file still gets an independent resolution attempt at inference. The
+        prefetch deadline therefore must never convert the prefetch lane's own unavailability (a starved lane, a
+        reference cooling after a transient failure, a dead download process) into a fault the inference path
+        would not have produced. When none of the job's outstanding references is in the downloader's in-flight
+        set, each is recorded skipped and the job is prepared for dispatch. The skip is incident-scoped (mirroring
+        a terminal plain failure) so an immediately-following job wanting the same reference dispatches through the
+        memoized skip rather than rotting a fresh full deadline window, and so a reference that becomes fetchable
+        again is prefetched later rather than omitted forever. A job with any outstanding reference still in flight
+        is left to the stalled-in-flight backstop, the one remaining deadline fault. No download backoff strike is
+        armed: the lane's unavailability is not evidence of a sick download path for the reference's whole class.
+        """
+        job_id = job.id_
+        if job_id is None:
+            return False
+        outstanding = self._uncached_entries(job)
+        if not outstanding or any(name in in_flight for _kind, name, _is_version in outstanding):
+            return False
+        for kind, name, is_version in outstanding:
+            self._job_tracker.mark_aux_skipped(
+                name,
+                is_version=is_version,
+                is_ti=kind is AuxModelKind.TI,
+                expires_at=now + STRIKE_DECAY_SECONDS,
+            )
+        if not self._salvage_via_skip(job_id):
+            return False
+        logger.info(
+            f"Aux prefetch deadline reached for job {str(job_id)[:8]} with "
+            f"{len(outstanding)} reference(s) never in flight; dispatching without them.",
+        )
+        return True
+
+    def _uncached_entries(self, job: ImageGenerateJobPopResponse) -> list[tuple[AuxModelKind, str, bool]]:
+        """The job's not-yet-cached auxiliary references as ``(kind, name, is_version)`` identity tuples.
+
+        The name-plus-kind counterpart to :meth:`_uncached_entry_names`, for a caller that must key each
+        outstanding reference by its skip identity rather than only match it against the in-flight name set.
+        """
+        entries: list[tuple[AuxModelKind, str, bool]] = []
+        for lora in job.payload.loras or []:
+            if not self._job_tracker.is_lora_cached(lora) and not self._job_tracker.is_lora_skipped(lora):
+                entries.append((AuxModelKind.LORA, lora.name, bool(lora.is_version)))
+        for ti in job.payload.tis or []:
+            if not self._job_tracker.is_ti_cached(ti.name) and not self._job_tracker.is_ti_skipped(ti.name):
+                entries.append((AuxModelKind.TI, ti.name, False))
+        return entries
 
     def _salvage_via_skip(self, job_id: GenerationID) -> bool:
         """Dispatch a job without a now-skipped reference, dropping its deadline; return whether it dispatched.

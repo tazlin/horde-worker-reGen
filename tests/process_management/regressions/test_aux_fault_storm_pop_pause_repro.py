@@ -2,9 +2,10 @@
 
 A fault whose origin is the auxiliary-prefetch pipeline (the worker never ran a generation for it) must not
 count toward the consecutive-failure pop pause, or one bad remote file silences a worker that is itself
-perfectly healthy. A not-found reference no longer faults a waiting job at all (it is served without the file),
-so the aux-origin fault under test here is the deadline backstop: a prefetch that never resolves and is never
-skipped, faulted once its per-job deadline expires. These assert that such faults are excluded from the pause
+perfectly healthy. A not-found reference no longer faults a waiting job (it is served without the file), and a
+reference that never enters a download is likewise served without it, so the aux-origin fault under test here is
+the one remaining deadline fault: a stalled in-flight transfer whose reported bytes never advance, faulted once
+its bounded deferrals are spent. These assert that such faults are excluded from the pause
 and never trip ``exit_on_unhandled_faults``, that a genuine generation-origin fault still counts (the exclusion
 is scoped by origin, not blanket), and that a shared not-found outcome adds no faults because it salvages every
 co-waiter. The arrangement is authentic end to end: real jobs are faulted through the prefetch coordinator's
@@ -34,7 +35,10 @@ from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.models.aux_prefetch_coordinator import (
+    _MAX_DEADLINE_DEFERRALS,
+    AuxPrefetchCoordinator,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -65,17 +69,30 @@ def _make_coordinator(
 ) -> AuxPrefetchCoordinator:
     """Build a real prefetch coordinator whose control-message senders are inert.
 
-    The senders and downloader-status probe are irrelevant here: the test only drives the coordinator's
-    completion/failure/deadline wiring, which mutates the shared tracker and worker state. An injected clock and
-    short download timeout let a test expire a job's prefetch deadline to produce a genuine aux-origin fault.
+    The senders are irrelevant here: the test only drives the coordinator's completion/failure/deadline wiring,
+    which mutates the shared tracker and worker state. The in-flight provider reports every pending job's
+    outstanding references as a transfer frozen at a fixed byte count, so a deadline scan sees a stalled
+    in-flight download (the one remaining deadline fault) and, once the bounded deferrals are spent, produces a
+    genuine aux-origin fault. An injected clock and short download timeout let a test reach that expiry.
     """
+
+    def _stalled_in_flight() -> dict[str, tuple[int, int]]:
+        frozen: dict[str, tuple[int, int]] = {}
+        for tracked in tracker.tracked_jobs():
+            payload = tracked.sdk_api_job_info.payload
+            for lora in payload.loras or []:
+                frozen[lora.name] = (50, 100)
+            for ti in payload.tis or []:
+                frozen[ti.name] = (50, 100)
+        return frozen
+
     return AuxPrefetchCoordinator(
         job_tracker=tracker,
         state=state,
         prefetch_sender=lambda _entries, _pins: None,
         download_timeout_provider=lambda: download_timeout,
         pin_sender=lambda _pins: None,
-        in_flight_provider=dict,
+        in_flight_provider=_stalled_in_flight,
         clock=(clock if clock is not None else time.time),
     )
 
@@ -203,15 +220,17 @@ async def _fault_one_ti_job_through_prefetch(
     """Pop a TI job and fault it through the prefetch deadline backstop, confirming it reaches PENDING_SUBMIT.
 
     A not-found reference no longer faults a waiting job (it is served without the file), so the aux-origin fault
-    these tests exclude from the pop pause now comes from the deadline backstop: a prefetch that never resolves
-    and is never skipped. Popping the job arms its deadline; advancing the injected clock past it and scanning
-    faults the job with the aux-prefetch origin, since no download is in flight and the reference is not skipped.
+    these tests exclude from the pop pause is the one remaining deadline fault: a stalled in-flight transfer whose
+    reported bytes never advance. Popping the job arms its deadline; the coordinator reports its reference in
+    flight but frozen, so advancing the injected clock past each of the bounded deferrals faults the job with the
+    aux-prefetch origin.
     """
     job = _ti_job(ti_name)
     await track_popped_job_async(tracker, job)
     coordinator.on_job_popped(job)
-    clock.now += 121.0
-    coordinator.scan_deadlines()
+    for _ in range(_MAX_DEADLINE_DEFERRALS + 1):
+        clock.now += 121.0
+        coordinator.scan_deadlines()
     assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT, (
         "arrange failed: prefetch deadline did not fault the job"
     )

@@ -168,8 +168,13 @@ LoRA intake the moment one job's file began downloading. The disk-floor and stri
 suppressions are separate mechanisms and are unaffected by this scoping.
 
 Two mechanisms keep the pipeline live. A per-job deadline derived from the configured
-download timeout, checked in the periodic scheduling scan, faults a job whose prefetch
-never resolves, so a job is never left pending forever: this is the backstop. The
+download timeout, checked in the periodic scheduling scan, bounds how long a job waits
+on its prefetch, so a job is never left pending forever: this is the backstop. It bounds
+the wait, not the job's fate. A job whose outstanding references have no in-flight
+download (a starved lane, a reference cooling after a transient failure, a dead
+downloader) is served without them: the inference child performs its own ad-hoc fetch,
+so the prefetch lane's own unavailability must never manufacture a fault the inference
+path would not have produced. Only a stalled in-flight transfer is faulted. The
 deadline is a backstop, not the primary detector (the download process reports a real
 failure through the outcome path), so it defers rather than punishing a slow-but-alive
 transfer: when a deadline expires while the downloader still shows the job's file in

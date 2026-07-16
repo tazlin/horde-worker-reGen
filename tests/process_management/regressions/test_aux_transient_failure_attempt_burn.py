@@ -12,8 +12,9 @@ These encode the cooldown contract at the coordinator seam:
   (no new request) within the cooldown, so the job cannot be terminalized by an instant second failure;
 - after the cooldown the reference is re-requested and a success dispatches the job;
 - after the cooldown a second genuine failure (incident still active) still faults terminally;
-- a job whose only uncached reference is cooling stays bounded: its deadline still faults it if the
-  cooldown-plus-refetch cycle never resolves it;
+- a job whose only uncached reference is cooling stays bounded: its deadline serves it without the reference
+  when the cooldown-plus-refetch cycle has not resolved it, the lane's own unavailability never faulting the
+  job, while the reference's cooling bookkeeping survives;
 - a cooling job still holds a live deadline, so it stays counted as aux-held and out of deadlock fuel.
 """
 
@@ -187,12 +188,14 @@ async def test_after_cooldown_second_genuine_failure_is_terminal_and_salvages() 
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
 
-async def test_cooling_job_stays_bounded_and_deadline_still_faults_it() -> None:
-    """A job cooling on its only reference is never unbounded: its bounding deadline still faults it.
+async def test_cooling_job_is_served_at_its_deadline_with_cooling_intact() -> None:
+    """A job cooling on its only reference is served without it at its bounding deadline, cooling state intact.
 
-    With the download timeout shorter than the cooldown, the bounding deadline armed while the reference cools
-    expires first. The deadline machinery faults the job exactly as it faults any unresolved prefetch, so a
-    reference that never becomes fetchable cannot leave the job pending forever.
+    The cooling window bounds the prefetch lane's retry churn for a reference, not the job's fate. With the
+    download timeout shorter than the cooldown, the bounding deadline armed while the reference cools expires
+    first; because nothing is in flight the deadline serves the job without the reference (the inference path
+    would run without it) rather than faulting it. The reference's cooldown bookkeeping survives, so the lane
+    still declines to re-request the reference until the cooldown lapses.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
@@ -210,7 +213,10 @@ async def test_cooling_job_stays_bounded_and_deadline_still_faults_it() -> None:
 
     clock.now += 6.0  # past the bounding deadline, still within the reference cooldown
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert coordinator._reference_is_cooling((AuxModelKind.LORA, "ghost", False), clock.now) is True
 
 
 async def test_cooling_job_still_counts_as_aux_held_against_deadlock() -> None:
