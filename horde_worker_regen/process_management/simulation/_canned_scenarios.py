@@ -7,6 +7,7 @@ import functools
 import random
 import time
 import uuid
+import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -22,7 +23,25 @@ from horde_sdk.ai_horde_api.fields import GenerationID
 
 from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES, KNOWN_CONTROLNET_WORKFLOWS
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
+from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_source_png_bytes
 from horde_worker_regen.process_management.simulation._dummy_jobs import DUMMY_R2_UPLOAD_URL, dummy_job_factory
+
+_IMG2IMG_SOURCE_PROCESSING = frozenset({"img2img", "remix"})
+"""Source-processing modes whose jobs carry a start image (and so drive the VAE-encode lane)."""
+
+
+def _source_image_seed(seed: str | None) -> int:
+    """Derive a stable integer image seed from a job's (string) generation seed.
+
+    Numeric seeds (what the canned/gate builders mint) map straight through; any other string falls back
+    to a CRC so the derivation stays deterministic across processes without depending on ``hash`` salting.
+    """
+    if seed is None:
+        return 0
+    try:
+        return int(seed) & 0xFFFFFFFF
+    except ValueError:
+        return zlib.crc32(seed.encode("utf-8"))
 
 
 @dataclass
@@ -159,6 +178,8 @@ def make_canned_job(
     cfg_scale: float | None = None,
     source_image_base64: str | None = None,
     source_processing: str | None = None,
+    seed: str | None = None,
+    prompt: str | None = None,
 ) -> ImageGenerateJobPopResponse:
     """Create a single canned job with configurable size, steps, batch amount, and features.
 
@@ -171,6 +192,9 @@ def make_canned_job(
     generation, and ``image_is_control`` marks the source image as already being a control map
     (which suppresses pre-annotation). Both mirror the like-named ``ImageGenerateJobPopPayload``
     fields the image-utilities routing predicate reads.
+
+    ``seed`` and ``prompt`` override the factory's pinned defaults so a caller can build a fixed,
+    deterministic job list for A/B soak parity; left None, the historical pins are preserved.
     """
     job = dummy_job_factory(model_name)
     data = job.model_dump(by_alias=True)
@@ -187,6 +211,10 @@ def make_canned_job(
     data["payload"]["hires_fix"] = hires_fix
     if cfg_scale is not None:
         data["payload"]["cfg_scale"] = cfg_scale
+    if seed is not None:
+        data["payload"]["seed"] = seed
+    if prompt is not None:
+        data["payload"]["prompt"] = prompt
 
     if loras is not None:
         data["payload"]["loras"] = [entry.model_dump(by_alias=True) for entry in loras]
@@ -206,6 +234,13 @@ def make_canned_job(
         data["payload"]["workflow"] = workflow
         if source_image_base64 is None:
             source_image_base64 = base64.b64encode(make_source_image_bytes()).decode("utf-8")
+    # A plain img2img/remix job carries no control or workflow, so it would otherwise ship without a
+    # start image and degrade to txt2img (never exercising the VAE-encode lane); attach a deterministic
+    # one at the job's own resolution so the encode cost is real. Content is seed-derived and byte-stable.
+    if source_processing in _IMG2IMG_SOURCE_PROCESSING and source_image_base64 is None:
+        source_image_base64 = base64.b64encode(
+            make_dummy_source_png_bytes(width, height, _source_image_seed(seed)),
+        ).decode("utf-8")
     if source_image_base64 is not None:
         data["source_image"] = source_image_base64
         data["source_processing"] = source_processing if source_processing is not None else "img2img"
@@ -401,6 +436,12 @@ class SoakImageTemplate:
     height: int = 512
     steps: int = 30
     n_iter: int = 1
+    seed: str | None = None
+    """Fixed seed every job minted from this template carries, or None to keep the factory's pinned default."""
+    prompt: str | None = None
+    """Fixed prompt every job minted from this template carries, or None to keep the factory's pinned default."""
+    source_processing: str | None = None
+    """Source-processing mode (e.g. ``img2img``) every minted job carries, or None to keep txt2img default."""
     control_type: str | None = None
     return_control_map: bool = False
     image_is_control: bool = False
@@ -536,6 +577,9 @@ class GeneratingJobSource(CannedJobSource):
             cfg_scale=template.cfg_scale,
             loras=template.loras or None,
             tis=template.tis or None,
+            source_processing=template.source_processing,
+            seed=template.seed,
+            prompt=template.prompt,
         )
 
 

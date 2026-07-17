@@ -38,7 +38,21 @@ class CannedImageJobSpec(BaseModel):
     cfg_scale: float | None = None
     n_iter: int = 1
     hires_fix: bool = False
+    seed: str | None = None
+    """Fixed seed for every job this spec expands to, or None to keep the canned factory's pinned default.
+
+    Pinning the seed (and ``prompt``) makes a spec expand to a byte-for-byte reproducible job list, which is
+    what lets two soak runs present identical work for an A/B comparison."""
+    prompt: str | None = None
+    """Fixed prompt for every job this spec expands to, or None to keep the canned factory's pinned default."""
+    source_processing: str | None = None
+    """Source-processing mode (e.g. ``img2img``) for every expanded job, or None to keep the txt2img default."""
     lora_names: list[str] = Field(default_factory=list)
+    lora_is_version: bool = False
+    """Whether ``lora_names`` are CivitAI version ids rather than model names.
+
+    Version ids resolve exactly (no name search), which is what lets a real-mode run reference LoRAs
+    already present in the on-disk cache instead of depending on a live lookup."""
     ti_names: list[str] = Field(default_factory=list)
     control_type: str | None = None
     workflow: str | None = None
@@ -112,7 +126,9 @@ class Scenario(BaseModel):
                         hires_fix=spec.hires_fix,
                         cfg_scale=spec.cfg_scale,
                         loras=(
-                            [LorasPayloadEntry(name=name) for name in spec.lora_names] if spec.lora_names else None
+                            [LorasPayloadEntry(name=name, is_version=spec.lora_is_version) for name in spec.lora_names]
+                            if spec.lora_names
+                            else None
                         ),
                         tis=(
                             [TIPayloadEntry(name=name, inject_ti="prompt") for name in spec.ti_names]
@@ -122,6 +138,9 @@ class Scenario(BaseModel):
                         control_type=spec.control_type,
                         workflow=spec.workflow,
                         post_processing=spec.post_processing if spec.post_processing else None,
+                        source_processing=spec.source_processing,
+                        seed=spec.seed,
+                        prompt=spec.prompt,
                     ),
                 )
         return jobs
@@ -159,11 +178,14 @@ class Scenario(BaseModel):
                 steps=spec.steps,
                 cfg_scale=spec.cfg_scale,
                 n_iter=spec.n_iter,
+                seed=spec.seed,
+                prompt=spec.prompt,
+                source_processing=spec.source_processing,
                 control_type=spec.control_type,
                 workflow=spec.workflow,
                 post_processing=list(spec.post_processing),
                 hires_fix=spec.hires_fix,
-                loras=[LorasPayloadEntry(name=name) for name in spec.lora_names],
+                loras=[LorasPayloadEntry(name=name, is_version=spec.lora_is_version) for name in spec.lora_names],
                 tis=[TIPayloadEntry(name=name, inject_ti="prompt") for name in spec.ti_names],
                 weight=float(spec.count),
             )

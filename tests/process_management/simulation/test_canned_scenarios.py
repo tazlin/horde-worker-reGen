@@ -13,6 +13,7 @@ from horde_worker_regen.benchmark.scenarios import (
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
+    GeneratingJobSource,
     TimedJobSource,
     make_alchemy_scenario,
     make_canned_job,
@@ -22,6 +23,11 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_post_processing_scenario,
     make_ti_scenario,
 )
+
+_PINNED_SEED = "123456789"
+"""The seed ``dummy_job_factory`` has always pinned; the deterministic knobs must default to it."""
+_PINNED_PROMPT = "a man walking in the snow"
+"""The prompt ``dummy_job_factory`` has always pinned; the deterministic knobs must default to it."""
 
 
 def _restrictive_pop_request() -> ImageGenerateJobPopRequest:
@@ -92,6 +98,85 @@ class TestFeatureFactories:
 
         assert response.id_ is not None
         assert response.payload.loras
+
+
+class TestDeterministicPayloadKnobs:
+    """Seed/prompt/source_processing knobs override the pinned canned payload, defaulting to today's pins."""
+
+    def test_defaults_reproduce_pinned_seed_and_prompt(self) -> None:
+        """With the knobs unset, a canned job carries the exact historical seed and prompt pins."""
+        job = make_canned_job()
+        assert job.payload.seed == _PINNED_SEED
+        assert job.payload.prompt == _PINNED_PROMPT
+
+    def test_overrides_flow_into_payload(self) -> None:
+        """An explicit seed/prompt/source_processing replaces the pinned values on the payload."""
+        job = make_canned_job(seed="777", prompt="a lighthouse at dusk", source_processing="img2img")
+        assert job.payload.seed == "777"
+        assert job.payload.prompt == "a lighthouse at dusk"
+        assert str(job.source_processing) == "img2img"
+
+    def test_spec_defaults_preserve_pinned_values(self) -> None:
+        """A spec without the knobs expands to jobs carrying the pinned seed/prompt (behaviour-neutral)."""
+        jobs = Scenario(
+            name="defaults",
+            image_jobs=[CannedImageJobSpec(count=2)],
+        ).expand_image_jobs()
+        assert [job.payload.seed for job in jobs] == [_PINNED_SEED, _PINNED_SEED]
+        assert all(job.payload.prompt == _PINNED_PROMPT for job in jobs)
+
+    def test_spec_overrides_flow_through_expansion(self) -> None:
+        """The spec knobs reach every expanded fixed-list job."""
+        jobs = Scenario(
+            name="fixed",
+            image_jobs=[CannedImageJobSpec(count=2, seed="555", prompt="a red door", source_processing="img2img")],
+        ).expand_image_jobs()
+        assert all(job.payload.seed == "555" for job in jobs)
+        assert all(job.payload.prompt == "a red door" for job in jobs)
+        assert all(str(job.source_processing) == "img2img" for job in jobs)
+
+    def test_spec_knobs_reach_generated_soak_jobs(self) -> None:
+        """The knobs survive the soak-template path so a generating source mints them onto every job."""
+        image_templates, _alchemy = Scenario(
+            name="soak",
+            image_jobs=[CannedImageJobSpec(seed="999", prompt="a snowy owl")],
+        ).to_soak_templates()
+        source = GeneratingJobSource(image_templates, seed=0)
+
+        job = source.next_pop_response()
+
+        assert job.payload.seed == "999"
+        assert job.payload.prompt == "a snowy owl"
+
+
+class TestImg2ImgSourceImage:
+    """A plain img2img/remix source-processing job carries a deterministic synthetic start image."""
+
+    def test_img2img_job_gets_a_source_image_at_its_resolution(self) -> None:
+        """An img2img job with no control/workflow still ships a source image sized to the job."""
+        import base64
+        import struct
+
+        job = make_canned_job(width=768, height=512, source_processing="img2img", seed="42")
+        assert job.source_image, "an img2img job must carry a start image so it does not degrade to txt2img"
+        raw = base64.b64decode(job.source_image)
+        width, height = struct.unpack(">II", raw[16:24])
+        assert (width, height) == (768, 512)
+
+    def test_remix_also_gets_a_source_image(self) -> None:
+        """The remix mode is treated as img2img-class and likewise carries a start image."""
+        job = make_canned_job(source_processing="remix", seed="7")
+        assert job.source_image
+
+    def test_source_image_is_deterministic_per_seed(self) -> None:
+        """Two builds with the same seed and size embed a byte-identical source image."""
+        first = make_canned_job(width=256, height=256, source_processing="img2img", seed="99")
+        second = make_canned_job(width=256, height=256, source_processing="img2img", seed="99")
+        assert first.source_image == second.source_image
+
+    def test_txt2img_job_carries_no_source_image(self) -> None:
+        """A job with no source_processing (and no control/workflow) stays a plain txt2img job."""
+        assert make_canned_job(seed="1").source_image is None
 
 
 class TestAlchemyScenario:
