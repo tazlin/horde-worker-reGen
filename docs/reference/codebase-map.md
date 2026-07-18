@@ -82,6 +82,7 @@ module paths directly.
 | ----------------------------- | --------------------------------------------------------------- |
 | `analysis/`                   | Log/session/support-bundle analysis and triage tools             |
 | `bridge_data/`                | Loading and validating `bridgeData.yaml` into `reGenBridgeData` |
+| `bridge_data/disagg_model_selection.py` | Pure ranking for the `disagg_optimized N` model rule: shared-VAE cluster (via `derive_canonical_registry` over merged record/sidecar hashes) then popularity |
 | `tui/`                        | Textual dashboard, web dashboard, config form, and worker host/launcher |
 | `models/`                     | Worker-side model reference and metadata helpers                |
 | `reporting/`                  | Status reporting and run statistics                             |
@@ -98,7 +99,7 @@ module paths directly.
 | `consts.py`                   | Shared constants and filenames                                  |
 | `load_env_vars.py`            | Environment-variable configuration path                         |
 | `log_file_registry.py`, `logging_purge.py` | Declared worker log-file families and startup retention sweep |
-| `model_download_core.py`, `model_download_plan.py` | Shared download planning/execution helpers used by the CLI and process manager |
+| `model_download_core.py`, `model_download_plan.py` | Shared download planning/execution helpers used by the CLI and process manager (`primary_checkpoint_path_for` resolves a record's primary checkpoint file for the scheduler's component charge and config-load sidecar lookup) |
 | `reference_helper.py`         | Parent/child-safe access to model-reference data                 |
 | `runtime_version.py`, `update_check.py`, `version_meta.py` | Runtime version metadata and update checks |
 | `torch_gpu_preflight.py`      | Container startup preflight for torch/GPU architecture mismatches |

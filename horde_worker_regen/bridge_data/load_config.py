@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from enum import auto
 from pathlib import Path
 
+from horde_model_reference.component_hash import ComponentKind, component_kind_for_purpose
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
@@ -20,6 +21,15 @@ from strenum import StrEnum
 from horde_worker_regen.bridge_data import AIWORKER_ENV_PREFIXES, AIWORKER_REGEN_PREFIX
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.bridge_data.disagg_model_selection import (
+    is_disagg_optimized_candidate,
+    select_disagg_optimized_models,
+)
+
+# The worker-local ``disagg_optimized N`` model-load meta command. The SDK's meta-instruction parser does not
+# recognise it, so it survives as a literal name in ``image_models_to_load`` for this module to expand (the
+# same worker-local precedent as beta-model expansion). The number is captured on its own.
+_DISAGG_OPTIMIZED_REGEX = re.compile(r"^\s*disagg_optimized\s+(\d+)\s*$", re.IGNORECASE)
 
 
 def _make_image_model_load_resolver(
@@ -381,6 +391,11 @@ class BridgeDataLoader:
         # records once and use them to keep opted-in beta models (e.g. qwen, Z-Image) advertised.
         beta_records = beta_aware_image_records(horde_model_reference_manager)
 
+        # Expand the worker-local `disagg_optimized N` command before the SDK families below: it strips its
+        # own literal from image_models_to_load and appends the resolved concrete names, which then flow
+        # through the known-models filter and skip/on-disk passes exactly like any other listed model.
+        BridgeDataLoader._resolve_disagg_optimized_instructions(bridge_data, beta_records)
+
         # Pass the config flag through so the resolver strips large baselines (Flux, Stable Cascade) for the
         # stats-based families (`top N`/`bottom N`) too, not only the `all` instruction. Without this the SDK
         # param defaults to True and those families could surface a large model even with the flag off.
@@ -460,6 +475,160 @@ class BridgeDataLoader:
             )
 
         return bridge_data.image_models_to_load
+
+    @staticmethod
+    def _image_popularity_order() -> list[str]:
+        """Return image-model names ordered most-popular first, from the same source ``top N`` uses.
+
+        Fetches the horde image-stats usage counts (monthly timeframe) and orders every named model by
+        descending usage, reusing the SDK's own ranking so ``disagg_optimized`` and ``top N`` share one
+        popularity signal. Best-effort: a network or API error yields an empty order, and the caller then
+        ranks by cluster size and name alone.
+        """
+        from horde_sdk.ai_horde_api.apimodels import (
+            ImageStatsModelsRequest,
+            ImageStatsModelsResponse,
+            StatsModelsTimeframe,
+        )
+        from horde_sdk.ai_horde_api.consts import MODEL_STATE
+        from horde_sdk.generic_api.apimodels import RequestErrorResponse
+
+        try:
+            response = AIHordeAPIManualClient().submit_request(
+                ImageStatsModelsRequest(model_state=MODEL_STATE.known),
+                ImageStatsModelsResponse,
+            )
+        except Exception as e:  # noqa: BLE001 - popularity is best-effort; any failure degrades to no order.
+            logger.warning(
+                f"`disagg_optimized`: could not fetch model usage stats for popularity ranking: "
+                f"{type(e).__name__}: {e}",
+            )
+            return []
+
+        if isinstance(response, RequestErrorResponse):
+            logger.warning(f"`disagg_optimized`: model usage stats request failed: {response.message}")
+            return []
+
+        timeframe_models = response.get_timeframe(StatsModelsTimeframe.month)
+        return ImageModelLoadResolver.resolve_top_n_model_names(
+            len(timeframe_models),
+            response,
+            StatsModelsTimeframe.month,
+        )
+
+    @staticmethod
+    def _local_disagg_component_hashes(
+        candidate_names: Iterable[str],
+        reference_records: Mapping[str, ImageGenerationModelRecord],
+    ) -> dict[str, dict[ComponentKind, str]]:
+        """Read on-disk component-identity sidecars for the candidates, keyed by model then component kind.
+
+        Only checkpoints already present on disk contribute (a sidecar is written beside the checkpoint), so
+        this is independent of record hash coverage: a model with no sidecar simply falls back to its record
+        hashes. Best-effort throughout, so a stat/read failure on one model never blocks the others.
+        """
+        from horde_model_reference import resolve_weights_root
+        from horde_model_reference.component_identity import read_sidecar
+
+        from horde_worker_regen.model_download_plan import extra_model_roots_from_env, primary_checkpoint_path_for
+
+        weights_root = resolve_weights_root()
+        extra_roots = extra_model_roots_from_env()
+
+        local_hashes: dict[str, dict[ComponentKind, str]] = {}
+        for name in candidate_names:
+            record = reference_records.get(name)
+            if record is None:
+                continue
+            try:
+                checkpoint_path = primary_checkpoint_path_for(record, weights_root, extra_roots=extra_roots)
+                if checkpoint_path is None or not checkpoint_path.exists():
+                    continue
+                sidecar = read_sidecar(checkpoint_path)
+            except Exception as e:  # noqa: BLE001 - a single model's sidecar failure must not block the rest.
+                logger.debug(f"`disagg_optimized`: sidecar lookup for {name!r} failed: {type(e).__name__}: {e}")
+                continue
+            if sidecar is None:
+                continue
+            kinds: dict[ComponentKind, str] = {}
+            for kind_value, component in sidecar.embedded.items():
+                kind = component_kind_for_purpose(kind_value)
+                if kind is not None:
+                    kinds[kind] = component.content_hash
+            if kinds:
+                local_hashes[name] = kinds
+        return local_hashes
+
+    @staticmethod
+    def _resolve_disagg_optimized_instructions(
+        bridge_data: reGenBridgeData,
+        reference_records: Mapping[str, ImageGenerationModelRecord],
+    ) -> None:
+        """Expand any ``disagg_optimized N`` entries in ``image_models_to_load`` in place.
+
+        Strips the literal command(s) from the list and appends the resolved concrete model names. Selection
+        ranks the disaggregation-eligible, downloadable models by shared-VAE cluster size then popularity (see
+        :func:`select_disagg_optimized_models`). The chosen set and its cluster rationale are logged once at
+        INFO; a hash-data-free fall back to pure popularity order is logged as such. When more than one
+        command is present the largest ``N`` wins.
+        """
+        requested_counts: list[int] = []
+        remaining: list[str] = []
+        for entry in bridge_data.image_models_to_load:
+            match = _DISAGG_OPTIMIZED_REGEX.match(entry) if isinstance(entry, str) else None
+            if match is not None:
+                requested_counts.append(int(match.group(1)))
+            else:
+                remaining.append(entry)
+
+        if not requested_counts:
+            return
+
+        bridge_data.image_models_to_load = remaining
+        n = max(requested_counts)
+        if len(requested_counts) > 1:
+            logger.warning(
+                f"Multiple `disagg_optimized` instructions found ({requested_counts}); using the largest N={n}.",
+            )
+
+        if not reference_records:
+            logger.warning(
+                "`disagg_optimized` was requested but the image model reference is unavailable; no models "
+                "were resolved from it.",
+            )
+            return
+
+        candidate_names = [name for name, record in reference_records.items() if is_disagg_optimized_candidate(record)]
+        if not candidate_names:
+            logger.warning(
+                "`disagg_optimized` found no disaggregation-eligible, downloadable models in the reference.",
+            )
+            return
+
+        popularity_order = BridgeDataLoader._image_popularity_order()
+        local_hashes = BridgeDataLoader._local_disagg_component_hashes(candidate_names, reference_records)
+
+        selection = select_disagg_optimized_models(
+            reference_records,
+            n,
+            popularity_order=popularity_order,
+            local_component_hashes=local_hashes,
+        )
+
+        if not selection.hash_data_available:
+            logger.info(
+                "`disagg_optimized` found no VAE component-hash data (neither record nor local sidecar); "
+                "ranking by popularity alone.",
+            )
+        logger.info(
+            f"`disagg_optimized {n}` selected {len(selection.selected)} of {selection.candidate_count} "
+            f"eligible model(s): {selection.selected}. Shared-VAE cluster sizes: {selection.cluster_sizes}.",
+        )
+
+        existing = set(bridge_data.image_models_to_load)
+        bridge_data.image_models_to_load = bridge_data.image_models_to_load + [
+            name for name in selection.selected if name not in existing
+        ]
 
     @staticmethod
     def _filter_to_models_on_disk(

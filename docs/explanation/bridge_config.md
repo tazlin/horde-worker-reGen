@@ -110,6 +110,33 @@ without curating an explicit list, and guarantees a config edit never triggers a
 large download. Presence is resolved against the configured weights root
 (`cache_home` / `AIWORKER_CACHE_HOME`), the same location the worker downloads to.
 
+#### The `disagg_optimized N` model rule
+
+`disagg_optimized N` is a worker-local model rule (listed in `models_to_load`
+like `top N` or `all`) that resolves to the `N` image models best suited to the
+disaggregated stage pipeline. The candidate pool is every model that passes the
+static disaggregation-eligibility check (an SD1.5/SDXL-family baseline, not an
+inpainting variant) and is known-downloadable. Candidates are ranked by two
+signals, in order:
+
+1. **Shared-VAE cluster size.** Disaggregated jobs decode on a shared VAE lane,
+   so models that carry byte-identical VAE weights let one materialised VAE serve
+   many models from a warm in-RAM copy. Models in a larger shared-VAE cluster are
+   preferred, largest cluster first. Clusters are derived from each model's
+   component content hashes, merging the reference record's declared hashes with
+   any local on-disk component-identity sidecar (the local value wins on
+   conflict), so the ranking improves as real checkpoints land on disk without
+   depending on the reference having complete hash coverage.
+2. **Popularity.** Within a cluster tier, the more-used model comes first, using
+   the same monthly usage ranking `top N` reads from the horde stats API.
+
+When no hash data exists at all (neither record nor sidecar), the rule degrades
+to pure popularity order, identical to `top N` filtered to the
+disaggregation-eligible pool. The chosen set and the shared-VAE cluster sizes
+that drove it are logged once at startup. Pair this rule with
+`disaggregation_optimized_mode` (below) to serve the models that share a VAE lane
+most effectively on a small-VRAM card.
+
 ### Queue sizing
 
 `queue_size` controls how many jobs the worker will hold in its internal
@@ -321,7 +348,38 @@ reserve, the sampling peak, and any pending chain reserve) clears a fixed margin
 sampler peak, so setting a positive value here applies that margin in place of
 the default for those jobs only. Monolithic-path jobs always keep the 1024MB
 default. Leave it unset (the default) to keep today's behavior. Only meaningful
-when `enable_pipeline_disaggregation` and the VRAM budget are on.
+when `enable_pipeline_disaggregation` and the VRAM budget are on. The `512` value
+in the preset below is not arbitrary: it ran gate-clean over a multi-hour soak on
+the reference 16 GB card, and is bundled with that provenance as operator
+guidance.
+
+#### `disaggregation_optimized_mode`
+
+`disaggregation_optimized_mode` is a one-switch operator preset for a
+disaggregation-tuned worker on a small-VRAM card. Off by default. When on, it
+applies a bundle of measured-good settings to any of the bundled fields the
+operator **left at their default**:
+
+| Bundled field                        | Preset value | Rationale                                                                 |
+| ------------------------------------ | ------------ | ------------------------------------------------------------------------- |
+| `enable_pipeline_disaggregation`     | `true`       | Turn the pipeline on (the whole point of the preset).                     |
+| `pp_overlap_margin_mb_disaggregated` | `512`        | Ran gate-clean over a multi-hour soak on the reference 16 GB card.        |
+| `component_cache_budget_mb`          | `12288`      | ~12 GB warm-component cache validated on the reference 16 GB card.        |
+
+An explicit operator value always wins over the preset, and every application or
+override is logged (never silently applied or dropped). In particular, setting
+this mode true while `enable_pipeline_disaggregation` is explicitly `false` keeps
+disaggregation off and logs a warning, since the preset then does nothing.
+
+The `12288` cache figure is **lane-first, not cache-first**. A larger budget is
+not better: raising it to `24576` (~24 GB) measured **~23% slower** sampling on
+the reference card, because keeping several UNets resident in RAM competes with
+the sampling working set. The throughput win of disaggregation comes from the
+stage **lanes** (a shared VAE lane, a shared encode lane), not from holding more
+whole models resident. Raise `component_cache_budget_mb` above the preset only
+against measured host-RAM headroom (sized beside `ram_per_process_max_mb` and any
+co-tenants), never on the assumption that more cache is faster. Pair this preset
+with the `disagg_optimized N` model rule so the served set shares VAE lanes well.
 
 ### Alchemy
 

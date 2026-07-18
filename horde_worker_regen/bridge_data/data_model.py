@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal, Self
 
@@ -106,6 +107,63 @@ def apply_extra_slow_clamps(config: reGenBridgeData, clamps: ExtraSlowClamps) ->
         config.max_threads = clamps.max_threads
     if clamps.preload_timeout is not None:
         config.preload_timeout = clamps.preload_timeout
+
+
+_DISAGGREGATION_OPTIMIZED_BUNDLE: dict[str, object] = {
+    "enable_pipeline_disaggregation": True,
+    "pp_overlap_margin_mb_disaggregated": 512.0,
+    "component_cache_budget_mb": 12288,
+}
+"""The tuning bundle ``disaggregation_optimized_mode`` applies to fields the operator left at their default.
+
+The values are the ones validated on the reference 16GB card: pipeline disaggregation on, a 512MB
+post-processing overlap margin (which ran gate-clean over a multi-hour soak), and a 12288MB (~12GB) component
+cache. The cache figure is deliberate: a larger budget (24576MB) measured ~23% slower sampling on that card
+because multi-UNet residency competes with the sampling working set. Lanes, not extra resident UNets, are the
+win, so the bundle keeps the smaller budget. Raise it only against measured host-RAM headroom, never on the
+assumption that more cache is faster."""
+
+
+def apply_disaggregation_optimized_mode(
+    config: reGenBridgeData,
+    *,
+    explicitly_set_fields: Collection[str],
+    log: bool = False,
+) -> None:
+    """Apply the disaggregation-optimized bundle to ``config``, honouring explicit operator values.
+
+    For each bundled field, the operator's explicit value always wins: it is applied only where the field was
+    left at its default (absent from ``explicitly_set_fields``). Every field is accounted for out loud when
+    ``log`` is set: an application, or the reason a value was kept. The one contradiction worth a warning is an
+    explicit ``enable_pipeline_disaggregation=False`` under this mode, which leaves the worker running the mode
+    with disaggregation off (so nothing is disaggregated).
+
+    Args:
+        config: The config to mutate in place.
+        explicitly_set_fields: The names the operator set explicitly (a snapshot of ``model_fields_set`` taken
+            before any mutation), used to tell an explicit value from a left-at-default one.
+        log: Whether to emit a log line for each application or kept value.
+    """
+    for field_name, bundle_value in _DISAGGREGATION_OPTIMIZED_BUNDLE.items():
+        if field_name in explicitly_set_fields:
+            current = getattr(config, field_name)
+            if field_name == "enable_pipeline_disaggregation" and current is False:
+                if log:
+                    logger.warning(
+                        "disaggregation_optimized_mode is enabled but enable_pipeline_disaggregation is "
+                        "explicitly false; the explicit value wins, so no jobs will be disaggregated.",
+                    )
+            elif log:
+                logger.info(
+                    f"disaggregation_optimized_mode: keeping explicit {field_name}={current!r} instead of the "
+                    f"optimized default {bundle_value!r}.",
+                )
+            continue
+        setattr(config, field_name, bundle_value)
+        if log:
+            logger.info(
+                f"disaggregation_optimized_mode: set {field_name}={bundle_value!r} (was left at its default).",
+            )
 
 
 def compute_performance_timeout(
@@ -733,6 +791,22 @@ class reGenBridgeData(CombinedHordeBridgeData):
     keep the 1024MB default regardless of this setting. None (the default) leaves the behavior unchanged. Only
     used when `enable_pipeline_disaggregation` and `enable_vram_budget` are true."""
 
+    disaggregation_optimized_mode: bool = Field(default=False)
+    """One-switch operator preset for a disaggregation-tuned worker on a small-VRAM card.
+
+    Off by default. When true, the worker applies a bundle of measured-good disaggregation settings to any of
+    the bundled fields the operator left at their default: it enables `enable_pipeline_disaggregation`, sets
+    `pp_overlap_margin_mb_disaggregated` to 512, and sets `component_cache_budget_mb` to 12288 (~12GB). Each
+    application is logged.
+
+    An explicit operator value always wins over the bundle, and the override is logged rather than silently
+    dropped; in particular, setting this mode true while `enable_pipeline_disaggregation` is explicitly false
+    keeps disaggregation off (a warning is emitted, since the mode then does nothing). The 12288 cache figure
+    is deliberate: a larger budget measured meaningfully slower sampling on the reference 16GB card because
+    keeping several UNets resident competes with the sampling working set, and the throughput win comes from
+    the stage lanes rather than extra resident models. Pair this preset with the `disagg_optimized N` model
+    rule to serve the models that share a VAE lane most effectively."""
+
     enable_image_utilities: bool = Field(default=True)
     """Run the dedicated image-utilities lane (the ``horde_image_utilities`` capability service).
 
@@ -1058,6 +1132,22 @@ class reGenBridgeData(CombinedHordeBridgeData):
             logger.warning(
                 "Both `dreamer` and `alchemist` are false, so this worker has nothing to serve. Enable "
                 "`dreamer` for image generation or `alchemist` for alchemy forms in bridgeData.yaml.",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def apply_disaggregation_optimized_mode_defaults(self) -> Self:
+        """Apply the disaggregation-optimized bundle when the operator opted into the preset.
+
+        The snapshot of ``model_fields_set`` is taken before the bundle mutates anything, so an explicit
+        operator value is distinguished from a left-at-default one and always wins. See
+        :func:`apply_disaggregation_optimized_mode` for the per-field rules.
+        """
+        if self.disaggregation_optimized_mode is True:
+            apply_disaggregation_optimized_mode(
+                self,
+                explicitly_set_fields=set(self.model_fields_set),
+                log=True,
             )
         return self
 
