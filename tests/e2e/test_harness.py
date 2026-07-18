@@ -13,9 +13,12 @@ report can be sent.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
-from horde_worker_regen.harness import HarnessConfig, run_harness_async
+from horde_worker_regen.harness import HarnessConfig, run_harness, run_harness_async
+from horde_worker_regen.process_management.lifecycle import shutdown_manager as shutdown_manager_module
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_alchemy_scenario,
     make_simple_scenario,
@@ -122,6 +125,40 @@ async def test_full_lifecycle_with_simulated_inference_time() -> None:
     assert result.num_jobs_completed == len(scenario), (
         f"Expected {len(scenario)} completed jobs, got {result.num_jobs_completed} ({result.failure_summary()})"
     )
+
+
+@pytest.mark.e2e
+def test_sequential_run_harness_calls_complete_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two fixed-scenario runs in one interpreter both succeed and leave no process-terminating thread.
+
+    The force-kill backstop is scoped to a single run: once ``run_harness`` returns it must have cancelled
+    and joined any backstop it armed, so a thread created by the first run can never terminate the shared
+    process during the second. ``_force_exit_process`` is replaced with a recorder so a regression (a
+    leaked backstop reaching the exit lever) is caught as a recorded call instead of killing the test
+    process, and the ``run_harness`` (asyncio.run) entry point is used so the sequential-lifecycle path is
+    exercised exactly as the gate driver drives it.
+    """
+    force_exit_calls: list[int] = []
+    monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", force_exit_calls.append)
+
+    for run_index in range(2):
+        result = run_harness(
+            HarnessConfig(
+                num_jobs=2,
+                process_mode="fake",
+                skip_api=True,
+                timeout_seconds=90.0,
+            ),
+        )
+        assert result.succeeded, f"run {run_index} did not succeed ({result.failure_summary()})"
+        assert result.num_jobs_completed == 2, f"run {run_index}: {result.failure_summary()}"
+        assert result.boot_failed_no_progress is False, f"run {run_index} was misread as a boot failure"
+        assert force_exit_calls == [], f"a backstop reached the force-exit lever by run {run_index}"
+
+        live_backstops = [
+            thread for thread in threading.enumerate() if thread.name == "shutdown-backstop" and thread.is_alive()
+        ]
+        assert not live_backstops, f"run {run_index} left a live backstop thread: {live_backstops}"
 
 
 class TestHarnessBridgeDataCapabilities:

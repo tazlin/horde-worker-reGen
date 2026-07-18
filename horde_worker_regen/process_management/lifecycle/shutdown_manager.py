@@ -37,6 +37,11 @@ API before the last-resort kill."""
 _SHUTDOWN_POLL_INTERVAL_SECONDS = 0.25
 """Granularity of the backstop's wait loops, so a clean exit is detected promptly."""
 
+_BACKSTOP_JOIN_TIMEOUT_SECONDS = 10.0
+"""Bound on how long ``cancel_timed_shutdown`` waits for the backstop thread to unwind after being
+cancelled. A cancelled backstop returns within one poll interval unless it is mid-``_hard_kill_processes``;
+the bound keeps an embedder's teardown from blocking indefinitely on a wedged kill."""
+
 
 def _force_exit_process(exit_code: int) -> None:
     """Terminate the worker process from any thread after last-resort cleanup."""
@@ -52,6 +57,8 @@ class ShutdownManager:
     _process_lifecycle: ProcessLifecycleManager
     _caught_sigints: int
     _timed_shutdown_started: bool
+    _backstop_cancelled: threading.Event
+    _backstop_thread: threading.Thread | None
 
     def __init__(
         self,
@@ -79,6 +86,8 @@ class ShutdownManager:
         self._process_lifecycle = process_lifecycle
         self._caught_sigints = 0
         self._timed_shutdown_started = False
+        self._backstop_cancelled = threading.Event()
+        self._backstop_thread = None
 
     def shutdown(self) -> None:
         """Initiate a graceful shutdown (idempotent)."""
@@ -172,7 +181,12 @@ class ShutdownManager:
         """Arm the background force-kill backstop (idempotent: only the first call starts the thread).
 
         The backstop thread force-kills all processes if the graceful drain does not complete within
-        a grace period scaled to the outstanding work.
+        a grace period scaled to the outstanding work. The thread is a named daemon so a stray backstop
+        can never block interpreter exit, and its lifetime is bounded to this manager: an embedder that
+        reuses one interpreter across worker lifecycles (the e2e harness) calls
+        :meth:`cancel_timed_shutdown` once a lifecycle's loop has returned, which both wakes the thread
+        out of its grace wait and suppresses the force-exit, so a backstop armed by one run can never
+        terminate the process during a later one.
         """
         if self._timed_shutdown_started:
             return
@@ -181,24 +195,50 @@ class ShutdownManager:
         grace = self._compute_shutdown_grace()
 
         def hard_shutdown() -> None:
-            # Wait for the graceful path to finish, polling so a clean exit is detected promptly
-            # instead of always burning the full grace.
+            # Wait out the grace, waking promptly on either a clean exit (shut_down) or an explicit
+            # cancel, instead of always burning the full window.
             deadline = time.monotonic() + grace
             while time.monotonic() < deadline:
+                if self._backstop_cancelled.wait(timeout=_SHUTDOWN_POLL_INTERVAL_SECONDS):
+                    return
                 if self._state.shut_down:
                     return
-                time.sleep(_SHUTDOWN_POLL_INTERVAL_SECONDS)
 
             # Grace expired with the worker still up: report any stuck jobs, then force the kill.
             self._fault_report_outstanding_jobs()
+
+            # A cancel or clean exit that landed during the fault-report window still suppresses the kill.
+            if self._backstop_cancelled.is_set() or self._state.shut_down:
+                return
+
             self._process_lifecycle._hard_kill_processes()
 
-            # Only force-exit if the graceful shutdown hasn't completed; a clean exit
-            # should be left to the main thread (and embedders like the test harness).
-            if not self._state.shut_down:
+            # Only force-exit if the graceful shutdown hasn't completed and no embedder has taken over the
+            # process; a clean exit is left to the main thread (and embedders like the test harness).
+            if not self._state.shut_down and not self._backstop_cancelled.is_set():
                 _force_exit_process(1)
 
-        threading.Thread(target=hard_shutdown).start()
+        thread = threading.Thread(target=hard_shutdown, name="shutdown-backstop", daemon=True)
+        self._backstop_thread = thread
+        thread.start()
+
+    def cancel_timed_shutdown(self) -> None:
+        """Neutralize any armed force-kill backstop and wait for its thread to unwind.
+
+        Idempotent and safe when no backstop was ever armed. Setting the cancel event wakes the backstop
+        out of its grace wait and gates the force-exit, so after this returns no thread this manager
+        created can terminate the process. A subsequent :meth:`start_timed_shutdown` on the same manager
+        stays neutralized (the event is already set), which is correct: an embedder that has cancelled
+        one lifecycle has taken ownership of the interpreter's exit.
+        """
+        self._backstop_cancelled.set()
+        thread = self._backstop_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=_BACKSTOP_JOIN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                logger.warning("Timed-shutdown backstop did not unwind within the cancel join timeout.")
+            else:
+                self._backstop_thread = None
 
     def is_time_for_shutdown(self) -> bool:
         """Return True if it is time to shut down."""

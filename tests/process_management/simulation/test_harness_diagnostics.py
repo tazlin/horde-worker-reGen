@@ -19,6 +19,7 @@ from horde_worker_regen.harness import (
     _cleanup_stale_abort_file,
     _collect_run_diagnostics,
     _determine_exit_reason,
+    _is_boot_failure_no_progress,
     build_harness_process_manager,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -199,6 +200,112 @@ class TestDetermineExitReason:
             exception_raised=None,
         )
         assert reason == "completed"
+
+
+class TestIsBootFailureNoProgress:
+    """The loud surface for a run that did no work at all via an early shutdown (a boot failure).
+
+    A driver that scores results generically must be able to tell a zero-work early exit apart from a
+    genuinely scored run; this flag is that distinction.
+    """
+
+    def test_zero_progress_early_shutdown_is_a_boot_failure(self) -> None:
+        """No job completed or faulted, ended by an early shutdown, is flagged."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=False,
+                num_jobs_expected=8,
+                num_jobs_completed=0,
+                num_jobs_faulted=0,
+                timed_out=False,
+                exit_reason="shut_down_before_completion",
+            )
+            is True
+        )
+
+    def test_unknown_early_exit_is_also_a_boot_failure(self) -> None:
+        """The ``unknown`` early-exit reason (no shut_down flag, nothing done) is flagged too."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=False,
+                num_jobs_expected=3,
+                num_jobs_completed=0,
+                num_jobs_faulted=0,
+                timed_out=False,
+                exit_reason="unknown",
+            )
+            is True
+        )
+
+    def test_a_completed_run_is_not_flagged(self) -> None:
+        """A run that finished its scenario is never a boot failure."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=False,
+                num_jobs_expected=3,
+                num_jobs_completed=3,
+                num_jobs_faulted=0,
+                timed_out=False,
+                exit_reason="completed",
+            )
+            is False
+        )
+
+    def test_a_run_that_faulted_work_is_not_flagged(self) -> None:
+        """Faulting jobs is real work reaching the pipeline, so an early exit with faults is not a boot failure."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=False,
+                num_jobs_expected=3,
+                num_jobs_completed=0,
+                num_jobs_faulted=3,
+                timed_out=False,
+                exit_reason="shut_down_before_completion",
+            )
+            is False
+        )
+
+    def test_a_timeout_is_not_a_boot_failure(self) -> None:
+        """A timeout is its own loud surface (``timed_out``); it is not reclassified as a boot failure."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=False,
+                num_jobs_expected=3,
+                num_jobs_completed=0,
+                num_jobs_faulted=0,
+                timed_out=True,
+                exit_reason="timed_out",
+            )
+            is False
+        )
+
+    def test_a_soak_is_never_flagged(self) -> None:
+        """A soak's expected count is whatever it produced, so a zero-work soak is not a boot failure here."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=True,
+                num_jobs_expected=0,
+                num_jobs_completed=0,
+                num_jobs_faulted=0,
+                timed_out=False,
+                exit_reason="shut_down_before_completion",
+            )
+            is False
+        )
+
+    def test_an_alchemy_only_run_expecting_no_image_jobs_is_not_flagged(self) -> None:
+        """With no image jobs expected there is nothing to have failed to boot for."""
+        assert (
+            _is_boot_failure_no_progress(
+                is_soak=False,
+                num_jobs_expected=0,
+                num_jobs_completed=0,
+                num_jobs_faulted=0,
+                timed_out=False,
+                exit_reason="shut_down_before_completion",
+            )
+            is False
+        )
 
 
 class TestCollectRunDiagnostics:

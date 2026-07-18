@@ -59,6 +59,23 @@ There are two termination paths:
    them immediately, and only then are all processes force-killed. This keeps
    the no-loss invariant even when a drain cannot finish in time.
 
+### Backstop lifetime
+
+The backstop is a named daemon thread (`shutdown-backstop`) scoped to the manager
+that armed it. It waits out its grace on a cancellable event, so it wakes promptly
+on either a clean exit (the `shut_down` flag) or an explicit cancel, and it
+force-exits only when neither has happened. `cancel_timed_shutdown()` sets that
+event and joins the thread, guaranteeing that once it returns no thread the manager
+created can terminate the process.
+
+This matters for embedders that run several worker lifecycles in one interpreter
+(the end-to-end harness and the warm benchmark session). `run_harness` cancels and
+joins any armed backstop as its final teardown step once the main loop has returned,
+so a backstop armed by one run can never terminate the process during a later one:
+after `run_harness` returns it leaves no process-terminating threads behind. A
+standalone worker (`start()`) never cancels, so its production contract is unchanged:
+a graceful shutdown that wedges past the grace is still force-killed.
+
 ### Abort sequence
 
 1. [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker]'s `_purge_jobs()`

@@ -6154,6 +6154,15 @@ class HordeWorkerProcessManager:
     def _start_timed_shutdown(self) -> None:
         self._shutdown_manager.start_timed_shutdown()
 
+    def _cancel_timed_shutdown(self) -> None:
+        """Neutralize any armed force-kill backstop and join its thread.
+
+        For embedders (the e2e harness) that run several worker lifecycles in one interpreter: once this
+        manager's main loop has returned, its backstop must never be able to terminate the shared process
+        during a later lifecycle.
+        """
+        self._shutdown_manager.cancel_timed_shutdown()
+
     def _record_session_end_once(self, reason: str) -> None:
         """Emit the session_end marker at most once, with terminal totals. Best-effort; never raises."""
         if self._session_end_recorded:

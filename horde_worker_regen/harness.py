@@ -313,6 +313,12 @@ class HarnessResult:
     criterion for a scheduling-clean soak is that this stays zero: no scheduling-caused failure backoff
     fired. Give-up faults tagged ``SCHEDULING_RECOVERY`` are already excluded from the count that arms it."""
 
+    boot_failed_no_progress: bool = False
+    """True when a fixed-scenario run ended with no job accounted for (none completed, none faulted) via an
+    early graceful shutdown rather than a timeout: the worker gave up (or never brought a child up) before it
+    could do any work. Distinguishes this boot failure from a legitimately scored run so a driver cannot read
+    a zero-work early exit as a real (if poor) result; the run's ``exit_reason`` carries the underlying cause."""
+
     @property
     def all_jobs_accounted_for(self) -> bool:
         """Whether every expected job either completed or faulted."""
@@ -920,6 +926,10 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             watcher_task.cancel()
         if progress_task is not None and not progress_task.done():
             progress_task.cancel()
+        # The main loop has returned, so this run's own teardown owns the process from here. Neutralize any
+        # force-kill backstop it armed and join its thread before returning: an embedder that runs several
+        # lifecycles in one interpreter must never inherit a thread that can later os._exit the process.
+        manager._cancel_timed_shutdown()
 
     timed_out = False
     with contextlib.suppress(asyncio.CancelledError):
@@ -988,11 +998,27 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_expected = num_jobs_completed
         num_forms_expected = num_forms_completed
 
+    num_jobs_faulted = manager._job_tracker.num_jobs_faulted
+    boot_failed_no_progress = _is_boot_failure_no_progress(
+        is_soak=config.soak_seconds is not None,
+        num_jobs_expected=num_jobs_expected,
+        num_jobs_completed=num_jobs_completed,
+        num_jobs_faulted=num_jobs_faulted,
+        timed_out=timed_out,
+        exit_reason=exit_reason,
+    )
+    if boot_failed_no_progress:
+        logger.error(
+            f"Harness run did no work: 0 of {num_jobs_expected} expected jobs completed or faulted, "
+            f"ended by early shutdown (exit_reason={exit_reason!r}). Treating as a boot failure, not a "
+            "scored run.",
+        )
+
     availability = manager._model_availability
     return HarnessResult(
         num_jobs_expected=num_jobs_expected,
         num_jobs_completed=num_jobs_completed,
-        num_jobs_faulted=manager._job_tracker.num_jobs_faulted,
+        num_jobs_faulted=num_jobs_faulted,
         elapsed_seconds=time.time() - time_started,
         started_at_epoch=time_started,
         timed_out=timed_out,
@@ -1014,6 +1040,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_faulted_with_loras=lora_split[2],
         num_jobs_faulted_without_loras=lora_split[3],
         consecutive_failed_jobs_pause_count=manager._state.consecutive_failed_jobs_pause_count,
+        boot_failed_no_progress=boot_failed_no_progress,
     )
 
 
@@ -1035,6 +1062,39 @@ def _determine_exit_reason(
     if manager._state.shut_down:
         return "shut_down_before_completion"
     return "unknown"
+
+
+_EARLY_SHUTDOWN_EXIT_REASONS = frozenset({"shut_down_before_completion", "unknown"})
+"""Exit reasons that mean the run ended by an early graceful shutdown rather than a timeout, an
+exception, or completion: the worker decided it was done (gave up, or never had a live child) with the
+scenario unfinished."""
+
+
+def _is_boot_failure_no_progress(
+    *,
+    is_soak: bool,
+    num_jobs_expected: int,
+    num_jobs_completed: int,
+    num_jobs_faulted: int,
+    timed_out: bool,
+    exit_reason: str,
+) -> bool:
+    """Whether a fixed-scenario run ended having done no work at all via an early shutdown.
+
+    True only when image jobs were expected, none were accounted for (neither completed nor faulted), the
+    run was not a soak (whose expected count is whatever it produced) and did not time out, and the exit
+    reason signals an early graceful shutdown. That combination is a boot failure: the worker gave up or
+    never brought a child to readiness before it could touch the scenario, which must not be mistaken for a
+    real (if empty) result.
+    """
+    return (
+        not is_soak
+        and not timed_out
+        and num_jobs_expected > 0
+        and num_jobs_completed == 0
+        and num_jobs_faulted == 0
+        and exit_reason in _EARLY_SHUTDOWN_EXIT_REASONS
+    )
 
 
 def _collect_run_diagnostics(
@@ -1349,6 +1409,11 @@ class WarmHarnessSession:
         if self._loop_task is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._loop_task, timeout=60.0)
+        # The loop has returned, so neutralize any armed force-kill backstop before handing the interpreter
+        # back to the caller: the warm session is a multi-lifecycle embedder and must leave no thread that
+        # can later os._exit the process.
+        if self._manager is not None:
+            self._manager._cancel_timed_shutdown()
 
     async def _drain_installed_scenario(
         self,

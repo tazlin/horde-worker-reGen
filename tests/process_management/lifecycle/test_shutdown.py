@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -360,6 +362,131 @@ class TestTimedShutdownBackstop:
 
         shutdown_manager._process_lifecycle._hard_kill_processes.assert_called_once()
         assert exit_codes == [1]
+
+
+def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> bool:
+    """Poll ``predicate`` until it is true or the timeout elapses; returns the final value."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class TestBackstopLifecycle:
+    """The force-kill backstop must fire for a wedged shutdown yet stay cancellable by an embedder.
+
+    A real thread is used (not the inline stub) so the cancel/grace timing is exercised as it runs in
+    production. ``_force_exit_process`` is replaced with a recorder so an actual ``os._exit`` never takes
+    the test process down, and the grace is shrunk so the wedged-path window is testable.
+    """
+
+    def test_wedged_shutdown_backstop_fires_within_grace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A graceful shutdown that never completes (shut_down stays False, no cancel) is force-exited."""
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        exit_codes: list[int] = []
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+
+        shutdown_manager.start_timed_shutdown()
+
+        assert _wait_until(lambda: exit_codes == [1]), "wedged shutdown backstop did not force-exit"
+        shutdown_manager._process_lifecycle._hard_kill_processes.assert_called_once()
+        thread = shutdown_manager._backstop_thread
+        assert thread is not None
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+
+    def test_cancel_suppresses_force_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancelling an armed backstop wakes its thread and suppresses the force-exit, even past the grace."""
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        exit_codes: list[int] = []
+        # A grace long enough that the fire can only happen after the test has cancelled, so the outcome
+        # is decided by the cancel and not by a race against the grace.
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 5.0)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+
+        shutdown_manager.start_timed_shutdown()
+        shutdown_manager.cancel_timed_shutdown()
+
+        # The join inside cancel_timed_shutdown has already reaped the thread; it can never fire now.
+        assert shutdown_manager._backstop_thread is None
+        assert exit_codes == []
+        shutdown_manager._process_lifecycle._hard_kill_processes.assert_not_called()
+
+    def test_cancel_before_arm_neutralizes_a_later_backstop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cancel that precedes arming keeps the later backstop from ever force-exiting.
+
+        Models an embedder that has taken ownership of the interpreter's exit: any backstop the same
+        manager arms afterwards must stay inert.
+        """
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        exit_codes: list[int] = []
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+
+        shutdown_manager.cancel_timed_shutdown()
+        shutdown_manager.start_timed_shutdown()
+
+        thread = shutdown_manager._backstop_thread
+        assert thread is not None
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+        assert exit_codes == []
+        shutdown_manager._process_lifecycle._hard_kill_processes.assert_not_called()
+
+    def test_leaked_backstop_cannot_kill_a_later_lifecycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A backstop armed by one lifecycle must not force-exit the shared process once cancelled.
+
+        Reproduces the cross-run defect directly: two managers share one interpreter (as sequential
+        ``run_harness`` calls do). The first arms a backstop whose ``shut_down`` never flips. Left alone it
+        force-exits, which in-process would kill the *second* lifecycle. The embedder's cancel (the fix,
+        which ``run_harness`` now performs on teardown) must neutralize it so only the intended run owns the
+        exit.
+        """
+        exit_codes: list[int] = []
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+
+        # Without the cancel, the leaked backstop reaches the force-exit lever (the behavior that, in one
+        # interpreter, terminates the following lifecycle).
+        uncancelled = _make_shutdown_manager()
+        uncancelled._process_lifecycle._hard_kill_processes = Mock()
+        uncancelled.start_timed_shutdown()
+        assert _wait_until(lambda: exit_codes == [1]), "an uncancelled leaked backstop should still fire"
+
+        exit_codes.clear()
+
+        # With the cancel the embedder performs on teardown, the same wedged backstop never fires, so a
+        # following lifecycle survives.
+        cancelled = _make_shutdown_manager()
+        cancelled._process_lifecycle._hard_kill_processes = Mock()
+        cancelled.start_timed_shutdown()
+        cancelled.cancel_timed_shutdown()
+        # Give any (incorrectly) surviving thread more than a grace to prove it cannot fire late.
+        time.sleep(0.2)
+        assert exit_codes == []
+        assert cancelled._backstop_thread is None
+
+    def test_backstop_thread_is_a_named_daemon(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The backstop runs as a named daemon so a stray one can neither block exit nor hide in a dump."""
+        shutdown_manager = _make_shutdown_manager()
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 5.0)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", Mock())
+
+        shutdown_manager.start_timed_shutdown()
+        try:
+            thread = shutdown_manager._backstop_thread
+            assert thread is not None
+            assert thread.daemon is True
+            assert thread.name == "shutdown-backstop"
+            assert isinstance(thread, threading.Thread)
+        finally:
+            shutdown_manager.cancel_timed_shutdown()
 
 
 class TestStartTimedShutdownIdempotent:
