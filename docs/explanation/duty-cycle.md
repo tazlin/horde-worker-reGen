@@ -372,6 +372,73 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
     gap without paying for sustained concurrent denoise, so it is the right shape even on no-MPS hardware;
     disable it only to restore the strict per-slot denoise gate.
 
+## The disagg A/B gate driver
+
+When you are optimising the disaggregated pipeline (the split text-encode / VAE / sampler lanes) rather
+than tuning a single worker, the question is comparative: does a scheduling change earn more kudos on
+the *same* traffic? The **disagg gate driver**
+([`horde_worker_regen.benchmark.gate_driver`][horde_worker_regen.benchmark.gate_driver]) answers that by
+running a named payload mix through the same in-repo harness under two bridge-data configurations and
+reporting the delta with the mechanism metrics that explain it.
+
+### The mixes
+
+[`build_disagg_gate_scenario`][horde_worker_regen.benchmark.disagg_mixes.build_disagg_gate_scenario]
+builds one of four named mixes (`DisaggGateMix`), all deliberately shaped to put the between-job
+component reload on the critical path:
+
+- **`churn_deterministic`** is a fixed, strict round-robin over the model pool: no two consecutive jobs
+  share a model, so every job pays a component switch. Its job list is byte-identical for identical
+  inputs, which is what makes it the A/B *work-parity* mix.
+- **`churn_seeded_random`** is a duration-paced stream of the same traffic, letting consecutive
+  same-model runs occur by chance: a softer, more production-like churn profile.
+- **`cluster_shared_vae`** and **`cluster_distinct_vae`** hold the deterministic interleave fixed but swap
+  the model pool for one whose checkpoints either share a VAE (so the VAE lane can keep a resident
+  autoencoder across the switch) or each carry a distinct VAE (so the VAE reload is unavoidable). The
+  pair isolates the VAE-residency component of the switch cost. Their default pools are real VAE-sharing
+  clusters from the horde-model-reference canonical-components backfill; every model named is
+  disaggregation-class (SD1.5/SDXL, txt2img/img2img, no controlnet). The pools are parameters, so a
+  re-derivation only updates the defaults.
+
+The img2img and LoRA shares (defaults 0.2 and 0.35) are placed deterministically so the fixed mixes stay
+reproducible. Real-mode runs must supply a resolvable LoRA pool, the same contract the soak mixes hold.
+
+### The ladder and A/B counterbalancing
+
+[`run_gate_ladder`][horde_worker_regen.benchmark.gate_driver.run_gate_ladder] runs the two configurations
+across a rung ladder (90/300/600/1200 s by default). Within each rung both arms meet byte-identical work
+on one seed, and they alternate in **ABBA** order (A, B, B, A) so a linear drift over the rung, a card
+warming up, a background task starting, cancels between the arms instead of biasing one. Each run's scored
+result and mechanism metrics land in a JSON report in the output directory, alongside a per-run JSONL dump
+of the job records that the [kudos scorer](#reading-a-throughput-change-in-kudos) can rescore later.
+
+The mechanism metrics are the *why* behind a kudos delta: disk→RAM reload counts and seconds grouped by
+pipeline stage (plus `whole_job` for monolithic records), per-stage compute-latency percentiles, and the
+device paging-cliff count (the run-metrics `governor_saturation_events`, which is zero on a fake-mode run
+by construction and only nonzero when a real card crosses into WDDM demand-paging).
+
+### Reading a throughput change in kudos
+
+The gate prices each run with the server-parity kudos scorer
+([`score_session`][horde_worker_regen.analysis.kudos_score.score_session]), so the headline is the same
+kudos/hour figure the server would pay. That needs the server's kudos checkpoint, supplied out of band:
+pass `--kudos-ckpt PATH` or set `AI_HORDE_KUDOS_MODEL_CKPT` to the checkpoint file. When scoring is
+required but no checkpoint resolves, the run fails with a clear message rather than reporting a silent
+blank; without a checkpoint and without requiring it, the kudos column simply reads `n/a` and the
+mechanism metrics still stand.
+
+Two guards keep a real-mode run honest: it refuses to start while a `pytest` process is running on the
+box (a stray test run would contend for the card and pollute the measurement), and a lockfile in the
+output directory prevents two gate runs from measuring over each other.
+
+```bash
+python -m horde_worker_regen.benchmark.gate_driver \
+    --mix cluster_shared_vae --mode real --seed 0 --out ./gate_out \
+    --a-override gpu_sampling_lease_enabled=false \
+    --b-override gpu_sampling_lease_enabled=true \
+    --kudos-ckpt ./kudos-v21-206.ckpt
+```
+
 ## See also
 
 - [Performance and backpressure](performance_and_backpressure.md): the scheduling, eviction, and budget

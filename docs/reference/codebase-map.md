@@ -88,7 +88,9 @@ module paths directly.
 | `utils/`                      | Image, job, system, accelerator-probe, quota, and diagnostics helpers |
 | `telemetry.py`, `telemetry_spans.py` | Logfire/OTel setup, cross-process trace context, and span/histogram definitions |
 | `locale_info/`, `localize.py` | Localization                                                    |
-| `benchmark/`                  | Progressive worker benchmark: tier/feature matrix in `ladder.py` (typed by `enums.py`), `sizing.py` (VRAM-derived post-processing resolution), level runner, controller, criteria, `report.py` (capabilities + conservative recommendation + per-setting provenance), `history.py` (enumerate/compare past runs), and the `horde-benchmark` CLI |
+| `benchmark/`                  | Progressive worker benchmark: tier/feature matrix in `ladder.py` (typed by `enums.py`), `sizing.py` (VRAM-derived post-processing resolution), level runner, controller, criteria, `report.py` (capabilities + conservative recommendation + per-setting provenance), `history.py` (enumerate/compare past runs), the sustained-load `soak.py` mixes, and the `horde-benchmark` CLI |
+| `benchmark/disagg_mixes.py`   | Named disagg-optimization payload mixes (`DisaggGateMix`): component-churn and VAE-cluster scenarios for the gate driver |
+| `benchmark/gate_driver.py`    | Disagg A/B measurement gate: runs a mix through the harness in ABBA order, scores kudos/hr, and derives per-stage reload/latency mechanism metrics (`python -m horde_worker_regen.benchmark.gate_driver`) |
 | `amd_go_fast/`                | AMD/ROCm-specific optimizations                                 |
 | `capabilities/`               | Placeholder for future optional "capability" processes (heavy features split out of the base worker; see the README) |
 | `app_state.py`                | Durable dashboard/worker state path helpers                     |
