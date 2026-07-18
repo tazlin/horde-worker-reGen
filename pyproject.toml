@@ -28,15 +28,10 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.27.0",
     "horde_safety~=0.3.0",
-    # Requires horde-engine (hordelib) 6.3.3+: process VRAM telemetry (hordelib.api.get_process_vram_stats,
-    # hordelib.utils.torch_memory.offthread_vram_sampling_ready), the disaggregated stage execution surface
-    # (hordelib.execution.stage_payloads plus the HordeLib encode_text_stage / sample_stage / vae_encode_stage /
-    # decode_stage entry points), atomic adhoc weight writes, the read-only adhoc model manager mode
-    # (SharedModelManager.load_model_managers adhoc_read_only) that inference children construct with, and the
-    # streamed adhoc fetch surface (fetch_adhoc_lora/fetch_adhoc_ti progress_callback + per-record completion)
-    # the download process passes its live progress callback into.
-    "horde_engine[layerdiffuse,upscale-extra]>=6.3.5,<7.0.0",
-    "horde_model_reference>=7.5.0,<8.0.0",
+    # We don't include all of the horde-engine extras here because some of them pull native deps that have no wheels for some
+    # accelerators (Intel XPU / Apple MPS / Ascend), so they are NOT in the base install: a base worker runs on every backend ComfyUI supports
+    "horde_engine[layerdiffuse,upscale-extra]>=6.4.0,<7.0.0",
+    "horde_model_reference>=7.6.0,<8.0.0",
     # Base package only (pillow/pydantic deps): the parent-side lane adapter and entry points import its
     # client and launcher in THIS venv. The heavy annotator/server stacks stay out of this resolution; they
     # are provisioned into the separate utilities venv from requirements/utilities/uv.lock.
