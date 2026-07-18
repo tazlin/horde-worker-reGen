@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import psutil
@@ -84,6 +85,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_post_processing_vram_mb,
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
+    predict_job_unet_only_ram_mb,
     predict_job_weight_mb,
     ram_pressure_floor_mb,
 )
@@ -174,6 +176,8 @@ from horde_worker_regen.utils.job_utils import (
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
 if TYPE_CHECKING:
+    from horde_model_reference.component_identity import ComponentIdentitySidecar
+
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 
@@ -268,6 +272,13 @@ constants can be retuned against field truth. Slack absorbs ordinary per-job cre
 only a materially over-generous credit is reported."""
 
 
+_REUSE_CREDIT_KIND_PAGE_REUSE = "page_reuse"
+"""A credited admission whose charge was reduced by a reusable staging target's retained resident pages."""
+
+_REUSE_CREDIT_KIND_COMPONENT = "component"
+"""A credited admission priced at a disaggregation-class job's UNet-only component charge, not the checkpoint."""
+
+
 @dataclass(frozen=True)
 class _ReuseCreditRecord:
     """A credited RAM admission awaiting the measured-truth check against its target's settled RSS.
@@ -285,6 +296,10 @@ class _ReuseCreditRecord:
     """The credited charge (MB) the admission priced the swap at; the growth is reconciled against this."""
     admitted_at: float
     """Wall-clock time of the credited admission, gating the settle grace before reconciliation."""
+    kind: str = _REUSE_CREDIT_KIND_PAGE_REUSE
+    """Which marginal accounting priced the admission (:data:`_REUSE_CREDIT_KIND_PAGE_REUSE` for a retained-page
+    reuse credit, :data:`_REUSE_CREDIT_KIND_COMPONENT` for a UNet-only component charge). The reconciliation
+    reads settled growth against the charge identically for both; only the discrepancy wording differs."""
 
 
 _PRELOAD_FIRST_REPORT_GRACE_SECONDS = 5.0
@@ -816,6 +831,16 @@ class InferenceScheduler:
         self._pending_reuse_credits: dict[int, _ReuseCreditRecord] = {}
         # Last credited-admission log key, so an unchanged credited admit is not re-logged (edge-triggered).
         self._last_credited_admission_key: tuple[int, str | None, int] | None = None
+        # Torch-free component-charge plumbing for disaggregation-class RAM staging. The checkpoint path per
+        # model is stable once the reference is loaded, so it is resolved once and cached; the component-
+        # identity sidecar is cached per model keyed on the checkpoint's on-disk size, so a replaced checkpoint
+        # re-reads while an unchanged one is not re-parsed every sub-second cycle. The weights root is resolved
+        # once (a filesystem walk) and reused. The fallback-logged set gates the missing-sidecar debug notice to
+        # once per model so the loop cannot spam it.
+        self._checkpoint_path_cache: dict[str, Path | None] = {}
+        self._component_sidecar_cache: dict[str, tuple[int, ComponentIdentitySidecar]] = {}
+        self._component_charge_fallback_logged: set[str] = set()
+        self._weights_root: Path | None = None
         self._scheduler_diagnostic_log_state = {}
         self._last_preload_admission = None
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
@@ -5122,14 +5147,165 @@ class InferenceScheduler:
                 admitted_at=time.time(),
             )
 
+    def _note_component_admission(
+        self,
+        job: ImageGenerateJobPopResponse,
+        target: HordeProcessInfo,
+        verdict: BudgetVerdict,
+    ) -> None:
+        """Log a UNet-only component admission (edge-triggered) and record it for the measured-truth check.
+
+        The disaggregation-class analogue of :meth:`_note_credited_admission`: emitted once per distinct
+        (target, model, rounded charge) so the sub-second loop cannot spam it, and recorded so
+        :meth:`_reconcile_reuse_credit` can compare the target's settled RSS growth to the component charge the
+        stage was priced at. The record carries :data:`_REUSE_CREDIT_KIND_COMPONENT` so the reconciliation
+        wording reflects a UNet-only charge rather than a retained-page reuse credit.
+        """
+        charge_key = int(verdict.predicted_mb) if verdict.predicted_mb is not None else 0
+        key = (target.process_id, job.model, charge_key)
+        if key != self._last_credited_admission_key:
+            whole = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
+            logger.opt(ansi=True).info(
+                f"<fg #8fd6a0>RAM UNet-only charge admitting preload of {job.model} onto process "
+                f"{target.process_id}: whole-checkpoint ~{whole:.0f} MB, component charge ~{charge_key:.0f} MB "
+                "(disaggregation-class sampler stages the UNet only).</>",
+            )
+            self._last_credited_admission_key = key
+        if job.model is not None:
+            self._pending_reuse_credits[target.process_id] = _ReuseCreditRecord(
+                model=job.model,
+                rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
+                effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
+                admitted_at=time.time(),
+                kind=_REUSE_CREDIT_KIND_COMPONENT,
+            )
+
+    def _disaggregated_component_charge_mb(
+        self,
+        job: ImageGenerateJobPopResponse,
+        target: HordeProcessInfo,
+    ) -> float | None:
+        """Return the UNet-only RAM staging charge (MB) for a disaggregation-class ``job``, or None.
+
+        None means "price the whole checkpoint" and is returned whenever the component charge does not apply:
+        the job is not disaggregation-class, it has no model, or no component-identity sidecar (hence no UNet
+        residual) can be read for its checkpoint. A readable sidecar yields the floored UNet residual charge
+        (:func:`predict_job_unet_only_ram_mb`), except that a checkpoint whose identity the residency map shows
+        already staged on ``target`` is charged 0.0: its pages are resident, so the stage materialises nothing
+        (the RAM analogue of the resident-weight credit the VRAM candidate delta applies). The class predicate
+        is the stable one the VRAM side charges against, so RAM and VRAM stay class-consistent within a cycle.
+        """
+        if not self._is_disaggregation_class_eligible(job):
+            return None
+        if job.model is None:
+            return None
+        sidecar = self._read_component_sidecar(job.model)
+        if sidecar is None:
+            return None
+        if self._checkpoint_identity_held_on(job.model, target.process_id):
+            return 0.0
+        return predict_job_unet_only_ram_mb(sidecar.residual_tensor_bytes)
+
+    def _checkpoint_identity_held_on(self, model_name: str, process_id: int) -> bool:
+        """Whether ``model_name``'s checkpoint is already staged in ``process_id``'s RAM component cache.
+
+        A checkpoint entry's residency identity is the bare horde model name, so this is a direct membership
+        test against the residency map. False when no residency map is wired (unit tests, or a worker whose
+        budgeted component cache is disabled), so the charge then defaults to the full UNet residual.
+        """
+        if self._component_residency_map is None:
+            return False
+        return model_name in self._component_residency_map.checkpoint_models_held_on([process_id])
+
+    def _read_component_sidecar(self, model_name: str) -> ComponentIdentitySidecar | None:
+        """Return ``model_name``'s component-identity sidecar (torch-free, cached), or None when unavailable.
+
+        Resolves the checkpoint path once per model (see :meth:`_resolve_checkpoint_path`) and reads the sidecar
+        beside it. The parsed sidecar is cached keyed on the checkpoint's on-disk size, so an unchanged
+        checkpoint is not re-parsed every sub-second cycle while a replaced one (a different size) re-reads;
+        this leans on the sidecar's own ``ckpt_size_bytes`` staleness check, which
+        :func:`horde_model_reference.component_identity.read_sidecar` applies on a fresh read. A missing path,
+        an unstattable checkpoint, or an absent/malformed/stale sidecar returns None (the whole-checkpoint
+        fallback) and logs a debug notice once per model so the loop cannot spam it.
+        """
+        ckpt_path = self._resolve_checkpoint_path(model_name)
+        if ckpt_path is None:
+            self._log_component_charge_fallback_once(model_name, "no checkpoint path resolved")
+            return None
+        try:
+            current_size = ckpt_path.stat().st_size
+        except OSError:
+            self._log_component_charge_fallback_once(model_name, "checkpoint not on disk")
+            return None
+        cached = self._component_sidecar_cache.get(model_name)
+        if cached is not None and cached[0] == current_size:
+            return cached[1]
+
+        from horde_model_reference.component_identity import read_sidecar
+
+        sidecar = read_sidecar(ckpt_path)
+        if sidecar is None:
+            self._log_component_charge_fallback_once(model_name, "no component-identity sidecar")
+            return None
+        self._component_sidecar_cache[model_name] = (current_size, sidecar)
+        return sidecar
+
+    def _resolve_checkpoint_path(self, model_name: str) -> Path | None:
+        """Resolve ``model_name``'s on-disk monolithic checkpoint path (torch-free, cached), or None.
+
+        The path is stable once the reference is loaded, so it is resolved once and cached per model. Resolution
+        uses the same on-disk layout authority the download path does
+        (:func:`horde_model_reference.on_disk_layout.file_paths_for`) over the env-resolved weights root, picking
+        the checkpoint file (the download entry that is not routed to a sibling component folder). None is
+        returned and cached when no reference is loaded, the model has no record, or resolution raises, so the
+        caller falls back to the whole-checkpoint charge.
+        """
+        if model_name in self._checkpoint_path_cache:
+            return self._checkpoint_path_cache[model_name]
+        path = self._compute_checkpoint_path(model_name)
+        self._checkpoint_path_cache[model_name] = path
+        return path
+
+    def _compute_checkpoint_path(self, model_name: str) -> Path | None:
+        """Resolve ``model_name``'s checkpoint path from the loaded reference, or None (see caller)."""
+        reference = self._model_metadata.reference
+        if reference is None:
+            return None
+        record = reference.get(model_name)
+        if record is None:
+            return None
+        try:
+            from horde_model_reference.on_disk_layout import resolve_weights_root
+
+            from horde_worker_regen.model_download_plan import primary_checkpoint_path_for
+
+            if self._weights_root is None:
+                self._weights_root = resolve_weights_root()
+            return primary_checkpoint_path_for(record, self._weights_root)
+        except Exception as e:  # noqa: BLE001 - path resolution is best-effort; any failure fails safe to None.
+            logger.debug(f"Checkpoint path resolution for {model_name!r} failed: {type(e).__name__}: {e}")
+            return None
+
+    def _log_component_charge_fallback_once(self, model_name: str, reason: str) -> None:
+        """Log the whole-checkpoint fallback for a disaggregation-class model once, keyed by model name."""
+        if model_name in self._component_charge_fallback_logged:
+            return
+        self._component_charge_fallback_logged.add(model_name)
+        logger.debug(
+            f"UNet-only RAM charge unavailable for {model_name!r} ({reason}); charging the whole checkpoint.",
+        )
+
     def _reconcile_reuse_credit(self) -> None:
         """Compare each settled credited admission's real RSS growth to its charge (the measured-truth check).
 
         Once a credited target has settled past :data:`_REUSE_CREDIT_RECONCILE_SETTLE_SECONDS` with the staged
         model resident, its measured RSS growth is known. Growth exceeding the charge by more than
-        :data:`_REUSE_CREDIT_RECONCILE_SLACK_MB` means the credit was too generous (the retained pages were not
-        as reusable as assumed); log it once so the credit constants can be retuned. Records for vanished or
-        re-tasked slots are dropped so the map does not accumulate.
+        :data:`_REUSE_CREDIT_RECONCILE_SLACK_MB` means the charge under-priced the load; log it once so the
+        constants can be retuned. Growth below the charge is expected and silent: a page-reuse credit assumes a
+        retaining slot, and a UNet-only component charge assumes mmap page sharing keeps a reload cheap, so
+        settling below the charge is the intended outcome, not a discrepancy. The wording distinguishes the two
+        record kinds; the threshold is identical. Records for vanished or re-tasked slots are dropped so the map
+        does not accumulate.
         """
         now = time.time()
         for process_id, record in list(self._pending_reuse_credits.items()):
@@ -5146,7 +5322,16 @@ class InferenceScheduler:
                 continue
             del self._pending_reuse_credits[process_id]
             growth_mb = max(0, process_info.ram_usage_bytes) / (1024 * 1024) - record.rss_at_admit_mb
-            if growth_mb > record.effective_charge_mb + _REUSE_CREDIT_RECONCILE_SLACK_MB:
+            if growth_mb <= record.effective_charge_mb + _REUSE_CREDIT_RECONCILE_SLACK_MB:
+                continue
+            if record.kind == _REUSE_CREDIT_KIND_COMPONENT:
+                logger.opt(ansi=True).warning(
+                    f"<fg #f0beff>UNet-only component charge for {record.model} on process {process_id} "
+                    f"under-priced the stage: measured RSS grew ~{growth_mb:.0f} MB against a component charge of "
+                    f"~{record.effective_charge_mb:.0f} MB; the reload shared fewer pages than the residual "
+                    "implied.</>",
+                )
+            else:
                 logger.opt(ansi=True).warning(
                     f"<fg #f0beff>RAM reuse credit for {record.model} on process {process_id} was too generous: "
                     f"measured RSS grew ~{growth_mb:.0f} MB against an effective charge of "
@@ -5168,25 +5353,41 @@ class InferenceScheduler:
         staging target: an idle ``available_process`` that retains its unloaded model's pages (or swaps a model
         in place) reuses those pages, so the verdict prices the swap at its marginal growth rather than a full
         cold load (see :meth:`_staging_reuse_credit_mb` and :meth:`RamBudget.check_job`). The credit is gated on
-        the host RAM danger floor so it never admits into a floor breach. Otherwise runs the reclaim attempts
-        (gentle eviction, escalated for the head, then cycling an allocator-stuck idle slot that is *not* this
-        target) and dispatches on
+        the host RAM danger floor so it never admits into a floor breach.
+
+        A disaggregation-class job (the same class predicate the VRAM side charges sampler-only against) is
+        instead priced at its UNet-only component charge: its sampler stages only the UNet, so the whole-
+        checkpoint charge would over-count by the text encoders and VAE that never enter this process. The
+        component charge supersedes the page-reuse credit (they are alternative marginal accountings of the
+        same load). When no component charge applies (the job is not disaggregation-class, or its checkpoint has
+        no resolvable sidecar, e.g. a ``.ckpt`` pickle that can never carry one), the verdict is exactly the
+        pre-feature path: the whole-checkpoint charge with the reusable-page credit still applied, so a model
+        that lacks a sidecar is never admitted more strictly than before this feature existed (see
+        :meth:`_disaggregated_component_charge_mb`). Otherwise runs the reclaim attempts (gentle
+        eviction, escalated for the head, then cycling an allocator-stuck idle slot that is *not* this target)
+        and dispatches on
         [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome]:
         reclaim progress is always worth waiting for, and only a head-of-queue blocker with no live job
         holding memory is admitted best-effort once nothing more can be reclaimed.
         """
         self._reconcile_reuse_credit()
+        component_charge_mb = self._disaggregated_component_charge_mb(job, available_process)
+        is_component_charge = component_charge_mb is not None
         ram_verdict = self._ram_budget.check_job(
             job,
             baseline,
             self._measured_available_ram_mb(),
             committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
-            reusable_credit_mb=self._staging_reuse_credit_mb(available_process),
+            reusable_credit_mb=0.0 if is_component_charge else self._staging_reuse_credit_mb(available_process),
             danger_floor_mb=self._ram_danger_floor_mb(),
+            disaggregated=is_component_charge,
+            component_charge_mb=component_charge_mb,
         )
         if ram_verdict.fits:
             self._ram_budget_defer_notified = False
-            if ram_verdict.reusable_credit_mb > 0.0:
+            if is_component_charge:
+                self._note_component_admission(job, available_process, ram_verdict)
+            elif ram_verdict.reusable_credit_mb > 0.0:
                 self._note_credited_admission(job, available_process, ram_verdict)
             self._resolve_head_ram_defer(job, reason="admitted")
             return True

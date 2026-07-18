@@ -849,6 +849,35 @@ measured truth once the target settles: a target that grew past the charge by a 
 margin logs that the credit was too generous, the signal for retuning the credit
 constants against field data.
 
+A **disaggregation-class** job is charged its **UNet-only** component cost on that
+same RAM check, for the same reason the VRAM side charges it sampler-only: its
+sampler process stages only the UNet, while the text encoders and VAE the whole
+checkpoint bundles run in the encode service and the image lane, never in the
+sampler. The whole-checkpoint prediction therefore over-counts by those support
+weights, and deferring on that inflated figure wrongly holds a UNet stage the host
+has room for. The budget instead reads the checkpoint's **component-identity
+sidecar** (a small JSON written beside the checkpoint, torch-free, so the
+orchestrator never imports hordelib to consult it) for the UNet-ish residual
+(`total tensor bytes − embedded VAE − embedded text encoders`) and charges that,
+floored so a degenerate residual is never priced near zero and clamped never to
+exceed the whole-checkpoint charge. When the residency map shows the checkpoint
+already staged on the target the charge is zero (the stage materialises nothing,
+the RAM analogue of the resident-weight credit), and a missing sidecar or
+unresolved checkpoint path falls back to the unchanged whole-checkpoint charge, so
+the optimization is fail-safe. This is a **charging-honesty** correction, not a
+residency strategy: it exists to stop the old checkpoint-sized price from deferring
+a stage that fits, and it deliberately does **not** assume keeping several UNets
+resident at once pays (a UNet reload off the page cache is cheap, and multi-UNet
+residency was measured to *slow* sampling on a tight card). The class predicate is
+the stable one the VRAM side shares, so a job's RAM and VRAM accounting agree
+within a cycle rather than flip-flopping between the whole and component footprint.
+A job re-routed back to the monolithic path is no longer disaggregation-class, so
+its next admission re-prices whole-checkpoint through the same seam, with no
+separate code path to keep in sync. Each UNet-only admission is reconciled like the
+reuse credit: measured RSS growth below the component charge is the expected mmap
+page-sharing outcome and stays silent, and only growth past it by a wide margin
+logs that the residual under-priced the stage.
+
 Separately from the *marginal* fit check above, an **absolute system-RAM danger
 floor** guards against the kernel OOM-killer. It is evaluated **every scheduling
 tick**, not only when a new model needs preloading: a steady-state worker whose

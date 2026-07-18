@@ -52,6 +52,7 @@ __all__ = [
     "extra_model_roots_from_env",
     "free_model_bytes",
     "is_model_present",
+    "primary_checkpoint_path_for",
 ]
 
 
@@ -70,6 +71,31 @@ def _coerce_extra_roots(extra_model_directories: Sequence[str | os.PathLike[str]
     if extra_model_directories is None:
         return extra_model_roots_from_env()
     return [Path(entry) for entry in extra_model_directories]
+
+
+def primary_checkpoint_path_for(
+    record: GenericModelRecord,
+    root: Path,
+    *,
+    extra_roots: Sequence[Path] = (),
+) -> Path | None:
+    """Resolve the record's primary (non-component-routed) checkpoint file path, or None.
+
+    Every declared file is resolved via :func:`horde_model_reference.on_disk_layout.file_paths_for` over
+    ``[root, *extra_roots]`` (the first existing copy wins, else the target under the primary root). The
+    primary file is the first download entry whose ``file_purpose`` does not route it to a sibling component
+    folder (the monolithic checkpoint); a record that declares only component files falls back to the first
+    resolved path, and one that declares no files returns None. Shared by the inference scheduler's component
+    charge and the config-load sidecar lookup so both pick the same file.
+    """
+    from horde_model_reference.on_disk_layout import COMPONENT_PURPOSE_FOLDERS
+
+    paths = file_paths_for(record, root, extra_roots=tuple(extra_roots))
+    downloads = record.config.download if record.config is not None else []
+    for path, download in zip(paths, downloads, strict=False):
+        if download.file_purpose not in COMPONENT_PURPOSE_FOLDERS:
+            return path
+    return paths[0] if paths else None
 
 
 @dataclass(frozen=True)

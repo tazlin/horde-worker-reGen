@@ -120,8 +120,9 @@ class BudgetVerdict:
     """Whether the job's predicted cost plus the reserve fits the measured available resource."""
     predicted_mb: float | None
     """The effective predicted cost (MB) the fit was decided against, or None when no estimate could be
-    produced. For a RAM verdict that credited a staging target's reusable retained pages this is the
-    credited (reduced) charge, not the raw model cost; ``uncredited_predicted_mb`` carries the raw figure."""
+    produced. For a RAM verdict that credited a staging target's reusable retained pages, or priced a
+    disaggregation-class job at its UNet-only component charge, this is the reduced charge, not the raw model
+    cost; ``uncredited_predicted_mb`` carries the raw whole-checkpoint figure."""
     available_mb: float | None
     """The measured available resource (MB) at check time, or None when no telemetry exists yet."""
     reserve_mb: float
@@ -1141,6 +1142,42 @@ def predict_job_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -
     return None if burden is None else float(burden.ram_mb)
 
 
+_COMPONENT_STAGING_CHARGE_FLOOR_MB = 1700.0
+"""Lower bound (MB) on the UNet-only RAM staging charge for a disaggregation-class job, whatever the sidecar
+residual computes.
+
+An SD1.5 UNet residual (~1.7GB fp16) is the smallest disaggregation-eligible UNet, so a component swap is never
+priced below it: a degenerate or malformed sidecar residual (near-zero, or a container whose embedded-component
+accounting over-subtracts) cannot admit a UNet stage as if it were free. The SDXL UNet residual (~5GB) is
+charged directly by :func:`predict_job_unet_only_ram_mb` and sits well above this floor, so this bound bites
+only on an implausibly small reading. Sized in the same reasoning family as
+:data:`_MARGINAL_STAGING_CHARGE_FLOOR_MB` (a measured worst-case swap growth), narrowed here to the UNet-only
+component rather than a whole in-place checkpoint swap."""
+
+
+def predict_job_unet_only_ram_mb(residual_tensor_bytes: int) -> float:
+    """Return the UNet-only RAM staging charge (MB) for a disaggregation-class job, floored.
+
+    A disaggregation-class job's sampler holds only the UNet: the text encoders and VAE run in the encode
+    service and image lane, so staging its checkpoint into RAM costs the UNet-ish residual (the checkpoint's
+    total tensor bytes minus its embedded VAE and text-encoder bytes), not the whole checkpoint. The residual
+    is read torch-free from the checkpoint's component-identity sidecar
+    (:attr:`horde_model_reference.component_identity.ComponentIdentitySidecar.residual_tensor_bytes`) and passed
+    here as bytes; this converts it to MB and floors it at :data:`_COMPONENT_STAGING_CHARGE_FLOOR_MB` so a
+    degenerate residual is never priced near zero.
+
+    This is a bookkeeping charge, not a residency strategy: a UNet reload is cheap (mmap plus page cache), so
+    the charge exists to stop the old whole-checkpoint price from wrongly deferring a UNet stage the host has
+    room for, never to encourage several UNets resident at once. The transient read-spike headroom is not
+    folded into this settled figure; it is reserved once at the danger-floor gate in
+    :meth:`RamBudget.check_job` (the same :data:`_MARGINAL_STAGING_TRANSIENT_HEADROOM_MB` reasoning the
+    marginal-credit path applies), so the spike is counted at the floor boundary and not double-charged into
+    the admission arithmetic. Never raises.
+    """
+    residual_mb = max(0, residual_tensor_bytes) / (1024 * 1024)
+    return max(_COMPONENT_STAGING_CHARGE_FLOOR_MB, residual_mb)
+
+
 def predict_job_post_processing_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
     """Return a job's predicted *post-processing-phase* VRAM peak (MB), or None when unavailable.
 
@@ -1569,6 +1606,8 @@ class RamBudget:
         *,
         reusable_credit_mb: float = 0.0,
         danger_floor_mb: float | None = None,
+        disaggregated: bool = False,
+        component_charge_mb: float | None = None,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured available system RAM.
 
@@ -1591,11 +1630,35 @@ class RamBudget:
         still leave available RAM above that floor, so the budget never credits itself into a floor breach;
         otherwise the raw charge stands (and ordinarily defers). Callers that pass neither keep the prior
         full-charge behavior.
+
+        Component contract: ``disaggregated`` with a non-None ``component_charge_mb`` prices the staging charge
+        at the job's UNet-only cost instead of the whole checkpoint. A disaggregation-class job's sampler holds
+        only the UNet, so staging it into RAM costs the component charge the caller derives from the
+        checkpoint's component-identity sidecar (:func:`predict_job_unet_only_ram_mb`), or 0.0 when the caller's
+        residency view shows the checkpoint already staged on the target (the RAM analogue of the resident-
+        weight credit, a stage that materialises nothing). This branch supersedes ``reusable_credit_mb`` (they
+        are alternative marginal accountings of the same load; stacking them would double-discount). The
+        reduced charge is clamped never to exceed the whole-checkpoint prediction and is gated against
+        ``danger_floor_mb`` structurally identically to the reuse credit; a floor-unsafe reduction falls back
+        to the conservative whole-checkpoint charge. When ``disaggregated`` is set but ``component_charge_mb``
+        is None (the caller found no sidecar), this branch is skipped entirely: the ordinary whole-checkpoint
+        path runs, ``reusable_credit_mb`` and all, so a sidecar-less model is priced exactly as it was before
+        component charging existed (fail-safe).
         """
         if available_ram_mb is None:
             return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
 
         effective_available_mb = available_ram_mb - committed_reserve_mb
+
+        if disaggregated and component_charge_mb is not None:
+            return self._check_component_charge(
+                job,
+                baseline,
+                effective_available_mb,
+                component_charge_mb=component_charge_mb,
+                danger_floor_mb=danger_floor_mb,
+            )
+
         predicted = predict_job_ram_mb(job, baseline)
         if predicted is None:
             return BudgetVerdict(
@@ -1626,6 +1689,54 @@ class RamBudget:
             available_mb=effective_available_mb,
             reserve_mb=self._reserve_mb,
             uncredited_predicted_mb=predicted if applied_credit_mb > 0.0 else None,
+            reusable_credit_mb=applied_credit_mb,
+        )
+
+    def _check_component_charge(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        effective_available_mb: float,
+        *,
+        component_charge_mb: float,
+        danger_floor_mb: float | None,
+    ) -> BudgetVerdict:
+        """Price a disaggregation-class preload at its UNet-only component charge instead of the whole checkpoint.
+
+        ``component_charge_mb`` is the caller's fully-reconciled UNet-only staging cost: the floored sidecar
+        residual (:func:`predict_job_unet_only_ram_mb`) for a swap, or 0.0 when the checkpoint is already staged
+        on the target (nothing to load). The whole-checkpoint prediction is still computed so the reduced charge
+        can be clamped never to exceed it and reported as ``uncredited_predicted_mb``. The danger-floor gate is
+        structurally identical to the marginal-credit path (available minus the charge minus a transient
+        load-spike headroom must clear the floor); a floor-unsafe reduction falls back to the conservative
+        whole-checkpoint charge, so the budget never prices a UNet stage cheap enough to admit into a floor
+        breach. When no whole-checkpoint estimate exists the job is admitted unpriced, matching the ordinary
+        path's never-wedge-on-unknown behavior.
+        """
+        whole_predicted = predict_job_ram_mb(job, baseline)
+        if whole_predicted is None:
+            return BudgetVerdict(
+                fits=True,
+                predicted_mb=None,
+                available_mb=effective_available_mb,
+                reserve_mb=self._reserve_mb,
+            )
+
+        candidate_charge = min(component_charge_mb, whole_predicted)
+        floor_safe = danger_floor_mb is None or (
+            effective_available_mb - candidate_charge - _MARGINAL_STAGING_TRANSIENT_HEADROOM_MB >= danger_floor_mb
+        )
+        if not floor_safe:
+            candidate_charge = whole_predicted
+        applied_credit_mb = whole_predicted - candidate_charge
+
+        fits = effective_available_mb >= candidate_charge + self._reserve_mb
+        return BudgetVerdict(
+            fits=fits,
+            predicted_mb=candidate_charge,
+            available_mb=effective_available_mb,
+            reserve_mb=self._reserve_mb,
+            uncredited_predicted_mb=whole_predicted if applied_credit_mb > 0.0 else None,
             reusable_credit_mb=applied_credit_mb,
         )
 

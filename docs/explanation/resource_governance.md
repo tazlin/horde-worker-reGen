@@ -146,7 +146,12 @@ the judgment calls live as pure functions in
    resolves whether to wait for the reclaimed memory to show up or proceed. Same-tick reclaim side effects
    stay behind the
    [`ReclamationExecutor`][horde_worker_regen.process_management.scheduling.governance.preload_admission.ReclamationExecutor]
-   protocol, implemented by the scheduler because it owns live process state and logging.
+   protocol, implemented by the scheduler because it owns live process state and logging. The RAM charge is
+   marginal-clean: a reload onto a warm slot is credited its reusable retained pages, and a
+   disaggregation-class job is charged its UNet-only component cost (from the checkpoint's component-identity
+   sidecar) rather than the whole checkpoint the sampler never fully stages. Both are charging-honesty
+   corrections that never mix the device-level baseline into a per-job marginal; see
+   [Performance and backpressure](performance_and_backpressure.md#the-vram-and-ram-budget).
 
 Two scoping rules keep these last-resort remedies from taxing a healthy host:
 
