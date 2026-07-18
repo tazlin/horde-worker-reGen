@@ -124,7 +124,10 @@ def _make_download_process(
     fake_api = types.ModuleType("hordelib.api")
     fake_api.SharedModelManager = SimpleNamespace(manager=fake_manager)  # type: ignore[attr-defined]
     hordelib_stub = sys.modules.get("hordelib") or types.ModuleType("hordelib")
-    hordelib_stub.api = fake_api  # type: ignore[attr-defined]
+    # The attribute mutation must go through monkeypatch: a real, already-imported hordelib package would
+    # otherwise keep the fake as its ``api`` attribute after teardown (setitem only restores sys.modules),
+    # poisoning every later attribute-path resolution of hordelib.api in this process.
+    monkeypatch.setattr(hordelib_stub, "api", fake_api, raising=False)
     monkeypatch.setitem(sys.modules, "hordelib", hordelib_stub)
     monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
 
