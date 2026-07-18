@@ -424,6 +424,27 @@ class HordeInferenceResultMessage(HordeProcessMessage):
         return total
 
 
+class PipelineStageTag(StrEnum):
+    """Identifies which disaggregated pipeline stage produced a per-job metrics snapshot.
+
+    Set on a :class:`HordeJobMetricsMessage` by the process that ran a single disaggregated stage, so
+    each model-load event (disk->RAM, RAM->VRAM) keeps the attribution of the stage that incurred it,
+    which lets the run metrics count reloads per stage instead of per whole job. Each stage drains the
+    collector when it finishes, so a multi-slice sample batch attributes its loads to the slice that
+    triggered them. The monolithic inference emission covers an entire job in one process (no single
+    stage owns its loads), so it stays untagged (``stage is None``).
+    """
+
+    TEXT_ENCODE = auto()
+    """Prompt conditioning produced by the component lane's text-encode service."""
+    VAE_ENCODE = auto()
+    """Source-image start latent produced by the VAE lane (img2img/remix/inpaint front-end)."""
+    SAMPLE = auto()
+    """UNet sampling of one slice on a pinned sampler process, producing the job's latent."""
+    VAE_DECODE = auto()
+    """Final images decoded from the sampled latent by the VAE lane."""
+
+
 class HordeJobMetricsMessage(HordeProcessMessage):
     """Per-job performance metrics, sent by a child right after a job (or alchemy form) finishes.
 
@@ -436,6 +457,9 @@ class HordeJobMetricsMessage(HordeProcessMessage):
     """The generation ID of the image job, or the form ID of the alchemy form."""
     is_alchemy: bool = False
     """Whether these metrics belong to an alchemy form rather than an image job."""
+    stage: PipelineStageTag | None = None
+    """The disaggregated pipeline stage these metrics belong to, or None for a whole-job (monolithic)
+    or otherwise unstaged emission. Additive over IPC: an older consumer that lacks the field ignores it."""
     phase_metrics: JobPhaseMetrics
     """The per-job metrics snapshot from hordelib."""
 

@@ -28,10 +28,12 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
+    HordeJobMetricsMessage,
     HordeProcessHeartbeatMessage,
     HordeProcessMemoryMessage,
     HordeProcessState,
     HordeProcessStateChangeMessage,
+    PipelineStageTag,
     UnsupportedControlMessageError,
 )
 
@@ -504,6 +506,30 @@ class HordeProcess(abc.ABC):
 
         self.process_message_queue.put(message)
         return True
+
+    def send_stage_job_metrics_message(self, job_id: str, *, stage: PipelineStageTag | None = None) -> None:
+        """Drain hordelib's per-job metrics collector after a stage and forward the snapshot, stage-tagged.
+
+        A disaggregated lane runs one pipeline stage of a job, so draining the collector here attributes
+        that stage's model-load events (disk->RAM, RAM->VRAM) to ``stage`` for the parent's run metrics.
+        Best effort by design: a metrics failure must never fault a stage that otherwise succeeded, and the
+        snapshot is sent even in dry-run (empty) so the message flow is identical with and without a backend.
+        """
+        try:
+            from hordelib.api import get_metrics_collector
+
+            self.process_message_queue.put(
+                HordeJobMetricsMessage(
+                    process_id=self.process_id,
+                    process_launch_identifier=self.process_launch_identifier,
+                    info=f"Stage metrics for {job_id}",
+                    job_id=job_id,
+                    stage=stage,
+                    phase_metrics=get_metrics_collector().snapshot_and_reset_job(),
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send stage job metrics: {type(e).__name__} {e}")
 
     @abstractmethod
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:

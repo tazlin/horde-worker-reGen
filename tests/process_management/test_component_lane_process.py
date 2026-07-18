@@ -8,9 +8,11 @@ import pytest
 
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
+    HordeJobMetricsMessage,
     HordeProcessState,
     HordeTextEncodeControlMessage,
     HordeTextEncodeResultMessage,
+    PipelineStageTag,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
@@ -89,3 +91,40 @@ def test_text_encode_fault_carries_exception_text(monkeypatch: pytest.MonkeyPatc
     assert len(results) == 1
     assert results[0].state == GENERATION_STATE.faulted
     assert results[0].fault_reason == "RuntimeError: CUDA out of memory"
+
+
+def _patch_metrics_collector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point hordelib's metrics collector at a stand-in that yields one disk->RAM model-load event."""
+    from unittest.mock import Mock
+
+    from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent
+
+    def _snapshot() -> JobPhaseMetrics:
+        return JobPhaseMetrics(
+            model_loads=[
+                ModelLoadEvent(model_name="text_encoders", phase="disk_to_ram", duration_seconds=1.0, timestamp=0.0),
+            ],
+        )
+
+    collector = Mock()
+    collector.snapshot_and_reset_job.side_effect = _snapshot
+    monkeypatch.setattr("hordelib.api.get_metrics_collector", lambda: collector)
+
+
+def test_text_encode_emits_stage_tagged_job_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a text-encode stage the lane forwards a stage-tagged HordeJobMetricsMessage for the job."""
+    _patch_metrics_collector(monkeypatch)
+    queue = _FakeQueue()
+    lane = _make_dry_run_lane(queue)
+
+    job = make_job_pop_response(model="SDXL 1.0")
+    queue.messages.clear()
+    lane._run_text_encode(
+        HordeTextEncodeControlMessage(horde_model_name="SDXL 1.0", job_id=job.id_, sdk_api_job_info=job),
+    )
+
+    metrics = [message for message in queue.messages if isinstance(message, HordeJobMetricsMessage)]
+    assert len(metrics) == 1
+    assert metrics[0].stage is PipelineStageTag.TEXT_ENCODE
+    assert metrics[0].job_id == str(job.id_)
+    assert any(load.phase == "disk_to_ram" for load in metrics[0].phase_metrics.model_loads)

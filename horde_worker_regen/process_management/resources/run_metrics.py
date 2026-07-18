@@ -24,6 +24,7 @@ from horde_worker_regen.app_state import default_app_state_dir
 from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
+    PipelineStageTag,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     StatsExportState,
@@ -130,6 +131,10 @@ class JobMetricsRecord(BaseModel):
     """Safety-check queue entry to submit-ready."""
     phase_metrics: JobPhaseMetrics | None = None
     """Model-load/sampling/memory metrics reported by the child process, when correlated."""
+    stage: PipelineStageTag | None = None
+    """The disaggregated pipeline stage this record's ``phase_metrics`` belong to, or None for a whole-job
+    (monolithic/alchemy) record. Set only on stage records (see :attr:`RunMetricsSnapshot.stage_metrics`), so a
+    consumer can count model-load events (disk->RAM reloads) grouped by the stage that incurred them."""
 
     model_name: str | None = None
     steps: int | None = None
@@ -368,6 +373,14 @@ class RunMetricsSnapshot(BaseModel):
     """Everything the run metrics aggregator observed, frozen at snapshot time."""
 
     jobs: list[JobMetricsRecord]
+    stage_metrics: list[JobMetricsRecord] = Field(default_factory=list)
+    """Per-stage metrics records from the disaggregated lanes (text-encode, VAE encode/decode), each tagged
+    with its :class:`~horde_worker_regen.process_management.ipc.messages.PipelineStageTag`.
+
+    Held separately from ``jobs`` because one disaggregated job emits a metrics snapshot per stage under the
+    same id: folding them into ``jobs`` would clobber the whole-job correlation and inflate job counts. This
+    list preserves every stage snapshot so a reload-per-stage count (disk->RAM events grouped by stage) can be
+    derived without disturbing the finalized-job records or their rollups."""
     downloads: list[DownloadEvent]
     vram_used_high_water_mb_per_process: dict[int, int]
     ram_used_high_water_mb_per_process: dict[int, int]
@@ -508,6 +521,7 @@ class WorkerRunMetrics:
     def __init__(self, *, baseline_resolver: Callable[[str], str | None] | None = None) -> None:
         """Initialize empty aggregation state."""
         self._jobs: list[JobMetricsRecord] = []
+        self._stage_metrics: list[JobMetricsRecord] = []
         self._downloads: list[DownloadEvent] = []
         self._phase_metrics_by_job: dict[str, JobPhaseMetrics] = {}
         self._vram_high_water_per_process: dict[int, int] = {}
@@ -534,6 +548,7 @@ class WorkerRunMetrics:
     def reset(self) -> None:
         """Clear all aggregated metrics, e.g. at a benchmark level boundary on a warm worker."""
         self._jobs.clear()
+        self._stage_metrics.clear()
         self._downloads.clear()
         self._phase_metrics_by_job.clear()
         self._vram_high_water_per_process.clear()
@@ -572,6 +587,21 @@ class WorkerRunMetrics:
         if metrics.ram_used_high_water_mb is not None:
             current = self._ram_high_water_per_process.get(message.process_id, 0)
             self._ram_high_water_per_process[message.process_id] = max(current, metrics.ram_used_high_water_mb)
+
+        # A disaggregated lane stage attributes its own model-load events to its stage. One job emits a
+        # snapshot per stage under the same id, so these are retained as standalone stage records rather than
+        # held in the single-slot whole-job correlation (which the last stage would clobber) or folded into
+        # the finalized-job rollups.
+        if message.stage is not None:
+            self._stage_metrics.append(
+                JobMetricsRecord(
+                    job_id=message.job_id,
+                    is_alchemy=message.is_alchemy,
+                    stage=message.stage,
+                    phase_metrics=metrics,
+                ),
+            )
+            return
 
         # Both image jobs and alchemy forms finalize later (the alchemy coordinator records the form's
         # full record at submit, with its name and pop->submit timing), so hold the child's phase metrics
@@ -1074,6 +1104,7 @@ class WorkerRunMetrics:
         """
         return RunMetricsSnapshot(
             jobs=list(self._jobs),
+            stage_metrics=list(self._stage_metrics),
             downloads=list(self._downloads),
             vram_used_high_water_mb_per_process=dict(self._vram_high_water_per_process),
             ram_used_high_water_mb_per_process=dict(self._ram_high_water_per_process),

@@ -55,6 +55,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSampleControlMessage,
     HordeSampleResultMessage,
     ModelLoadState,
+    PipelineStageTag,
     SampleSliceResult,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -399,14 +400,16 @@ class FakeInferenceProcess(HordeProcess):
         """
         self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
         time_start = time.time()
-        results = [
-            SampleSliceResult(
-                job_id=job_slice.job_id,
-                latent_bytes=self._make_dummy_latent_bytes(),
-                state=GENERATION_STATE.ok,
+        results = []
+        for job_slice in message.slices:
+            results.append(
+                SampleSliceResult(
+                    job_id=job_slice.job_id,
+                    latent_bytes=self._make_dummy_latent_bytes(),
+                    state=GENERATION_STATE.ok,
+                ),
             )
-            for job_slice in message.slices
-        ]
+            self.send_stage_job_metrics_message(str(job_slice.job_id), stage=PipelineStageTag.SAMPLE)
         self.process_message_queue.put(
             HordeSampleResultMessage(
                 process_id=self.process_id,

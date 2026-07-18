@@ -12,6 +12,7 @@ from pytest import MonkeyPatch
 from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
+    PipelineStageTag,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import StatsSample
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
@@ -169,6 +170,87 @@ class TestJobCorrelation:
         rollups = {row.model: row for row in metrics.form_rollups()}
         assert rollups["caption"].jobs == 2
         assert rollups["caption"].e2e_seconds == 6.0
+
+
+class TestStageMetrics:
+    """Stage-tagged lane metrics are retained per stage without disturbing the whole-job records."""
+
+    def _stage_message(self, job_id: str, stage: PipelineStageTag) -> HordeJobMetricsMessage:
+        return HordeJobMetricsMessage(
+            process_id=3,
+            process_launch_identifier=0,
+            info="stage",
+            job_id=job_id,
+            stage=stage,
+            phase_metrics=_make_phase_metrics(),
+        )
+
+    def test_stage_messages_are_retained_per_stage(self) -> None:
+        """Each disaggregated stage of one job survives as its own stage record with the disk->RAM event."""
+        metrics = WorkerRunMetrics()
+        metrics.on_job_metrics(self._stage_message("job-1", PipelineStageTag.TEXT_ENCODE))
+        metrics.on_job_metrics(self._stage_message("job-1", PipelineStageTag.VAE_ENCODE))
+        metrics.on_job_metrics(self._stage_message("job-1", PipelineStageTag.VAE_DECODE))
+
+        stage_records = metrics.snapshot().stage_metrics
+        assert [record.stage for record in stage_records] == [
+            PipelineStageTag.TEXT_ENCODE,
+            PipelineStageTag.VAE_ENCODE,
+            PipelineStageTag.VAE_DECODE,
+        ]
+        assert all(record.job_id == "job-1" for record in stage_records)
+        disk_to_ram_per_stage = [
+            sum(1 for load in record.phase_metrics.model_loads if load.phase == "disk_to_ram")
+            for record in stage_records
+            if record.phase_metrics is not None
+        ]
+        assert disk_to_ram_per_stage == [1, 1, 1]
+
+    def test_stage_messages_do_not_enter_jobs_or_rollups(self) -> None:
+        """Stage records stay out of the finalized-job list and the model rollups (existing consumers)."""
+        metrics = WorkerRunMetrics()
+        metrics.on_job_metrics(self._stage_message("job-1", PipelineStageTag.VAE_DECODE))
+
+        snapshot = metrics.snapshot()
+        assert snapshot.jobs == []
+        assert metrics.model_rollups() == []
+        assert metrics.baseline_rollups() == []
+
+    def test_untagged_message_still_correlates_at_finalize_with_no_stage(self) -> None:
+        """A whole-job (untagged) message keeps its historical correlation and lands with stage=None."""
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        metrics.on_job_metrics(_job_metrics_message(str(job.id_)))  # untagged
+        _finalize_job_from(metrics, job)
+
+        snapshot = metrics.snapshot()
+        assert snapshot.stage_metrics == []
+        assert len(snapshot.jobs) == 1
+        assert snapshot.jobs[0].stage is None
+        assert snapshot.jobs[0].phase_metrics is not None
+
+    def test_reset_clears_stage_metrics(self) -> None:
+        """A benchmark-level reset drops retained stage records alongside the other aggregates."""
+        metrics = WorkerRunMetrics()
+        metrics.on_job_metrics(self._stage_message("job-1", PipelineStageTag.TEXT_ENCODE))
+        metrics.reset()
+        assert metrics.snapshot().stage_metrics == []
+
+
+def _finalize_job_from(metrics: WorkerRunMetrics, job: object) -> None:
+    """Finalize a specific job object (so a held phase-metrics correlation can be asserted)."""
+    tracked = TrackedJob(
+        job_id=job.id_,  # type: ignore[attr-defined]
+        sdk_api_job_info=job,  # type: ignore[arg-type]
+        stage=JobStage.PENDING_SUBMIT,
+        time_popped=100.0,
+        stage_timestamps={"FINALIZED": 110.0},
+    )
+    metrics.on_job_finalized(
+        tracked,
+        HordeJobInfo(sdk_api_job_info=job, state=GENERATION_STATE.ok, time_popped=100.0),  # type: ignore[arg-type]
+    )
 
 
 class TestAggregates:

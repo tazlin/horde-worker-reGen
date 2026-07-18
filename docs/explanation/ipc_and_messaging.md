@@ -74,7 +74,7 @@ so a routing-incapable process is never asked.
 | `HordeProcessMemoryMessage`       | Periodic memory report                       | `ram_usage_bytes`, `vram_usage_mb`, `vram_total_mb`                                    |
 | `HordeInferenceResultMessage`     | Inference completes (success/fault/censored) | State, base64 images, timing, metadata                                                |
 | `HordeAlchemyResultMessage`       | An alchemy form completes                    | `form_id`, `form`, state; `result_payload` (text forms) or `image_base64` (graph forms) |
-| `HordeJobMetricsMessage`          | A job (or alchemy form) finishes             | `job_id`, `is_alchemy`, a `JobPhaseMetrics` snapshot (load timings, it/s, mem high-water) |
+| `HordeJobMetricsMessage`          | A job, alchemy form, or disaggregated stage finishes | `job_id`, `is_alchemy`, optional `stage` (`PipelineStageTag`, else None), a `JobPhaseMetrics` snapshot (load timings, it/s, mem high-water) |
 | `HordeDownloadMetricsMessage`     | Ad-hoc downloads (lora/ti) complete          | A list of `DownloadEvent` (name, size, MB/s, success)                                 |
 | `HordeSafetyResultMessage`        | Safety check completes                       | `job_id` + per-image safety evaluations (NSFW/CSAM flags, optional replacement image) |
 
@@ -82,6 +82,15 @@ The two metrics messages (`HordeJobMetricsMessage`, `HordeDownloadMetricsMessage
 carry the numbers from hordelib's in-process metrics collector into the main
 process's run-metrics aggregator; see
 [Architecture → Metrics and observability](architecture.md#metrics-and-observability).
+
+Under pipeline disaggregation every stage drains the collector when it finishes and sets
+`stage` on the message: the dedicated lanes (text-encode, VAE encode/decode) once per
+stage, and the sampler once per slice of a sample batch, so the slice that triggered a
+UNet load owns its load events. Because one job emits several such messages under the
+same id, the aggregator retains them as separate stage records
+(`RunMetricsSnapshot.stage_metrics`) rather than folding them into the whole-job
+correlation; the monolithic inference emission covers an entire job in one process and
+stays untagged (`stage is None`).
 
 ## Process state machine
 

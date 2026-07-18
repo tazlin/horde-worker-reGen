@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
 
@@ -17,6 +18,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
+    HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
@@ -30,6 +32,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeVaeEncodeControlMessage,
     HordeVaeEncodeResultMessage,
     ModelLoadState,
+    PipelineStageTag,
     SampleSliceSpec,
 )
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
@@ -118,6 +121,13 @@ def make_fake_safety_process() -> tuple[FakeSafetyProcess, RecordingQueue]:
         process_launch_identifier=0,
     )
     return process, queue
+
+
+def _empty_phase_metrics() -> object:
+    """A metrics snapshot with no load events, as a dry-run stage drain would produce."""
+    from hordelib.metrics import JobPhaseMetrics
+
+    return JobPhaseMetrics()
 
 
 class TestFakeInferenceProcess:
@@ -232,13 +242,17 @@ class TestFakeInferenceProcess:
 
         assert process._active_model_name is None
 
-    def test_sample_stage_emits_starting_result_and_waiting(self) -> None:
+    def test_sample_stage_emits_starting_result_and_waiting(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A START_SAMPLE message must report INFERENCE_STARTING, return a LATENT per slice, then idle.
 
         This mirrors the real sampler's disaggregated stage: the ``INFERENCE_STARTING`` is a plain
         process-state change (no model-state traffic), so the fake never fakes a model residency the
-        parent tracks. Two slices must yield two per-slice results, in order.
+        parent tracks. Two slices must yield two per-slice results, in order, and each slice must emit
+        a SAMPLE-tagged metrics snapshot so per-stage reload counting sees the sampler.
         """
+        collector = Mock()
+        collector.snapshot_and_reset_job.return_value = _empty_phase_metrics()
+        monkeypatch.setattr("hordelib.api.get_metrics_collector", lambda: collector)
         process, queue = make_fake_inference_process()
         job_a = make_job_pop_response(model="SDXL 1.0")
         job_b = make_job_pop_response(model="SDXL 1.0")
@@ -275,6 +289,10 @@ class TestFakeInferenceProcess:
         states = queue.state_changes()
         assert HordeProcessState.INFERENCE_STARTING in states
         assert states[-1] == HordeProcessState.WAITING_FOR_JOB
+
+        stage_metrics = queue.of_type(HordeJobMetricsMessage)
+        assert [m.job_id for m in stage_metrics] == [str(job_a.id_), str(job_b.id_)]
+        assert all(m.stage == PipelineStageTag.SAMPLE for m in stage_metrics)
 
 
 class TestVaeLaneProcess:

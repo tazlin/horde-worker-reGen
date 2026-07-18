@@ -38,6 +38,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeVaeDecodeResultMessage,
     HordeVaeEncodeControlMessage,
     HordeVaeEncodeResultMessage,
+    PipelineStageTag,
     UnsupportedControlMessageError,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
@@ -278,6 +279,7 @@ class HordeVaeLaneProcess(HordeProcess):
                 fault_reason=fault_reason,
             ),
         )
+        self.send_stage_job_metrics_message(str(message.job_id), stage=PipelineStageTag.VAE_ENCODE)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
     def _run_vae_decode(self, message: HordeVaeDecodeControlMessage) -> None:
@@ -330,6 +332,7 @@ class HordeVaeLaneProcess(HordeProcess):
                 fault_reason=fault_reason,
             ),
         )
+        self.send_stage_job_metrics_message(str(message.job_id), stage=PipelineStageTag.VAE_DECODE)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
     @override

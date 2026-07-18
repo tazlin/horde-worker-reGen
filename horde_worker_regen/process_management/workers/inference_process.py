@@ -43,6 +43,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSampleControlMessage,
     HordeSampleResultMessage,
     ModelLoadState,
+    PipelineStageTag,
     SampleSliceResult,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
@@ -1066,6 +1067,9 @@ class HordeInferenceProcess(HordeProcess):
                 results.append(
                     SampleSliceResult(job_id=job_slice.job_id, latent_bytes=None, state=GENERATION_STATE.faulted),
                 )
+            # Drained per slice (success or fault) so the slice that triggered a UNet load owns the
+            # load events; same-model siblings in the batch then correctly report none.
+            self.send_stage_job_metrics_message(str(job_slice.job_id), stage=PipelineStageTag.SAMPLE)
 
         self.process_message_queue.put(
             HordeSampleResultMessage(

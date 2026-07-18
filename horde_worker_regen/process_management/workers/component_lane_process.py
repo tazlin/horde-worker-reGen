@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     HordeTextEncodeControlMessage,
     HordeTextEncodeResultMessage,
+    PipelineStageTag,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
 from horde_worker_regen.utils.oom_signature import is_resource_class_exception
@@ -167,6 +168,7 @@ class HordeComponentLaneProcess(HordeProcess):
                 fault_reason=fault_reason,
             ),
         )
+        self.send_stage_job_metrics_message(str(message.job_id), stage=PipelineStageTag.TEXT_ENCODE)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, info="Text-encode service ready")
 
     @staticmethod
