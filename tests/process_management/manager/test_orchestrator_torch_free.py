@@ -25,6 +25,7 @@ _TORCH_FREE_IMPORT_MODULES = [
     "horde_worker_regen.process_management.scheduling.inference_scheduler",
     "horde_worker_regen.process_management.models.desired_state",
     "horde_worker_regen.process_management.models.feature_readiness",
+    "horde_worker_regen.process_management.models.component_residency_map",
     "horde_worker_regen.process_management.resources.resource_budget",
     "horde_worker_regen.process_management.jobs.job_popper",
     "horde_worker_regen.process_management.lifecycle.process_map",

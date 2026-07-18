@@ -47,6 +47,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
@@ -260,6 +261,7 @@ class ProcessLifecycleManager:
 
     _process_map: ProcessMap
     _horde_model_map: HordeModelMap
+    _component_residency_map: ComponentResidencyMap | None
     _job_tracker: JobTracker
     _process_message_queue: ProcessQueue
     _child_facing_queues: list[ProcessQueue]
@@ -303,6 +305,7 @@ class ProcessLifecycleManager:
         ctx: BaseContext,
         process_map: ProcessMap,
         horde_model_map: HordeModelMap,
+        component_residency_map: ComponentResidencyMap | None = None,
         job_tracker: JobTracker,
         process_message_queue: ProcessQueue,
         child_facing_queues: list[ProcessQueue] | None = None,
@@ -344,6 +347,7 @@ class ProcessLifecycleManager:
         self._validate_spawn_start_method()
         self._process_map = process_map
         self._horde_model_map = horde_model_map
+        self._component_residency_map = component_residency_map
         self._job_tracker = job_tracker
         self._process_message_queue = process_message_queue
         # Every parent-created child-facing queue to neutralize at teardown. Falls back to the single status
@@ -3113,6 +3117,10 @@ class ProcessLifecycleManager:
             logger.debug(
                 f"Expired model-map entries {expired_by_pid} stranded on dead process {process_info.process_id}",
             )
+        # Drop the dead/recycled slot's component residency alongside its model-map entries, so a checkpoint
+        # stranded on a gone process never keeps widening the staged-model offer nor the eviction candidate set.
+        if self._component_residency_map is not None:
+            self._component_residency_map.expire_process(process_info.process_id)
 
         if job_to_remove is not None:
             # A slot crash/hang mid-job is retryable: the job is requeued to a fresh slot (bounded by

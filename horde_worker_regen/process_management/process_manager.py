@@ -123,6 +123,7 @@ from horde_worker_regen.process_management.lifecycle.process_temperature import 
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
 from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.desired_state import DesiredState
 from horde_worker_regen.process_management.models.download_coordinator import ModelDownloadCoordinator
 from horde_worker_regen.process_management.models.feature_readiness import (
@@ -860,6 +861,12 @@ class HordeWorkerProcessManager:
 
     _horde_model_map: HordeModelMap
 
+    _component_residency_map: ComponentResidencyMap
+    """Per-process view of the components each child holds resident in its RAM component cache.
+
+    Shared by reference: the message dispatcher updates it from memory reports, the process lifecycle expires
+    a dead/recycled process's entry, and the popper reads the staged-checkpoint set from it."""
+
     _device_map: TorchDeviceMap
     """A mapping (dict) of device IDs to TorchDeviceInfo objects. Contains some helper methods."""
 
@@ -997,6 +1004,7 @@ class HordeWorkerProcessManager:
 
         self._process_map = ProcessMap({})
         self._horde_model_map = HordeModelMap(root={})
+        self._component_residency_map = ComponentResidencyMap()
 
         self.max_safety_processes = max_safety_processes
 
@@ -1153,6 +1161,7 @@ class HordeWorkerProcessManager:
             ctx=ctx,
             process_map=self._process_map,
             horde_model_map=self._horde_model_map,
+            component_residency_map=self._component_residency_map,
             job_tracker=self._job_tracker,
             process_message_queue=self._process_message_queue,
             child_facing_queues=self._child_facing_queues,
@@ -1234,6 +1243,8 @@ class HordeWorkerProcessManager:
         # lock) is unrecoverable in place because every child inherits the same queue; the only correct
         # terminal is a loud abort and restart onto a fresh channel.
         self._message_dispatcher.set_channel_corruption_handler(lambda reason: self._abort())
+        # The dispatcher decodes each memory report's component-residency snapshot into this shared map.
+        self._message_dispatcher.set_component_residency_map(self._component_residency_map)
 
         self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
 
@@ -1382,6 +1393,7 @@ class HordeWorkerProcessManager:
             state=self._state,
             process_map=self._process_map,
             horde_model_map=self._horde_model_map,
+            component_residency_map=self._component_residency_map,
             job_tracker=self._job_tracker,
             process_lifecycle=self._process_lifecycle,
             runtime_config=self._runtime_config,
@@ -1524,6 +1536,7 @@ class HordeWorkerProcessManager:
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             admission_baseline_provider=self.latest_baseline_estimate_mb,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
+            staged_models_provider=self._staged_checkpoint_models,
             action_ledger=self._action_ledger,
             post_processing_lane_commitments_provider=lambda: getattr(
                 getattr(self, "_alchemy_coordinator", None),
@@ -3413,6 +3426,19 @@ class HordeWorkerProcessManager:
         except Exception as e:  # noqa: BLE001 - readiness is best-effort; a resolution failure must fail closed.
             logger.debug(f"Extended controlnet readiness probe failed: {type(e).__name__}: {e}")
             return False
+
+    def _staged_checkpoint_models(self) -> frozenset[str]:
+        """Return the checkpoints staged in RAM on live, healthy inference processes eligible to sample.
+
+        Feeds the popper's residency-bias floor: a checkpoint held in a live inference process's RAM cache can
+        be started cheaply (no fresh download/stage), so a narrowed pop may safely offer it. Restricted to the
+        inference processes that are alive (the narrowest liveness predicate the process map exposes), so a
+        checkpoint stranded in a dying slot never widens the offer toward work the card cannot actually run.
+        """
+        live_inference_ids = [
+            info.process_id for info in self._process_map.get_inference_processes() if info.is_process_alive()
+        ]
+        return self._component_residency_map.checkpoint_models_held_on(live_inference_ids)
 
     def _head_aux_prefetch_in_flight(self) -> bool:
         """Whether the head-of-queue pending job is auxiliary-gated with its prefetch still in flight.

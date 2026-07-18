@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
     HordeControlFlag,
     HordeControlMessage,
+    HordeEvictComponentsControlMessage,
     HordeProcessState,
     HordeTextEncodeControlMessage,
     HordeTextEncodeResultMessage,
@@ -89,6 +90,9 @@ class HordeComponentLaneProcess(HordeProcess):
         # The service pages the text encoders onto the device per encode, so its periodic report samples VRAM
         # like inference and the post-process lane, keeping the parent's per-card free-VRAM view fresh.
         self._periodic_report_includes_vram = True
+        # Only a loaded backend has a component cache to report/evict from; a dry-run lane reports nothing and
+        # must not import hordelib on the report/evict paths.
+        self._reports_held_components = not dry_run
         self._horde_model_names = horde_model_names or []
         self._dry_run = dry_run
 
@@ -249,6 +253,10 @@ class HordeComponentLaneProcess(HordeProcess):
 
         if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
             self.release_allocator_cache()
+            return
+
+        if isinstance(message, HordeEvictComponentsControlMessage):
+            self.evict_held_components(message.identities)
             return
 
         if isinstance(message, HordeTextEncodeControlMessage):

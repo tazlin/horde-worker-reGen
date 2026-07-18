@@ -68,7 +68,7 @@ module paths directly.
 | `workers/` | Child-process bodies and worker-side orchestration: inference, safety, safety dispatch, post-processing, disaggregated text/VAE lanes, and background downloads. |
 | `scheduling/` | What to run, when, where, and why: inference scheduling, resource governance, pop throttling, model affinity, performance model, pop-governor visibility, and workload flow routing. |
 | `jobs/` | The unit of work: pop, submit, track, classify failures, alchemy coordination, job data models, and source-image downloads. |
-| `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, cache, LoRA guards/backoff, download coordination, and download scheduling. |
+| `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, the per-process RAM component-residency map, cache, LoRA guards/backoff, download coordination, and download scheduling. |
 | `resources/` | Runtime resource accounting: VRAM/RAM budgets, VRAM arbitration, attribution, device info, system memory, duty-cycle summaries, and run metrics. |
 | `gpu/` | Multi-GPU routing primitives: card runtime state, eligibility checks, and advertised pop-shaping capabilities. |
 | `ipc/` | Message types, channels, dispatch, supervisor protocol, action ledger, and API sessions. |

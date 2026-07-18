@@ -25,6 +25,7 @@ from loguru import logger
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.fd_limits import descriptor_soft_limit, open_descriptor_count
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
@@ -159,6 +160,17 @@ class HordeProcess(abc.ABC):
 
     _last_sent_process_state: HordeProcessState = HordeProcessState.PROCESS_STARTING
     """The last process state that was sent to the main process."""
+
+    _reports_held_components: bool = False
+    """Whether the interval memory report should attach the component-cache residency snapshot.
+
+    Set True only by a process whose hordelib backend is actually loaded (a non-dry-run inference process or
+    VAE/component lane), so the snapshot read touches hordelib solely where it is already resident. Every
+    other process (the fakes, the safety/download processes, any dry-run lane) leaves it False and never
+    imports hordelib on the memory-report path, keeping the report torch-free where no cache exists."""
+
+    _held_components_read_failed_logged: bool = False
+    """Whether the one-shot debug line for a failed component-residency read has already been emitted."""
 
     def get_vram_usage_mb(self) -> int:
         """Return ``torch_total - torch_free`` (mem_get_info): device-wide used on Linux, per-process view on Windows.
@@ -504,8 +516,60 @@ class HordeProcess(abc.ABC):
             logger.error(f"Failed to get VRAM usage: {e}")
             return False
 
+        message.held_components = self._collect_held_components()
+
         self.process_message_queue.put(message)
         return True
+
+    def _collect_held_components(self) -> list[HeldComponentSnapshot] | None:
+        """Snapshot the component cache's resident entries for the memory report, or None when unavailable.
+
+        Best effort by design, mirroring :meth:`send_stage_job_metrics_message`: it reads only observational
+        state and any failure returns None (logged once at debug) rather than disturbing the report. The
+        hordelib import is lazy and gated on :attr:`_reports_held_components`, so a process with no loaded
+        backend (a fake, a dry-run lane, the CPU-only safety/download processes) never imports hordelib here
+        and simply reports None.
+        """
+        if not self._reports_held_components:
+            return None
+        try:
+            from hordelib.api import SharedModelManager
+
+            snapshots = SharedModelManager.manager._models_in_ram.held_report()
+            return [
+                HeldComponentSnapshot(
+                    kind=str(snapshot.kind),
+                    identity=snapshot.identity,
+                    approx_ram_mb=snapshot.approx_ram_mb,
+                )
+                for snapshot in snapshots
+            ]
+        except Exception as e:
+            if not self._held_components_read_failed_logged:
+                logger.debug(f"Could not read component residency for the memory report: {type(e).__name__} {e}")
+                self._held_components_read_failed_logged = True
+            return None
+
+    def evict_held_components(self, identities: list[str]) -> None:
+        """Evict the named component-cache entries from RAM (a targeted, partial reclaim), never faulting.
+
+        Best effort: an identity the cache does not hold is skipped (hordelib's ``evict_identities`` ignores
+        misses), so a raced eviction is harmless, and any failure is logged at debug rather than raised. Gated
+        on :attr:`_reports_held_components` so a process without a loaded backend (a fake, a dry-run lane, a
+        CPU-only process) treats the request as a no-op and never imports hordelib.
+        """
+        if not identities:
+            return
+        if not self._reports_held_components:
+            logger.debug(f"Ignoring EVICT_COMPONENTS for {len(identities)} identity(ies): no component cache here")
+            return
+        try:
+            from hordelib.api import SharedModelManager
+
+            evicted = SharedModelManager.manager._models_in_ram.evict_identities(identities)
+            logger.info(f"Evicted {evicted} of {len(identities)} requested component(s) from RAM under pressure")
+        except Exception as e:
+            logger.debug(f"Component eviction request failed: {type(e).__name__} {e}")
 
     def send_stage_job_metrics_message(self, job_id: str, *, stage: PipelineStageTag | None = None) -> None:
         """Drain hordelib's per-job metrics collector after a stage and forward the snapshot, stage-tagged.

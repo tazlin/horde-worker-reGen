@@ -799,6 +799,19 @@ class reGenBridgeData(CombinedHordeBridgeData):
     when every process is busy). The ceiling is only consulted while the host is under the danger floor, so a
     roomy host never recycles needlessly. Set to 0 to disable. Only used when `enable_vram_budget` is true."""
 
+    component_cache_budget_mb: int | None = Field(default=None, ge=0)
+    """Approximate host-RAM budget (MB) for each GPU child's in-process model-component cache, or None for legacy.
+
+    When set, each inference process and the VAE/component lanes keep as many loaded model components (whole
+    checkpoints and bare unet/clip/vae parts) resident in RAM as fit within this many megabytes, evicting the
+    least-recently-used first, so a swapped-away model reloads from a warm RAM copy instead of from disk. This
+    is the lever that lets a small-VRAM card serve diverse traffic without paying a full disk reload on every
+    model switch. None (the default) leaves the legacy single-slot behaviour (one component resident at a
+    time), so an existing worker is unchanged until an operator opts in. 0 is equivalent to legacy. The value
+    validated in testing on a 16GB card is 12288 (~12GB); size it against the host RAM available beside the
+    per-process ceiling and any co-tenants rather than copying that figure blindly. Consumed by the child
+    processes via the ``HORDE_COMPONENT_CACHE_MB`` environment variable this worker exports on their behalf."""
+
     post_processing_fault_breaker_enabled: bool = Field(default=True)
     """Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults.
 
@@ -1175,6 +1188,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
                 "AI_HORDE_MODEL_META_LARGE_MODELS was set but `load_large_models` is false; clearing it so "
                 "large models (e.g. Flux, Stable Cascade) are not loaded.",
             )
+
+        # The component-cache budget reaches each GPU child (inference, VAE lane, component lane) through this
+        # env var, which they inherit at spawn. Only set it when the operator opted in: None leaves the var
+        # unset so hordelib keeps its legacy single-slot cache. An explicit shell/Docker value is left to win.
+        if self.component_cache_budget_mb is not None and os.getenv("HORDE_COMPONENT_CACHE_MB") is None:
+            os.environ["HORDE_COMPONENT_CACHE_MB"] = str(self.component_cache_budget_mb)
 
     def save(self, file_path: str) -> None:
         """Save the config model to a file.

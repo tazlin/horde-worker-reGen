@@ -32,6 +32,7 @@ from horde_worker_regen.process_management._internal._aliased_types import Proce
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
+    HordeEvictComponentsControlMessage,
     HordeImageResult,
     HordeProcessState,
     HordeVaeDecodeControlMessage,
@@ -104,6 +105,9 @@ class HordeVaeLaneProcess(HordeProcess):
         # This process holds a CUDA context, so its periodic report should sample VRAM (like inference)
         # and unlike the CPU-only safety process, so the parent's per-card free-VRAM view stays fresh.
         self._periodic_report_includes_vram = True
+        # A loaded backend has a component cache to report residency from; a dry-run lane has none (and must
+        # not import hordelib on the report path), so residency reporting tracks whether the backend is real.
+        self._reports_held_components = not dry_run
 
         if dry_run:
             logger.info("Dry-run mode: skipping HordeLib/SharedModelManager initialisation")
@@ -347,6 +351,10 @@ class HordeVaeLaneProcess(HordeProcess):
 
         if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
             self.release_allocator_cache()
+            return
+
+        if isinstance(message, HordeEvictComponentsControlMessage):
+            self.evict_held_components(message.identities)
             return
 
         if isinstance(message, HordeVaeEncodeControlMessage):

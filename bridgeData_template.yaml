@@ -599,6 +599,14 @@ ram_pressure_min_free_mb: 1024
 # Only used with enable_vram_budget.
 ram_per_process_max_mb: 18432
 
+# Host-RAM budget (MB) for each GPU child's in-process model-component cache. Left unset (the default) each
+# child keeps only one component resident at a time (legacy behaviour); set a positive value to keep as many
+# loaded checkpoints/components warm in RAM as fit within it, so a swapped-away model reloads from RAM instead
+# of disk. This lets a small-VRAM card serve diverse traffic without a full disk reload on every model switch.
+# The value validated in testing on a 16GB card is 12288; size it against the RAM left beside
+# ram_per_process_max_mb and any co-tenants rather than copying that number blindly. 0 is equivalent to unset.
+# component_cache_budget_mb: 12288
+
 # Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults. A peak that
 # cannot be hosted faults the job (the horde reissues it), but a worker that keeps faulting trips the horde's
 # forced maintenance. When true (default), post-processing over-commit faults (the planner's unhostable-peak

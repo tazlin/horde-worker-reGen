@@ -53,6 +53,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import InferenceFail
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap, RetiredProcessLaunch
+from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
@@ -189,6 +190,9 @@ class MessageDispatcher:
     _footprint_store: LearnedFootprintStore | None = None
     """Optional learned-footprint store observed on each memory report. Shadow-only: peaks are recorded
     but feed no decision. None (the default) disables observation entirely."""
+    _component_residency_map: ComponentResidencyMap | None = None
+    """Optional per-process component-residency map updated from each memory report's snapshot. None (the
+    default) leaves residency untracked, so a dispatcher wired without it (and the tests) is unchanged."""
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -385,6 +389,10 @@ class MessageDispatcher:
         into the store. The store feeds no decision path; this is measurement for the future arbiter.
         """
         self._footprint_store = store
+
+    def set_component_residency_map(self, residency_map: ComponentResidencyMap) -> None:
+        """Register the component-residency map to update from each memory report's snapshot."""
+        self._component_residency_map = residency_map
 
     async def receive_and_handle_process_messages(self) -> None:
         """Drain and handle any messages the child processes have queued.
@@ -816,6 +824,14 @@ class MessageDispatcher:
 
     def _handle_memory_report(self, message: HordeProcessMemoryMessage) -> None:
         """Handle a memory usage report from a child process."""
+        if self._component_residency_map is not None:
+            # Reached only after the exact-launch-id gate above, so the map's own stale-launch guard is a
+            # belt-and-suspenders defence for a report that slipped past (e.g. a race with expiry).
+            self._component_residency_map.update_from_report(
+                message.process_id,
+                message.process_launch_identifier,
+                message.held_components,
+            )
         self._process_map.on_memory_report(
             process_id=message.process_id,
             ram_usage_bytes=message.ram_usage_bytes,

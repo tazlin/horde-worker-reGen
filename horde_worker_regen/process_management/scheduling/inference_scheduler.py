@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeControlModelMessage,
+    HordeEvictComponentsControlMessage,
     HordeInferenceControlMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
@@ -39,6 +40,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import (
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
@@ -558,6 +560,7 @@ class InferenceScheduler:
     _state: WorkerState
     _process_map: ProcessMap
     _horde_model_map: HordeModelMap
+    _component_residency_map: ComponentResidencyMap | None
     _job_tracker: JobTracker
     _process_lifecycle: ProcessLifecycleManager
     _runtime_config: RuntimeConfig
@@ -589,6 +592,7 @@ class InferenceScheduler:
         state: WorkerState,
         process_map: ProcessMap,
         horde_model_map: HordeModelMap,
+        component_residency_map: ComponentResidencyMap | None = None,
         job_tracker: JobTracker,
         process_lifecycle: ProcessLifecycleManager,
         runtime_config: RuntimeConfig,
@@ -611,6 +615,10 @@ class InferenceScheduler:
                 their states.
             horde_model_map (HordeModelMap): The worker's HordeModelMap, which tracks the load state of all models
                 and which processes they are loaded on.
+            component_residency_map (ComponentResidencyMap | None): The per-process view of components staged in
+                each child's RAM cache. Read by the RAM-pressure component-eviction rung to reclaim idle,
+                unprotected staged components before the coarser whole-RAM unload. ``None`` (unit tests, and a
+                worker whose budgeted cache is disabled) skips that rung and takes the legacy path unchanged.
             job_tracker (JobTracker): The worker's JobTracker, which tracks all jobs in-flight
                 and is responsible for managing their state transitions.
             process_lifecycle (ProcessLifecycleManager): The worker's ProcessLifecycleManager, which is responsible
@@ -640,6 +648,7 @@ class InferenceScheduler:
         self._state = state
         self._process_map = process_map
         self._horde_model_map = horde_model_map
+        self._component_residency_map = component_residency_map
         self._job_tracker = job_tracker
         self._process_lifecycle = process_lifecycle
         self._runtime_config = runtime_config
@@ -3346,11 +3355,15 @@ class InferenceScheduler:
                         "into an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
                     )
                 case EvictIdleModels():
-                    # Unload an idle resident model; when none remains to unload, the footprint left on the
-                    # host is a slot whose allocator kept the freed model's pages, which only a process cycle
-                    # returns to the OS. Mirrors the preload reclaim path so sustained pressure with a drained
-                    # queue still reclaims RAM instead of pinning it and holding pops forever.
-                    if not self.unload_models(under_pressure=True):
+                    # First reclaim the cheap, targeted way: drop idle, unprotected staged components from the
+                    # budgeted RAM cache, keeping a queued job's staged model resident. Only when nothing
+                    # unprotected can be evicted (or the budgeted cache is off) does the coarser whole-RAM
+                    # unload run: unload an idle resident model, and when none remains, cycle the slot whose
+                    # allocator kept the freed pages (only a process cycle returns them to the OS). Mirrors the
+                    # preload reclaim path so sustained pressure with a drained queue still reclaims RAM.
+                    if not self._evict_unprotected_components_under_pressure() and not self.unload_models(
+                        under_pressure=True,
+                    ):
                         self._replace_stale_ram_unload_process()
                 case ReduceWorkerProcesses(
                     target_count=target_count,
@@ -9017,6 +9030,44 @@ class InferenceScheduler:
             jobs_traversed += 1
 
         return next_n_models
+
+    def _evict_unprotected_components_under_pressure(self) -> bool:
+        """Evict idle, unprotected staged components from RAM ahead of the whole-RAM unload; return progress.
+
+        The RAM-pressure path's gentle first rung. When the budgeted component cache holds staged checkpoints
+        that no queued or in-flight job needs, dropping just those returns host RAM while every model a job
+        still needs stays warm, unlike the coarser whole-RAM unload that clears a slot's entire cache. The
+        protected set is every model with live demand (:meth:`_compute_wanted_models`: resident, queued, and
+        in-progress, which covers the head-of-queue and every dispatched job); each slot's own tracked active
+        model is also spared and left to the whole-RAM unload, which keeps the parent's per-slot model
+        bookkeeping consistent, so this reclaims only the extra budgeted-cache residents.
+
+        Returns:
+            True when it commanded at least one eviction (this rung made progress, so the caller need not run
+            the whole-RAM unload this tick); False when the cache is untracked or everything held is
+            protected, so the caller falls through to the existing whole-RAM unload unchanged.
+        """
+        if self._component_residency_map is None:
+            return False
+
+        protected = self._compute_wanted_models()
+        acted = False
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE or not process_info.is_process_alive():
+                continue
+            held = self._component_residency_map.checkpoint_models_held_on([process_info.process_id])
+            evictable = held - protected
+            if process_info.loaded_horde_model_name is not None:
+                evictable = evictable - {process_info.loaded_horde_model_name}
+            if not evictable:
+                continue
+            if process_info.safe_send_message(HordeEvictComponentsControlMessage(identities=sorted(evictable))):
+                logger.opt(ansi=True).info(
+                    f"<fg #ff8c69>RAM pressure: evicting {len(evictable)} idle unprotected staged component(s) "
+                    f"{sorted(evictable)} from process {process_info.process_id} before a whole-RAM unload.</>",
+                )
+                acted = True
+        return acted
 
     def unload_models(self, *, under_pressure: bool = False, for_head_of_queue: bool = False) -> bool:
         """Unload one idle model from RAM that is no longer needed; return True if one was unloaded.

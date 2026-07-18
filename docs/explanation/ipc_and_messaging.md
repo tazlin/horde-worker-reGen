@@ -42,6 +42,7 @@ dedicated reader thread so a read that cannot return never freezes the loop (see
 | `HordeAlchemyControlMessage`        | Run one alchemy form (`START_ALCHEMY`) | `AlchemyFormSpec` (form name, pre-downloaded base64 source image, optional R2 upload URL)       |
 | `HordeSafetyControlMessage`         | Evaluate safety of completed images | Images + metadata                                                                                  |
 | `HordeControlModelMessage`          | Unload model from RAM or VRAM       | Model name (direction set by `control_flag`: `UNLOAD_MODELS_FROM_VRAM` / `UNLOAD_MODELS_FROM_RAM`) |
+| `HordeEvictComponentsControlMessage` | Evict specific staged components from RAM (`EVICT_COMPONENTS`) | A list of component `identities` (a checkpoint's identity is its bare model name) |
 | `HordeControlMessage`               | Generic control (flag only)         | A `HordeControlFlag` (e.g. `END_PROCESS`, `UNLOAD_MODELS_FROM_RAM`)                                |
 
 The inference, preload, and alchemy control messages also carry an optional
@@ -71,7 +72,7 @@ so a routing-incapable process is never asked.
 | `HordeModelStateChangeMessage`    | Model load state changes                     | Model name, new `ModelLoadState`                                                      |
 | `HordeAuxModelStateChangeMessage` | Auxiliary model state changes                | Aux model name, new state                                                             |
 | `HordeProcessHeartbeatMessage`    | Periodic heartbeat (progress)                | `HordeHeartbeatType`, `percent_complete`, and (during sampling) `current_step` / `total_steps` / `iterations_per_second` |
-| `HordeProcessMemoryMessage`       | Periodic memory report                       | `ram_usage_bytes`, `vram_usage_mb`, `vram_total_mb`                                    |
+| `HordeProcessMemoryMessage`       | Periodic memory report                       | `ram_usage_bytes`, `vram_usage_mb`, `vram_total_mb`, `held_components`                 |
 | `HordeInferenceResultMessage`     | Inference completes (success/fault/censored) | State, base64 images, timing, metadata                                                |
 | `HordeAlchemyResultMessage`       | An alchemy form completes                    | `form_id`, `form`, state; `result_payload` (text forms) or `image_base64` (graph forms) |
 | `HordeJobMetricsMessage`          | A job, alchemy form, or disaggregated stage finishes | `job_id`, `is_alchemy`, optional `stage` (`PipelineStageTag`, else None), a `JobPhaseMetrics` snapshot (load timings, it/s, mem high-water) |
@@ -91,6 +92,20 @@ same id, the aggregator retains them as separate stage records
 (`RunMetricsSnapshot.stage_metrics`) rather than folding them into the whole-job
 correlation; the monolithic inference emission covers an entire job in one process and
 stays untagged (`stage is None`).
+
+When the operator opts into the RAM component cache (`component_cache_budget_mb`),
+each GPU child attaches a `held_components` list to its periodic memory report: one
+`HeldComponentSnapshot` (`kind`, `identity`, `approx_ram_mb`) per resident cache entry.
+Because the parent is torch-free and never imports hordelib, that snapshot type is a
+plain three-field twin of hordelib's, copied field-for-field at the child. The parent
+decodes each report into a `ComponentResidencyMap` keyed by process id (guarded against
+a stale launch, and expired when a process dies or is recycled). It reads the
+checkpoint-kind identities as the RAM-staged model set: the popper offers them beside
+the VRAM-resident set while narrowing under a model-swap backlog, and the RAM-pressure
+path evicts the idle, unprotected ones (via `HordeEvictComponentsControlMessage`) before
+the coarser whole-RAM unload. `held_components` is additive and optimistic: an older
+child omits it (reported as `None`, which the parent reads as "no data", never "nothing
+resident"), and a child with no loaded backend reports `None` without importing hordelib.
 
 ## Process state machine
 

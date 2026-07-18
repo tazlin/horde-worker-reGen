@@ -196,6 +196,7 @@ for how it works.
 | `ram_pressure_pause_percent` | `85.0` | Absolute whole-host RAM danger floor, evaluated every scheduling tick. At/above this usage percentage the worker degrades (refuses new model loads, sheds idle resident processes, recycles an over-ceiling process, pauses pops) until RAM recovers, rather than loading weights through an out-of-RAM host and being OS OOM-killed. The default leaves ~15% free because a resident process can allocate several GB in a single step. |
 | `ram_pressure_min_free_mb`   | `1024` | Free-RAM (MB) companion floor: the worker also degrades below this many MB free. The effective floor is `max((100 - ram_pressure_pause_percent)% of total RAM, this)`, so the percentage protects large-RAM hosts and the absolute floor protects small ones. |
 | `ram_per_process_max_mb`     | `18432` | Resident RAM (MB) one inference process may hold before it is a reclaim candidate *while the host is under the danger floor*. Over it, an idle process is recycled immediately and a busy one is drained (fed no new work) then recycled once its job finishes, so a single process's balloon cannot drive the summed footprint into an OS OOM kill. Consulted only under the floor, so a roomy host never recycles. `0` disables. |
+| `component_cache_budget_mb`  | `None`  | Host-RAM budget (MB) for each GPU child's in-process model-component cache. Unset (the default) keeps the legacy single-slot cache (one component resident at a time); a positive value keeps as many loaded checkpoints/components warm in RAM as fit within it, so a swapped-away model reloads from RAM instead of disk. The value validated in testing on a 16 GB card is `12288`; size it against the host RAM left beside `ram_per_process_max_mb` and any co-tenants rather than copying that number blindly. `0` is equivalent to legacy. |
 | `post_processing_fault_breaker_enabled` | `true` | Disable post-processing on this worker after repeated post-processing over-commit faults, so it stops feeding the horde's forced-maintenance spiral (see below). |
 | `post_processing_fault_threshold` | `4` | The breaker trips when *more than* this many post-processing over-commit faults occur within the window (tolerates 4, trips on the 5th). |
 | `post_processing_fault_window_seconds` | `1800` | Rolling window (seconds) over which `post_processing_fault_threshold` is counted. |
@@ -224,6 +225,18 @@ what is actually left of the shared pool rather than the whole of it.
 When the budget evicts resident models to reclaim VRAM/RAM under pressure, it
 logs prominently; frequent eviction/reload churn is a signal to reduce the model
 set or the queue depth.
+
+`component_cache_budget_mb` is the lever that lets a small-VRAM card serve diverse
+traffic without paying a full disk reload on every model switch: each GPU child
+(the inference processes and the VAE/component lanes) keeps recently loaded model
+components warm in RAM up to the budget. The worker exports the budget to those
+children as the `HORDE_COMPONENT_CACHE_MB` environment variable at start, tracks
+which checkpoints each child holds staged, and offers that staged set alongside
+the VRAM-resident one when it narrows its pop advertising under a model-swap
+backlog. Under host-RAM pressure the worker first evicts only the idle, staged
+components no queued or in-flight job needs (a targeted reclaim that leaves a
+queued job's staged model warm) before falling back to the coarser whole-RAM
+unload, so opting in trades host RAM for far fewer disk reloads.
 
 ### Very fast disk mode
 

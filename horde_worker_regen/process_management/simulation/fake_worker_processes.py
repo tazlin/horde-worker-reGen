@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlMessage,
     HordeDownloadAvailabilityMessage,
     HordeDownloadControlMessage,
+    HordeEvictComponentsControlMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
@@ -524,6 +525,10 @@ class FakeInferenceProcess(HordeProcess):
             # sends a fresh memory report, so the fake emits the same report traffic and no model-unload
             # state change (the ledger residency is untouched).
             self.send_memory_report_message(include_vram=True)
+        elif isinstance(message, HordeEvictComponentsControlMessage):
+            # The fake holds no real component cache, so the base handler no-ops; accepting the message
+            # keeps the fake from faulting when the RAM-pressure rung targets it in a simulation.
+            self.evict_held_components(message.identities)
 
     @override
     def cleanup_for_exit(self) -> None:

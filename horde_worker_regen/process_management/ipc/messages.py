@@ -195,6 +195,26 @@ class HordeProcessMessage(BaseModel):
     """The time elapsed since the process started."""
 
 
+class HeldComponentSnapshot(BaseModel):
+    """One resident component-cache entry a child reports: its kind, content identity, and approximate RAM.
+
+    The worker-side twin of hordelib's ``HeldComponentSnapshot`` (``hordelib.execution.component_cache``).
+    The parent is torch-free and must never import hordelib, so the three-field shape is duplicated here as a
+    plain pydantic model rather than shared: the child reads hordelib's snapshot inside the process that holds
+    the cache and copies each field onto this transport type, which the parent decodes without any hordelib
+    dependency. ``kind`` is one of ``unet``/``clip``/``vae``/``checkpoint`` (kept as ``str`` so a future
+    hordelib kind survives an older parent); for a monolithic ``checkpoint`` entry ``identity`` is the bare
+    horde model name, which is what makes the checkpoint-kind identities the worker's staged-model set.
+    """
+
+    kind: str
+    """The component kind (``unet``/``clip``/``vae``/``checkpoint``); a ``str`` so an unknown future kind survives."""
+    identity: str
+    """The content identity of the cached entry (a checkpoint entry's identity is the bare horde model name)."""
+    approx_ram_mb: float
+    """The entry's approximate resident RAM cost in megabytes, as hordelib's budget estimates it."""
+
+
 class HordeProcessMemoryMessage(HordeProcessMessage):
     """Memory messages that are sent from the child processes to the main process."""
 
@@ -260,6 +280,14 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
 
     A device-pinned child measures its own (masked) device and reports under its global index, so the
     parent can aggregate VRAM usage/total per card. Defaults to 0 for single-GPU and older children."""
+    held_components: list[HeldComponentSnapshot] | None = None
+    """The component-cache entries this process holds resident in RAM, or None off the budgeted-cache path.
+
+    Populated only by a GPU-bearing child whose hordelib backend is loaded (inference, the VAE lane, the
+    component lane); every other process, and any child without a reachable component cache, reports None.
+    An additive, optimistic-IPC field: an older parent ignores it, and a newer parent treats None as "no
+    residency data from this process" rather than "nothing resident". The parent maps the checkpoint-kind
+    identities to the staged-model set and to the RAM-pressure component-eviction rung."""
 
 
 class HordeHeartbeatType(enum.Enum):
@@ -543,6 +571,12 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to unload models from VRAM."""
     UNLOAD_MODELS_FROM_RAM = auto()
     """Signal the child process to unload models from RAM."""
+    EVICT_COMPONENTS = auto()
+    """Signal a GPU-bearing child to evict specific component-cache entries (a targeted, partial RAM reclaim).
+
+    Unlike ``UNLOAD_MODELS_FROM_RAM`` (which clears the whole cache), this drops only the named content
+    identities, so the RAM-pressure path can reclaim an idle, unprotected staged component while leaving a
+    queued job's staged model resident. Naming an identity the cache does not hold is a no-op, never a fault."""
     RELEASE_ALLOCATOR_CACHE = auto()
     """Signal the child to release the torch allocator's cached free blocks WITHOUT unloading any models.
 
@@ -585,6 +619,20 @@ class HordeControlModelMessage(HordeControlMessage):
 
     horde_model_name: str
     """The name of the model as defined in the horde model reference."""
+
+
+class HordeEvictComponentsControlMessage(HordeControlMessage):
+    """Ask a GPU-bearing child to evict specific component-cache entries by content identity.
+
+    The RAM-pressure path sends this to relieve host RAM by dropping only idle, unprotected staged
+    components, in preference to the coarser whole-cache ``UNLOAD_MODELS_FROM_RAM``. The child evicts every
+    cache entry whose identity is listed and ignores any identity it does not hold, so a raced eviction (a
+    component already gone) is harmless.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.EVICT_COMPONENTS
+    identities: list[str] = Field(default_factory=list)
+    """The content identities to evict (a checkpoint entry's identity is the bare horde model name)."""
 
 
 class HordeDownloadControlMessage(HordeControlMessage):

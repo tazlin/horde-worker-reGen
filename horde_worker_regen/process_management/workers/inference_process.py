@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlMessage,
     HordeControlModelMessage,
     HordeDownloadMetricsMessage,
+    HordeEvictComponentsControlMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
@@ -189,6 +190,9 @@ class HordeInferenceProcess(HordeProcess):
         self._dry_run_skip_inference = dry_run_skip_inference
         self._dry_run_inference_delay = dry_run_inference_delay
         self._expect_image_models = expect_image_models
+        # Only a loaded backend has a component cache to report residency from (and to evict from under RAM
+        # pressure); a dry-run process has none and must not import hordelib on the report/evict paths.
+        self._reports_held_components = not dry_run_skip_inference
 
         self._inference_semaphore = inference_semaphore
         self._vae_decode_semaphore = vae_decode_semaphore
@@ -1318,6 +1322,10 @@ class HordeInferenceProcess(HordeProcess):
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         """Dispatch one control message to the appropriate handler (preload/inference/alchemy/lifecycle)."""
         logger.debug(f"Received ({type(message)}): {message.control_flag}")
+
+        if isinstance(message, HordeEvictComponentsControlMessage):
+            self.evict_held_components(message.identities)
+            return
 
         if isinstance(message, HordePreloadInferenceModelMessage):
             self.preload_model(
