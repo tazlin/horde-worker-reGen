@@ -130,6 +130,16 @@ stops and resumes, and nothing is aborted. On a box where safety runs on CPU beh
 two GPU producers this is what keeps the in-flight backlog from climbing without limit
 until jobs age out.
 
+The **submit stage** sits at the same post-inference tail and gets the same treatment:
+when finished generations pile up unsubmitted past a cap scaled to the worker's
+concurrent-inference ceiling (`_submit_backlog_cap`), the identical pop hold engages
+until the backlog drains. This latch logs its own engage and release lines and records
+a `submit_backlog` skipped reason, so a hold caused by a slow or stalled submit
+endpoint is attributed to the submit stage rather than to safety. Brief engagements are
+normal when a batched job finishes (several generations land in the submit queue at
+once and drain within seconds); only a latch that stays engaged indicates a genuinely
+stalled submit path.
+
 Safety placement also yields to this backlog. Any pending or active safety work protects
 an already-on-GPU safety process from being demoted for sampling headroom. If safety has
 already been moved off-GPU and the backlog grows deeper than two jobs, the runtime
@@ -208,6 +218,17 @@ demand it gives little or no throughput gain, because reload churn already
 overlaps across the spare inference processes. See
 [GPU duty cycle → Tuning levers](duty-cycle.md#tuning-levers-and-what-they-cannot-do)
 for the measured analysis.
+
+**Superseded by the fixed model pool.** `model_stickiness` is deprecated. It
+biased a single pop toward the already-loaded models; the
+[fixed model pool](model_pool.md) instead commits the worker to a standing set of
+seated models and narrows its pop advertisement toward them (its **fixed lane**),
+which is the durable version of the same swap-avoidance intent. A worker still
+carrying a positive `model_stickiness` with the pool off is mapped onto a modest
+pool automatically (ranker on, a 30-minute rotation) wherever the `model_pool`
+fields were left at their defaults, and a one-time deprecation notice is logged.
+With the pool enabled the sticky bias is ignored entirely, because the pool lane
+overwrites the pop's advertised model set.
 
 ## Pop-rate throttling
 
@@ -1451,6 +1472,8 @@ and the streak is worker-wide - identical to before.
   throttling behavior
 - [GPU duty cycle](duty-cycle.md): how the reload churn and hand-off gaps from
   this page show up as measured GPU idle, and the tuning levers
+- [The Fixed Model Pool](model_pool.md): the committed seat set and pop lanes that
+  supersede model stickiness
 - [Job Lifecycle](job_lifecycle.md): where popping and scheduling fit in the
   pipeline
 - [Job State Machine](job_state_machine.md): the stages and the dual-presence

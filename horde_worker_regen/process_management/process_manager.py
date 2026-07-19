@@ -5469,6 +5469,7 @@ class HordeWorkerProcessManager:
         "allow_post_processing": "post-processing not allowed",
         "allow_painting": "inpainting not allowed",
         "safety_backlog": "safety backlogged",
+        "submit_backlog": "submit backlogged",
         "kudos": "insufficient kudos",
         "worker_id": "worker-id mismatch",
     }

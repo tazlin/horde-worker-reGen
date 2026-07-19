@@ -1470,15 +1470,22 @@ class JobPopper:
         # grows unbounded, and the horde aborts the aged jobs as too slow and forces maintenance.
         if self._is_post_inference_backlogged():
             self._state.last_pop_no_jobs_available = False
-            self._state.last_pop_skipped_reasons["safety_backlog"] = (
-                self._state.last_pop_skipped_reasons.get("safety_backlog", 0) + 1
+            # The hold can come from either post-inference stage; attribute the skipped reason (and any
+            # prose) to the latch actually engaged, or an alert reader chases the wrong stage.
+            backlog_reason = "safety_backlog" if self._safety_backpressure_engaged else "submit_backlog"
+            self._state.last_pop_skipped_reasons[backlog_reason] = (
+                self._state.last_pop_skipped_reasons.get(backlog_reason, 0) + 1
             )
-            # Surface the backpressure in prose, throttled so the sub-second pop loop never spams it: a
+            # Surface safety backpressure in prose, throttled so the sub-second pop loop never spams it: a
             # bundle should show pops were stopped *because the safety stage is backed up*, not merely that
             # pops stopped. Names the depth, the self-tuned cap, and the oldest waiting safety job so a
-            # slow downstream stage (typically CPU safety) is unmistakable.
+            # slow downstream stage (typically CPU safety) is unmistakable. The submit latch logs its own
+            # engage/release lines, so only the safety latch needs this periodic reminder.
             now = time.time()
-            if (now - self._safety_backlog_log_time) >= self._SAFETY_BACKLOG_LOG_INTERVAL_SECONDS:
+            if (
+                self._safety_backpressure_engaged
+                and (now - self._safety_backlog_log_time) >= self._SAFETY_BACKLOG_LOG_INTERVAL_SECONDS
+            ):
                 self._safety_backlog_log_time = now
                 backlog = len(self._job_tracker.jobs_pending_safety_check) + len(
                     self._job_tracker.jobs_being_safety_checked,
@@ -1496,6 +1503,7 @@ class JobPopper:
             return
 
         self._state.last_pop_skipped_reasons.pop("safety_backlog", None)
+        self._state.last_pop_skipped_reasons.pop("submit_backlog", None)
 
         # Warm-up rule: until the first job of the session has completed, don't queue
         # ahead (if we're doomed to fail with 1 job, we're doomed to fail with 2).
