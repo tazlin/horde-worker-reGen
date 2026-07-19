@@ -360,11 +360,20 @@ rolling-window counter
 ([`JobTracker.count_recent_post_processing_faults`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.count_recent_post_processing_faults]);
 once it exceeds `post_processing_fault_threshold` within
 `post_processing_fault_window_seconds`, the worker stops advertising
-post-processing at pop time, so the horde stops sending it upscale/face-fix jobs,
-and logs an operator advisory to downgrade settings. The suppression is
-**session-latched** (it survives a soft reset and clears only on restart)
-because the over-commit is structural and auto-recovery would simply re-trip it.
-It mirrors the per-model unservable breaker and the self-maintenance throttle: a
+post-processing at pop time, so the horde stops sending it upscale/face-fix jobs.
+Recovery is **headroom-gated rather than restart-only**: because the over-commit
+is a VRAM shortage the card can grow out of (a heavy resident unloads, a fixed
+pool seat rotates to a smaller model), the latch clears once the parent measures
+the card's free VRAM back above the post-processing peak plus a safety margin,
+and a fresh fault first attempts a one-shot idle-resident VRAM reclaim so the
+peak may fit without ever latching. A **proactive** gate closes the same loop
+from the front: whenever the parent measures free VRAM below that requirement it
+withholds post-processing advertising before any fault, killing the boot-window
+burst a relaunch into heavy residents would otherwise pay. Both paths need a
+truthful NVML device-free reading; a host without one keeps the reactive breaker
+alone, **session-latched** (it survives a soft reset and clears only on restart).
+The structural whole-card conflict that shares the latch never auto-recovers. It
+mirrors the per-model unservable breaker and the self-maintenance throttle: a
 worker that protects its own standing on the horde rather than bleeding dropped
 jobs until the server intervenes. The dedicated post-processing lane (see
 [Process lanes and job chaining](process_lanes_and_chaining.md)) is the structural

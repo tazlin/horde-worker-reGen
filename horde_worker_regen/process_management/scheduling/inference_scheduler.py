@@ -6537,6 +6537,49 @@ class InferenceScheduler:
         logger.info(f"Reclaim ladder: unloading model {model_name} from VRAM on idle process {process_id}")
         return True
 
+    def reclaim_idle_resident_for_post_processing(self, *, device_index: int | None = None) -> str | None:
+        """Unload the coldest idle resident model's VRAM to make room for a post-processing peak; return its name.
+
+        Picks the least-recently-demanded idle inference resident whose model no pending or in-progress job
+        needs, and unloads its weights to RAM (the RAM copy is retained, so a later job re-stages it cheaply).
+        Returns the unloaded model's name, or None when no such momentarily-idle resident exists (every resident
+        is busy, is already unloading, or is a queued/in-progress job's model, so yielding one would only force
+        an immediate reload).
+
+        ``device_index`` scopes the search to one card on a multi-GPU host; None considers every card.
+        """
+        pending_models = {job.model for job in self._job_tracker.jobs_pending_inference}
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        now_monotonic = time.monotonic()
+        now_wall = time.time()
+
+        coldest_process_id: int | None = None
+        coldest_model_name: str | None = None
+        coldest_recency_key = float("inf")
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy() or process_info.loaded_horde_model_name is None:
+                continue
+            model_name = process_info.loaded_horde_model_name
+            if model_name in pending_models or model_name in in_progress_models:
+                continue
+            if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                continue
+            recency_key = self._reclaim_recency_key(process_info, now_monotonic, now_wall)
+            if recency_key < coldest_recency_key:
+                coldest_recency_key = recency_key
+                coldest_process_id = process_info.process_id
+                coldest_model_name = model_name
+
+        if coldest_process_id is None:
+            return None
+        if not self.unload_idle_model(coldest_process_id, device_index=device_index):
+            return None
+        return coldest_model_name
+
     def release_idle_cache(self, process_id: int) -> bool:
         """Release an idle process's reclaimable allocator cache back to the card (reclaim-ladder actuator)."""
         return self.release_allocator_cache(process_id)

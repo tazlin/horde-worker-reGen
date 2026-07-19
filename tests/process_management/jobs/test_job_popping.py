@@ -559,6 +559,15 @@ class TestPostProcessingBreakerSuppression:
 
         assert request.allow_post_processing is True
 
+    async def test_headroom_gate_withholds_post_processing(self) -> None:
+        """With the proactive headroom gate closed, the pop advertises ``allow_post_processing=False``."""
+        state = WorkerState()
+        state.post_processing_withheld_for_headroom = True
+
+        request = await self._pop_and_capture_request(state=state)
+
+        assert request.allow_post_processing is False
+
 
 class TestPostProcessingBacklogOfferShaping:
     """Post-processing pressure narrows the advertised feature set without stopping unrelated intake."""

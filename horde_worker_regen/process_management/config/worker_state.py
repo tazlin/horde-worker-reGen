@@ -96,14 +96,25 @@ class WorkerState:
     process is draining."""
 
     post_processing_disabled_by_breaker: bool = False
-    """Session-latched: the post-processing fault breaker tripped on repeated unhostable post-processing peaks.
+    """The post-processing fault breaker (or a whole-card residency conflict) has stopped advertising post-processing.
 
     A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
     over-commits) faults the job and, reaped, accumulates toward this breaker. While true the job popper stops
     advertising post-processing support (see the popper's ``pop_allow_post_processing``) so the worker is no
-    longer handed upscale/face-fix jobs it cannot host, ending the fault->forced-maintenance spiral. The
-    over-commit is structural, so this clears only on restart (auto-recovery would simply re-trip it) and is
-    deliberately NOT cleared by a save-our-ship soft reset; the operator should downgrade settings."""
+    longer handed upscale/face-fix jobs it cannot host, ending the fault->forced-maintenance spiral. Whether it
+    can clear without a restart depends on ``post_processing_breaker_auto_recoverable``: the fault-count breaker
+    sets that true and re-enables once the parent measures the card's free VRAM back above the post-processing
+    peak (so a relaunch or seat rotation that frees the card restores post-processing earnings on its own),
+    while a structural whole-card conflict leaves it false and stays latched to restart. Deliberately NOT
+    cleared by a save-our-ship soft reset."""
+
+    post_processing_breaker_auto_recoverable: bool = False
+    """Whether the current ``post_processing_disabled_by_breaker`` latch may clear on measured headroom recovery.
+
+    Set true only by the rolling-window fault-count breaker, whose over-commit can be undone when the card
+    later has room (a heavy resident unloads, a seat rotates to a smaller model). Left false by the structural
+    whole-card residency conflict, which cannot be undone in-session and so stays latched until restart. Read
+    only while ``post_processing_disabled_by_breaker`` is true; meaningless otherwise."""
 
     post_processing_breaker_tripped_at: float = 0.0
     """Wall-clock time the post-processing breaker tripped; 0 when not tripped (for the operator advisory/TUI)."""
@@ -115,6 +126,15 @@ class WorkerState:
     ``post_processing_disabled_by_breaker`` to stop advertising post-processing. This detail tells the TUI and
     logs which structural condition caused the session latch.
     """
+
+    post_processing_withheld_for_headroom: bool = False
+    """Proactive gate: the parent measures a driven card's free VRAM below the post-processing peak requirement.
+
+    Independent of the fault breaker's latch: while true the job popper withholds post-processing advertising
+    before any fault occurs, so a worker relaunched into heavy residents does not earn a boot-window burst of
+    post-processing jobs it cannot yet host. Cleared the moment a driven card's measured free VRAM recovers
+    above the requirement. Never set on a host without an NVML device-free reading (headroom is unmeasurable
+    there), so such a host keeps its fault-breaker-only behaviour."""
 
     lora_disk_exhausted: bool = False
     """The LoRA cache volume is below its free-space floor and eviction could not clear it.

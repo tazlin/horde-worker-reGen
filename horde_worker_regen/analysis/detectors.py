@@ -535,8 +535,9 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
                 "`post_processing_fault_breaker_enabled` breaker disables post-processing automatically after "
                 "repeated stalls so the worker stops feeding the forced-maintenance spiral"
                 + (
-                    "; it has already tripped here, so restart the worker after downgrading settings to "
-                    "restore post-processing."
+                    "; it has already tripped here. It re-enables on its own once the card's measured free VRAM "
+                    "recovers above the post-processing peak; downgrade settings (or restart) if the card cannot "
+                    "reach that headroom."
                     if breaker_trips
                     else "."
                 )

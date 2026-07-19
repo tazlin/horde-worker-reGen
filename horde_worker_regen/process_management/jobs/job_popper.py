@@ -1593,10 +1593,11 @@ class JobPopper:
         pop_allow_post_processing = (
             advertised.allow_post_processing if advertised is not None else bridge_data.allow_post_processing
         )
-        # Session-latched off by the post-processing fault breaker: once repeated post-processing peaks could
-        # not be hosted, stop advertising post-processing so the worker is not handed more upscale/face-fix
-        # jobs it cannot host (which would keep faulting toward the horde's forced-maintenance).
-        if self._state.post_processing_disabled_by_breaker:
+        # Withheld by the worker's post-processing self-protection: the reactive fault breaker (repeated
+        # unhostable peaks) or the proactive headroom gate (the parent measures the card's free VRAM below the
+        # post-processing peak). Either way, stop advertising post-processing so the worker is not handed more
+        # upscale/face-fix jobs it cannot host (which would keep faulting toward the horde's forced-maintenance).
+        if self._state.post_processing_disabled_by_breaker or self._state.post_processing_withheld_for_headroom:
             pop_allow_post_processing = False
         pop_allow_controlnet = advertised.allow_controlnet if advertised is not None else bridge_data.allow_controlnet
         pop_allow_sdxl_controlnet = (
