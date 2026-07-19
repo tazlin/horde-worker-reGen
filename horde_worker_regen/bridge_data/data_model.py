@@ -166,6 +166,61 @@ def apply_disaggregation_optimized_mode(
             )
 
 
+_MAX_THROUGHPUT_MODE_BUNDLE: dict[str, object] = {
+    "enabled": True,
+    "ranker_enabled": True,
+    "download_budget_gb": 50.0,
+}
+"""The ``model_pool`` sub-field bundle ``max_throughput_mode`` applies where the operator left the field default.
+
+The preset turns the fixed model pool on with its demand ranker and a 50GB auto-download budget, so a worker
+opting into maximum throughput serves a slowly-rotating, ranker-fed set of models and may fetch a strong
+candidate it does not yet have on disk. Each value maps to a ``ModelPoolConfig`` sub-field rather than a
+top-level field, so the apply step reads the operator's explicit choices from the nested model's own
+``model_fields_set``."""
+
+
+def apply_max_throughput_mode(
+    config: reGenBridgeData,
+    *,
+    explicitly_set_pool_fields: Collection[str],
+    log: bool = False,
+) -> None:
+    """Apply the max-throughput bundle to ``config.model_pool``, honouring explicit operator sub-field values.
+
+    Each bundled ``model_pool`` sub-field is applied only where the operator left it at its default (absent
+    from ``explicitly_set_pool_fields``); an explicit value always wins and is logged rather than silently
+    dropped. The one contradiction worth a warning is an explicit ``model_pool.enabled=False`` under this
+    mode, which leaves the pool off so the mode does nothing.
+
+    Args:
+        config: The config to mutate in place.
+        explicitly_set_pool_fields: The ``model_pool`` sub-field names the operator set explicitly (a snapshot
+            of ``config.model_pool.model_fields_set`` taken before any mutation).
+        log: Whether to emit a log line for each application or kept value.
+    """
+    for field_name, bundle_value in _MAX_THROUGHPUT_MODE_BUNDLE.items():
+        if field_name in explicitly_set_pool_fields:
+            current = getattr(config.model_pool, field_name)
+            if field_name == "enabled" and current is False:
+                if log:
+                    logger.warning(
+                        "max_throughput_mode is enabled but model_pool.enabled is explicitly false; the "
+                        "explicit value wins, so the fixed model pool stays off and the mode does nothing.",
+                    )
+            elif log:
+                logger.info(
+                    f"max_throughput_mode: keeping explicit model_pool.{field_name}={current!r} instead of the "
+                    f"throughput default {bundle_value!r}.",
+                )
+            continue
+        setattr(config.model_pool, field_name, bundle_value)
+        if log:
+            logger.info(
+                f"max_throughput_mode: set model_pool.{field_name}={bundle_value!r} (was left at its default).",
+            )
+
+
 def compute_performance_timeout(
     *,
     high_performance_mode: bool,
@@ -316,6 +371,77 @@ class GpuOverride(BaseModel):
     vram_reserve_mb: int | None = Field(default=None, ge=0)
     vram_to_leave_free: str | None = Field(default=None, pattern=r"^\d+%$|^\d+$")
     whole_card_exclusive_residency: bool | None = None
+
+
+class PinnedModelEntry(BaseModel):
+    """A model the operator pins into the fixed model pool, with a persistent seating bias.
+
+    The affinity is a bias, never a lock: it orders which pins claim seats first (highest first) and makes a
+    pinned model stickier against rotation, but a sufficiently stronger candidate can still take the seat and
+    the pin can re-seat later. 1.0 is the strongest bias; values approach (but never reach) 0 for a pin the
+    pool should hold only when nothing else wants the seat.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """The model name to pin, as it appears in the served model reference."""
+
+    affinity: float = Field(default=1.0, gt=0.0, le=1.0)
+    """The persistent seating bias in the half-open range (0, 1]; higher is stickier. Defaults to 1.0."""
+
+
+class ModelPoolConfig(BaseModel):
+    """Operator configuration for the fixed model pool: a bounded set of persistently-served model seats.
+
+    The pool commits the worker to serving a small, slowly-rotating set of models so the horde returns work
+    the card can run without a per-job model swap. Seats fill first from ``pinned`` (in affinity order) and
+    then, when ``ranker_enabled``, from a demand ranker. A free (non-pool) advertising lane still reaches cold
+    and rare-model demand alongside the pool, so pinning a model biases what the worker holds without hiding
+    everything else. All timing knobs are operator-facing minutes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    """Whether the fixed model pool is active. Off by default, leaving model selection unchanged."""
+
+    seats: int = Field(default=0, ge=0, le=64)
+    """How many pool seats to hold. 0 (the default) means auto: one seat per inference process, resolved at
+    wiring time from the running concurrency."""
+
+    pinned: list[PinnedModelEntry] = Field(default_factory=list)
+    """Models the operator pins into seats, each with a persistent affinity bias. Empty by default."""
+
+    ranker_enabled: bool = True
+    """Whether the demand ranker may fill seats the pins do not claim. On by default."""
+
+    rotation_minutes: float = Field(default=60.0, gt=0.0)
+    """How long a seat serves before it becomes eligible for a timed re-contest against a stronger candidate.
+    A pin's affinity extends its own rotation window on top of this base."""
+
+    min_dwell_minutes: float = Field(default=10.0, ge=0.0)
+    """The minimum time a freshly-seated model is held before any demotion or rotation may unseat it, so a
+    seat is never churned before it has had a fair chance to earn its place."""
+
+    rescue_enabled: bool = False
+    """Whether a starved, high-wait model may briefly claim the weakest ranker seat. Off by default."""
+
+    rescue_eta_seconds: float = Field(default=10000.0, gt=0.0)
+    """The requester wait (in seconds) at or above which a model counts as starved enough to warrant a rescue
+    seat. Only consulted when ``rescue_enabled``."""
+
+    rescue_window_minutes: float = Field(default=15.0, gt=0.0)
+    """How long a rescued model holds its borrowed seat before it is released back to the ranker. Only
+    consulted when ``rescue_enabled``."""
+
+    demand_poll_seconds: float = Field(default=90.0, ge=60.0)
+    """How often the pool refreshes its demand ranking. Floored at 60 seconds to keep the poll gentle on the
+    horde's demand endpoint."""
+
+    download_budget_gb: float = Field(default=0.0, ge=0.0)
+    """How much disk (in gigabytes) the pool may spend auto-downloading a not-yet-present model to seat it.
+    0 (the default) never auto-downloads, so the pool only ever seats models already on disk."""
 
 
 class reGenBridgeData(CombinedHordeBridgeData):
@@ -807,6 +933,24 @@ class reGenBridgeData(CombinedHordeBridgeData):
     the stage lanes rather than extra resident models. Pair this preset with the `disagg_optimized N` model
     rule to serve the models that share a VAE lane most effectively."""
 
+    model_pool: ModelPoolConfig = Field(default_factory=ModelPoolConfig)
+    """Fixed model pool configuration: a bounded set of persistently-served model seats.
+
+    Off by default (``model_pool.enabled: false``), leaving model selection unchanged. When enabled, the
+    worker commits to serving a small, slowly-rotating set of models so the horde returns work the card can
+    run without a per-job model swap. See :class:`ModelPoolConfig` for the individual knobs."""
+
+    max_throughput_mode: bool = Field(default=False)
+    """One-switch operator preset that turns the fixed model pool on for maximum throughput.
+
+    Off by default. When true, the worker applies a bundle of pool settings to any of the bundled
+    ``model_pool`` sub-fields the operator left at their default: it enables the pool, enables its demand
+    ranker, and sets a 50GB auto-download budget. Each application is logged.
+
+    An explicit operator value always wins over the bundle, and the override is logged rather than silently
+    dropped; in particular, setting this mode true while ``model_pool.enabled`` is explicitly false keeps the
+    pool off (a warning is emitted, since the mode then does nothing)."""
+
     enable_image_utilities: bool = Field(default=True)
     """Run the dedicated image-utilities lane (the ``horde_image_utilities`` capability service).
 
@@ -1147,6 +1291,22 @@ class reGenBridgeData(CombinedHordeBridgeData):
             apply_disaggregation_optimized_mode(
                 self,
                 explicitly_set_fields=set(self.model_fields_set),
+                log=True,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def apply_max_throughput_mode_defaults(self) -> Self:
+        """Apply the max-throughput bundle to ``model_pool`` when the operator opted into the preset.
+
+        The snapshot of ``model_pool.model_fields_set`` is taken before the bundle mutates anything, so an
+        explicit operator sub-field value is distinguished from a left-at-default one and always wins. See
+        :func:`apply_max_throughput_mode` for the per-sub-field rules.
+        """
+        if self.max_throughput_mode is True:
+            apply_max_throughput_mode(
+                self,
+                explicitly_set_pool_fields=set(self.model_pool.model_fields_set),
                 log=True,
             )
         return self
