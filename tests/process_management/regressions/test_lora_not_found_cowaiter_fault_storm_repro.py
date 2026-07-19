@@ -343,6 +343,33 @@ async def test_single_transient_lora_failure_requeues_and_arms_backoff_once() ->
     assert tracker.is_lora_skipped(_lora("net")) is False
 
 
+async def test_low_retry_budget_single_job_failure_requeues_then_salvages_never_faults() -> None:
+    """A one-attempt worker never faults a job on an aux download failure: it requeues, then salvages bare.
+
+    Before the fix the first retryable failure consumed the job's sole inference attempt and faulted it (the
+    live ~1-2/hour fault storm). A download failure is not a generation verdict, so it must not touch the
+    inference retry budget: the first failure requeues the job for an aux re-fetch, charging no attempt, and the
+    terminal second failure dispatches the job without the unfetchable reference.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    tracker.set_retry_policy(1)
+    coordinator, _sender, _state = _make(tracker, clock=clock)
+
+    job = await _job_of(tracker, coordinator, loras=[_lora("ghost")])
+    coordinator.on_prefetch_result(_result(_laundered_failure("ghost", job.id_)))
+    assert _faulted(tracker, [job]) == []
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is False
+    tracked = tracker.get_tracked_job(job.id_)
+    assert tracked is not None and tracked.inference_attempts == 0
+
+    coordinator.on_prefetch_result(_result(_laundered_failure("ghost", job.id_)))
+    assert _faulted(tracker, [job]) == []
+    assert _prepared(tracker, job)
+    assert tracker.is_lora_skipped(_lora("ghost")) is True
+
+
 # Exploratory matrix: vary queue shape, config, and system condition to map the concurrent-fault dynamic.
 
 
@@ -479,14 +506,14 @@ async def test_deadline_backstop_salvages_a_cowaiter_whose_reference_was_skipped
     assert _prepared(tracker, job_b)
 
 
-async def test_deadline_backstop_faults_only_a_stalled_in_flight_reference() -> None:
-    """The deadline is two-sided: a reference never in flight salvages, a stalled in-flight one still faults.
+async def test_deadline_backstop_salvages_both_never_started_and_stalled_in_flight() -> None:
+    """The deadline salvages both a never-started reference and a stalled in-flight one; it faults neither.
 
     A reference the downloader never began fetching is the prefetch lane's own unavailability, so at the deadline
-    the job is served without it (the inference path would run without the file), not faulted. The one remaining
-    deadline fault is a genuinely stuck transfer: a reference that is in flight but whose reported bytes never
-    advance is deferred a bounded number of times and then faults, so the backstop keeps bounding a sick download
-    while never converting a never-started fetch into a fault.
+    the job is served without it (the inference path would run without the file). A genuinely stuck transfer (a
+    reference in flight whose reported bytes never advance) is deferred a bounded number of times and then, its
+    budget spent, likewise served without it. The deferral cap distinguishes the two only by how long each waits;
+    aux prefetch faults neither, so no deadline path ever drops a job.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
@@ -501,15 +528,15 @@ async def test_deadline_backstop_faults_only_a_stalled_in_flight_reference() -> 
     assert stalled.id_ is not None
     assert tracker.is_lora_skipped(_lora("never-resolves")) is False
 
-    # The stalled reference's reported bytes never advance, so it defers a bounded number of times and only then
-    # faults; the never-in-flight reference is served without the file at its first expiry.
+    # The never-in-flight reference is served without the file at its first expiry; the stalled reference's
+    # reported bytes never advance, so it defers a bounded number of times and is then served without it too.
     for _ in range(_MAX_DEADLINE_DEFERRALS + 1):
         clock.now += 31.0
         coordinator.scan_deadlines()
 
-    assert tracker.get_stage(unstarted.id_) == JobStage.PENDING_INFERENCE
-    assert tracker.are_job_aux_models_prepared(unstarted) is True
-    assert tracker.get_stage(stalled.id_) == JobStage.PENDING_SUBMIT
+    assert _faulted(tracker, [unstarted, stalled]) == []
+    assert _prepared(tracker, unstarted)
+    assert _prepared(tracker, stalled)
 
 
 async def test_downloader_reset_before_terminal_still_salvages_cowaiters() -> None:

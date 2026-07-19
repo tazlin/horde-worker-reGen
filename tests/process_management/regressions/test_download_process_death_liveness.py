@@ -247,12 +247,14 @@ async def test_frozen_bytes_defer_once_despite_inflight_provider_flicker() -> No
     coordinator.scan_deadlines()
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
-    # Second expiry: the frozen snapshot reports the same 7,340,032, so the stall is detected and the job
-    # faults. Without the fix the flicker would have wiped the memory and deferred a second time.
+    # Second expiry: the frozen snapshot reports the same 7,340,032, so the stall is detected and the job is
+    # served without the reference (salvaged, not faulted). Without the byte-memory fix the flicker would have
+    # wiped the memory and deferred a second time, leaving the job still pending instead of resolved here.
     in_flight.map = {"styleA": (7_340_032, 20_000_000)}
     clock.now += 61.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
 
 
 # --- (#1) death detection, restart-within-bound, and re-fetch within one budget --------------------------

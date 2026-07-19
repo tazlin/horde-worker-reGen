@@ -1,14 +1,14 @@
-"""The auxiliary-prefetch fault origin is excluded from the consecutive-failure pop pause.
+"""Auxiliary-prefetch trouble never reaches the consecutive-failure pop pause, because it never faults a job.
 
-A fault whose origin is the auxiliary-prefetch pipeline (the worker never ran a generation for it) must not
-count toward the consecutive-failure pop pause, or one bad remote file silences a worker that is itself
-perfectly healthy. A not-found reference no longer faults a waiting job (it is served without the file), and a
-reference that never enters a download is likewise served without it, so the aux-origin fault under test here is
-the one remaining deadline fault: a stalled in-flight transfer whose reported bytes never advance, faulted once
-its bounded deferrals are spent. These assert that such faults are excluded from the pause
-and never trip ``exit_on_unhandled_faults``, that a genuine generation-origin fault still counts (the exclusion
-is scoped by origin, not blanket), and that a shared not-found outcome adds no faults because it salvages every
-co-waiter. The arrangement is authentic end to end: real jobs are faulted through the prefetch coordinator's
+The consecutive-failure pop pause exists to stop a worker whose own generations keep failing; a problem the
+worker never ran a generation for must not count toward it, or one bad remote file silences a worker that is
+itself perfectly healthy. Aux prefetch now serves a job without any file it cannot fetch on every path: a
+not-found reference, a reference that never enters a download, and a stalled in-flight transfer are all
+salvaged (dispatched to inference without the file), never faulted. There is therefore no aux-origin fault for
+the pause to count or exclude. These assert that a streak of aux stalls never latches the pause and never trips
+``exit_on_unhandled_faults``, that a genuine generation-origin fault still counts (the salvage does not swallow
+real generation failures), and that a shared not-found outcome adds no faults because it salvages every
+co-waiter. The arrangement is authentic end to end: real jobs are driven through the prefetch coordinator's
 deadline path and reported through a real submitter, all sharing one ``WorkerState``, so the counter the popper
 reads is only ever mutated by production code.
 """
@@ -72,8 +72,9 @@ def _make_coordinator(
     The senders are irrelevant here: the test only drives the coordinator's completion/failure/deadline wiring,
     which mutates the shared tracker and worker state. The in-flight provider reports every pending job's
     outstanding references as a transfer frozen at a fixed byte count, so a deadline scan sees a stalled
-    in-flight download (the one remaining deadline fault) and, once the bounded deferrals are spent, produces a
-    genuine aux-origin fault. An injected clock and short download timeout let a test reach that expiry.
+    in-flight download and, once the bounded deferrals are spent, salvages the job (serves it without the stuck
+    reference) while arming the class backoff. An injected clock and short download timeout let a test reach that
+    expiry.
     """
 
     def _stalled_in_flight() -> dict[str, tuple[int, int]]:
@@ -211,19 +212,18 @@ def _ti_terminal_failure_message(name: str, job_ids: list[object]) -> HordeAuxPr
     )
 
 
-async def _fault_one_ti_job_through_prefetch(
+async def _salvage_one_ti_job_through_prefetch(
     tracker: JobTracker,
     coordinator: AuxPrefetchCoordinator,
     clock: _Clock,
     ti_name: str,
 ) -> ImageGenerateJobPopResponse:
-    """Pop a TI job and fault it through the prefetch deadline backstop, confirming it reaches PENDING_SUBMIT.
+    """Pop a TI job and drive it to a stalled-in-flight deadline salvage, confirming it is served, not faulted.
 
-    A not-found reference no longer faults a waiting job (it is served without the file), so the aux-origin fault
-    these tests exclude from the pop pause is the one remaining deadline fault: a stalled in-flight transfer whose
-    reported bytes never advance. Popping the job arms its deadline; the coordinator reports its reference in
-    flight but frozen, so advancing the injected clock past each of the bounded deferrals faults the job with the
-    aux-prefetch origin.
+    Aux prefetch never faults a job on any path: a not-found reference, a never-started fetch, and a stalled
+    in-flight transfer are all served without the file. Popping the job arms its deadline; the coordinator
+    reports its reference in flight but frozen, so advancing the injected clock past each of the bounded
+    deferrals salvages the job (dispatched to inference without the file) rather than faulting it.
     """
     job = _ti_job(ti_name)
     await track_popped_job_async(tracker, job)
@@ -231,15 +231,11 @@ async def _fault_one_ti_job_through_prefetch(
     for _ in range(_MAX_DEADLINE_DEFERRALS + 1):
         clock.now += 121.0
         coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT, (
-        "arrange failed: prefetch deadline did not fault the job"
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE, (
+        "arrange failed: prefetch deadline did not salvage the job"
     )
+    assert tracker.are_job_aux_models_prepared(job) is True
     return job
-
-
-async def _submit_head_pending_job(submitter: JobSubmitter) -> None:
-    """Report the head pending-submit job through the real submit path (which drives the failure counter)."""
-    await submitter.api_submit_job()
 
 
 async def _submit_one_successful_generation(
@@ -287,29 +283,23 @@ async def _fault_one_generation_job_through_submit(
     await submitter.api_submit_job()
 
 
-async def test_aux_prefetch_fault_streak_does_not_pause_pops() -> None:
-    """A streak of aux-prefetch faults (a healthy worker, one bad file) must not latch the pop pause.
+async def test_aux_prefetch_stall_streak_does_not_pause_pops() -> None:
+    """A streak of aux-prefetch stalls (a healthy worker, one bad file) never latches the pop pause.
 
-    Three distinct jobs each reference the same unfetchable textual inversion and are faulted before any
-    generation runs. The consecutive-failure pop pause exists to stop a worker whose generations are failing;
-    a fault the worker never generated for is outside that contract and must not silence all job intake.
+    Three distinct jobs each reference an unfetchable textual inversion whose transfer stalls in flight. Each is
+    served without the file (salvaged) rather than faulted, so no fault ever reaches the consecutive-failure
+    counter and the pause the worker's own generations would drive is never touched.
     """
     state = WorkerState()
-    tracker = JobTracker()
-    tracker.set_retry_policy(1)
     clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    tracker.set_retry_policy(1)
     coordinator = _make_coordinator(tracker, state, clock=clock)
-    submitter = _make_submitter(
-        state,
-        tracker,
-        horde_client_session=_fault_report_session(),
-        aiohttp_session=Mock(),
-    )
 
     for index in range(3):
-        await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, f"popular-ti-{index}")
-    for _ in range(3):
-        await _submit_head_pending_job(submitter)
+        await _salvage_one_ti_job_through_prefetch(tracker, coordinator, clock, f"popular-ti-{index}")
+
+    assert state.consecutive_failed_jobs == 0
 
     popper = _make_popper(state, tracker, bridge_data=make_mock_bridge_data(), shutdown_manager=Mock())
     should_skip = popper._handle_consecutive_failures(make_mock_bridge_data(), time.time())
@@ -318,28 +308,20 @@ async def test_aux_prefetch_fault_streak_does_not_pause_pops() -> None:
     assert state.too_many_consecutive_failed_jobs is False
 
 
-async def test_aux_prefetch_fault_streak_does_not_kill_worker_under_exit_on_unhandled_faults() -> None:
-    """The same aux-prefetch fault streak must not trip ``exit_on_unhandled_faults`` and shut the worker down.
+async def test_aux_prefetch_stall_streak_does_not_kill_worker_under_exit_on_unhandled_faults() -> None:
+    """The same aux-prefetch stall streak must not trip ``exit_on_unhandled_faults`` and shut the worker down.
 
-    Killing a healthy worker because one popular remote file cannot be fetched is the worst acceptable
-    outcome of this bug, so the shutdown seam must never be invoked for aux-prefetch-origin faults.
+    Killing a healthy worker because one popular remote file cannot be fetched is the worst acceptable outcome of
+    this bug. Since aux prefetch salvages rather than faults, no aux-origin fault exists to trip the shutdown seam.
     """
     state = WorkerState()
-    tracker = JobTracker()
-    tracker.set_retry_policy(1)
     clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    tracker.set_retry_policy(1)
     coordinator = _make_coordinator(tracker, state, clock=clock)
-    submitter = _make_submitter(
-        state,
-        tracker,
-        horde_client_session=_fault_report_session(),
-        aiohttp_session=Mock(),
-    )
 
     for index in range(3):
-        await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, f"popular-ti-{index}")
-    for _ in range(3):
-        await _submit_head_pending_job(submitter)
+        await _salvage_one_ti_job_through_prefetch(tracker, coordinator, clock, f"popular-ti-{index}")
 
     shutdown_manager = Mock()
     bridge_data = make_mock_bridge_data(exit_on_unhandled_faults=True)
@@ -350,20 +332,20 @@ async def test_aux_prefetch_fault_streak_does_not_kill_worker_under_exit_on_unha
     shutdown_manager.shutdown.assert_not_called()
 
 
-async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults() -> None:
-    """Aux faults are excluded from the failure counter while ordinary generation faults still count.
+async def test_generation_faults_still_count_and_successes_reset_amid_aux_stalls() -> None:
+    """Aux stalls contribute nothing to the failure counter while ordinary generation faults still count.
 
-    The exclusion must be scoped by fault origin, not blanket: a fault from the auxiliary-prefetch pipeline
-    never reaches the consecutive-failure counter, but a genuine generation-origin fault still increments it
-    (guarding against the widened exclusion swallowing real generation failures). A successful generation
-    resets the counter, and an aux fault interleaved between the generation fault and the success neither
-    increments nor resets it. Across the whole mixed-origin workload the counter never reaches the pause
-    threshold, so no pause latches.
+    Aux prefetch never faults a job, so an aux stall adds nothing to the consecutive-failure counter (the
+    exclusion is now structural: there is no aux fault to count). A genuine generation-origin fault still
+    increments the counter (guarding against the salvage swallowing real generation failures). A successful
+    generation resets it, and an aux stall interleaved between the generation fault and the success neither
+    increments nor resets it. Across the whole mixed workload the counter never reaches the pause threshold, so
+    no pause latches.
     """
     state = WorkerState()
-    tracker = JobTracker()
-    tracker.set_retry_policy(1)
     clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    tracker.set_retry_policy(1)
     coordinator = _make_coordinator(tracker, state, clock=clock)
     submitter = _make_submitter(
         state,
@@ -372,18 +354,16 @@ async def test_generation_faults_still_count_and_successes_reset_amid_aux_faults
         aiohttp_session=_r2_ok_session(),
     )
 
-    # An aux-prefetch-origin fault is reported through the real submit path but never reaches the counter.
-    await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, "popular-ti")
-    await _submit_head_pending_job(submitter)
+    # An aux-prefetch stall is salvaged (served without the file), so it never reaches the counter.
+    await _salvage_one_ti_job_through_prefetch(tracker, coordinator, clock, "popular-ti")
     assert state.consecutive_failed_jobs == 0
 
     # A genuine generation-origin fault does increment the counter (the over-exclusion guard).
     await _fault_one_generation_job_through_submit(tracker, submitter)
     assert state.consecutive_failed_jobs == 1
 
-    # An aux fault interleaved before the reset neither increments the counter nor clears it.
-    await _fault_one_ti_job_through_prefetch(tracker, coordinator, clock, "another-popular-ti")
-    await _submit_head_pending_job(submitter)
+    # An aux stall interleaved before the reset neither increments the counter nor clears it.
+    await _salvage_one_ti_job_through_prefetch(tracker, coordinator, clock, "another-popular-ti")
     assert state.consecutive_failed_jobs == 1
 
     # A successful generation resets the counter through the production submit path.

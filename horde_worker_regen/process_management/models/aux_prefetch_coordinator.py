@@ -8,12 +8,13 @@ download process:
 - the pop-time trigger, which computes the not-yet-known-cached auxiliary set (plus the eviction-pin set of
   every file any tracked job still references) and sends one prefetch request;
 - the completion/failure wiring, which marks each cached file, clears a job's dispatch gate once its full
-  auxiliary set is present, and faults a job promptly when a file it needs cannot be fetched; and
-- a per-job deadline (derived from the configured download timeout) that bounds how long a job waits on its
-  prefetch: a job whose outstanding references have no in-flight download by the deadline is served without them
-  (the inference child performs its own ad-hoc fetch, so the prefetch lane's unavailability must not become a
-  fault the inference path would not have produced), and only a stalled in-flight download that never advances is
-  faulted, so a job is never left pending forever; and
+  auxiliary set is present, requeues a job for a re-fetch on a retryable failure, and salvage-dispatches it
+  without a reference the fetch terminally cannot satisfy; and
+- a per-job deadline (derived from the configured download timeout, capped TTL-coherently) that bounds how
+  long a job waits on its prefetch: at expiry the job is served without its outstanding references, whether
+  they never started or their in-flight transfer stalled (the inference child performs its own ad-hoc fetch,
+  and a degraded delivery always beats a dropped job), so aux prefetch never faults a job and never leaves
+  one pending forever; and
 - a periodic reconcile-and-pin-refresh step that re-requests any aux-bearing pending job left without an
   in-flight request (a retryable requeue, a lost result message, a restarted downloader) and sends a
   pins-only update whenever the set of still-referenced files changes, coalesced so an unchanged set is never
@@ -39,7 +40,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AuxPrefetchOutcome,
     HordeAuxPrefetchResultMessage,
 )
-from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.models.aux_download_backoff import STRIKE_DECAY_SECONDS
 
 _PIN_STAGES = (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS, JobStage.PENDING_ANNOTATION)
@@ -62,6 +63,15 @@ retry is not delayed longer than needed, and never longer than the class's own s
 window lapses the reference is fetchable again, so cooling it further would be pointless). While a job's only
 uncached references are cooling it holds a live per-job deadline, so it stays bounded exactly as any unresolved
 prefetch does and still counts as aux-held against deadlock detection."""
+
+_AUX_SALVAGE_TTL_FRACTION = 0.35
+"""Fraction of a job's horde ttl by which its auxiliary prefetch must land or be salvaged (dispatched without).
+
+The download-timeout-derived deadline can outlast the whole job ttl (its SLA), so a file that never starts
+downloading would only be salvaged after the horde has already given up on the job. Capping the deadline at
+``time_popped + _AUX_SALVAGE_TTL_FRACTION * ttl`` keeps salvage inside a winnable window: the job dispatches
+without the missing file while its result can still be submitted in time. Sized well below the post-inference
+tail budget so the freed remainder of the ttl still covers the job's own inference and submission."""
 
 
 def _no_in_flight() -> dict[str, tuple[int, int]]:
@@ -107,7 +117,8 @@ class AuxPrefetchCoordinator:
         self._in_flight_provider = in_flight_provider if in_flight_provider is not None else _no_in_flight
         self._clock = clock
         # Per-job prefetch deadlines: a job whose auxiliary files have not all landed by its deadline is
-        # faulted rather than left pending forever. Cleared when the job is prepared, faulted, or gone.
+        # salvage-dispatched without them rather than left pending forever. Cleared when the job is prepared
+        # or gone.
         self._deadlines: dict[GenerationID, float] = {}
         # How many extra budgets each job's deadline has already been extended by while its files stayed in
         # flight, capped at ``_MAX_DEADLINE_DEFERRALS`` so a stalled download cannot defer a fault forever.
@@ -184,7 +195,8 @@ class AuxPrefetchCoordinator:
             entries.append(AuxPrefetchEntry(kind=AuxModelKind.TI, name=ti.name, requesting_job_id=job_id))
 
         if entries:
-            self._deadlines[job_id] = now + max(0.0, self._download_timeout_provider())
+            base_deadline = now + max(0.0, self._download_timeout_provider())
+            self._deadlines[job_id] = self._ttl_coherent_deadline(job, base_deadline, now=now)
             # A fresh request is a fresh attempt: forget any deferral/cooling bookkeeping a prior attempt left.
             self._forget_deferral_state(job_id)
             pins = self._current_pins()
@@ -201,7 +213,8 @@ class AuxPrefetchCoordinator:
             # download path yet, but hold a live deadline so the job stays bounded (and counts as aux-held) and
             # scan_deadlines still faults it if the cooldown-plus-refetch cycle never resolves it. The deadline
             # is armed once and not pushed forward on later reconcile passes, so the bound is real.
-            self._deadlines.setdefault(job_id, now + max(0.0, self._download_timeout_provider()))
+            base_deadline = now + max(0.0, self._download_timeout_provider())
+            self._deadlines.setdefault(job_id, self._ttl_coherent_deadline(job, base_deadline, now=now))
             self._cooling_deadline_jobs.add(job_id)
             return
 
@@ -210,8 +223,31 @@ class AuxPrefetchCoordinator:
         self._cooling_deadline_jobs.discard(job_id)
         self._job_tracker.mark_job_aux_prepared_if_ready(job_id)
 
+    def _ttl_coherent_deadline(
+        self,
+        job: ImageGenerateJobPopResponse,
+        base_deadline: float,
+        *,
+        now: float,
+    ) -> float:
+        """Return the prefetch deadline capped so salvage stays inside a winnable fraction of the job's ttl.
+
+        The download-timeout-derived ``base_deadline`` can outlast the job's whole horde ttl (its SLA), so an
+        auxiliary file that never starts downloading would only be salvaged after the horde has already given up
+        and the result is worthless. Anchoring the cap at ``time_popped + _AUX_SALVAGE_TTL_FRACTION * ttl``
+        guarantees a job whose aux cannot land in time dispatches without the missing file while its result can
+        still be submitted. A job the horde gave no ttl (or one not yet tracked) keeps ``base_deadline``.
+        """
+        ttl = job.ttl
+        if ttl is None or ttl <= 0:
+            return base_deadline
+        tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
+        time_popped = tracked.time_popped if tracked is not None and tracked.time_popped is not None else now
+        ttl_cap = time_popped + _AUX_SALVAGE_TTL_FRACTION * float(ttl)
+        return min(base_deadline, ttl_cap)
+
     def on_prefetch_result(self, message: HordeAuxPrefetchResultMessage) -> None:
-        """Consume per-entry prefetch outcomes: mark cached files, prepare ready jobs, fault failed ones."""
+        """Consume per-entry prefetch outcomes: mark cached files, prepare ready jobs, requeue or salvage failures."""
         now = self._clock()
         for outcome in message.outcomes:
             if outcome.ok:
@@ -244,9 +280,10 @@ class AuxPrefetchCoordinator:
           missing references recorded skipped, exactly as the rejection and terminal-plain-failure paths serve a
           job the fetch could not satisfy.
         - A job whose reference is present in the downloader's in-flight set defers while that transfer advances
-          (bounded at ``_MAX_DEADLINE_DEFERRALS`` extra download-timeout budgets), and is faulted only once the
-          transfer's reported bytes stop advancing or the budget is spent. A stalled in-flight download is the
-          one remaining deadline fault: a genuinely sick transfer that neither completes nor progresses.
+          (bounded at ``_MAX_DEADLINE_DEFERRALS`` extra download-timeout budgets and by the job's TTL-coherent
+          cap). Once the transfer's reported bytes stop advancing or the budget is spent, the job is served
+          without the stuck reference (recorded skipped incident-scoped) while the class backoff arms; the
+          transfer itself continues for future jobs. Aux prefetch therefore never faults a job at a deadline.
         """
         reference = self._clock() if now is None else now
         in_flight = self._in_flight_provider()
@@ -270,18 +307,17 @@ class AuxPrefetchCoordinator:
             # have run without them, so a fault here would drop otherwise-servable work.
             if self._salvage_never_started(tracked.sdk_api_job_info, in_flight=in_flight, now=reference):
                 continue
-            # Only a stalled in-flight transfer reaches here. A deadline is per-job, so each expiry is its own
-            # incident: arm the backoff (once) for each auxiliary class the job carries, then fault it. A job
-            # carrying both classes arms both. Retryability follows the combined backoff state exactly as a
-            # reported failure does; both arms always run (their strike is a side effect) so a class window
-            # escalates even when another class already made the fault terminal.
+            # Only a stalled in-flight transfer reaches here. The stall is real evidence of a sick download
+            # path, so the class backoff still arms (protecting the CDN from hammering), but the JOB is served
+            # without the stuck reference rather than faulted: with TTL-coherent deadlines the expiry lands
+            # while most of the job's completion budget remains, and a degraded delivery always beats a
+            # dropped job. The transfer itself continues in the downloader for future jobs.
             payload = tracked.sdk_api_job_info.payload
-            retryable = True
             if payload.loras:
-                retryable = self._arm_lora_backoff(now=reference) and retryable
+                self._arm_lora_backoff(now=reference)
             if payload.tis:
-                retryable = self._arm_ti_backoff(now=reference) and retryable
-            self._fault_pending_job(job_id, retryable=retryable, detail="aux prefetch deadline exceeded")
+                self._arm_ti_backoff(now=reference)
+            self._salvage_stalled_in_flight(tracked.sdk_api_job_info, now=reference)
 
     def _defer_deadline_if_in_flight(
         self,
@@ -309,7 +345,8 @@ class AuxPrefetchCoordinator:
         if not any(self._file_still_progressing(name, in_flight) for name in matched):
             return False
         self._deferrals[job_id] = self._deferrals.get(job_id, 0) + 1
-        self._deadlines[job_id] = now + max(0.0, self._download_timeout_provider())
+        base_deadline = now + max(0.0, self._download_timeout_provider())
+        self._deadlines[job_id] = self._ttl_coherent_deadline(job, base_deadline, now=now)
         for name in matched:
             self._last_inflight_bytes[name] = in_flight[name][0]
         if job_id not in self._deferral_logged:
@@ -482,7 +519,7 @@ class AuxPrefetchCoordinator:
 
         Read by the recovery coordinator so save-our-ship give-up defers to a head-of-queue job whose
         auxiliary prefetch is still progressing, bounded by that deadline: once it expires the entry is gone
-        (or scan_deadlines faults the job) and this reports False, so a stalled prefetch cannot defer give-up
+        (or scan_deadlines salvages the job) and this reports False, so a stalled prefetch cannot defer give-up
         forever.
         """
         deadline = self._deadlines.get(job_id)
@@ -498,7 +535,7 @@ class AuxPrefetchCoordinator:
         its LoRA/TI prefetch runs in the background download process does not fuel a queue- or general-deadlock
         verdict: "pending plus every process idle" is the aux-prefetch gate working as designed, not a wedge.
         The hold is intrinsically bounded by these deadlines: once a job's deadline expires the entry is gone
-        (or ``scan_deadlines`` faults the job) and it drops out of this set, so a stalled prefetch cannot shield
+        (or ``scan_deadlines`` salvages the job) and it drops out of this set, so a stalled prefetch cannot shield
         the queue from deadlock detection forever.
         """
         reference = self._clock() if now is None else now
@@ -552,9 +589,11 @@ class AuxPrefetchCoordinator:
         missing file), so no waiting job is faulted no matter how many shared the deduplicated download: the fault
         count does not scale with queue depth, and a job that also obtained valid files is served with them. A
         subsequent failure for an already-memoized reference takes the same skip path. A retryable failure instead
-        requeues each waiter for another attempt; a job whose own attempts are exhausted faults through the retry
-        policy exactly as any transient does, and such a fault is stamped with the aux-prefetch origin so it is
-        excluded from the consecutive-failure pop pause.
+        requeues each waiter for the download path's own retry (after the reference's cooldown) without charging
+        an inference attempt or faulting the job: a download the fetch lane cannot satisfy is not a generation
+        verdict, and the job would reach inference and run without the file anyway, so an auxiliary failure never
+        consumes the generation retry budget. If the reference stays unfetchable the next failure is terminal and
+        salvages the job, so a low retry budget can no longer turn a broken download into a dropped job.
         """
         live = [job_id for job_id in outcome.requesting_job_ids if self._is_pending(job_id)]
         if not live:
@@ -587,15 +626,23 @@ class AuxPrefetchCoordinator:
             )
             # The skip supersedes any re-fetch cooldown (a skipped reference is never re-requested anyway).
             self._reference_cooldowns.pop(self._outcome_key(outcome), None)
-            for job_id in live:
-                self._salvage_via_skip(job_id)
+            salvaged = [job_id for job_id in live if self._salvage_via_skip(job_id)]
+            if salvaged:
+                job_list = ", ".join(str(job_id)[:8] for job_id in salvaged)
+                logger.info(
+                    f"Aux ({'TI' if is_ti else 'LoRA'}) prefetch failed terminally for {outcome.name!r} "
+                    f"({detail}); dispatching job(s) {job_list} without it "
+                    "(a download failure is not a generation fault).",
+                )
             return
-        # Retryable: the requeued job will be revisited by the pop/reconcile path, so hold the reference in a
-        # cooldown first, or a sub-second failure is re-requested at once and its instant re-failure burns the
-        # job's remaining attempt. A waiter whose own attempts are exhausted faults through the retry policy.
+        # Retryable (a transient outage the download path may still recover from): hold the reference in a
+        # cooldown so the reconcile/pop path re-requests it after a quiet gap instead of re-entering the failing
+        # path at once, and keep each waiting job pending for that retry. A download failure is not a generation
+        # verdict, so it never charges an inference attempt or faults the job here; if the reference stays
+        # unfetchable the next failure is terminal (the incident is now active) and salvages the job without it.
         self._arm_reference_cooldown(outcome, now=now)
         for job_id in live:
-            self._fault_pending_job(job_id, retryable=True, detail=detail)
+            self._requeue_for_aux_refetch(job_id)
 
     def _salvage_never_started(
         self,
@@ -639,6 +686,36 @@ class AuxPrefetchCoordinator:
         )
         return True
 
+    def _salvage_stalled_in_flight(self, job: ImageGenerateJobPopResponse, *, now: float) -> bool:
+        """Serve a job whose deadline expired on a stalled in-flight transfer; return whether it dispatched.
+
+        The counterpart of :meth:`_salvage_never_started` for the one case that used to fault: a reference
+        whose download is in flight but no longer advancing (or whose deferral budget is spent) at the job's
+        deadline. Each outstanding reference is recorded skipped incident-scoped, exactly as a terminal plain
+        failure records it, so co-waiting and immediately-following jobs dispatch through the memoized skip
+        while the sick transfer recovers or dies on its own; the reference is prefetched again once the skip
+        expires. The job dispatches without the files (the inference child still makes its own ad-hoc attempt),
+        so aux prefetch can no longer fault a job on any path.
+        """
+        job_id = job.id_
+        if job_id is None:
+            return False
+        outstanding = self._uncached_entries(job)
+        for kind, name, is_version in outstanding:
+            self._job_tracker.mark_aux_skipped(
+                name,
+                is_version=is_version,
+                is_ti=kind is AuxModelKind.TI,
+                expires_at=now + STRIKE_DECAY_SECONDS,
+            )
+        if not self._salvage_via_skip(job_id):
+            return False
+        logger.info(
+            f"Aux prefetch deadline reached for job {str(job_id)[:8]} with {len(outstanding)} stalled "
+            "in-flight reference(s); dispatching without them (the transfer continues for future jobs).",
+        )
+        return True
+
     def _uncached_entries(self, job: ImageGenerateJobPopResponse) -> list[tuple[AuxModelKind, str, bool]]:
         """The job's not-yet-cached auxiliary references as ``(kind, name, is_version)`` identity tuples.
 
@@ -667,6 +744,18 @@ class AuxPrefetchCoordinator:
             self._forget_deferral_state(job_id)
             return True
         return False
+
+    def _requeue_for_aux_refetch(self, job_id: GenerationID) -> None:
+        """Keep a still-pending job waiting for an auxiliary re-fetch, dropping the failed attempt's deadline.
+
+        A retryable download failure is a property of the download path, not of the job's generation, so it must
+        neither consume the job's inference retry budget nor fault it. The job is already ``PENDING_INFERENCE``
+        (auxiliary preparation runs while it is pending), so requeuing is simply clearing the failed attempt's
+        deadline and deferral bookkeeping; the reconcile/pop path re-requests the reference once its cooldown
+        lapses. A job that has moved on keeps the same clearing, since it no longer holds a live deadline anyway.
+        """
+        self._deadlines.pop(job_id, None)
+        self._forget_deferral_state(job_id)
 
     def _is_pending(self, job_id: GenerationID) -> bool:
         """Whether the job is still tracked and awaiting inference (so a fault would actually affect it)."""
@@ -708,28 +797,6 @@ class AuxPrefetchCoordinator:
             f"(strike {self._state.ti_download_backoff.strikes}).",
         )
         return retryable
-
-    def _fault_pending_job(self, job_id: GenerationID, *, retryable: bool, detail: str) -> None:
-        """Fault one still-pending prefetch job, dropping its deadline.
-
-        A no-op if the job is gone or no longer pending (already dispatched, prepared by a sibling entry, or
-        faulted), so a late or duplicate failure never disturbs a job that has moved on. Any terminal fault is
-        stamped with the aux-prefetch origin so it is excluded from the consecutive-failure pop pause: the
-        worker never ran a generation for this job, so a fetch it cannot satisfy is not a generation verdict.
-        """
-        tracked = self._job_tracker.get_tracked_job(job_id)
-        if tracked is None or tracked.stage != JobStage.PENDING_INFERENCE:
-            self._deadlines.pop(job_id, None)
-            self._forget_deferral_state(job_id)
-            return
-        self._job_tracker.handle_job_fault_now(
-            tracked.sdk_api_job_info,
-            retryable=retryable,
-            fault_reason=detail,
-            fault_origin=JobFaultOrigin.AUX_PREFETCH,
-        )
-        self._deadlines.pop(job_id, None)
-        self._forget_deferral_state(job_id)
 
     def _current_pins(self) -> list[AuxModelRef]:
         """The eviction-pin set: every auxiliary file any not-yet-terminal tracked job still references."""

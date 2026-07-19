@@ -324,17 +324,19 @@ async def test_progressing_ti_download_defers_deadline() -> None:
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
 
-async def test_stalled_ti_download_faults_at_deadline() -> None:
-    """A TI whose in-flight transfer stops advancing is faulted once the deadline deferral is spent.
+async def test_stalled_ti_download_salvages_at_deadline() -> None:
+    """A TI whose in-flight transfer stops advancing is salvaged once the deadline deferral is spent, not faulted.
 
-    The deadline backstop defers once for an in-flight file, then faults when its reported bytes fail to move,
-    so a wedged TI download does not leave the job pending forever.
+    The deadline backstop defers once for an in-flight file, then, when its reported bytes fail to move, serves
+    the job without the textual inversion rather than faulting it, so a wedged TI download neither leaves the job
+    pending forever nor drops it. The class backoff still arms as evidence of the sick download path.
     """
-    tracker = JobTracker()
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     job = _job(tis=[TIPayloadEntry(name="emb")])
     await track_popped_job_async(tracker, job)
     in_flight = _InFlightSpy()
-    coordinator, _sender, _state, clock = _make(tracker, timeout=60.0, in_flight=in_flight)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=60.0, in_flight=in_flight)
     coordinator.on_job_popped(job)
 
     in_flight.map = {"emb": (2_000, 10_000)}
@@ -344,4 +346,7 @@ async def test_stalled_ti_download_faults_at_deadline() -> None:
 
     clock.now += 61.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_ti_skipped("emb") is True
+    assert state.ti_download_backoff.strikes >= 1

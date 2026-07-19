@@ -268,31 +268,33 @@ async def test_single_transient_lora_failure_requeues_and_arms_backoff_once() ->
     assert tracker.is_lora_skipped(_lora("net")) is False
 
 
-async def test_aux_prefetch_deadline_fault_excluded_from_consecutive_failure_pause() -> None:
-    """A job faulted by the aux-prefetch deadline carries the aux-prefetch origin, excluded from the pause.
+async def test_stalled_in_flight_deadline_salvages_so_nothing_counts_toward_pause() -> None:
+    """A stalled in-flight transfer is salvaged at the deadline (not faulted), so nothing reaches the pause.
 
-    A not-found reference is served without the file, and a reference that never enters a download is likewise
-    served without it, so the one aux-origin fault that must be excluded from the consecutive-failure pop pause
-    is the remaining deadline fault: a stalled in-flight transfer whose reported bytes never advance. Its
-    reference is in flight but frozen, so after the bounded deferrals the deadline faults the job with the
-    aux-prefetch origin. Guards the origin stamping the fault-storm reproduction relies on end to end.
+    A not-found reference is served without the file, a reference that never enters a download is likewise served
+    without it, and a reference in flight whose bytes never advance is served without it once its bounded
+    deferrals are spent. Aux prefetch therefore produces no fault on any path, so there is no aux-origin fault to
+    reach (or be excluded from) the consecutive-failure pop pause: the pause simply never sees one. The class
+    backoff still arms as evidence of the sick download path.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(1)
     in_flight: dict[str, tuple[int, int]] = {"net": (50, 100)}
-    coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=30.0, in_flight=in_flight)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=30.0, in_flight=in_flight)
 
     job = _job(loras=[_lora("net")])
     await track_popped_job_async(tracker, job)
     coordinator.on_job_popped(job)
-    # The reference is in flight but its bytes never advance, so it defers a bounded number of times then faults.
+    # The reference is in flight but its bytes never advance, so it defers a bounded number of times then salvages.
     for _ in range(_MAX_DEADLINE_DEFERRALS + 1):
         clock.now += 31.0
         coordinator.scan_deadlines()
 
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
-    assert tracker.was_faulted_by_non_generation_action(job.id_) is True
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.was_faulted_by_non_generation_action(job.id_) is False
+    assert state.lora_download_backoff.strikes >= 1
 
 
 async def test_mixed_job_with_laundered_lora_should_dispatch_with_only_valid() -> None:

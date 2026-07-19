@@ -1,25 +1,28 @@
 """Deadline handling of an aux prefetch whose download was requested but never entered in-flight.
 
-The parent-side aux-prefetch coordinator arms a per-job deadline at pop and, when it expires, faults a job
-whose auxiliary files are not yet on disk. That backstop defers only while the downloader reports a file
-actively in flight (:meth:`AuxPrefetchCoordinator._defer_deadline_if_in_flight`). A reference the downloader
-never began fetching (its lane starved, so the file was neither placed nor reported in flight) therefore
-reaches the deadline unmatched and is faulted.
+The parent-side aux-prefetch coordinator arms a per-job deadline at pop and, when it expires, serves a job
+whose auxiliary files are not yet on disk without them rather than faulting it. That backstop defers only
+while the downloader reports a file actively in flight and advancing
+(:meth:`AuxPrefetchCoordinator._defer_deadline_if_in_flight`). A reference the downloader never began fetching
+(its lane starved, so the file was neither placed nor reported in flight) therefore reaches the deadline
+unmatched and is salvaged (:meth:`AuxPrefetchCoordinator._salvage_never_started`).
 
 The standing repo ruling is that the prefetch optimization must never change a job's outcome versus reaching
-inference: the coordinator already serves a job without an auxiliary file the fetch API rejects
-(:meth:`AuxPrefetchCoordinator._skip_rejected_aux`) and salvages co-waiters on a terminal plain failure. A
-job whose reference merely never started downloading is in the same position (inference would run without the
-missing file), so faulting it drops otherwise-servable work that the deadline was only meant to bound.
+inference: the coordinator serves a job without an auxiliary file the fetch API rejects
+(:meth:`AuxPrefetchCoordinator._skip_rejected_aux`), salvages co-waiters on a terminal plain failure, and
+salvages the job whose reference stalled in flight (:meth:`AuxPrefetchCoordinator._salvage_stalled_in_flight`).
+A job whose reference merely never started downloading is in the same position (inference would run without the
+missing file), so faulting it would drop otherwise-servable work that the deadline was only meant to bound.
 
 RED contract: a job whose aux entries were requested but never entered an in-flight download by deadline
 expiry is salvaged (dispatched to inference without the file), not faulted.
 
-Controls bound the salvage: a download that IS in flight at expiry still defers, an in-flight download whose
-reported bytes never advance still faults once the deferral budget is spent, and a reference whose incident
-already memoized it skipped is salvaged through that skip (the adjacent salvage path). The reproductions and
-controls drive the real coordinator over a real :class:`JobTracker` sharing an injected clock, so no live
-worker is needed.
+Controls bound the salvage: a download that IS in flight and advancing at expiry still defers, and a reference
+whose incident already memoized it skipped is salvaged through that skip (the adjacent salvage path). An
+in-flight download whose reported bytes never advance is also salvaged once the deferral budget is spent (aux
+prefetch never faults a job on any path); only the deferral count, not the job's fate, distinguishes it. The
+reproductions and controls drive the real coordinator over a real :class:`JobTracker` sharing an injected
+clock, so no live worker is needed.
 """
 
 from __future__ import annotations
@@ -220,18 +223,19 @@ async def test_in_flight_progressing_download_defers_at_deadline() -> None:
     assert not _salvaged(tracker, job)  # still pending its in-flight file, neither faulted nor dispatched
 
 
-async def test_stuck_in_flight_download_still_faults_after_deferrals_exhaust() -> None:
-    """An in-flight download whose bytes never advance still faults once the deferral budget is spent.
+async def test_stuck_in_flight_download_salvages_after_deferrals_exhaust() -> None:
+    """An in-flight download whose bytes never advance is salvaged once the deferral budget is spent, not faulted.
 
-    A download that is reported in flight but makes no byte progress is deferred a bounded number of times
-    and then faulted, so a genuinely stalled transfer cannot postpone its fault forever. This bounds the
-    never-started salvage to references with no in-flight download at all.
+    A download reported in flight but making no byte progress is deferred a bounded number of times and then,
+    with its budget spent, the job is served without the stalled reference. The deferral cap distinguishes it
+    from a never-started reference only by how long it waits: both are salvaged, never faulted, so a genuinely
+    stalled transfer can neither postpone resolution forever nor drop the job.
     """
     clock = _Clock()
     tracker = JobTracker(clock=clock)
     tracker.set_retry_policy(1)
     in_flight: dict[str, tuple[int, int]] = {"stalled": (50, 100)}
-    coordinator, _sender, _state = _make(tracker, clock=clock, in_flight=in_flight)
+    coordinator, _sender, state = _make(tracker, clock=clock, in_flight=in_flight)
 
     job = await _job_of(tracker, coordinator, loras=[_lora("stalled")])
 
@@ -241,4 +245,7 @@ async def test_stuck_in_flight_download_still_faults_after_deferrals_exhaust() -
         clock.now += _DEADLINE_SECONDS + 1.0
         coordinator.scan_deadlines()
 
-    assert _faulted(tracker, job)
+    assert _salvaged(tracker, job)
+    assert not _faulted(tracker, job)
+    assert tracker.is_lora_skipped(_lora("stalled")) is True
+    assert state.lora_download_backoff.strikes >= 1

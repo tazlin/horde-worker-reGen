@@ -242,9 +242,15 @@ async def test_partial_completion_does_not_prepare_multi_lora_job() -> None:
     assert tracker.are_job_aux_models_prepared(job) is True
 
 
-async def test_failure_faults_job_and_arms_backoff() -> None:
-    """A LoRA prefetch failure faults the pending job and registers a LoRA-download backoff strike."""
+async def test_retryable_failure_requeues_job_without_faulting_and_arms_backoff() -> None:
+    """A retryable LoRA prefetch failure requeues the pending job and arms a backoff strike, faulting neither.
+
+    A download failure is not a generation verdict, so it neither charges an inference attempt nor faults the
+    job: the job stays pending for an aux re-fetch (even with a single-attempt retry budget) while the strike
+    protects the download path.
+    """
     tracker = JobTracker()
+    tracker.set_retry_policy(1)
     job = _job(loras=[_lora("styleA")])
     await track_popped_job_async(tracker, job)
     coordinator, _sender, state, _clock = _make(tracker)
@@ -268,7 +274,10 @@ async def test_failure_faults_job_and_arms_backoff() -> None:
         ),
     )
 
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is False
+    tracked = tracker.get_tracked_job(job.id_)
+    assert tracked is not None and tracked.inference_attempts == 0
     assert state.lora_download_backoff.strikes == 1
 
 
@@ -379,8 +388,8 @@ async def test_rejected_lora_not_re_requested_on_next_job() -> None:
     assert tracker.get_stage(job_b.id_) == JobStage.PENDING_INFERENCE
 
 
-async def test_shared_lora_failure_arms_backoff_once_and_faults_both_jobs() -> None:
-    """One failed download shared by two jobs faults both but registers a single backoff strike."""
+async def test_shared_lora_failure_arms_backoff_once_and_requeues_both_jobs() -> None:
+    """One failed download shared by two jobs requeues both (faulting neither) and registers a single strike."""
     tracker = JobTracker()
     job_a = _job(loras=[_lora("shared")])
     job_b = _job(loras=[_lora("shared")])
@@ -400,14 +409,15 @@ async def test_shared_lora_failure_arms_backoff_once_and_faults_both_jobs() -> N
                     kind=AuxModelKind.LORA,
                     name="shared",
                     ok=False,
+                    retryable=True,
                     requesting_job_ids=[job_a.id_, job_b.id_],
                 ),
             ],
         ),
     )
 
-    assert tracker.get_stage(job_a.id_) == JobStage.PENDING_SUBMIT
-    assert tracker.get_stage(job_b.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job_a.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.get_stage(job_b.id_) == JobStage.PENDING_INFERENCE
     # One download failed once, so exactly one strike is registered despite two waiting jobs.
     assert state.lora_download_backoff.strikes == 1
 
@@ -440,6 +450,51 @@ async def test_deadline_expiry_salvages_unresolved_job() -> None:
     assert tracker.are_job_aux_models_prepared(job) is True
     assert tracker.is_lora_skipped(_lora("styleA")) is True
     assert state.lora_download_backoff.strikes == 0
+
+
+async def test_short_ttl_caps_salvage_deadline_within_fraction() -> None:
+    """A short-ttl job is salvage-dispatched by ``time_popped + fraction*ttl``, well before the download timeout.
+
+    The download-timeout deadline would outlast the job's whole ttl (its SLA), so a never-in-flight reference
+    would only be salvaged after the horde had already aborted the job. The ttl-coherent cap pulls salvage
+    inside a winnable window.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    job = _job(loras=[_lora("styleA")]).model_copy(update={"ttl": 100})
+    # Align the tracked pop time with the coordinator's injected clock so the ttl cap is computed against it.
+    await track_popped_job_async(tracker, job, time_popped=clock.now)
+    coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=120.0)
+    coordinator.on_job_popped(job)
+
+    # The ttl cap is 1000 + 0.35*100 = 1035, far earlier than the 1000+120 = 1120 download-timeout deadline.
+    clock.now += 30.0  # 1030: before the cap, the job still waits.
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is False
+
+    clock.now += 10.0  # 1040: past the ttl cap (1035) but far under the raw timeout deadline (1120).
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
+
+
+async def test_no_ttl_keeps_download_timeout_deadline() -> None:
+    """A job the horde gave no ttl keeps the download-timeout deadline (existing salvage timing preserved)."""
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    job = _job(loras=[_lora("styleA")])  # ttl is None
+    await track_popped_job_async(tracker, job, time_popped=clock.now)
+    coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=60.0)
+    coordinator.on_job_popped(job)
+
+    # Past where a 0.35*ttl cap would fire for a short ttl, but with no ttl the raw 1060 timeout still governs.
+    clock.now += 40.0  # 1040: before the download-timeout deadline (1060).
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is False
+
+    clock.now += 25.0  # 1065: past the download-timeout deadline.
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is True
 
 
 async def test_ti_job_gates_and_prepares_like_loras() -> None:
@@ -656,13 +711,19 @@ async def test_deadline_defers_while_file_in_flight_then_prepares_on_completion(
     assert tracker.are_job_aux_models_prepared(job) is True
 
 
-async def test_deadline_defers_to_cap_then_faults_when_bytes_unreported() -> None:
-    """A file in flight but reporting no bytes defers up to the cap (three budgets total), then faults."""
-    tracker = JobTracker()
+async def test_deadline_defers_to_cap_then_salvages_when_bytes_unreported() -> None:
+    """A file in flight but reporting no bytes defers up to the cap (three budgets total), then salvages.
+
+    Once the deferral budget is spent the job is served without the stalled reference (dispatched bare) rather
+    than faulted, so a wedged transfer never drops the job; the class backoff still arms as real evidence of a
+    sick download path.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     job = _job(loras=[_lora("styleA")])
     await track_popped_job_async(tracker, job)
     in_flight = _InFlightSpy()
-    coordinator, _sender, state, clock = _make(tracker, timeout=60.0, in_flight=in_flight)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=60.0, in_flight=in_flight)
     coordinator.on_job_popped(job)
 
     # The engine cannot report progress (zero bytes): the first two expiries defer, bounded by the cap.
@@ -673,20 +734,25 @@ async def test_deadline_defers_to_cap_then_faults_when_bytes_unreported() -> Non
         assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
         assert state.lora_download_backoff.strikes == 0
 
-    # The third expiry is out of deferral budget, so the job faults with the usual deadline semantics.
+    # The third expiry is out of deferral budget: the job is salvaged (served without the reference), the
+    # reference recorded skipped, the deadline cleared, and one strike armed. It is never faulted.
     clock.now += 61.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
+    assert coordinator.has_live_deadline(job.id_) is False
     assert state.lora_download_backoff.strikes == 1
 
 
-async def test_deadline_defers_once_then_faults_when_reported_bytes_stall() -> None:
-    """A file reporting bytes that stop advancing defers exactly once, then faults at the next expiry."""
-    tracker = JobTracker()
+async def test_deadline_defers_once_then_salvages_when_reported_bytes_stall() -> None:
+    """A file reporting bytes that stop advancing defers exactly once, then salvages the job at the next expiry."""
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
     job = _job(loras=[_lora("styleA")])
     await track_popped_job_async(tracker, job)
     in_flight = _InFlightSpy()
-    coordinator, _sender, state, clock = _make(tracker, timeout=60.0, in_flight=in_flight)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=60.0, in_flight=in_flight)
     coordinator.on_job_popped(job)
 
     # First expiry: bytes are reported but there is no prior observation to call it stalled, so it defers.
@@ -696,10 +762,13 @@ async def test_deadline_defers_once_then_faults_when_reported_bytes_stall() -> N
     assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
     assert state.lora_download_backoff.strikes == 0
 
-    # Next expiry: the reported bytes have not advanced, so the stall is detected and the job faults.
+    # Next expiry: the reported bytes have not advanced, so the stall is detected and the job is served without
+    # the reference (salvaged, not faulted) while the strike records the sick download path.
     clock.now += 61.0
     coordinator.scan_deadlines()
-    assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
     assert state.lora_download_backoff.strikes == 1
 
 
