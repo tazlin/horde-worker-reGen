@@ -34,6 +34,12 @@ from horde_worker_regen.process_management.jobs.large_model_pop_governor import 
     LargeModelGovernorStatus,
     LargeModelPopGovernor,
 )
+from horde_worker_regen.process_management.jobs.pool_lanes import (
+    LaneDecision,
+    PoolLaneState,
+    decide_pool_lane,
+    record_fixed_pop_outcome,
+)
 from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.feature_readiness import (
@@ -57,6 +63,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable_for,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_affinity import (
     ResidencyBiasDecision,
     ResidencyBiasState,
@@ -190,7 +197,14 @@ def _select_models_for_pop(
         if process.loaded_horde_model_name is not None
     }
 
-    if len(configured) > max_inference_processes and len(loaded_models) == max_inference_processes:
+    # The fixed model pool supersedes probabilistic stickiness: when the pool is enabled its advertising
+    # lanes own the narrowing, so the deprecated stickiness roll must not run (nor emit its logs).
+    stickiness_superseded = bridge_data.model_pool.enabled
+    if (
+        not stickiness_superseded
+        and len(configured) > max_inference_processes
+        and len(loaded_models) == max_inference_processes
+    ):
         if (
             (not last_pop_had_no_jobs)
             and bridge_data.horde_model_stickiness > 0
@@ -401,6 +415,8 @@ class JobPopper:
         action_ledger: ActionLedger | None = None,
         on_job_popped: Callable[[ImageGenerateJobPopResponse], None] | None = None,
         background_downloads_enabled: bool = True,
+        pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
+        pool_pop_outcome_sink: Callable[..., None] | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -440,6 +456,19 @@ class JobPopper:
         `action_ledger`, when provided, records the edge-triggered engage/release of residency advertising
         narrowing for offline diagnosis. It defaults to None (in-memory logging only), so a directly
         constructed popper (and the tests) records no ledger events.
+
+        `pool_active_seats_provider` reports the models the fixed model pool currently seats. When it is
+        provided, the pool is enabled, and it reports a non-empty seat set, each non-idle-fill pop is routed
+        through a fixed/free advertising lane (see
+        :func:`~horde_worker_regen.process_management.jobs.pool_lanes.decide_pool_lane`). It defaults to None,
+        so a popper wired without it (and the tests) behaves exactly as before, leaving model selection and the
+        residency-bias call untouched. This byte-identical no-provider path is a hard regression contract.
+
+        `pool_pop_outcome_sink` receives each pool-routed pop's outcome (its lane, advertised set, popped model
+        name or None, and a monotonic timestamp), matching
+        :meth:`~horde_worker_regen.process_management.scheduling.model_pool.ModelPool.on_pop_outcome`. It is
+        called only for cycles the pool actually routed, never for pool-disabled or idle-fill pops. It defaults
+        to None (no outcome reporting).
         """
         self._state = state
         self._process_map = process_map
@@ -474,6 +503,16 @@ class JobPopper:
         self._residency_bias_state = ResidencyBiasState()
         self._residency_bias_narrowing = False
         self._residency_bias_offered_count = 0
+        # Fixed-pool advertising: the seat provider and outcome sink are inert by default, so a popper wired
+        # without them is byte-identical to the pre-pool worker. The lane state carries the fixed/free
+        # interleave across pops; the narrowing latch anchors the edge log/ledger; the last-fixed count and
+        # current lane are readable status snapshots.
+        self._pool_active_seats_provider = pool_active_seats_provider
+        self._pool_pop_outcome_sink = pool_pop_outcome_sink
+        self._pool_lane_state = PoolLaneState()
+        self._pool_lane_narrowing = False
+        self._pool_last_fixed_seat_count = 0
+        self._pool_lane_this_cycle: PopLane | None = None
         self._large_model_pop_governor = LargeModelPopGovernor()
         # Notified once per popped job. With background downloads enabled this is the aux-prefetch
         # coordinator's pop trigger (place the job's LoRAs/TIs on disk while it is still pending); without
@@ -797,6 +836,113 @@ class JobPopper:
     def latest_residency_bias_offered_count(self) -> int:
         """The model count advertised on the most recent residency-bias decision (status snapshot)."""
         return self._residency_bias_offered_count
+
+    def _apply_pool_lane(
+        self,
+        models: set[str],
+        bridge_data: reGenBridgeData,
+        *,
+        idle_fill_wanted: bool,
+    ) -> LaneDecision | None:
+        """Route this pop through a fixed/free advertising lane, or None when the pool does not run.
+
+        The pool runs only for a non-idle-fill pop when a seat provider is wired, the pool is enabled, and it
+        reports at least one seated model. It then chooses the lane (advancing the interleave state) and
+        surfaces the edge log/ledger. Returns None whenever the pool does not run, leaving the offer and the
+        residency-bias call untouched, so the pool-disabled path is byte-identical to the pre-pool worker.
+        """
+        self._pool_lane_this_cycle = None
+        if idle_fill_wanted or self._pool_active_seats_provider is None or not bridge_data.model_pool.enabled:
+            return None
+        active_seats = self._pool_active_seats_provider()
+        if not active_seats:
+            return None
+
+        # The free-lane weight must be measured against the same capacity the auto seat count resolves
+        # from (the provisioned process ceiling), or a lower live concurrency cap would hand the free lane
+        # capacity the seats already claim and dilute the fixed lane with churn traffic.
+        decision = decide_pool_lane(
+            self._pool_lane_state,
+            eligible=frozenset(models),
+            active_seats=active_seats,
+            process_count=self._max_inference_processes,
+        )
+        self._pool_lane_state = decision.next_state
+        self._pool_lane_this_cycle = decision.lane
+        if decision.lane is PopLane.FIXED:
+            self._pool_last_fixed_seat_count = len(decision.advertised)
+        self._log_pool_lane_edge(decision)
+        return decision
+
+    def _report_pool_pop_outcome(self, pool_lane: LaneDecision | None, *, popped_model: str | None) -> None:
+        """Report a pool-routed pop's outcome and fold fixed-lane emptiness into the interleave.
+
+        A no-op for cycles the pool did not route (``pool_lane`` is None). A fixed-lane pop records whether it
+        came back empty (feeding the free-weight boost that yields the offer back when the fixed lane stops
+        earning work) independently of the sink, then the wired sink is handed the lane, advertised set, popped
+        model (or None), and a monotonic timestamp.
+        """
+        if pool_lane is None:
+            return
+        if pool_lane.lane is PopLane.FIXED:
+            self._pool_lane_state = record_fixed_pop_outcome(
+                self._pool_lane_state,
+                was_empty=popped_model is None,
+            )
+        if self._pool_pop_outcome_sink is None:
+            return
+        self._pool_pop_outcome_sink(
+            lane=pool_lane.lane,
+            advertised=pool_lane.advertised,
+            popped_model=popped_model,
+            now=time.monotonic(),
+        )
+
+    def _log_pool_lane_edge(self, decision: LaneDecision) -> None:
+        """Emit the edge-triggered lane-narrowing log line and ledger event.
+
+        Coalesced against the last lane surfaced, so a steady fixed (or steady free) lane is never re-logged
+        pop after pop; only a transition between the narrowed fixed lane and the wider free lane fires.
+        """
+        narrowing = decision.lane is PopLane.FIXED
+        if narrowing == self._pool_lane_narrowing:
+            return
+        self._pool_lane_narrowing = narrowing
+        if narrowing:
+            logger.info(
+                "Fixed model pool: entered the fixed advertising lane, offering "
+                f"{len(decision.advertised)} seated model(s) so the horde returns swap-free work.",
+            )
+            self._record_pool_lane_ledger(
+                LedgerEventType.MODEL_POOL_LANE_FIXED,
+                reason="fixed_lane",
+                offered_count=len(decision.advertised),
+            )
+        else:
+            logger.info("Fixed model pool: returned to the free advertising lane, re-opening the wider offer.")
+            self._record_pool_lane_ledger(
+                LedgerEventType.MODEL_POOL_LANE_FREE,
+                reason="free_lane",
+                offered_count=len(decision.advertised),
+            )
+
+    def _record_pool_lane_ledger(self, event_type: LedgerEventType, *, reason: str, offered_count: int) -> None:
+        """Record a pool-lane edge to the action ledger when one is wired (never raises)."""
+        if self._action_ledger is None:
+            return
+        self._action_ledger.record(event_type, reason=reason, detail={"offered_models": offered_count})
+
+    def latest_pool_lane(self) -> PopLane | None:
+        """The advertising lane the pool routed the most recent pop through, or None when it did not run."""
+        return self._pool_lane_this_cycle
+
+    def latest_pool_fixed_seat_count(self) -> int:
+        """The seated-model count advertised on the most recent fixed-lane pop (status snapshot)."""
+        return self._pool_last_fixed_seat_count
+
+    def latest_pool_lane_narrowing(self) -> bool:
+        """Whether the most recent pool-routed pop narrowed to the fixed lane (status snapshot)."""
+        return self._pool_lane_narrowing
 
     def large_model_governor_status(self, *, now: float, residency_active: bool) -> LargeModelGovernorStatus:
         """Report the live engagement of the two large-model limiters, for the governor registry.
@@ -1422,11 +1568,21 @@ class JobPopper:
         if len(models) == 0:
             return
 
+        # Fixed-pool advertising lane: when the pool holds seats, route this pop through the fixed lane (the
+        # seated models, so the horde returns work the card runs without a swap) or the free lane (the rest,
+        # so cold demand still reaches the worker), interleaved by a weighted round-robin. A fixed-lane offer
+        # is already the narrowing, so it must NOT then pass through the residency-bias floor (which could cut
+        # a not-yet-resident seat from its own lane); the free lane and every pool-disabled pop keep the bias.
+        pool_lane = self._apply_pool_lane(models, bridge_data, idle_fill_wanted=idle_fill_wanted)
+        if pool_lane is not None:
+            models = set(pool_lane.advertised)
+
         # Residency-biased advertising: while the worker is paying model swaps (a queued head needs a
         # non-resident model), narrow the offer toward the resident+staged set so the horde returns work the
         # card can run without a swap. Duty-cycled so the full set is periodically re-advertised, and skipped
         # entirely on an idle-fill pop, whose job is to grab the quickest available work regardless of model.
-        if not idle_fill_wanted:
+        on_fixed_lane = pool_lane is not None and pool_lane.lane is PopLane.FIXED
+        if not idle_fill_wanted and not on_fixed_lane:
             models = self._apply_residency_advertising_bias(models)
 
         pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw
@@ -1596,6 +1752,7 @@ class JobPopper:
                     len(self._job_tracker.jobs_pending_inference) == 0 and self._state.alchemy_forms_in_flight == 0
                 ),
             )
+            self._report_pool_pop_outcome(pool_lane, popped_model=None)
             return
 
         if self._state.last_pop_maintenance_mode:
@@ -1609,6 +1766,7 @@ class JobPopper:
             # Fed at this rung; restart the ladder at the smallest, quickest rung for the next idle episode.
             self._state.idle_fill_rung = 0
         self._pop_throttler.on_job_popped()
+        self._report_pool_pop_outcome(pool_lane, popped_model=job_pop_response.model)
 
         has_loras = job_pop_response.payload.loras is not None and len(job_pop_response.payload.loras) > 0
         has_post_processing = (

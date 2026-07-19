@@ -271,6 +271,30 @@ class TestStickyModels:
         for model in result:
             assert model in {"model_a"}
 
+    def test_stickiness_superseded_by_enabled_pool(self) -> None:
+        """With the fixed pool enabled, even stickiness=1.0 never narrows: the pool lanes own narrowing."""
+        from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
+        from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+
+        bridge_data = make_mock_bridge_data(
+            image_models_to_load=["model_a", "model_b", "model_c"],
+            horde_model_stickiness=1.0,
+            model_pool=ModelPoolConfig(enabled=True),
+        )
+        process_info = make_mock_process_info(0, model_name="model_a", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
+
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=1,
+            last_pop_had_no_jobs=False,
+        )
+
+        assert result == {"model_a", "model_b", "model_c"}
+
     def test_stickiness_skipped_when_last_pop_had_no_jobs(self) -> None:
         """When last pop returned no jobs, stickiness is bypassed to try different models."""
         bridge_data = make_mock_bridge_data(

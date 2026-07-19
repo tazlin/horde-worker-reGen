@@ -21,6 +21,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     LorasPayloadEntry,
 )
 
+from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -30,9 +31,11 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.pool_lanes import PoolLaneState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource, make_empty_pop_response
 from horde_worker_regen.utils.job_utils import small_pop_max_power
@@ -63,6 +66,8 @@ def _make_popper(
     model_availability: ModelAvailability | None = None,
     post_processing_lane_commitments_provider: Callable[[], int] | None = None,
     extended_controlnet_ready_provider: Callable[[], bool] | None = None,
+    pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
+    pool_pop_outcome_sink: Callable[..., None] | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -99,6 +104,8 @@ def _make_popper(
         model_availability=model_availability,
         post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
         extended_controlnet_ready_provider=extended_controlnet_ready_provider,
+        pool_active_seats_provider=pool_active_seats_provider,
+        pool_pop_outcome_sink=pool_pop_outcome_sink,
     )
 
 
@@ -2011,6 +2018,228 @@ class TestIdleFillEscalationAndGates:
         request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
         assert request.allow_lora is True
         assert request.max_pixels == 64 * 8 * 64 * 64
+
+
+# endregion
+
+
+# region Fixed model pool lane routing
+
+
+class TestPoolLaneAdvertising:
+    """A pool-routed pop narrows its offer to the chosen lane and gates the residency-bias call by lane."""
+
+    @staticmethod
+    def _make_pool_popper(
+        *,
+        seats: frozenset[str],
+        eligible: list[str],
+        initial_lane_state: PoolLaneState,
+        outcome_sink: Callable[..., None] | None = None,
+    ) -> tuple[JobPopper, Mock, Mock]:
+        """Build a pool-enabled popper primed to pop once, returning it, its session, and the bias spy."""
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=eligible,
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: seats,
+            pool_pop_outcome_sink=outcome_sink,
+        )
+        popper._pool_lane_state = initial_lane_state
+        bias_spy = Mock(side_effect=lambda models: models)
+        popper._apply_residency_advertising_bias = bias_spy  # type: ignore[method-assign]
+        return popper, session, bias_spy
+
+    async def test_fixed_lane_advertises_seated_intersect_eligible_and_skips_bias(self) -> None:
+        """The fixed lane narrows the offer to the seated-and-eligible models and skips the residency-bias call."""
+        popper, session, bias_spy = self._make_pool_popper(
+            seats=frozenset({"model_a", "model_b"}),
+            eligible=["model_a", "model_b", "model_c"],
+            initial_lane_state=PoolLaneState(fixed_credit=1000),
+        )
+
+        await popper.api_job_pop()
+
+        request = session.submit_request.call_args.args[0]
+        assert set(request.models) == {"model_a", "model_b"}
+        assert popper.latest_pool_lane() is PopLane.FIXED
+        bias_spy.assert_not_called()
+
+    async def test_free_lane_advertises_eligible_minus_seats_and_keeps_bias(self) -> None:
+        """The free lane offers the eligible models the pool does not seat and still runs the residency-bias call."""
+        popper, session, bias_spy = self._make_pool_popper(
+            seats=frozenset({"model_a"}),
+            eligible=["model_a", "model_b", "model_c"],
+            initial_lane_state=PoolLaneState(free_credit=1000),
+        )
+
+        await popper.api_job_pop()
+
+        request = session.submit_request.call_args.args[0]
+        assert set(request.models) == {"model_b", "model_c"}
+        assert popper.latest_pool_lane() is PopLane.FREE
+        bias_spy.assert_called_once()
+
+
+class TestPoolLaneGating:
+    """The pool routes a pop only for a non-idle-fill pop with a provider, an enabled pool, and seats."""
+
+    @staticmethod
+    def _popper(*, provider: Callable[[], frozenset[str]] | None, enabled: bool) -> JobPopper:
+        """Build a pool-configured popper with the given seat provider and enabled flag."""
+        return _make_popper(
+            bridge_data=make_mock_bridge_data(model_pool=ModelPoolConfig(enabled=enabled)),
+            pool_active_seats_provider=provider,
+        )
+
+    def test_idle_fill_pop_bypasses_the_pool(self) -> None:
+        """An idle-fill pop is never routed through the pool, even with seats available."""
+        popper = self._popper(provider=lambda: frozenset({"model_a"}), enabled=True)
+        decision = popper._apply_pool_lane(
+            {"model_a", "model_b"},
+            popper._runtime_config.bridge_data,
+            idle_fill_wanted=True,
+        )
+        assert decision is None
+        assert popper.latest_pool_lane() is None
+
+    def test_disabled_pool_does_not_route(self) -> None:
+        """A disabled pool never routes a pop, leaving the offer to the existing shaping."""
+        popper = self._popper(provider=lambda: frozenset({"model_a"}), enabled=False)
+        decision = popper._apply_pool_lane(
+            {"model_a", "model_b"},
+            popper._runtime_config.bridge_data,
+            idle_fill_wanted=False,
+        )
+        assert decision is None
+
+    def test_absent_provider_does_not_route(self) -> None:
+        """A popper wired without a seat provider never routes a pop through the pool."""
+        popper = self._popper(provider=None, enabled=True)
+        decision = popper._apply_pool_lane(
+            {"model_a", "model_b"},
+            popper._runtime_config.bridge_data,
+            idle_fill_wanted=False,
+        )
+        assert decision is None
+
+    def test_empty_seats_do_not_route(self) -> None:
+        """An enabled pool that currently seats nothing does not route a pop."""
+        popper = self._popper(provider=frozenset, enabled=True)
+        decision = popper._apply_pool_lane(
+            {"model_a", "model_b"},
+            popper._runtime_config.bridge_data,
+            idle_fill_wanted=False,
+        )
+        assert decision is None
+
+
+class TestPoolProviderAbsentRegression:
+    """With the pool feature off, the advertised model set is byte-identical to a plain popper's."""
+
+    @staticmethod
+    async def _capture_models(
+        *,
+        provider: Callable[[], frozenset[str]] | None,
+        enabled: bool,
+    ) -> set[str]:
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b", "model_c"],
+                model_pool=ModelPoolConfig(enabled=enabled),
+            ),
+            pool_active_seats_provider=provider,
+        )
+        await popper.api_job_pop()
+        return set(session.submit_request.call_args.args[0].models)
+
+    async def test_provider_absent_matches_baseline(self) -> None:
+        """With no provider the advertised set is the full eligible set, as a plain popper would send."""
+        baseline = await self._capture_models(provider=None, enabled=False)
+        assert baseline == {"model_a", "model_b", "model_c"}
+
+    async def test_provider_present_but_disabled_matches_baseline(self) -> None:
+        """A wired-but-disabled pool advertises the same set as the provider-absent baseline."""
+        baseline = await self._capture_models(provider=None, enabled=False)
+        with_disabled_pool = await self._capture_models(
+            provider=lambda: frozenset({"model_a"}),
+            enabled=False,
+        )
+        assert with_disabled_pool == baseline
+
+
+class TestPoolOutcomeSink:
+    """A pool-routed pop reports its outcome (lane, advertised set, popped model or None) to the sink."""
+
+    @_full_flow_patches
+    async def test_empty_fixed_lane_pop_reports_none(self, _mock_req_cls: Mock) -> None:
+        """An empty fixed-lane pop reports its lane and advertised set to the sink with a None popped model."""
+        empty_response = Mock()
+        empty_response.id_ = None
+        empty_response.skipped = Mock()
+        empty_response.skipped.model_dump.return_value = {}
+        empty_response.skipped.model_extra = None
+        empty_response.messages = None
+
+        sink = Mock()
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=empty_response)
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b"],
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: frozenset({"model_a", "model_b"}),
+            pool_pop_outcome_sink=sink,
+        )
+
+        await popper.api_job_pop()
+
+        sink.assert_called_once()
+        outcome = sink.call_args.kwargs
+        assert outcome["lane"] is PopLane.FIXED
+        assert outcome["advertised"] == frozenset({"model_a", "model_b"})
+        assert outcome["popped_model"] is None
+
+    @_full_flow_patches
+    async def test_popped_fixed_lane_pop_reports_model(self, _mock_req_cls: Mock) -> None:
+        """A fulfilled fixed-lane pop reports the popped model name to the sink."""
+        job_response = make_job_pop_response(model="model_a")
+        sink = Mock()
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=job_response)
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b"],
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: frozenset({"model_a", "model_b"}),
+            pool_pop_outcome_sink=sink,
+        )
+
+        await popper.api_job_pop()
+
+        sink.assert_called_once()
+        outcome = sink.call_args.kwargs
+        assert outcome["lane"] is PopLane.FIXED
+        assert outcome["popped_model"] == "model_a"
 
 
 # endregion

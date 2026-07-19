@@ -52,6 +52,14 @@ class LedgerEventType(enum.StrEnum):
     SAFETY_RECOVERY_HOLD_RELEASED = "safety_recovery_hold_released"
     RESIDENCY_ADVERTISING_NARROWED = "residency_advertising_narrowed"
     RESIDENCY_ADVERTISING_RELEASED = "residency_advertising_released"
+    MODEL_POOL_LANE_FIXED = "model_pool_lane_fixed"
+    MODEL_POOL_LANE_FREE = "model_pool_lane_free"
+    MODEL_POOL_SEATED = "model_pool_seated"
+    MODEL_POOL_DEMOTED = "model_pool_demoted"
+    MODEL_POOL_RESCUE_ENGAGED = "model_pool_rescue_engaged"
+    MODEL_POOL_RESCUE_RELEASED = "model_pool_rescue_released"
+    MODEL_POOL_DOWNLOAD_PENDING = "model_pool_download_pending"
+    MODEL_POOL_DOWNLOAD_READY = "model_pool_download_ready"
 
 
 class LedgerEvent(BaseModel):
