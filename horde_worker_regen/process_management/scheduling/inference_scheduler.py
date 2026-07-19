@@ -418,6 +418,16 @@ a head that will not fit even as the card empties), the head is faulted for reis
 rather than left to rot, and the barrier releases. Three times the engage bound: long enough that draining
 siblings win the race in practice, bounded so a permanently unfittable head fails fast."""
 
+_DISPATCH_ANTI_STARVATION_TTL_FRACTION = 0.3
+"""Fraction of a queued head's ttl past which resident-model bypass yields so the head's own preload runs.
+
+The affinity skip budget measures from the head's first bypass, so it does not bound the head's total age
+since it was popped: a head that waited in queue before its first skip can still be bypassed well past a
+winnable window, and by the time it dispatches the horde has aborted it as too slow. This absolute age gate,
+anchored at ``time_popped`` and the job's own ttl, closes that gap independently of the skip budget. Sized
+below the affinity budget fraction so the head reclaims its slot with enough of the ttl left for its own
+staging, sampling, and submission."""
+
 _SAFETY_RECOVERY_HOLD_TTL_SECONDS = 120.0
 """How long the safety-recovery admission hold may keep new preloads off a saturated card while the safety
 pool crash-loops before it releases. The hold exists to let the card drain so a deferred safety GPU start can
@@ -767,6 +777,9 @@ class InferenceScheduler:
         # it purely. When the window is spent the head reclaims the slot via the same fall-through as a
         # non-forecast head. Calibration visibility only.
         self._affinity_skip_state = AffinitySkipState()
+        # The head id whose anti-starvation age override was last logged, so the "resident bypass yields"
+        # notice is edge-triggered (once per head) rather than repeated every scheduling cycle it engages.
+        self._anti_starvation_logged_head_id: str | None = None
 
         # The set of job ids whose dispatch the post-processing co-residency gate held on the pass that last
         # evaluated them. The gate computes this verdict during dispatch (``_should_defer_dispatch_for_post_
@@ -7185,6 +7198,42 @@ class InferenceScheduler:
             return resident
         return None
 
+    def _head_aged_past_anti_starvation(self, head_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether a queued head has waited past the anti-starvation fraction of its ttl and must not be bypassed.
+
+        Measures the head's absolute age since pop against its own ttl (the per-job value when the horde supplied
+        one, else the most recent ttl the worker saw). Returns False when neither a ttl nor a pop time is known,
+        so a job the horde gave no ttl keeps the pure skip-budget behaviour and is never forced off the bypass
+        path by this gate.
+        """
+        job_id = head_job.id_
+        if job_id is None:
+            return False
+        ttl = float(head_job.ttl) if head_job.ttl is not None else self._state.recent_job_ttl
+        if ttl is None or ttl <= 0:
+            return False
+        tracked = self._job_tracker.get_tracked_job(job_id)
+        if tracked is None or tracked.time_popped is None:
+            return False
+        age_since_pop = time.time() - tracked.time_popped
+        return age_since_pop > _DISPATCH_ANTI_STARVATION_TTL_FRACTION * ttl
+
+    def _note_anti_starvation_override(self, head_job: ImageGenerateJobPopResponse) -> None:
+        """Log once (edge-triggered) when the age override first suppresses resident-model bypass for a head."""
+        if head_job.id_ is None:
+            return
+        job_id = str(head_job.id_)
+        if job_id == self._anti_starvation_logged_head_id:
+            return
+        self._anti_starvation_logged_head_id = job_id
+        tracked = self._job_tracker.get_tracked_job(head_job.id_)
+        age_since_pop = time.time() - tracked.time_popped if tracked is not None and tracked.time_popped else 0.0
+        logger.info(
+            f"Anti-starvation override: head job {job_id[:8]} (model {head_job.model}) has waited "
+            f"{age_since_pop:.0f}s since pop, past the anti-starvation fraction of its ttl; resident-model bypass "
+            "yields so its preload runs.",
+        )
+
     def _select_preload_process(
         self,
         job: ImageGenerateJobPopResponse,
@@ -7387,6 +7436,13 @@ class InferenceScheduler:
                 affinity_budget,
                 _AFFINITY_MAX_SKIPS,
             )
+            # Absolute age override: the affinity budget runs from the first bypass, not from pop, so a head
+            # that aged in queue before its first skip could still be bypassed past a winnable window. Once the
+            # head has waited more than the anti-starvation fraction of its ttl since pop, resident-model bypass
+            # yields so its own preload runs (a pin-wait head stays exempt: it funds no fresh copy).
+            if within_affinity_budget and self._head_aged_past_anti_starvation(next_job):
+                within_affinity_budget = False
+                self._note_anti_starvation_override(next_job)
             if pinned_resident is not None or within_affinity_budget:
                 for candidate_job in next_n_jobs:
                     if candidate_job.model is None or candidate_job.model == next_job.model:

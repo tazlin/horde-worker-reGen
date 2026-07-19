@@ -753,6 +753,65 @@ class TestGetNextJobAndProcess:
         assert reclaimed.next_job is head_job
         assert reclaimed.line_skip is None
 
+    async def test_aged_head_not_bypassed_past_anti_starvation_fraction(self) -> None:
+        """A cold head past the anti-starvation fraction of its ttl stops being bypassed, even mid affinity budget.
+
+        The affinity budget measures from the first skip, so a fresh window would otherwise permit the bypass.
+        The absolute age gate (anchored at pop time and the job's ttl) forces the resident stream to yield so the
+        aged head reclaims the room-making fall-through instead of ageing past its ttl behind resident work.
+        """
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a").model_copy(update={"ttl": 100})
+        bypass_job = make_job_pop_response("resident_b")
+        # Popped 60s ago, past the 0.3*100 = 30s anti-starvation threshold; the affinity window is still fresh.
+        await track_popped_job_async(job_tracker, head_job, time_popped=time.time() - 60.0)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        assert await sched.get_next_job_and_process() is None
+
+    async def test_fresh_head_still_bypassed_under_anti_starvation_fraction(self) -> None:
+        """Regression: a cold head under the age threshold keeps today's resident-model bypass (card stays fed)."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a").model_copy(update={"ttl": 100})
+        bypass_job = make_job_pop_response("resident_b")
+        # Just popped: well under the 0.3*100 = 30s threshold, so the bypass is unchanged.
+        await track_popped_job_async(job_tracker, head_job, time_popped=time.time())
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        result = await sched.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.line_skip is not None
+        assert result.line_skip.reason == "resident_bypass"
+
+    async def test_aged_head_without_ttl_keeps_bypass_behaviour(self) -> None:
+        """A head the horde gave no ttl is never forced off the bypass path by the age gate (unchanged)."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")  # ttl is None, and the worker has no recent ttl either
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job, time_popped=time.time() - 3600.0)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        result = await sched.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.line_skip is not None
+        assert result.line_skip.reason == "resident_bypass"
+
     async def test_max_concurrent_reached_returns_none(self) -> None:
         """get_next_job_and_process should return None if the maximum number of concurrent jobs is reached."""
         process_info = make_mock_process_info(
