@@ -16,6 +16,7 @@ from horde_model_reference.model_reference_records import (
 )
 
 from horde_worker_regen.bridge_data.disagg_model_selection import (
+    compute_vae_cluster_sizes,
     is_disagg_optimized_candidate,
     select_disagg_optimized_models,
 )
@@ -193,3 +194,49 @@ class TestDeterminism:
         records = {name: _record(name) for name in ("c", "a", "b")}
         result = select_disagg_optimized_models(records, 2)
         assert result.selected == ["a", "b"]
+
+
+class TestComputeVaeClusterSizes:
+    """The public shared-VAE cluster-sizing core that runtime code can call without model selection."""
+
+    def test_shared_vae_reports_cluster_size_and_hash_availability(self) -> None:
+        """Models sharing a VAE report that cluster's size; unshared VAEs are absent from the result."""
+        records = {
+            "a": _record("a", vae_hash="V"),
+            "b": _record("b", vae_hash="V"),
+            "solo": _record("solo", vae_hash="D"),
+        }
+        sizes, hash_data_available = compute_vae_cluster_sizes(records, None)
+        assert sizes == {"a": 2, "b": 2}
+        assert hash_data_available is True
+
+    def test_no_hash_data_reports_empty_and_unavailable(self) -> None:
+        """With no component hashes at all, no clusters form and hash data is reported unavailable."""
+        records = {"a": _record("a"), "b": _record("b")}
+        sizes, hash_data_available = compute_vae_cluster_sizes(records, None)
+        assert sizes == {}
+        assert hash_data_available is False
+
+    def test_local_sidecar_hash_overrides_record(self) -> None:
+        """A local sidecar VAE hash wins over the record's own, forming a cluster the records alone would not."""
+        records = {
+            "a": _record("a", vae_hash="RECORD_A"),
+            "b": _record("b", vae_hash="SHARED"),
+        }
+        local = {"a": {ComponentKind.VAE: "SHARED"}}
+        sizes, hash_data_available = compute_vae_cluster_sizes(records, local)
+        assert sizes == {"a": 2, "b": 2}
+        assert hash_data_available is True
+
+    def test_delegation_matches_selection_cluster_sizes(self) -> None:
+        """The public core produces the same cluster sizes the full selection reports for the same records."""
+        records = {
+            "a": _record("a", vae_hash="V"),
+            "b": _record("b", vae_hash="V"),
+            "c": _record("c", vae_hash="V"),
+            "d": _record("d", vae_hash="D"),
+        }
+        sizes, _ = compute_vae_cluster_sizes(records, None)
+        selection = select_disagg_optimized_models(records, 3, popularity_order=["a", "b", "c", "d"])
+        for selected_name in selection.selected:
+            assert selection.cluster_sizes[selected_name] == sizes.get(selected_name, 1)

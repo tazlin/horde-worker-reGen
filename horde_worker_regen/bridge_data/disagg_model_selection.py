@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DisaggModelSelection",
+    "compute_vae_cluster_sizes",
     "is_disagg_optimized_candidate",
     "select_disagg_optimized_models",
 ]
@@ -123,7 +124,7 @@ def _merged_component_hashes(
     return merged
 
 
-def _vae_cluster_sizes(
+def compute_vae_cluster_sizes(
     candidate_records: Mapping[str, ImageGenerationModelRecord],
     local_component_hashes: Mapping[str, Mapping[ComponentKind, str]] | None,
 ) -> tuple[dict[str, int], bool]:
@@ -131,8 +132,17 @@ def _vae_cluster_sizes(
 
     Feeds :func:`derive_canonical_registry` a per-candidate view whose embedded hashes are the merged
     (record-plus-local) identities, so the grouping authority the worker already ships decides which VAEs are
-    shared rather than a second implementation. Returns the per-model VAE cluster size (only models in a
-    cluster of two or more appear) and whether any candidate contributed hash data at all.
+    shared rather than a second implementation. This popularity-independent core is public so runtime scheduling
+    code can size shared-VAE clusters without re-running config-time model selection.
+
+    Args:
+        candidate_records: The disaggregation-eligible image-generation records, keyed by model name.
+        local_component_hashes: Optional per-model local component hashes (from on-disk sidecars) that win
+            over each record's declared hashes on conflict.
+
+    Returns:
+        The per-model VAE cluster size (only models in a cluster of two or more appear) and whether any
+        candidate contributed hash data at all.
     """
     synthetic: dict[str, ImageGenerationModelRecord] = {}
     hash_data_available = False
@@ -187,7 +197,7 @@ def select_disagg_optimized_models(
     if not candidate_records:
         return DisaggModelSelection(selected=[], candidate_count=0, hash_data_available=False)
 
-    cluster_sizes, hash_data_available = _vae_cluster_sizes(candidate_records, local_component_hashes)
+    cluster_sizes, hash_data_available = compute_vae_cluster_sizes(candidate_records, local_component_hashes)
 
     popularity_rank = {name: index for index, name in enumerate(popularity_order)}
     unranked = len(popularity_rank)
