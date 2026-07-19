@@ -20,6 +20,8 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Scheduling inference & model preloads  | `process_management/scheduling/inference_scheduler.py` (`InferenceScheduler`) |
 | Pop-rate & megapixelstep throttling    | `process_management/scheduling/pop_throttler.py` (`PopThrottler`)  |
 | Pop/scheduling hold visibility         | `process_management/scheduling/pop_governor_registry.py`           |
+| Fixed model pool (seat engine, ranker, demand poll, config wiring) | `process_management/scheduling/model_pool.py` (`ModelPool`), `pool_ranker.py`, `model_demand_poller.py` (`ModelDemandPoller`), `pool_wiring.py` |
+| Fixed-pool pop lanes (fixed/free interleave)  | `process_management/jobs/pool_lanes.py` (`decide_pool_lane`)      |
 | Safety-check dispatch                  | `process_management/workers/safety_orchestrator.py` (`SafetyOrchestrator`) |
 | Post-processing lane dispatch          | `process_management/workers/post_process_orchestrator.py` (`PostProcessOrchestrator`) |
 | Disaggregated pipeline stages          | `process_management/workers/disaggregation_orchestrator.py`, `component_lane_process.py`, `inference_process.py`, `vae_lane_process.py` |
@@ -66,8 +68,8 @@ module paths directly.
 | ---------- | -------------- |
 | `lifecycle/` | Parent-side process machinery: spawn, supervise, reap, replace, shutdown, worker-level recovery, crash capture, process maps, and process metadata. |
 | `workers/` | Child-process bodies and worker-side orchestration: inference, safety, safety dispatch, post-processing, disaggregated text/VAE lanes, and background downloads. |
-| `scheduling/` | What to run, when, where, and why: inference scheduling, resource governance, pop throttling, model affinity, performance model, pop-governor visibility, and workload flow routing. |
-| `jobs/` | The unit of work: pop, submit, track, classify failures, alchemy coordination, job data models, and source-image downloads. |
+| `scheduling/` | What to run, when, where, and why: inference scheduling, resource governance, pop throttling, model affinity, performance model, pop-governor visibility, the fixed model pool (seat engine, demand ranker/poller, config wiring), and workload flow routing. |
+| `jobs/` | The unit of work: pop, submit, track, classify failures, alchemy coordination, the fixed-pool pop lanes, job data models, and source-image downloads. |
 | `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, the per-process RAM component-residency map, cache, LoRA guards/backoff, download coordination, and download scheduling. |
 | `resources/` | Runtime resource accounting: VRAM/RAM budgets, VRAM arbitration, attribution, device info, system memory, duty-cycle summaries, and run metrics. |
 | `gpu/` | Multi-GPU routing primitives: card runtime state, eligibility checks, and advertised pop-shaping capabilities. |

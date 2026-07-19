@@ -65,6 +65,8 @@ def _make_inference_scheduler(
     card_runtimes: dict[int, CardRuntime] | None = None,
     model_metadata: ModelMetadata | None = None,
     post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+    pool_protected_models_provider: Callable[[], frozenset[str]] | None = None,
+    on_pool_pressure_eviction: Callable[[str], None] | None = None,
     device_free_mb: float | None = 24000.0,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with mostly-mocked dependencies.
@@ -103,6 +105,8 @@ def _make_inference_scheduler(
         max_inference_processes=max_inference,
         lru=LRUCache(max_inference),
         post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
+        pool_protected_models_provider=pool_protected_models_provider,
+        on_pool_pressure_eviction=on_pool_pressure_eviction,
         card_runtimes=card_runtimes,
     )
     if device_free_mb is not None:
@@ -1531,6 +1535,41 @@ class TestWorkingSetResidency:
         """A process with no loaded model is never protected."""
         scheduler = _make_inference_scheduler(max_inference=2)
         assert scheduler._residency_protects_from_unload(None, {"model_a"}, vram=False) is False
+
+    async def test_pool_seats_stay_out_of_the_wanted_set(self) -> None:
+        """A seat with no live job must NOT join the wanted set: it would flip the VRAM regime sizing.
+
+        The wanted-set cardinality drives ``affinity_active`` and preload biasing, so an idle seat for a
+        not-yet-loaded model would collapse (or spuriously grant) whole-card VRAM retention for every
+        resident model. Seats hold RAM through the seat term of ``_residency_protects_from_unload`` instead.
+        """
+        job_tracker = JobTracker()
+        pending = make_job_pop_response("model_pending")
+        await track_popped_job_async(job_tracker, pending)
+
+        scheduler = _make_inference_scheduler(
+            job_tracker=job_tracker,
+            pool_protected_models_provider=lambda: frozenset({"seat_only"}),
+        )
+        assert scheduler._compute_wanted_models() == {"model_pending"}
+
+    def test_absent_pool_provider_leaves_wanted_unchanged(self) -> None:
+        """With no pool provider wired, the wanted set is the pre-pool live-state union (regression)."""
+        scheduler = _make_inference_scheduler()
+        assert scheduler._compute_wanted_models() == set()
+
+    def test_seat_protects_ram_in_overflow_regime(self) -> None:
+        """An overflow-regime seat earns RAM residency even without recent demand, but VRAM is still reclaimed."""
+        scheduler = _make_inference_scheduler(
+            max_inference=2,
+            pool_protected_models_provider=lambda: frozenset({"seated"}),
+        )
+        wanted = {"seated", "model_b", "model_c"}  # 3 > 2 processes => affinity inactive
+        # The seat has no recent-demand stamp, yet as a standing commitment it holds RAM residency.
+        assert scheduler._residency_protects_from_unload("seated", wanted, vram=False) is True
+        assert scheduler._residency_protects_from_unload("seated", wanted, vram=True) is False
+        # An unseated, not-recently-demanded overflow model is not protected from RAM eviction.
+        assert scheduler._residency_protects_from_unload("model_b", wanted, vram=False) is False
 
     async def test_unload_models_keeps_resident_working_set(self) -> None:
         """unload_models must not evict a resident working-set model just because its queue is momentarily empty."""

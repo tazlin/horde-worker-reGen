@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 18
+SUPERVISOR_PROTOCOL_VERSION = 19
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -62,6 +62,9 @@ stop relaunching and the dashboard can show the specific reason and remedy inste
 v16 added post-processing lane counters and per-entry queue order so the TUI can show the image job route
 through the dedicated post-processing process.
 v17 added the operator-facing reason post-processing was session-disabled.
+v19 added the snapshot's ``model_pool`` field (:class:`ModelPoolSnapshot`): the fixed model pool's seats,
+bench, current advertising lane, demand-reading age, and download budget. Omitted (None) when the pool is
+disabled, so a worker with no pool leaves the field unset and older supervisors are unaffected.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -896,6 +899,71 @@ class SystemMemorySnapshot(BaseModel):
         )
 
 
+class ModelPoolSeatRow(BaseModel):
+    """Represents one fixed-pool seat's operator-facing state, with monotonic stamps resolved to ages.
+
+    The worker's seat engine keeps its timing in a monotonic clock the supervisor cannot interpret, so the
+    stamps are converted to durations at snapshot time: ``dwell_seconds`` is how long the current model has
+    held the seat, ``last_fulfilled_age_seconds`` how long since it last served work, and
+    ``rescue_expires_in_seconds`` how long a rescue seat has left before release. All are ``None`` when the
+    seat is empty or the underlying stamp is unset.
+    """
+
+    model: str | None = None
+    """The model currently holding the seat, or None when the seat is empty (a pending-only seat included)."""
+    source: str | None = None
+    """How the seat's model came to hold it (``SeatSource`` value ``MANUAL``/``RANKER``/``RESCUE``); None if empty."""
+    state: str
+    """Whether the seat is serving its model or mid-download (``SeatState`` value ``ACTIVE``/``PENDING_DOWNLOAD``)."""
+    dwell_seconds: float | None = None
+    """Seconds the current model has held the seat, or None when the seat is empty."""
+    empty_pops: int = 0
+    """Consecutive fixed-lane empty pops charged to the seated model since its last fulfillment."""
+    last_fulfilled_age_seconds: float | None = None
+    """Seconds since the seated model last served work, or None when it has not served since seating."""
+    pending_model: str | None = None
+    """The model this seat is downloading to swap in, or None when no download is pending."""
+    rescue_expires_in_seconds: float | None = None
+    """Seconds until a rescue seat's borrowed window closes, or None when the seat is not a rescue."""
+
+
+class ModelPoolBenchRow(BaseModel):
+    """Represents one benched model held out of seating until its cooldown elapses."""
+
+    model: str
+    reason: str
+    """Why the model was demoted to the bench (``DemotionReason`` value, e.g. ``EMPTY_POPS``)."""
+    cooldown_remaining_seconds: float
+    """Seconds until the model may seat again (0 once the cooldown has lapsed)."""
+
+
+class ModelPoolSnapshot(BaseModel):
+    """Represents the fixed model pool's operator-facing state for the dashboard, or its disabled marker.
+
+    Carried on :attr:`WorkerStateSnapshot.model_pool` only when the pool is enabled; a worker with the pool
+    off leaves that field None so older supervisors and the plain (no-pool) case are unaffected. All
+    monotonic timing is resolved to ages/countdowns at snapshot time, so no raw monotonic value travels.
+    """
+
+    enabled: bool = False
+    """Whether the fixed pool is active (always True when this snapshot is present)."""
+    seats: list[ModelPoolSeatRow] = Field(default_factory=list)
+    """Every seat in seat order, holding a committed model or empty."""
+    bench: list[ModelPoolBenchRow] = Field(default_factory=list)
+    """Models cooling down out of seating after a demotion."""
+    current_lane: str | None = None
+    """The advertising lane the most recent pool-routed pop used (``PopLane`` value ``FIXED``/``FREE``), or
+    None when the pool has not routed a pop yet."""
+    last_fixed_seat_count: int = 0
+    """The seated-model count advertised on the most recent fixed-lane pop."""
+    demand_age_seconds: float | None = None
+    """Seconds since the pool's demand ranking was last refreshed, or None before the first reading."""
+    download_budget_gb: float = 0.0
+    """Configured disk budget (GB) the pool may spend auto-downloading a model to seat it (0 = never)."""
+    download_bytes_charged: int = 0
+    """Bytes the pool has charged against the download budget this session."""
+
+
 class WorkerStateSnapshot(BaseModel):
     """One frame of worker state pushed from the worker to its supervisor over the pipe.
 
@@ -1078,6 +1146,9 @@ class WorkerStateSnapshot(BaseModel):
 
     per_card: list[CardSnapshot] = Field(default_factory=list)
     """Per-card multi-GPU view, one entry per driven card (exactly one on a single-GPU host)."""
+
+    model_pool: ModelPoolSnapshot | None = None
+    """Fixed model pool seats/bench/lane/demand-age/budget, or None when the pool is disabled."""
 
 
 class SupervisorCommand(enum.Enum):

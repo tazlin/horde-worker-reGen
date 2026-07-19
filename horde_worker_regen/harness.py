@@ -48,6 +48,10 @@ from horde_worker_regen.process_management.process_manager import (
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
+from horde_worker_regen.process_management.scheduling.model_demand_poller import (
+    DemandSnapshot,
+    ModelDemandRecord,
+)
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
@@ -87,6 +91,58 @@ startup, triggering a kill/respawn storm that only deepens the contention. The l
 timeout (and the lifecycle's dead-child detection) are the real backstops in a benchmark, so real
 mode runs with this generous budget instead. Fake/dry-run start instantly and keep the defaults, so
 the recovery machinery stays exercised by the tests."""
+
+
+@dataclass(frozen=True)
+class SyntheticModelDemand:
+    """One model's synthetic queue reading for a harness run's seeded demand snapshot.
+
+    Mirrors the fields the pool's ranker and rescue selection read from a live ``/v2/status/models`` reading:
+    ``queued`` (outstanding megapixelsteps), ``worker_count`` (threads serving the model network-wide), and
+    ``eta_seconds`` (the requester wait estimate; drive it at or above the rescue threshold to exercise the
+    rescue path).
+    """
+
+    queued: float
+    worker_count: int = 0
+    eta_seconds: int | None = None
+
+
+_SYNTHETIC_DEMAND_RESEED_SECONDS = 60.0
+"""Cadence at which a harness run re-stamps its seeded demand snapshot, comfortably inside the poller's
+staleness horizon so the pool never bench-holds mid-sim for want of a fresh reading."""
+
+
+def build_synthetic_demand_snapshot(
+    demand: dict[str, SyntheticModelDemand],
+    fetched_at: float,
+) -> DemandSnapshot:
+    """Convert a synthetic demand mapping into the immutable snapshot the demand poller serves."""
+    return DemandSnapshot(
+        records={
+            model: ModelDemandRecord(
+                queued=entry.queued,
+                jobs=None,
+                eta_seconds=entry.eta_seconds,
+                worker_count=entry.worker_count,
+                performance=None,
+            )
+            for model, entry in demand.items()
+        },
+        fetched_at=fetched_at,
+    )
+
+
+async def _seed_synthetic_demand_periodically(
+    manager: HordeWorkerProcessManager,
+    demand: dict[str, SyntheticModelDemand],
+) -> None:
+    """Keep the manager's demand poller seeded with the synthetic reading until cancelled."""
+    while True:
+        manager._model_demand_poller.seed(
+            build_synthetic_demand_snapshot(demand, fetched_at=time.monotonic()),
+        )
+        await asyncio.sleep(_SYNTHETIC_DEMAND_RESEED_SECONDS)
 
 
 @dataclass
@@ -131,6 +187,14 @@ class HarnessConfig:
     card, but canary tests can inject varied RAM, card count, VRAM capacity, backend kind, and process
     overheads so the real manager plans the same topology an operator's machine would present.
     """
+
+    synthetic_demand: dict[str, SyntheticModelDemand] | None = None
+    """If set, a per-model demand reading seeded into the manager's demand poller and refreshed on a cadence.
+
+    Harness sessions never run the live demand-poll loop (canned pops have no API to query), so without this
+    the fixed model pool sees no demand signal and bench-holds its ranker. Seeding keeps the pool's ranking,
+    rotation, and rescue paths exercisable in sims; the mapping is re-stamped periodically so the snapshot
+    never goes stale mid-run."""
 
     fail_every_n: int = 0
     """If > 0, every nth fake inference job reports a faulted result (fake process mode only)."""
@@ -913,6 +977,12 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             ),
         )
 
+    demand_seed_task: asyncio.Task[None] | None = None
+    if config.synthetic_demand is not None:
+        demand_seed_task = asyncio.create_task(
+            _seed_synthetic_demand_periodically(manager, config.synthetic_demand),
+        )
+
     exception_raised: BaseException | None = None
     try:
         await manager._main_loop()
@@ -926,6 +996,8 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             watcher_task.cancel()
         if progress_task is not None and not progress_task.done():
             progress_task.cancel()
+        if demand_seed_task is not None and not demand_seed_task.done():
+            demand_seed_task.cancel()
         # The main loop has returned, so this run's own teardown owns the process from here. Neutralize any
         # force-kill backstop it armed and join its thread before returning: an embedder that runs several
         # lifecycles in one interpreter must never inherit a thread that can later os._exit the process.

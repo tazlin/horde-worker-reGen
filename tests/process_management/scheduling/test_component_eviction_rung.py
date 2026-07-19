@@ -7,6 +7,7 @@ contract) and that an all-protected process degrades to the legacy whole-RAM pat
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.ipc.messages import (
@@ -48,11 +49,17 @@ async def _scheduler_holding(
     active_model: str,
     staged_identities: tuple[str, ...],
     queued_model: str | None,
+    pool_seats: frozenset[str] = frozenset(),
+    on_pool_pressure_eviction: Callable[[str], None] | None = None,
 ) -> tuple[InferenceScheduler, object]:
     """Build a scheduler whose lone idle inference slot holds ``staged_identities`` and, optionally, a queued job."""
     process = make_mock_process_info(0, model_name=active_model, state=HordeProcessState.WAITING_FOR_JOB)
     process_map = ProcessMap({0: process})
-    scheduler = _make_inference_scheduler(process_map=process_map)
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        pool_protected_models_provider=(lambda: pool_seats) if pool_seats else None,
+        on_pool_pressure_eviction=on_pool_pressure_eviction,
+    )
 
     residency = ComponentResidencyMap()
     residency.update_from_report(0, 0, _checkpoint_snapshots(*staged_identities))
@@ -146,3 +153,64 @@ class TestDisabledWhenCacheUntracked:
 
         assert scheduler._evict_unprotected_components_under_pressure() is False
         assert _sent_evict_message(process) is None
+
+
+class TestPoolSeatPressureYield:
+    """Under true RAM pressure a seat with no live job yields its components; a busy seat stays protected."""
+
+    async def test_busy_seat_stays_protected(self) -> None:
+        """A seated model with a pending job is protected: the rung never evicts it and never notifies the pool."""
+        yielded_models: list[str] = []
+        scheduler, process = await _scheduler_holding(
+            active_model="A",
+            staged_identities=("A", "S"),
+            queued_model="S",
+            pool_seats=frozenset({"S"}),
+            on_pool_pressure_eviction=yielded_models.append,
+        )
+
+        acted = scheduler._evict_unprotected_components_under_pressure()
+
+        assert acted is False
+        assert _sent_evict_message(process) is None
+        assert "S" in scheduler._compute_wanted_models()
+        assert yielded_models == []
+
+    async def test_idle_seat_yields_and_notifies_the_pool(self) -> None:
+        """A seated model with no pending or in-progress job is not protected: it is evicted and the pool is told."""
+        yielded_models: list[str] = []
+        scheduler, process = await _scheduler_holding(
+            active_model="A",
+            staged_identities=("A", "S"),
+            queued_model=None,
+            pool_seats=frozenset({"S"}),
+            on_pool_pressure_eviction=yielded_models.append,
+        )
+        # The seat has no live job, so it is a seat-only idle model that must yield under pressure.
+        assert scheduler._seat_only_idle_models() == frozenset({"S"})
+
+        acted = scheduler._evict_unprotected_components_under_pressure()
+
+        assert acted is True
+        message = _sent_evict_message(process)
+        assert message is not None
+        assert message.identities == ["S"]
+        assert yielded_models == ["S"]
+
+    async def test_idle_seat_yield_notifies_only_on_the_rising_edge(self) -> None:
+        """A sustained pressure run notifies the pool once per seat yield, not every tick while the child drains."""
+        yielded_models: list[str] = []
+        scheduler, _process = await _scheduler_holding(
+            active_model="A",
+            staged_identities=("A", "S"),
+            queued_model=None,
+            pool_seats=frozenset({"S"}),
+            on_pool_pressure_eviction=yielded_models.append,
+        )
+
+        # The mock child never actually drops the component, so a second pass still sees S evictable; the
+        # notifier must not fire again for the same unbroken yield.
+        scheduler._evict_unprotected_components_under_pressure()
+        scheduler._evict_unprotected_components_under_pressure()
+
+        assert yielded_models == ["S"]

@@ -8,7 +8,16 @@ build, which is exercised elsewhere.
 
 from __future__ import annotations
 
+import time
+
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
+from horde_worker_regen.process_management.scheduling.model_pool import (
+    ModelPool,
+    PoolParams,
+    PopLane,
+    RankedCandidate,
+)
 from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
 
 
@@ -47,6 +56,89 @@ def test_snapshot_reflects_runtime_cpu_only_torch_build() -> None:
     assert "alchemy" in after.enabled_workloads
     assert after.torch_build_cpu_only is True
     assert after.torch_build_cpu_only_reason
+
+
+def test_snapshot_omits_model_pool_when_disabled() -> None:
+    """A worker with the fixed pool off leaves ``model_pool`` unset, so old supervisors are unaffected."""
+    manager = make_testable_process_manager()
+    assert manager.bridge_data.model_pool.enabled is False
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    assert snapshot.model_pool is None
+
+
+def test_snapshot_populates_model_pool_when_enabled() -> None:
+    """An enabled pool ships seats/bench/lane/demand-age/budget with monotonic stamps resolved to ages.
+
+    The pool engine keeps its timing in a monotonic clock, so the population must convert each stamp to an
+    age or countdown at snapshot time; this drives a real seat plus a real bench entry and asserts no
+    resolved age is ever negative.
+    """
+    manager = make_testable_process_manager()
+    manager.bridge_data.model_pool.enabled = True
+    manager.bridge_data.model_pool.download_budget_gb = 5.0
+    manager._model_pool_download_bytes_charged = 4096
+
+    pool = ModelPool(
+        PoolParams(
+            seat_count=2,
+            ranker_enabled=True,
+            min_dwell_minutes=1.0,
+            zero_fulfillment_demotion_minutes=1.0,
+            rotation_minutes=1000.0,
+        ),
+    )
+    seat_time = time.monotonic()
+    pool.tick(
+        seat_time,
+        ranked=[
+            RankedCandidate(name="Deliberate", score=10.0, on_disk=True),
+            RankedCandidate(name="AlbedoBase XL", score=5.0, on_disk=True),
+        ],
+        demand_is_stale=False,
+    )
+    # Keep Deliberate earning its seat while AlbedoBase XL goes without fulfillment and demotes to the bench.
+    pool.on_pop_outcome(
+        lane=PopLane.FIXED,
+        advertised=frozenset({"Deliberate", "AlbedoBase XL"}),
+        popped_model="Deliberate",
+        now=seat_time + 190.0,
+    )
+    pool.tick(
+        seat_time + 200.0,
+        ranked=[RankedCandidate(name="Deliberate", score=10.0, on_disk=True)],
+        demand_is_stale=False,
+    )
+    manager._model_pool = pool
+
+    manager._job_popper._pool_lane_this_cycle = PopLane.FIXED
+    manager._job_popper._pool_last_fixed_seat_count = 1
+    manager._model_demand_poller.seed(DemandSnapshot(records={}, fetched_at=time.monotonic()))
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    pool_snapshot = snapshot.model_pool
+    assert pool_snapshot is not None
+    assert pool_snapshot.enabled is True
+    assert len(pool_snapshot.seats) == 2
+    assert pool_snapshot.seats[0].model == "Deliberate"
+    assert pool_snapshot.seats[0].source == "RANKER"
+    assert pool_snapshot.seats[1].model is None
+    assert any(bench_row.model == "AlbedoBase XL" for bench_row in pool_snapshot.bench)
+    assert pool_snapshot.current_lane == "FIXED"
+    assert pool_snapshot.last_fixed_seat_count == 1
+    assert pool_snapshot.demand_age_seconds is not None
+    assert pool_snapshot.demand_age_seconds >= 0.0
+    assert pool_snapshot.download_budget_gb == 5.0
+    assert pool_snapshot.download_bytes_charged == 4096
+
+    for seat_row in pool_snapshot.seats:
+        assert seat_row.dwell_seconds is None or seat_row.dwell_seconds >= 0.0
+        assert seat_row.last_fulfilled_age_seconds is None or seat_row.last_fulfilled_age_seconds >= 0.0
+        assert seat_row.rescue_expires_in_seconds is None or seat_row.rescue_expires_in_seconds >= 0.0
+    for bench_row in pool_snapshot.bench:
+        assert bench_row.cooldown_remaining_seconds >= 0.0
 
 
 def test_publish_is_dirty_gated_with_a_floor() -> None:

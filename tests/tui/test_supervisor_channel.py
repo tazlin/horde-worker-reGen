@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
+    ModelPoolBenchRow,
+    ModelPoolSeatRow,
+    ModelPoolSnapshot,
     PreloadAdmissionSnapshot,
     ProcessSnapshot,
     RamGovernanceSnapshot,
@@ -48,7 +51,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 18
+    assert SUPERVISOR_PROTOCOL_VERSION == 19
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -352,3 +355,55 @@ def test_scheduling_governance_survives_json_roundtrip() -> None:
     assert restored.scheduling_governance.ram.draining_process_ids == [2]
     assert restored.scheduling_governance.preload.decision == "defer_budget"
     assert restored.scheduling_governance.preload.model == "Flux.1-dev"
+
+
+def test_model_pool_defaults_to_absent() -> None:
+    """A snapshot with the pool disabled carries no ``model_pool`` section, so old supervisors are unaffected."""
+    snapshot = _make_snapshot()
+    assert snapshot.model_pool is None
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert restored.model_pool is None
+
+
+def test_model_pool_snapshot_survives_json_roundtrip() -> None:
+    """The pool's seats, bench, lane, demand age, and budget are part of the typed snapshot."""
+    snapshot = _make_snapshot()
+    snapshot.model_pool = ModelPoolSnapshot(
+        enabled=True,
+        seats=[
+            ModelPoolSeatRow(
+                model="Deliberate",
+                source="MANUAL",
+                state="ACTIVE",
+                dwell_seconds=120.0,
+                empty_pops=3,
+                last_fulfilled_age_seconds=15.0,
+            ),
+            ModelPoolSeatRow(
+                model="AlbedoBase XL",
+                source="RANKER",
+                state="PENDING_DOWNLOAD",
+                dwell_seconds=30.0,
+                pending_model="Flux.1-dev",
+                rescue_expires_in_seconds=None,
+            ),
+        ],
+        bench=[ModelPoolBenchRow(model="OldModel", reason="EMPTY_POPS", cooldown_remaining_seconds=200.0)],
+        current_lane="FIXED",
+        last_fixed_seat_count=2,
+        demand_age_seconds=42.0,
+        download_budget_gb=10.0,
+        download_bytes_charged=1024,
+    )
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert restored.model_pool is not None
+    assert restored.model_pool.enabled is True
+    assert restored.model_pool.seats[0].source == "MANUAL"
+    assert restored.model_pool.seats[0].dwell_seconds == 120.0
+    assert restored.model_pool.seats[1].pending_model == "Flux.1-dev"
+    assert restored.model_pool.bench[0].reason == "EMPTY_POPS"
+    assert restored.model_pool.current_lane == "FIXED"
+    assert restored.model_pool.demand_age_seconds == 42.0
+    assert restored.model_pool.download_bytes_charged == 1024

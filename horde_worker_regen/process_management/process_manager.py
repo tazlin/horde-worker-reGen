@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import asyncio.exceptions
+import contextlib
 import dataclasses
 import os
 import ssl
@@ -37,6 +38,10 @@ from horde_sdk.ai_horde_api.apimodels import (
     UserDetailsResponse,
     WorkerDetailItem,
 )
+from horde_sdk.ai_horde_api.apimodels.status import (
+    HordeStatusModelsAllRequest,
+    HordeStatusModelsAllResponse,
+)
 from horde_sdk.utils.image_utils import base64_str_to_bytes
 from horde_sdk.worker.dispatch.ai_horde.image.source_image import (
     job_requires_source_image_input,
@@ -46,7 +51,8 @@ from loguru import logger
 
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
-from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.bridge_data.data_model import ModelPoolConfig, reGenBridgeData
+from horde_worker_regen.bridge_data.disagg_model_selection import compute_vae_cluster_sizes
 from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities, enabled_workloads
 from horde_worker_regen.consts import (
@@ -86,6 +92,9 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     FeatureReadinessSummary,
     JobFeatureSummary,
     JobQueueEntry,
+    ModelPoolBenchRow,
+    ModelPoolSeatRow,
+    ModelPoolSnapshot,
     OrchestrationIntentSnapshot,
     PopGovernorsSnapshot,
     PopGovernorStatus,
@@ -171,15 +180,28 @@ from horde_worker_regen.process_management.resources.vram_attribution import (
     VramAttributionReconciler,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
+from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot, ModelDemandPoller
+from horde_worker_regen.process_management.scheduling.model_pool import (
+    ModelPool,
+    RankedCandidate,
+    SeatTransition,
+    SeatView,
+    TransitionKind,
+)
 from horde_worker_regen.process_management.scheduling.performance_model import (
     PERF_MODEL_FILENAME,
     PerformanceModel,
     load_seed_its_by_signature,
+)
+from horde_worker_regen.process_management.scheduling.pool_wiring import (
+    build_expected_value_adapter,
+    build_pool_params,
 )
 from horde_worker_regen.process_management.scheduling.pop_governor_registry import (
     PopGovernorReading,
@@ -741,6 +763,19 @@ _DOWNLOAD_RESTART_MAX_IN_WINDOW = 3
 up. Past this bound the loss is reported once (edge-triggered) and LoRA/aux advertising is withheld until an
 operator restart, so a crash-looping downloader cannot spin the parent forever."""
 
+_POOL_TRANSITION_LEDGER_EVENTS: Mapping[TransitionKind, LedgerEventType] = {
+    TransitionKind.SEATED: LedgerEventType.MODEL_POOL_SEATED,
+    TransitionKind.DEMOTED: LedgerEventType.MODEL_POOL_DEMOTED,
+    TransitionKind.RESCUE_ENGAGED: LedgerEventType.MODEL_POOL_RESCUE_ENGAGED,
+    TransitionKind.RESCUE_RELEASED: LedgerEventType.MODEL_POOL_RESCUE_RELEASED,
+    TransitionKind.DOWNLOAD_PENDING: LedgerEventType.MODEL_POOL_DOWNLOAD_PENDING,
+    TransitionKind.DOWNLOAD_READY: LedgerEventType.MODEL_POOL_DOWNLOAD_READY,
+}
+"""Maps each fixed-pool seat transition kind to the action-ledger event the manager records for it."""
+
+_BYTES_PER_GIGABYTE = 1024**3
+"""Bytes in one binary gigabyte, used to turn the pool's gigabyte-valued download budget into a byte budget."""
+
 
 class HordeWorkerProcessManager:
     """Manages and controls processes to act as a horde worker."""
@@ -1215,6 +1250,7 @@ class HordeWorkerProcessManager:
             bridge_data_provider=lambda: self.bridge_data,
             stable_diffusion_reference_provider=lambda: self.stable_diffusion_reference,
             enable_background_downloads=self._enable_background_downloads,
+            pool_pending_models_provider=lambda: self._model_pool.pending_download_models(),
         )
 
         self._aux_prefetch_coordinator = AuxPrefetchCoordinator(
@@ -1519,6 +1555,27 @@ class HordeWorkerProcessManager:
             dry_run_skip_api=bridge_data.dry_run_skip_api,
         )
 
+        # Fixed model pool: the seat/bench/decay engine, the demand poller feeding its ranker, and the
+        # per-tick throttle stamp. All three are built regardless of the enabled flag (so a mid-session
+        # config enable needs no reconstruction); the poller task and pool tick gate on the live flag, and the
+        # popper's lane routing is inert while the pool holds no seats, keeping a disabled pool byte-identical.
+        self._model_pool = ModelPool(build_pool_params(bridge_data.model_pool, self.max_inference_processes))
+        self._model_demand_poller = ModelDemandPoller(
+            self._submit_status_models_request,
+            interval_seconds=bridge_data.model_pool.demand_poll_seconds,
+            time_source=time.monotonic,
+        )
+        self._model_pool_expected_value = build_expected_value_adapter(
+            expected_its=self._performance_model.expected_its,
+            baseline_resolver=self._safe_model_baseline,
+        )
+        self._model_pool_tick_last_at = 0.0
+        self._model_pool_cluster_sizes: dict[str, int] | None = None
+        # Cumulative bytes the pool has committed to downloading this session, charged when a seat's download is
+        # requested (never refunded on failure, since a failed download still consumed the bandwidth). Gates
+        # whether a further off-disk candidate fits the operator's pool download budget.
+        self._model_pool_download_bytes_charged = 0
+
         self._job_popper = JobPopper(
             state=self._state,
             process_map=self._process_map,
@@ -1549,6 +1606,8 @@ class HordeWorkerProcessManager:
                 else self._fault_aux_job_without_downloader
             ),
             background_downloads_enabled=self._enable_background_downloads,
+            pool_active_seats_provider=self._model_pool.active_seat_models,
+            pool_pop_outcome_sink=self._model_pool.on_pop_outcome,
         )
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
@@ -3205,6 +3264,7 @@ class HordeWorkerProcessManager:
             self._evaluate_wddm_paging()
             self._evaluate_device_free_governor()
             self._evaluate_vram_attribution_drift()
+            self._maybe_tick_model_pool()
             self._download_coordinator.maybe_start_safety_processes()
             self._download_coordinator.maybe_start_inference_processes()
             # A child may have just reported a CPU-only torch build (image generation disabled); collapse the
@@ -4137,6 +4197,270 @@ class HordeWorkerProcessManager:
         elif not exhausted and self._state.lora_disk_exhausted:
             logger.success("LoRA cache volume recovered above its free-space floor; resuming LoRA support.")
         self._state.lora_disk_exhausted = exhausted
+
+    async def _submit_status_models_request(
+        self,
+        api_request: HordeStatusModelsAllRequest,
+        expected_response_type: type[HordeStatusModelsAllResponse],
+        /,
+    ) -> HordeStatusModelsAllResponse | RequestErrorResponse:
+        """Submit a status-models request on the live horde session for the demand poller.
+
+        Structurally matches ``AIHordeAPIAsyncClientSession.submit_request`` so the poller depends on this
+        bound method rather than reaching into the manager's session, resolving the session at call time (it
+        exists once ``_main_loop`` has opened it before the poller task starts).
+        """
+        return await self.horde_client_session.submit_request(api_request, expected_response_type)
+
+    async def _model_demand_poller_loop(self) -> None:
+        """Drive the model-demand poller while the pool is enabled, keeping its snapshot fresh for the tick.
+
+        Follows the live config on the 1s shutdown-poll cadence the other background loops use: the poller
+        task starts when ``model_pool.enabled`` turns on (including a mid-session hot-reload enable) and stops
+        when it turns off, so an operator never needs a restart for the ranker to gain its demand signal. Owns
+        the stop event the poller watches and drains the poller task on the way out so cancellation shuts the
+        loop down cleanly.
+        """
+        stop_event: asyncio.Event | None = None
+        poller_task: asyncio.Task[None] | None = None
+
+        async def _stop_poller() -> None:
+            nonlocal stop_event, poller_task
+            if poller_task is None or stop_event is None:
+                return
+            stop_event.set()
+            with contextlib.suppress(CancelledError):
+                await poller_task
+            stop_event = None
+            poller_task = None
+
+        try:
+            while not (self.is_time_for_shutdown() or self._state.shut_down):
+                pool_enabled = self.bridge_data.model_pool.enabled
+                if pool_enabled and poller_task is None:
+                    stop_event = asyncio.Event()
+                    poller_task = asyncio.create_task(self._model_demand_poller.run(stop_event))
+                elif not pool_enabled and poller_task is not None:
+                    await _stop_poller()
+                await asyncio.sleep(1)
+        finally:
+            await _stop_poller()
+
+    _MODEL_POOL_TICK_INTERVAL_SECONDS = 5.0
+    """Minimum spacing between fixed-pool ticks. The engine's dynamics are minute-scaled, so a five-second
+    cadence advances seats promptly without spending work on a demand signal that shifts far more slowly."""
+
+    def _maybe_tick_model_pool(self) -> None:
+        """Advance the fixed pool once against fresh demand, throttled, when it is enabled.
+
+        A disabled pool is skipped entirely. When enabled, a config change since the last tick is reconciled
+        into the engine before the tick, then a freshly-ranked candidate set (with rescue merged in when
+        rescue is enabled) drives one :meth:`ModelPool.tick`; every returned seat transition is logged and
+        ledgered. All times handed to the engine are monotonic.
+        """
+        pool_config = self.bridge_data.model_pool
+        if not pool_config.enabled:
+            return
+
+        now = time.monotonic()
+        if now - self._model_pool_tick_last_at < self._MODEL_POOL_TICK_INTERVAL_SECONDS:
+            return
+        self._model_pool_tick_last_at = now
+
+        desired_params = build_pool_params(pool_config, self.max_inference_processes)
+        if desired_params != self._model_pool.params():
+            for transition in self._model_pool.replace_params(desired_params, now):
+                self._emit_pool_transition(transition)
+
+        self._observe_pool_downloads(now)
+
+        snapshot = self._model_demand_poller.latest()
+        ranked_candidates = self._build_pool_ranked_candidates(snapshot, pool_config)
+        demand_is_stale = snapshot is None or snapshot.is_stale(now)
+        for transition in self._model_pool.tick(now, ranked=ranked_candidates, demand_is_stale=demand_is_stale):
+            self._emit_pool_transition(transition)
+
+    def _build_pool_ranked_candidates(
+        self,
+        snapshot: DemandSnapshot | None,
+        pool_config: ModelPoolConfig,
+    ) -> list[RankedCandidate] | None:
+        """Rank the configured image models for the pool this tick, or None when there is no demand snapshot.
+
+        Candidates are the configured image models minus the operator skip list and minus any model the pop
+        gauntlet is currently holding back as locally unservable (repeated over-budget faults, or a conditional
+        VRAM-ceiling hold), so the pool never seats a model the worker would refuse to advertise. The skip list
+        is the ranker's excluded set. On-disk membership comes from the availability report, cluster sizes from
+        the shared-VAE grouping (computed once and cached), and expected speed from the performance-model
+        adapter. When rescue is enabled the most-starved eligible candidate is merged in so a seat can be lent to
+        it. A final download-budget pass drops off-disk candidates the operator's budget cannot afford, so a
+        model that would need a download the pool is not allowed to fund never reaches the engine as seatable.
+        """
+        if snapshot is None:
+            return None
+
+        skip_list = frozenset(self.bridge_data.image_models_to_skip or [])
+        candidates = {
+            model
+            for model in (set(self.bridge_data.image_models_to_load) - skip_list)
+            if not is_model_locally_unservable_for(self.bridge_data, self._job_tracker, model)
+        }
+        on_disk = frozenset(self._model_availability.filter_present(set(candidates)))
+
+        ranked_models = pool_ranker.rank_candidates(
+            snapshot=snapshot,
+            candidates=candidates,
+            on_disk=on_disk,
+            expected_value=self._model_pool_expected_value,
+            cluster_sizes=self._pool_vae_cluster_sizes(),
+            excluded=skip_list,
+        )
+        ranked_candidates = [
+            RankedCandidate(
+                name=ranked.name,
+                score=ranked.score,
+                on_disk=ranked.on_disk,
+                eta_seconds=ranked.eta_seconds,
+                queued_per_worker=snapshot.queued_per_worker(ranked.name),
+            )
+            for ranked in ranked_models
+        ]
+
+        if pool_config.rescue_enabled:
+            already_ranked = {candidate.name for candidate in ranked_candidates}
+            rescue_pick = pool_ranker.select_rescue_candidate(
+                snapshot=snapshot,
+                candidates=candidates,
+                on_disk=on_disk,
+                excluded=skip_list,
+                eta_threshold_seconds=pool_config.rescue_eta_seconds,
+            )
+            if rescue_pick is not None and rescue_pick.name not in already_ranked:
+                ranked_candidates.append(
+                    RankedCandidate(
+                        name=rescue_pick.name,
+                        score=rescue_pick.score,
+                        on_disk=rescue_pick.on_disk,
+                        eta_seconds=rescue_pick.eta_seconds,
+                        queued_per_worker=snapshot.queued_per_worker(rescue_pick.name),
+                    ),
+                )
+
+        return self._apply_pool_download_budget(ranked_candidates, pool_config)
+
+    def _apply_pool_download_budget(
+        self,
+        candidates: list[RankedCandidate],
+        pool_config: ModelPoolConfig,
+    ) -> list[RankedCandidate]:
+        """Return the candidates the pool download budget can afford, dropping off-disk ones it cannot fund.
+
+        On-disk candidates and models a seat is already downloading (already charged) always pass through. When
+        the budget is zero every other off-disk candidate is dropped, so a zero-budget pool only ever seats
+        models already present. When the budget is positive, off-disk candidates are admitted in the order the
+        ranker offered them while their sizes plus the bytes already charged this session still fit the budget; a
+        candidate whose reference record declares no size is dropped, since its cost cannot be honestly charged.
+        """
+        budget_bytes = int(pool_config.download_budget_gb * _BYTES_PER_GIGABYTE)
+        already_pending = self._model_pool.pending_download_models()
+
+        if budget_bytes <= 0:
+            return [candidate for candidate in candidates if candidate.on_disk or candidate.name in already_pending]
+
+        admitted: list[RankedCandidate] = []
+        projected_bytes = self._model_pool_download_bytes_charged
+        for candidate in candidates:
+            if candidate.on_disk or candidate.name in already_pending:
+                admitted.append(candidate)
+                continue
+            size_bytes = self._pool_model_size_bytes(candidate.name)
+            if size_bytes is None or projected_bytes + size_bytes > budget_bytes:
+                continue
+            projected_bytes += size_bytes
+            admitted.append(candidate)
+        return admitted
+
+    def _pool_model_size_bytes(self, model_name: str) -> int | None:
+        """Return a model's declared total download size in bytes, or None when the reference cannot size it."""
+        reference = self.stable_diffusion_reference
+        if reference is None:
+            return None
+        record = reference.get(model_name)
+        if record is None:
+            return None
+        return record.declared_total_size_bytes
+
+    def _observe_pool_downloads(self, now: float) -> None:
+        """Reconcile the pool against the download report, resolving the seats whose downloads landed or failed.
+
+        Consults on-disk presence and the failed set only for the models a seat is actually pending on, so an
+        unrelated config-driven download never pokes the engine. A pending model now present resolves as ready
+        (presence wins over a stale failed entry); one in the failed set with no presence resolves as failed.
+        """
+        pending_models = self._model_pool.pending_download_models()
+        if not pending_models:
+            return
+        present = self._model_availability.present
+        failed = set(self._model_availability.failed)
+        for model_name in pending_models:
+            if present is not None and model_name in present:
+                for transition in self._model_pool.on_download_ready(model_name, now):
+                    self._emit_pool_transition(transition)
+            elif model_name in failed:
+                for transition in self._model_pool.on_download_failed(model_name, now):
+                    self._emit_pool_transition(transition)
+
+    def _pool_vae_cluster_sizes(self) -> dict[str, int]:
+        """Return the shared-VAE cluster size per configured model, computing it once and caching the result.
+
+        Derived from the reference records the manager already holds (record-declared component hashes only, no
+        on-disk sidecar merge at this layer), so a model sharing a VAE with others ranks ahead of an isolated
+        one. An empty mapping when no reference is loaded yet, which the ranker treats as every model
+        unclustered.
+        """
+        if self._model_pool_cluster_sizes is not None:
+            return self._model_pool_cluster_sizes
+        if self.stable_diffusion_reference is None:
+            return {}
+        cluster_sizes, _hash_data_available = compute_vae_cluster_sizes(self.stable_diffusion_reference, None)
+        self._model_pool_cluster_sizes = cluster_sizes
+        return cluster_sizes
+
+    def _emit_pool_transition(self, transition: SeatTransition) -> None:
+        """Log and ledger one fixed-pool seat transition, edge-triggered by nature (transitions fire on change).
+
+        A pending-download transition additionally commands the fetch and charges its size against the session's
+        pool download budget, so a seat's chosen off-disk model is actually downloaded and the spend is counted
+        at request time.
+        """
+        event_type = _POOL_TRANSITION_LEDGER_EVENTS[transition.kind]
+        reason = transition.reason.value if transition.reason is not None else ""
+        source = transition.source.value if transition.source is not None else None
+        logger.info(
+            f"Fixed model pool: {transition.kind.value} '{transition.model}'"
+            + (f" (source {source})" if source is not None else "")
+            + (f" ({reason})" if reason else ""),
+        )
+        if self._action_ledger is not None:
+            self._action_ledger.record(
+                event_type,
+                reason=reason,
+                detail={"model": transition.model, "source": source},
+            )
+        if transition.kind is TransitionKind.DOWNLOAD_PENDING:
+            self._request_pool_download(transition.model)
+
+    def _request_pool_download(self, model_name: str) -> None:
+        """Charge a newly-pending pool model against the session budget and command its background download.
+
+        The charge is booked at request time (not on completion) and is never refunded on failure, since a
+        failed download still consumed the bandwidth; the budget is a bandwidth ceiling, not a disk-occupancy
+        one. A model whose reference record declares no size is commanded but charges nothing this session.
+        """
+        size_bytes = self._pool_model_size_bytes(model_name)
+        if size_bytes is not None:
+            self._model_pool_download_bytes_charged += size_bytes
+        self._download_coordinator.request_pool_model_download(model_name)
 
     def _build_performance_model(self) -> PerformanceModel:
         """Construct the performance model, seeding from the last benchmark report when one exists.
@@ -5554,6 +5878,58 @@ class HordeWorkerProcessManager:
         ]
         return PopGovernorsSnapshot(governors=governors, any_active=any(v.active for v in views))
 
+    def _model_pool_status(self) -> ModelPoolSnapshot | None:
+        """Project the fixed model pool onto the wire snapshot, or None when the pool is disabled.
+
+        A disabled pool leaves the field unset so older supervisors and the no-pool case are unaffected. The
+        engine keeps its timing in a monotonic clock, so every seat/bench/demand stamp is resolved to an age or
+        countdown against a single ``time.monotonic()`` reading here; no raw monotonic value travels.
+        """
+        pool_config = self.bridge_data.model_pool
+        if not pool_config.enabled:
+            return None
+
+        now = time.monotonic()
+        seats = [self._model_pool_seat_row(seat, now) for seat in self._model_pool.seats()]
+        bench = [
+            ModelPoolBenchRow(
+                model=bench_entry.model,
+                reason=str(bench_entry.reason),
+                cooldown_remaining_seconds=max(0.0, bench_entry.cooldown_until - now),
+            )
+            for bench_entry in self._model_pool.bench()
+        ]
+        lane = self._job_popper.latest_pool_lane()
+        demand_snapshot = self._model_demand_poller.latest()
+        demand_age = max(0.0, now - demand_snapshot.fetched_at) if demand_snapshot is not None else None
+
+        return ModelPoolSnapshot(
+            enabled=True,
+            seats=seats,
+            bench=bench,
+            current_lane=str(lane) if lane is not None else None,
+            last_fixed_seat_count=self._job_popper.latest_pool_fixed_seat_count(),
+            demand_age_seconds=demand_age,
+            download_budget_gb=pool_config.download_budget_gb,
+            download_bytes_charged=self._model_pool_download_bytes_charged,
+        )
+
+    def _model_pool_seat_row(self, seat: SeatView, now: float) -> ModelPoolSeatRow:
+        """Project one seat onto its wire row, resolving the monotonic stamps to ages against ``now``."""
+        dwell_seconds = max(0.0, now - seat.seated_at) if seat.model is not None else None
+        last_fulfilled_age = max(0.0, now - seat.last_fulfilled_at) if seat.last_fulfilled_at is not None else None
+        rescue_expires_in = max(0.0, seat.rescue_expires_at - now) if seat.rescue_expires_at is not None else None
+        return ModelPoolSeatRow(
+            model=seat.model,
+            source=str(seat.source) if seat.source is not None else None,
+            state=str(seat.state),
+            dwell_seconds=dwell_seconds,
+            empty_pops=seat.empty_pops,
+            last_fulfilled_age_seconds=last_fulfilled_age,
+            pending_model=seat.pending_model,
+            rescue_expires_in_seconds=rescue_expires_in,
+        )
+
     def _build_card_snapshots(self) -> list[CardSnapshot]:
         """Project per-card multi-GPU state onto wire models, one per driven card.
 
@@ -5913,6 +6289,7 @@ class HordeWorkerProcessManager:
             scheduling_governance=self._scheduling_governance_status(),
             per_card=self._build_card_snapshots(),
             system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),
+            model_pool=self._model_pool_status(),
         )
 
     def _build_feature_readiness_summary(self, bridge_data: reGenBridgeData) -> FeatureReadinessSummary:
@@ -6128,6 +6505,11 @@ class HordeWorkerProcessManager:
                 # parent to the supervisor, while a genuinely dead loop must still trip it. A dedicated
                 # 1s task heartbeats between the busy tick's own awaits, so only real loop death alarms.
                 coroutines.append(self._supervisor_liveness_heartbeat())
+            if not self.bridge_data.dry_run_skip_api:
+                # The fixed pool ranks against live horde demand. The loop itself follows the live
+                # model_pool.enabled flag (so a mid-session hot-reload enable starts polling without a
+                # restart); only dry-run is excluded outright, since it has no API session to query.
+                coroutines.append(self._model_demand_poller_loop())
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_reloader.bridge_data_loop())
 

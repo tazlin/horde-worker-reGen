@@ -12,6 +12,7 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 from pydantic import JsonValue
 
+from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
@@ -290,6 +291,11 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.alchemy_caption_enabled = False
     bd.aesthetic_scoring_enabled = True
     bd.forms = []
+    bd.image_models_to_skip = None
+    # A real (disabled) fixed-pool config, not an auto-Mock, so the manager and popper read a false
+    # ``enabled`` flag and leave the pool wiring inert by default.
+    bd.model_pool = ModelPoolConfig()
+    bd.max_throughput_mode = False
     bd._loaded_from_env_vars = False
     bd.dry_run_skip_inference = False
     bd.dry_run_skip_safety = False

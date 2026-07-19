@@ -10,24 +10,45 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
-from horde_worker_regen.tui.formatters import human_duration
+from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSnapshot, WorkerStateSnapshot
+from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.recommendations import analyze
+
+_SEAT_SOURCE_GLYPHS: dict[str, tuple[str, str]] = {
+    "MANUAL": ("M", "yellow"),
+    "RANKER": ("R", "cyan"),
+    "RESCUE": ("S", "magenta"),
+}
+"""Compact glyph plus style per seat source (``M``anual pin, ``R``anker fill, re``S``cue)."""
+
+_BENCH_ROWS_SHOWN = 3
+"""How many benched models the pool panel lists before summarizing the remainder."""
 
 
 class InsightsView(VerticalScroll):
     """Live recommendations plus a recent-activity rollup and a benchmark pointer."""
 
     def compose(self) -> ComposeResult:
-        """Hold the recommendations, activity, and benchmark-hint panels."""
+        """Hold the recommendations, activity, model-pool, and benchmark-hint panels."""
         yield Static(id="insights-recommendations")
         yield Static(id="insights-activity")
+        yield Static(id="insights-model-pool")
         yield Static(self._benchmark_hint(), id="insights-benchmark")
 
     def update_snapshot(self, snapshot: WorkerStateSnapshot) -> None:
-        """Recompute recommendations and the activity summary from a snapshot."""
+        """Recompute recommendations, the activity summary, and the model-pool panel from a snapshot."""
         self.query_one("#insights-recommendations", Static).update(self._render_recommendations(snapshot))
         self.query_one("#insights-activity", Static).update(self._render_activity(snapshot))
+        self._update_model_pool(snapshot.model_pool)
+
+    def _update_model_pool(self, pool: ModelPoolSnapshot | None) -> None:
+        """Render the model-pool panel, or hide it entirely when the pool is disabled or absent."""
+        panel = self.query_one("#insights-model-pool", Static)
+        if pool is None or not pool.enabled:
+            panel.display = False
+            return
+        panel.display = True
+        panel.update(self._render_model_pool(pool))
 
     def _render_recommendations(self, snapshot: WorkerStateSnapshot) -> Panel:
         """Render the recommendation list as a bordered panel."""
@@ -64,6 +85,86 @@ class InsightsView(VerticalScroll):
 
         table.add_row("GPU busy fraction", self._fraction(snapshot.gpu_utilization_busy_fraction))
         return Panel(table, title="Recent activity", title_align="left", border_style="grey37")
+
+    def _render_model_pool(self, pool: ModelPoolSnapshot) -> Panel:
+        """Render the fixed model pool's seats, a lane/demand status line, and a bench summary."""
+        status_line = self._render_pool_status_line(pool)
+        seats_table = self._render_pool_seats(pool)
+        bench_line = self._render_pool_bench(pool)
+        return Panel(
+            Group(status_line, seats_table, bench_line),
+            title="Model pool",
+            title_align="left",
+            border_style="green",
+        )
+
+    def _render_pool_status_line(self, pool: ModelPoolSnapshot) -> Text:
+        """Render the one-line lane/demand/budget status for the pool panel."""
+        lane = pool.current_lane or "-"
+        demand = human_duration(pool.demand_age_seconds) if pool.demand_age_seconds is not None else "-"
+        parts = [
+            Text.assemble(("Lane ", "grey70"), (lane, "bold")),
+            Text.assemble(("seats ", "grey70"), (str(pool.last_fixed_seat_count), "bold")),
+            Text.assemble(("demand ", "grey70"), (demand, "bold")),
+        ]
+        if pool.download_budget_gb > 0:
+            used = human_bytes(pool.download_bytes_charged)
+            total = f"{pool.download_budget_gb:.1f} GB"
+            parts.append(Text.assemble(("budget ", "grey70"), (f"{used} / {total}", "bold")))
+        return Text("  ·  ").join(parts)
+
+    def _render_pool_seats(self, pool: ModelPoolSnapshot) -> Table:
+        """Render the pool's seats as a compact table (model, source glyph, state, dwell, empty pops, rescue)."""
+        table = Table.grid(padding=(0, 2))
+        table.add_column(justify="left")
+        table.add_column(justify="center")
+        table.add_column(justify="left")
+        table.add_column(justify="right")
+        table.add_column(justify="right")
+        table.add_column(justify="right")
+        table.add_row(
+            Text("Model", style="bold grey70"),
+            Text("Src", style="bold grey70"),
+            Text("State", style="bold grey70"),
+            Text("Dwell", style="bold grey70"),
+            Text("Empty", style="bold grey70"),
+            Text("Rescue", style="bold grey70"),
+        )
+        for seat in pool.seats:
+            model = seat.model if seat.model is not None else "-"
+            state = f"dl:{seat.pending_model}" if seat.pending_model is not None else str(seat.state)
+            dwell = human_duration(seat.dwell_seconds) if seat.dwell_seconds is not None else "-"
+            rescue = (
+                human_duration(seat.rescue_expires_in_seconds) if seat.rescue_expires_in_seconds is not None else "-"
+            )
+            table.add_row(
+                Text(model),
+                self._source_glyph(seat.source),
+                Text(state, style="grey70"),
+                Text(dwell),
+                Text(str(seat.empty_pops)),
+                Text(rescue),
+            )
+        return table
+
+    def _render_pool_bench(self, pool: ModelPoolSnapshot) -> Text:
+        """Render the top few benched models (name, reason, remaining cooldown) as one line."""
+        if not pool.bench:
+            return Text.assemble(("Bench ", "grey70"), ("empty", "grey50"))
+        shown = pool.bench[:_BENCH_ROWS_SHOWN]
+        entries = [f"{row.model} ({row.reason}, {human_duration(row.cooldown_remaining_seconds)})" for row in shown]
+        remainder = len(pool.bench) - len(shown)
+        if remainder > 0:
+            entries.append(f"+{remainder} more")
+        return Text.assemble(("Bench ", "grey70"), ("  |  ".join(entries), "grey50"))
+
+    @staticmethod
+    def _source_glyph(source: str | None) -> Text:
+        """Render a seat source as a compact, colour-coded glyph (or a dash when the seat is empty)."""
+        if source is None:
+            return Text("-", style="grey50")
+        glyph, style = _SEAT_SOURCE_GLYPHS.get(source, (source[:1].upper(), "grey70"))
+        return Text(glyph, style=style)
 
     @staticmethod
     def _fraction(value: float | None) -> str:

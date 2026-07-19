@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from loguru import logger
@@ -39,6 +39,7 @@ class ModelDownloadCoordinator:
         bridge_data_provider: Callable[[], reGenBridgeData],
         stable_diffusion_reference_provider: Callable[[], dict[str, ImageGenerationModelRecord] | None],
         enable_background_downloads: bool,
+        pool_pending_models_provider: Callable[[], Collection[str]] = frozenset,
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -53,6 +54,9 @@ class ModelDownloadCoordinator:
             bridge_data_provider: Return the current live bridge data.
             stable_diffusion_reference_provider: Return the loaded image-model reference, if available.
             enable_background_downloads: Whether the background download process is enabled.
+            pool_pending_models_provider: Return the fixed-pool models a seat is waiting to download, unioned
+                into every authoritative desired-model set sent to the download process so a config reconcile
+                does not prune a pool-initiated download. Defaults to an empty set (pool disabled or absent).
             clock: Wall-clock provider for startup-grace decisions.
             monotonic_clock: Monotonic clock provider for download-plan cache expiry.
         """
@@ -64,6 +68,7 @@ class ModelDownloadCoordinator:
         self._bridge_data_provider = bridge_data_provider
         self._stable_diffusion_reference_provider = stable_diffusion_reference_provider
         self._enable_background_downloads = enable_background_downloads
+        self._pool_pending_models_provider = pool_pending_models_provider
         self._clock = clock
         self._monotonic_clock = monotonic_clock
 
@@ -140,10 +145,31 @@ class ModelDownloadCoordinator:
                 f"Worker has {desired_present} of {len(plan.desired)} desired models on disk; "
                 f"background-downloading {len(plan.to_fetch)} missing: {list(plan.to_fetch)}",
             )
+        desired_image_models = set(plan.desired)
+        desired_image_models.update(self._pool_pending_models_provider())
         self._process_lifecycle.request_downloads(
             list(plan.to_fetch),
             download_aux=download_aux,
-            desired_image_models=sorted(plan.desired),
+            desired_image_models=sorted(desired_image_models),
+        )
+
+    def request_pool_model_download(self, model_name: str) -> None:
+        """Fetch one fixed-pool model now, keeping the pool's other pending downloads out of the pruning set.
+
+        The authoritative desired set on this send is the configured image models unioned with every model a
+        pool seat is currently waiting on (including this one), so the download process does not treat this
+        targeted request as a signal to prune the pool's other in-flight fetches. A no-op when background
+        downloads are disabled.
+        """
+        if not self._enable_background_downloads:
+            return
+        self._process_lifecycle.start_download_process()
+        desired_image_models = set(self.bridge_data.image_models_to_load)
+        desired_image_models.update(self._pool_pending_models_provider())
+        desired_image_models.add(model_name)
+        self._process_lifecycle.request_downloads(
+            [model_name],
+            desired_image_models=sorted(desired_image_models),
         )
 
     def download_process_flags(self) -> tuple[object, ...]:

@@ -600,6 +600,8 @@ class InferenceScheduler:
     _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
     _last_preload_admission: LatestPreloadAdmission | None
     _post_processing_lane_commitments_provider: Callable[[], int]
+    _pool_protected_models_provider: Callable[[], frozenset[str]]
+    _on_pool_pressure_eviction: Callable[[str], None]
 
     def __init__(
         self,
@@ -619,6 +621,8 @@ class InferenceScheduler:
         performance_model: PerformanceModel | None = None,
         reserve_ledger: CommittedReserveLedger | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+        pool_protected_models_provider: Callable[[], frozenset[str]] | None = None,
+        on_pool_pressure_eviction: Callable[[str], None] | None = None,
         decision_sink: DecisionSink | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
@@ -656,6 +660,14 @@ class InferenceScheduler:
             post_processing_lane_commitments_provider (Callable[[], int] | None): Optional count of
                 non-JobTracker work already committed to the shared post-processing lane, such as
                 graph-backed alchemy forms waiting for or running on that lane.
+            pool_protected_models_provider (Callable[[], frozenset[str]] | None): Optional source of the
+                fixed model pool's currently-seated models. Their weights gain residency protection so the
+                scheduler does not evict what the pool is advertising, except under true RAM pressure where a
+                seat with no live job yields. ``None`` (unit tests, and a worker running no pool) reads an
+                empty set, so seat protection is inert and residency behaves exactly as before the pool existed.
+            on_pool_pressure_eviction (Callable[[str], None] | None): Optional callback invoked with each
+                seated idle model whose staged components the RAM-pressure rung yields, so the manager can tell
+                the pool a seat was reclaimed. ``None`` (unit tests, and until wired) is a no-op.
             decision_sink (DecisionSink | None): Optional callback the manager injects to record
                 dispatch-residency admission decisions (holds and their release) to the stats export.
                 ``None`` in unit tests and until wired; emission is a no-op then.
@@ -669,6 +681,13 @@ class InferenceScheduler:
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
         self._post_processing_lane_commitments_provider = post_processing_lane_commitments_provider or (lambda: 0)
+        # The fixed model pool's seat set and the pool's pressure-eviction notifier. Both default inert so a
+        # worker running no pool (and every standalone unit test) keeps the pre-pool residency behaviour.
+        self._pool_protected_models_provider = pool_protected_models_provider or (lambda: frozenset())
+        self._on_pool_pressure_eviction = on_pool_pressure_eviction or (lambda _model_name: None)
+        # Seat models whose staged components the RAM-pressure rung has already yielded, so the pool notifier
+        # and the summary log fire only on the rising edge of a seat's yield rather than every pressure tick.
+        self._pool_pressure_yielded_models: frozenset[str] = frozenset()
         # Injected by the manager: records dispatch-residency admission decisions (holds and their release)
         # to the stats export, coalesced on the receiving side. None in unit tests and until wired.
         self._decision_sink = decision_sink
@@ -8844,6 +8863,13 @@ class InferenceScheduler:
         affinity computation in :meth:`preload_models`; ``bridge_data.image_models_to_load`` is
         deliberately not used because the harness/canned path never resolves that config field,
         so live state is the only reliable source.
+
+        Fixed-pool seats are deliberately NOT unioned in. This set sizes ``affinity_active`` and biases
+        preload decisions, so a seat for a not-yet-loaded model would flip the whole card between the
+        fits and overflow VRAM regimes and starve co-resident lanes of headroom. Seats are an advertising
+        and RAM-idle-protection concept only: their RAM hold lives in the seat term of
+        :meth:`_residency_protects_from_unload`, and under true RAM pressure an idle seat simply yields
+        (:meth:`_evict_unprotected_components_under_pressure`).
         """
         wanted: set[str] = {
             p.loaded_horde_model_name
@@ -8853,6 +8879,22 @@ class InferenceScheduler:
         wanted.update(j.model for j in self._job_tracker.jobs_pending_inference if j.model is not None)
         wanted.update(j.model for j in self._job_tracker.jobs_in_progress if j.model is not None)
         return wanted
+
+    def _seat_only_idle_models(self) -> frozenset[str]:
+        """The seated pool models with no pending or in-progress job right now.
+
+        A seat is "busy" while any pending or in-progress job references its model; those seats keep full
+        residency protection. The remainder are seat-only idle models: the worker still advertises them, but
+        no live work needs their weights this instant, so under true RAM pressure they yield their staged
+        components to avoid a host-memory deadlock. Busy-versus-idle is derived from the same JobTracker demand
+        that :meth:`_compute_wanted_models` reads, so no separate busy-seat provider is needed.
+        """
+        seats = self._pool_protected_models_provider()
+        if not seats:
+            return frozenset()
+        busy_models = {job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None}
+        busy_models.update(job.model for job in self._job_tracker.jobs_in_progress if job.model is not None)
+        return seats - busy_models
 
     def _is_model_forecast_to_load(self, model_name: str | None) -> bool:
         """Whether ``model_name`` is already on track to become resident soon.
@@ -8914,7 +8956,9 @@ class InferenceScheduler:
           next job has not yet been popped.
         - **More models than processes**: residency cannot be guaranteed, so apply only a RAM
           grace period; cheap to hold, and it avoids the expensive disk reload between a model's
-          consecutive jobs. VRAM, the scarce resource, is still reclaimed promptly.
+          consecutive jobs. VRAM, the scarce resource, is still reclaimed promptly. A fixed-pool seat
+          earns the same RAM protection as a recently-demanded model here, since seating is a standing
+          commitment to keep the model ready.
 
         ``under_pressure`` is the measured-budget override (the WS-1 "aggregate budget"): the
         fits-regime assumption that model-count <= process-count implies the resident set fits the
@@ -8937,7 +8981,13 @@ class InferenceScheduler:
         if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
             return True
 
-        return not vram and self._is_recently_demanded(model_name)
+        # A pool seat is a standing commitment to serve the model, so in the overflow regime it earns the same
+        # RAM residency the demand grace grants a recently-run model: cheap to hold and it spares a disk reload
+        # between the seat's jobs. VRAM, the scarce resource, is still reclaimed promptly (this is the non-
+        # pressure branch; the ``under_pressure`` override above never reaches here).
+        is_pool_seat = model_name in self._pool_protected_models_provider()
+        held_by_grace_or_seat = self._is_recently_demanded(model_name) or is_pool_seat
+        return not vram and held_by_grace_or_seat
 
     def unload_post_process_models_from_vram(self, *, device_index: int | None = None) -> bool:
         """Ask an idle post-processing lane to unload its modules while keeping the lane alive."""
@@ -9243,6 +9293,13 @@ class InferenceScheduler:
         model is also spared and left to the whole-RAM unload, which keeps the parent's per-slot model
         bookkeeping consistent, so this reclaims only the extra budgeted-cache residents.
 
+        A fixed-pool seat with a live job is protected the same as any demanded model (it appears in the
+        wanted set through that job); a seat with no pending or in-progress job carries no protection here at
+        all, so it yields its staged components under true RAM pressure. This is the deadlock-avoidance
+        posture: seat holds must never keep the host above its RAM floor. Each seat actually yielded
+        (:meth:`_seat_only_idle_models` members among the evicted) is reported to the pool via the
+        manager-supplied notifier on the rising edge of its yield.
+
         Returns:
             True when it commanded at least one eviction (this rung made progress, so the caller need not run
             the whole-RAM unload this tick); False when the cache is untracked or everything held is
@@ -9251,8 +9308,10 @@ class InferenceScheduler:
         if self._component_residency_map is None:
             return False
 
+        seat_only_idle_models = self._seat_only_idle_models()
         protected = self._compute_wanted_models()
         acted = False
+        yielded_seat_models: set[str] = set()
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE or not process_info.is_process_alive():
                 continue
@@ -9268,7 +9327,35 @@ class InferenceScheduler:
                     f"{sorted(evictable)} from process {process_info.process_id} before a whole-RAM unload.</>",
                 )
                 acted = True
+                yielded_seat_models.update(evictable & seat_only_idle_models)
+
+        self._announce_pool_pressure_yield(frozenset(yielded_seat_models))
         return acted
+
+    def _announce_pool_pressure_yield(self, yielded_seat_models: frozenset[str]) -> None:
+        """Notify the pool of seated idle models that yielded staged components under RAM pressure.
+
+        Edge-triggered against the previously-yielded seat set: the manager-supplied notifier fires once per
+        model that newly yields (so a seat is not re-reported every sub-second pressure tick while its child
+        drains the eviction), and a single summary line names that rising-edge set. Passing an empty set (the
+        common case, and every pressure tick that yields no seat) clears the latch so a later re-yield of the
+        same model is announced afresh.
+
+        Args:
+            yielded_seat_models (frozenset[str]): The seated idle models whose staged components this pass
+                actually evicted.
+        """
+        newly_yielded_models = yielded_seat_models - self._pool_pressure_yielded_models
+        self._pool_pressure_yielded_models = yielded_seat_models
+        if not newly_yielded_models:
+            return
+
+        for model_name in sorted(newly_yielded_models):
+            self._on_pool_pressure_eviction(model_name)
+        logger.opt(ansi=True).info(
+            f"<fg #ff8c69>RAM pressure: {len(newly_yielded_models)} seated idle pool model(s) "
+            f"{sorted(newly_yielded_models)} yielded their staged components; the pool has been notified.</>",
+        )
 
     def unload_models(self, *, under_pressure: bool = False, for_head_of_queue: bool = False) -> bool:
         """Unload one idle model from RAM that is no longer needed; return True if one was unloaded.

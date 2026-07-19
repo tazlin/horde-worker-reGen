@@ -294,6 +294,20 @@ record itself, and all on-disk-layout knowledge is delegated to
 `horde_model_reference.on_disk_layout` (there is no worker-local
 category/folder/size bridge to keep in step with hordelib).
 
+## Pool-initiated downloads within a budget
+
+The [fixed model pool](model_pool.md) is the one scheduling subsystem that can
+*initiate* a model download on its own. When its demand ranker wants to seat a
+high-demand model the worker does not yet hold, and `model_pool.download_budget_gb`
+is positive, the candidate becomes a pending-download seat: the fetch is requested
+through the same dedicated download process described above, and the seat resolves
+once the weights land (or is abandoned if the download fails). The budget bounds how
+much disk the pool may spend this way over the session. With the default budget of
+`0.0` the pool never downloads and only ever seats models already on disk, so the
+pool changes *which* on-disk models are advertised without changing the disk
+footprint. Everything else on this page (availability gating, planning, bandwidth
+controls) applies to a pool-initiated fetch exactly as it does to any other.
+
 ## Pause and bandwidth controls
 
 Downloads honour live controls so an operator can throttle or pause fetching
@@ -483,4 +497,6 @@ takeover, and cancelling leaves the worker serving untouched.
   supervisor control channel
 - [Performance and Backpressure](performance_and_backpressure.md): how popping is
   gated, including by model availability
+- [The Fixed Model Pool](model_pool.md): the seat set whose budgeted fetches are the
+  only pool-initiated downloads
 - [`ModelAvailability`][horde_worker_regen.process_management.models.model_availability.ModelAvailability]
