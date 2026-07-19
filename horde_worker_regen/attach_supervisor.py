@@ -309,7 +309,11 @@ class AttachSupervisor:
         self._faults: list[tuple[float, int]] = []
         self._download_last_bytes: int | None = None
         self._download_stall_since: float | None = None
-        self._commands_consumed = 0
+        # Lines already in the inbox when this supervisor binds are history, not work: they were consumed
+        # by a predecessor (or are stale), and replaying them re-applies old operator intent against a fresh
+        # worker (a leftover GRACEFUL_SHUTDOWN would kill the relaunch it preceded). Only lines appended
+        # after this point are applied.
+        self._commands_consumed = self._count_inbox_lines()
         self._guard_since: float | None = None
         self._guard_fired = False
 
@@ -727,8 +731,18 @@ class AttachSupervisor:
 
     # region command inbox
 
+    def _count_inbox_lines(self) -> int:
+        """Return the number of lines currently in the command inbox, or 0 if it is missing or unreadable."""
+        if not self._commands_path.exists():
+            return 0
+        try:
+            return len(self._commands_path.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            logger.exception("Could not read the command inbox to seed the cursor; treating it as empty.")
+            return 0
+
     def _process_command_inbox(self, now: float) -> None:
-        """Apply every not-yet-seen line in the command inbox exactly once (malformed lines are skipped)."""
+        """Apply every line appended since this supervisor bound, exactly once (malformed lines are skipped)."""
         if not self._commands_path.exists():
             return
         try:
