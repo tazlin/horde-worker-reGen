@@ -177,7 +177,7 @@ class TestZeroFulfillmentDemotion:
 
         after_window = pool.tick(16.0 * _MINUTE, ranked=None, demand_is_stale=False)
         assert pool.active_seat_models() == frozenset()
-        assert _of_kind(after_window, TransitionKind.DEMOTED)[0].reason is DemotionReason.EMPTY_POPS
+        assert _of_kind(after_window, TransitionKind.DEMOTED)[0].reason is DemotionReason.ZERO_FULFILLMENT
 
 
 class TestTimerRecontest:
@@ -595,6 +595,131 @@ class TestPinIdentityPreservation:
         seat = pool.seats()[0]
         assert seat.model == "pinned"
         assert seat.source is SeatSource.MANUAL
+
+
+class TestOffDiskRescue:
+    """An off-disk rescue pick marks the weakest ranker seat pending, keeping its incumbent until the file lands."""
+
+    def _off_disk_params(self, seat_count: int = 2, **overrides: object) -> PoolParams:
+        return _params(
+            seat_count,
+            ranker_enabled=True,
+            rescue_enabled=True,
+            rescue_eta_seconds=10000.0,
+            rescue_window_minutes=15.0,
+            rescue_model_cooldown_hours=6.0,
+            min_dwell_minutes=0.0,
+            rotation_minutes=100000.0,
+            zero_fulfillment_demotion_minutes=100000.0,
+            **overrides,
+        )
+
+    def test_off_disk_rescue_marks_pending_and_retains_incumbent(self) -> None:
+        """A starved off-disk pick marks the weakest ranker seat pending while its incumbent keeps serving."""
+        pool = ModelPool(self._off_disk_params())
+        pool.tick(0.0, ranked=[_cand("strong", 10.0), _cand("weak", 8.0)], demand_is_stale=False)
+
+        transitions = pool.tick(
+            1.0,
+            ranked=[_cand("strong", 10.0), _cand("weak", 8.0), _cand("starved", 0.5, on_disk=False, eta=20000.0)],
+            demand_is_stale=False,
+        )
+
+        weak_seat = next(seat for seat in pool.seats() if seat.model == "weak")
+        assert weak_seat.state is SeatState.PENDING_DOWNLOAD
+        assert weak_seat.pending_model == "starved"
+        assert pool.active_seat_models() == frozenset({"strong", "weak"})
+        assert pool.pending_download_models() == frozenset({"starved"})
+        assert _of_kind(transitions, TransitionKind.DOWNLOAD_PENDING)[0].model == "starved"
+        assert _of_kind(transitions, TransitionKind.RESCUE_ENGAGED) == []
+        assert _of_kind(transitions, TransitionKind.DEMOTED) == []
+
+    def test_off_disk_rescue_ready_activates_as_rescue_with_window(self) -> None:
+        """When the rescue download lands the model seats as RESCUE with its window started at activation."""
+        pool = ModelPool(self._off_disk_params())
+        pool.tick(0.0, ranked=[_cand("strong", 10.0), _cand("weak", 8.0)], demand_is_stale=False)
+        pool.tick(
+            1.0,
+            ranked=[_cand("strong", 10.0), _cand("weak", 8.0), _cand("starved", 0.5, on_disk=False, eta=20000.0)],
+            demand_is_stale=False,
+        )
+
+        transitions = pool.on_download_ready("starved", now=2.0)
+
+        rescue_seat = next(seat for seat in pool.seats() if seat.model == "starved")
+        assert rescue_seat.source is SeatSource.RESCUE
+        assert rescue_seat.state is SeatState.ACTIVE
+        assert rescue_seat.rescue_expires_at == 2.0 + 15.0 * _MINUTE
+        assert pool.active_seat_models() == frozenset({"strong", "starved"})
+        assert _of_kind(transitions, TransitionKind.DOWNLOAD_READY)[0].model == "starved"
+        assert "weak" in {entry.model for entry in pool.bench()}
+
+    def test_pending_off_disk_rescue_blocks_a_second_rescue(self) -> None:
+        """While an off-disk rescue is still downloading, a second starving candidate cannot engage a rescue."""
+        pool = ModelPool(self._off_disk_params(seat_count=3))
+        baseline = [_cand("strong", 10.0), _cand("mid", 9.0), _cand("weak", 8.0)]
+        pool.tick(0.0, ranked=baseline, demand_is_stale=False)
+        pool.tick(
+            1.0,
+            ranked=[*baseline, _cand("starved_one", 0.5, on_disk=False, eta=20000.0)],
+            demand_is_stale=False,
+        )
+        assert pool.pending_download_models() == frozenset({"starved_one"})
+
+        transitions = pool.tick(
+            2.0,
+            ranked=[
+                *baseline,
+                _cand("starved_one", 0.5, on_disk=False, eta=20000.0),
+                _cand("starved_two", 0.4, on_disk=False, eta=30000.0),
+            ],
+            demand_is_stale=False,
+        )
+
+        assert _of_kind(transitions, TransitionKind.DOWNLOAD_PENDING) == []
+        assert pool.pending_download_models() == frozenset({"starved_one"})
+
+
+class TestNonProductiveDemotionReasons:
+    """The empty-pop and zero-fulfillment demotion triggers surface as distinct reasons for the caller."""
+
+    def test_empty_pop_and_zero_fulfillment_triggers_differ(self) -> None:
+        """The empty-pop path reports EMPTY_POPS while the zero-fulfillment path reports ZERO_FULFILLMENT."""
+        empty_pop_pool = ModelPool(
+            _params(
+                1,
+                pinned=(PinnedModel("m", 1.0),),
+                ranker_enabled=False,
+                min_dwell_minutes=0.0,
+                zero_fulfillment_demotion_minutes=100000.0,
+            ),
+        )
+        empty_pop_pool.tick(0.0, ranked=None, demand_is_stale=False)
+        for _ in range(40):
+            empty_pop_pool.on_pop_outcome(lane=PopLane.FIXED, advertised=frozenset({"m"}), popped_model=None, now=1.0)
+        empty_pop_transitions = empty_pop_pool.tick(
+            2.0, ranked=[_cand("m", 1.0, queued_per_worker=0.0)], demand_is_stale=False
+        )
+        assert _of_kind(empty_pop_transitions, TransitionKind.DEMOTED)[0].reason is DemotionReason.EMPTY_POPS
+
+        zero_fulfillment_pool = ModelPool(
+            _params(
+                1,
+                pinned=(PinnedModel("m", 1.0),),
+                ranker_enabled=False,
+                min_dwell_minutes=0.0,
+                zero_fulfillment_demotion_minutes=15.0,
+            ),
+        )
+        zero_fulfillment_pool.tick(0.0, ranked=None, demand_is_stale=False)
+        zero_fulfillment_transitions = zero_fulfillment_pool.tick(16.0 * _MINUTE, ranked=None, demand_is_stale=False)
+        assert (
+            _of_kind(zero_fulfillment_transitions, TransitionKind.DEMOTED)[0].reason is DemotionReason.ZERO_FULFILLMENT
+        )
+
+
+class TestReplaceParamsPromotion:
+    """A newly pinned model already holding a ranker seat converts to manual in place on a config change."""
 
     def test_replace_params_promotes_ranker_seat_of_newly_pinned_model(self) -> None:
         """Pinning a model that already holds a ranker seat converts the seat to manual in place."""
