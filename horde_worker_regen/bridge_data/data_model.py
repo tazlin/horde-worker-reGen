@@ -221,6 +221,98 @@ def apply_max_throughput_mode(
             )
 
 
+_STICKINESS_POOL_MIGRATION_BUNDLE: dict[str, object] = {
+    "enabled": True,
+    "ranker_enabled": True,
+    "rotation_minutes": 30.0,
+}
+"""The ``model_pool`` sub-field bundle a deprecated positive ``model_stickiness`` maps onto when the pool is off.
+
+The fixed model pool supersedes ``model_stickiness``: committing to a small, slowly-rotating resident set is
+what the per-pop stickiness bias only approximated. A worker still carrying a positive ``model_stickiness`` and
+no enabled pool is migrated onto a modest pool (enabled, ranker on, a 30-minute rotation) wherever it left
+those pool fields at their default, so the standing-residency behaviour it wanted is delivered by the mechanism
+that replaced the knob."""
+
+
+_DEPRECATED_CONFIG_KEY_POINTERS: dict[str, str] = {
+    "horde_model_stickiness": (
+        "`model_stickiness` is deprecated: the fixed model pool (`model_pool`) replaces it by committing the "
+        "worker to a small, slowly-rotating resident set instead of a per-pop bias. It is being mapped onto a "
+        "modest pool for you (ranker on, a 30-minute rotation) wherever the `model_pool` fields were left at "
+        "their defaults; set `model_pool` explicitly to take control, and remove `model_stickiness` to silence "
+        "this notice."
+    ),
+    "dynamic_models": (
+        "`dynamic_models` is inert in reGen and has no effect. The fixed model pool (`model_pool`) with its "
+        "demand ranker is the supported way to serve a demand-following model set; see the `model_pool` section "
+        "of bridgeData.yaml."
+    ),
+    "number_of_dynamic_models_to_load": (
+        "`number_of_dynamic_models` is inert in reGen and has no effect. Use `model_pool.seats` to size the "
+        "served set; see the `model_pool` section of bridgeData.yaml."
+    ),
+    "max_dynamic_models_to_download": (
+        "`max_models_to_download` is inert in reGen and has no effect. Use `model_pool.download_budget_gb` to "
+        "let the pool fetch high-demand models within a session budget; see the `model_pool` section of "
+        "bridgeData.yaml."
+    ),
+}
+"""Deprecation pointers keyed by model field name, each redirecting a legacy key at the fixed model pool."""
+
+
+_warned_deprecated_config_keys: set[str] = set()
+"""Field names whose deprecation pointer has already been logged this process, so each fires at most once.
+
+Config reloads re-validate the model on every on-disk edit, so a plain per-validation warning would repeat on
+every reload. This guard keeps each pointer to a single line for the life of the process; it re-arms only on
+restart."""
+
+
+def _warn_deprecated_config_key_once(field_name: str) -> None:
+    """Emit the deprecation pointer for ``field_name`` at most once per worker process.
+
+    A no-op for a field with no registered pointer or one already warned this process.
+    """
+    if field_name in _warned_deprecated_config_keys:
+        return
+    pointer = _DEPRECATED_CONFIG_KEY_POINTERS.get(field_name)
+    if pointer is None:
+        return
+    _warned_deprecated_config_keys.add(field_name)
+    logger.warning(pointer)
+
+
+def apply_stickiness_pool_migration(
+    config: reGenBridgeData,
+    *,
+    explicitly_set_pool_fields: Collection[str],
+    log: bool = False,
+) -> None:
+    """Map a deprecated positive ``model_stickiness`` onto ``config.model_pool``, honouring explicit pool values.
+
+    Applies :data:`_STICKINESS_POOL_MIGRATION_BUNDLE` to each ``model_pool`` sub-field the operator left at its
+    default (absent from ``explicitly_set_pool_fields``), so an explicit pool value always wins. A pool the
+    operator explicitly disabled therefore stays disabled and the map leaves it inert. Mutates ``config`` in
+    place; the caller owns the one-time deprecation pointer and the guard on stickiness being positive with the
+    pool off.
+
+    Args:
+        config: The config to mutate in place.
+        explicitly_set_pool_fields: The ``model_pool`` sub-field names the operator set explicitly (a snapshot
+            of ``config.model_pool.model_fields_set`` taken before any mutation).
+        log: Whether to emit a log line for each mapped sub-field.
+    """
+    for field_name, bundle_value in _STICKINESS_POOL_MIGRATION_BUNDLE.items():
+        if field_name in explicitly_set_pool_fields:
+            continue
+        setattr(config.model_pool, field_name, bundle_value)
+        if log:
+            logger.info(
+                f"model_stickiness migration: set model_pool.{field_name}={bundle_value!r} (was left at its default).",
+            )
+
+
 def compute_performance_timeout(
     *,
     high_performance_mode: bool,
@@ -660,9 +752,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     horde_model_stickiness: float = Field(default=0.0, le=1.0, ge=0.0, alias="model_stickiness")
-    """
-    A percent chance (expressed as a decimal between 0 and 1) that the currently loaded models will
-    be favored when popping a job.
+    """Deprecated per-pop bias toward the currently-loaded models, superseded by ``model_pool``.
+
+    A percent chance (expressed as a decimal between 0 and 1) that the currently loaded models will be favored
+    when popping a job. The fixed model pool delivers the same standing-residency intent as a committed seat set
+    rather than a per-pop gamble, so a positive value here with the pool off is migrated onto a modest pool (see
+    :func:`apply_stickiness_pool_migration`); with the pool enabled this field is ignored entirely.
     """
 
     high_performance_mode: bool = Field(default=False)
@@ -1031,16 +1126,20 @@ class reGenBridgeData(CombinedHordeBridgeData):
     processes via the ``HORDE_COMPONENT_CACHE_MB`` environment variable this worker exports on their behalf."""
 
     post_processing_fault_breaker_enabled: bool = Field(default=True)
-    """Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults.
+    """Let the worker automatically stop advertising post-processing when a card cannot host its VRAM peak.
 
     A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
     over-commits) faults the job; the horde reassigns it, but a worker that keeps faulting trips the horde's
-    forced-maintenance, the very spiral this guards against. When true (the default), the worker counts
-    post-processing-over-commit faults (both the planner's unhostable-peak faults and watchdog-reaped
-    post-processing stalls) in a rolling window and, once they exceed `post_processing_fault_threshold`
-    within `post_processing_fault_window_seconds`, stops *popping* post-processing-requesting jobs and logs an
-    operator advisory to downgrade settings. The suppression is session-latched (it clears only on restart),
-    since the over-commit is structural and auto-recovery would simply re-trip it."""
+    forced-maintenance, the very spiral this guards against. When true (the default), two mechanisms cooperate:
+    a reactive rolling-window breaker counts post-processing-over-commit faults (both the planner's
+    unhostable-peak faults and watchdog-reaped post-processing stalls) and, once they exceed
+    `post_processing_fault_threshold` within `post_processing_fault_window_seconds`, stops popping
+    post-processing-requesting jobs; and, where the parent has a truthful device-free VRAM reading, a proactive
+    gate withholds post-processing advertising whenever the card's free VRAM sits below the post-processing peak
+    plus a safety margin, before any fault occurs. Both re-open on their own once the card's measured free VRAM
+    recovers (a heavy resident unloads, or a seat rotates to a smaller model); a host without an NVML reading
+    keeps the reactive breaker alone, session-latched until restart. Set false to opt out entirely and manage
+    post-processing advertising by hand."""
 
     post_processing_fault_threshold: int = Field(default=4, ge=1)
     """The breaker trips when *more than* this many post-processing-over-commit faults occur within
@@ -1309,6 +1408,42 @@ class reGenBridgeData(CombinedHordeBridgeData):
                 explicitly_set_pool_fields=set(self.model_pool.model_fields_set),
                 log=True,
             )
+        return self
+
+    @model_validator(mode="after")
+    def apply_stickiness_pool_migration_defaults(self) -> Self:
+        """Map a deprecated positive ``model_stickiness`` onto the fixed model pool when the pool is off.
+
+        Runs after ``max_throughput_mode`` so a pool that mode already enabled is seen as enabled here. When the
+        operator still carries a positive ``model_stickiness`` and no enabled pool (neither explicit nor via
+        that mode), the pool-residency mechanism that replaced stickiness is turned on for them, honouring any
+        explicit ``model_pool`` values. When the pool is already enabled, stickiness is ignored entirely and
+        nothing is mapped. The deprecation pointer is logged once per process. See
+        :func:`apply_stickiness_pool_migration` for the per-sub-field rules.
+        """
+        if self.horde_model_stickiness <= 0.0 or self.model_pool.enabled:
+            return self
+        _warn_deprecated_config_key_once("horde_model_stickiness")
+        apply_stickiness_pool_migration(
+            self,
+            explicitly_set_pool_fields=set(self.model_pool.model_fields_set),
+            log=True,
+        )
+        return self
+
+    @model_validator(mode="after")
+    def warn_deprecated_inert_model_keys(self) -> Self:
+        """Point any set legacy dynamic-model key at the fixed model pool that replaces it.
+
+        ``dynamic_models``, ``number_of_dynamic_models``, and ``max_models_to_download`` are inert in reGen.
+        Setting any of them is accepted (an existing bridgeData keeps loading) and draws a one-time pointer at
+        the ``model_pool`` section, which is the supported way to serve a demand-following model set. Membership
+        is tested against ``model_fields_set``, which records the field name even when the key was supplied
+        under its config alias, so an alias-only key still triggers the pointer.
+        """
+        for field_name in ("dynamic_models", "number_of_dynamic_models_to_load", "max_dynamic_models_to_download"):
+            if field_name in self.model_fields_set:
+                _warn_deprecated_config_key_once(field_name)
         return self
 
     @field_validator("dreamer_worker_name", mode="after")

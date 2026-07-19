@@ -83,6 +83,7 @@ class DemotionReason(StrEnum):
     """Why a seat's model left the seat (or, for pressure, why it was recorded but kept)."""
 
     EMPTY_POPS = auto()
+    ZERO_FULFILLMENT = auto()
     TIMER_LOST = auto()
     RESCUE_DISPLACED = auto()
     DOWNLOAD_FAILED = auto()
@@ -263,6 +264,15 @@ class ModelPool:
     def active_seat_models(self) -> frozenset[str]:
         """Return the set of models currently serving a seat (a pending download's incumbent still serves)."""
         return frozenset(seat.model for seat in self._seats if seat.model is not None)
+
+    def pending_download_models(self) -> frozenset[str]:
+        """Return every model a seat is currently waiting to download, for the caller to command and protect.
+
+        The caller reads this to issue the actual fetch for each pending target and to union those targets into
+        any authoritative desired-model set it sends the download subsystem, so a config reconciliation does not
+        prune a pool-initiated download out from under a seat.
+        """
+        return frozenset(seat.pending_model for seat in self._seats if seat.pending_model is not None)
 
     def seats(self) -> tuple[SeatView, ...]:
         """Return an immutable snapshot of every seat in seat order."""
@@ -791,10 +801,10 @@ class ModelPool:
     ) -> DemotionReason | None:
         """Return why a dwell-eligible seat should demote, or ``None`` if it still earns its place.
 
-        Two non-productive triggers share the one non-productive reason the enum carries. A seat charged the
-        empty-pop threshold while its model's observed queue is near zero demotes on the first trigger; a seat
-        that has served without any fulfillment for the zero-fulfillment window demotes on the second. Whichever
-        condition holds first ends the seat, and both surface as :attr:`DemotionReason.EMPTY_POPS`.
+        Two distinct non-productive triggers each carry their own reason for the caller to tell apart. A seat
+        charged the empty-pop threshold while its model's observed queue is near zero demotes as
+        :attr:`DemotionReason.EMPTY_POPS`; a seat that has served without any fulfillment for the zero-fulfillment
+        window demotes as :attr:`DemotionReason.ZERO_FULFILLMENT`. Whichever condition holds first ends the seat.
         """
         empty_pops_exhausted = seat.empty_pops >= self._params.empty_pop_demotion_threshold
         if empty_pops_exhausted and self._demand_is_near_zero(seat, ranked_by_name):
@@ -803,7 +813,7 @@ class ModelPool:
         reference_time = seat.last_fulfilled_at if seat.last_fulfilled_at is not None else seat.seated_at
         no_fulfillment_seconds = now - reference_time
         if no_fulfillment_seconds >= self._params.zero_fulfillment_demotion_minutes * _SECONDS_PER_MINUTE:
-            return DemotionReason.EMPTY_POPS
+            return DemotionReason.ZERO_FULFILLMENT
         return None
 
     def _demand_is_near_zero(self, seat: _Seat, ranked_by_name: dict[str, RankedCandidate]) -> bool:
@@ -879,7 +889,14 @@ class ModelPool:
         return None
 
     def _engage_rescue(self, candidates: Sequence[RankedCandidate], now: float) -> list[SeatTransition]:
-        """Let the most-starved eligible candidate claim the weakest ranker seat for a bounded rescue window."""
+        """Let the most-starved eligible candidate claim the weakest ranker seat for a bounded rescue window.
+
+        An on-disk pick displaces the weakest ranker seat at once and benches the model it evicts. An off-disk
+        pick does not evict anything yet: it marks that seat pending against the rescue download, so the
+        incumbent keeps serving until :meth:`on_download_ready` swaps the rescued model in and starts its window.
+        Either way the per-model rescue cooldown is charged at the engagement decision, so a pick that is still
+        downloading is not re-selected while its fetch is in flight.
+        """
         if self._rescue_seat_exists():
             return []
         rescue_pick = self._best_rescue_candidate(candidates, now=now)
@@ -892,6 +909,23 @@ class ModelPool:
         if not self._past_dwell(target_seat, now):
             return []
 
+        self._rescue_cooldowns[rescue_pick.name] = now + self._params.rescue_model_cooldown_hours * _SECONDS_PER_HOUR
+
+        if not rescue_pick.on_disk:
+            target_seat.pending_model = rescue_pick.name
+            target_seat.pending_source = SeatSource.RESCUE
+            target_seat.pending_affinity = 0.0
+            target_seat.state = SeatState.PENDING_DOWNLOAD
+            return [
+                SeatTransition(
+                    kind=TransitionKind.DOWNLOAD_PENDING,
+                    model=rescue_pick.name,
+                    source=SeatSource.RESCUE,
+                    reason=None,
+                    at=now,
+                ),
+            ]
+
         transitions = [
             self._demote_seat(
                 target_seat,
@@ -900,7 +934,6 @@ class ModelPool:
                 bench_cooldown_minutes=self._params.bench_cooldown_timer_minutes,
             ),
         ]
-        self._rescue_cooldowns[rescue_pick.name] = now + self._params.rescue_model_cooldown_hours * _SECONDS_PER_HOUR
         self._activate_seat(target_seat, model=rescue_pick.name, source=SeatSource.RESCUE, affinity=0.0, now=now)
         transitions.append(
             SeatTransition(
@@ -914,11 +947,15 @@ class ModelPool:
         return transitions
 
     def _best_rescue_candidate(self, candidates: Sequence[RankedCandidate], now: float) -> RankedCandidate | None:
-        """Return the on-disk, uncommitted, uncooled candidate with the highest wait ETA above the threshold."""
+        """Return the uncommitted, uncooled candidate with the highest wait ETA above the threshold.
+
+        On-disk membership is not required: an off-disk pick engages as a pending download rather than seating
+        at once, and the caller is responsible for having budget-gated any off-disk candidate before offering it.
+        """
         committed = self._committed_models()
         best: RankedCandidate | None = None
         for candidate in candidates:
-            if not candidate.on_disk or candidate.eta_seconds is None:
+            if candidate.eta_seconds is None:
                 continue
             if candidate.eta_seconds < self._params.rescue_eta_seconds:
                 continue

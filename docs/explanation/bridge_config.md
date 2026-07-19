@@ -312,19 +312,27 @@ forms waiting for or running on the same lane. The shaping is separate from the
 fault breaker: it clears automatically as the commitments drain and does not
 mean the worker is unable to serve non-post-processing jobs.
 
-`post_processing_fault_breaker_enabled` is the self-protective backstop. If
-post-processing peaks keep failing to host (more than
-`post_processing_fault_threshold` over-commit faults within
+`post_processing_fault_breaker_enabled` is the self-protective backstop, and it
+works two ways. Reactively, if post-processing peaks keep failing to host (more
+than `post_processing_fault_threshold` over-commit faults within
 `post_processing_fault_window_seconds`), the worker stops advertising
 post-processing so the horde stops sending it upscale/face-fix jobs it cannot
-host, ending the fault-to-forced-maintenance spiral, and logs an advisory to
-downgrade settings. The suppression is session-latched: the over-commit is
-structural, so it clears only on restart. See
+host, ending the fault-to-forced-maintenance spiral. Proactively, where the
+parent has a truthful device-free VRAM reading (NVML), it withholds
+post-processing advertising *before* any fault whenever the card's measured free
+VRAM sits below the post-processing peak plus a safety margin, so a worker
+relaunched into heavy residents does not earn a boot-window burst of jobs it
+cannot yet host. Either suppression re-opens on its own once the card's measured
+free VRAM recovers above the requirement (a heavy resident unloads, or a fixed
+pool seat rotates to a smaller model); the worker also attempts a one-shot
+idle-resident VRAM reclaim to bring that recovery about. A host without an NVML
+reading keeps the reactive breaker alone, session-latched until restart. See
 [Resilience and recovery](resilience_and_recovery.md) for how it sits alongside
-the other self-protective throttles. The same session-latched suppression is
+the other self-protective throttles. A separate, session-latched suppression is
 used when a whole-card model cannot fit beside even the post-processing lane's
-bare GPU context; in that case the worker logs an operator warning and the TUI
-health view shows post-processing as disabled until restart.
+bare GPU context; that structural case does not auto-recover, so the worker logs
+an operator warning and the TUI health view shows post-processing as disabled
+until restart.
 
 ### Pipeline disaggregation (experimental)
 

@@ -251,15 +251,6 @@ extra_slow_worker: false
 limit_max_steps: false
 # Low-end cards or low performance: true
 
-# Automatically determine the models with the highest queue and offer those.
-dynamic_models: false # Currently unused in reGen
-
-# Number of models to offer when `dynamic_models` is true.
-number_of_dynamic_models: 0 # Currently unused in reGen
-
-# Maximum number of models to download automatically for `dynamic_models`.
-max_models_to_download: 10 # Currently unused in reGen
-
 # Frequency (in seconds) to output worker summary stats, such as kudos per hour.
 # Set to zero to disable stats output completely.
 stats_output_frequency: 20
@@ -348,7 +339,7 @@ load_large_models: false
 # and guarantees a config change never kicks off a large download. Default: false.
 only_models_on_disk: false
 
-# Models to skip when `dynamic_models` is true or TOP n models are selected in models_to_load.
+# Models to skip when TOP n or ALL models are selected in models_to_load.
 # Avoid loading models due to VRAM constraints, NSFW content, or other reasons.
 # Models skipped are not replaced by other models, meaning TOP n will load fewer models. See the note above models_to_load.
 models_to_skip:
@@ -365,6 +356,77 @@ models_to_skip:
   # - Poison # Un-pruned SD1.5 model (5gb+)
   # - MoistMix # Un-pruned SD1.5 model (5gb+)
   # - Laolei New Berry Protogen Mix # Un-pruned SD1.5 model (5gb+)
+
+#############################
+## Fixed Model Pool        ##
+#############################
+
+# The fixed model pool commits the worker to a bounded set of "seats", each a model it keeps ready to serve,
+# so the horde returns work the card can run without a per-job model swap. It fills seats first from your
+# `pinned` list, then (when the ranker is on) from live horde demand weighted by how fast this card runs each
+# model. A model is held for a minimum dwell, then becomes eligible for a slow, timed re-contest against a
+# stronger candidate; a model that stops earning its seat benches and has to re-earn it. This is the supported
+# replacement for the deprecated `model_stickiness` knob below.
+#
+# Two advertising lanes run while the pool holds seats: the FIXED lane offers only the seated models (swap-free
+# work), and the FREE lane offers everything else (so cold and rare-model demand still reaches the worker). The
+# worker interleaves the two by live demand; the TUI shows the current lane. The whole section is off by
+# default, leaving model selection exactly as it was.
+model_pool:
+  # Turn the fixed model pool on. Off by default.
+  enabled: false
+
+  # How many seats to hold. 0 (the default) means one seat per inference process, resolved from your running
+  # concurrency. WARNING: seating more models than you have inference processes forfeits the guaranteed-
+  # residency regime (not every seat can keep a home process), so the swap-free promise weakens; keep seats at
+  # or below your inference-process count unless you know you want the trade.
+  seats: 0
+
+  # Models you pin into seats yourself. A pin's `affinity` is a bias, never a lock: higher affinity fills its
+  # seat earlier, extends its rotation deadline, and bolsters it in a re-contest, but a sufficiently stronger
+  # candidate can still take the seat, and a benched pin has to re-earn its place. Affinity is in the half-open
+  # range (0, 1]; 1.0 (the default when omitted) is the strongest bias.
+  # pinned:
+  #   - name: "Deliberate"
+  #     affinity: 1.0
+  #   - name: "AlbedoBase XL (SDXL)"
+  #     affinity: 0.6
+
+  # Let the demand ranker fill the seats your pins do not claim, choosing the highest live-demand models this
+  # card runs quickly. On by default; set false to run a pins-only pool.
+  ranker_enabled: true
+
+  # How long (minutes) a seat serves before it becomes eligible for a timed re-contest against a stronger
+  # candidate. A pin's affinity extends its own window on top of this. Default 60.
+  # rotation_minutes: 60.0
+
+  # The minimum time (minutes) a freshly-seated model is held before any rotation or demotion may unseat it, so
+  # a seat is never churned before it has had a fair chance to earn its place. Default 10.
+  # min_dwell_minutes: 10.0
+
+  # Rescue donates one seat, time-boxed, to the single most-starved model (one with a very high requester wait)
+  # so otherwise-impossible jobs still get done. Off by default. `rescue_eta_seconds` is the wait at or above
+  # which a model counts as starved enough to warrant the borrowed seat; `rescue_window_minutes` is how long it
+  # holds that seat before returning it to the ranker.
+  rescue_enabled: false
+  # rescue_eta_seconds: 10000.0
+  # rescue_window_minutes: 15.0
+
+  # Disk (GB) the pool may spend auto-downloading a high-demand model it does not yet have on disk, so the
+  # ranker can seat a strong candidate you have not pre-fetched. 0 (the default) never auto-downloads, so the
+  # pool only ever seats models already on disk. A positive value lets the ranker fetch within this session
+  # budget.
+  download_budget_gb: 0.0
+
+  # How often (seconds) the pool refreshes its live demand ranking. Floored at 60 to keep the poll gentle on
+  # the horde's demand endpoint. Default 90.
+  # demand_poll_seconds: 90.0
+
+# One-switch preset for maximum throughput: turns the fixed model pool on with its demand ranker and a 50GB
+# auto-download budget, so the worker serves a ranker-fed, slowly-rotating set and may fetch a strong model it
+# does not yet hold. Applied only where you left the matching `model_pool` fields at their defaults (an explicit
+# `model_pool` value always wins). Off by default.
+max_throughput_mode: false
 
 # Suppress speed warnings if jobs are taking too long.
 # Note: If you are getting these messages, you are serving jobs much slower than ideal.
@@ -519,10 +581,12 @@ max_inference_attempts: 2
 # worker (it does not exit when idle); it is only a reminder that demand is low. 0 (default) disables it.
 minutes_allowed_without_jobs: 0
 
-# Percent chance (0.0 to 1.0) that the currently loaded models will be favored when popping a job.
-# Higher values keep the same model loaded longer, reducing model switches at the cost of throughput.
-# NOTE: the config key is `model_stickiness` (the model field is horde_model_stickiness, but its bind
-# alias is model_stickiness). Using `horde_model_stickiness:` here is silently ignored (stays 0.0).
+# DEPRECATED: superseded by the fixed model pool (see the `model_pool` section above). This was a per-pop
+# chance (0.0 to 1.0) that a pop would ask only for the currently-loaded models, trading job variety for fewer
+# model switches. The pool delivers that standing-residency intent as a committed seat set rather than a
+# per-pop gamble. A positive value here with the pool off is mapped onto a modest pool for you (ranker on, a
+# 30-minute rotation) wherever you left the `model_pool` fields at their defaults, and a one-time notice is
+# logged; with the pool enabled this key is ignored entirely. Prefer `model_pool`; leave this at 0.0.
 model_stickiness: 0.0
 
 #############################
@@ -768,7 +832,7 @@ capture_kudos_training_data: false
 # Per-card deltas over the global config, keyed by the same stable device index. Each card sets ONLY the
 # fields it wants to differ; everything else inherits the global value. A card with no entry inherits
 # wholesale. Overridable per card: max_threads, queue_size, high_performance_mode, moderate_performance_mode,
-# extra_slow_worker, preload_timeout, models_to_load, models_to_skip, dynamic_models, allow_lora,
+# extra_slow_worker, preload_timeout, models_to_load, models_to_skip, allow_lora,
 # allow_controlnet, allow_sdxl_controlnet, allow_post_processing, allow_painting, allow_img2img, nsfw,
 # max_power, enable_vram_budget, vram_reserve_mb, vram_to_leave_free, whole_card_exclusive_residency.
 # gpu_overrides:
