@@ -667,6 +667,13 @@ class HordeWorkerTUI(App[None]):
         """Drain worker state, restart on crash, derive health, and refresh the data views."""
         self._supervisor.tick()
         self._benchmark_supervisor.tick()
+        if self._graceful_quit_in_progress and not self._supervisor.is_alive():
+            # Cooperative shutdown is complete. Exit from the same UI thread that owns tick/lifecycle state;
+            # this avoids racing a background blocking stop against the supervisor tick.
+            self._benchmark_supervisor.stop()
+            self._supervisor.close()
+            self.exit()
+            return
         # Flush a deferred download-only hold (and any picker selection) once the freshly-started worker's
         # pipe is up. The hold goes first so inference never starts; the selection follows once it is sent.
         if self._supervisor.is_alive():
@@ -1312,11 +1319,7 @@ class HordeWorkerTUI(App[None]):
             self._supervisor.start()
         else:
             self.notify("Stopping worker (in-flight jobs will finish)…")
-            self.run_worker(self._stop_worker_only, thread=True, exclusive=True, group="lifecycle")
-
-    def _stop_worker_only(self) -> None:
-        """Gracefully stop the worker without exiting the app (runs in a thread)."""
-        self._supervisor.stop()
+            self._supervisor.request_graceful_stop()
 
     def action_toggle_autostart(self) -> None:
         """Flip and persist whether the worker auto-starts on launch."""
@@ -1336,18 +1339,9 @@ class HordeWorkerTUI(App[None]):
             self.notify("Worker not running; reload not sent.", severity="warning")
 
     def action_restart_worker(self) -> None:
-        """Restart the worker process (off the UI thread)."""
+        """Begin a cooperative worker restart driven by the normal supervisor ticks."""
         self.notify("Restarting worker…")
-        self.run_worker(self._restart_worker, thread=True, exclusive=True, group="lifecycle")
-
-    def _restart_worker(self) -> None:
-        """Restart the worker (runs in a thread).
-
-        Delegated to the supervisor as a single intent so that, when attached to a host, the stop and the
-        subsequent start are not raced by the non-blocking shutdown (the host completes the stop before
-        starting again).
-        """
-        self._supervisor.restart()
+        self._supervisor.request_restart()
 
     def on_tabbed_content_tab_activated(self, message: TabbedContent.TabActivated) -> None:
         """Guard against leaving the Config tab with unsaved edits.
@@ -1787,20 +1781,15 @@ class HordeWorkerTUI(App[None]):
             self._do_quit()
 
     def _do_quit(self) -> None:
-        """Kick off the stop-and-exit worker (common path for both the direct and confirmed quit)."""
+        """Begin stop-and-exit without blocking or concurrently mutating the supervisor."""
         self.notify("Stopping worker…")
-        self.run_worker(self._stop_and_exit, thread=True, exclusive=True, group="lifecycle")
-
-    def _stop_and_exit(self) -> None:
-        """Close the worker connection and any benchmark, then exit (runs in a thread).
-
-        Uses ``close()`` rather than ``stop()``: when owning the worker locally this stops it, but when
-        attached to a host (browser mode) it only detaches, so closing the dashboard leaves the worker
-        running.
-        """
         self._benchmark_supervisor.stop()
-        self._supervisor.close()
-        self.call_from_thread(self.exit)
+        if isinstance(self._supervisor, AttachedWorkerSupervisor):
+            # The host owns the worker; closing this browser/session only detaches it.
+            self._supervisor.close()
+            self.exit()
+            return
+        self._supervisor.request_graceful_stop()
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

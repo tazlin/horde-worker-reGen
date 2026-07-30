@@ -369,6 +369,34 @@ def test_restart_clears_stale_snapshot_and_shows_restarting() -> None:
     assert ctx.process_count == 2  # the worker was relaunched
 
 
+def test_cooperative_restart_stays_restarting_until_old_worker_exits() -> None:
+    """UI-driven restart is non-blocking, ignores late old frames, and spawns only after confirmed exit."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    old_process = ctx.last_process
+    assert old_process is not None
+    supervisor.latest_snapshot = _stub_snapshot()
+
+    supervisor.request_restart()
+
+    assert old_process.is_alive()
+    assert ctx.process_count == 1
+    assert supervisor.latest_snapshot is None
+    assert supervisor.status is SupervisorStatus.RESTARTING
+
+    supervisor._connection = _ScriptedConn([WorkerLivenessFrame(loop_alive_wall_time=12345.0)])  # type: ignore[assignment]
+    supervisor.drain_snapshots()
+    assert supervisor.status is SupervisorStatus.RESTARTING
+
+    old_process.kill_it()
+    supervisor.tick()
+
+    assert ctx.process_count == 2
+    assert supervisor.is_alive()
+    assert supervisor.status is SupervisorStatus.RESTARTING
+
+
 def test_stop_clears_snapshot() -> None:
     """An explicit stop drops the last frame so a stopped worker shows no stale live data."""
     ctx = _FakeCtx()

@@ -59,11 +59,13 @@ class TestControlLoopTick:
         supervisor.note_alive.assert_called()
 
     async def test_tick_requests_shutdown_when_ready(self) -> None:
-        """When shutting down with no jobs and no processes, the tick should ask to stop."""
+        """A ready shutdown publishes its terminal state before asking the control loop to stop."""
         process_manager = _make_tickable_manager()
         process_manager._state.shutting_down = True
+        process_manager._publish_supervisor_snapshot = Mock()  # type: ignore[method-assign]
 
         assert await process_manager._control_loop_tick() is False
+        process_manager._publish_supervisor_snapshot.assert_called_once()
 
     async def test_shutdown_keeps_inference_processes_up_while_queue_remains(self) -> None:
         """During a drain, inference processes are not ended while queued inference work remains.
@@ -107,6 +109,25 @@ class TestControlLoopTick:
         assert safety_proc.end_intended is True
         safety_proc.pipe_connection.send.assert_called_once()  # type: ignore[attr-defined]
         sent = safety_proc.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
+        assert sent.control_flag == HordeControlFlag.END_PROCESS
+
+    async def test_shutdown_ends_vae_lane_once_downstream_work_drains(self) -> None:
+        """The dedicated VAE lane must receive END_PROCESS before the control loop exits."""
+        process_manager = _make_tickable_manager()
+        process_manager._state.shutting_down = True
+        vae_proc = make_mock_process_info(
+            11,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.VAE_LANE,
+        )
+        process_manager._process_map.update({11: vae_proc})
+
+        assert await process_manager._control_loop_tick() is False
+
+        assert vae_proc.end_intended is True
+        vae_proc.pipe_connection.send.assert_called_once()  # type: ignore[attr-defined]
+        sent = vae_proc.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
         assert sent.control_flag == HordeControlFlag.END_PROCESS
 
     async def test_shutdown_keeps_safety_process_up_while_alchemy_form_is_pending(self) -> None:

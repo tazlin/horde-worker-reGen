@@ -113,11 +113,19 @@ class FakeSupervisor:
         self._alive = False
         self._status = SupervisorStatus.STOPPED
 
+    def request_graceful_stop(self, *, timeout: float = 0.0) -> None:
+        """Record the app's cooperative stop intent and complete it immediately in-process."""
+        self.stop(timeout=timeout)
+
     def restart(self) -> None:
         """Record a restart and leave the worker running."""
         self.restart_calls += 1
         self._alive = True
         self._status = SupervisorStatus.RUNNING
+
+    def request_restart(self, *, timeout: float = 0.0) -> None:
+        """Record the app's cooperative restart intent; the in-process fake completes it immediately."""
+        self.restart()
 
     def close(self) -> None:
         """Record the frontend releasing the supervisor and mark the worker not running."""

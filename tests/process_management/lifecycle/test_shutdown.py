@@ -73,13 +73,13 @@ class TestIsTimeForShutdown:
         shutdown_manager = _make_shutdown_manager()
         assert shutdown_manager.is_time_for_shutdown() is False
 
-    def test_recently_recovered_returns_false(self) -> None:
-        """If we've recently recovered from a failure, we should delay shutdown to avoid a shutdown loop."""
+    def test_recent_recovery_does_not_delay_an_idle_shutdown(self) -> None:
+        """A hang-detection cooldown must not hold an operator-requested shutdown open with no work."""
         state = WorkerState(shutting_down=True)
         shutdown_manager = _make_shutdown_manager(state=state)
-        shutdown_manager._process_lifecycle.recently_recovered = True  # pyrefly: ignore - we aren't testing the process lifecycle here, just that the shutdown manager respects this flag
+        shutdown_manager._process_lifecycle.recently_recovered = True  # pyrefly: ignore
 
-        assert shutdown_manager.is_time_for_shutdown() is False
+        assert shutdown_manager.is_time_for_shutdown() is True
 
     async def test_jobs_pending_submit_returns_false(self) -> None:
         """Jobs pending submit should prevent actually shutting down."""
@@ -157,6 +157,32 @@ class TestIsTimeForShutdown:
             process_type=HordeProcessType.SAFETY,
         )
         process_map = ProcessMap({0: safety})
+        shutdown_manager = _make_shutdown_manager(state=state, process_map=process_map)
+
+        assert shutdown_manager.is_time_for_shutdown() is False
+
+        process_map.on_process_ending(0)
+        assert shutdown_manager.is_time_for_shutdown() is True
+
+    @pytest.mark.parametrize(
+        "process_type",
+        [
+            HordeProcessType.POST_PROCESS,
+            HordeProcessType.COMPONENT,
+            HordeProcessType.VAE_LANE,
+            HordeProcessType.UTILITIES,
+        ],
+    )
+    def test_live_service_lane_blocks_shutdown_until_ending(self, process_type: HordeProcessType) -> None:
+        """Every non-inference child lane must accept shutdown before the control loop may return."""
+        state = WorkerState(shutting_down=True)
+        process_info = make_mock_process_info(
+            0,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=process_type,
+        )
+        process_map = ProcessMap({0: process_info})
         shutdown_manager = _make_shutdown_manager(state=state, process_map=process_map)
 
         assert shutdown_manager.is_time_for_shutdown() is False

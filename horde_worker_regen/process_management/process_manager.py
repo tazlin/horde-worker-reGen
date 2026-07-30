@@ -3653,9 +3653,14 @@ class HordeWorkerProcessManager:
                     self._process_lifecycle.end_safety_processes()
                     self._process_lifecycle.end_post_process_processes()
                     self._process_lifecycle.end_component_processes()
+                    self._process_lifecycle.end_vae_lane_processes()
                     self._process_lifecycle.end_utilities_processes()
 
             if self.is_time_for_shutdown():
+                # Publish the terminal drain state before leaving the loop. Without this frame an idle
+                # shutdown returns before the normal publication below, leaving the TUI to age its last
+                # RUNNING snapshot into a false UNRESPONSIVE state while interpreter teardown completes.
+                self._publish_supervisor_snapshot()
                 return False
 
         self._maybe_refresh_references()
@@ -4335,13 +4340,22 @@ class HordeWorkerProcessManager:
         self._wddm_paging_monitor.stop()
         self._process_lifecycle.end_inference_processes(force=True)
         self._process_lifecycle.end_safety_processes()
-        self._process_lifecycle.end_download_process()
+        self._process_lifecycle.end_post_process_processes()
+        self._process_lifecycle.end_component_processes()
+        self._process_lifecycle.end_vae_lane_processes()
+        self._process_lifecycle.end_utilities_processes()
 
         logger.info("Shutting down process manager")
-        self._state.shut_down = True
-        for process in self._process_map.values():
-            process.mp_process.terminate()
-            process.mp_process.join(0.2)
+        # Python waits without a timeout for live non-daemon multiprocessing children during interpreter
+        # finalization. Prove every lane (plus the out-of-map downloader) dead before setting shut_down, so
+        # the frontend never has to wait for its outer punt timeout after this loop has already returned.
+        all_children_reaped = self._process_lifecycle.reap_all_processes_for_shutdown()
+        if all_children_reaped:
+            self._state.shut_down = True
+        else:
+            # Keep the timed-shutdown backstop armed. Other loops remain alive until it retries the hard
+            # kill and force-exits; declaring a clean shutdown here would cancel that only remaining remedy.
+            logger.critical("Child teardown remained incomplete; waiting for the timed-shutdown backstop.")
 
         await asyncio.sleep(0.2)
 

@@ -159,6 +159,16 @@ INFERENCE_SHUTDOWN_END_GRACE_SECONDS: float = 1.0
 """End grace during shutdown: brief, since the tree is coming down promptly and a clean per-slot exit no
 longer matters."""
 
+ALL_PROCESS_SHUTDOWN_REAP_GRACE_SECONDS: float = 2.0
+"""Shared grace for every already-signalled child to exit during final worker teardown.
+
+This stays below the empty-pipeline shutdown backstop. Children are signalled during preceding control-loop
+ticks, so this is a final bounded reap rather than their primary drain window.
+"""
+
+ALL_PROCESS_SHUTDOWN_KILL_JOIN_SECONDS: float = 1.0
+"""Final join after killing a child that outlived graceful worker teardown."""
+
 SOFT_RESET_POOL_END_GRACE_SECONDS: float = 10.0
 """Total wall-clock budget for ending every victim of a soft-reset pool rebuild. Each victim is signalled
 to end first (a parallel head start), then reaped against this one shared deadline, so a busy child gets
@@ -2069,11 +2079,79 @@ class ProcessLifecycleManager:
             )
         try:
             self._download_process_info.mp_process.join(timeout=1)
-            self._download_process_info.mp_process.kill()
+            if self._download_process_info.mp_process.is_alive():
+                self._download_process_info.mp_process.kill()
+                self._download_process_info.mp_process.join(timeout=ALL_PROCESS_SHUTDOWN_KILL_JOIN_SECONDS)
         except Exception as e:
             logger.debug(f"Failed to stop download process: {e}")
+        if self._download_process_info.mp_process.is_alive():
+            logger.error(
+                "Download process remained alive after its shutdown kill; retaining it for the exit backstop."
+            )
+            return
         self._forget_owned(self._download_process_info)
         self._download_process_info = None
+
+    def reap_all_processes_for_shutdown(self) -> bool:
+        """Signal, kill if necessary, and reap every child before the worker interpreter exits.
+
+        The normal drain sends lane-specific ``END_PROCESS`` messages over several control-loop ticks. This
+        final pass deliberately covers the complete process map plus the out-of-map download child, so a new
+        lane or an interrupted earlier send cannot leave a non-daemon multiprocessing child for Python's
+        unbounded interpreter-exit finalizer to join. All children receive their graceful signal first, then
+        share one bounded join deadline; stragglers are killed and joined once more.
+
+        Returns:
+            True only when every known child was confirmed dead and its ownership record was removed.
+        """
+        process_infos = list(self._process_map.values())
+        if self._download_process_info is not None:
+            process_infos.append(self._download_process_info)
+
+        for process_info in process_infos:
+            process_info.end_intended = True
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError, ValueError):
+                process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+
+        join_deadline = time.monotonic() + ALL_PROCESS_SHUTDOWN_REAP_GRACE_SECONDS
+        for process_info in process_infos:
+            try:
+                process_info.mp_process.join(timeout=max(0.0, join_deadline - time.monotonic()))
+            except Exception as join_error:  # noqa: BLE001 - teardown must continue across every child
+                logger.debug(f"Failed to join process {process_info.process_id} during shutdown: {join_error}")
+
+        for process_info in process_infos:
+            try:
+                if process_info.mp_process.is_alive():
+                    logger.warning(
+                        f"Process {process_info.process_id} ({process_info.process_type.name}) did not exit "
+                        "gracefully; killing it before worker exit.",
+                    )
+                    process_info.mp_process.kill()
+                    process_info.mp_process.join(timeout=ALL_PROCESS_SHUTDOWN_KILL_JOIN_SECONDS)
+            except Exception as kill_error:  # noqa: BLE001 - retain ownership so the atexit backstop can retry
+                logger.error(f"Failed to kill and reap process {process_info.process_id}: {kill_error}")
+
+        survivors = [process_info for process_info in process_infos if process_info.mp_process.is_alive()]
+        survivor_ids = {id(process_info) for process_info in survivors}
+        for process_info in process_infos:
+            if id(process_info) not in survivor_ids:
+                self._forget_owned(process_info)
+
+        if survivors:
+            logger.error(
+                "Worker teardown could not reap child process(es): "
+                + ", ".join(f"{info.process_id}/{info.process_type.name}" for info in survivors),
+            )
+            return False
+
+        self._process_map.clear()
+        self._horde_model_map.root.clear()
+        self._download_process_info = None
+        if self._owned_registry is not None:
+            self._owned_registry.clear()
+        self.neutralize_message_queue_feeder()
+        return True
 
     def restart_download_process(self) -> None:
         """Stop and restart the download process (a hard reset that re-reads the current bridge data).
@@ -3340,7 +3418,13 @@ class ProcessLifecycleManager:
         all_: bool = True,
     ) -> None:
         """Kill all processes immediately."""
-        for process_info in self._process_map.values():
+        process_infos = list(self._process_map.values())
+        # The downloader deliberately lives outside ProcessMap, but a whole-worker hard stop must still
+        # include it or os._exit can orphan that child after killing only the GPU/service lanes.
+        if all_ and self._download_process_info is not None:
+            process_infos.append(self._download_process_info)
+
+        for process_info in process_infos:
             if (
                 (inference and process_info.process_type == HordeProcessType.INFERENCE)
                 or (safety and process_info.process_type == HordeProcessType.SAFETY)
@@ -3348,13 +3432,14 @@ class ProcessLifecycleManager:
             ):
                 try:
                     process_info.mp_process.kill()
-                    process_info.mp_process.kill()
                     process_info.mp_process.join(1)
                 except Exception as e:
                     logger.error(f"Failed to kill process {process_info}: {e}")
 
         self._process_map.clear()
         self._horde_model_map.root.clear()
+        if all_:
+            self._download_process_info = None
         if self._owned_registry is not None:
             self._owned_registry.clear()
         self.neutralize_message_queue_feeder()
@@ -3709,7 +3794,11 @@ class ProcessLifecycleManager:
 
         if any_replaced:
             self._recently_recovered = True
-            threading.Thread(target=timed_unset_recently_recovered).start()
+            threading.Thread(
+                target=timed_unset_recently_recovered,
+                name="process-recovery-cooldown",
+                daemon=True,
+            ).start()
 
         # The hang/timeout heuristics below are debounced: a just-replaced process is still spinning
         # up and would otherwise trip the startup / all-processes-timed-out checks before it reports in.
@@ -3736,7 +3825,11 @@ class ProcessLifecycleManager:
             if self._replace_if_paged_and_slow(process_info, paging_victims, now):
                 any_replaced = True
                 self._recently_recovered = True
-                threading.Thread(target=timed_unset_recently_recovered).start()
+                threading.Thread(
+                    target=timed_unset_recently_recovered,
+                    name="process-recovery-cooldown",
+                    daemon=True,
+                ).start()
                 continue
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
@@ -3754,7 +3847,11 @@ class ProcessLifecycleManager:
                 self._replace_inference_process(process_info)
                 any_replaced = True
                 self._recently_recovered = True
-                threading.Thread(target=timed_unset_recently_recovered).start()
+                threading.Thread(
+                    target=timed_unset_recently_recovered,
+                    name="process-recovery-cooldown",
+                    daemon=True,
+                ).start()
             elif stuck_step_limit is not None and self._process_map.is_stuck_on_nonadvancing_step(
                 process_info.process_id,
                 stuck_step_limit,
@@ -3775,7 +3872,11 @@ class ProcessLifecycleManager:
                 self._replace_inference_process(process_info)
                 any_replaced = True
                 self._recently_recovered = True
-                threading.Thread(target=timed_unset_recently_recovered).start()
+                threading.Thread(
+                    target=timed_unset_recently_recovered,
+                    name="process-recovery-cooldown",
+                    daemon=True,
+                ).start()
             else:
                 conditions: list[tuple[float, HordeProcessState, str, bool]] = [
                     (
@@ -3868,12 +3969,20 @@ class ProcessLifecycleManager:
                     self._replace_inference_process(process_info)
                     self._any_replaced = True
 
-            threading.Thread(target=timed_unset_recently_recovered).start()
+            threading.Thread(
+                target=timed_unset_recently_recovered,
+                name="process-recovery-cooldown",
+                daemon=True,
+            ).start()
         else:
             self._hung_processes_detected = False
 
         if any_replaced:
-            threading.Thread(target=timed_unset_recently_recovered).start()
+            threading.Thread(
+                target=timed_unset_recently_recovered,
+                name="process-recovery-cooldown",
+                daemon=True,
+            ).start()
 
         return any_replaced or any_started_pending
 

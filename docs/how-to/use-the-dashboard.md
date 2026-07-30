@@ -194,6 +194,10 @@ These are options for the `horde-worker` program itself. The wrapper-script flag
 
 When it owns the worker, the dashboard relaunches it automatically if it crashes (bounded by a restart
 budget, which `--no-auto-restart` disables) and stops it cleanly on exit.
+Manual Stop, Restart, Save + restart, and dashboard exit are non-blocking lifecycle intents: the UI remains
+responsive while accepted work drains. Restart stays labelled **Restarting** and launches the replacement only
+after the previous worker PID has exited, so two worker trees never overlap on the GPU. Pressing quit again
+during a graceful exit escalates to an immediate process-tree kill.
 
 ## Serve the dashboard over the web yourself
 

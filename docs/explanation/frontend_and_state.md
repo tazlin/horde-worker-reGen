@@ -105,6 +105,16 @@ implementations behind a common `SupervisorLike` interface:
   localhost socket, reflects its streamed snapshots, and forwards commands. Used
   in served/browser mode.
 
+Lifecycle changes are cooperative state-machine intents owned by the same thread
+that calls `WorkerSupervisor.tick()`. Stop sends `SHUTDOWN` and returns; later
+ticks keep draining progress until the old PID exits or the 150-second outer
+deadline tree-kills it. Restart is the same stop followed by a spawn only after
+the old PID is confirmed dead. The supervisor drops the old snapshot immediately
+and pins `RESTARTING`, so late frames from the draining process cannot change the
+display back to `RUNNING` or age into `UNRESPONSIVE`. Terminal and served modes
+use this same supervisor transition; socket clients merely enqueue the intent on
+the host's single owner thread.
+
 In served mode (`tui/web.py`, the default for non-technical users) a single
 `WorkerHost` owns one worker independently of any browser session, so closing a
 browser tab detaches the client but **leaves the worker running**. Network

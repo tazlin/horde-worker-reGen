@@ -41,8 +41,15 @@ There are two termination paths:
    stops its pop/dispatch/submit loop (it checks the shutdown manager each iteration).
 6. [`JobSubmitter`][horde_worker_regen.process_management.jobs.job_submitter.JobSubmitter] continues
    submitting pending results.
-7. When all jobs are finalized (all stage collections empty), the main loop
-   exits. Every background loop (popper, submitter, user-info, alchemy, and the
+7. Once downstream work has drained, every child lane is explicitly moved into
+   `PROCESS_ENDING`: inference, safety, post-processing, component, VAE, and
+   image utilities. Shutdown readiness covers every non-inference lane rather
+   than treating inference and safety as a complete proxy for the process tree.
+   A recent-recovery cooldown never vetoes an otherwise-ready operator-requested
+   shutdown; that cooldown only suppresses premature hang recovery.
+8. Immediately before the control loop returns, it publishes a final
+   `shutting_down` supervisor snapshot. When all jobs are finalized (all stage
+   collections empty), the main loop exits. Every background loop (popper, submitter, user-info, alchemy, and the
    periodic update check) polls the shutdown flag on a short cadence rather than
    waiting out its own interval, so none of them holds the gathered task group
    (and thus the process) open after the drain finishes. This matters for the
@@ -50,7 +57,15 @@ There are two termination paths:
    process that lingered would age into a false `UNRESPONSIVE`; the supervisor
    also reads a `shutting_down` snapshot as "Shutting down" rather than
    "not responding" while the teardown completes.
-8. A timed backstop bounds the drain. If no accepted work remains anywhere in
+9. Final teardown takes a snapshot of the complete process map plus the separate
+   download process, sends `END_PROCESS` to all of them, and joins them against
+   one short shared deadline. Any straggler is killed and joined again. Only
+   after every known child is confirmed dead are its durable ownership record
+   and the process/model maps cleared and `shut_down` set. This avoids Python's
+   unbounded interpreter-exit wait for a live non-daemon multiprocessing child.
+   Parent-owned queue feeders are detached after the children are reaped so a
+   buffered IPC put cannot pin interpreter finalization either.
+10. A timed backstop bounds the drain. If no accepted work remains anywhere in
    the pipeline (no inference, safety, submit, or alchemy work), the backstop
    uses a short grace and then force-kills/reaps children because there is no
    horde-owned job to lose. If work is still outstanding, the grace is scaled by
@@ -58,6 +73,13 @@ There are two termination paths:
    faulted so the still-running submitter reports them and the horde reissues
    them immediately, and only then are all processes force-killed. This keeps
    the no-loss invariant even when a drain cannot finish in time.
+
+The dashboard has a separate 150-second outer graceful-stop deadline, longer
+than the worker's 120-second maximum drain plus its fault-report tail. It is only
+an orphan-proof last resort: normal shutdown completes at step 9, before that
+deadline. If final child reaping cannot prove the tree dead, the worker leaves
+`shut_down` false so its shorter timed backstop remains armed instead of falsely
+reporting a clean exit.
 
 ### Backstop lifetime
 

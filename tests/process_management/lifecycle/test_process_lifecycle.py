@@ -84,6 +84,84 @@ def _make_plm(
     )
 
 
+def _make_exiting_process_info(
+    process_id: int,
+    process_type: HordeProcessType,
+    *,
+    exits_gracefully: bool,
+) -> HordeProcessInfo:
+    """Build a process double whose join observes graceful exit or the later kill."""
+    process_info = make_mock_process_info(
+        process_id,
+        model_name=None,
+        process_type=process_type,
+    )
+    alive = True
+    killed = False
+
+    def is_alive() -> bool:
+        return alive
+
+    def join(timeout: float | None = None) -> None:
+        nonlocal alive
+        if exits_gracefully or killed:
+            alive = False
+
+    def kill() -> None:
+        nonlocal killed
+        killed = True
+
+    process_info.mp_process.is_alive.side_effect = is_alive
+    process_info.mp_process.join.side_effect = join
+    process_info.mp_process.kill.side_effect = kill
+    return process_info
+
+
+class TestFinalShutdownReap:
+    """Final worker teardown must prove every in-map lane and the downloader dead."""
+
+    def test_reap_covers_vae_and_out_of_map_download_process(self) -> None:
+        """All child roles are signalled and removed after their graceful exits are joined."""
+        vae_process = _make_exiting_process_info(4, HordeProcessType.VAE_LANE, exits_gracefully=True)
+        download_process = _make_exiting_process_info(5, HordeProcessType.DOWNLOAD, exits_gracefully=True)
+        process_map = ProcessMap({4: vae_process})
+        process_lifecycle = _make_plm(process_map=process_map)
+        process_lifecycle._download_process_info = download_process
+
+        assert process_lifecycle.reap_all_processes_for_shutdown() is True
+
+        assert len(process_map) == 0
+        assert process_lifecycle.download_process_info is None
+        vae_process.pipe_connection.send.assert_called()  # type: ignore[attr-defined]
+        download_process.pipe_connection.send.assert_called()  # type: ignore[attr-defined]
+        vae_process.mp_process.kill.assert_not_called()
+        download_process.mp_process.kill.assert_not_called()
+
+    def test_reap_kills_and_joins_a_graceful_shutdown_straggler(self) -> None:
+        """A lane that ignores END_PROCESS is killed and reaped before teardown reports success."""
+        vae_process = _make_exiting_process_info(4, HordeProcessType.VAE_LANE, exits_gracefully=False)
+        process_map = ProcessMap({4: vae_process})
+        process_lifecycle = _make_plm(process_map=process_map)
+
+        assert process_lifecycle.reap_all_processes_for_shutdown() is True
+
+        vae_process.mp_process.kill.assert_called_once()
+        assert vae_process.mp_process.join.call_count == 2
+        assert len(process_map) == 0
+
+    def test_hard_kill_includes_out_of_map_download_process(self) -> None:
+        """The terminal backstop must not orphan the downloader when it force-exits the parent."""
+        download_process = _make_exiting_process_info(5, HordeProcessType.DOWNLOAD, exits_gracefully=False)
+        process_lifecycle = _make_plm()
+        process_lifecycle._download_process_info = download_process
+
+        process_lifecycle._hard_kill_processes()
+
+        download_process.mp_process.kill.assert_called_once()
+        download_process.mp_process.join.assert_called_once_with(1)
+        assert process_lifecycle.download_process_info is None
+
+
 class TestRecoveryParkLifecycleQuiescence:
     """A recovery park suspends automatic child churn until the coordinator's bounded re-probe."""
 

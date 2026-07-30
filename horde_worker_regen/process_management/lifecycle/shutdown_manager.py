@@ -245,9 +245,6 @@ class ShutdownManager:
         if not self._state.shutting_down:
             return False
 
-        if self._process_lifecycle.recently_recovered:
-            return False
-
         if len(self._job_tracker.jobs_pending_submit) > 0:
             return False
         if (
@@ -262,8 +259,11 @@ class ShutdownManager:
         if self._state.alchemy_forms_in_flight > 0:
             return False
 
+        # Every non-inference lane must have accepted its END_PROCESS transition before the control loop
+        # returns. The final lifecycle reap is the safety net, not the first time a forgotten service lane
+        # (notably VAE) discovers that the worker is exiting.
         for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.SAFETY:
+            if process_info.process_type == HordeProcessType.INFERENCE:
                 continue
             if process_info.last_process_state not in (
                 HordeProcessState.PROCESS_ENDING,

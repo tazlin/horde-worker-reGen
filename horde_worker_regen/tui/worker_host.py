@@ -70,8 +70,6 @@ class WorkerHost:
         self._clients_lock = threading.Lock()
         self._requests: queue.Queue[tuple[str, object]] = queue.Queue()
         self._stop = threading.Event()
-        self._restart_after_stop = False
-        """Set by a restart request: once the in-progress graceful stop completes, the worker is started."""
         self._threads: list[threading.Thread] = []
         self._tray: tray_module.WorkerTray | None = None
 
@@ -209,19 +207,8 @@ class WorkerHost:
         while not self._stop.is_set():
             self._drain_requests()
             self._supervisor.tick()
-            self._apply_pending_restart()
             self._broadcast()
             time.sleep(self._control_interval)
-
-    def _apply_pending_restart(self) -> None:
-        """Start the worker once a restart-triggered graceful stop has fully completed.
-
-        Restart is a stop-then-start, but the stop is non-blocking and completed across ticks, so the
-        start has to wait until the worker has actually exited rather than firing while it still drains.
-        """
-        if self._restart_after_stop and not self._supervisor.is_alive():
-            self._restart_after_stop = False
-            self._supervisor.start()
 
     def _drain_requests(self) -> None:
         """Apply every queued client request to the supervisor (worker commands and lifecycle)."""
@@ -246,11 +233,9 @@ class WorkerHost:
             if not self._supervisor.is_alive():
                 self._supervisor.start()
         elif action == sp.LIFECYCLE_STOP:
-            self._restart_after_stop = False  # an explicit stop cancels any pending restart
             self._supervisor.request_graceful_stop()
         elif action == sp.LIFECYCLE_RESTART:
-            self._restart_after_stop = True
-            self._supervisor.request_graceful_stop()
+            self._supervisor.request_restart()
         elif action == sp.LIFECYCLE_SHUTDOWN:
             # The launcher is exiting: stop serving so serve_forever unwinds and stops the worker cleanly.
             self._stop.set()

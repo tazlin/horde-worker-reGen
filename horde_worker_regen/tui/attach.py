@@ -71,6 +71,12 @@ class SupervisorLike(Protocol):
     def restart(self) -> None:
         """Restart the worker (stop then start)."""
 
+    def request_graceful_stop(self, *, timeout: float = ...) -> None:
+        """Begin a non-blocking graceful stop."""
+
+    def request_restart(self, *, timeout: float = ...) -> None:
+        """Begin a non-blocking stop-then-start transition."""
+
     def close(self) -> None:
         """Release the supervisor as the frontend exits (the worker's fate depends on the implementor)."""
 
@@ -194,8 +200,19 @@ class AttachedWorkerSupervisor:
         """Ask the host to stop the worker (an explicit user/control action, not a session close)."""
         self._send_lifecycle(sp.LIFECYCLE_STOP)
 
+    def request_graceful_stop(self, *, timeout: float = 0.0) -> None:
+        """Ask the host to stop the worker without blocking this client."""
+        self.stop(timeout=timeout)
+
     def restart(self) -> None:
         """Ask the host to restart the worker as a single intent (sent even across a brief disconnect)."""
+        self.request_restart()
+
+    def request_restart(self, *, timeout: float = 0.0) -> None:
+        """Ask the host to restart and present the intent locally until the host confirms it."""
+        self.latest_snapshot = None
+        self.last_liveness_wall_time = None
+        self._status = SupervisorStatus.RESTARTING
         self._send_lifecycle(sp.LIFECYCLE_RESTART)
 
     def force_kill(self) -> None:

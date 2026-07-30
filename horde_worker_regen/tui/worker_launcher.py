@@ -214,6 +214,8 @@ class WorkerSupervisor:
         self._connection: Connection | None = None
         self._status = SupervisorStatus.STOPPED
         self._intentional_stop = False
+        self._restart_after_stop = False
+        """Whether the current cooperative stop should spawn a replacement once the old worker is reaped."""
         self._graceful_stop_deadline = 0.0
         """When > 0, a non-blocking graceful stop is in progress; ``tick`` terminates the worker if it
         has not exited by this monotonic-free wall-clock deadline (see :meth:`request_graceful_stop`)."""
@@ -264,6 +266,7 @@ class WorkerSupervisor:
     def start(self) -> None:
         """Launch the worker child process."""
         self._intentional_stop = False
+        self._restart_after_stop = False
         self._graceful_stop_deadline = 0.0
         self._restart_attempts = 0
         self.last_fatal_error = None
@@ -370,7 +373,9 @@ class WorkerSupervisor:
 
     def _note_frame_received(self) -> None:
         """Shared bookkeeping for any frame from the worker: it is alive, so refresh liveness/status."""
-        if self.is_alive():
+        # Frames already buffered by the old worker remain useful for shutdown progress, but must not undo
+        # the lifecycle phase pinned by a cooperative restart intent.
+        if self.is_alive() and not self._intentional_stop:
             self._set_status(SupervisorStatus.RUNNING)
         if time.time() - self._last_spawn_time > _HEALTHY_UPTIME_SECONDS:
             self._restart_attempts = 0
@@ -488,10 +493,17 @@ class WorkerSupervisor:
                 process.terminate()
 
     def _complete_graceful_stop(self) -> None:
-        """Finalize a graceful stop once the worker has exited: clean up the pipe and mark it stopped."""
+        """Finalize a cooperative stop, spawning its requested replacement only after the old worker exits."""
+        restart_after_stop = self._restart_after_stop
         self._cleanup_process()
         self._graceful_stop_deadline = 0.0
         self._intentional_stop = False
+        self._restart_after_stop = False
+        if restart_after_stop:
+            self._restart_attempts = 0
+            self.last_fatal_error = None
+            self._spawn(status=SupervisorStatus.RESTARTING)
+            return
         self._set_status(SupervisorStatus.STOPPED)
 
     def _startup_crash_hint(self) -> str:
@@ -659,7 +671,25 @@ class WorkerSupervisor:
             Intended to be driven by the same thread that calls :meth:`tick`; it is not safe to call
             concurrently with :meth:`tick`, :meth:`start`, or :meth:`stop`.
         """
+        self._begin_graceful_stop(timeout=timeout, restart_after_stop=False)
+
+    def request_restart(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS) -> None:
+        """Begin a non-blocking stop-then-start transition completed by successive :meth:`tick` calls.
+
+        The old snapshot and liveness baseline are dropped immediately and ``RESTARTING`` remains pinned
+        while the old process drains. A replacement is spawned only after that process is confirmed dead,
+        including after the graceful-stop tree-kill backstop fires.
+        """
+        self.latest_snapshot = None
+        self.last_liveness_wall_time = None
+        self._last_loop_advance_wall = None
+        self._set_status(SupervisorStatus.RESTARTING)
+        self._begin_graceful_stop(timeout=timeout, restart_after_stop=True)
+
+    def _begin_graceful_stop(self, *, timeout: float, restart_after_stop: bool) -> None:
+        """Record one cooperative lifecycle intent without blocking the thread that owns :meth:`tick`."""
         self._intentional_stop = True
+        self._restart_after_stop = restart_after_stop
         process = self._process
         if process is None or not process.is_alive():
             self._complete_graceful_stop()
@@ -678,6 +708,7 @@ class WorkerSupervisor:
         """
         self.latest_snapshot = None
         self._set_status(SupervisorStatus.RESTARTING)
+        self._restart_after_stop = False
         self.stop(set_stopped_status=False)
         # Mirror start()'s lifecycle reset, but keep the RESTARTING phase instead of STARTING.
         self._intentional_stop = False
@@ -693,6 +724,7 @@ class WorkerSupervisor:
         instead of briefly flashing ``STOPPED`` between the teardown and the relaunch.
         """
         self._intentional_stop = True
+        self._restart_after_stop = False
         process = self._process
         if process is not None and process.is_alive():
             self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
@@ -718,6 +750,7 @@ class WorkerSupervisor:
         to the kill rather than blocking on the join timeout.
         """
         self._intentional_stop = True
+        self._restart_after_stop = False
         process = self._process
         if process is not None and process.is_alive():
             self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
