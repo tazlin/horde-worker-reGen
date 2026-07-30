@@ -242,6 +242,8 @@ def test_model_pool_section_is_configurable() -> None:
     assert "max_throughput_mode" in keys
     assert "model_pool_enabled" in keys
     assert "model_pool_download_budget_gb" in keys
+    assert "model_pool_pinned" in keys
+    assert next(field for field in pool_fields if field.key == "model_pool_pinned").hidden is False
 
     for field in pool_fields:
         # max_throughput_mode is a top-level flag; every other pool field nests under model_pool.

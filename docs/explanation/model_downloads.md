@@ -301,9 +301,11 @@ The [fixed model pool](model_pool.md) is the one scheduling subsystem that can
 high-demand model the worker does not yet hold, and `model_pool.download_budget_gb`
 is positive, the candidate becomes a pending-download seat: the fetch is requested
 through the same dedicated download process described above, and the seat resolves
-once the weights land (or is abandoned if the download fails). The budget bounds how
-much disk the pool may spend this way over the session. With the default budget of
-`0.0` the pool never downloads and only ever seats models already on disk, so the
+once the weights land (or is abandoned if the download fails). The setting is a session
+admission budget charged by each request's reference-declared full size when it starts.
+It is not live disk occupancy or measured bandwidth, and a failed request is not
+refunded. With the default budget of `0.0` the ranker never initiates a download and only
+selects seats already on disk, so the
 pool changes *which* on-disk models are advertised without changing the disk
 footprint. Everything else on this page (availability gating, planning, bandwidth
 controls) applies to a pool-initiated fetch exactly as it does to any other.

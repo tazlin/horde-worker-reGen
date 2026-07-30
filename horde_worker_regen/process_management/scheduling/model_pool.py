@@ -197,6 +197,7 @@ class SeatView:
     state: SeatState
     seated_at: float
     last_fulfilled_at: float | None
+    last_match_was_resident: bool | None
     empty_pops: int
     pending_model: str | None
     rescue_expires_at: float | None
@@ -220,6 +221,7 @@ class _Seat:
     state: SeatState = SeatState.ACTIVE
     seated_at: float = 0.0
     last_fulfilled_at: float | None = None
+    last_match_was_resident: bool | None = None
     empty_pops: int = 0
     score: float = 0.0
     affinity: float = 0.0
@@ -283,6 +285,7 @@ class ModelPool:
                 state=seat.state,
                 seated_at=seat.seated_at,
                 last_fulfilled_at=seat.last_fulfilled_at,
+                last_match_was_resident=seat.last_match_was_resident,
                 empty_pops=seat.empty_pops,
                 pending_model=seat.pending_model,
                 rescue_expires_at=seat.rescue_expires_at,
@@ -379,21 +382,22 @@ class ModelPool:
         lane: PopLane,
         advertised: frozenset[str],
         popped_model: str | None,
+        popped_model_was_resident: bool = False,
         now: float,
     ) -> None:
         """Record a pop outcome against the seats, updating the signals a later :meth:`tick` acts on.
 
-        A fixed-lane empty pop charges one empty-pop count to every seated model that was advertised, since
-        the horde returned no work for the narrowed offer. A fulfillment (either lane) credits the seated
-        model that served it: its empty-pop count resets and its last-fulfilled time is stamped. Free-lane
-        empty pops charge nothing. This method never seats or demotes; it only accumulates, so the caller can
-        report many outcomes between ticks.
+        A fixed-lane empty pop charges one empty-pop count to every seated model that was advertised, since the
+        horde returned no work for the narrowed offer. A match (either lane) credits the seated model: its
+        empty-pop count resets, its last-match time is stamped, and whether it was resident at pop time is
+        retained separately. Free-lane empty pops charge nothing. This method never seats or demotes.
         """
         if popped_model is not None:
             for seat in self._seats:
                 if seat.model == popped_model:
                     seat.empty_pops = 0
                     seat.last_fulfilled_at = now
+                    seat.last_match_was_resident = popped_model_was_resident
             return
 
         if lane is not PopLane.FIXED:
@@ -599,6 +603,7 @@ class ModelPool:
         seat.state = SeatState.ACTIVE
         seat.seated_at = now
         seat.last_fulfilled_at = None
+        seat.last_match_was_resident = None
         seat.empty_pops = 0
         seat.affinity = affinity
         seat.timer_deadline = self._rotation_deadline(now, affinity)
@@ -624,6 +629,7 @@ class ModelPool:
         seat.state = SeatState.PENDING_DOWNLOAD if seat.pending_model is not None else SeatState.ACTIVE
         seat.seated_at = 0.0
         seat.last_fulfilled_at = None
+        seat.last_match_was_resident = None
         seat.empty_pops = 0
         seat.score = 0.0
         seat.affinity = 0.0

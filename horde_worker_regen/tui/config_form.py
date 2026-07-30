@@ -230,13 +230,14 @@ SECTION_GUIDANCE: dict[str, str] = {
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
     "Workload policy": "These switches shape the model set produced by the load/skip rules. Presets may replace "
     "the model list; review the preset diff before saving.",
-    "Model pool": "The fixed model pool biases work toward a small set of seated models the worker keeps ready, "
-    "which can reduce model swaps when the horde has demand for that set. Leave it off (the default) to advertise "
+    "Model pool": "The fixed model pool biases work toward a small set of logical seats. A seat is an advertising "
+    "commitment, and the runtime panels separately show whether its model is resident. This can reduce model "
+    "swaps when the horde has demand for resident seats. Leave it off (the default) to advertise "
     "the normal eligible model set without a persistent seat bias; turn it on when reducing swap churn matters "
     "more than serving the broadest mix of models. These fields "
     "match the Insights and Overview 'Model pool' panels (seats, bench, the fixed and free lanes, rotation, "
-    "rescue, download budget); flip Max throughput mode for a one-switch ranker-fed pool with an auto-download "
-    "budget, then adjust the individual knobs below where you want tighter control.",
+    "rescue, download admission); the demand-following preset enables a ranker-fed pool and permits up to 50 GB "
+    "of declared-size download admission for the session. Review that allowance before enabling it.",
     "Model downloads": "Controls background download behaviour. The Downloads tab provides a live pause/resume "
     "toggle; downloads_paused here sets the default at worker startup.",
     "LoRA": "Offering LoRA jobs downloads resources on demand and requires a CivitAI API token. Without a token, "
@@ -606,23 +607,23 @@ CONFIG_FIELDS: list[ConfigField] = [
     # Model pool
     ConfigField(
         "max_throughput_mode",
-        "Max throughput mode",
+        "Demand-following pool preset (50 GB admission)",
         FieldKind.BOOL,
         "Model pool",
-        "One-switch preset for reducing model-swap churn: turns the fixed model pool on with its demand ranker and a "
-        "50 GB auto-download budget, so the worker serves a ranker-fed, slowly-rotating seat set and may fetch a "
-        "strong model it does not yet hold. Applied only where an individual model_pool field below is absent, so "
-        "an explicit value always wins. Inherited values are shown directly in the form.",
+        "Aggressive convenience preset: enables the pool and demand ranker and permits 50 GB of declared-size "
+        "automatic-download admission per session. It can reduce model swaps when selected seats stay resident, "
+        "but does not guarantee higher throughput. Applied only where an individual model_pool field below is "
+        "absent, so an explicit value always wins. Inherited values are shown directly in the form.",
+        risk_level="advanced",
     ),
     ConfigField(
         "model_pool_enabled",
         "Enable model pool",
         FieldKind.BOOL,
         "Model pool",
-        "Commit the worker to a bounded set of seats, each holding one model it keeps ready, and shape pops so the "
-        "horde returns work for the seated models (swap-free). A free lane still reaches the models you are not "
-        "seating, so the pool biases what you hold without hiding everything else. Off by default: model selection "
-        "is unchanged.",
+        "Commit the worker to a bounded set of logical seats and shape some pops toward their models. A seat is not "
+        "a residency guarantee: memory pressure and scheduling may leave it cold, which the runtime panels show. "
+        "A free lane still reaches models outside the seat set. Off by default: model selection is unchanged.",
         yaml_parent="model_pool",
     ),
     ConfigField(
@@ -631,8 +632,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.INT,
         "Model pool",
         "How many seated models to hold. 0 (the default) means auto: one seat per inference process. Seating more "
-        "models than you have inference processes weakens the swap-free promise (not every seat can keep a home "
-        "process), so keep this at or below your inference-process count unless you want that trade.",
+        "models than you have inference processes guarantees that some seats cannot have a dedicated resident "
+        "process, so keep this at or below your inference-process count unless you want that trade.",
         minimum=0,
         maximum=64,
         yaml_parent="model_pool",
@@ -679,8 +680,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Enable rescue seat",
         FieldKind.BOOL,
         "Model pool",
-        "Donate one seat, time-boxed, to the single most-starved model (a very high requester wait) so otherwise-"
-        "impossible jobs still get done. Off by default; never displaces a manual pin and engages at most one seat.",
+        "Donate one seat, time-boxed, to the single most-starved model (a very high requester wait), increasing its "
+        "chance of being offered by this worker. Off by default; never displaces a manual pin and engages at most "
+        "one seat.",
         yaml_parent="model_pool",
     ),
     ConfigField(
@@ -723,13 +725,13 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "model_pool_download_budget_gb",
-        "Auto-download budget",
+        "Auto-download admission budget",
         FieldKind.FLOAT,
         "Model pool",
-        "Disk (GB) the pool may spend auto-downloading a high-demand model it does not yet have, so the ranker can "
-        "seat a strong candidate you have not pre-fetched. 0 (the default) prevents ranker-selected automatic "
-        "downloads; models already configured or pinned remain governed by their normal download rules. The budget "
-        "is charged when a pool download starts, so reaching the limit does not stop an in-progress transfer.",
+        "Declared-size GB the pool may admit for automatic downloads during this session. Each request is charged "
+        "its reference-declared full size when it starts; the charge is neither live disk occupancy nor measured "
+        "bandwidth and is not refunded after failure. 0 prevents ranker-selected automatic downloads. Models "
+        "already configured or pinned remain governed by their normal download rules.",
         minimum=0.0,
         unit="GB",
         yaml_parent="model_pool",
@@ -737,16 +739,16 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "model_pool_pinned",
-        "Pinned models",
+        "Pinned models (structured YAML)",
         FieldKind.YAML,
         "Model pool",
         "Models you pin into seats yourself, as a YAML list of {name, affinity} entries. Affinity is a bias, not a "
         "lock (higher fills its seat earlier and bolsters it in a re-contest, but a stronger candidate can still "
-        "take the seat). Edit this list directly in bridgeData.yaml.",
+        "take the seat). Enter one list item per model, for example `- name: Deliberate` followed by an optional "
+        "`  affinity: 0.8`. Affinity must be greater than 0 and at most 1. Duplicate and contradictory pins are "
+        "blocked before save.",
         yaml_parent="model_pool",
-        hidden=True,
-        yaml_only_reason="Structured list of {name, affinity} entries; edited directly in bridgeData.yaml rather "
-        "than through a scalar widget.",
+        explicit_default=[],
     ),
     # Model downloads
     ConfigField(
@@ -1818,6 +1820,39 @@ def coerce_value(field: ConfigField, raw: object) -> object:
                 for required in ("name", "baseline", "filepath"):
                     if not str(item.get(required) or "").strip():
                         raise ValueError(f"Custom model #{index} must include {required}")
+        if field.key == "model_pool_pinned":
+            if parsed is None:
+                return []
+            if not isinstance(parsed, list):
+                raise ValueError("Pinned models must be a YAML list")
+            normalized: list[dict[str, object]] = []
+            seen: set[str] = set()
+            for index, item in enumerate(parsed, start=1):
+                if not isinstance(item, MutableMapping):
+                    raise ValueError(f"Pinned model #{index} must be a mapping with name and optional affinity")
+                unknown = set(item).difference({"name", "affinity"})
+                if unknown:
+                    raise ValueError(f"Pinned model #{index} has unknown field(s): {', '.join(sorted(unknown))}")
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    raise ValueError(f"Pinned model #{index} must include name")
+                normalized_name = name.casefold()
+                if normalized_name in seen:
+                    raise ValueError(f"Pinned model {name!r} appears more than once")
+                seen.add(normalized_name)
+                affinity_raw = item.get("affinity", 1.0)
+                if isinstance(affinity_raw, bool):
+                    raise ValueError(f"Pinned model {name!r} affinity must be a number greater than 0 and at most 1")
+                try:
+                    affinity = float(affinity_raw)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Pinned model {name!r} affinity must be a number greater than 0 and at most 1",
+                    ) from error
+                if affinity <= 0 or affinity > 1:
+                    raise ValueError(f"Pinned model {name!r} affinity must be greater than 0 and at most 1")
+                normalized.append({"name": name, "affinity": affinity})
+            return normalized
         return parsed
     return str(raw)
 

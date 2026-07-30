@@ -6,6 +6,7 @@ from rich.console import Console
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ModelPoolBenchRow,
+    ModelPoolSeatReadiness,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
 )
@@ -30,6 +31,10 @@ def _pool_snapshot() -> ModelPoolSnapshot:
                 dwell_seconds=180.0,
                 empty_pops=2,
                 last_fulfilled_age_seconds=12.0,
+                last_match_was_resident=True,
+                readiness=ModelPoolSeatReadiness.RESIDENT,
+                resident_process_ids=[0],
+                resident_device_indices=[0],
             ),
             ModelPoolSeatRow(
                 model="AlbedoBase XL",
@@ -59,7 +64,8 @@ def test_model_pool_panel_renders_seats_lane_and_bench() -> None:
     assert "Flux.1-dev" in text
     # The lane/demand line and its budget usage.
     assert "FIXED" in text
-    assert "budget" in text
+    assert "download admission" in text
+    assert "1 / 2 seated" in text
     # The bench line names the demoted model and its reason.
     assert "OldModel" in text
     assert "EMPTY_POPS" in text
@@ -71,7 +77,7 @@ def test_model_pool_status_line_omits_budget_when_not_configured() -> None:
     pool.download_budget_gb = 0.0
     text = _render(InsightsView()._render_pool_status_line(pool))
 
-    assert "budget" not in text
+    assert "download admission" not in text
     assert "FIXED" in text
 
 
@@ -87,13 +93,14 @@ def test_model_pool_bench_line_summarizes_overflow() -> None:
     assert "+2 more" in text
 
 
-def test_model_pool_seats_table_shows_fulfilled_age() -> None:
-    """The seats table carries a Fulfilled column rendering each seat's last-fulfilled age."""
+def test_model_pool_seats_table_shows_match_age_and_residency() -> None:
+    """The seats table distinguishes current readiness and the latest pop match's residency."""
     text = _render(InsightsView()._render_pool_seats(_pool_snapshot()))
 
-    assert "Fulfilled" in text
-    # The first seat last served 12 seconds ago; that age must appear as a rendered duration.
+    assert "Readiness" in text
+    assert "Matched" in text
     assert "12s" in text
+    assert "resident" in text
 
 
 def test_model_pool_disabled_panel_shows_off_state() -> None:

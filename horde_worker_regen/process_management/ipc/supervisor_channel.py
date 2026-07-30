@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 20
+SUPERVISOR_PROTOCOL_VERSION = 21
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -63,7 +63,7 @@ v16 added post-processing lane counters and per-entry queue order so the TUI can
 through the dedicated post-processing process.
 v17 added the operator-facing reason post-processing was session-disabled.
 v19 added the snapshot's ``model_pool`` field (:class:`ModelPoolSnapshot`): the fixed model pool's seats,
-bench, current advertising lane, demand-reading age, and download budget. Omitted (None) when the pool is
+bench, current advertising lane, demand-reading age, and download admission budget. Omitted (None) when the pool is
 disabled, so a worker with no pool leaves the field unset and older supervisors are unaffected.
 v20 added the snapshot's ``disagg_job_stages`` list (:class:`DisaggStageRow`): each in-flight
 pipeline-disaggregated job's current stage and the process its stage is dispatched to, so the dashboard
@@ -73,6 +73,9 @@ or no disaggregated jobs are in flight. v20 also added ``ProcessSnapshot.residen
 RAM component cache, so the dashboard can show which models/components a lane actually holds. Empty for a
 process with no component cache. The model-pool snapshot also gained cumulative fixed/free lane pop and
 fulfillment counts for per-lane hit rates.
+v21 distinguishes logical model-pool seating from measured residency. Each seat carries a readiness value,
+resident process/GPU identities, and whether its last matched pop was already resident. The lane tallies add
+resident-hit counts, allowing the TUI to report observed load avoidance rather than infer it from a seat match.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -956,12 +959,23 @@ class SystemMemorySnapshot(BaseModel):
         )
 
 
+class ModelPoolSeatReadiness(enum.StrEnum):
+    """Measured readiness of the model logically assigned to a fixed-pool seat."""
+
+    EMPTY = "EMPTY"
+    """The seat has no active model."""
+    RESIDENT = "RESIDENT"
+    """At least one live inference process currently reports the seated model loaded."""
+    COLD = "COLD"
+    """The seat remains logically assigned, but no live inference process currently reports its model loaded."""
+
+
 class ModelPoolSeatRow(BaseModel):
     """Represents one fixed-pool seat's operator-facing state, with monotonic stamps resolved to ages.
 
     The worker's seat engine keeps its timing in a monotonic clock the supervisor cannot interpret, so the
     stamps are converted to durations at snapshot time: ``dwell_seconds`` is how long the current model has
-    held the seat, ``last_fulfilled_age_seconds`` how long since it last served work, and
+    held the seat, ``last_fulfilled_age_seconds`` how long since a pop last matched it, and
     ``rescue_expires_in_seconds`` how long a rescue seat has left before release. All are ``None`` when the
     seat is empty or the underlying stamp is unset.
     """
@@ -975,9 +989,17 @@ class ModelPoolSeatRow(BaseModel):
     dwell_seconds: float | None = None
     """Seconds the current model has held the seat, or None when the seat is empty."""
     empty_pops: int = 0
-    """Consecutive fixed-lane empty pops charged to the seated model since its last fulfillment."""
+    """Consecutive fixed-lane empty pops charged to the seated model since its last successful match."""
     last_fulfilled_age_seconds: float | None = None
-    """Seconds since the seated model last served work, or None when it has not served since seating."""
+    """Seconds since a pop last matched the seated model, or None when none has matched since seating."""
+    last_match_was_resident: bool | None = None
+    """Whether the seated model was already resident for its last matched pop; None before the first match."""
+    readiness: ModelPoolSeatReadiness = ModelPoolSeatReadiness.EMPTY
+    """Measured current readiness of the active model, distinct from the logical seat's ``state``."""
+    resident_process_ids: list[int] = Field(default_factory=list)
+    """Live inference process IDs currently reporting the active seated model loaded."""
+    resident_device_indices: list[int] = Field(default_factory=list)
+    """GPU device indices carrying those resident processes, deduplicated and sorted."""
     pending_model: str | None = None
     """The model this seat is downloading to swap in, or None when no download is pending."""
     rescue_expires_in_seconds: float | None = None
@@ -1016,17 +1038,21 @@ class ModelPoolSnapshot(BaseModel):
     demand_age_seconds: float | None = None
     """Seconds since the pool's demand ranking was last refreshed, or None before the first reading."""
     download_budget_gb: float = 0.0
-    """Configured disk budget (GB) the pool may spend auto-downloading a model to seat it (0 = never)."""
+    """Configured session admission budget (declared-size GB) for pool-initiated downloads (0 = never)."""
     download_bytes_charged: int = 0
-    """Bytes the pool has charged against the download budget this session."""
+    """Reference-declared bytes charged when pool download requests started during this session."""
     fixed_pops: int = 0
     """Session-cumulative pops the pool advertised on the fixed (seated-model) lane."""
     fixed_fulfilled: int = 0
     """How many of ``fixed_pops`` returned a job (the fixed lane's hit rate is this over ``fixed_pops``)."""
+    fixed_resident_hits: int = 0
+    """Fixed-lane matches whose returned model was already resident at pop time."""
     free_pops: int = 0
     """Session-cumulative pops the pool advertised on the free (unseated-model) lane."""
     free_fulfilled: int = 0
     """How many of ``free_pops`` returned a job (the free lane's hit rate is this over ``free_pops``)."""
+    free_resident_hits: int = 0
+    """Free-lane matches whose returned model was already resident at pop time."""
 
 
 class WorkerStateSnapshot(BaseModel):

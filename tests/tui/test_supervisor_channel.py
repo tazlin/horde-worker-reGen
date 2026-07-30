@@ -12,6 +12,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
     DisaggStageRow,
     ModelPoolBenchRow,
+    ModelPoolSeatReadiness,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
     PreloadAdmissionSnapshot,
@@ -53,7 +54,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 20
+    assert SUPERVISOR_PROTOCOL_VERSION == 21
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -418,6 +419,10 @@ def test_model_pool_snapshot_survives_json_roundtrip() -> None:
                 dwell_seconds=120.0,
                 empty_pops=3,
                 last_fulfilled_age_seconds=15.0,
+                last_match_was_resident=True,
+                readiness=ModelPoolSeatReadiness.RESIDENT,
+                resident_process_ids=[2],
+                resident_device_indices=[0],
             ),
             ModelPoolSeatRow(
                 model="AlbedoBase XL",
@@ -436,8 +441,10 @@ def test_model_pool_snapshot_survives_json_roundtrip() -> None:
         download_bytes_charged=1024,
         fixed_pops=8,
         fixed_fulfilled=6,
+        fixed_resident_hits=5,
         free_pops=3,
         free_fulfilled=1,
+        free_resident_hits=0,
     )
 
     restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
@@ -453,5 +460,9 @@ def test_model_pool_snapshot_survives_json_roundtrip() -> None:
     assert restored.model_pool.download_bytes_charged == 1024
     assert restored.model_pool.fixed_pops == 8
     assert restored.model_pool.fixed_fulfilled == 6
+    assert restored.model_pool.fixed_resident_hits == 5
     assert restored.model_pool.free_pops == 3
     assert restored.model_pool.free_fulfilled == 1
+    assert restored.model_pool.free_resident_hits == 0
+    assert restored.model_pool.seats[0].readiness is ModelPoolSeatReadiness.RESIDENT
+    assert restored.model_pool.seats[0].resident_process_ids == [2]

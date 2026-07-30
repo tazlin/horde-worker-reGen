@@ -173,11 +173,11 @@ _MAX_THROUGHPUT_MODE_BUNDLE: dict[str, object] = {
 }
 """The ``model_pool`` sub-field bundle ``max_throughput_mode`` applies where the operator left the field default.
 
-The preset turns the fixed model pool on with its demand ranker and a 50GB auto-download budget, so a worker
-opting into maximum throughput serves a slowly-rotating, ranker-fed set of models and may fetch a strong
-candidate it does not yet have on disk. Each value maps to a ``ModelPoolConfig`` sub-field rather than a
-top-level field, so the apply step reads the operator's explicit choices from the nested model's own
-``model_fields_set``."""
+The preset turns the fixed model pool on with its demand ranker and a 50GB declared-size download admission
+budget. It is an aggressive demand-following convenience bundle that may reduce model-swap churn when its
+seats stay resident; it does not guarantee maximum throughput. Each value maps to a ``ModelPoolConfig``
+sub-field rather than a top-level field, so the apply step reads the operator's explicit choices from the
+nested model's own ``model_fields_set``."""
 
 
 def apply_max_throughput_mode(
@@ -532,8 +532,12 @@ class ModelPoolConfig(BaseModel):
     horde's demand endpoint."""
 
     download_budget_gb: float = Field(default=0.0, ge=0.0)
-    """How much disk (in gigabytes) the pool may spend auto-downloading a not-yet-present model to seat it.
-    0 (the default) never auto-downloads, so the pool only ever seats models already on disk."""
+    """Session admission budget for pool-initiated model downloads, in declared-size gigabytes.
+
+    A request is charged its reference-declared total size when it starts. The charge is not measured disk
+    occupancy or transferred bandwidth and is not refunded after failure. 0 (the default) prevents the ranker
+    from initiating a download, so ranker-selected seats only use models already on disk.
+    """
 
 
 class reGenBridgeData(CombinedHordeBridgeData):
@@ -1036,11 +1040,13 @@ class reGenBridgeData(CombinedHordeBridgeData):
     run without a per-job model swap. See :class:`ModelPoolConfig` for the individual knobs."""
 
     max_throughput_mode: bool = Field(default=False)
-    """One-switch operator preset that turns the fixed model pool on for maximum throughput.
+    """One-switch operator preset for an aggressive demand-following fixed model pool.
 
     Off by default. When true, the worker applies a bundle of pool settings to any of the bundled
     ``model_pool`` sub-fields the operator left at their default: it enables the pool, enables its demand
-    ranker, and sets a 50GB auto-download budget. Each application is logged.
+    ranker, and permits 50GB of declared-size automatic-download admission per session. This can reduce model
+    swaps when the selected seats stay resident, but it does not guarantee maximum throughput. Each application
+    is logged.
 
     An explicit operator value always wins over the bundle, and the override is logged rather than silently
     dropped; in particular, setting this mode true while ``model_pool.enabled`` is explicitly false keeps the

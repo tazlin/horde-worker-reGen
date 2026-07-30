@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSeatReadiness
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import (
@@ -113,8 +114,14 @@ def test_snapshot_populates_model_pool_when_enabled() -> None:
     )
     manager._model_pool = pool
 
-    manager._job_popper._pool_lane_this_cycle = PopLane.FIXED
+    manager._job_popper._pool_last_routed_lane = PopLane.FIXED
     manager._job_popper._pool_last_fixed_seat_count = 1
+    manager._process_map[7] = make_mock_process_info(
+        7,
+        model_name="Deliberate",
+        state=HordeProcessState.WAITING_FOR_JOB,
+        device_index=1,
+    )
     manager._model_demand_poller.seed(DemandSnapshot(records={}, fetched_at=time.monotonic()))
 
     snapshot = manager._build_worker_state_snapshot()
@@ -125,7 +132,11 @@ def test_snapshot_populates_model_pool_when_enabled() -> None:
     assert len(pool_snapshot.seats) == 2
     assert pool_snapshot.seats[0].model == "Deliberate"
     assert pool_snapshot.seats[0].source == "RANKER"
+    assert pool_snapshot.seats[0].readiness is ModelPoolSeatReadiness.RESIDENT
+    assert pool_snapshot.seats[0].resident_process_ids == [7]
+    assert pool_snapshot.seats[0].resident_device_indices == [1]
     assert pool_snapshot.seats[1].model is None
+    assert pool_snapshot.seats[1].readiness is ModelPoolSeatReadiness.EMPTY
     assert any(bench_row.model == "AlbedoBase XL" for bench_row in pool_snapshot.bench)
     assert pool_snapshot.current_lane == "FIXED"
     assert pool_snapshot.last_fixed_seat_count == 1
@@ -172,8 +183,10 @@ def test_snapshot_projects_pool_lane_tally() -> None:
     assert pool_snapshot is not None
     assert pool_snapshot.fixed_pops == 2
     assert pool_snapshot.fixed_fulfilled == 1
+    assert pool_snapshot.fixed_resident_hits == 0
     assert pool_snapshot.free_pops == 1
     assert pool_snapshot.free_fulfilled == 0
+    assert pool_snapshot.free_resident_hits == 0
 
 
 def test_publish_is_dirty_gated_with_a_floor() -> None:

@@ -81,34 +81,46 @@ class LaneDecision:
 class PoolLaneTally:
     """Session-cumulative pool-routed pop counts, split by advertising lane.
 
-    Each lane counts its pops and how many of them were fulfilled (returned a job), so a reader forms the
-    lane's hit rate as ``fulfilled / pops``. The two lanes are counted apart so a fixed lane the horde keeps
-    feeding and a free lane it does not (or the reverse) are distinguishable. The empty default is the state
-    before any pool-routed pop.
+    Each lane counts its pops, how many returned a job, and how many returned a job whose model was already
+    resident at pop time. The distinction prevents a logical seat match from being presented as proof that the
+    worker avoided a model load. The empty default is the state before any pool-routed pop.
     """
 
     fixed_pops: int = 0
     fixed_fulfilled: int = 0
+    fixed_resident_hits: int = 0
     free_pops: int = 0
     free_fulfilled: int = 0
+    free_resident_hits: int = 0
 
 
-def fold_pool_lane_outcome(tally: PoolLaneTally, *, lane: PopLane, fulfilled: bool) -> PoolLaneTally:
+def fold_pool_lane_outcome(
+    tally: PoolLaneTally,
+    *,
+    lane: PopLane,
+    fulfilled: bool,
+    resident_hit: bool = False,
+) -> PoolLaneTally:
     """Add one pool-routed pop's outcome to the cumulative lane tally.
 
-    The pop is counted under its advertising ``lane``, and additionally as fulfilled when it returned a job.
-    Only the counted lane's fields advance, so the two lanes' hit rates stay independent.
+    The pop is counted under its advertising ``lane``, additionally as fulfilled when it returned a job (the
+    legacy field name means a pop match, not job completion), and as a resident hit only when that returned
+    model was already resident. Only the counted lane advances. A caller cannot create a resident hit for an
+    empty pop; that inconsistent input is normalized to false.
     """
+    counted_resident_hit = fulfilled and resident_hit
     if lane is PopLane.FIXED:
         return replace(
             tally,
             fixed_pops=tally.fixed_pops + 1,
             fixed_fulfilled=tally.fixed_fulfilled + (1 if fulfilled else 0),
+            fixed_resident_hits=tally.fixed_resident_hits + (1 if counted_resident_hit else 0),
         )
     return replace(
         tally,
         free_pops=tally.free_pops + 1,
         free_fulfilled=tally.free_fulfilled + (1 if fulfilled else 0),
+        free_resident_hits=tally.free_resident_hits + (1 if counted_resident_hit else 0),
     )
 
 

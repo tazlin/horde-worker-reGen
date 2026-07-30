@@ -7,6 +7,7 @@ from textual.app import App, ComposeResult
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ModelPoolBenchRow,
+    ModelPoolSeatReadiness,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
     StatsRollupRow,
@@ -27,35 +28,39 @@ def _pool_snapshot() -> ModelPoolSnapshot:
     return ModelPoolSnapshot(
         enabled=True,
         seats=[
-            ModelPoolSeatRow(model="Deliberate", source="MANUAL", state="ACTIVE"),
+            ModelPoolSeatRow(
+                model="Deliberate",
+                source="MANUAL",
+                state="ACTIVE",
+                readiness=ModelPoolSeatReadiness.RESIDENT,
+            ),
             ModelPoolSeatRow(model=None, source=None, state="ACTIVE"),
         ],
         bench=[ModelPoolBenchRow(model="OldModel", reason="EMPTY_POPS", cooldown_remaining_seconds=200.0)],
         current_lane="FIXED",
         fixed_pops=10,
         fixed_fulfilled=6,
+        fixed_resident_hits=5,
         free_pops=4,
         free_fulfilled=1,
     )
 
 
-def test_pool_section_shows_per_lane_throughput_seats_and_bench() -> None:
-    """The pool section reports fixed/free lane fulfillment, active seat count, and bench size."""
+def test_pool_section_shows_per_lane_matches_residency_seats_and_bench() -> None:
+    """The pool section reports pop matches, resident hits, ready seats, and bench size."""
     text = _render(StatsView._render_model_pool(_pool_snapshot()))
 
     assert "Model pool" in text
     assert "FIXED" in text
-    # One of two seats holds a model; the bench holds one entry.
-    assert "1 active / 2 total" in text
-    # Fixed lane: 6 of 10 pops fulfilled (60%); free lane: 1 of 4 (25%).
-    assert "6 / 10 fulfilled (60%)" in text
-    assert "1 / 4 fulfilled (25%)" in text
+    assert "1 resident / 1 seated / 2 total" in text
+    assert "6 / 10 matched (60%); 5 resident" in text
+    assert "1 / 4 matched (25%); 0 resident" in text
 
 
-def test_lane_throughput_dashes_before_any_pop() -> None:
+def test_lane_pop_summary_dashes_before_any_pop() -> None:
     """A lane with no pops yet shows a dash rather than a divide-by-zero rate."""
-    assert StatsView._lane_throughput(0, 0) == "-"
-    assert StatsView._lane_throughput(3, 4) == "3 / 4 fulfilled (75%)"
+    assert StatsView._lane_pop_summary(0, 0, 0) == "-"
+    assert StatsView._lane_pop_summary(3, 4, 2) == "3 / 4 matched (75%); 2 resident"
 
 
 def test_by_model_rollup_marks_seated_models() -> None:

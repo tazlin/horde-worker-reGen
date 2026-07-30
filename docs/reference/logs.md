@@ -26,9 +26,11 @@ The dashboard reads only the trailing window of a log, so a large file scrolls q
 
 The headless worker's periodic status block always names the model-pool mode. With the pool off, it says that
 normal eligible-model advertising has no persistent seat bias. With the pool on, one compact line lists the
-seats and their source (`M`, `R`, or `S`), the current fixed/free advertising lane, each lane's fulfilled/popped
-hit rate, bench size, demand-reading age, and charged/session download budget. A pending seat names its target
-model and reads `downloading`; reaching the charged budget does not cancel that already-started transfer.
+first six seats (plus an overflow count), their source (`M`, `R`, or `S`) and readiness (`resident` with GPU,
+`cold`, or `downloading`), the most recent fixed/free advertising lane, each lane's matched/popped rate and
+resident-match count, bench size, demand-reading age, and charged/session download admission budget. The charge is the
+reference-declared model size booked when a request starts, not measured disk use or bandwidth. A pending seat
+names its target model and reads `downloading`; reaching the limit does not cancel that already-started transfer.
 
 ## Which process is which
 

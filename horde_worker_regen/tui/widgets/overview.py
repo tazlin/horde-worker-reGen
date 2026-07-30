@@ -897,11 +897,11 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _render_model_pool_panel(pool: ModelPoolSnapshot) -> Panel:
-        """Render a compact fixed model pool panel: seated models, current lane, and the fixed-lane hit rate.
+        """Render a compact fixed model pool panel with residency and pop-match evidence.
 
         Shares the Insights seats-table vocabulary (Model pool, seats, fixed/free lane, bench) so an operator
         reads the two surfaces as one feature. The caller hides the panel entirely when the pool is disabled;
-        the fixed-lane hit rate is added only once at least one fixed-lane pop has been tallied.
+        fixed-lane match and resident-hit counts are added only after a fixed-lane pop has been tallied.
         """
         seats_line = Text()
         visible_seats = [seat for seat in pool.seats if seat.model is not None or seat.pending_model is not None]
@@ -919,22 +919,28 @@ class OverviewView(Vertical):
                 seats_line.append(" ")
                 seats_line.append(glyph, style=glyph_style)
                 seats_line.append("  ")
-                seats_line.append(
-                    "downloading" if downloading else "active",
-                    style="yellow" if downloading else "green",
-                )
+                if downloading:
+                    seats_line.append("downloading", style="yellow")
+                elif seat.readiness == "RESIDENT":
+                    devices = ",".join(str(index) for index in seat.resident_device_indices)
+                    suffix = f" gpu {devices}" if devices else ""
+                    seats_line.append(f"resident{suffix}", style="green")
+                else:
+                    seats_line.append("cold seat", style="grey62")
 
         status_line = Text.assemble(
             ("lane ", "grey50"),
             (pool.current_lane or "-", "bold"),
-            ("   ·   seats ", "grey50"),
+            ("   ·   last fixed offer ", "grey50"),
             (str(pool.last_fixed_seat_count), "grey70"),
         )
         if pool.fixed_pops > 0:
             rate = pool.fixed_fulfilled / pool.fixed_pops * 100
-            status_line.append("   ·   fixed hits ", style="grey50")
+            status_line.append("   ·   fixed matches ", style="grey50")
             status_line.append(f"{pool.fixed_fulfilled}/{pool.fixed_pops}", style="grey70")
             status_line.append(f" ({rate:.0f}%)", style="grey50")
+            status_line.append("   ·   resident ", style="grey50")
+            status_line.append(f"{pool.fixed_resident_hits}/{pool.fixed_fulfilled}", style="grey70")
         if pool.bench:
             status_line.append("   ·   bench ", style="grey50")
             status_line.append(str(len(pool.bench)), style="grey70")

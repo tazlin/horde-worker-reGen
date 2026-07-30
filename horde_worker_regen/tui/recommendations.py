@@ -52,12 +52,11 @@ _LOW_DUTY_CYCLE = 50.0
 _HIGH_VRAM_FRACTION = 0.92
 _HIGH_FAULT_RATE = 0.10
 
-# Pool-off: how much recent model variety, over how many jobs, before suggesting the throughput-for-variety trade.
-_POOL_OFF_DISTINCT_MODELS = 4
-_POOL_OFF_MIN_JOBS = 8
+# Pool-off: enough measured session model swaps to make the pool trade relevant.
+_POOL_OFF_MODEL_SWAPS = 3
 # Pool-on thresholds: a demand reading this old means the ranker is acting on a frozen signal; a seat with this
-# many charged empty pops (or seated this long with nothing served) is not earning its residency; a seat that
-# served within this window is actively earning.
+# many charged empty pops (or seated this long with no match) is not matching demand; a seat that
+# matched resident work within this window is evidence that the pool is avoiding a cold load at pop time.
 _POOL_STALE_DEMAND_SECONDS = 900.0
 _POOL_HIGH_EMPTY_POPS = 5
 _POOL_UNPRODUCTIVE_SEAT_SECONDS = 600.0
@@ -183,22 +182,22 @@ def _check_model_pool(snapshot: WorkerStateSnapshot, out: list[Recommendation]) 
 
 
 def _check_pool_off_diversity(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> None:
-    """With the pool off, offer (not push) the throughput-for-variety trade when the worker serves many models.
+    """With the pool off, offer the pool trade only after measured model-swap churn.
 
-    Serving many distinct models is a legitimate operator choice, so this is framed as a preference. A pool can
-    improve throughput when model swaps are the bottleneck, at the cost of biasing work toward fewer models.
+    Distinct recent models are not proof of a swap because multiple processes may keep them resident. The
+    session churn counter records actual preloads that displaced another model, which makes the recommendation
+    evidence-based while preserving model variety as a legitimate operator preference.
     """
-    image_jobs = [job for job in snapshot.recent_jobs if not job.is_alchemy]
-    distinct_models = {job.model_name for job in image_jobs if job.model_name}
-    if len(image_jobs) >= _POOL_OFF_MIN_JOBS and len(distinct_models) >= _POOL_OFF_DISTINCT_MODELS:
+    sample = snapshot.latest_stats_sample
+    model_swaps = sample.churn_counts.get("model_swap", 0) if sample is not None else 0
+    if model_swaps >= _POOL_OFF_MODEL_SWAPS:
         out.append(
             Recommendation(
                 Severity.SUGGESTION,
-                f"Serving {len(distinct_models)} models with the pool off",
-                "Recent work spanned many distinct models while the fixed model pool is off. If the card spends "
-                "time swapping between them, enabling the model pool (or Max throughput mode) commits it to a "
-                "small, ready seat set. That can improve throughput when swaps are the bottleneck, while trading "
-                "away some model variety. This is a genuine "
+                f"Model pool off after {model_swaps} model swaps",
+                "This session has recorded model preloads that displaced another resident model. Enabling the "
+                "model pool (or its demand-following preset) can bias pops toward a smaller seat set and reduce "
+                "that churn when the seats stay resident, while trading away some model variety. This is a genuine "
                 "preference: leave the pool off if serving that variety is the point.",
             ),
         )
@@ -209,12 +208,12 @@ def _check_pool_on(
     pool: ModelPoolSnapshot,
     out: list[Recommendation],
 ) -> None:
-    """Read the live seats and demand age, flagging what to review and noting a pool that is clearly earning."""
+    """Read live seats and demand age, flagging issues and noting measured resident matches."""
     before = len(out)
     _check_pool_demand_staleness(pool, out)
     _check_pool_unproductive_seats(pool, out)
     if len(out) == before:
-        _note_pool_earning(pool, out)
+        _note_pool_resident_matches(pool, out)
 
 
 def _check_pool_demand_staleness(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
@@ -234,7 +233,7 @@ def _check_pool_demand_staleness(pool: ModelPoolSnapshot, out: list[Recommendati
 
 
 def _check_pool_unproductive_seats(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
-    """Flag seats that keep taking empty fixed-lane pops or have served nothing since seating."""
+    """Flag seats that keep taking empty fixed-lane pops or have matched nothing since seating."""
     flagged: list[str] = []
     for seat in pool.seats:
         if seat.model is None or seat.pending_model is not None:
@@ -248,31 +247,33 @@ def _check_pool_unproductive_seats(pool: ModelPoolSnapshot, out: list[Recommenda
         out.append(
             Recommendation(
                 Severity.SUGGESTION,
-                "Model pool seats are not earning",
-                f"Seat(s) {', '.join(flagged)} keep taking fixed-lane pops that come back empty (or have served "
-                "nothing since seating), which is what charges a seat toward demotion. If it persists, the horde "
+                "Model pool seats are not matching demand",
+                f"Seat(s) {', '.join(flagged)} keep taking fixed-lane pops that come back empty (or have matched "
+                "no pops since seating), which is what charges a seat toward demotion. If this persists, the "
+                "horde "
                 "has little demand for those models on this card: review your pins, or let the demand ranker "
                 "rotate them out (model_pool.ranker_enabled) so the seats go to models with live demand.",
             ),
         )
 
 
-def _note_pool_earning(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
-    """Note a pool whose seats are serving work swap-free, so a healthy pool reads as working, not silent."""
-    earning = [
+def _note_pool_resident_matches(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
+    """Note recent pop matches that were resident when accepted."""
+    resident_matches = [
         seat
         for seat in pool.seats
         if seat.model is not None
         and seat.pending_model is None
         and seat.last_fulfilled_age_seconds is not None
         and seat.last_fulfilled_age_seconds <= _POOL_FRESH_FULFILLED_SECONDS
+        and seat.last_match_was_resident is True
     ]
-    if earning:
+    if resident_matches:
         out.append(
             Recommendation(
                 Severity.INFO,
-                "Model pool is earning",
-                f"{len(earning)} seat(s) served work swap-free within the last few minutes. The pool is holding a "
-                "set the horde is feeding; no action needed.",
+                "Model pool is receiving resident matches",
+                f"{len(resident_matches)} seat(s) matched a pop while already resident within the last few minutes. "
+                "That avoided a cold model load at acceptance time; job completion is tracked separately.",
             ),
         )

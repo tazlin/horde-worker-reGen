@@ -7,6 +7,7 @@ from textual.app import App, ComposeResult
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ModelPoolBenchRow,
+    ModelPoolSeatReadiness,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
     WorkerConfigSummary,
@@ -28,7 +29,14 @@ def _pool_snapshot() -> ModelPoolSnapshot:
     return ModelPoolSnapshot(
         enabled=True,
         seats=[
-            ModelPoolSeatRow(model="Deliberate", source="MANUAL", state="ACTIVE", dwell_seconds=180.0),
+            ModelPoolSeatRow(
+                model="Deliberate",
+                source="MANUAL",
+                state="ACTIVE",
+                dwell_seconds=180.0,
+                readiness=ModelPoolSeatReadiness.RESIDENT,
+                resident_device_indices=[0],
+            ),
             ModelPoolSeatRow(
                 model="AlbedoBase XL",
                 source="RANKER",
@@ -41,6 +49,7 @@ def _pool_snapshot() -> ModelPoolSnapshot:
         last_fixed_seat_count=2,
         fixed_pops=10,
         fixed_fulfilled=7,
+        fixed_resident_hits=5,
         free_pops=4,
         free_fulfilled=1,
     )
@@ -53,13 +62,14 @@ def test_panel_shows_seats_lane_and_fixed_hit_rate() -> None:
     assert "Model pool" in text
     assert "Deliberate" in text
     assert "AlbedoBase XL" in text
-    # The downloading seat reads as downloading, the served seat as active.
+    # The downloading seat reads as downloading, and the loaded seat names its device.
     assert "downloading" in text
-    assert "active" in text
-    # The lane line carries the fixed-lane hit rate (7 of 10 pops fulfilled) and the bench size.
+    assert "resident gpu 0" in text
+    # The lane line carries pop matches, resident matches, and the bench size.
     assert "FIXED" in text
     assert "7/10" in text
     assert "70%" in text
+    assert "5/7" in text
     assert "bench" in text
 
 
@@ -70,7 +80,7 @@ def test_panel_omits_hit_rate_before_any_fixed_pop() -> None:
     pool.fixed_fulfilled = 0
     text = _render(OverviewView._render_model_pool_panel(pool))
 
-    assert "fixed hits" not in text
+    assert "fixed matches" not in text
     assert "FIXED" in text
 
 

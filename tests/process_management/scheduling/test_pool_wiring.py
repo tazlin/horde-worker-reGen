@@ -44,6 +44,19 @@ class TestBuildPoolParams:
             PinnedModel(name="beta", affinity=0.4),
         )
 
+    def test_ineligible_pins_are_filtered_when_worker_eligibility_is_supplied(self) -> None:
+        """A pin excluded by the resolved model rules cannot become an unadvertisable logical seat."""
+        config = ModelPoolConfig(
+            pinned=[
+                PinnedModelEntry(name="eligible", affinity=0.9),
+                PinnedModelEntry(name="skipped", affinity=1.0),
+            ],
+        )
+
+        params = build_pool_params(config, max_inference_processes=2, eligible_models={"eligible"})
+
+        assert params.pinned == (PinnedModel(name="eligible", affinity=0.9),)
+
     def test_tunables_pass_through(self) -> None:
         """Test tunables pass through."""
         config = ModelPoolConfig(
@@ -129,3 +142,20 @@ class TestExpectedValueAdapter:
         assert adapter("an_xl_model") is not None
         assert adapter("an_sd15_model") is not None
         assert seen["stable_diffusion_xl"].resolution_bucket != seen["stable_diffusion_1"].resolution_bucket
+
+    @pytest.mark.parametrize("baseline", ["flux_1", "qwen_image", "z_image_turbo", "stable_cascade"])
+    def test_large_model_baselines_use_their_native_1024_signature(self, baseline: str) -> None:
+        """Large-model ranking reads the same 1024 bucket populated by benchmark and live calibration."""
+        seen: list[JobSignature] = []
+
+        def record_expected_its(signature: JobSignature) -> float | None:
+            seen.append(signature)
+            return 1.0
+
+        adapter = build_expected_value_adapter(
+            expected_its=record_expected_its,
+            baseline_resolver=lambda _name: baseline,
+        )
+
+        assert adapter("large-model") is not None
+        assert seen == [baseline_signature(baseline=baseline, resolution=1024)]

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from horde_worker_regen.process_management.jobs.pool_lanes import (
     PoolLaneState,
+    PoolLaneTally,
     decide_pool_lane,
+    fold_pool_lane_outcome,
     record_fixed_pop_outcome,
 )
 from horde_worker_regen.process_management.scheduling.model_pool import PopLane
@@ -204,3 +206,29 @@ class TestRecordFixedPopOutcome:
         updated = record_fixed_pop_outcome(state, was_empty=True)
         assert updated.fixed_credit == 2
         assert updated.free_credit == 1
+
+
+class TestPoolLaneTally:
+    """Resident-hit counts advance only for successful pops whose model was already loaded."""
+
+    def test_resident_fixed_match_advances_all_fixed_counts(self) -> None:
+        """A resident fixed-lane match counts the pop, match, and resident hit together."""
+        tally = fold_pool_lane_outcome(
+            PoolLaneTally(),
+            lane=PopLane.FIXED,
+            fulfilled=True,
+            resident_hit=True,
+        )
+
+        assert tally == PoolLaneTally(fixed_pops=1, fixed_fulfilled=1, fixed_resident_hits=1)
+
+    def test_empty_pop_cannot_count_as_resident(self) -> None:
+        """The resident flag is ignored when the pop did not return a model."""
+        tally = fold_pool_lane_outcome(
+            PoolLaneTally(),
+            lane=PopLane.FREE,
+            fulfilled=False,
+            resident_hit=True,
+        )
+
+        assert tally == PoolLaneTally(free_pops=1)

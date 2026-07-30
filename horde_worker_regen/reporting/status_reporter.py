@@ -151,7 +151,7 @@ class StatusReporter:
             download_plan: The config's disk-budget summary, or None when the reference is not loaded.
             stage_age_line: A pre-formatted per-stage census (count + oldest age) to print under the job
                 info, or None to omit it (nothing is aging).
-            model_pool_status: Live fixed-pool seats, lane tallies, and download budget. None means the pool
+            model_pool_status: Live fixed-pool seats, lane tallies, and download admission budget. None means the pool
                 is disabled or has not produced a snapshot yet; ``bridge_data`` distinguishes those cases.
 
         Returns:
@@ -270,7 +270,8 @@ class StatusReporter:
             return
 
         seats: list[str] = []
-        for seat in pool.seats:
+        shown_seats = pool.seats[:6]
+        for seat in shown_seats:
             model = seat.model or seat.pending_model
             if model is None:
                 seats.append("empty")
@@ -278,12 +279,24 @@ class StatusReporter:
             source = {"MANUAL": "M", "RANKER": "R", "RESCUE": "S"}.get(seat.source or "", "?")
             if seat.model is not None and seat.pending_model is not None:
                 model = f"{seat.model}->{seat.pending_model}"
-            suffix = " downloading" if seat.pending_model is not None else ""
+            if seat.pending_model is not None:
+                suffix = " downloading"
+            elif seat.readiness == "RESIDENT":
+                devices = ",".join(str(index) for index in seat.resident_device_indices)
+                suffix = f" resident(gpu {devices})" if devices else " resident"
+            else:
+                suffix = " cold"
             seats.append(f"{model}[{source}]{suffix}")
+        if len(pool.seats) > len(shown_seats):
+            seats.append(f"+{len(pool.seats) - len(shown_seats)} more")
         seat_summary = ", ".join(seats) if seats else "none"
 
-        fixed_rate = StatusReporter._pool_hit_rate(pool.fixed_fulfilled, pool.fixed_pops)
-        free_rate = StatusReporter._pool_hit_rate(pool.free_fulfilled, pool.free_pops)
+        fixed_rate = StatusReporter._pool_hit_rate(
+            pool.fixed_fulfilled,
+            pool.fixed_pops,
+            pool.fixed_resident_hits,
+        )
+        free_rate = StatusReporter._pool_hit_rate(pool.free_fulfilled, pool.free_pops, pool.free_resident_hits)
         budget = (
             f"{_human_bytes(pool.download_bytes_charged)}/{pool.download_budget_gb:g} GB"
             if pool.download_budget_gb > 0
@@ -292,16 +305,16 @@ class StatusReporter:
         demand = _human_duration(pool.demand_age_seconds)
         logging_function(
             "<fg #7dcea0>  Model pool: "
-            f"seats {seat_summary} | lane {pool.current_lane or '-'} | fixed {fixed_rate} | free {free_rate} | "
-            f"bench {len(pool.bench)} | demand age {demand} | download budget {budget}</>",
+            f"seats {seat_summary} | last lane {pool.current_lane or '-'} | fixed {fixed_rate} | free {free_rate} | "
+            f"bench {len(pool.bench)} | demand age {demand} | download admission {budget}</>",
         )
 
     @staticmethod
-    def _pool_hit_rate(fulfilled: int, pops: int) -> str:
-        """Format one model-pool lane's fulfilled/popped count and percentage."""
+    def _pool_hit_rate(matches: int, pops: int, resident_hits: int) -> str:
+        """Format one model-pool lane's matches, pop rate, and resident subset."""
         if pops <= 0:
             return "0/0"
-        return f"{fulfilled}/{pops} ({fulfilled / pops * 100:.0f}%)"
+        return f"{matches}/{pops} matched ({matches / pops * 100:.0f}%); {resident_hits} resident"
 
     def _print_api_messages(
         self,

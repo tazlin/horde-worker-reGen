@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ModelPoolBenchRow,
+    ModelPoolSeatReadiness,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
 )
@@ -33,7 +34,13 @@ def test_enabled_pool_prints_seats_lanes_demand_and_budget() -> None:
     pool = ModelPoolSnapshot(
         enabled=True,
         seats=[
-            ModelPoolSeatRow(model="Deliberate", source="MANUAL", state="ACTIVE"),
+            ModelPoolSeatRow(
+                model="Deliberate",
+                source="MANUAL",
+                state="ACTIVE",
+                readiness=ModelPoolSeatReadiness.RESIDENT,
+                resident_device_indices=[0],
+            ),
             ModelPoolSeatRow(
                 model="AlbedoBase XL",
                 state="PENDING_DOWNLOAD",
@@ -49,18 +56,20 @@ def test_enabled_pool_prints_seats_lanes_demand_and_budget() -> None:
         download_bytes_charged=5 * 1024**3,
         fixed_pops=8,
         fixed_fulfilled=6,
+        fixed_resident_hits=5,
         free_pops=2,
         free_fulfilled=1,
+        free_resident_hits=0,
     )
 
     StatusReporter._print_model_pool(record, enabled=True, pool=pool)
 
     line = lines[0]
-    assert "Deliberate[M]" in line
+    assert "Deliberate[M] resident(gpu 0)" in line
     assert "AlbedoBase XL->Flux.1-dev[R] downloading" in line
-    assert "Starved[S]" in line
-    assert "fixed 6/8 (75%)" in line
-    assert "free 1/2 (50%)" in line
+    assert "Starved[S] cold" in line
+    assert "fixed 6/8 matched (75%); 5 resident" in line
+    assert "free 1/2 matched (50%); 0 resident" in line
     assert "bench 1" in line
     assert "demand age 42s" in line
     assert "5.0 GB/50 GB" in line

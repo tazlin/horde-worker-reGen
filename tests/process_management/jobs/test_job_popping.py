@@ -2118,6 +2118,25 @@ class TestPoolLaneGating:
         assert decision is None
         assert popper.latest_pool_lane() is None
 
+    def test_unrouted_cycle_retains_last_routed_lane_for_status(self) -> None:
+        """An idle-fill cycle does not erase the most recent pool lane shown in status."""
+        popper = self._popper(provider=lambda: frozenset({"model_a"}), enabled=True)
+        first = popper._apply_pool_lane(
+            {"model_a", "model_b"},
+            popper._runtime_config.bridge_data,
+            idle_fill_wanted=False,
+        )
+        assert first is not None
+
+        second = popper._apply_pool_lane(
+            {"model_a", "model_b"},
+            popper._runtime_config.bridge_data,
+            idle_fill_wanted=True,
+        )
+
+        assert second is None
+        assert popper.latest_pool_lane() is first.lane
+
     def test_disabled_pool_does_not_route(self) -> None:
         """A disabled pool never routes a pop, leaving the offer to the existing shaping."""
         popper = self._popper(provider=lambda: frozenset({"model_a"}), enabled=False)
@@ -2223,6 +2242,7 @@ class TestPoolOutcomeSink:
         assert outcome["lane"] is PopLane.FIXED
         assert outcome["advertised"] == frozenset({"model_a", "model_b"})
         assert outcome["popped_model"] is None
+        assert outcome["popped_model_was_resident"] is False
 
     @_full_flow_patches
     async def test_popped_fixed_lane_pop_reports_model(self, _mock_req_cls: Mock) -> None:
@@ -2249,6 +2269,34 @@ class TestPoolOutcomeSink:
         outcome = sink.call_args.kwargs
         assert outcome["lane"] is PopLane.FIXED
         assert outcome["popped_model"] == "model_a"
+        assert outcome["popped_model_was_resident"] is False
+
+    @_full_flow_patches
+    async def test_popped_resident_model_reports_resident_hit(self, _mock_req_cls: Mock) -> None:
+        """A model already loaded by a live inference process is reported as a resident match."""
+        job_response = make_job_pop_response(model="model_a")
+        sink = Mock()
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=job_response)
+        process_map = _make_process_map_with_available_processes()
+        process_map[0].loaded_horde_model_name = "model_a"
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=process_map,
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b"],
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: frozenset({"model_a", "model_b"}),
+            pool_pop_outcome_sink=sink,
+        )
+
+        await popper.api_job_pop()
+
+        assert sink.call_args.kwargs["popped_model_was_resident"] is True
+        tally = popper.latest_pool_lane_tally()
+        assert tally.fixed_resident_hits == 1
 
 
 def _empty_pop_response() -> Mock:

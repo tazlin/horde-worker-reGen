@@ -94,6 +94,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     JobFeatureSummary,
     JobQueueEntry,
     ModelPoolBenchRow,
+    ModelPoolSeatReadiness,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
     OrchestrationIntentSnapshot,
@@ -1606,7 +1607,14 @@ class HordeWorkerProcessManager:
         # per-tick throttle stamp. All three are built regardless of the enabled flag (so a mid-session
         # config enable needs no reconstruction); the poller task and pool tick gate on the live flag, and the
         # popper's lane routing is inert while the pool holds no seats, keeping a disabled pool byte-identical.
-        self._model_pool = ModelPool(build_pool_params(bridge_data.model_pool, self.max_inference_processes))
+        self._model_pool = ModelPool(
+            build_pool_params(
+                bridge_data.model_pool,
+                self.max_inference_processes,
+                eligible_models=self._pool_eligible_models(bridge_data),
+            ),
+        )
+        self._model_pool_ineligible_pins_warned: frozenset[str] = frozenset()
         self._model_demand_poller = ModelDemandPoller(
             self._submit_status_models_request,
             interval_seconds=bridge_data.model_pool.demand_poll_seconds,
@@ -1619,8 +1627,8 @@ class HordeWorkerProcessManager:
         self._model_pool_tick_last_at = 0.0
         self._model_pool_cluster_sizes: dict[str, int] | None = None
         # Cumulative bytes the pool has committed to downloading this session, charged when a seat's download is
-        # requested (never refunded on failure, since a failed download still consumed the bandwidth). Gates
-        # whether a further off-disk candidate fits the operator's pool download budget.
+        # requested (never refunded on failure). This session admission charge gates whether a further off-disk
+        # candidate fits the operator's configured pool allowance.
         self._model_pool_download_bytes_charged = 0
 
         self._job_popper = JobPopper(
@@ -4467,7 +4475,13 @@ class HordeWorkerProcessManager:
             return
         self._model_pool_tick_last_at = now
 
-        desired_params = build_pool_params(pool_config, self.max_inference_processes)
+        eligible_models = self._pool_eligible_models(self.bridge_data)
+        self._warn_ineligible_pool_pins(pool_config, eligible_models)
+        desired_params = build_pool_params(
+            pool_config,
+            self.max_inference_processes,
+            eligible_models=eligible_models,
+        )
         if desired_params != self._model_pool.params():
             for transition in self._model_pool.replace_params(desired_params, now):
                 self._emit_pool_transition(transition)
@@ -4479,6 +4493,31 @@ class HordeWorkerProcessManager:
         demand_is_stale = snapshot is None or snapshot.is_stale(now)
         for transition in self._model_pool.tick(now, ranked=ranked_candidates, demand_is_stale=demand_is_stale):
             self._emit_pool_transition(transition)
+
+    @staticmethod
+    def _pool_eligible_models(bridge_data: reGenBridgeData) -> frozenset[str]:
+        """Return resolved load models that the operator did not also skip."""
+        return frozenset(bridge_data.image_models_to_load).difference(bridge_data.image_models_to_skip or [])
+
+    def _warn_ineligible_pool_pins(
+        self,
+        pool_config: ModelPoolConfig,
+        eligible_models: frozenset[str],
+    ) -> None:
+        """Warn once per changed set of pins that load/skip rules make impossible to advertise."""
+        configured = frozenset(entry.name for entry in pool_config.pinned)
+        ineligible = configured.difference(eligible_models)
+        if ineligible == self._model_pool_ineligible_pins_warned:
+            return
+        if ineligible:
+            logger.warning(
+                "Ignoring model-pool pin(s) excluded by the resolved models_to_load/models_to_skip rules: "
+                f"{sorted(ineligible)}. Add them to models_to_load and remove them from models_to_skip before "
+                "they can hold a seat.",
+            )
+        elif self._model_pool_ineligible_pins_warned:
+            logger.info("All configured model-pool pins are eligible again; they may compete for seats.")
+        self._model_pool_ineligible_pins_warned = ineligible
 
     def _build_pool_ranked_candidates(
         self,
@@ -4651,11 +4690,12 @@ class HordeWorkerProcessManager:
             self._request_pool_download(transition.model)
 
     def _request_pool_download(self, model_name: str) -> None:
-        """Charge a newly-pending pool model against the session budget and command its background download.
+        """Charge a newly-pending pool model against the admission budget and command its background download.
 
-        The charge is booked at request time (not on completion) and is never refunded on failure, since a
-        failed download still consumed the bandwidth; the budget is a bandwidth ceiling, not a disk-occupancy
-        one. A model whose reference record declares no size is commanded but charges nothing this session.
+        The charge is booked at request time (not on completion) and is never refunded on failure because the
+        configured allowance counts admitted declared size rather than successful delivery. The charge is not
+        measured disk occupancy or transferred bandwidth. A model whose reference declares no size is commanded
+        but charges nothing this session.
         """
         size_bytes = self._pool_model_size_bytes(model_name)
         if size_bytes is not None:
@@ -6143,8 +6183,10 @@ class HordeWorkerProcessManager:
             download_bytes_charged=self._model_pool_download_bytes_charged,
             fixed_pops=tally.fixed_pops,
             fixed_fulfilled=tally.fixed_fulfilled,
+            fixed_resident_hits=tally.fixed_resident_hits,
             free_pops=tally.free_pops,
             free_fulfilled=tally.free_fulfilled,
+            free_resident_hits=tally.free_resident_hits,
         )
 
     def _model_pool_seat_row(self, seat: SeatView, now: float) -> ModelPoolSeatRow:
@@ -6152,6 +6194,20 @@ class HordeWorkerProcessManager:
         dwell_seconds = max(0.0, now - seat.seated_at) if seat.model is not None else None
         last_fulfilled_age = max(0.0, now - seat.last_fulfilled_at) if seat.last_fulfilled_at is not None else None
         rescue_expires_in = max(0.0, seat.rescue_expires_at - now) if seat.rescue_expires_at is not None else None
+        resident_processes = [
+            process
+            for process in self._process_map.values()
+            if seat.model is not None
+            and process.process_type is HordeProcessType.INFERENCE
+            and process.is_process_alive()
+            and process.loaded_horde_model_name == seat.model
+        ]
+        if seat.model is None:
+            readiness = ModelPoolSeatReadiness.EMPTY
+        elif resident_processes:
+            readiness = ModelPoolSeatReadiness.RESIDENT
+        else:
+            readiness = ModelPoolSeatReadiness.COLD
         return ModelPoolSeatRow(
             model=seat.model,
             source=str(seat.source) if seat.source is not None else None,
@@ -6159,6 +6215,10 @@ class HordeWorkerProcessManager:
             dwell_seconds=dwell_seconds,
             empty_pops=seat.empty_pops,
             last_fulfilled_age_seconds=last_fulfilled_age,
+            last_match_was_resident=seat.last_match_was_resident,
+            readiness=readiness,
+            resident_process_ids=sorted(process.process_id for process in resident_processes),
+            resident_device_indices=sorted({process.device_index for process in resident_processes}),
             pending_model=seat.pending_model,
             rescue_expires_in_seconds=rescue_expires_in,
         )

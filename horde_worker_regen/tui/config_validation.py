@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -63,6 +64,21 @@ def _uses_meta_command(entries: list[str]) -> bool:
     return False
 
 
+def _pinned_names(config: dict[str, Any]) -> list[str]:
+    """Return non-empty model names from the structured model-pool pin list."""
+    value = config.get("model_pool_pinned")
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
 def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationIssue]:
     """Return config interlock errors and warnings for the raw TUI state."""
     issues: list[ConfigValidationIssue] = []
@@ -105,10 +121,49 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
         if _int(config, "preload_timeout", 150) < 150:
             error("extra_slow_worker", "Extra slow worker forces Preload timeout to at least 150 seconds.")
 
-    skipped = {entry.lower() for entry in _list(config, "models_to_skip")}
-    duplicated = [entry for entry in models_to_load if entry.lower() in skipped]
+    skipped = {entry.casefold() for entry in _list(config, "models_to_skip")}
+    duplicated = [entry for entry in models_to_load if entry.casefold() in skipped]
     if duplicated:
         error("models_to_skip", f"Models to load also appears in Models to skip: {', '.join(duplicated)}.")
+
+    pinned = _pinned_names(config)
+    pinned_by_lower = {name.casefold(): name for name in pinned}
+    skipped_pins = [name for lowered, name in pinned_by_lower.items() if lowered in skipped]
+    if skipped_pins:
+        error(
+            "model_pool_pinned",
+            f"Pinned models also appear in Models to skip: {', '.join(skipped_pins)}.",
+        )
+    if models_to_load and not _uses_meta_command(models_to_load):
+        load_names = {name.casefold() for name in models_to_load}
+        ineligible_pins = [name for lowered, name in pinned_by_lower.items() if lowered not in load_names]
+        if ineligible_pins:
+            error(
+                "model_pool_pinned",
+                "Pinned models must also be present in the explicit Models to load list: "
+                f"{', '.join(ineligible_pins)}.",
+            )
+
+    pool_enabled = _bool(config, "model_pool_enabled")
+    if _bool(config, "max_throughput_mode") and not pool_enabled:
+        warning(
+            "model_pool_enabled",
+            "The demand-following pool preset is on, but Enable model pool is explicitly off; the explicit "
+            "override wins, so the preset cannot seat models.",
+        )
+    if pinned and not pool_enabled:
+        warning("model_pool_pinned", "Pinned models have no effect while Enable model pool is off.")
+    if pool_enabled and not _bool(config, "model_pool_ranker_enabled") and not pinned:
+        warning(
+            "model_pool_ranker_enabled",
+            "The model pool has neither a demand ranker nor pinned models, so it has nothing to seat.",
+        )
+    seats = _int(config, "model_pool_seats")
+    if seats > 0 and len(pinned) > seats:
+        warning(
+            "model_pool_pinned",
+            f"There are {len(pinned)} pinned models for {seats} seat(s); affinity decides which pins seat first.",
+        )
 
     if _bool(config, "gpu_sampling_lease_enabled") and _bool(config, "unload_models_from_vram_often"):
         warning(

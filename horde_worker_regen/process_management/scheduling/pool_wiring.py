@@ -12,7 +12,7 @@ Two pieces of policy live here so the pure modules stay policy-free:
 - ``seats: 0`` in config resolves to one seat per inference process (``max_inference_processes``).
 - Turning a bare model name into an expected earning rate needs a job signature and a price (resolution,
   steps, baseline, kudos pricing). The ranker refuses to pick those; this adapter does, using a canonical
-  per-baseline signature (an SDXL model is scored at 1024x1024 and every other baseline at 512x512, both at
+  per-baseline signature (native large-model baselines at 1024x1024 and smaller baselines at 512x512, both at
   the benchmark baseline step count) and a per-baseline canonical job price. The value handed to the ranker
   is kudos per wall second: canonical job price divided by expected sampling seconds plus a fixed per-job
   overhead, so deep queues of cheap fast jobs (whose wall time is dominated by the overhead every job pays)
@@ -31,7 +31,7 @@ from horde_worker_regen.process_management.scheduling.model_pool import PinnedMo
 from horde_worker_regen.process_management.scheduling.performance_model import baseline_signature
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection
 
     from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
     from horde_worker_regen.process_management.scheduling.performance_model import JobSignature
@@ -42,32 +42,55 @@ __all__ = [
 ]
 
 _SDXL_BASELINE = "stable_diffusion_xl"
-"""The baseline string whose canonical scoring resolution is the SDXL native square rather than the default."""
 
-_SDXL_SIGNATURE_RESOLUTION = 1024
-"""The canonical square resolution an SDXL model is scored at when building its expected-speed signature."""
+_NATIVE_1024_BASELINES = frozenset(
+    {
+        _SDXL_BASELINE,
+        "stable_cascade",
+        "flux_1",
+        "qwen_image",
+        "z_image_turbo",
+    },
+)
+"""Baselines whose benchmark and normal operating signature uses a 1024-pixel native square."""
+
+_NATIVE_1024_SIGNATURE_RESOLUTION = 1024
+"""Canonical square resolution for large-model baselines measured by the benchmark at 1024x1024."""
 
 _DEFAULT_SIGNATURE_RESOLUTION = 512
-"""The canonical square resolution every non-SDXL baseline is scored at when building its signature."""
+"""Canonical square resolution for smaller or unknown baselines."""
 
 
-def build_pool_params(config: ModelPoolConfig, max_inference_processes: int) -> PoolParams:
-    """Build the engine's :class:`PoolParams` from operator config, resolving the auto seat count.
+def build_pool_params(
+    config: ModelPoolConfig,
+    max_inference_processes: int,
+    *,
+    eligible_models: Collection[str] | None = None,
+) -> PoolParams:
+    """Build engine parameters, resolving auto seats and filtering pins against worker eligibility.
 
     A configured ``seats`` of 0 resolves to one seat per inference process; any positive value passes through.
-    Manual pins pass through as :class:`PinnedModel` entries preserving their affinity, and the ranker gate and
-    the rotation, dwell, and rescue tunables pass through unchanged. The engine-only tunables the config does
-    not surface keep their :class:`PoolParams` defaults.
+    Manual pins preserve their affinity. When ``eligible_models`` is supplied, a pin outside that set is
+    omitted so the engine cannot seat a model the worker's load/skip rules prevent the popper from advertising.
+    The ranker gate and the rotation, dwell, and rescue tunables pass through unchanged. Engine-only tunables
+    the config does not surface keep their :class:`PoolParams` defaults.
 
     Args:
         config: The operator's fixed-pool configuration.
         max_inference_processes: The running inference-process count, used to resolve an auto seat count.
+        eligible_models: The worker's resolved advertised model set. None preserves every configured pin for
+            import-light callers that do not own eligibility.
 
     Returns:
         The frozen :class:`PoolParams` the engine reconciles against.
     """
     seat_count = config.seats if config.seats > 0 else max_inference_processes
-    pinned = tuple(PinnedModel(name=entry.name, affinity=entry.affinity) for entry in config.pinned)
+    eligible = frozenset(eligible_models) if eligible_models is not None else None
+    pinned = tuple(
+        PinnedModel(name=entry.name, affinity=entry.affinity)
+        for entry in config.pinned
+        if eligible is None or entry.name in eligible
+    )
     return PoolParams(
         seat_count=seat_count,
         pinned=pinned,
@@ -111,11 +134,12 @@ def build_expected_value_adapter(
 ) -> Callable[[str], float | None]:
     """Create the ranker's ``name -> expected earning rate`` callable (kudos per wall second on this card).
 
-    The returned callable resolves a model's baseline, builds the canonical baseline signature (SDXL at
-    1024x1024, every other baseline at 512x512), and computes the earning rate: the baseline's canonical job
-    price divided by expected sampling seconds (signature steps over the performance model's expected it/s)
-    plus the fixed per-job overhead. A model whose baseline is unknown (or which the performance model has no
-    rate for) returns ``None``, which the ranker treats as neutral rather than excluding the model.
+    The returned callable resolves a model's baseline, builds the same native-resolution signature used by the
+    benchmark (1024x1024 for SDXL and large-model baselines; 512x512 otherwise), and computes the earning rate:
+    the baseline's canonical job price divided by expected sampling seconds (signature steps over the performance
+    model's expected it/s) plus the fixed per-job overhead. A model whose baseline is unknown (or which the
+    performance model has no rate for) returns ``None``, which the ranker treats as neutral rather than excluding
+    the model.
 
     Args:
         expected_its: The performance model's expected-it/s lookup for a job signature.
@@ -129,7 +153,9 @@ def build_expected_value_adapter(
         baseline = baseline_resolver(model_name)
         if baseline is None:
             return None
-        resolution = _SDXL_SIGNATURE_RESOLUTION if baseline == _SDXL_BASELINE else _DEFAULT_SIGNATURE_RESOLUTION
+        resolution = (
+            _NATIVE_1024_SIGNATURE_RESOLUTION if baseline in _NATIVE_1024_BASELINES else _DEFAULT_SIGNATURE_RESOLUTION
+        )
         signature = baseline_signature(baseline=baseline, resolution=resolution)
         sampling_its = expected_its(signature)
         if sampling_its is None or sampling_its <= 0:

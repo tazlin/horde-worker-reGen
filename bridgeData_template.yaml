@@ -361,24 +361,26 @@ models_to_skip:
 ## Fixed Model Pool        ##
 #############################
 
-# The fixed model pool commits the worker to a bounded set of "seats", each a model it keeps ready to serve,
-# so the horde returns work the card can run without a per-job model swap. It fills seats first from your
+# The fixed model pool commits the worker to a bounded set of logical "seats" and biases some pop requests
+# toward their models. A seat is not a residency guarantee: memory pressure or scheduling can leave it cold,
+# and the TUI/headless status report that readiness separately. It fills seats first from your
 # `pinned` list, then (when the ranker is on) from live horde demand weighted by how fast this card runs each
 # model. A model is held for a minimum dwell, then becomes eligible for a slow, timed re-contest against a
-# stronger candidate; a model that stops earning its seat benches and has to re-earn it. This is the supported
+# stronger candidate; a model that stops matching demand benches and has to re-enter. This is the supported
 # replacement for the deprecated `model_stickiness` knob below.
 #
-# Two advertising lanes run while the pool holds seats: the FIXED lane offers only the seated models (swap-free
-# work), and the FREE lane offers everything else (so cold and rare-model demand still reaches the worker). The
-# worker interleaves the two by live demand; the TUI shows the current lane. The whole section is off by
+# Two advertising lanes run while the pool holds seats: the FIXED lane offers only the seated models, and the
+# FREE lane offers everything else (so cold and rare-model demand still reaches the worker). A fixed-lane match
+# avoids a model load only when that seat is resident. The TUI shows the most recent routed lane and resident-hit
+# counts. The whole section is off by
 # default, leaving model selection exactly as it was.
 model_pool:
   # Turn the fixed model pool on. Off by default.
   enabled: false
 
   # How many seats to hold. 0 (the default) means one seat per inference process, resolved from your running
-  # concurrency. WARNING: seating more models than you have inference processes forfeits the guaranteed-
-  # residency regime (not every seat can keep a home process), so the swap-free promise weakens; keep seats at
+  # concurrency. WARNING: seating more models than you have inference processes means not every seat can have a
+  # resident home process; keep seats at
   # or below your inference-process count unless you know you want the trade.
   seats: 0
 
@@ -405,27 +407,28 @@ model_pool:
   # min_dwell_minutes: 10.0
 
   # Rescue donates one seat, time-boxed, to the single most-starved model (one with a very high requester wait)
-  # so otherwise-impossible jobs still get done. Off by default. `rescue_eta_seconds` is the wait at or above
+  # to increase its chance of being offered by this worker. Off by default. `rescue_eta_seconds` is the wait at
+  # or above
   # which a model counts as starved enough to warrant the borrowed seat; `rescue_window_minutes` is how long it
   # holds that seat before returning it to the ranker.
   rescue_enabled: false
   # rescue_eta_seconds: 10000.0
   # rescue_window_minutes: 15.0
 
-  # Disk (GB) the pool may spend auto-downloading a high-demand model it does not yet have on disk, so the
-  # ranker can seat a strong candidate you have not pre-fetched. 0 (the default) never auto-downloads, so the
-  # pool only ever seats models already on disk. A positive value lets the ranker fetch within this session
-  # budget.
+  # Session admission budget (declared-size GB) for ranker-initiated downloads. A request is charged its
+  # reference-declared full size when it starts; this is not measured disk occupancy or bandwidth, and a failed
+  # request is not refunded. 0 (the default) prevents ranker-initiated downloads, so ranker seats use models
+  # already on disk. Reaching the limit does not cancel a transfer that already started.
   download_budget_gb: 0.0
 
   # How often (seconds) the pool refreshes its live demand ranking. Floored at 60 to keep the poll gentle on
   # the horde's demand endpoint. Default 90.
   # demand_poll_seconds: 90.0
 
-# One-switch preset for maximum throughput: turns the fixed model pool on with its demand ranker and a 50GB
-# auto-download budget, so the worker serves a ranker-fed, slowly-rotating set and may fetch a strong model it
-# does not yet hold. Applied only where you left the matching `model_pool` fields at their defaults (an explicit
-# `model_pool` value always wins). Off by default.
+# Aggressive demand-following pool preset: turns the pool and ranker on and permits 50GB of declared-size
+# automatic-download admission per session. This may reduce model-swap churn when the chosen seats stay
+# resident; it does not guarantee maximum throughput. Applied only where you left the matching `model_pool`
+# fields at their defaults (an explicit `model_pool` value always wins). Off by default.
 max_throughput_mode: false
 
 # Suppress speed warnings if jobs are taking too long.

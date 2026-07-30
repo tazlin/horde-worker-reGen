@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from unittest.mock import Mock
 
-from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
+from horde_worker_regen.bridge_data.data_model import ModelPoolConfig, PinnedModelEntry
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.models.download_coordinator import ModelDownloadCoordinator
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
@@ -95,6 +95,23 @@ class TestModelPoolTick:
         assert manager._model_pool.active_seat_models() == frozenset()
         assert LedgerEventType.MODEL_POOL_SEATED not in _ledger_event_types(manager)
 
+    def test_pin_excluded_by_load_rules_never_holds_a_seat(self) -> None:
+        """Direct YAML cannot make the engine seat a pin the popper is unable to advertise."""
+        manager = make_testable_process_manager(
+            model_pool=ModelPoolConfig(
+                enabled=True,
+                seats=1,
+                ranker_enabled=False,
+                pinned=[PinnedModelEntry(name="not_offered")],
+            ),
+            image_models_to_load=["offered"],
+        )
+
+        manager._maybe_tick_model_pool()
+
+        assert manager._model_pool.params().pinned == ()
+        assert manager._model_pool.active_seat_models() == frozenset()
+
 
 class TestModelPoolDownloadBudget:
     """The manager gates off-disk pool candidates by the operator's download budget before the engine sees them."""
@@ -139,7 +156,7 @@ class TestModelPoolDownloadBudget:
         assert manager._model_pool_download_bytes_charged == 30 * _BYTES_PER_GIGABYTE
 
     def test_failed_download_is_not_refunded(self) -> None:
-        """A failed pool download resolves the seat but keeps its charged bytes, since the bandwidth was spent."""
+        """A failed pool download resolves the seat while retaining its declared-size admission charge."""
         manager = make_testable_process_manager(
             model_pool=ModelPoolConfig(enabled=True, seats=1, min_dwell_minutes=0.0, download_budget_gb=40.0),
             image_models_to_load=["offdisk_a"],

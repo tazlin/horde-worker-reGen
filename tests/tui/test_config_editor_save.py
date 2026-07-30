@@ -146,6 +146,25 @@ async def test_max_throughput_mode_allows_an_explicit_pool_override(tmp_path: Pa
 
 
 @pytest.mark.e2e
+async def test_structured_model_pool_pins_round_trip_from_form(tmp_path: Path) -> None:
+    """The model-pool tab exposes pins and saves their normalized affinity under the nested block."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "n"\nmodels_to_load:\n  - Deliberate\nmodel_pool:\n  enabled: true\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        pins = editor.query_one("#cfg-model_pool_pinned", TextArea)
+        pins.text = "- name: Deliberate\n  affinity: 0.8\n"
+        assert editor._save() is True
+        await pilot.pause()
+
+    reloaded = load_config(path)
+    assert reloaded["model_pool"]["pinned"] == [{"name": "Deliberate", "affinity": 0.8}]
+
+
+@pytest.mark.e2e
 async def test_preexisting_invalid_value_does_not_block_unrelated_save(tmp_path: Path) -> None:
     """A value already out of bounds on disk (and untouched) cannot block an unrelated edit."""
     app, path = await _mount(
@@ -460,6 +479,7 @@ async def test_action_bar_separates_presets_and_highlights_restart_edits(tmp_pat
         assert editor.query_one("#config-actions-separator") is not None
         assert editor.query_one("#config-restart", Button).variant == "default"
         assert "image generation" in _plain(editor.query_one("#config-effective-summary", Static))
+        assert "pool: off" in _plain(editor.query_one("#config-effective-summary", Static))
         assert "No unsaved changes" in _plain(editor.query_one("#config-change-summary", Static))
 
         editor.query_one("#cfg-max_batch", Input).value = "2"

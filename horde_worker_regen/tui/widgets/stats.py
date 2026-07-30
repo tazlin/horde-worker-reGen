@@ -230,28 +230,35 @@ class StatsView(Vertical):
 
     @staticmethod
     def _render_model_pool(pool: ModelPoolSnapshot) -> Panel:
-        """Render the fixed model pool's lane throughput: per-lane pops, fulfillment rate, seats, and bench.
+        """Render model-pool pop matches, resident hits, seat readiness, and bench size.
 
-        The fixed and free lanes are shown apart (fulfilled over pops, plus the hit rate) so an operator can
-        see whether the seated-model lane and the wider free lane are each earning the work they advertise for.
+        The fixed and free lanes are shown apart. Matches measure successful pop responses; resident hits are
+        the subset whose model was already loaded by a live inference process. Neither is completion throughput.
         """
         grid = Table.grid(padding=(0, 3))
         grid.add_column(style="bold cyan", no_wrap=True)
         grid.add_column(no_wrap=True)
         active_seats = sum(1 for seat in pool.seats if seat.model is not None)
-        grid.add_row("Seats", f"{active_seats} active / {len(pool.seats)} total")
+        resident_seats = sum(1 for seat in pool.seats if seat.readiness == "RESIDENT")
+        grid.add_row("Seats", f"{resident_seats} resident / {active_seats} seated / {len(pool.seats)} total")
         grid.add_row("Bench", str(len(pool.bench)))
-        grid.add_row("Current lane", pool.current_lane or "-")
-        grid.add_row("Fixed lane", StatsView._lane_throughput(pool.fixed_fulfilled, pool.fixed_pops))
-        grid.add_row("Free lane", StatsView._lane_throughput(pool.free_fulfilled, pool.free_pops))
+        grid.add_row("Last routed lane", pool.current_lane or "-")
+        grid.add_row(
+            "Fixed lane",
+            StatsView._lane_pop_summary(pool.fixed_fulfilled, pool.fixed_pops, pool.fixed_resident_hits),
+        )
+        grid.add_row(
+            "Free lane",
+            StatsView._lane_pop_summary(pool.free_fulfilled, pool.free_pops, pool.free_resident_hits),
+        )
         return Panel(grid, title="Model pool", title_align="left", border_style="grey37", padding=(0, 1))
 
     @staticmethod
-    def _lane_throughput(fulfilled: int, pops: int) -> str:
-        """Format a lane's fulfilled-over-pops throughput with its hit rate, or a dash before any pop."""
+    def _lane_pop_summary(matches: int, pops: int, resident_hits: int) -> str:
+        """Format a lane's matches, pop rate, and resident subset, or a dash before any pop."""
         if pops <= 0:
             return "-"
-        return f"{fulfilled:,} / {pops:,} fulfilled ({fulfilled / pops * 100:.0f}%)"
+        return f"{matches:,} / {pops:,} matched ({matches / pops * 100:.0f}%); {resident_hits:,} resident"
 
     @staticmethod
     def _render_rollups(

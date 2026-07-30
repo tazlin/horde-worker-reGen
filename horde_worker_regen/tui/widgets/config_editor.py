@@ -823,7 +823,7 @@ class ConfigEditorView(Vertical):
         else:
             changed_keys = {key for key, value in current.items() if baseline.get(key) != value}
 
-        # Toggling Max throughput mode refreshes its three absent pool controls to their effective values. Those
+        # Toggling the demand-following preset refreshes its three absent pool controls to their effective values.
         # display-only changes must not be persisted as explicit overrides: doing so would freeze the preset's
         # current bundle into YAML and defeat its "operator values win, absent values inherit" contract. A value
         # that differs from the new inherited value is a real operator edit and remains in changed_keys.
@@ -1157,9 +1157,25 @@ class ConfigEditorView(Vertical):
         if bool(state.get("load_large_models")):
             feature_bits.append("large models allowed")
 
+        if bool(state.get("model_pool_enabled")):
+            seat_count = self._state_int(state, "model_pool_seats", 0)
+            seat_text = "auto seats" if seat_count == 0 else f"{seat_count} seat(s)"
+            raw_pins = state.get("model_pool_pinned")
+            pin_count = len(raw_pins) if isinstance(raw_pins, list) else 0
+            ranker = "ranker on" if bool(state.get("model_pool_ranker_enabled")) else "ranker off"
+            budget = state.get("model_pool_download_budget_gb", 0)
+            try:
+                budget_value = float(budget) if isinstance(budget, int | float | str) else 0.0
+                budget_text = f", {budget_value:g} GB download admission" if budget_value > 0 else ""
+            except (TypeError, ValueError):
+                budget_text = ""
+            pool_text = f"pool: {seat_text}, {pin_count} pin(s), {ranker}{budget_text}"
+        else:
+            pool_text = "pool: off"
+
         text = Text("Current: ", style="bold")
         text.append(role, style="cyan" if dreamer or alchemist else "red")
-        text.append(f"  |  {process_text}  |  models: {model_text}  |  ")
+        text.append(f"  |  {process_text}  |  models: {model_text}  |  {pool_text}  |  ")
         text.append(" / ".join(feature_bits))
         return text
 

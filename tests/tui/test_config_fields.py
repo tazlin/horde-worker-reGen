@@ -62,6 +62,23 @@ def test_custom_models_yaml_validation() -> None:
         coerce_value(_BY_KEY["custom_models"], '- name: "bad"\n  baseline: "stable_diffusion_1"\n')
 
 
+def test_model_pool_pins_are_structured_and_validated() -> None:
+    """The visible pin editor normalizes names/affinities and rejects malformed or duplicate pins."""
+    pins = _BY_KEY["model_pool_pinned"]
+
+    assert pins.hidden is False
+    assert coerce_value(pins, "- name: Deliberate\n  affinity: 0.8\n- name: Flux.1-dev\n") == [
+        {"name": "Deliberate", "affinity": 0.8},
+        {"name": "Flux.1-dev", "affinity": 1.0},
+    ]
+    with pytest.raises(ValueError, match="appears more than once"):
+        coerce_value(pins, "- name: Deliberate\n- name: deliberate\n")
+    with pytest.raises(ValueError, match="greater than 0 and at most 1"):
+        coerce_value(pins, "- name: Deliberate\n  affinity: 2\n")
+    with pytest.raises(ValueError, match="unknown field"):
+        coerce_value(pins, "- name: Deliberate\n  priority: 1\n")
+
+
 def test_pipeline_disaggregation_field_is_visible_advanced() -> None:
     """The experimental disaggregation option is catalogued under Advanced and rendered for the operator."""
     field = _BY_KEY["enable_pipeline_disaggregation"]

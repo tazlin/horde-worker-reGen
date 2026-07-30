@@ -62,8 +62,8 @@ class InsightsView(VerticalScroll):
             ("off", "bold grey62"),
             (
                 "  ·  the worker serves your whole model list evenly, for the widest variety of jobs. Enabling "
-                "the pool (or Max throughput mode) commits it to a small, ready seat set: fewer model swaps and "
-                "higher kudos/hr, at the cost of serving less model variety.",
+                "the pool (or the demand-following preset) biases pops toward a small seat set. This can reduce "
+                "model swaps when those seats are resident, at the cost of serving less model variety.",
                 "grey62",
             ),
         )
@@ -123,20 +123,26 @@ class InsightsView(VerticalScroll):
         demand = human_duration(pool.demand_age_seconds) if pool.demand_age_seconds is not None else "-"
         parts = [
             Text.assemble(("Lane ", "grey70"), (lane, "bold")),
-            Text.assemble(("seats ", "grey70"), (str(pool.last_fixed_seat_count), "bold")),
+            Text.assemble(
+                ("resident ", "grey70"),
+                (str(sum(seat.readiness == "RESIDENT" for seat in pool.seats)), "bold"),
+                (f" / {sum(seat.model is not None for seat in pool.seats)} seated", "grey70"),
+            ),
+            Text.assemble(("last fixed offer ", "grey70"), (str(pool.last_fixed_seat_count), "bold")),
             Text.assemble(("demand ", "grey70"), (demand, "bold")),
         ]
         if pool.download_budget_gb > 0:
             used = human_bytes(pool.download_bytes_charged)
             total = f"{pool.download_budget_gb:.1f} GB"
-            parts.append(Text.assemble(("budget ", "grey70"), (f"{used} / {total}", "bold")))
+            parts.append(Text.assemble(("download admission ", "grey70"), (f"{used} / {total}", "bold")))
         return Text("  ·  ").join(parts)
 
     def _render_pool_seats(self, pool: ModelPoolSnapshot) -> Table:
-        """Render the pool's seats as a compact table (model, source, state, dwell, fulfilled age, empty, rescue).
+        """Render the pool's seats as a compact table with readiness and recent-match evidence.
 
-        The fulfilled-age column is how long since each seat last served work: a fresh age is a seat earning
-        its place, while a growing age alongside empty pops is what pushes a seat toward demotion.
+        ``Readiness`` distinguishes a logical seat from a model currently loaded by a live inference process.
+        ``Matched`` is the age of the last successful pop for the seat; its suffix says whether that match was
+        resident or cold. It does not claim that the accepted job has completed.
         """
         table = Table.grid(padding=(0, 2))
         table.add_column(justify="left")
@@ -149,28 +155,32 @@ class InsightsView(VerticalScroll):
         table.add_row(
             Text("Model", style="bold grey70"),
             Text("Src", style="bold grey70"),
-            Text("State", style="bold grey70"),
+            Text("Readiness", style="bold grey70"),
             Text("Dwell", style="bold grey70"),
-            Text("Fulfilled", style="bold grey70"),
+            Text("Matched", style="bold grey70"),
             Text("Empty", style="bold grey70"),
             Text("Rescue", style="bold grey70"),
         )
         for seat in pool.seats:
             model = seat.model if seat.model is not None else "-"
-            state = f"dl:{seat.pending_model}" if seat.pending_model is not None else str(seat.state)
+            readiness = str(seat.readiness).lower()
+            if seat.pending_model is not None:
+                readiness = f"{readiness} · dl:{seat.pending_model}"
             dwell = human_duration(seat.dwell_seconds) if seat.dwell_seconds is not None else "-"
-            fulfilled = (
+            matched = (
                 human_duration(seat.last_fulfilled_age_seconds) if seat.last_fulfilled_age_seconds is not None else "-"
             )
+            if seat.last_match_was_resident is not None and matched != "-":
+                matched += " resident" if seat.last_match_was_resident else " cold"
             rescue = (
                 human_duration(seat.rescue_expires_in_seconds) if seat.rescue_expires_in_seconds is not None else "-"
             )
             table.add_row(
                 Text(model),
                 self._source_glyph(seat.source),
-                Text(state, style="grey70"),
+                Text(readiness, style="green" if seat.readiness == "RESIDENT" else "grey70"),
                 Text(dwell),
-                Text(fulfilled),
+                Text(matched),
                 Text(str(seat.empty_pops)),
                 Text(rescue),
             )

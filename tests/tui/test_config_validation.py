@@ -75,3 +75,50 @@ def test_subtle_interactions_warn_without_error() -> None:
 
     assert not [issue for issue in issues if issue.severity is ConfigValidationSeverity.ERROR]
     assert len([issue for issue in issues if issue.severity is ConfigValidationSeverity.WARNING]) == 3
+
+
+def test_model_pool_pins_must_be_eligible_and_not_skipped() -> None:
+    """A manual pin that cannot be advertised is blocked before save."""
+    errors = _messages(
+        {
+            "dreamer": True,
+            "model_pool_enabled": True,
+            "model_pool_pinned": [{"name": "Pinned", "affinity": 1.0}],
+            "models_to_load": ["Other"],
+            "models_to_skip": ["Pinned"],
+        },
+        ConfigValidationSeverity.ERROR,
+    )
+
+    assert any("Models to skip" in message for message in errors)
+    assert any("explicit Models to load" in message for message in errors)
+
+
+def test_model_pool_configuration_contradictions_warn() -> None:
+    """Valid but ineffective pool combinations are called out without blocking save."""
+    warnings = _messages(
+        {
+            "dreamer": True,
+            "max_throughput_mode": True,
+            "model_pool_enabled": False,
+            "model_pool_ranker_enabled": False,
+            "model_pool_seats": 1,
+            "model_pool_pinned": [{"name": "A"}, {"name": "B"}],
+            "models_to_load": ["all"],
+        },
+        ConfigValidationSeverity.WARNING,
+    )
+
+    assert any("preset is on" in message for message in warnings)
+    assert any("no effect" in message for message in warnings)
+    assert any("2 pinned models for 1 seat" in message for message in warnings)
+
+
+def test_enabled_pins_only_pool_without_pins_warns() -> None:
+    """A pool with both seat sources disabled cannot populate a seat."""
+    warnings = _messages(
+        {"dreamer": True, "model_pool_enabled": True, "model_pool_ranker_enabled": False},
+        ConfigValidationSeverity.WARNING,
+    )
+
+    assert any("nothing to seat" in message for message in warnings)

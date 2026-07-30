@@ -7,6 +7,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ModelPoolSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
+    StatsSample,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -83,9 +84,9 @@ def _seat(model: str, **overrides: object) -> ModelPoolSeatRow:
     return ModelPoolSeatRow(**base)  # type: ignore[arg-type]
 
 
-def test_pool_off_many_models_offers_the_trade() -> None:
-    """With the pool off and many distinct models served recently, a variety-vs-throughput nudge appears."""
-    result = analyze(_snapshot(recent_jobs=_jobs(["A", "B", "C", "D", "E", "F", "G", "H"])))
+def test_pool_off_measured_swaps_offer_the_trade() -> None:
+    """With the pool off and actual model-swap churn, a variety trade-off nudge appears."""
+    result = analyze(_snapshot(latest_stats_sample=StatsSample(churn_counts={"model_swap": 4})))
     hit = next((item for item in result if "pool off" in item.title.lower()), None)
     assert hit is not None
     assert hit.severity is Severity.SUGGESTION
@@ -93,9 +94,9 @@ def test_pool_off_many_models_offers_the_trade() -> None:
     assert "variety" in hit.detail.lower()
 
 
-def test_pool_off_few_models_stays_quiet() -> None:
-    """Serving only a couple of models with the pool off does not trigger the pool nudge."""
-    result = analyze(_snapshot(recent_jobs=_jobs(["A", "B", "A", "B", "A", "B", "A", "B"])))
+def test_pool_off_distinct_models_without_measured_swaps_stays_quiet() -> None:
+    """Distinct recent models alone do not prove that the worker displaced any resident model."""
+    result = analyze(_snapshot(recent_jobs=_jobs(["A", "B", "C", "D", "E", "F", "G", "H"])))
     assert not any("pool off" in item.title.lower() for item in result)
 
 
@@ -110,7 +111,7 @@ def test_pool_on_unproductive_seat_suggests_review() -> None:
     """A seat taking many empty pops is flagged for rotation/ranker review."""
     pool = ModelPoolSnapshot(enabled=True, seats=[_seat("A", empty_pops=6)], demand_age_seconds=30.0)
     result = analyze(_snapshot(model_pool=pool))
-    assert any("not earning" in item.title.lower() for item in result)
+    assert any("not matching" in item.title.lower() for item in result)
 
 
 def test_pool_on_charged_download_is_not_reported_as_budget_blocked() -> None:
@@ -126,24 +127,51 @@ def test_pool_on_charged_download_is_not_reported_as_budget_blocked() -> None:
     assert not any("budget" in item.title.lower() for item in result)
 
 
-def test_pool_on_earning_seats_are_noted_positively() -> None:
-    """A pool whose seats served work recently and cleanly gets a positive 'earning' line."""
+def test_pool_on_resident_matches_are_noted_positively() -> None:
+    """A recent pop match is positive only when its model was resident at acceptance time."""
     pool = ModelPoolSnapshot(
         enabled=True,
-        seats=[_seat("A", last_fulfilled_age_seconds=20.0, dwell_seconds=300.0)],
+        seats=[
+            _seat(
+                "A",
+                last_fulfilled_age_seconds=20.0,
+                last_match_was_resident=True,
+                dwell_seconds=300.0,
+            ),
+        ],
         demand_age_seconds=30.0,
     )
     result = analyze(_snapshot(model_pool=pool))
-    assert any("earning" in item.title.lower() for item in result)
+    assert any("resident matches" in item.title.lower() for item in result)
 
 
-def test_pool_on_earning_line_suppressed_when_a_pool_issue_fires() -> None:
+def test_pool_on_cold_match_does_not_claim_residency_benefit() -> None:
+    """A fresh cold pop match does not claim that the pool avoided a model load."""
+    pool = ModelPoolSnapshot(
+        enabled=True,
+        seats=[_seat("A", last_fulfilled_age_seconds=20.0, last_match_was_resident=False, dwell_seconds=300.0)],
+        demand_age_seconds=30.0,
+    )
+
+    result = analyze(_snapshot(model_pool=pool))
+
+    assert not any("resident matches" in item.title.lower() for item in result)
+
+
+def test_pool_on_resident_match_line_suppressed_when_a_pool_issue_fires() -> None:
     """The positive line is withheld while a pool problem (here, stale demand) is outstanding."""
     pool = ModelPoolSnapshot(
         enabled=True,
-        seats=[_seat("A", last_fulfilled_age_seconds=20.0, dwell_seconds=300.0)],
+        seats=[
+            _seat(
+                "A",
+                last_fulfilled_age_seconds=20.0,
+                last_match_was_resident=True,
+                dwell_seconds=300.0,
+            ),
+        ],
         demand_age_seconds=1200.0,
     )
     result = analyze(_snapshot(model_pool=pool))
-    assert not any("earning" in item.title.lower() for item in result)
+    assert not any("resident matches" in item.title.lower() for item in result)
     assert any("stale" in item.title.lower() for item in result)

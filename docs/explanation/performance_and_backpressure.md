@@ -221,9 +221,10 @@ for the measured analysis.
 
 **Superseded by the fixed model pool.** `model_stickiness` is deprecated. It
 biased a single pop toward the already-loaded models; the
-[fixed model pool](model_pool.md) instead commits the worker to a standing set of
-seated models and narrows its pop advertisement toward them (its **fixed lane**),
-which is the durable version of the same swap-avoidance intent. A worker still
+[fixed model pool](model_pool.md) commits the worker to a standing logical set of
+seated models and narrows its pop advertisement toward them (its **fixed lane**).
+The scheduler prefers residency for that set and reports cold seats separately, making
+this the durable version of the same swap-avoidance intent. A worker still
 carrying a positive `model_stickiness` with the pool off is mapped onto a modest
 pool automatically (ranker on, a 30-minute rotation) wherever the `model_pool`
 fields were left at their defaults, and a one-time deprecation notice is logged.
