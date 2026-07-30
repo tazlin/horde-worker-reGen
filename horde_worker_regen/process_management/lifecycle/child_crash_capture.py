@@ -27,6 +27,7 @@ writes behave the same on both; there are no POSIX-only paths here).
 from __future__ import annotations
 
 import faulthandler
+import os
 import re
 import sys
 import traceback
@@ -47,6 +48,15 @@ _FAULTHANDLER_FILES: list[object] = []
 outlive the call; letting it be garbage-collected would close the file and silence the backstop.
 """
 
+_FAULTHANDLER_MAX_BYTES = 1_000_000
+"""Size at which a role's fault file is rolled aside to a single ``.1`` companion before reopening.
+
+The file is append-mode and shared across every launch of a role, so a process that faults on most of its
+launches accumulates dumps without bound. Each dump carries the interpreter's full extension-module list,
+so the file grows by kilobytes per fault and can reach megabytes of history whose oldest entries predate
+anything else in a log bundle. One generation of history is enough to cover the launches a diagnosis
+spans, and rolling rather than truncating keeps the immediately preceding run readable."""
+
 
 def enable_child_faulthandler(role: str) -> None:
     """Point :mod:`faulthandler` at ``logs/bridge_{role}.faulthandler`` for hard-fault capture.
@@ -56,16 +66,45 @@ def enable_child_faulthandler(role: str) -> None:
     and kept open for the process lifetime. Any failure is swallowed so enabling capture can never stop
     the worker from starting.
 
+    A dated banner naming the role and OS pid is written and flushed on entry. faulthandler's own output
+    carries no timestamp, and the file accumulates across every launch of the role, so without the banner a
+    dump cannot be attributed to a launch or lined up against the timestamped logs. The file is also rolled
+    aside once it passes :data:`_FAULTHANDLER_MAX_BYTES` so that history stays bounded.
+
     Args:
         role: Short identifier for the writing process (e.g. ``"main"``, ``"inference_0"``), used to
             name the per-process file so concurrent children never write to the same handle.
     """
     try:
         _LOG_DIR.mkdir(exist_ok=True)
-        fault_file = (_LOG_DIR / f"bridge_{role}.faulthandler").open("a", encoding="utf-8")
+        fault_path = _LOG_DIR / f"bridge_{role}.faulthandler"
+        _roll_oversized_fault_file(fault_path)
+        fault_file = fault_path.open("a", encoding="utf-8")
         _FAULTHANDLER_FILES.append(fault_file)
+        fault_file.write(
+            f"\n=== {role} pid={os.getpid()} faulthandler armed {datetime.now().isoformat(timespec='seconds')}\n",
+        )
+        # Flushed immediately: a fault can arrive before any buffered write would reach disk, and an
+        # unflushed banner would leave the dump it belongs to unattributed.
+        fault_file.flush()
         faulthandler.enable(file=fault_file)  # type: ignore[arg-type]
     except Exception:  # noqa: BLE001 - crash capture must never block the worker from starting
+        return
+
+
+def _roll_oversized_fault_file(fault_path: Path) -> None:
+    """Move a fault file past its size bound aside to a single ``.1`` companion, replacing any previous one.
+
+    Args:
+        fault_path: The role's fault file, which may not exist yet.
+    """
+    try:
+        if not fault_path.exists() or fault_path.stat().st_size < _FAULTHANDLER_MAX_BYTES:
+            return
+        fault_path.replace(fault_path.with_suffix(fault_path.suffix + ".1"))
+    except OSError:
+        # A fault file that cannot be rolled is still usable for capture, so keep the larger file rather
+        # than losing the backstop.
         return
 
 

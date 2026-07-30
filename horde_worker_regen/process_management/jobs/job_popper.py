@@ -393,6 +393,8 @@ class JobPopper:
     _model_metadata: ModelMetadata | None
     _post_processing_lane_commitments_provider: Callable[[], int]
     _extended_controlnet_ready_provider: Callable[[], bool]
+    _post_processing_lane_paused_provider: Callable[[], bool]
+    _vram_pressure_provider: Callable[[], bool]
 
     def __init__(
         self,
@@ -414,6 +416,8 @@ class JobPopper:
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
+        post_processing_lane_paused_provider: Callable[[], bool] | None = None,
+        vram_pressure_provider: Callable[[], bool] | None = None,
         staged_models_provider: Callable[[], frozenset[str]] | None = None,
         action_ledger: ActionLedger | None = None,
         on_job_popped: Callable[[ImageGenerateJobPopResponse], None] | None = None,
@@ -450,6 +454,16 @@ class JobPopper:
         right now. It is ANDed with the operator's `extended_controlnet` flag to decide the per-pop
         `allow_extended_controlnet` offer, so a fresh install advertises extended only once its annotators
         land. It defaults to "never ready", keeping the offer fail-closed when a popper is wired without it.
+
+        `post_processing_lane_paused_provider` reports whether the dedicated post-processing lane is currently
+        held off the GPU. A paused lane cannot run an upscale or face-fix, so the pop stops advertising
+        post-processing while it is down. It defaults to "never paused", which is the truth for a worker wired
+        without a lifecycle manager (and for the tests).
+
+        `vram_pressure_provider` reports whether every governed card is at or below the device-free governor's
+        PRESSURE floor. It gates the very-large-model offer narrowing, which stops advertising models that want
+        the whole card while no card has room for one. It defaults to "never under pressure", so a popper wired
+        without it advertises the full configured set.
 
         `staged_models_provider` reports the models staged in RAM (loadable without a fresh download/stage).
         It widens the residency-bias floor beyond the VRAM-resident set so a narrowed pop can also offer work
@@ -496,6 +510,16 @@ class JobPopper:
         self._extended_controlnet_ready_provider = (
             extended_controlnet_ready_provider if extended_controlnet_ready_provider is not None else (lambda: False)
         )
+        # Both default to the benign reading, so a popper wired without them advertises exactly as before: the
+        # lane is not paused and no card is under VRAM pressure.
+        self._post_processing_lane_paused_provider = (
+            post_processing_lane_paused_provider
+            if post_processing_lane_paused_provider is not None
+            else (lambda: False)
+        )
+        self._vram_pressure_provider = (
+            vram_pressure_provider if vram_pressure_provider is not None else (lambda: False)
+        )
         self._staged_models_provider = (
             staged_models_provider if staged_models_provider is not None else (lambda: frozenset())
         )
@@ -519,6 +543,9 @@ class JobPopper:
         self._pool_lane_this_cycle: PopLane | None = None
         self._pool_last_routed_lane: PopLane | None = None
         self._large_model_pop_governor = LargeModelPopGovernor()
+        # Edge-log anchor for the VRAM-pressure offer narrowing, so a steady narrow (or steady full) offer is
+        # never re-logged pop after pop.
+        self._vram_pressure_narrowing = False
         # Notified once per popped job. With background downloads enabled this is the aux-prefetch
         # coordinator's pop trigger (place the job's LoRAs/TIs on disk while it is still pending); without
         # them the manager wires a guard that faults auxiliary-bearing jobs immediately, since nothing could
@@ -750,6 +777,48 @@ class JobPopper:
             )
             return models.difference(decision.withheld)
         return models
+
+    def _apply_vram_pressure_model_narrowing(self, models: set[str]) -> set[str]:
+        """Drop whole-card (EXTRA_LARGE) models from the offer while every governed card is under VRAM pressure.
+
+        A model that wants the whole card cannot be hosted on a card already below the device-free governor's
+        soft floor, so advertising it only earns work that waits on a reclaim that may never come. The pressure
+        reading is the governor's own debounced state (two agreeing samples), so the offer does not flap on a
+        single dip.
+
+        Two rails bound the narrowing:
+
+        - It never applies while the worker holds no work locally. A worker configured only with whole-card
+          models would otherwise offer nothing, be sent nothing, and so never generate the activity that would
+          relieve the pressure it is waiting on.
+        - It never returns an empty set. When every offered model is whole-card, the full set is offered
+          unchanged for the same reason.
+        """
+        if not self._vram_pressure_provider():
+            self._log_vram_pressure_narrowing_edge(narrowing=False, withheld_count=0)
+            return models
+        if self._job_tracker.num_jobs_total == 0:
+            self._log_vram_pressure_narrowing_edge(narrowing=False, withheld_count=0)
+            return models
+        narrowed = {model for model in models if not self._is_large_model(model)}
+        if not narrowed:
+            self._log_vram_pressure_narrowing_edge(narrowing=False, withheld_count=0)
+            return models
+        self._log_vram_pressure_narrowing_edge(narrowing=True, withheld_count=len(models) - len(narrowed))
+        return narrowed
+
+    def _log_vram_pressure_narrowing_edge(self, *, narrowing: bool, withheld_count: int) -> None:
+        """Emit the edge-triggered engage/release line for the VRAM-pressure offer narrowing."""
+        if narrowing == self._vram_pressure_narrowing:
+            return
+        self._vram_pressure_narrowing = narrowing
+        if narrowing:
+            logger.info(
+                f"VRAM-pressure offer narrowing engaged: withholding {withheld_count} whole-card model(s) from "
+                "the pop offer while every governed card sits below the device-free governor's soft floor.",
+            )
+            return
+        logger.info("VRAM-pressure offer narrowing released: advertising the whole-card models again.")
 
     def _resident_model_names(self) -> frozenset[str]:
         """The models currently resident on a sampler slot (loaded in VRAM on some inference process)."""
@@ -1207,6 +1276,24 @@ class JobPopper:
             + shared_lane_commitments
         )
 
+    def _post_processing_offer_withheld(self) -> bool:
+        """Whether the worker's post-processing self-protection withholds the capability from this pop.
+
+        Three independent reasons, any of which stops the advertising so the worker is not handed more
+        upscale/face-fix work it cannot host (which would keep faulting toward the horde's forced-maintenance):
+        the reactive fault breaker (repeated unhostable peaks), the proactive headroom gate (the parent measures
+        the card's free VRAM below the post-processing peak), and the dedicated lane being held off the GPU.
+
+        The paused-lane read is derived live rather than latched. Whoever paused the lane owns its restore, so
+        the offer follows the lane back up on its own; borrowing either latch would instead leave the offer
+        gated on a third party clearing state it does not own.
+        """
+        return (
+            self._state.post_processing_disabled_by_breaker
+            or self._state.post_processing_withheld_for_headroom
+            or self._post_processing_lane_paused_provider()
+        )
+
     def _should_withhold_post_processing_offer(self, bridge_data: reGenBridgeData) -> bool:
         """Return whether this pop should stop advertising post-processing until the lane catches up."""
         if not bridge_data.post_processing_lane_enabled:
@@ -1432,11 +1519,10 @@ class JobPopper:
                 all other preconditions (queue-full, free process, megapixelstep wait, error
                 backoff) are still enforced below.
         """
-        if self._state.shutting_down:
-            self._state.last_pop_no_jobs_available = False
-            return
-
-        if self._state.supervisor_paused or self._state.self_throttle_paused:
+        if self._state.workload_intake_paused:
+            # Every workload flow shares this boundary (shutdown, operator/self pause, download-only hold, and
+            # terminal-recovery park). Keep it centralized on WorkerState so a new flow cannot accidentally
+            # accept work under a worker-wide hold.
             self._state.last_pop_no_jobs_available = False
             return
 
@@ -1463,11 +1549,6 @@ class JobPopper:
             # CPU-only torch build: image generation is impractically slow and is disabled, so this (image)
             # popper never pops. Alchemy runs on its own loop and is unaffected. This is the runtime
             # equivalent of a 'cpu' install sentinel; sticky for the session (a build fact).
-            self._state.last_pop_no_jobs_available = False
-            return
-
-        if self._state.downloads_only_hold:
-            # Download-only posture: pre-fetch models without committing the GPU; pop nothing until GO_LIVE.
             self._state.last_pop_no_jobs_available = False
             return
 
@@ -1599,6 +1680,11 @@ class JobPopper:
         if len(models) == 0:
             return
 
+        # Stop promising what the card cannot host: while every governed card is under VRAM pressure, the
+        # whole-card models come off the offer. Floored so the offer never empties and skipped while the worker
+        # is idle, since a whale-only worker that advertised nothing could never recover.
+        models = self._apply_vram_pressure_model_narrowing(models)
+
         # Fixed-pool advertising lane: when the pool holds seats, route this pop through the fixed lane (the
         # seated models, so the horde returns work the card runs without a swap) or the free lane (the rest,
         # so cold demand still reaches the worker), interleaved by a weighted round-robin. A fixed-lane offer
@@ -1624,11 +1710,7 @@ class JobPopper:
         pop_allow_post_processing = (
             advertised.allow_post_processing if advertised is not None else bridge_data.allow_post_processing
         )
-        # Withheld by the worker's post-processing self-protection: the reactive fault breaker (repeated
-        # unhostable peaks) or the proactive headroom gate (the parent measures the card's free VRAM below the
-        # post-processing peak). Either way, stop advertising post-processing so the worker is not handed more
-        # upscale/face-fix jobs it cannot host (which would keep faulting toward the horde's forced-maintenance).
-        if self._state.post_processing_disabled_by_breaker or self._state.post_processing_withheld_for_headroom:
+        if self._post_processing_offer_withheld():
             pop_allow_post_processing = False
         pop_allow_controlnet = advertised.allow_controlnet if advertised is not None else bridge_data.allow_controlnet
         pop_allow_sdxl_controlnet = (

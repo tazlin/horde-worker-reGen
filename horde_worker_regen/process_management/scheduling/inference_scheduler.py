@@ -6357,16 +6357,24 @@ class InferenceScheduler:
         """Cycle the safety model off the GPU to reclaim its context (:class:`VramActuator`)."""
         return self._pause_safety_for_residency_if_idle(device_index)
 
-    def build_reclaim_ladder_candidates(self, device_index: int | None) -> LadderCandidates:
+    def build_reclaim_ladder_candidates(
+        self,
+        device_index: int | None,
+        *,
+        protected_models: frozenset[str] = frozenset(),
+    ) -> LadderCandidates:
         """Assemble the idle-filtered inputs the verified reclaim ladder orders into rungs for a card.
 
         Every actively-sampling process is excluded, so a busy tenant can never become a rung. Idle inference
-        processes still holding a model (and not serving an in-progress job) are unload candidates, ranked by
-        recency via their last model-state report. The reclaimable-cache targets reuse the arbiter's
-        release-cache selection (idle processes whose reservation exceeds allocation by the release threshold,
-        holding no model). Lane and safety candidates are included only while their context is on the GPU, in
-        the fixed pause order the ladder escalates through. Promised-free figures are the tenants' measured
-        reservations where known, so verification compares realized frees against measured expectations.
+        processes still holding a model (and not serving in-progress or caller-protected demand) are unload
+        candidates, ranked by recency via their last model-state report. ``protected_models`` lets SOS protect
+        the exact resident capacity a wedged queue is waiting to dispatch without weakening ordinary
+        device-pressure reclaim, which may evict queued lookahead to make room for the head. The
+        reclaimable-cache targets reuse the arbiter's release-cache selection (idle processes whose reservation
+        exceeds allocation by the release threshold, holding no model). Lane and safety candidates are included
+        only while their context is on the GPU, in the fixed pause order the ladder escalates through.
+        Promised-free figures are the tenants' measured reservations where known, so verification compares
+        realized frees against measured expectations.
         """
         now_monotonic = time.monotonic()
         now_wall = time.time()
@@ -6379,7 +6387,10 @@ class InferenceScheduler:
                 continue
             if process_info.is_process_busy() or process_info.loaded_horde_model_name is None:
                 continue
-            if process_info.loaded_horde_model_name in in_progress_models:
+            if (
+                process_info.loaded_horde_model_name in in_progress_models
+                or process_info.loaded_horde_model_name in protected_models
+            ):
                 continue
             footprint_mb = float(process_info.process_reserved_mb) if process_info.process_reserved_mb else 0.0
             idle_residents.append(

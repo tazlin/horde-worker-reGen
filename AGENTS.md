@@ -169,6 +169,23 @@ uv run pytest tests/process_management/
   before the child confirms; `process_launch_identifier` discards messages from replaced processes.
 - **Config flows by reference:** sub-managers read `RuntimeConfig.bridge_data`; the file hot-reloads
   every 1 s unless config came from env vars (`-e`).
+- **A liveness proof the failure can satisfy is not a proof.** Whenever you touch a watchdog, escalation
+  counter, or "did it recover" signal, ask what the failure itself increments. Prefer completion counters
+  over attempt counters (an inference *start* rises freely while a downstream stage is the thing stuck),
+  scale any performance expectation by the concurrency actually present, and never let a counter be reset
+  by state the escalation's own remedy produces. Three separate instances of this defeated the recovery
+  escalation's backstops, so `made_progress_since_episode` and `RecoverySupervisor`'s episode close are
+  deliberately strict. Pair every "we did not fire" test with a positive-liveness test that work flows.
+- **Recovery must end in a working worker.** The escalation ladder is ordered least-destructive first and
+  its endpoint is a running worker, never a stopped one. Exiting is only a rung when something will start
+  a new process (the dashboard supervising its child, or `exit_on_unhandled_faults` plus a service
+  manager); otherwise the worker keeps escalating in place. Adding a rung means adding something that
+  *changes the condition*, since a rung that reproduces its own trigger is not a rung. See
+  [Resilience and recovery](docs/explanation/resilience_and_recovery.md).
+- **Do not gate a recovery action behind a preference flag.** A reclaim or degradation rung switched off
+  by a throughput or feature preference will be disabled by operators who have no idea they removed a
+  recovery capability. Give the recovery path its own key (defaulting to enabled) or let it override the
+  preference.
 
 ## See also
 

@@ -20,6 +20,7 @@ as needed.
     - [configure for your GPU](how-to/configure-for-your-gpu.md)
     - [use the dashboard](how-to/use-the-dashboard.md)
     - [run headless](how-to/run-headless.md)
+    - [run as a system service](how-to/run-as-a-system-service.md)
     - [run on AMD ROCm](how-to/run-on-amd-rocm.md)
     - [run an alchemist-only worker](how-to/run-an-alchemist-only-worker.md)
     - [run multiple GPUs](how-to/run-multiple-gpus.md)

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
+    _FAULTHANDLER_MAX_BYTES,
     enable_child_faulthandler,
     neutralize_inherited_argv,
     read_last_startup_crash,
@@ -147,3 +150,63 @@ def test_enable_child_faulthandler_opens_file_and_enables(monkeypatch: pytest.Mo
         assert faulthandler.is_enabled()
     finally:
         faulthandler.disable()
+
+
+def test_enable_child_faulthandler_writes_a_dated_banner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Each arming writes an identifying, dated banner so a dump can be attributed to a launch.
+
+    faulthandler's own output carries no timestamp and the file is shared across every launch of a role, so
+    without the banner a dump cannot be lined up against the timestamped logs.
+    """
+    monkeypatch.chdir(tmp_path)
+    try:
+        enable_child_faulthandler("safety_0")
+    finally:
+        faulthandler.disable()
+
+    banner = (tmp_path / "logs" / "bridge_safety_0.faulthandler").read_text(encoding="utf-8")
+
+    assert "safety_0" in banner
+    assert f"pid={os.getpid()}" in banner
+    assert str(datetime.now().year) in banner
+
+
+def test_enable_child_faulthandler_bounds_history(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An oversized fault file is rolled aside rather than grown without bound.
+
+    A role that faults on most of its launches would otherwise accumulate megabytes whose oldest entries
+    predate everything else in a log bundle.
+    """
+    monkeypatch.chdir(tmp_path)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    fault_path = log_dir / "bridge_inference_1.faulthandler"
+    fault_path.write_text("x" * (_FAULTHANDLER_MAX_BYTES + 1), encoding="utf-8")
+
+    try:
+        enable_child_faulthandler("inference_1")
+    finally:
+        faulthandler.disable()
+
+    assert fault_path.with_suffix(".faulthandler.1").exists()
+    assert fault_path.stat().st_size < _FAULTHANDLER_MAX_BYTES
+
+
+def test_enable_child_faulthandler_keeps_a_small_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A fault file under the bound is appended to, so recent launch history survives.
+
+    The control for the roll: bounding history must not discard the immediately preceding runs.
+    """
+    monkeypatch.chdir(tmp_path)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    fault_path = log_dir / "bridge_inference_2.faulthandler"
+    fault_path.write_text("earlier launch dump\n", encoding="utf-8")
+
+    try:
+        enable_child_faulthandler("inference_2")
+    finally:
+        faulthandler.disable()
+
+    assert "earlier launch dump" in fault_path.read_text(encoding="utf-8")
+    assert not fault_path.with_suffix(".faulthandler.1").exists()

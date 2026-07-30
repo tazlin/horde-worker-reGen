@@ -87,21 +87,21 @@ class ReclaimRungKind(enum.StrEnum):
     """Move the on-GPU safety context off the card to reclaim it (the last rung before a kill)."""
 
 
-_LANE_PAUSE_RUNG_KINDS = frozenset(
+LANE_PAUSE_RUNG_KINDS = frozenset(
     {
         ReclaimRungKind.PAUSE_PP_LANE,
         ReclaimRungKind.PAUSE_VAE_LANE,
         ReclaimRungKind.PAUSE_COMPONENT_LANE,
     },
 )
-"""The rung kinds that stop a dedicated lane off the GPU, which the engine must later restore on its own.
+"""The rung kinds that stop a dedicated lane off the GPU, which the issuer must later restore on its own.
 
 A lane pause has no external restore trigger: unlike safety (re-promoted by the runtime safety-placement
-policy once the card fits it), a paused lane stays down until something restarts it. The engine therefore owns
-the restore for exactly these rungs, unwinding them when the card's saturation episode ends. Safety is
-excluded on purpose: it is restored by the placement policy, not by the ladder."""
+policy once the card fits it), a paused lane stays down until something restarts it. Whichever subsystem
+issued the pause therefore owns the restore for exactly these rungs, unwinding them when the condition it
+paused for ends. Safety is excluded on purpose: it is restored by the placement policy, not by a rung issuer."""
 
-_TEARDOWN_RUNG_KINDS = _LANE_PAUSE_RUNG_KINDS | frozenset({ReclaimRungKind.SAFETY_OFF_GPU})
+_TEARDOWN_RUNG_KINDS = LANE_PAUSE_RUNG_KINDS | frozenset({ReclaimRungKind.SAFETY_OFF_GPU})
 """Rung kinds whose memory is freed by a process exiting, so they get the longer verification window."""
 
 
@@ -300,6 +300,57 @@ class ReclaimLadderActuator(Protocol):
         ...
 
 
+def execute_reclaim_rung(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> bool:
+    """Dispatch one rung onto the actuator, returning whether it acted.
+
+    The single mapping from a rung kind to the actuator call that performs it, shared by every subsystem that
+    issues rungs so a rung means the same action wherever it is driven from. A rung whose target has already
+    gone away (or whose kind carries no target) reports False, which the caller reads as "nothing was freed".
+
+    Args:
+        rung: The rung to perform.
+        actuator: The surface that owns the process actions.
+
+    Returns:
+        True when the actuator reported that it acted.
+    """
+    if rung.kind is ReclaimRungKind.UNLOAD_IDLE_MODEL and rung.target_process_id is not None:
+        return actuator.unload_idle_model(rung.target_process_id, rung.device_index)
+    if rung.kind is ReclaimRungKind.RELEASE_IDLE_CACHE and rung.target_process_id is not None:
+        return actuator.release_idle_cache(rung.target_process_id)
+    if rung.kind is ReclaimRungKind.PAUSE_PP_LANE:
+        return actuator.pause_post_process_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.PAUSE_VAE_LANE:
+        return actuator.pause_vae_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.PAUSE_COMPONENT_LANE:
+        return actuator.pause_component_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU:
+        return actuator.safety_off_gpu(rung.device_index)
+    return False
+
+
+def restore_reclaim_rung(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> bool:
+    """Dispatch one lane-restore onto the actuator, returning whether it acted.
+
+    Defined for the :data:`LANE_PAUSE_RUNG_KINDS` only; any other kind reports False. The actuator routes the
+    call through its owner-guarded restore path, so a lane another owner paused is left untouched.
+
+    Args:
+        rung: The lane-pause rung to unwind.
+        actuator: The surface that owns the process actions.
+
+    Returns:
+        True when the actuator reported that it acted.
+    """
+    if rung.kind is ReclaimRungKind.PAUSE_PP_LANE:
+        return actuator.restore_post_process_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.PAUSE_VAE_LANE:
+        return actuator.restore_vae_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.PAUSE_COMPONENT_LANE:
+        return actuator.restore_component_lane(rung.device_index)
+    return False
+
+
 @dataclass
 class _PendingVerification:
     """A rung awaiting verification: its promise, the device-free baseline at issue, and samples waited."""
@@ -430,12 +481,30 @@ class VerifiedReclaimLadder:
         or safety off-GPU, whose memory only returns once the process has exited) and :data:`_VERIFICATION_SAMPLES`
         otherwise. While it is still within its verification window it returns False so the engine waits another
         tick rather than issuing the next rung.
+
+        A rung whose promise is not a positive figure (the tenant's reservation was never reported, so it was
+        priced at zero) is *unverifiable* rather than verified: the yield-fraction test would reduce to
+        "realized at least nothing" and certify the first sample of a rung that freed nothing at all, sprinting
+        the engine down the whole ladder on a rung it never graded. Such a rung serves its full sample window,
+        credits nothing to :attr:`verified_frees_mb`, and resolves without being counted either verified or
+        short, so the engine escalates on an honest absence of evidence.
         """
         pending = episode.pending
         assert pending is not None
         pending.samples_waited += 1
         realized_mb = device_free_mb - pending.baseline_free_mb
         promised_mb = pending.rung.promised_freed_mb
+
+        if promised_mb <= 0.0:
+            if pending.samples_waited < self._verification_window_for(pending.rung.kind):
+                return False
+            logger.debug(
+                f"Reclaim rung {pending.rung.kind.value} on {pending.rung.tenant_label} "
+                f"(device {pending.rung.device_index}) carried no promised free, so its realized "
+                f"~{max(0.0, realized_mb):.0f}MB cannot be graded; escalating without crediting it.",
+            )
+            episode.pending = None
+            return True
 
         if realized_mb >= _VERIFICATION_YIELD_FRACTION * promised_mb:
             self.verified_frees_mb += max(0.0, realized_mb)
@@ -470,9 +539,9 @@ class VerifiedReclaimLadder:
         while episode.next_index < len(episode.ladder):
             rung = episode.ladder[episode.next_index]
             episode.next_index += 1
-            if self._execute(rung, actuator):
+            if execute_reclaim_rung(rung, actuator):
                 self.rungs_issued += 1
-                if rung.kind in _LANE_PAUSE_RUNG_KINDS:
+                if rung.kind in LANE_PAUSE_RUNG_KINDS:
                     # Only a lane pause that actually acted is the engine's to restore later; record it so the
                     # episode-end unwind restarts exactly the lanes this engine stopped.
                     episode.paused_lanes.append(rung)
@@ -495,19 +564,8 @@ class VerifiedReclaimLadder:
         another owner paused is left untouched. Called once, when the card returns HEALTHY.
         """
         for rung in reversed(episode.paused_lanes):
-            VerifiedReclaimLadder._restore_lane(rung, actuator)
+            restore_reclaim_rung(rung, actuator)
         episode.paused_lanes.clear()
-
-    @staticmethod
-    def _restore_lane(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> bool:
-        """Dispatch one lane-restore onto the actuator, returning whether it acted."""
-        if rung.kind is ReclaimRungKind.PAUSE_PP_LANE:
-            return actuator.restore_post_process_lane(rung.device_index)
-        if rung.kind is ReclaimRungKind.PAUSE_VAE_LANE:
-            return actuator.restore_vae_lane(rung.device_index)
-        if rung.kind is ReclaimRungKind.PAUSE_COMPONENT_LANE:
-            return actuator.restore_component_lane(rung.device_index)
-        return False
 
     @staticmethod
     def execute_arbiter_commands(
@@ -549,20 +607,3 @@ class VerifiedReclaimLadder:
             if acted:
                 applied.append(command)
         return tuple(applied)
-
-    @staticmethod
-    def _execute(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> bool:
-        """Dispatch one rung onto the actuator, returning whether it acted."""
-        if rung.kind is ReclaimRungKind.UNLOAD_IDLE_MODEL and rung.target_process_id is not None:
-            return actuator.unload_idle_model(rung.target_process_id, rung.device_index)
-        if rung.kind is ReclaimRungKind.RELEASE_IDLE_CACHE and rung.target_process_id is not None:
-            return actuator.release_idle_cache(rung.target_process_id)
-        if rung.kind is ReclaimRungKind.PAUSE_PP_LANE:
-            return actuator.pause_post_process_lane(rung.device_index)
-        if rung.kind is ReclaimRungKind.PAUSE_VAE_LANE:
-            return actuator.pause_vae_lane(rung.device_index)
-        if rung.kind is ReclaimRungKind.PAUSE_COMPONENT_LANE:
-            return actuator.pause_component_lane(rung.device_index)
-        if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU:
-            return actuator.safety_off_gpu(rung.device_index)
-        return False

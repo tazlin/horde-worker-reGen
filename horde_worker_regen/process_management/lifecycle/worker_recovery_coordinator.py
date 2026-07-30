@@ -10,7 +10,11 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
+from horde_worker_regen.process_management.config.worker_state import (
+    PopPauseOwner,
+    RecoveryParkReason,
+    WorkerState,
+)
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
@@ -19,6 +23,13 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
+from horde_worker_regen.process_management.resources.reclaim_ladder import (
+    LANE_PAUSE_RUNG_KINDS,
+    ReclaimRung,
+    build_reclaim_ladder,
+    execute_reclaim_rung,
+    restore_reclaim_rung,
+)
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
@@ -56,6 +67,48 @@ class WorkerRecoveryCoordinator:
     bounds the yield: a reclaim that never lands (the lane wedged, or the freed room still insufficient) falls
     through to the ordinary give-up so the horde reissues the jobs rather than the worker parking forever.
     Sized to the post-processing admission-patience window."""
+
+    RECLAIM_RUNG_GRACE_SECONDS = 45.0
+    """How long one issued reclaim rung is given to clear the wedge before the next rung is consumed.
+
+    A rung's effect is not instant: a lane teardown returns its context only once the OS has reaped the
+    process, and the process that could not obtain memory then has to start and drain its backlog. This is the
+    settling window the wedge oracle waits out before grading the rung. Sized above an observed child boot so a
+    rung that did work is not graded a failure while the capacity it freed is still coming up, and bounded so a
+    rung that did nothing does not stall the escalation."""
+
+    RECLAIM_RUNG_ALLOTMENT = 3
+    """Reclaim rungs issuable before the escalation proceeds to a pool rebuild; renewed once it has.
+
+    Budgeting the rungs by count rather than by elapsed time is what keeps the rest of the escalation
+    reachable: a rung is consumed whether or not it appeared to help, so the allotment cannot be replenished by
+    a wedge that simply persists. The allotment is renewed after a pool rebuild so the cheaper remedies below
+    the rebuild stay reachable, and the total stays finite because the cursor into the frozen candidate list
+    only ever advances."""
+
+    RECLAIM_REMEDY_EPISODE_BUDGET_SECONDS = 300.0
+    """Aggregate time the reclaim remedies of one wedge episode may occupy, measured from the first rung.
+
+    An independent bound on the counted allotment: even a run of rungs that each look worth waiting out cannot
+    hold accepted work past this, so the give-up that reissues those jobs to the horde stays reachable on a
+    condition no rung fixes."""
+
+    MAX_GIVE_UP_YIELDS_PER_EPISODE = 3
+    """Give-ups one wedge episode may refund to an in-flight remedy before it must actually fire.
+
+    A refunded give-up restores the escalation cycle it would have consumed, so an unbounded number of them
+    decays the bounded yield into an indefinite park with the safety valve never having fired. Capping the
+    refunds means a remedy that keeps looking reachable (a card that keeps regenerating candidates) can defer
+    the terminal escalation only a bounded number of times."""
+
+    RECOVERY_PARK_REPROBE_SECONDS = 600.0
+    """How long a recovery park stays quiescent before one fresh escalation attempt is permitted.
+
+    A park is entered only when the escalation has nothing left to try, but what dooms a pool is often external
+    to the worker (a co-tenant process holding the card's VRAM, an exhausted disk) and can clear with no action
+    from the worker at all. Waiting this long between attempts keeps the worker available for that recovery
+    while bounding what a permanently doomed pool can cost to one escalation cycle per interval instead of
+    continuous process churn and job faulting."""
 
     HEAD_RECOVERY_BUDGET_FALLBACK_SECONDS = 150.0
     """Give-up deferral budget for head-of-queue model materialisation when no numeric preload timeout is set.
@@ -136,6 +189,9 @@ class WorkerRecoveryCoordinator:
         self.episode_post_processing_progress_baseline: int | None = None
         self.recovery_event_times: list[float] = []
         self.last_seen_recovery_count = 0
+        # Edge latch so a runaway-recovery abort the worker declined is recorded once rather than every tick
+        # for as long as the rolling window stays over the ceiling.
+        self.runaway_abort_refusal_logged = False
         self.orphan_in_progress_since: dict[GenerationID, float] = {}
         self.orphan_punt_history: list[float] = []
         self.orphan_safety_since: dict[GenerationID, float] = {}
@@ -151,6 +207,22 @@ class WorkerRecoveryCoordinator:
         # no such remedy is in flight. Cleared when the wedge episode closes so a later episode gets its own
         # remedy attempt.
         self.pp_reclaim_remedy_issued_at: float | None = None
+        # The reclaim rungs this wedge episode may issue, frozen at the first look so a flapping card cannot
+        # regenerate candidates indefinitely, plus the monotonic cursor into them. None until first frozen.
+        self.reclaim_rungs: tuple[ReclaimRung, ...] | None = None
+        self.reclaim_cursor = 0
+        # Rungs issued against the current allotment, when the most recent one was issued (its settling window),
+        # and when the episode's first rung was issued (the aggregate time bound's origin).
+        self.reclaim_rungs_issued_in_allotment = 0
+        self.reclaim_rung_issued_at: float | None = None
+        self.reclaim_remedy_started_at: float | None = None
+        # Give-ups refunded to the constructive rung's settling window. The PP-specific remedy uses its own
+        # independently bounded clock and does not consume or inflate this count.
+        self.give_up_yields_spent = 0
+        # Lane pauses this episode's rungs actually acquired, in issue order, so the episode close restores
+        # exactly those and in reverse. A pause that was a no-op (another owner already held it) is not recorded,
+        # so this coordinator never lifts a hold it does not own.
+        self.reclaim_paused_lanes: list[ReclaimRung] = []
         # When head-of-queue model materialisation (a preload/load for the head over an otherwise idle pool)
         # was first observed in the current continuity; None when the head is not materialising. Bounds the
         # give-up deferral so a stuck load still escalates. Cleared when materialisation stops or the episode
@@ -484,26 +556,43 @@ class WorkerRecoveryCoordinator:
                     f"(attempt {requeues + 1}/{self.POST_PROCESS_REQUEUE_MAX}).",
                 )
 
+    def structural_queue_wedge_active(self) -> bool:
+        """Return whether a structural queue deadlock is real rather than a deliberately held queue.
+
+        The dispatcher reports the raw deadlock shape (pending inference work while every process is idle).
+        Several scheduler states hold the queue on purpose while capacity lands, and inference actually
+        running disproves the all-idle premise outright, so neither is a wedge.
+
+        Every consumer reads this one verdict. The wedge assessment and the give-up that acts on it must not
+        diverge: a give-up applying a narrower set of excuses would fault exactly the backlog the scheduler
+        is holding for capacity that is about to arrive.
+        """
+        if not self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge():
+            return False
+        queue_held_for_capacity = (
+            self._inference_scheduler.whole_card_residency_grace_active()
+            or self._inference_scheduler.heavy_head_load_grace_active()
+            or self._inference_scheduler.ram_reclaim_cycle_grace_active()
+            or self._inference_starts_backing_off()
+        )
+        if queue_held_for_capacity:
+            return False
+        return not self._process_map.has_inference_in_progress()
+
     def assess_wedge(self) -> bool:
         """Return whether the worker structurally cannot make progress."""
         if self._state.shutting_down:
             return False
         if self._state.downloads_only_hold:
             return False
-        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
-        if structural_queue_wedge and (
-            self._inference_scheduler.whole_card_residency_grace_active()
-            or self._inference_scheduler.heavy_head_load_grace_active()
-            or self._inference_scheduler.ram_reclaim_cycle_grace_active()
-            or self._inference_starts_backing_off()
-        ):
-            structural_queue_wedge = False
-        if structural_queue_wedge and self._process_map.has_inference_in_progress():
-            structural_queue_wedge = False
+        if self._state.recovery_parked:
+            # A park is the state after the remedies ran out: reporting the wedge again would only drive the
+            # same exhausted actions. The park's re-probe is what re-opens the assessment.
+            return False
         return (
             self.is_inference_pool_unrecoverable()
             or self.is_safety_pool_unrecoverable()
-            or structural_queue_wedge
+            or self.structural_queue_wedge_active()
             or self.orphan_wedge_active()
         )
 
@@ -522,6 +611,12 @@ class WorkerRecoveryCoordinator:
 
         The baseline is captured when the episode opens and re-captured on each soft reset, so this reports
         progress since the latest soft reset once one has been attempted.
+
+        Credit requires motion the stalled stage cannot produce by itself. A job completion counts
+        unconditionally, since it proves every downstream stage cleared. An inference *start* is only an
+        attempt, so it counts only when no downstream stage is holding accepted work: a post-processing or
+        safety backlog keeps admitting fresh starts while nothing leaves the stage, and crediting those would
+        close a wedge episode on the very symptom that defines it.
         """
         if (
             self.episode_progress_baseline is None
@@ -534,13 +629,107 @@ class WorkerRecoveryCoordinator:
         if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
             # A downstream post-processing drain stall is not disproved by starting more upstream inference.
             return False
-        return (
-            self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline
-            or self._job_tracker.total_num_inference_starts > self.episode_inference_start_baseline
+        if self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline:
+            # A completion is end-to-end proof: the job cleared every downstream stage, safety included.
+            return True
+        if self._job_tracker.jobs_pending_safety_check or self._job_tracker.jobs_being_safety_checked:
+            # A safety-stage drain stall is not disproved by more upstream inference starting either. Generated
+            # work parks after the sampler while starts keep rising behind it, so crediting starts would let the
+            # stalled stage manufacture its own proof of recovery and reset the escalation it should be climbing.
+            return False
+        return self._job_tracker.total_num_inference_starts > self.episode_inference_start_baseline
+
+    def enter_recovery_park(self, reason: RecoveryParkReason, detail: dict[str, str | int | float | bool]) -> None:
+        """Hold escalation quiescent because its remedies are spent and the exit rung was withheld.
+
+        The worker stays up but stops popping work and stops rebuilding pools, so a condition no remaining
+        remedy can fix costs a bounded amount instead of unbounded process churn and job faulting. Idempotent:
+        a park already engaged is neither re-logged nor re-recorded.
+
+        Args:
+            reason: Which exhausted escalation is parking, recorded on worker state and in the ledger.
+            detail: Measurements describing the exhausted condition, attached to the ledger record.
+        """
+        if self._state.recovery_parked:
+            return
+        self._state.recovery_parked = True
+        self._state.recovery_park_reason = reason
+        self._state.recovery_park_since = self._clock()
+        logger.critical(
+            f"Save-our-ship: no remedy remains ({reason.value}) and nothing would bring a fresh process back, "
+            "so recovery is parked: job popping and pool rebuilds stop while the worker stays up. The "
+            f"escalation is re-attempted in {self.RECOVERY_PARK_REPROBE_SECONDS:.0f}s, so a condition that "
+            "clears on its own (a co-tenant process freeing the card, disk space returning) restores service "
+            "without an operator. Attach a supervisor or set exit_on_unhandled_faults to have the worker "
+            "restart itself instead.",
+        )
+        self._action_ledger.record(
+            LedgerEventType.RECOVERY_PARKED,
+            reason=f"save-our-ship: recovery parked ({reason.value})",
+            detail={**detail, "reprobe_seconds": self.RECOVERY_PARK_REPROBE_SECONDS},
         )
 
+    def recovery_park_reprobe_due(self) -> bool:
+        """Return whether the park has held long enough to permit one fresh escalation attempt."""
+        if not self._state.recovery_parked:
+            return False
+        return (self._clock() - self._state.recovery_park_since) >= self.RECOVERY_PARK_REPROBE_SECONDS
+
+    def leave_recovery_park(self) -> None:
+        """Lift the park and re-arm the escalation so the next tick makes one fresh attempt.
+
+        The rolling recovery window, the runaway refusal latch, and the supervisor's episode are all returned
+        to baseline: they hold the verdict that the previous attempt was exhausted, and an attempt starting
+        from that verdict would neither rebuild nor escalate while the worker resumed accepting work.
+        """
+        if not self._state.recovery_parked:
+            return
+        parked_seconds = self._clock() - self._state.recovery_park_since
+        reason = self._state.recovery_park_reason
+        self._state.recovery_parked = False
+        self._state.recovery_park_reason = None
+        self._state.recovery_park_since = 0.0
+        self.recovery_event_times.clear()
+        self.last_seen_recovery_count = self._process_lifecycle._num_process_recoveries
+        self.runaway_abort_refusal_logged = False
+        self.recovery_supervisor.reset_episode()
+        self.limp_by_active = False
+        self._clear_recovery_episode_accounting()
+        # The healthy-hold watchdog is another bounded recovery episode owned by this coordinator. A stale
+        # timestamp would let the first post-park tick skip its grace and rebuild immediately.
+        self.healthy_hold_since = None
+        self.governance_reset_at = None
+        reason_value = reason.value if reason is not None else "unknown"
+        logger.warning(
+            f"Save-our-ship: lifting the recovery park after {parked_seconds:.0f}s ({reason_value}); resuming "
+            "job popping and permitting one fresh escalation attempt. If the condition has not cleared the "
+            "worker parks again rather than churning.",
+        )
+
+    def _clear_recovery_episode_accounting(self) -> None:
+        """Return every SOS episode-owned latch, baseline, lane receipt, and remedy budget to baseline."""
+        self.episode_progress_baseline = None
+        self.episode_inference_start_baseline = None
+        self.episode_post_processing_progress_baseline = None
+        self.episode_saw_unrecoverable_pool = False
+        self.pp_reclaim_remedy_issued_at = None
+        self.head_recovery_in_flight_since = None
+        # A park may begin while a constructive rung owns a lane pause. Restore exactly those owned pauses
+        # before accepting work again, then discard the frozen ladder so the fresh episode re-assesses reality.
+        self.restore_reclaimed_lanes()
+        self._reset_constructive_remedy_budget()
+
     def maybe_abort_on_runaway_recoveries(self) -> bool:
-        """Abort if process recoveries are flapping faster than the rolling-window ceiling."""
+        """Abort if process recoveries are flapping faster than the rolling-window ceiling.
+
+        Returns:
+            Whether the abort actually took, so the caller stops driving escalation this tick. An abort the
+            worker declined (nothing is watching to relaunch it, and the operator did not opt into exiting)
+            returns False and parks recovery instead: rebuilding at this rate has demonstrably not stabilised
+            the pool, so continuing to drive the ladder would only churn children with no remedy left to reach.
+        """
+        if self._state.recovery_parked:
+            return False
         current = self._process_lifecycle._num_process_recoveries
         if current < self.last_seen_recovery_count:
             self.recovery_event_times.clear()
@@ -555,6 +744,11 @@ class WorkerRecoveryCoordinator:
             recovery_time for recovery_time in self.recovery_event_times if recovery_time >= cutoff
         ]
         if len(self.recovery_event_times) < self.RUNAWAY_RECOVERY_CEILING or self._state.shutting_down:
+            self.runaway_abort_refusal_logged = False
+            return False
+        if self.runaway_abort_refusal_logged:
+            # A refused abort leaves the ceiling breached every tick. The verdict is already recorded, so
+            # report "not aborted" quietly and let the caller keep driving the rungs that remain.
             return False
         logger.critical(
             f"Save-our-ship: {len(self.recovery_event_times)} process recoveries within "
@@ -570,7 +764,19 @@ class WorkerRecoveryCoordinator:
             },
         )
         self._abort_callback()
-        return True
+        if self._state.shutting_down:
+            return True
+        # The abort was declined because nothing would relaunch this worker, and the in-place rung (rebuilding)
+        # is what produced this recovery rate in the first place. Park instead of driving it again.
+        self.runaway_abort_refusal_logged = True
+        self.enter_recovery_park(
+            RecoveryParkReason.RUNAWAY_RECOVERIES,
+            {
+                "recoveries_in_window": len(self.recovery_event_times),
+                "window_seconds": self.RUNAWAY_RECOVERY_WINDOW_SECONDS,
+            },
+        )
+        return False
 
     def _head_recovery_in_flight(self) -> bool:
         """Return whether the head-of-queue job's capacity is in flight, so give-up defers to it.
@@ -605,10 +811,22 @@ class WorkerRecoveryCoordinator:
         return (now - self.head_recovery_in_flight_since) < budget_seconds
 
     def run_recovery_supervisor(self) -> None:
-        """Drive save-our-ship escalation one tick and perform any returned action."""
+        """Drive save-our-ship escalation one tick and perform any returned action.
+
+        A parked worker performs no escalation at all until its re-probe interval elapses, at which point the
+        park lifts and this tick becomes the fresh attempt.
+        """
         if self._state.shutting_down:
             return
+        if self._state.recovery_parked:
+            if not self.recovery_park_reprobe_due():
+                return
+            self.leave_recovery_park()
         if self.maybe_abort_on_runaway_recoveries():
+            return
+        if self._state.recovery_parked:
+            # The runaway backstop parked recovery on this very tick (its abort was withheld); there is nothing
+            # further to drive.
             return
         self.maybe_reset_stuck_governance_hold()
         is_wedged = self.assess_wedge()
@@ -625,34 +843,39 @@ class WorkerRecoveryCoordinator:
                 self.episode_saw_unrecoverable_pool = False
             else:
                 is_wedged = True
+        # Consulted only while the worker actually reads as wedged: the candidate snapshot walks the process map,
+        # and a healthy worker has no episode for a rung to belong to.
+        constructive_remedy_available = is_wedged and self.constructive_remedy_available()
         action = self.recovery_supervisor.evaluate(
             is_wedged=is_wedged,
             pool_ready=self.is_inference_pool_ready(),
             made_progress=made_progress,
             head_recovery_in_flight=head_recovery_in_flight,
             boot_in_progress=boot_in_progress,
+            constructive_remedy_available=constructive_remedy_available,
         )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:
                 self._capture_progress_baseline()
         else:
-            self.episode_progress_baseline = None
-            self.episode_inference_start_baseline = None
-            self.episode_post_processing_progress_baseline = None
-            self.episode_saw_unrecoverable_pool = False
-            self.pp_reclaim_remedy_issued_at = None
-            self.head_recovery_in_flight_since = None
-        if action is RecoveryAction.SOFT_RESET:
+            self._clear_recovery_episode_accounting()
+        if action is RecoveryAction.RECLAIM:
+            self.issue_next_constructive_remedy()
+        elif action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()
             # Re-anchor the progress baseline to the reset: the episode may close only when work moves forward
             # from here, so a rebuild that never serves cannot look like a recovery and reset the escalation.
             self._capture_progress_baseline()
             self.limp_by_active = True
+            # The rebuild has happened, so the rungs the earlier allotment did not reach become reachable again.
+            self.renew_reclaim_rung_allotment()
         elif action is RecoveryAction.GIVE_UP:
-            if self._give_up_yields_to_pp_reclaim():
-                # The wedged head may be servable once the just-driven lane reclaim lands: defer this give-up
-                # (the supervisor refunds the cycle, so the eventual real give-up escalates undiminished).
+            if self._give_up_yields_to_remedy():
+                # The wedge may be curable by a remedy that has not had time to land: defer this give-up (the
+                # supervisor refunds the cycle, so the eventual real give-up escalates undiminished).
                 self.recovery_supervisor.yield_give_up()
+                if self.pp_reclaim_remedy_issued_at is None:
+                    self.give_up_yields_spent += 1
             else:
                 self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)
         elif self.limp_by_active and not self.recovery_supervisor.is_in_episode:
@@ -754,6 +977,171 @@ class WorkerRecoveryCoordinator:
         self.healthy_hold_since = None
         self.governance_reset_at = None
 
+    def constructive_remedy_available(self) -> bool:
+        """Return whether a reclaim rung remains issuable, or the last one issued is still settling.
+
+        The fact the escalation policy reads to decide that a constructive resource remedy outranks rebuilding
+        the pools or faulting accepted work. It is True while either a rung the frozen candidate list still
+        holds is within the current allotment, or a rung already issued is inside its settling window (so the
+        escalation waits for the wedge oracle instead of climbing past a remedy that may be about to work).
+
+        The bounds that make this eventually False, and so keep the rest of the escalation reachable, are the
+        counted allotment (:attr:`RECLAIM_RUNG_ALLOTMENT`), the monotonic cursor into a candidate list frozen
+        once per episode, and the aggregate time bound
+        (:attr:`RECLAIM_REMEDY_EPISODE_BUDGET_SECONDS`), which overrides a still-settling rung.
+        """
+        if self._reclaim_remedy_time_budget_spent():
+            return False
+        if self._reclaim_rung_settling():
+            return True
+        if self.reclaim_rungs_issued_in_allotment >= self.RECLAIM_RUNG_ALLOTMENT:
+            return False
+        return self._next_reclaim_rung() is not None
+
+    def _frozen_reclaim_ladder(self) -> tuple[ReclaimRung, ...]:
+        """Return this episode's reclaim rungs, ordering them cheapest-first on the first call.
+
+        The list is snapshotted once and reused for the whole episode. Rebuilding it per tick would let a card
+        whose idle tenants come and go regenerate candidates without limit, and an escalation reading a
+        never-shrinking candidate list would never reach its pool rebuild or its give-up backstop.
+        """
+        if self.reclaim_rungs is None:
+            protected_models = frozenset(
+                job.model for job in self._job_tracker.jobs_pending_inference if isinstance(job.model, str)
+            )
+            self.reclaim_rungs = build_reclaim_ladder(
+                self._inference_scheduler.build_reclaim_ladder_candidates(
+                    None,
+                    protected_models=protected_models,
+                ),
+            )
+        return self.reclaim_rungs
+
+    def _next_reclaim_rung(self) -> ReclaimRung | None:
+        """Return the rung the cursor points at, or None once the frozen list is exhausted."""
+        ladder = self._frozen_reclaim_ladder()
+        if self.reclaim_cursor >= len(ladder):
+            return None
+        return ladder[self.reclaim_cursor]
+
+    def _reclaim_rung_settling(self) -> bool:
+        """Return whether the most recently issued rung is still inside its settling window."""
+        if self.reclaim_rung_issued_at is None:
+            return False
+        return (self._clock() - self.reclaim_rung_issued_at) < self.RECLAIM_RUNG_GRACE_SECONDS
+
+    def _reclaim_remedy_time_budget_spent(self) -> bool:
+        """Return whether this episode's reclaim rungs have occupied their aggregate time bound."""
+        if self.reclaim_remedy_started_at is None:
+            return False
+        return (self._clock() - self.reclaim_remedy_started_at) >= self.RECLAIM_REMEDY_EPISODE_BUDGET_SECONDS
+
+    def issue_next_constructive_remedy(self) -> ReclaimRung | None:
+        """Perform the next reclaim rung of this episode, or hold while the last one issued settles.
+
+        Advances the monotonic cursor through the frozen candidate list until a rung actually acts, skipping
+        rungs whose target has gone away (those free nothing, so waiting on them would spend the settling window
+        for no effect). The rung that acts opens a fresh settling window; the wedge oracle is simply whether the
+        next tick still assesses the worker as wedged, so a rung that resolved the condition ends the episode
+        and a rung that did not is followed by the next one.
+
+        Returns:
+            The rung that was performed, or None when the last rung is still settling, the allotment is spent,
+            or nothing in the frozen list acts any more.
+        """
+        if self._reclaim_rung_settling():
+            return None
+        now = self._clock()
+        ladder = self._frozen_reclaim_ladder()
+        while self.reclaim_cursor < len(ladder):
+            if self.reclaim_rungs_issued_in_allotment >= self.RECLAIM_RUNG_ALLOTMENT:
+                return None
+            rung = ladder[self.reclaim_cursor]
+            self.reclaim_cursor += 1
+            if not execute_reclaim_rung(rung, self._inference_scheduler):
+                continue
+            self.reclaim_rungs_issued_in_allotment += 1
+            self.reclaim_rung_issued_at = now
+            if self.reclaim_remedy_started_at is None:
+                self.reclaim_remedy_started_at = now
+            if rung.kind in LANE_PAUSE_RUNG_KINDS:
+                self.reclaim_paused_lanes.append(rung)
+            logger.warning(
+                f"Save-our-ship: issued the constructive remedy {rung.kind.value} on {rung.tenant_label} "
+                f"(~{rung.promised_freed_mb:.0f}MB promised) and yielding up to "
+                f"{self.RECLAIM_RUNG_GRACE_SECONDS:.0f}s for the wedge to clear. Rebuilding the pools against "
+                "the same resource condition would not change it, and the accepted work is not faulted while a "
+                "remedy remains.",
+            )
+            self._action_ledger.record(
+                LedgerEventType.RECOVERY_RECLAIM_ISSUED,
+                reason=f"save-our-ship constructive remedy ({rung.kind.value})",
+                detail={
+                    "rung_kind": rung.kind.value,
+                    "tenant": rung.tenant_label,
+                    "promised_freed_mb": round(rung.promised_freed_mb, 1),
+                    "rungs_issued_in_allotment": self.reclaim_rungs_issued_in_allotment,
+                },
+            )
+            return rung
+        return None
+
+    def renew_reclaim_rung_allotment(self) -> None:
+        """Grant a fresh rung allotment because the escalation has moved past the pool rebuild.
+
+        The cursor is untouched, so the remaining rungs are the ones the earlier allotment did not reach and the
+        episode's total stays bounded by the frozen list.
+        """
+        self.reclaim_rungs_issued_in_allotment = 0
+
+    def restore_reclaimed_lanes(self) -> None:
+        """Restart every lane this episode's rungs paused, in reverse issue order.
+
+        The recovery episode owns this restore because the pauses are its own: it holds the receipt of exactly
+        which lanes its rungs acquired, so it restores those and no others. No external backstop is relied on,
+        because the conditions those backstops require (a card debounced healthy for a sustained window, a
+        matching device index) are not reached on a chronically pressured card, and a stranded reclaim-owned
+        post-processing pause additionally stops suppressing the lane's admission-patience clock, aging out
+        queued work.
+        """
+        for rung in reversed(self.reclaim_paused_lanes):
+            if not restore_reclaim_rung(rung, self._inference_scheduler):
+                continue
+            self._action_ledger.record(
+                LedgerEventType.RECOVERY_RECLAIM_RESTORED,
+                reason=f"save-our-ship constructive remedy unwound ({rung.kind.value})",
+                detail={"rung_kind": rung.kind.value, "tenant": rung.tenant_label},
+            )
+        self.reclaim_paused_lanes.clear()
+
+    def _reset_constructive_remedy_budget(self) -> None:
+        """Discard the frozen candidate list, the cursor, and every remedy budget for a closed episode."""
+        self.reclaim_rungs = None
+        self.reclaim_cursor = 0
+        self.reclaim_rungs_issued_in_allotment = 0
+        self.reclaim_rung_issued_at = None
+        self.reclaim_remedy_started_at = None
+        self.give_up_yields_spent = 0
+
+    def _give_up_yields_to_remedy(self) -> bool:
+        """Return whether an in-flight remedy still deserves to land, so this give-up defers instead of faulting.
+
+        The reachable-remedy guard: a give-up that arrives while a constructive remedy is still settling, or
+        while a post-processing lane reclaim can still be issued for a servable head, would fault work the
+        remedy is about to unblock. Constructive-rung refunds are bounded by
+        :attr:`MAX_GIVE_UP_YIELDS_PER_EPISODE`; an already-issued post-processing unload instead owns its
+        independent wall-clock grace, which is self-bounding and must not be shortened merely because the
+        supervisor evaluates several give-up cycles during that window.
+        """
+        if self.pp_reclaim_remedy_issued_at is not None:
+            return self._give_up_yields_to_pp_reclaim()
+        if self.give_up_yields_spent >= self.MAX_GIVE_UP_YIELDS_PER_EPISODE:
+            return False
+        reclaim_rung_still_settling = self._reclaim_rung_settling() and not self._reclaim_remedy_time_budget_spent()
+        if reclaim_rung_still_settling:
+            return True
+        return self._give_up_yields_to_pp_reclaim()
+
     def _give_up_yields_to_pp_reclaim(self) -> bool:
         """Issue or await a post-processing lane reclaim for a wedged head; True while it deserves to land.
 
@@ -768,17 +1156,13 @@ class WorkerRecoveryCoordinator:
         ordinary give-up proceeds. Returns False when no fresh unload could be issued and no issued one is
         still within its window: there is nothing left to yield to.
         """
-        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
-        if self._inference_scheduler.ram_reclaim_cycle_grace_active():
-            structural_queue_wedge = False
-        if not structural_queue_wedge or not self.is_inference_capacity_available():
+        if not self.structural_queue_wedge_active() or not self.is_inference_capacity_available():
             return False
         now = self._clock()
-        if (
-            self.pp_reclaim_remedy_issued_at is not None
-            and now - self.pp_reclaim_remedy_issued_at <= self.PP_RECLAIM_REMEDY_GRACE_SECONDS
-        ):
-            return True
+        if self.pp_reclaim_remedy_issued_at is not None:
+            # One issue per episode. Once its grace expires, reissuing the identical unload would reproduce its
+            # own trigger and reset this clock forever, turning a bounded remedy into a permanent park.
+            return now - self.pp_reclaim_remedy_issued_at <= self.PP_RECLAIM_REMEDY_GRACE_SECONDS
         if self._inference_scheduler.unload_post_process_models_from_vram():
             self.pp_reclaim_remedy_issued_at = now
             logger.warning(
@@ -799,9 +1183,7 @@ class WorkerRecoveryCoordinator:
                 spin forever.
         """
         faulted = 0
-        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
-        if self._inference_scheduler.ram_reclaim_cycle_grace_active():
-            structural_queue_wedge = False
+        structural_queue_wedge = self.structural_queue_wedge_active()
         in_progress = self._job_tracker.jobs_in_progress
         if not self.is_inference_capacity_available() or structural_queue_wedge:
             for job in list(self._job_tracker.jobs_pending_inference):
@@ -845,11 +1227,16 @@ class WorkerRecoveryCoordinator:
                 "so the horde reissues them. Repeated drops like this can trigger horde-forced maintenance.",
             )
 
+        # Safety capacity counts here for the same reason inference capacity does: it is on every job's path,
+        # so a pool that cannot serve safety checks cannot serve work at all. Faulting the safety backlog
+        # without recording that as structurally broken lets a worker with no safety process drop its queue on
+        # every cycle while the escalation reads the pool as fine and never reaches its last rung.
         structurally_broken = (
             self.is_inference_pool_unrecoverable()
             or self.is_safety_pool_unrecoverable()
             or self.episode_saw_unrecoverable_pool
             or not self.is_inference_capacity_available()
+            or not self.is_safety_capacity_available()
         )
         should_abort = (structurally_broken or terminal) and not self._state.shutting_down
         # Record only when the give-up actually did something: it faulted at least one job, or it is a
@@ -867,3 +1254,12 @@ class WorkerRecoveryCoordinator:
                 "resets; abandoning ship (the last resort) rather than spinning indefinitely.",
             )
             self._abort_callback()
+            # Park only behind the terminal give-up. A non-terminal one still has its continuation cycle (a
+            # fresh soft reset, then the terminal escalation) to try, so a withheld exit there leaves untried
+            # remedies. Once the terminal give-up's exit is withheld the ladder is spent, and another cycle
+            # would only rebuild and fault against the same pool.
+            if terminal and not self._state.shutting_down:
+                self.enter_recovery_park(
+                    RecoveryParkReason.UNRECOVERABLE_POOL,
+                    {"jobs_faulted": faulted, "terminal": terminal},
+                )

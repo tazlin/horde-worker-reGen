@@ -34,6 +34,7 @@ class _StubState:
     supervisor_paused = False
     self_throttle_paused = False
     gpu_torch_incompatible = False
+    workload_intake_paused = False
 
 
 class _StubRuntimeConfig:
@@ -75,6 +76,9 @@ class _StubProcessMap:
 
     def num_loaded_utilities_processes(self) -> int:
         return 0
+
+    def num_loaded_post_process_processes(self) -> int:
+        return 1  # a capable lane always exists for these admission tests
 
     def get_free_vram_mb(self) -> float | None:
         return self._free_vram_mb

@@ -586,7 +586,10 @@ class TestGiveUpRemedyGraceIsBounded:
 
         grace = coordinator.PP_RECLAIM_REMEDY_GRACE_SECONDS
         first_fault_at: float | None = None
-        for _ in range(int(grace) + 60):
+        # A cheaper constructive rung may precede the PP-specific unload. Drive across both independent
+        # bounded windows; the assertion below anchors to the PP issue time rather than process start.
+        total_window = coordinator.RECLAIM_REMEDY_EPISODE_BUDGET_SECONDS + grace + 60
+        for _ in range(int(total_window)):
             clock.advance(1)
             coordinator.run_recovery_supervisor()
             if any(record.detail.get("jobs_faulted", 0) > 0 for record in _abandoned_records(pm)):
@@ -597,5 +600,8 @@ class TestGiveUpRemedyGraceIsBounded:
         assert pp_lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         # And the yield stayed bounded: the give-up faulted the backlog once the grace expired, not before.
         assert first_fault_at is not None, "the guard parked the wedge forever: the give-up never fired"
-        assert first_fault_at > grace, "the give-up faulted inside the remedy grace it was meant to yield"
+        assert coordinator.pp_reclaim_remedy_issued_at is not None
+        assert first_fault_at > coordinator.pp_reclaim_remedy_issued_at + grace, (
+            "the give-up faulted inside the remedy grace it was meant to yield"
+        )
         assert len(list(pm._job_tracker.jobs_pending_inference)) == 0

@@ -24,6 +24,11 @@ horde-bridge.cmd
 
 These scripts ensure the environment, download and verify your configured models, then run the
 worker. Model downloads happen before the worker starts, so the first run can take a while.
+
+For a host that should bring the worker back after a reboot or an unrecoverable fault, run it under a
+service manager instead of starting it by hand: see
+[Run the worker as a system service](run-as-a-system-service.md). That page also explains what the
+recovery escalation does differently when nothing is supervising the worker.
 `horde-worker.cmd --headless` (or `./horde-worker.sh --headless`) does the same thing if you prefer a
 single launcher for every mode.
 

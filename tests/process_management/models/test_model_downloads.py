@@ -543,6 +543,24 @@ class TestDownloadsOnlyMode:
 
         manager._process_lifecycle.start_inference_processes.assert_not_called()
 
+    @pytest.mark.parametrize("pool", ["inference", "safety"])
+    def test_recovery_park_blocks_download_ready_pool_start(self, pool: str) -> None:
+        """A late model-availability report cannot bypass a recovery park by starting a fresh pool."""
+        manager = self._manager(image_models_to_load=["a"])
+        manager._model_availability.update(
+            present={"a"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            safety_present=True,
+        )
+        manager._state.recovery_parked = True
+
+        getattr(manager._download_coordinator, f"maybe_start_{pool}_processes")()
+
+        getattr(manager._process_lifecycle, f"start_{pool}_processes").assert_not_called()
+        assert getattr(manager._download_coordinator, f"{pool}_processes_started") is False
+
     def test_go_live_clears_hold_and_starts_inference(self) -> None:
         """GO_LIVE lifts the hold and brings inference up (a model is present)."""
         manager = self._manager(image_models_to_load=["a"])

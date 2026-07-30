@@ -1123,6 +1123,15 @@ class ProcessLifecycleManager:
         self._post_process_results_known_lost = set()
         return lost
 
+    def _automatic_replacement_is_parked(self) -> bool:
+        """Return whether automatic child replacement is suspended by recovery.
+
+        A shutdown already in progress takes precedence: its hard timeout must still inspect liveness and invoke
+        the unconditional abort callback. Explicit operator replacements use their own override at the inference
+        replacement seam; ordinary watchdogs and lane state machines remain frozen until the bounded re-probe.
+        """
+        return self._state.recovery_parked and not self._state.shutting_down
+
     def _replace_all_post_process_process(self) -> None:
         """Replace the dedicated post-processing process across control-loop ticks.
 
@@ -1131,7 +1140,7 @@ class ProcessLifecycleManager:
         process that died while still PROCESS_STARTING (never "loaded"), the same startup-crash wedge the
         safety flow guards against.
         """
-        if not self._post_process_processes_should_be_replaced:
+        if self._automatic_replacement_is_parked() or not self._post_process_processes_should_be_replaced:
             return
 
         if not self._post_process_processes_ending:
@@ -1366,7 +1375,7 @@ class ProcessLifecycleManager:
         process that died while still ``PROCESS_STARTING``), wait for the old process to drain out of the
         map, then start a fresh one.
         """
-        if not self._utilities_processes_should_be_replaced:
+        if self._automatic_replacement_is_parked() or not self._utilities_processes_should_be_replaced:
             return
 
         if not self._utilities_processes_ending:
@@ -1529,7 +1538,7 @@ class ProcessLifecycleManager:
         there are no in-flight job results to account for: the lane serves no jobs, and consumers that lose a
         producer fall back to loading their own copies.
         """
-        if not self._component_processes_should_be_replaced:
+        if self._automatic_replacement_is_parked() or not self._component_processes_should_be_replaced:
             return
 
         if not self._component_processes_ending:
@@ -1747,7 +1756,7 @@ class ProcessLifecycleManager:
         no parent-side known-lost set is drained: in-flight VAE stages are held by the disaggregation
         orchestrator, which re-dispatches an orphaned stage from held state once the replacement lane appears.
         """
-        if not self._vae_lane_processes_should_be_replaced:
+        if self._automatic_replacement_is_parked() or not self._vae_lane_processes_should_be_replaced:
             return
 
         if not self._vae_lane_processes_ending:
@@ -2761,7 +2770,7 @@ class ProcessLifecycleManager:
 
     def _replace_all_safety_process(self) -> None:
         """Replace all of the safety processes."""
-        if not self._safety_processes_should_be_replaced:
+        if self._automatic_replacement_is_parked() or not self._safety_processes_should_be_replaced:
             return
 
         if not self._safety_processes_ending:
@@ -3103,6 +3112,7 @@ class ProcessLifecycleManager:
         resource_fault_reason: str | None = None,
         recovery_requeue: bool = False,
         end_join_deadline: float | None = None,
+        allow_while_recovery_parked: bool = False,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -3137,7 +3147,11 @@ class ProcessLifecycleManager:
             end_join_deadline: A shared monotonic reap deadline for a batched pool rebuild. When set, this
                 slot's end joins against that one budget rather than the per-slot grace, so a whole batch of
                 victims already sent END_PROCESS can be reaped in parallel under a single bounded window.
+            allow_while_recovery_parked: Permit an explicit operator-requested replacement while automatic
+                lifecycle recovery is parked. Shutdown also overrides the park without this flag.
         """
+        if self._automatic_replacement_is_parked() and not allow_while_recovery_parked:
+            return
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
         # Fault the job *this* process was working on. It must be taken from process_info, never by
@@ -3653,6 +3667,9 @@ class ProcessLifecycleManager:
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
         import threading
+
+        if self._automatic_replacement_is_parked():
+            return False
 
         bridge_data = self._runtime_config.bridge_data
 

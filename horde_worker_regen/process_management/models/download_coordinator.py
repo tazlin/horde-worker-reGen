@@ -240,7 +240,7 @@ class ModelDownloadCoordinator:
         """Start safety processes once the required safety models are on disk."""
         if self.safety_processes_started or not self._enable_background_downloads:
             return
-        if self._state.downloads_only_hold:
+        if self._state.downloads_only_hold or self._state.recovery_parked:
             return
 
         availability = self._model_availability
@@ -273,7 +273,7 @@ class ModelDownloadCoordinator:
         """Start inference processes once at least one model is present."""
         if self.inference_processes_started or not self._enable_background_downloads:
             return
-        if self._state.downloads_only_hold:
+        if self._state.downloads_only_hold or self._state.recovery_parked:
             return
 
         availability = self._model_availability

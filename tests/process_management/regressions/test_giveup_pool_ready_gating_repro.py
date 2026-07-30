@@ -21,6 +21,7 @@ state (no real children run in unit tests).
 from __future__ import annotations
 
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -86,6 +87,40 @@ def _abandoned_records(pm: HordeWorkerProcessManager) -> list[LedgerEvent]:
         for event in pm._recovery_coordinator._action_ledger.recent(limit=1000)
         if event.event_type == LedgerEventType.RECOVERY_ABANDONED
     ]
+
+
+_SUPERVISION_ARMS = pytest.mark.parametrize("supervised", [True, False], ids=["supervised", "unattended"])
+"""Both supervision postures: a worker something would relaunch, and an unattended one."""
+
+
+def _install_abort_stub(
+    pm: HordeWorkerProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    supervised: bool,
+) -> dict[str, bool]:
+    """Attach the supervision posture and capture whether the worker actually exited.
+
+    Args:
+        pm: The process manager under test.
+        monkeypatch: Fixture used to replace the real abort.
+        supervised: Whether a supervising frontend is attached. With one the exit is permitted and reaches this
+            stub; without one it is withheld, because nothing would launch a replacement, and the stub is never
+            reached. The stub deliberately does not tear the worker down, so a single run stays observable
+            through both give-ups of the escalation in either posture.
+
+    Returns:
+        A one-key record whose ``called`` entry reports whether the abort fired.
+    """
+    aborted = {"called": False}
+
+    def _abort() -> None:
+        aborted["called"] = True
+
+    if supervised:
+        pm._supervisor = Mock()
+    monkeypatch.setattr(pm, "_abort", _abort)
+    return aborted
 
 
 async def test_boot_window_after_soft_reset_does_not_fault_servable_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,43 +242,67 @@ async def test_latched_give_up_does_not_spam_ledger(monkeypatch: pytest.MonkeyPa
     assert len(_abandoned_records(pm)) == 1  # no spam: still exactly one record
 
 
+@_SUPERVISION_ARMS
 async def test_persisting_wedge_over_ready_pool_escalates_to_deliberate_abort(
     monkeypatch: pytest.MonkeyPatch,
+    supervised: bool,
 ) -> None:
-    """A wedge that outlives a continuation soft-reset cycle aborts deliberately, not by chance.
+    """A wedge that outlives a continuation soft-reset cycle ends deliberately, not by chance.
 
     The first give-up faults the head (no abort: capacity is live). The wedge persists over the ready pool,
-    so after the cool-down one further soft-reset cycle runs and a second, terminal give-up abandons ship.
-    Both ledger records are honest (a faulted job, then a terminal decision).
+    so after the cool-down one further soft-reset cycle runs and a second, terminal give-up escalates. Both
+    ledger records are honest (a faulted job, then a terminal decision) in either posture. Supervised, the
+    terminal escalation exits so a fresh process replaces this one. Unattended, it stays up and the escalation
+    stops: no third rebuild, no third give-up, no further faulted work.
     """
     pm = make_testable_process_manager()
     clock = _FakeClock()
     _install_supervisor(pm, clock)
+    pm._recovery_coordinator._clock = clock
     await _latch_structural_queue_wedge(pm)
 
-    aborted = {"called": False}
-    monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+    aborted = _install_abort_stub(pm, monkeypatch, supervised=supervised)
 
     proc = pm._process_map[0]
-    monkeypatch.setattr(
-        pm._process_lifecycle,
-        "rebuild_inference_pool",
-        lambda *, reason: setattr(proc, "last_process_state", HordeProcessState.WAITING_FOR_JOB),
-    )
+    rebuilds = {"count": 0}
+
+    def _rebuild_inference(*, reason: str) -> None:
+        rebuilds["count"] += 1
+        proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
+
+    monkeypatch.setattr(pm._process_lifecycle, "rebuild_inference_pool", _rebuild_inference)
     monkeypatch.setattr(pm._process_lifecycle, "rebuild_safety_pool", lambda *, reason: None)
 
+    # Driven until the escalation has reached its terminal decision (two give-ups) or has gone quiescent.
     for _ in range(60):
         clock.advance(1)
         pm._recovery_coordinator.run_recovery_supervisor()
-        if aborted["called"]:
+        if pm._state.recovery_parked or len(_abandoned_records(pm)) >= 2:
             break
 
-    assert aborted["called"] is True  # a deliberate terminal escalation, not an infinite spin
     records = _abandoned_records(pm)
     assert len(records) == 2  # exactly one continuation: two give-ups total
     assert records[0].detail["terminal"] is False
     assert records[1].detail["terminal"] is True
     assert records[0].detail["jobs_faulted"] == 1  # the first reissued the servable head
+
+    if supervised:
+        assert aborted["called"] is True  # a deliberate terminal escalation, not an infinite spin
+        return
+
+    assert aborted["called"] is False
+    rebuilds_before = rebuilds["count"]
+    for _ in range(120):
+        clock.advance(1)
+        pm._recovery_coordinator.run_recovery_supervisor()
+
+    assert rebuilds["count"] == rebuilds_before, (
+        "The unattended worker kept rebuilding a pool the escalation had already declared beyond its remedies."
+    )
+    assert len(_abandoned_records(pm)) == 2, (
+        "The unattended worker kept giving up over the same wedge: the faulting must stop once the escalation "
+        "is spent, rather than repeat for as long as the worker runs."
+    )
 
 
 def _install_transient_window_supervisor(pm: HordeWorkerProcessManager, clock: _FakeClock) -> RecoverySupervisor:
@@ -484,18 +543,23 @@ class TestHeadModelMaterialisingDefersGiveUp:
         assert first_give_up_at > preload_budget
 
 
+@_SUPERVISION_ARMS
 async def test_recovery_granted_retry_survives_first_give_up_then_faults_when_wedge_persists(
     monkeypatch: pytest.MonkeyPatch,
+    supervised: bool,
 ) -> None:
     """A retry a pool rebuild granted gets a dispatch opportunity: the first give-up spares it, the terminal does not.
 
     The rebuild requeues an in-flight job (``recovery_requeue``), granting it another attempt. A non-terminal
     give-up in the same cycle must not terminally fault that retry before the rebuilt pool has had a chance to
-    run it; the terminal give-up (the wedge outlived the continuation cycle) faults it regardless.
+    run it; the terminal give-up (the wedge outlived the continuation cycle) faults it regardless. Supervised,
+    the terminal escalation then exits. Unattended, the worker stays up and no further give-up follows, so the
+    faulting is bounded by the escalation rather than by the operator noticing.
     """
     pm = make_testable_process_manager()
     clock = _FakeClock()
     _install_supervisor(pm, clock)
+    pm._recovery_coordinator._clock = clock
     await _latch_structural_queue_wedge(pm)
     pm._job_tracker.set_retry_policy(2)
 
@@ -506,8 +570,7 @@ async def test_recovery_granted_retry_survives_first_give_up_then_faults_when_we
     pm._job_tracker.handle_job_fault_now(head, retryable=True, recovery_requeue=True)
     assert pm._job_tracker.retry_granted_by_recovery(head.id_) is True
 
-    aborted = {"called": False}
-    monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+    aborted = _install_abort_stub(pm, monkeypatch, supervised=supervised)
 
     proc = pm._process_map[0]
     monkeypatch.setattr(
@@ -533,10 +596,11 @@ async def test_recovery_granted_retry_survives_first_give_up_then_faults_when_we
 
     monkeypatch.setattr(pm._recovery_coordinator, "give_up_on_wedged_jobs", _spy_give_up)
 
+    # Driven until the terminal give-up has run or the escalation has gone quiescent.
     for _ in range(60):
         clock.advance(1)
         pm._recovery_coordinator.run_recovery_supervisor()
-        if aborted["called"]:
+        if pm._state.recovery_parked or any(call["terminal"] is True for call in give_up_calls):
             break
 
     assert give_up_calls, "give-up never fired"
@@ -547,7 +611,21 @@ async def test_recovery_granted_retry_survives_first_give_up_then_faults_when_we
     terminal_calls = [call for call in give_up_calls if call["terminal"] is True]
     assert terminal_calls, "the persisting wedge never reached a terminal give-up"
     assert terminal_calls[-1]["pending_after"] == 0
-    assert aborted["called"] is True
+
+    if supervised:
+        assert aborted["called"] is True
+        return
+
+    assert aborted["called"] is False
+    give_ups_before = len(give_up_calls)
+    for _ in range(120):
+        clock.advance(1)
+        pm._recovery_coordinator.run_recovery_supervisor()
+
+    assert len(give_up_calls) == give_ups_before, (
+        "The unattended worker kept giving up after the terminal escalation: the retry it granted, and any "
+        "later work, would be faulted on every cycle for as long as the worker runs."
+    )
 
 
 async def _fault_pending_as_generation_failure(pm: HordeWorkerProcessManager) -> None:

@@ -1037,6 +1037,10 @@ class HordeWorkerProcessManager:
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
+        # Recovery-triggered shutdown uses the ordinary bounded cleanup path, then leaves the interpreter with
+        # failure so service managers configured for failure-only restart can distinguish it from an operator's
+        # clean stop. Kept on the top-level manager because it is a process-exit contract, not shared worker state.
+        self._recovery_failure_exit_requested = False
         self._sleep = asyncio.sleep
 
         ceiling = max(bridge_data.max_threads, max_threads_ceiling if max_threads_ceiling is not None else 0)
@@ -1245,6 +1249,8 @@ class HordeWorkerProcessManager:
             max_safety_processes=self.max_safety_processes,
             amd_gpu=self._amd_gpu,
             directml=self._directml,
+            # The lifecycle manager owns the hard timeout of an already-started shutdown. That cleanup must be
+            # unconditional; it is distinct from SOS recovery's restart-gated terminal rung below.
             abort_callback=lambda: self._abort(),
             state=self._state,
             entry_points=process_entry_points,
@@ -1588,7 +1594,7 @@ class HordeWorkerProcessManager:
             reserve_ledger=self._reserve_ledger,
             bridge_data_provider=lambda: self.bridge_data,
             max_inference_processes_provider=lambda: self.max_inference_processes,
-            abort_callback=lambda: self._abort(),
+            abort_callback=lambda: self._abort_for_recovery(),
             release_disaggregated_job=self._disaggregation_orchestrator.release_job,
             head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
         )
@@ -1648,6 +1654,8 @@ class HordeWorkerProcessManager:
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             admission_baseline_provider=self.latest_baseline_estimate_mb,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
+            post_processing_lane_paused_provider=lambda: self._process_lifecycle.is_post_process_gpu_paused,
+            vram_pressure_provider=self._all_governed_cards_under_vram_pressure,
             staged_models_provider=self._staged_checkpoint_models,
             action_ledger=self._action_ledger,
             post_processing_lane_commitments_provider=lambda: getattr(
@@ -2093,6 +2101,19 @@ class HordeWorkerProcessManager:
                 f"above the ~{POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB / 1024:.1f}GB open requirement (peak plus "
                 "resident-shift margin) for the sustain window.",
             )
+
+    def _all_governed_cards_under_vram_pressure(self) -> bool:
+        """Whether every governed card sits below the device-free governor's soft floor.
+
+        The popper's whole-card-model offer narrowing reads this: a model that wants the whole card has nowhere
+        to go while no card is HEALTHY, so it comes off the offer. The question is worker-wide because the offer
+        is (the worker routes a popped job to whichever card can serve it), so one healthy card answers no. A
+        host with no governed card (no NVML reading yet) also answers no, keeping the offer unnarrowed while
+        pressure is unmeasurable.
+        """
+        if not self._governor_states_by_device:
+            return False
+        return all(state is not GovernorState.HEALTHY for state in self._governor_states_by_device.values())
 
     def _max_driven_card_free_mb(self) -> float | None:
         """Return the highest recent NVML device-free reading across driven cards, or None when unavailable.
@@ -5144,7 +5165,10 @@ class HordeWorkerProcessManager:
                     return
                 if process_info.process_type == HordeProcessType.INFERENCE:
                     logger.warning(f"Supervisor requested restart of inference process {command.process_id}.")
-                    self._process_lifecycle._replace_inference_process(process_info)
+                    self._process_lifecycle._replace_inference_process(
+                        process_info,
+                        allow_while_recovery_parked=True,
+                    )
                     return
                 # A service lane (COMPONENT/VAE_LANE/POST_PROCESS/UTILITIES) accrues host commit charge (its
                 # CUDA context and allocator arenas) that an in-process model unload cannot return; a process
@@ -6679,8 +6703,8 @@ class HordeWorkerProcessManager:
         """Return a durable summary of this worker session for app-state persistence.
 
         Read after the main loop ends (the counters remain valid on the manager). ``clean_exit`` is
-        False when the session tripped the consecutive-failure circuit breaker, which both flags a
-        bad run and disqualifies the active config from being recorded as known-good.
+        False when the session tripped the consecutive-failure circuit breaker or needed terminal recovery,
+        either of which flags a bad run and disqualifies the active config from being recorded as known-good.
         """
         import horde_worker_regen
 
@@ -6693,7 +6717,9 @@ class HordeWorkerProcessManager:
             jobs_submitted=self._job_tracker.total_num_completed_jobs,
             jobs_faulted=self._job_tracker.num_jobs_faulted,
             kudos_this_session=self._state.kudos_generated_this_session,
-            clean_exit=not self._state.too_many_consecutive_failed_jobs,
+            clean_exit=(
+                not self._state.too_many_consecutive_failed_jobs and not self._recovery_failure_exit_requested
+            ),
         )
 
     def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:
@@ -6840,7 +6866,7 @@ class HordeWorkerProcessManager:
                     logger.error(f"main loop task raised during shutdown: {result}")
 
     def start(self) -> None:
-        """Start the process manager."""
+        """Start the process manager and propagate a terminal recovery as a failed process exit."""
         import atexit
         import signal
 
@@ -6852,6 +6878,8 @@ class HordeWorkerProcessManager:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         asyncio.run(self._main_loop())
+        if self._recovery_failure_exit_requested:
+            raise SystemExit(1)
 
     def _kill_owned_children_on_exit(self) -> None:
         """Best-effort kill of any child still owned at interpreter exit (the atexit backstop)."""
@@ -6909,3 +6937,33 @@ class HordeWorkerProcessManager:
     def _abort(self) -> None:
         """Exit as soon as possible, aborting all processes and jobs immediately."""
         self._shutdown_manager.abort()
+
+    def _abort_for_recovery(self) -> None:
+        """Take the escalation's last rung, a fresh process, but only when something would bring one back.
+
+        A replacement process is the one remedy that clears state an in-place rebuild cannot, so the worker
+        exits non-zero and lets whoever launched it start a new one. That is only a recovery if something is
+        actually watching: a supervising frontend relaunches on the unexpected exit, and an operator running
+        unattended can arrange the same with a service manager, which they signal by setting
+        ``exit_on_unhandled_faults``.
+
+        With neither in place, exiting would end the worker's usefulness rather than restore it, so this rung
+        is withheld and the escalation keeps re-attempting the remedies it can perform in place. Callers treat
+        a withheld abort as "not aborted" and carry on driving the ladder; once even those remedies are spent
+        the recovery coordinator holds the worker quiescent rather than churning (see
+        :attr:`WorkerState.recovery_parked`).
+        """
+        supervisor_would_relaunch = self._supervisor is not None
+        if supervisor_would_relaunch or self.bridge_data.exit_on_unhandled_faults is True:
+            # ``ShutdownManager.abort`` deliberately lets the event loop unwind through its bounded cleanup and
+            # persistence path. Remember the terminal outcome here so ``start`` does not turn that unwind into a
+            # successful process status when it returns.
+            self._recovery_failure_exit_requested = True
+            self._abort()
+            return
+        logger.critical(
+            "Save-our-ship: the escalation asked for a fresh process, but no supervisor is attached and "
+            "exit_on_unhandled_faults is off, so exiting would leave nothing to restart this worker. Staying "
+            "up and continuing to escalate in place. To let the worker restart itself unattended, run it "
+            "under a service manager and set exit_on_unhandled_faults.",
+        )

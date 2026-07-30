@@ -108,6 +108,21 @@ class TestExpandOfferedForms:
         assert "CodeFormers" in offered
         assert "BACKEND_DEFAULT" not in offered
 
+    def test_lane_bound_forms_withheld_while_the_post_processing_lane_is_down(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Upscalers and face-fixers are dropped while no post-processing lane is up; other forms stay."""
+        monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
+        bridge_data = self._bridge_data()
+        offered = expand_offered_forms(bridge_data, post_process_lane_healthy=False)
+
+        assert "RealESRGAN_x4plus" not in offered
+        assert "GFPGAN" not in offered
+        assert "CodeFormers" not in offered
+        assert "interrogation" in offered, "CLIP-stack forms do not touch the post-processing lane"
+        assert "strip_background" in offered, "strip_background runs on the image-utilities lane"
+
     def test_caption_offered_with_opt_in(self) -> None:
         """Caption is offered once alchemy_caption_enabled is set."""
         bridge_data = self._bridge_data(alchemy_caption_enabled=True)
@@ -647,11 +662,26 @@ class _StubState:
         supervisor_paused: bool = False,
         self_throttle_paused: bool = False,
         gpu_torch_incompatible: bool = False,
+        recovery_parked: bool = False,
+        downloads_only_hold: bool = False,
     ) -> None:
         self.shutting_down = shutting_down
         self.supervisor_paused = supervisor_paused
         self.self_throttle_paused = self_throttle_paused
         self.gpu_torch_incompatible = gpu_torch_incompatible
+        self.recovery_parked = recovery_parked
+        self.downloads_only_hold = downloads_only_hold
+
+    @property
+    def workload_intake_paused(self) -> bool:
+        """Mirror the shared WorkerState intake boundary for the policy-only test double."""
+        return (
+            self.shutting_down
+            or self.supervisor_paused
+            or self.self_throttle_paused
+            or self.recovery_parked
+            or self.downloads_only_hold
+        )
 
 
 class _StubRuntimeConfig:
@@ -699,6 +729,8 @@ class _PolicyProcessMap:
             return self._graph
         if capability is WorkerCapability.ALCHEMY_CLIP:
             return self._clip
+        if capability is WorkerCapability.IMAGE_UTILITIES and self._utilities_lanes > 0:
+            return object()
         return None
 
     def get_capable_processes(self, capability: WorkerCapability) -> list[_IdleProc]:
@@ -711,6 +743,10 @@ class _PolicyProcessMap:
 
     def num_loaded_utilities_processes(self) -> int:
         return self._utilities_lanes
+
+    def num_loaded_post_process_processes(self) -> int:
+        # The graph capability is served only by the post-processing lane, so the two readings agree.
+        return 1 if self._graph is not None else 0
 
 
 def _make_policy_coordinator(
@@ -809,6 +845,52 @@ class TestShouldPopPolicy:
             in_flight=1,
         )
         assert coordinator._should_pop() is False
+
+    @pytest.mark.parametrize(
+        ("hold", "should_pop"),
+        [("recovery", False), ("downloads-only", False), ("none", True)],
+    )
+    @pytest.mark.parametrize(
+        ("lane", "form"),
+        [
+            ("graph", "RealESRGAN_x4plus"),
+            ("clip", "interrogation"),
+            ("utilities", "strip_background"),
+        ],
+        ids=["post-processing", "safety", "utilities"],
+    )
+    def test_worker_wide_holds_block_alchemy_across_servable_lanes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        hold: str,
+        should_pop: bool,
+        lane: str,
+        form: str,
+    ) -> None:
+        """Worker-wide holds reject alchemy work even when a surviving lane could accept it.
+
+        The active arm for each lane proves that the arranged process map, form offer, queue, timing, and
+        headroom otherwise pass the admission policy. This keeps a held result attributable to the worker
+        posture rather than to an unavailable lane or malformed offer. Download-only and terminal-recovery
+        holds share this boundary because both promise that no workload is accepted while GPU pools are held.
+        """
+        monkeypatch.setattr(alchemy_popper, "expand_offered_forms", lambda *_args, **_kwargs: [form])
+        process_map = _PolicyProcessMap(
+            graph=object() if lane == "graph" else None,
+            clip=object() if lane == "clip" else None,
+            utilities_lanes=1 if lane == "utilities" else 0,
+            idle_image_lanes=1,
+            free_vram_mb=8_000.0,
+        )
+        coordinator = _make_policy_coordinator(
+            bridge_data=self._bridge_data(alchemy_allow_concurrent=False),
+            process_map=process_map,
+            job_tracker=_StubJobTracker(pending=0),
+        )
+        coordinator._state.recovery_parked = hold == "recovery"
+        coordinator._state.downloads_only_hold = hold == "downloads-only"
+
+        assert coordinator._should_pop() is should_pop
 
     def test_unknown_vram_falls_back_to_backfill(self) -> None:
         """When VRAM telemetry is unavailable, alchemy only pops with an empty image queue."""

@@ -242,6 +242,33 @@ class TestVerifiedReclaimLadderEngine:
         engine.on_tick(0, saturated=True, device_free_mb=2000.0, actuator=actuator, ladder_builder=builder)
         assert builds == 1
 
+    def test_a_rung_with_no_promised_free_is_never_certified_on_its_first_sample(self) -> None:
+        """A rung priced at zero (an unreported reservation) is unverifiable, so it must not self-certify.
+
+        The yield-fraction test against a zero promise reduces to "realized at least nothing", which the first
+        sample always satisfies. Certifying there would credit a rung that freed nothing and sprint the engine
+        down the rest of the ladder, up to moving safety off the card, on evidence it never had.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_unload_rung(1, 0.0), _unload_rung(2, 1000.0))
+
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        assert actuator.calls == [("unload", 1)]
+
+        # First sample: the unverifiable rung is held, not certified, and nothing is credited.
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        assert actuator.calls == [("unload", 1)]
+        assert engine.verified_frees_mb == 0.0
+
+        # Its full window served, it resolves so the engine escalates, still crediting nothing and counting no
+        # shortfall against a promise that was never a measurement.
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        assert actuator.calls == [("unload", 1), ("unload", 2)]
+        assert engine.verified_frees_mb == 0.0
+        assert engine.verification_shortfalls == 0
+        assert actuator.calibration_events == []
+
 
 class TestReclaimLadderVerifiedRestore:
     """Lane-pause rungs the engine issues are restored (LIFO) when the card returns HEALTHY, safety excepted."""

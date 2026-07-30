@@ -22,7 +22,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason, WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.jobs.pool_lanes import PoolLaneState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.process_manager import POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB
 from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource, make_empty_pop_response
@@ -46,6 +47,7 @@ from tests.process_management.conftest import (
     make_mock_process_info,
     make_test_api_sessions,
     make_test_runtime_config,
+    make_testable_process_manager,
     track_popped_job_async,
 )
 
@@ -66,6 +68,8 @@ def _make_popper(
     model_availability: ModelAvailability | None = None,
     post_processing_lane_commitments_provider: Callable[[], int] | None = None,
     extended_controlnet_ready_provider: Callable[[], bool] | None = None,
+    post_processing_lane_paused_provider: Callable[[], bool] | None = None,
+    vram_pressure_provider: Callable[[], bool] | None = None,
     pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
     pool_pop_outcome_sink: Callable[..., None] | None = None,
 ) -> JobPopper:
@@ -104,6 +108,8 @@ def _make_popper(
         model_availability=model_availability,
         post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
         extended_controlnet_ready_provider=extended_controlnet_ready_provider,
+        post_processing_lane_paused_provider=post_processing_lane_paused_provider,
+        vram_pressure_provider=vram_pressure_provider,
         pool_active_seats_provider=pool_active_seats_provider,
         pool_pop_outcome_sink=pool_pop_outcome_sink,
     )
@@ -196,6 +202,30 @@ class TestApiJobPopGuardClauses:
 
         assert state.last_pop_no_jobs_available is False
         assert state.torch_build_cpu_only is True
+
+    async def test_recovery_park_blocks_pop(self) -> None:
+        """A worker whose recovery escalation is parked takes no new work, even with an available pool.
+
+        The park means every remedy the worker can apply in place is spent over a pool that cannot serve, so
+        work accepted now would only be faulted back to the horde.
+        """
+        state = WorkerState(
+            recovery_parked=True,
+            recovery_park_reason=RecoveryParkReason.UNRECOVERABLE_POOL,
+            last_pop_no_jobs_available=True,
+        )
+        session = Mock()
+        session.submit_request = AsyncMock()
+        popper = _make_popper(
+            state=state,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+        assert state.last_pop_no_jobs_available is False
 
     async def test_too_many_consecutive_failures_blocks_pop(self) -> None:
         """Active failure pause prevents any pop attempt."""
@@ -567,6 +597,157 @@ class TestPostProcessingBreakerSuppression:
         request = await self._pop_and_capture_request(state=state)
 
         assert request.allow_post_processing is False
+
+
+class TestPausedPostProcessingLaneSuppression:
+    """A post-processing lane held off the GPU stops being advertised, and resumes when it returns."""
+
+    @staticmethod
+    async def _pop_and_capture_request(*, lane_paused: bool) -> object:
+        """Drive one full pop with the lane paused or up and return the built job-pop request."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            post_processing_lane_paused_provider=lambda: lane_paused,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        return session.submit_request.call_args.args[0]
+
+    async def test_paused_lane_withholds_post_processing(self) -> None:
+        """A lane held off the GPU cannot run an upscale, so the pop stops advertising post-processing."""
+        request = await self._pop_and_capture_request(lane_paused=True)
+
+        assert request.allow_post_processing is False
+
+    async def test_restored_lane_advertises_post_processing_again(self) -> None:
+        """Once the lane is back on the GPU the capability is advertised again, with no latch to clear."""
+        request = await self._pop_and_capture_request(lane_paused=False)
+
+        assert request.allow_post_processing is True
+
+    def test_pause_alone_withholds_with_the_headroom_gate_open(self) -> None:
+        """The pause itself withholds the offer, not either self-protection latch.
+
+        Both latches are proven clear first: the headroom gate is driven open by free VRAM that holds the open
+        requirement past the sustain window, and the fault breaker never trips. The reclaim-ladder lane pause is
+        then the only remaining reason the offer can be withheld.
+        """
+        manager = make_testable_process_manager(
+            post_processing_fault_breaker_enabled=True,
+            device_free_mb=POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB + 5000.0,
+        )
+        manager._apply_post_processing_headroom_gate()
+        manager._pp_headroom_sustained_since = (
+            time.monotonic() - manager._POST_PROCESSING_HEADROOM_SUSTAIN_SECONDS - 1.0
+        )
+        manager._apply_post_processing_headroom_gate()
+        assert manager._state.post_processing_withheld_for_headroom is False
+        assert manager._state.post_processing_disabled_by_breaker is False
+        assert manager._job_popper._post_processing_offer_withheld() is False
+
+        assert manager._inference_scheduler.pause_post_process_lane(None) is True
+        assert manager._process_lifecycle.is_post_process_gpu_paused is True
+
+        # Neither latch moved: the pause is the sole cause of the withheld offer.
+        assert manager._state.post_processing_withheld_for_headroom is False
+        assert manager._state.post_processing_disabled_by_breaker is False
+        assert manager._job_popper._post_processing_offer_withheld() is True
+
+
+class TestVramPressureModelNarrowing:
+    """Under sustained VRAM pressure the whole-card models come off the offer, floored so it never empties."""
+
+    _FLUX = "Flux.1-Schnell fp8 (Compact)"
+    _CASCADE = "Stable Cascade 1.0"
+    _SMALL = "stable_diffusion"
+
+    async def _popper_holding_one_job(
+        self,
+        *,
+        under_pressure: bool,
+        model: str = _SMALL,
+    ) -> JobPopper:
+        """A popper holding one queued job (so the idle rail does not fire) with the given pressure reading."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response(model))
+        return _make_popper(
+            job_tracker=job_tracker,
+            vram_pressure_provider=lambda: under_pressure,
+        )
+
+    async def test_pressure_drops_extra_large_models(self) -> None:
+        """With every card under pressure the whole-card models are withheld and the rest stay offered."""
+        popper = await self._popper_holding_one_job(under_pressure=True)
+
+        offered = popper._apply_vram_pressure_model_narrowing({self._SMALL, self._FLUX, self._CASCADE})
+
+        assert offered == {self._SMALL}
+
+    async def test_healthy_worker_offers_everything(self) -> None:
+        """With no pressure the offer is untouched, whole-card models included."""
+        popper = await self._popper_holding_one_job(under_pressure=False)
+
+        offered = popper._apply_vram_pressure_model_narrowing({self._SMALL, self._FLUX, self._CASCADE})
+
+        assert offered == {self._SMALL, self._FLUX, self._CASCADE}
+
+    async def test_whole_card_only_worker_keeps_its_offer(self) -> None:
+        """A worker configured only with whole-card models keeps offering them: an empty offer never recovers."""
+        popper = await self._popper_holding_one_job(under_pressure=True, model=self._FLUX)
+
+        offered = popper._apply_vram_pressure_model_narrowing({self._FLUX, self._CASCADE})
+
+        assert offered == {self._FLUX, self._CASCADE}
+
+    def test_idle_queue_is_never_narrowed(self) -> None:
+        """Holding no work, the worker offers everything: narrowing now could never be relieved."""
+        popper = _make_popper(job_tracker=JobTracker(), vram_pressure_provider=lambda: True)
+
+        offered = popper._apply_vram_pressure_model_narrowing({self._SMALL, self._FLUX})
+
+        assert offered == {self._SMALL, self._FLUX}
+
+    async def test_pop_under_pressure_still_advertises_a_non_empty_model_set(self) -> None:
+        """End to end: a whole-card-only worker under pressure still sends a real, non-empty offer."""
+        job_tracker = JobTracker()
+        job_tracker.set_performance_mode_thresholds(1000)
+        await track_popped_job_async(job_tracker, make_job_pop_response(self._FLUX))
+        await job_tracker.increment_jobs_completed()
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=self._FLUX, state=HordeProcessState.WAITING_FOR_JOB),
+                10: make_mock_process_info(
+                    10,
+                    model_name=None,
+                    state=HordeProcessState.WAITING_FOR_JOB,
+                    process_type=HordeProcessType.SAFETY,
+                ),
+            },  # type: ignore[arg-type]
+        )
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=process_map,
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(image_models_to_load=[self._FLUX], queue_size=8),
+            vram_pressure_provider=lambda: True,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        request = session.submit_request.call_args.args[0]
+        assert request.models == [self._FLUX]
 
 
 class TestPostProcessingBacklogOfferShaping:

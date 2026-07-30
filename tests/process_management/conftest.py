@@ -14,13 +14,18 @@ from pydantic import JsonValue
 
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle import owned_process_registry
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
@@ -28,6 +33,8 @@ from horde_worker_regen.process_management.process_manager import (
     SystemResources,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 
@@ -585,3 +592,100 @@ def mock_process_info() -> HordeProcessInfo:
 def process_manager() -> HordeWorkerProcessManager:
     """Create a testable HordeWorkerProcessManager with all external deps mocked."""
     return make_testable_process_manager()
+
+
+class FakeClock:
+    """A monotonic clock the test advances explicitly, so escalation timing is deterministic."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        """Start the clock at ``now`` seconds."""
+        self.now = now
+
+    def __call__(self) -> float:
+        """Return the current time, matching the ``Callable[[], float]`` clock contract."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward by ``seconds``."""
+        self.now += seconds
+
+
+def make_test_recovery_coordinator(
+    *,
+    job_tracker: JobTracker | None = None,
+    clock: FakeClock | None = None,
+    structural_wedge: bool = False,
+    ready_lane: bool = True,
+    lane_state: HordeProcessState = HordeProcessState.WAITING_FOR_JOB,
+    **scheduler_overrides: bool,
+) -> WorkerRecoveryCoordinator:
+    """Create a WorkerRecoveryCoordinator over a single inference lane with mocked collaborators.
+
+    Every scheduler grace and hold defaults to inactive so a test asserts against exactly the condition
+    it arranges. Pass a grace by name to activate it, for example
+    ``whole_card_residency_grace_active=True``.
+
+    Args:
+        job_tracker: The tracker to wire in; a fresh one sharing ``clock`` when omitted.
+        clock: Injectable monotonic clock shared by the coordinator, supervisor, and tracker.
+        structural_wedge: What the message dispatcher's deadlock snapshot reports.
+        ready_lane: Whether the process map contains an inference lane at all.
+        lane_state: The lane's reported process state, so a test can present a slot that is running a job
+            rather than idle.
+        **scheduler_overrides: Scheduler predicate return values to override from their inactive default.
+
+    Returns:
+        A coordinator suitable for driving ``run_recovery_supervisor`` or the give-up path directly.
+    """
+    clock = clock if clock is not None else FakeClock()
+    job_tracker = job_tracker if job_tracker is not None else JobTracker(clock=clock)
+
+    process_map = ProcessMap(
+        {1: make_mock_process_info(1, model_name=None, state=lane_state)} if ready_lane else {},
+    )
+
+    lifecycle = Mock()
+    lifecycle._num_process_recoveries = 0
+    lifecycle.has_pending_inference_starts.return_value = False
+    lifecycle.pending_gpu_starts_backing_off.return_value = False
+    lifecycle.has_pending_safety_starts.return_value = False
+    lifecycle.quarantined_inference_slots = frozenset()
+    lifecycle.safety_pool_failing = False
+
+    dispatcher = Mock()
+    dispatcher.get_deadlock_snapshot.return_value.indicates_structural_wedge.return_value = structural_wedge
+
+    scheduler = Mock()
+    scheduler_defaults: dict[str, bool] = {
+        "head_model_materializing": False,
+        "whole_card_residency_grace_active": False,
+        "heavy_head_load_grace_active": False,
+        "ram_reclaim_cycle_grace_active": False,
+        "governance_healthy_but_held": False,
+        "unload_post_process_models_from_vram": False,
+    }
+    scheduler_defaults.update(scheduler_overrides)
+    for predicate_name, predicate_value in scheduler_defaults.items():
+        getattr(scheduler, predicate_name).return_value = predicate_value
+    # No reclaim candidates by default, so a test asserts against exactly the escalation it arranges. A test of
+    # the constructive remedy cursor overrides this with the candidates it wants offered.
+    scheduler.build_reclaim_ladder_candidates.return_value = LadderCandidates(device_index=None)
+
+    bridge_data = make_mock_bridge_data(max_threads=1, preload_timeout=150.0)
+
+    return WorkerRecoveryCoordinator(
+        state=WorkerState(),
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        job_tracker=job_tracker,
+        process_map=process_map,
+        process_lifecycle=lifecycle,
+        message_dispatcher=dispatcher,
+        inference_scheduler=scheduler,
+        action_ledger=ActionLedger(),
+        reserve_ledger=CommittedReserveLedger(),
+        bridge_data_provider=lambda: bridge_data,
+        max_inference_processes_provider=lambda: 1,
+        abort_callback=Mock(),
+        recovery_supervisor=RecoverySupervisor(clock=clock),
+        clock=clock,
+    )

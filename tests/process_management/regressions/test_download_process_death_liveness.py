@@ -504,7 +504,10 @@ def test_restart_process_command_still_replaces_an_inference_slot() -> None:
         SupervisorControlMessage(command=SupervisorCommand.RESTART_PROCESS, process_id=1),
     )
 
-    manager._process_lifecycle._replace_inference_process.assert_called_once_with(inference)
+    manager._process_lifecycle._replace_inference_process.assert_called_once_with(
+        inference,
+        allow_while_recovery_parked=True,
+    )
     manager._process_lifecycle.recycle_lane_process.assert_not_called()
 
 

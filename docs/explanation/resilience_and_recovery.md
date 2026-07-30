@@ -29,7 +29,16 @@ the one below and only escalating when the lower layer cannot cope:
 | ----- | ----- | --------- | ----- |
 | 1 | A single job faulted | Bounded retry; one degraded (isolated) retry for resource faults | `JobTracker` + `failure_classification.py` |
 | 2 | A single slot crashed | Replace the process; quarantine it if it crash-loops | `ProcessLifecycleManager` |
-| 3 | The whole worker is wedged | Soft-reset the pools (concurrency preserved), then give up cleanly on unservable jobs | `RecoverySupervisor` (policy) + `WorkerRecoveryCoordinator` (assessment/actions) |
+| 3 | The whole worker is wedged | Soft-reset the pools (concurrency preserved), then give up cleanly on unservable jobs, and finally take a fresh process when one is reachable | `RecoverySupervisor` (policy) + `WorkerRecoveryCoordinator` (assessment/actions) |
+
+The escalation is ordered least-destructive first, and its endpoint is a **working worker**, not a stopped
+one. A fresh process is the last rung rather than an outcome: the worker exits non-zero so whoever
+launched it starts a new one, which clears state an in-place rebuild cannot. That rung is only taken when
+something is listening for the exit, either the dashboard supervising its worker child or an operator who
+set `exit_on_unhandled_faults` alongside a service manager (see
+[Run the worker as a system service](../how-to/run-as-a-system-service.md)). With neither, the worker does
+not exit: it keeps escalating with the remedies it can apply in place, because exiting where nothing would
+restart it ends the worker's usefulness instead of restoring it.
 
 Cutting across all three are two durable records used for diagnosis and orphan
 cleanup: the [action ledger](#the-action-ledger) and the
@@ -259,7 +268,13 @@ manager-side **actions**:
 
 The escalation, in order:
 
-1. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools
+1. **Constructive reclaim (bounded)**: before rebuilding healthy children, borrow the verified reclaim ladder's
+   remaining idle-only rungs and allow each issued action a settling window. The candidate list is frozen per
+   episode, its cursor only advances, and both its issue allotment and aggregate time are bounded. SOS protects
+   models demanded by pending work, so the rung cannot unload the exact resident model the wedged head needs.
+   A post-processing module unload has one independent wall-clock grace and is issued at most once per episode;
+   it cannot reset its own deadline indefinitely.
+2. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools
    in place (kill and respawn every child, un-quarantine slots), preserving the
    configured concurrency (`max_threads`). The rebuild alone clears a transient
    wedge; the cap is deliberately not lowered, because shedding a lane on every
@@ -268,14 +283,44 @@ The escalation, in order:
    escalation policy still **counts** each soft reset (`limp_by_level`) so a
    persistent wedge still escalates to give-up. The parent process and the TUI stay
    attached. A transient wedge (a bad model load, a one-off deadlock) recovers here.
-2. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
+3. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
    helping (e.g. a deterministic crash-on-start), stop fighting: fault the jobs
    that cannot be served so the horde reissues them, rather than wedging forever.
    If the pool is still structurally usable (for example, a queue-deadlock give-up
    with live capacity), the worker keeps running. If inference or safety capacity
    cannot be restored, SOS escalates through abort so the worker process exits
    non-zero after killing its children; the TUI supervisor then relaunches it via
-   the normal unexpected-exit path.
+   the normal unexpected-exit path. Safety capacity counts here for the same reason
+   inference capacity does: it sits on every job's path, so a pool that cannot serve
+   safety checks cannot serve work at all, and faulting that backlog without
+   recording the pool as structurally broken would drop the queue on every cycle
+   while the escalation read the pool as healthy.
+
+   The abort is gated on a reachable restart. When no supervisor is attached and
+   `exit_on_unhandled_faults` is unset, the worker declines to exit and continues
+   escalating in place instead, so a refused abort never freezes the escalation that
+   still has remedies to try.
+
+   Continuing in place is only safe while remedies remain. When the terminal rung is
+   withheld *and* the escalation is spent (the terminal give-up, or a process-recovery
+   rate past its rolling ceiling), the coordinator **parks recovery**
+   (`WorkerState.recovery_parked`): the worker stays up, but every workload popper
+   (image generation and alchemy) stops accepting work through the shared
+   `WorkerState.workload_intake_paused` contract, and every automatic child
+   replacement or late model-ready pool-start path is suspended across inference, safety, post-processing,
+   component, VAE, and utilities lanes. Already-accepted work may still drain, and a
+   shutdown that begins during the park retains its unconditional hard-abort path.
+   Thus a doomed pool costs a bounded amount instead of endless process churn and job
+   faulting. A park is an indefinite hold, kept off the
+   time-bounded pop-pause deadline for that reason, and modelled on
+   `downloads_only_hold`. It is exitable: what dooms a pool is often external (a
+   co-tenant process holding the card's VRAM, an exhausted disk), so after
+   `RECOVERY_PARK_REPROBE_SECONDS` the park lifts. Every episode-owned wedge latch,
+   progress baseline, reclaim cursor, lane-pause receipt, and remedy budget returns to
+   baseline before one fresh attempt runs. A worker whose condition cleared resumes
+   serving; one still doomed parks again, bounding the churn to a cycle per interval.
+   Entry is logged and recorded in the ledger once (`recovery_parked`), and the lift
+   is logged once.
 
    Give-up is **readiness-gated**, not fixed-age. A soft reset rebuilds the pool,
    and the replacement children spend real time booting (importing torch) before
@@ -336,7 +381,25 @@ The escalation, in order:
    capacity.
 
 With `exit_on_unhandled_faults` set, the worker exits instead of limping; SOS is
-the default-on alternative that prioritises continued operation.
+the default-on alternative that prioritises continued operation. The same flag is
+how an unattended operator opts into the escalation's fresh-process rung, since it
+declares that something outside the worker will restart it. See
+[Run the worker as a system service](../how-to/run-as-a-system-service.md).
+
+## What counts as progress
+
+An escalation resets only on forward motion the failure could not have produced itself. A completed job
+counts unconditionally: it proves every downstream stage cleared. An inference *start* is only an attempt,
+so it counts only while no downstream stage is holding accepted work. A post-processing or safety backlog
+keeps admitting fresh starts while nothing leaves the stage, so crediting those starts would let the
+stalled stage manufacture its own proof of recovery and close the very episode that should be climbing.
+
+The same rule governs the wedge verdict itself. A structural queue deadlock is excused while the scheduler
+is deliberately holding the queue (a whole-card model establishing residency, a heavy head loading, a RAM
+reclaim cycle, backing-off process starts) or while inference is actually running, and every consumer reads
+that one verdict. The wedge assessment and the give-up that acts on it must not diverge: a give-up applying
+a narrower set of excuses would fault exactly the backlog the scheduler is holding for capacity that is
+about to arrive.
 
 ## Self-protective feature throttles
 

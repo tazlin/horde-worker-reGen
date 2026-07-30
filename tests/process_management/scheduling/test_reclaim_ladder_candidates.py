@@ -81,6 +81,26 @@ def test_idle_resident_promises_its_measured_reservation() -> None:
     assert candidates.idle_residents[0].footprint_mb == 5000.0
 
 
+async def test_idle_resident_needed_by_pending_work_is_not_a_reclaim_candidate() -> None:
+    """Recovery never unloads the resident model that is the pending head's existing capacity.
+
+    A structural scheduler wedge over an idle process already holding the requested model is not a resource
+    shortage. Unloading that model reproduces the trigger, consumes the reclaim settling budget, and delays the
+    soft reset that can actually clear corrupt scheduling state.
+    """
+    tracker = JobTracker()
+    await tracker.record_popped_job(make_job_pop_response(model="head-model"))
+    idle = _idle_resident(1, model="head-model", reserved_mb=5000)
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: idle}),  # type: ignore[dict-item]
+        job_tracker=tracker,
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None, protected_models=frozenset({"head-model"}))
+
+    assert candidates.idle_residents == ()
+
+
 def test_unload_idle_model_refuses_a_busy_process() -> None:
     """The targeted unload actuator never unloads an actively-sampling process (the second immunity guard)."""
     busy = make_mock_process_info(2, model_name="m", state=HordeProcessState.INFERENCE_STARTING)

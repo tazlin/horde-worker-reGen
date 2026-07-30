@@ -198,6 +198,32 @@ latched the feature off, the feature remains unadvertised regardless of backlog.
 safety backpressure, this does not record a skipped-pop reason because the pop still goes
 out.
 
+A lane held **off the GPU** withholds the capability too, on the same reasoning and by a live
+read rather than a latch: see
+[Advertising follows the lane, not a latch](process_lanes_and_chaining.md#advertising-follows-the-lane-not-a-latch).
+
+## Whole-card model offer narrowing under VRAM pressure
+
+The same "never advertise what cannot be served" rule applies to models. While *every* governed
+card sits below the device-free governor's soft floor, the pop drops the whole-card
+(`EXTRA_LARGE`) models: Flux, Cascade, Qwen, Z-Image, and the named VRAM-heavy checkpoints. A
+model that wants the whole card has nowhere to go on a card already under pressure, so offering
+it only earns work that waits on a reclaim which may never arrive.
+
+The signal is the governor's own committed state, which requires two agreeing NVML samples, so
+the offer does not flap on a single dip. One healthy card answers "no pressure" for the whole
+worker, because the offer is worker-wide (a popped job is routed to whichever card can serve
+it), and a host with no device-free reading yet never narrows.
+
+Two rails bound the narrowing, and both exist because an advertised set that reaches empty is
+unrecoverable: a worker offering nothing is sent nothing, so it never generates the activity
+that would relieve the pressure it is waiting on.
+
+- The offer is never narrowed to the empty set. A worker configured exclusively with whole-card
+  models (an all-Flux or all-Qwen box) keeps offering them.
+- No narrowing happens while the worker holds no work locally, mirroring the large-model pop
+  limiters' idle escape.
+
 ## Model stickiness
 
 When the worker has more configured models than inference processes, every new
@@ -678,6 +704,12 @@ post-processing or graph-backed alchemy) is not a pause candidate. An **actively
 rung**: it is the one process the driver did not demote, and tearing it down would trade a slow job for a
 faulted one. A VAE, component, or post-processing service lane doing live work is likewise never a pause rung.
 Both candidate assembly and the targeted action re-check liveness, so immunity holds at two layers.
+
+SOS recovery adds one further protection when it borrows this ladder for a structural wedge: models demanded
+by accepted pending work are not idle-resident unload candidates. In particular, it never unloads the model
+already held by the idle process that should serve the pending head; that action would recreate the wedge
+instead of changing it. Ordinary device-pressure reclaim does not apply this blanket pending-demand protection,
+because it may need to evict queued lookahead to make room for the actual head.
 
 It **verifies**. A real release shows up in NVML device-used within a sample or two, so after issuing a rung
 the engine watches the next one or two governor samples and compares the realized device-free gain against

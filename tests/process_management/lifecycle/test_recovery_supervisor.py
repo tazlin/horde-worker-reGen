@@ -291,6 +291,81 @@ def test_zero_progress_reset_cycles_escalate_to_give_up() -> None:
     assert supervisor.limp_by_level == 3
 
 
+def test_continuation_does_not_re_arm_the_progress_free_episode_close() -> None:
+    """A transient not-wedged window after a give-up continuation must not close the episode.
+
+    The continuation restores the soft-reset budget so one more rebuild can be attempted. That budget
+    reset must not also restore the "no reset spent yet, so a clean streak alone suffices" exemption:
+    a rebuilt pool reads as not-wedged while it boots, and that window can outlast the clean streak
+    without any work moving. An episode that has spent a reset closes only on corroborated progress.
+    """
+    supervisor, clock = _make(give_up_cooldown_seconds=3, clean_streak_seconds=3)
+
+    # Wedge -> soft reset -> readiness-gated give-up (the first of the cycle, so not terminal).
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+    clock.advance(1)
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.GIVE_UP
+    assert not supervisor.give_up_is_terminal
+
+    # Ride out the cool-down so the continuation re-opens the cycle and restores the reset budget.
+    clock.advance(3)
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    assert supervisor.limp_by_level == 0
+
+    # The rebuild's transient not-wedged window, with no progress, outlasts the clean streak.
+    clock.advance(1)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+    clock.advance(4)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+
+    assert supervisor.is_in_episode
+
+
+def test_give_up_after_a_continuation_is_terminal_despite_a_rebuild_window() -> None:
+    """The second give-up of a cycle stays terminal even when a not-wedged rebuild window intervenes.
+
+    The terminal flag is what escalates a wedge that outlived a fresh soft-reset cycle. If the
+    intervening rebuild window can close the episode without progress, the continuation counter is
+    zeroed and the escalation restarts from the first reset indefinitely, so the terminal give-up is
+    never reached and unservable work is faulted on every cycle instead.
+    """
+    supervisor, clock = _make(give_up_cooldown_seconds=3, clean_streak_seconds=3)
+
+    # Wedge -> soft reset -> first give-up of the cycle.
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+    clock.advance(1)
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.GIVE_UP
+    assert not supervisor.give_up_is_terminal
+
+    # Cool-down elapses and the continuation re-opens the cycle.
+    clock.advance(3)
+    supervisor.evaluate(is_wedged=True, pool_ready=True)
+
+    # One progress-free rebuild window, longer than the clean streak.
+    clock.advance(1)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+    clock.advance(4)
+    supervisor.evaluate(is_wedged=False, pool_ready=True, made_progress=False)
+
+    # The wedge returns and never clears again. The next give-up ends this cycle, so it is terminal.
+    first_give_up_terminal: bool | None = None
+    for _ in range(20):
+        clock.advance(2)
+        if supervisor.evaluate(is_wedged=True, pool_ready=True, made_progress=False) is RecoveryAction.GIVE_UP:
+            first_give_up_terminal = supervisor.give_up_is_terminal
+            break
+
+    assert first_give_up_terminal is True
+
+
 def test_progress_after_reset_resets_then_next_wedge_starts_at_one() -> None:
     """Healthy counterpart: a reset followed by progress closes the episode; a later wedge starts at #1."""
     supervisor, clock = _make(clean_streak_seconds=3)

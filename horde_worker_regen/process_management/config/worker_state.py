@@ -35,6 +35,19 @@ class PopPauseOwner(enum.StrEnum):
     """The safety soft-pause armed the pause because a generated result could not be safety-checked."""
 
 
+class RecoveryParkReason(enum.StrEnum):
+    """Which exhausted escalation put the worker into a recovery park (see :attr:`WorkerState.recovery_parked`).
+
+    Recorded so the operator-facing surfaces and the action ledger name the escalation that ran out of
+    remedies, rather than reporting one generic cause for conditions with different remedies.
+    """
+
+    RUNAWAY_RECOVERIES = "runaway_recoveries"
+    """Process recoveries breached the rolling-window ceiling: rebuilding is not stabilising the pool."""
+    UNRECOVERABLE_POOL = "unrecoverable_pool"
+    """The escalation spent its in-place remedies over a pool that still cannot serve accepted work."""
+
+
 @dataclasses.dataclass
 class WorkerState:
     """Cross-cutting mutable flags shared by all process-management sub-components."""
@@ -62,6 +75,26 @@ class WorkerState:
     """The worker is in a download-only posture (pre-fetch models without committing the GPU): the
     download process runs but inference/safety are held and no jobs are popped. Lifted by GO_LIVE. Kept
     separate from ``supervisor_paused`` so leaving the hold never clobbers an operator's manual pause."""
+
+    recovery_parked: bool = False
+    """Save-our-ship escalation is held quiescent: the worker stays up but stops popping and stops rebuilding.
+
+    Engaged when the escalation has spent every remedy it can perform in place and the exit rung was withheld
+    (nothing is watching that would bring a fresh process back). Escalating further there only churns children
+    and faults work the worker cannot serve, so the escalation stops and the worker waits for the underlying
+    condition to change. The recovery coordinator lifts it after its re-probe interval so one fresh escalation
+    attempt runs, which restores service by itself if the condition cleared (a co-tenant process freeing the
+    card's VRAM, disk space returning).
+
+    A hold rather than a timed pause, so it is kept off the shared ``self_throttle_paused`` deadline: that
+    deadline is owned by whichever backstop set the latest expiry, and a hold with no expiry cannot share it
+    without one lifetime clobbering the other. Modelled on ``downloads_only_hold`` for the same reason."""
+
+    recovery_park_reason: RecoveryParkReason | None = None
+    """Which exhausted escalation engaged ``recovery_parked``; None when the worker is not parked."""
+
+    recovery_park_since: float = 0.0
+    """Wall-clock time the recovery park engaged; 0 when the worker is not parked."""
 
     self_throttle_paused: bool = False
     """Worker-initiated local pop-pause: the self-throttle backstop engaged because resource/OOM faults
@@ -270,6 +303,23 @@ class WorkerState:
 
     Captured on each successful pop; the popper uses it to size the post-inference backpressure budget to
     the actual deadline. Falls back to a conservative constant when the horde does not supply one."""
+
+    @property
+    def workload_intake_paused(self) -> bool:
+        """Return whether the worker-wide posture forbids every workload popper from accepting new work.
+
+        Workload-specific gates (for example, a CPU-only torch build disabling image generation while alchemy
+        remains viable) stay with their flow. These five states are global contracts: shutdown, either local
+        pause, download-only operation, and terminal-recovery parking all require every current and future
+        workload flow to drain or remain idle rather than deepen the worker's queue.
+        """
+        return (
+            self.shutting_down
+            or self.supervisor_paused
+            or self.self_throttle_paused
+            or self.downloads_only_hold
+            or self.recovery_parked
+        )
 
     def record_safety_duration(self, seconds: float) -> None:
         """Fold one measured safety-check wall-clock into the EMA used for post-inference backpressure."""

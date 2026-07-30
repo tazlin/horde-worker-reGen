@@ -142,6 +142,20 @@ been governor-`HEALTHY` for a debounced interval, with a WARNING naming what was
 whole-card pause or a pause a live claimant holds; it exists only to reclaim an orphan neither responsible
 owner will.
 
+### Advertising follows the lane, not a latch
+
+A paused post-processing lane cannot run an upscale or a face-fix, so while it is down the worker stops
+advertising the capability: the image popper withholds `allow_post_processing`, and the alchemy popper drops the
+upscaler and face-fixer forms from its offer (`strip_background` runs on the image-utilities lane and keeps its
+own gate). Otherwise the horde keeps sending work nothing can serve, and those jobs strand until the orphan
+watchdog requeues them a bounded number of times and then faults them without images.
+
+Both readings are **derived live** from whether a lane is up rather than latched at pause time. Restore
+ownership is the reason: whoever paused the lane owns bringing it back, and a latch would leave the offer gated
+on some other party clearing state it does not own. The whole-card residency path additionally sets its
+session-long post-processing disable, because that case is a structural incompatibility rather than a transient
+pause.
+
 ### Decode-drain eligibility: a VAE-lane pause defers to a queued decode
 
 The arbiter guarantees a lane it names for a pause is *idle* at the instant of the pause (its process is not
@@ -247,7 +261,8 @@ two or more accepted jobs still need post-processing, the next image pop tempora
 queued or running inference and graph-backed alchemy forms waiting for or running on the same lane, so
 back-to-back batched PP jobs and alchemy lane occupancy are visible before the image job reaches the lane.
 When the commitment count drains below that point, post-processing is offered again, subject to the normal
-operator setting, model-readiness gate, and fault breaker.
+operator setting, model-readiness gate, fault breaker, and the lane actually being on the GPU (see
+[Advertising follows the lane, not a latch](#advertising-follows-the-lane-not-a-latch)).
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde

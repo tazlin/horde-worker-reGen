@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.lifecycle.recovery_supervisor import 
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
 from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -78,6 +79,102 @@ def _make_plm(
         device_governor_state_provider=device_governor_state_provider,  # type: ignore[arg-type]
         gpu_start_context_mb_provider=gpu_start_context_mb_provider,  # type: ignore[arg-type]
     )
+
+
+class TestRecoveryParkLifecycleQuiescence:
+    """A recovery park suspends automatic child churn until the coordinator's bounded re-probe."""
+
+    @pytest.mark.parametrize(
+        ("parked", "shutting_down", "replacement_expected"),
+        [
+            (True, False, False),
+            (False, False, True),
+            (True, True, True),
+        ],
+        ids=["parked", "ordinary-recovery", "shutdown-overrides-park"],
+    )
+    def test_crashed_inference_child_reaping_obeys_worker_posture(
+        self,
+        parked: bool,
+        shutting_down: bool,
+        replacement_expected: bool,
+    ) -> None:
+        """Crash detection is quiescent only for a running, parked worker.
+
+        The shutdown arm is a control for lifecycle precedence: a signal received during a recovery park must
+        still be able to drive the lifecycle manager's hard-timeout abort path.
+        """
+        process_info = make_mock_process_info(1, state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.mp_process = Mock()
+        process_info.mp_process.is_alive.return_value = False
+        process_info.mp_process.exitcode = 1
+        lifecycle = _make_plm(process_map=ProcessMap({1: process_info}))
+        # Replacement clears its debounce on a helper thread. A zero test timeout keeps that thread from
+        # extending the test process lifetime; the assertion concerns whether replacement begins, not debounce.
+        lifecycle._runtime_config.bridge_data.inference_step_timeout = 0
+        lifecycle._state.recovery_parked = parked
+        lifecycle._state.shutting_down = shutting_down
+        lifecycle._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+        replaced = lifecycle.replace_hung_processes()
+
+        if replacement_expected:
+            lifecycle._replace_inference_process.assert_called_once_with(process_info)
+        else:
+            assert replaced is False
+            lifecycle._replace_inference_process.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("replacement_method", "state_prefix", "start_method"),
+        [
+            ("_replace_all_safety_process", "safety_processes", "start_safety_processes"),
+            ("_replace_all_post_process_process", "post_process_processes", "start_post_process_processes"),
+            ("_replace_all_component_process", "component_processes", "start_component_processes"),
+            ("_replace_all_vae_lane_process", "vae_lane_processes", "start_vae_lane_processes"),
+            ("_replace_all_utilities_process", "utilities_processes", "start_utilities_processes"),
+        ],
+        ids=["safety", "post-process", "component", "vae", "utilities"],
+    )
+    @pytest.mark.parametrize("parked", [True, False], ids=["parked", "active"])
+    def test_service_lane_replacement_state_machines_obey_park(
+        self,
+        replacement_method: str,
+        state_prefix: str,
+        start_method: str,
+        parked: bool,
+    ) -> None:
+        """Every automatically maintained service lane shares the same recovery-park boundary."""
+        lifecycle = _make_plm()
+        lifecycle._state.recovery_parked = parked
+        setattr(lifecycle, f"_{state_prefix}_should_be_replaced", True)
+        setattr(lifecycle, f"_{state_prefix}_ending", True)
+        start = Mock()
+        setattr(lifecycle, start_method, start)
+
+        getattr(lifecycle, replacement_method)()
+
+        if parked:
+            start.assert_not_called()
+            assert getattr(lifecycle, f"_{state_prefix}_should_be_replaced") is True
+            assert getattr(lifecycle, f"_{state_prefix}_ending") is True
+        else:
+            start.assert_called_once()
+            assert getattr(lifecycle, f"_{state_prefix}_should_be_replaced") is False
+            assert getattr(lifecycle, f"_{state_prefix}_ending") is False
+
+    @pytest.mark.parametrize("parked", [True, False], ids=["parked-before-signal", "ordinary-shutdown"])
+    def test_hard_shutdown_timeout_reaches_abort_callback(self, parked: bool) -> None:
+        """The five-minute drain timeout remains terminal even if shutdown began from a recovery park."""
+        lifecycle = _make_plm()
+        lifecycle._abort_callback = Mock()
+        lifecycle._state.recovery_parked = parked
+        lifecycle._state.shutting_down = True
+        lifecycle._state.shutting_down_time = time.time() - (5 * 60 + 1)
+        lifecycle._hung_processes_detected = True
+        lifecycle._hung_processes_detected_time = time.time() - 21
+
+        assert lifecycle.replace_hung_processes() is True
+        lifecycle._abort_callback.assert_called_once()
 
 
 def test_inference_child_is_created_from_the_injected_context() -> None:
@@ -869,6 +966,50 @@ def test_vae_lane_pause_ownership_is_isolated() -> None:
     assert plm.is_vae_lane_gpu_paused is False
 
 
+def test_reclaim_owned_lane_and_safety_rungs_do_not_inflate_the_recovery_count() -> None:
+    """Every reclaim-owned rung that ends a process is an intentional teardown, not a crash recovery.
+
+    The save-our-ship escalation now reaches these rungs to relieve the resource condition under a wedge, and it
+    can reach several of them in one episode. If any counted as a process recovery, the rolling
+    runaway-recovery ceiling would trip on the remedy itself and park the worker that was recovering.
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+    fake_ctx.Process.return_value.exitcode = None
+
+    process_map = ProcessMap(
+        {
+            1: make_mock_process_info(1, process_type=HordeProcessType.POST_PROCESS),
+            2: make_mock_process_info(2, process_type=HordeProcessType.VAE_LANE),
+            3: make_mock_process_info(3, process_type=HordeProcessType.COMPONENT),
+        },
+    )
+    plm = _make_plm(ctx=fake_ctx, process_map=process_map)
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]  # avoid spawning a real process
+    plm._runtime_config.bridge_data.post_processing_lane_enabled = True
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm._runtime_config.bridge_data.dry_run_skip_inference = False
+    before = plm._num_process_recoveries
+
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.pause_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.pause_safety_on_gpu() is True
+
+    # Drive each replacement machine through its end -> delete -> completion branches.
+    for _ in range(4):
+        plm._replace_all_post_process_process()
+        plm._replace_all_vae_lane_process()
+        plm._replace_all_component_process()
+        plm._replace_all_safety_process()
+
+    assert plm._num_process_recoveries == before
+    assert plm._safety_recovery_history == []
+
+
 def test_component_lane_pause_ownership_is_isolated() -> None:
     """The component lane honors the same pause ownership: only the initiating owner's restore clears it."""
     running_lane = make_mock_process_info(1, process_type=HordeProcessType.COMPONENT)
@@ -1510,6 +1651,9 @@ class TestGiveUpDefersToAuxPrefetch:
         scheduler.ram_reclaim_cycle_grace_active.return_value = False
         scheduler.governance_healthy_but_held.return_value = False
         scheduler.unload_post_process_models_from_vram.return_value = False
+        # No reclaim candidates: this harness is about the aux-prefetch deferral, so the escalation must not be
+        # diverted into a constructive remedy.
+        scheduler.build_reclaim_ladder_candidates.return_value = LadderCandidates(device_index=None)
 
         bridge_data = Mock()
         bridge_data.max_threads = 1

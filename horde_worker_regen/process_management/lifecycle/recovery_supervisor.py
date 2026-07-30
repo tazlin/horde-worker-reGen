@@ -1,17 +1,22 @@
-"""Save-our-ship escalation policy: decide when a wedged worker should soft-reset or give up.
+"""Save-our-ship escalation policy: decide when a wedged worker should reclaim, soft-reset, or give up.
 
 The lower layers detect and recover individual failures (a slot crashes -> replaced; a slot crash-loops
 -> quarantined; a job faults -> bounded/degraded retry). This supervisor sits above them and answers a
 different question: *the worker as a whole has stopped making progress on work it has accepted. Now
 what?* Continued operation is the paramount goal, so the escalation is, in order:
 
-1. **Soft reset** (bounded): rebuild the worker's process pools in-place (kill and re-spawn every child,
+1. **Constructive remedy** (bounded, cheapest): perform a resource remedy that changes the condition under
+   the wedge, typically giving device memory back so a process that could not obtain its allocation can. A
+   wedge caused by a saturated card is not fixed by rebuilding the same processes against the same card, so
+   this precedes the rebuild; it is also attempted again after the rebuild, for whatever the caller's renewed
+   allotment permits. The caller owns which remedies exist and bounds how many it will perform.
+2. **Soft reset** (bounded): rebuild the worker's process pools in-place (kill and re-spawn every child,
    un-quarantine slots) without restarting the parent process or detaching the TUI, preserving the
    configured concurrency. A transient wedge (a bad model load, a one-off deadlock) recovers here.
-2. **Give up cleanly**: once the worker has been wedged long enough that resets clearly are not helping
+3. **Give up cleanly**: once the worker has been wedged long enough that resets clearly are not helping
    (e.g. a deterministic crash-on-start), stop fighting: fault the jobs that cannot be served so the
    horde reissues them, rather than wedging forever. The worker keeps running and keeps popping.
-3. **Abandon ship** (last resort): a second give-up whose wedge outlived even a fresh soft-reset cycle
+4. **Abandon ship** (last resort): a second give-up whose wedge outlived even a fresh soft-reset cycle
    escalates to a deliberate abort, rather than faulting jobs every tick forever.
 
 Readiness gating is the crux. A soft reset rebuilds the pools, and the replacement children spend real
@@ -110,6 +115,13 @@ class RecoveryAction(enum.Enum):
 
     NONE = enum.auto()
     """No action: not wedged, still within a grace/backoff window, or holding after a latched give-up."""
+    RECLAIM = enum.auto()
+    """Perform the next constructive resource remedy the caller reported reachable.
+
+    The cheapest rung of the escalation: it changes the resource condition under the wedge (giving memory
+    back) rather than rebuilding identically or faulting work, so it is attempted before any pool rebuild and
+    before any give-up. The caller owns which remedy this maps to and owns bounding how many it will perform;
+    the policy only sequences it."""
     SOFT_RESET = enum.auto()
     """Rebuild the process pools in-place; the configured concurrency is preserved across the rebuild."""
     GIVE_UP = enum.auto()
@@ -140,6 +152,9 @@ class RecoverySupervisor:
     Progress, not merely a quiet wedge signal, ends an escalation. Once a soft reset has been attempted the
     counter resets only when the clean streak is backed by real forward progress, so a pool that keeps
     rebuilding without ever serving work climbs the ladder to give-up instead of re-attempting the first reset.
+    "Has been attempted" is tracked for the whole episode, not read off the remaining reset budget: the give-up
+    continuation deliberately restores that budget, and an episode whose exemption followed the budget would
+    close on a rebuild's transient not-wedged window and restart its escalation from the first reset forever.
     """
 
     def __init__(
@@ -194,6 +209,10 @@ class RecoverySupervisor:
         self._clean_since: float | None = None
         self._last_action_time: float = -math.inf
         self._soft_resets_done = 0
+        # Whether any soft reset has been attempted in this episode, independent of the remaining budget.
+        # The give-up continuation restores the budget so one more rebuild can be tried, so the budget alone
+        # cannot answer "has this episode already tried a reset" and must not gate the episode close.
+        self._episode_spent_a_soft_reset = False
         # When the pool last (re)entered a booting state within this episode: episode open, or a soft reset.
         # The boot allowance is measured from here so a pool that never reaches an accepting state still
         # eventually counts as ready for escalation.
@@ -236,6 +255,7 @@ class RecoverySupervisor:
         self._clean_since = None
         self._last_action_time = -math.inf
         self._soft_resets_done = 0
+        self._episode_spent_a_soft_reset = False
         self._pool_rebuilt_at = None
         self._ready_wedged_since = None
         self._gave_up_latched = False
@@ -243,6 +263,16 @@ class RecoverySupervisor:
         self._give_up_cycles = 0
         self._give_up_is_terminal = False
         self._boot_hold_deferral_logged = False
+
+    def reset_episode(self) -> None:
+        """Discard all episode state so the next :meth:`evaluate` starts a fresh escalation cycle.
+
+        For a manager that deliberately stopped escalating because its remedies were exhausted and is now
+        permitting one new attempt. The spent reset budget and the taken terminal give-up would otherwise keep
+        returning :attr:`RecoveryAction.NONE`, so the new attempt would neither rebuild nor escalate while the
+        worker resumed accepting work it still cannot serve.
+        """
+        self._close_episode()
 
     def yield_give_up(self) -> None:
         """Un-count the give-up just returned because the caller deferred it to an in-flight remedy.
@@ -268,6 +298,7 @@ class RecoverySupervisor:
         made_progress: bool = False,
         head_recovery_in_flight: bool = False,
         boot_in_progress: bool = False,
+        constructive_remedy_available: bool = False,
     ) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 
@@ -295,6 +326,14 @@ class RecoverySupervisor:
                 hard cap, past which even a still-live boot is deemed hung and the allowance applies again, so
                 a permanently stuck boot still escalates. A dead boot must report False here (the caller uses a
                 liveness-aware count) so it does not hold give-up. Defaults to False for an unwired caller.
+            constructive_remedy_available: Whether the caller has a constructive resource remedy left to
+                perform (one that changes the condition under the wedge instead of rebuilding identically),
+                or has just performed one that is still settling. While True the escalation returns
+                :attr:`RecoveryAction.RECLAIM` rather than rebuilding the pools or faulting accepted work: a
+                rung is cheaper than a whole pool rebuild and immeasurably cheaper than dropping servable jobs.
+                The caller owns the budget that makes this go False, and it must (a frozen candidate list and a
+                counted allotment), or the pool rebuild and the give-up backstop below become unreachable.
+                Defaults to False so an unwired caller escalates rather than stalling.
         """
         now = self._clock()
         self._give_up_is_terminal = False
@@ -317,12 +356,15 @@ class RecoverySupervisor:
         # reads as not-wedged while it boots, so the streak alone would reset the counter on a pool that never
         # actually recovered, stranding it below the give-up backstop. Before any reset there is no such
         # transient window to guard against, so the streak alone suffices (a self-healed wedge needs no proof).
+        # The gate reads the episode-scoped "spent a reset" fact rather than the remaining budget, because the
+        # give-up continuation restores the budget: keying on the budget would re-arm this exemption mid-episode
+        # and let the same rebuild window close an episode that has demonstrably not recovered.
         if (
             self._episode_start is not None
             and not is_wedged
             and self._clean_since is not None
             and (now - self._clean_since) >= self._clean_streak_seconds
-            and (self._soft_resets_done == 0 or made_progress)
+            and (not self._episode_spent_a_soft_reset or made_progress)
         ):
             self._close_episode()
             return RecoveryAction.NONE
@@ -387,6 +429,16 @@ class RecoverySupervisor:
             self._ready_wedged_since = None
             return RecoveryAction.NONE
 
+        # A constructive remedy outranks both remaining rungs. Rebuilding the pools reproduces the same
+        # processes against the same resource condition, and giving up drops work the worker could still serve,
+        # so a remedy that actually changes the condition is tried first, and tried again after the rebuild for
+        # whatever the caller's renewed allotment still permits. It deliberately consumes no soft-reset budget
+        # and no give-up cycle: the arithmetic that makes the give-up backstop reachable is untouched, and the
+        # caller's counted allotment is what returns this to False so the rungs below stay reachable.
+        wedge_grace_elapsed = self._wedge_since is not None and (now - self._wedge_since) >= self._wedge_grace_seconds
+        if is_wedged and wedge_grace_elapsed and constructive_remedy_available:
+            return RecoveryAction.RECLAIM
+
         # Give-up is readiness-gated: only after the soft-reset budget is spent and the wedge has persisted
         # over a ready pool for the grace. A second give-up (a wedge that outlived a continuation) is terminal.
         if (
@@ -408,6 +460,7 @@ class RecoverySupervisor:
             and self._soft_resets_done < self._max_soft_resets
         ):
             self._soft_resets_done += 1
+            self._episode_spent_a_soft_reset = True
             self._last_action_time = now
             # The rebuild makes the pool un-ready; anchor the boot allowance here and restart the ready grace.
             self._pool_rebuilt_at = now

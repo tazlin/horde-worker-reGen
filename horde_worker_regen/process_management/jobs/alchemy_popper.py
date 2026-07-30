@@ -174,6 +174,7 @@ def expand_offered_forms(
     bridge_data: reGenBridgeData,
     *,
     utilities_lane_healthy: bool = True,
+    post_process_lane_healthy: bool = True,
     annotation_types: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Expand the bridge-data `forms` config into the individual form names the API expects.
@@ -186,6 +187,11 @@ def expand_offered_forms(
     currently up (``utilities_lane_healthy``). The pure-torch upscalers and face-fixers are unaffected by
     the lane's health. ``utilities_lane_healthy`` defaults True for the config-only callers that cannot see
     runtime process state; the pop path passes the live reading.
+
+    The upscalers and face-fixers run on the dedicated post-processing lane, so they are withheld while no
+    such lane is up (``post_process_lane_healthy``), whether it is held off the GPU to reclaim its context or
+    momentarily restarting: nothing could serve them, and an accepted form would only strand.
+    ``post_process_lane_healthy`` defaults True for the same config-only callers.
     """
     offered: list[str] = []
     configured_forms = bridge_data.forms or list(DEFAULT_ALCHEMY_FORMS)
@@ -239,26 +245,30 @@ def expand_offered_forms(
         # are also offered straight from the worker-known set so the worker does not have to wait on an
         # SDK release that lists them in KNOWN_UPSCALERS (the pop/submit wire models accept unknown
         # upscaler names as plain strings; hordelib classifies them via its own SDK).
-        sdk_upscalers = [m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT]
-        extra_beta_upscalers = [u for u in sorted(WORKER_KNOWN_BETA_UPSCALERS) if u not in sdk_upscalers]
-        for upscaler_value in (*sdk_upscalers, *extra_beta_upscalers):
-            if upscaler_value in WORKER_KNOWN_BETA_UPSCALERS and not server_supports_interrogation_form(
-                upscaler_value,
-            ):
-                continue
-            offered.append(upscaler_value)
-        # Face-fixers gate identically to the beta upscalers above: a newly-added face restorer is
-        # withheld until the server lists it, since one unknown post-processor rejects the whole pop.
-        # GFPGAN/CodeFormers are in every server's enum and are never gated. The beta names are also
-        # offered from the worker-known set so offering does not wait on an SDK release that lists them.
-        sdk_facefixers = [m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT]
-        extra_beta_facefixers = [f for f in sorted(WORKER_KNOWN_BETA_FACEFIXERS) if f not in sdk_facefixers]
-        for facefixer_value in (*sdk_facefixers, *extra_beta_facefixers):
-            if facefixer_value in WORKER_KNOWN_BETA_FACEFIXERS and not server_supports_interrogation_form(
-                facefixer_value,
-            ):
-                continue
-            offered.append(facefixer_value)
+        # Upscalers and face-fixers are the lane-bound half of the expansion: only the post-processing lane
+        # serves either, so both are dropped together while it is down. strip_background below runs on the
+        # separate image-utilities lane and keeps its own gate.
+        if post_process_lane_healthy:
+            sdk_upscalers = [m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT]
+            extra_beta_upscalers = [u for u in sorted(WORKER_KNOWN_BETA_UPSCALERS) if u not in sdk_upscalers]
+            for upscaler_value in (*sdk_upscalers, *extra_beta_upscalers):
+                if upscaler_value in WORKER_KNOWN_BETA_UPSCALERS and not server_supports_interrogation_form(
+                    upscaler_value,
+                ):
+                    continue
+                offered.append(upscaler_value)
+            # Face-fixers gate identically to the beta upscalers above: a newly-added face restorer is
+            # withheld until the server lists it, since one unknown post-processor rejects the whole pop.
+            # GFPGAN/CodeFormers are in every server's enum and are never gated. The beta names are also
+            # offered from the worker-known set so offering does not wait on an SDK release that lists them.
+            sdk_facefixers = [m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT]
+            extra_beta_facefixers = [f for f in sorted(WORKER_KNOWN_BETA_FACEFIXERS) if f not in sdk_facefixers]
+            for facefixer_value in (*sdk_facefixers, *extra_beta_facefixers):
+                if facefixer_value in WORKER_KNOWN_BETA_FACEFIXERS and not server_supports_interrogation_form(
+                    facefixer_value,
+                ):
+                    continue
+                offered.append(facefixer_value)
         # strip_background runs only on the image-utilities lane (no in-graph fallback); drop just it when
         # that lane is not provisioned or is momentarily down. Upscalers/face-fixers above are pure torch
         # and stay on offer. Unlike image-generation post-processing, alchemy forms are enumerated per-form,
@@ -539,9 +549,7 @@ class AlchemyCoordinator:
         bridge_data = self.bridge_data
         if not bridge_data.alchemist:
             return False
-        if self._state.shutting_down:
-            return False
-        if self._state.supervisor_paused or self._state.self_throttle_paused:
+        if self._state.workload_intake_paused:
             return False
         if self._state.gpu_torch_incompatible:
             # The installed PyTorch cannot run this GPU; alchemy forms would fail the same way. Don't pop.
@@ -556,6 +564,7 @@ class AlchemyCoordinator:
         offered = expand_offered_forms(
             bridge_data,
             utilities_lane_healthy=self._utilities_lane_healthy(),
+            post_process_lane_healthy=self._post_process_lane_healthy(),
             annotation_types=self._annotation_types(),
         )
         if not offered:
@@ -589,6 +598,15 @@ class AlchemyCoordinator:
         be advertised while no lane can serve it (a still-starting, ending, or absent lane).
         """
         return self._process_map.num_loaded_utilities_processes() > 0
+
+    def _post_process_lane_healthy(self) -> bool:
+        """Return True when a dedicated post-processing lane process is up and past startup.
+
+        Gates the upscaler and face-fixer offers at pop time: the lane is the only place those forms run, so
+        they must not be advertised while none is up, whether the lane is held off the GPU to reclaim its
+        context or is momentarily restarting.
+        """
+        return self._process_map.num_loaded_post_process_processes() > 0
 
     def _annotation_types(self) -> frozenset[str]:
         """Return the servable annotation control types the pop request can carry.
@@ -742,6 +760,7 @@ class AlchemyCoordinator:
             forms=expand_offered_forms(
                 bridge_data,
                 utilities_lane_healthy=self._utilities_lane_healthy(),
+                post_process_lane_healthy=self._post_process_lane_healthy(),
                 annotation_types=annotation_types,
             ),
             annotation_types=sorted(annotation_types) or None,
