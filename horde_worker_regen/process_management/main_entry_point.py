@@ -17,6 +17,7 @@ from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
 from horde_worker_regen.process_management.config.worker_identity import WorkerNameConfigError, verify_worker_identity
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import RecoveryDisposition
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 
 _KNOWN_GOOD_MIN_SESSION_SECONDS = 600.0
@@ -86,10 +87,15 @@ def start_working(
         enable_background_downloads=True,
     )
 
+    recovery_disposition = RecoveryDisposition.CONTINUE_IN_PROCESS
     try:
-        process_manager.start()
+        recovery_disposition = process_manager.start()
     finally:
         _persist_session_state(process_manager, bridge_data)
+    if recovery_disposition is RecoveryDisposition.RESTART_PROCESS:
+        # Persistence above must finish before the failed exit is exposed to the supervising frontend or
+        # service manager. A normal operator stop returns without manufacturing a failure status.
+        raise SystemExit(1)
 
 
 def _persist_session_state(process_manager: HordeWorkerProcessManager, bridge_data: reGenBridgeData) -> None:

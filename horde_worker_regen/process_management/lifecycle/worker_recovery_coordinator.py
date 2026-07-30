@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import time
 from collections.abc import Callable
 
@@ -33,6 +34,21 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+
+
+class RecoveryDisposition(enum.Enum):
+    """How the worker resolved a request for terminal process recovery.
+
+    The coordinator consumes this result directly instead of inferring whether an untyped abort callback
+    changed shared shutdown state. The same value is retained by the process manager as the session's recovery
+    outcome, so persistence and the outer entry point agree on whether a failed exit is required.
+    """
+
+    CONTINUE_IN_PROCESS = enum.auto()
+    """No reliable relaunch contract exists; keep the current process alive and quiesce when remedies expire."""
+
+    RESTART_PROCESS = enum.auto()
+    """A relauncher is available; finish bounded cleanup and leave the process with failure status."""
 
 
 class WorkerRecoveryCoordinator:
@@ -131,7 +147,7 @@ class WorkerRecoveryCoordinator:
         reserve_ledger: CommittedReserveLedger,
         bridge_data_provider: Callable[[], reGenBridgeData],
         max_inference_processes_provider: Callable[[], int],
-        abort_callback: Callable[[], None],
+        terminal_recovery_callback: Callable[[], RecoveryDisposition],
         release_disaggregated_job: Callable[[GenerationID], None] = lambda _job_id: None,
         head_aux_prefetch_in_flight: Callable[[], bool] = lambda: False,
         recovery_supervisor: RecoverySupervisor | None = None,
@@ -151,7 +167,8 @@ class WorkerRecoveryCoordinator:
             reserve_ledger: Shared committed-resource ledger used to release stranded post-processing holds.
             bridge_data_provider: Return the current live bridge data.
             max_inference_processes_provider: Return the provisioned inference-process count.
-            abort_callback: Abort the worker promptly.
+            terminal_recovery_callback: Request a fresh worker process and report whether a relaunch contract
+                accepted the request or the current process must continue recovering in place.
             release_disaggregated_job: Tell the disaggregation orchestrator to drop any state it holds for a
                 job, called whenever a job leaves the tracker by a watchdog/give-up path outside the
                 orchestrator's own flow. Idempotent and a no-op for a job the orchestrator does not hold, so it
@@ -176,7 +193,7 @@ class WorkerRecoveryCoordinator:
         self._reserve_ledger = reserve_ledger
         self._bridge_data_provider = bridge_data_provider
         self._max_inference_processes_provider = max_inference_processes_provider
-        self._abort_callback = abort_callback
+        self._terminal_recovery_callback = terminal_recovery_callback
         self._release_disaggregated_job = release_disaggregated_job
         self._head_aux_prefetch_in_flight = head_aux_prefetch_in_flight
         self._clock = clock
@@ -763,11 +780,11 @@ class WorkerRecoveryCoordinator:
                 "window_seconds": self.RUNAWAY_RECOVERY_WINDOW_SECONDS,
             },
         )
-        self._abort_callback()
-        if self._state.shutting_down:
+        disposition = self._terminal_recovery_callback()
+        if disposition is RecoveryDisposition.RESTART_PROCESS:
             return True
-        # The abort was declined because nothing would relaunch this worker, and the in-place rung (rebuilding)
-        # is what produced this recovery rate in the first place. Park instead of driving it again.
+        # No relaunch contract exists, and the in-place rung (rebuilding) is what produced this recovery rate
+        # in the first place. Park instead of driving it again.
         self.runaway_abort_refusal_logged = True
         self.enter_recovery_park(
             RecoveryParkReason.RUNAWAY_RECOVERIES,
@@ -1253,12 +1270,12 @@ class WorkerRecoveryCoordinator:
                 "Save-our-ship: the worker cannot restore a working process pool after repeated soft "
                 "resets; abandoning ship (the last resort) rather than spinning indefinitely.",
             )
-            self._abort_callback()
+            disposition = self._terminal_recovery_callback()
             # Park only behind the terminal give-up. A non-terminal one still has its continuation cycle (a
             # fresh soft reset, then the terminal escalation) to try, so a withheld exit there leaves untried
             # remedies. Once the terminal give-up's exit is withheld the ladder is spent, and another cycle
             # would only rebuild and fault against the same pool.
-            if terminal and not self._state.shutting_down:
+            if terminal and disposition is RecoveryDisposition.CONTINUE_IN_PROCESS:
                 self.enter_recovery_park(
                     RecoveryParkReason.UNRECOVERABLE_POOL,
                     {"jobs_faulted": faulted, "terminal": terminal},

@@ -15,9 +15,13 @@ from unittest.mock import Mock
 
 import pytest
 
+from horde_worker_regen.process_management import main_entry_point
 from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
-from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
+    RecoveryDisposition,
+    WorkerRecoveryCoordinator,
+)
 from tests.process_management.conftest import make_testable_process_manager
 
 
@@ -30,8 +34,9 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
         process_manager._supervisor = Mock()
         process_manager._shutdown_manager = Mock()
 
-        process_manager._abort_for_recovery()
+        disposition = process_manager._request_terminal_recovery()
 
+        assert disposition is RecoveryDisposition.RESTART_PROCESS
         process_manager._shutdown_manager.abort.assert_called_once()
 
     def test_opt_in_permits_the_exit_without_a_supervisor(self) -> None:
@@ -40,8 +45,9 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
         process_manager._supervisor = None
         process_manager._shutdown_manager = Mock()
 
-        process_manager._abort_for_recovery()
+        disposition = process_manager._request_terminal_recovery()
 
+        assert disposition is RecoveryDisposition.RESTART_PROCESS
         process_manager._shutdown_manager.abort.assert_called_once()
 
     def test_unattended_worker_stays_up_instead_of_exiting(self) -> None:
@@ -50,8 +56,9 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
         process_manager._supervisor = None
         process_manager._shutdown_manager = Mock()
 
-        process_manager._abort_for_recovery()
+        disposition = process_manager._request_terminal_recovery()
 
+        assert disposition is RecoveryDisposition.CONTINUE_IN_PROCESS
         process_manager._shutdown_manager.abort.assert_not_called()
 
     def test_a_closed_supervisor_channel_counts_as_unattended(self) -> None:
@@ -63,8 +70,9 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
         process_manager._supervisor = None
         process_manager._shutdown_manager = Mock()
 
-        process_manager._abort_for_recovery()
+        disposition = process_manager._request_terminal_recovery()
 
+        assert disposition is RecoveryDisposition.CONTINUE_IN_PROCESS
         process_manager._shutdown_manager.abort.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -72,17 +80,16 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
         [(True, False), (True, True), (False, True)],
         ids=["supervisor", "both-restart-contracts", "service-manager"],
     )
-    def test_accepted_recovery_abort_exits_with_failure_status(
+    def test_process_manager_reports_accepted_recovery_restart(
         self,
         monkeypatch: pytest.MonkeyPatch,
         supervised: bool,
         exit_on_unhandled_faults: bool,
     ) -> None:
-        """A terminal recovery exit is observable as failure by every supported relauncher.
+        """The process manager reports terminal recovery through its typed session outcome.
 
-        The recovery abort first performs the normal child cleanup and lets the async worker loop unwind. Once
-        that loop has returned, the process-manager entry point must still propagate a nonzero status; otherwise
-        ``Restart=on-failure`` and equivalent service policies interpret the terminal rung as a clean stop.
+        Cleanup still runs through the ordinary async loop. The manager returns the retained disposition instead
+        of raising inside the lifecycle layer, leaving process-status policy to the outer entry point.
         """
         process_manager = make_testable_process_manager(exit_on_unhandled_faults=exit_on_unhandled_faults)
         process_manager._supervisor = Mock() if supervised else None
@@ -93,16 +100,15 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
             # harness, then emulate the terminal callback occurring during that loop.
             assert hasattr(coroutine, "close")
             coroutine.close()  # type: ignore[union-attr]
-            process_manager._abort_for_recovery()
+            process_manager._request_terminal_recovery()
 
         monkeypatch.setattr(asyncio, "run", _run_worker_loop)
         monkeypatch.setattr("atexit.register", Mock())
         monkeypatch.setattr("signal.signal", Mock())
 
-        with pytest.raises(SystemExit) as exit_info:
-            process_manager.start()
+        disposition = process_manager.start()
 
-        assert exit_info.value.code != 0
+        assert disposition is RecoveryDisposition.RESTART_PROCESS
         process_manager._shutdown_manager.abort.assert_called_once()
 
     def test_accepted_recovery_abort_marks_session_unclean(self) -> None:
@@ -111,9 +117,49 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
         process_manager._supervisor = Mock()
         process_manager._shutdown_manager = Mock()
 
-        process_manager._abort_for_recovery()
+        process_manager._request_terminal_recovery()
 
         assert process_manager.build_run_record().clean_exit is False
+
+
+class TestRecoveryDispositionEntryPoint:
+    """The outer entry point owns conversion from a session outcome to process status."""
+
+    @pytest.mark.parametrize(
+        ("disposition", "expects_failure_exit"),
+        [
+            (RecoveryDisposition.CONTINUE_IN_PROCESS, False),
+            (RecoveryDisposition.RESTART_PROCESS, True),
+        ],
+        ids=["ordinary-stop", "recovery-restart"],
+    )
+    def test_session_is_persisted_before_process_status_is_applied(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        disposition: RecoveryDisposition,
+        expects_failure_exit: bool,
+    ) -> None:
+        """Both outcomes persist once; only a requested restart becomes a failed process exit."""
+        events: list[str] = []
+        process_manager = Mock()
+        process_manager.start.side_effect = lambda: events.append("start") or disposition
+        manager_factory = Mock(return_value=process_manager)
+        persist = Mock(side_effect=lambda *_args: events.append("persist"))
+
+        monkeypatch.setattr(main_entry_point, "verify_worker_identity", Mock())
+        monkeypatch.setattr(main_entry_point, "coerce_bridge_data_to_capabilities", Mock())
+        monkeypatch.setattr(main_entry_point, "HordeWorkerProcessManager", manager_factory)
+        monkeypatch.setattr(main_entry_point, "_persist_session_state", persist)
+
+        if expects_failure_exit:
+            with pytest.raises(SystemExit) as exit_info:
+                main_entry_point.start_working(Mock(), Mock(), Mock())
+            assert exit_info.value.code != 0
+        else:
+            main_entry_point.start_working(Mock(), Mock(), Mock())
+
+        assert events == ["start", "persist"]
+        persist.assert_called_once_with(process_manager, manager_factory.call_args.kwargs["bridge_data"])
 
 
 class TestLifecycleAbortPolicy:
@@ -180,21 +226,17 @@ class TestRefusedAbortIsReportedHonestly:
 
         assert _abandoned_count(coordinator) == abandoned_after_first
 
-    def test_an_attached_supervisor_still_stops_escalation_on_abort(self) -> None:
-        """The control: when the abort takes, the caller must stop driving escalation."""
+    def test_an_attached_supervisor_stops_escalation_from_the_typed_disposition(self) -> None:
+        """The coordinator trusts the returned contract instead of observing a shutdown side effect."""
         process_manager = make_testable_process_manager(exit_on_unhandled_faults=False)
         process_manager._supervisor = Mock()
         process_manager._shutdown_manager = Mock()
         coordinator = process_manager._recovery_coordinator
 
-        # A real abort marks the worker shutting down, which is the fact the caller keys on.
-        def _abort_marks_shutting_down() -> None:
-            coordinator._state.shutting_down = True
-
-        process_manager._shutdown_manager.abort.side_effect = _abort_marks_shutting_down
         process_manager._process_lifecycle._num_process_recoveries = coordinator.RUNAWAY_RECOVERY_CEILING + 1
 
         assert coordinator.maybe_abort_on_runaway_recoveries() is True
+        assert coordinator._state.shutting_down is False
         process_manager._shutdown_manager.abort.assert_called_once()
 
 

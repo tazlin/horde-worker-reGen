@@ -13,7 +13,10 @@ from unittest.mock import Mock
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
-from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
+    RecoveryDisposition,
+    WorkerRecoveryCoordinator,
+)
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     CacheReleaseTarget,
     IdleResidentModel,
@@ -319,6 +322,8 @@ class TestRemedyBudgetsBoundTheEscalation:
         coordinator, clock, transcript = await _make_safety_starved_coordinator(
             candidates=_two_rung_candidates(),
         )
+        terminal_recovery = Mock(return_value=RecoveryDisposition.RESTART_PROCESS)
+        coordinator._terminal_recovery_callback = terminal_recovery
         fault_spy = _spy_on_scheduling_recovery_faults(coordinator, transcript)
 
         terminal_give_up_seen = False
@@ -331,7 +336,7 @@ class TestRemedyBudgetsBoundTheEscalation:
 
         assert fault_spy.call_count > 0, "the wedged safety backlog must eventually be reissued to the horde"
         assert terminal_give_up_seen
-        assert coordinator._abort_callback.called
+        assert terminal_recovery.call_count > 0
 
     async def test_refunded_give_ups_are_capped_so_the_terminal_escalation_arrives(self) -> None:
         """A remedy that always looks reachable can defer terminal give-up only within its declared bound.

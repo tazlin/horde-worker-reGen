@@ -19,7 +19,10 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
-from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
+    RecoveryDisposition,
+    WorkerRecoveryCoordinator,
+)
 from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
@@ -267,7 +270,7 @@ def test_pending_inference_start_is_recoverable_capacity_during_backoff() -> Non
         reserve_ledger=CommittedReserveLedger(),
         bridge_data_provider=lambda: bridge_data,
         max_inference_processes_provider=lambda: 2,
-        abort_callback=Mock(),
+        terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
     )
 
     assert coordinator.is_inference_capacity_available() is True
@@ -1671,7 +1674,7 @@ class TestGiveUpDefersToAuxPrefetch:
             reserve_ledger=CommittedReserveLedger(),
             bridge_data_provider=lambda: bridge_data,
             max_inference_processes_provider=lambda: 1,
-            abort_callback=Mock(),
+            terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
             head_aux_prefetch_in_flight=head_aux_prefetch_in_flight,
             recovery_supervisor=RecoverySupervisor(clock=clock),
             clock=clock,

@@ -132,7 +132,10 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import Pa
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
-from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
+    RecoveryDisposition,
+    WorkerRecoveryCoordinator,
+)
 from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.desired_state import DesiredState
@@ -1037,10 +1040,10 @@ class HordeWorkerProcessManager:
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
-        # Recovery-triggered shutdown uses the ordinary bounded cleanup path, then leaves the interpreter with
-        # failure so service managers configured for failure-only restart can distinguish it from an operator's
-        # clean stop. Kept on the top-level manager because it is a process-exit contract, not shared worker state.
-        self._recovery_failure_exit_requested = False
+        # Recovery-triggered shutdown uses the ordinary bounded cleanup path. Its typed disposition is retained
+        # here because the run record and outer entry point both consume the same process-exit contract; it is
+        # deliberately not inferred from mutable shutdown flags shared by the worker's collaborators.
+        self._recovery_disposition = RecoveryDisposition.CONTINUE_IN_PROCESS
         self._sleep = asyncio.sleep
 
         ceiling = max(bridge_data.max_threads, max_threads_ceiling if max_threads_ceiling is not None else 0)
@@ -1594,7 +1597,7 @@ class HordeWorkerProcessManager:
             reserve_ledger=self._reserve_ledger,
             bridge_data_provider=lambda: self.bridge_data,
             max_inference_processes_provider=lambda: self.max_inference_processes,
-            abort_callback=lambda: self._abort_for_recovery(),
+            terminal_recovery_callback=self._request_terminal_recovery,
             release_disaggregated_job=self._disaggregation_orchestrator.release_job,
             head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
         )
@@ -6718,7 +6721,8 @@ class HordeWorkerProcessManager:
             jobs_faulted=self._job_tracker.num_jobs_faulted,
             kudos_this_session=self._state.kudos_generated_this_session,
             clean_exit=(
-                not self._state.too_many_consecutive_failed_jobs and not self._recovery_failure_exit_requested
+                not self._state.too_many_consecutive_failed_jobs
+                and self._recovery_disposition is RecoveryDisposition.CONTINUE_IN_PROCESS
             ),
         )
 
@@ -6865,8 +6869,8 @@ class HordeWorkerProcessManager:
                 if isinstance(result, BaseException) and not isinstance(result, CancelledError):
                     logger.error(f"main loop task raised during shutdown: {result}")
 
-    def start(self) -> None:
-        """Start the process manager and propagate a terminal recovery as a failed process exit."""
+    def start(self) -> RecoveryDisposition:
+        """Run the process manager and return its terminal-recovery disposition after cleanup."""
         import atexit
         import signal
 
@@ -6878,8 +6882,7 @@ class HordeWorkerProcessManager:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         asyncio.run(self._main_loop())
-        if self._recovery_failure_exit_requested:
-            raise SystemExit(1)
+        return self._recovery_disposition
 
     def _kill_owned_children_on_exit(self) -> None:
         """Best-effort kill of any child still owned at interpreter exit (the atexit backstop)."""
@@ -6938,8 +6941,8 @@ class HordeWorkerProcessManager:
         """Exit as soon as possible, aborting all processes and jobs immediately."""
         self._shutdown_manager.abort()
 
-    def _abort_for_recovery(self) -> None:
-        """Take the escalation's last rung, a fresh process, but only when something would bring one back.
+    def _request_terminal_recovery(self) -> RecoveryDisposition:
+        """Request a fresh process and report whether a reliable relaunch contract accepted the request.
 
         A replacement process is the one remedy that clears state an in-place rebuild cannot, so the worker
         exits non-zero and lets whoever launched it start a new one. That is only a recovery if something is
@@ -6948,22 +6951,25 @@ class HordeWorkerProcessManager:
         ``exit_on_unhandled_faults``.
 
         With neither in place, exiting would end the worker's usefulness rather than restore it, so this rung
-        is withheld and the escalation keeps re-attempting the remedies it can perform in place. Callers treat
-        a withheld abort as "not aborted" and carry on driving the ladder; once even those remedies are spent
-        the recovery coordinator holds the worker quiescent rather than churning (see
-        :attr:`WorkerState.recovery_parked`).
+        is withheld and the escalation keeps re-attempting the remedies it can perform in place. The returned
+        disposition tells the coordinator whether to stop for process replacement or keep driving its bounded
+        in-process ladder; once those remedies are spent it holds the worker quiescent rather than churning.
+
+        Returns:
+            :attr:`RecoveryDisposition.RESTART_PROCESS` when cleanup has begun under a relaunch contract;
+            otherwise :attr:`RecoveryDisposition.CONTINUE_IN_PROCESS`.
         """
         supervisor_would_relaunch = self._supervisor is not None
         if supervisor_would_relaunch or self.bridge_data.exit_on_unhandled_faults is True:
-            # ``ShutdownManager.abort`` deliberately lets the event loop unwind through its bounded cleanup and
-            # persistence path. Remember the terminal outcome here so ``start`` does not turn that unwind into a
-            # successful process status when it returns.
-            self._recovery_failure_exit_requested = True
+            # ``ShutdownManager.abort`` deliberately lets the event loop unwind through bounded cleanup. The
+            # outer entry point converts this same retained outcome into failure only after session persistence.
+            self._recovery_disposition = RecoveryDisposition.RESTART_PROCESS
             self._abort()
-            return
+            return self._recovery_disposition
         logger.critical(
             "Save-our-ship: the escalation asked for a fresh process, but no supervisor is attached and "
             "exit_on_unhandled_faults is off, so exiting would leave nothing to restart this worker. Staying "
             "up and continuing to escalate in place. To let the worker restart itself unattended, run it "
             "under a service manager and set exit_on_unhandled_faults.",
         )
+        return RecoveryDisposition.CONTINUE_IN_PROCESS

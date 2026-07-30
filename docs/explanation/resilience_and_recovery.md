@@ -301,6 +301,14 @@ The escalation, in order:
    escalating in place instead, so a refused abort never freezes the escalation that
    still has remedies to try.
 
+   That decision crosses the lifecycle boundary as a typed `RecoveryDisposition`, not
+   as an abort callback whose success is guessed from mutable shutdown state. The
+   coordinator consumes the disposition directly when deciding whether to park; the
+   process manager retains the same value when constructing the run record; and the
+   outer entry point converts `RESTART_PROCESS` to a non-zero status only after session
+   state has been persisted. Thus recovery policy, durable history, and the service
+   manager always observe one outcome.
+
    Continuing in place is only safe while remedies remain. When the terminal rung is
    withheld *and* the escalation is spent (the terminal give-up, or a process-recovery
    rate past its rolling ceiling), the coordinator **parks recovery**

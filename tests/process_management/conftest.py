@@ -25,7 +25,10 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
-from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
+    RecoveryDisposition,
+    WorkerRecoveryCoordinator,
+)
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
@@ -685,7 +688,7 @@ def make_test_recovery_coordinator(
         reserve_ledger=CommittedReserveLedger(),
         bridge_data_provider=lambda: bridge_data,
         max_inference_processes_provider=lambda: 1,
-        abort_callback=Mock(),
+        terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
         recovery_supervisor=RecoverySupervisor(clock=clock),
         clock=clock,
     )
