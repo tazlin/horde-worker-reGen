@@ -76,6 +76,50 @@ count, dropping it once the pool is back at plan. Without that reconciliation th
 stale claim that the pool is still short, and while the host stayed under its floor the governor would
 re-shed the pool the residency just regrew, cycle after cycle, without ever returning to steady state.
 
+## Idle service-lane RAM containment
+
+The degrade response above sheds and cycles inference slots, but the disaggregation service lanes (the
+COMPONENT text-encode lane and the VAE decode lane) are a separate RAM source: each keeps its encoders
+resident across jobs and, alternating between the hot pool models, ratchets its resident set well past
+what its working encoders occupy. The governor tick therefore also runs
+[`_contain_idle_lane_ram`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler._contain_idle_lane_ram]
+every iteration: an idle lane (one accepting a job, so never mid-stage) whose reported resident RAM
+crosses `_LANE_RAM_CONTAINMENT_RSS_BYTES` is sent `UNLOAD_MODELS_FROM_RAM`. Unlike an inference slot, a
+lane self-reloads its encoders on its next stage, so containment is an in-process RAM unload rather than a
+process cycle; the only cost is one reload. A control message cannot interrupt a stage (a lane reads its
+pipe serially and finishes any in-flight encode or decode first), and a per-lane throttle
+(`_LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS`) keeps the reload cost negligible against the RAM returned.
+
+The containment ceiling sits well below the host RAM danger floor, so this actuates as a bounded sawtooth
+before the floor is threatened as well as under active pressure: the lanes participate in the RAM-pressure
+response rather than being exempt from it. Lane processes are deliberately left out of the creep-cycling
+path (which only cycles inference slots); the in-process unload is the whole containment for a lane.
+
+A complementary release happens inside `hordelib`: when the component cache drops an entry (a budget
+eviction or a single-slot replacement), it issues a throttled, best-effort `gc.collect()` plus host trim
+so the displaced component's cold pages return to the OS. That trim reclaims only components the comfy
+model-management layer has already released; the guaranteed reclaim of every held component is this
+worker-driven RAM unload.
+
+### Honest RAM accounting and per-process residency
+
+The RAM figures the containment logic reacts to are also what the operator sees, and both must be honest.
+The per-role RAM breakdown (the console status block's *Worker* line and the Live tab's *Worker RAM by
+role* panel) sums every worker process's resident-set size into its role. Every child on the process map
+is bucketed: inference and safety alongside the component, VAE, post-processing, and image-utilities lanes.
+A lane's footprint is therefore attributed to the worker rather than being mislabelled as *Other (OS +
+apps)*, which stays a genuine remainder (system-used RAM minus the worker subtotal, clamped at zero because
+resident-set sizes over-count pages shared between processes). See
+[`system_memory`][horde_worker_regen.process_management.resources.system_memory] for the role set and the
+derivation.
+
+Each GPU-bearing child also reports which model components it holds resident in its RAM component cache
+(identity, kind, and the cache's approximate MB for each entry), carried on every memory report and
+surfaced per process on the Live tab. The listing is the cache's own view, so it is approximate: a
+process's resident-set size minus the summed listed approximation is a *retained/unattributed* remainder,
+the allocator-retained or comfy-held pages the cache no longer lists. Surfacing that remainder makes the
+resident-set ratchet the containment logic fights visible rather than hidden inside one opaque RAM total.
+
 ## Governance baseline and the healthy-hold watchdog
 
 Because the soft pop hold and the governor's shed/draining bookkeeping live in worker state rather than in

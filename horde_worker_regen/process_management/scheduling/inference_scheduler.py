@@ -256,6 +256,24 @@ staging target: such a slot is cycled and cold-loaded rather than reused, which 
 reusing it would only perpetuate the leak. A slot that was just routed a preload is still spared (reaping it
 mid-stage would fault the head's load), matching the stale-unload path's own mid-preload guard."""
 
+_LANE_RAM_CONTAINMENT_RSS_BYTES = 10240 * 1024 * 1024
+"""Idle service-lane RSS above which the lane is asked to unload its models from RAM.
+
+A disaggregation service lane (the COMPONENT text-encode lane, and the VAE decode lane) keeps its
+components resident across jobs and, alternating between the hot pool models, ratchets its resident set
+well past what its live encoders occupy (observed to 19-26GB on the COMPONENT lane). Unlike an inference
+slot, a lane self-reloads its encoders on the next stage, so the containment remedy is an in-process RAM
+unload rather than a process cycle: the only cost is one reload. This ceiling sits far below the host RAM
+danger floor so containment actuates as a bounded sawtooth well before the floor is threatened, yet high
+enough that a lane holding only its working encoders never trips it."""
+
+_LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS = 180.0
+"""Minimum wall-time between two RAM-unload requests to the same idle service lane.
+
+A lane re-pages its encoders on the next stage after an unload, so a too-eager re-unload would pay a reload
+every few jobs. This spacing bounds the containment to at most one unload per lane per interval, keeping the
+sawtooth's reload cost negligible against the RAM it returns."""
+
 _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS = 30.0
 """How long after a credited admission the target's RSS must settle before the credit is reconciled.
 
@@ -919,6 +937,10 @@ class InferenceScheduler:
         # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
         # deliberate window. 0.0 when no reclaim cycle is in flight. See _RAM_RECLAIM_CYCLE_GRACE_SECONDS.
         self._ram_reclaim_cycle_at: float = 0.0
+        # Per-lane throttle for idle service-lane RAM containment (_contain_idle_lane_ram): maps a lane's
+        # process id to the monotonic time its last RAM-unload was requested, so a lane is asked to unload
+        # at most once per _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS.
+        self._lane_ram_containment_at: dict[int, float] = {}
         # Head-of-queue starvation clock. Tracks the id of the job currently at the head of the queue and
         # when it first became budget-deferred onto an idle device. It only feeds
         # the arbiter's starvation diagnostic (a warning naming the arithmetic once a head is deferred past
@@ -3555,13 +3577,14 @@ class InferenceScheduler:
     def run_governance_tick(self) -> None:
         """Drive one resource-governance tick per control-loop iteration, independent of queue depth.
 
-        The process manager calls this every iteration so the governor's degrade/restore response and the
-        soft pop hold are re-evaluated even when the inference queue is empty. Gated on the same budget
-        switch as the rest of the memory machinery, which also no-ops against partial/mocked or
-        early-startup config.
+        The process manager calls this every iteration so the governor's degrade/restore response, the soft
+        pop hold, and idle service-lane RAM containment (:meth:`_contain_idle_lane_ram`) are re-evaluated even
+        when the inference queue is empty. Gated on the same budget switch as the rest of the memory
+        machinery, which also no-ops against partial/mocked or early-startup config.
         """
         if self._budget_active():
             self._govern_ram_pressure_if_pressured()
+            self._contain_idle_lane_ram()
 
     def reset_governance_to_baseline(self, reason: str) -> None:
         """Return RAM-governance state to a clean baseline, re-derived from live measurement next tick.
@@ -9310,9 +9333,25 @@ class InferenceScheduler:
             self._process_map.on_model_ram_clear(process_id=process_id)
             return
 
+        if process_info.process_type in (HordeProcessType.COMPONENT, HordeProcessType.VAE_LANE):
+            if process_info.is_process_busy():
+                logger.warning(f"Service lane {process_id} is busy, not unloading models from RAM")
+                return
+
+            logger.debug(f"Unloading service-lane models from RAM on process {process_id}")
+            process_info.safe_send_message(
+                HordeControlMessage(
+                    control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_RAM,
+                ),
+            )
+            process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+            self._process_map.on_model_ram_clear(process_id=process_id)
+            return
+
         if process_info.process_type != HordeProcessType.INFERENCE:
             logger.warning(
-                f"Process {process_id} is not an inference or post-processing process, not unloading models"
+                f"Process {process_id} is not an inference, post-processing, or service-lane process, "
+                "not unloading models"
             )
             return
 
@@ -9360,6 +9399,43 @@ class InferenceScheduler:
             )
         logger.debug(f"Clearing process {process_id} of model {process_info.loaded_horde_model_name}")
         self._process_map.on_model_ram_clear(process_id=process_id)
+
+    def _contain_idle_lane_ram(self) -> None:
+        """Ask each idle service lane holding excess resident RAM to unload its models, throttled per lane.
+
+        Runs every governance tick as a bounded sawtooth. A disaggregation service lane (the COMPONENT
+        text-encode lane and the VAE decode lane) keeps its components resident across jobs and, alternating
+        between the hot pool models, ratchets its resident set well above the RAM its working encoders occupy.
+        When a lane is idle (:meth:`HordeProcessInfo.can_accept_job`) and its reported RSS exceeds
+        :data:`_LANE_RAM_CONTAINMENT_RSS_BYTES`, it is sent ``UNLOAD_MODELS_FROM_RAM`` via
+        :meth:`unload_from_ram`; the lane re-pages its encoders on its next stage, so the only cost is one
+        reload. The unload never interrupts a stage: a lane handles its pipe messages serially and finishes any
+        in-flight encode or decode before it reads the control message. A per-lane throttle
+        (:data:`_LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS`) keeps the reload cost negligible against the RAM
+        returned.
+
+        The threshold sits well below the host RAM danger floor, so containment actuates both before and under
+        host RAM pressure: service lanes participate in the RAM-pressure response rather than being exempt from
+        it.
+        """
+        now = time.monotonic()
+        for process_info in self._process_map.values():
+            if process_info.process_type not in (HordeProcessType.COMPONENT, HordeProcessType.VAE_LANE):
+                continue
+            if not process_info.is_process_alive() or not process_info.can_accept_job():
+                continue
+            if process_info.ram_usage_bytes < _LANE_RAM_CONTAINMENT_RSS_BYTES:
+                continue
+            last_contained = self._lane_ram_containment_at.get(process_info.process_id)
+            if last_contained is not None and (now - last_contained) < _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS:
+                continue
+            logger.opt(ansi=True).info(
+                f"<fg #ff8c69>Idle {process_info.process_type.name} lane {process_info.process_id} holds "
+                f"{process_info.ram_usage_bytes / (1024 * 1024):.0f}MB resident (above the lane RAM "
+                f"containment ceiling); unloading its models from RAM. It re-pages on its next stage.</>",
+            )
+            self._lane_ram_containment_at[process_info.process_id] = now
+            self.unload_from_ram(process_info.process_id)
 
     def get_next_n_models(self, n: int) -> list[str]:
         """Get the next n models that will be used in the job deque."""

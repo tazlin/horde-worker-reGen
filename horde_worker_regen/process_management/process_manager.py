@@ -88,6 +88,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
     CardSnapshot,
+    DisaggStageRow,
     FeatureInfoRow,
     FeatureReadinessSummary,
     JobFeatureSummary,
@@ -1561,6 +1562,10 @@ class HordeWorkerProcessManager:
         )
         self._disaggregation_orchestrator.set_vram_arbiter(self._vram_arbiter)
         self._message_dispatcher.set_stage_result_handler(self._disaggregation_orchestrator.handle_stage_result)
+        # Crash-path inference failures resolve in the tracker without touching the orchestrator; releasing the
+        # job's held pipeline state there keeps the retry single-flight (no parallel held-state re-dispatch)
+        # and purges the registration on a terminal fault (no zombie sampling of a job the tracker dropped).
+        self._job_tracker.set_inference_failure_release_observer(self._disaggregation_orchestrator.release_job)
         self._inference_scheduler.set_disaggregation_hooks(
             is_disaggregatable=self._is_disaggregatable_sdk_job,
             is_disaggregation_class_eligible=self._disaggregation_class_eligible,
@@ -5093,11 +5098,28 @@ class HordeWorkerProcessManager:
                     self._process_lifecycle.restart_download_process()
                     return
                 process_info = self._process_map.get(command.process_id)
-                if process_info is None or process_info.process_type != HordeProcessType.INFERENCE:
-                    logger.warning(f"RESTART_PROCESS: no inference process with id {command.process_id}.")
+                if process_info is None:
+                    logger.warning(f"RESTART_PROCESS: no process with id {command.process_id}.")
                     return
-                logger.warning(f"Supervisor requested restart of inference process {command.process_id}.")
-                self._process_lifecycle._replace_inference_process(process_info)
+                if process_info.process_type == HordeProcessType.INFERENCE:
+                    logger.warning(f"Supervisor requested restart of inference process {command.process_id}.")
+                    self._process_lifecycle._replace_inference_process(process_info)
+                    return
+                # A service lane (COMPONENT/VAE_LANE/POST_PROCESS/UTILITIES) accrues host commit charge (its
+                # CUDA context and allocator arenas) that an in-process model unload cannot return; a process
+                # recycle is the only reset. Route it through the lane's normal respawn machine.
+                lane_state = "idle" if process_info.can_accept_job() else "mid-stage"
+                if self._process_lifecycle.recycle_lane_process(process_info):
+                    logger.warning(
+                        f"Supervisor requested recycle of {process_info.process_type.name} lane "
+                        f"{command.process_id} ({lane_state}); routing through its respawn machine to reset its "
+                        "host commit charge. Any in-flight stage is re-dispatched from held state.",
+                    )
+                    return
+                logger.warning(
+                    f"RESTART_PROCESS: process {command.process_id} ({process_info.process_type.name}) is not "
+                    "restartable via this command (the safety and download processes are excluded).",
+                )
             case SupervisorCommand.RELOAD_CONFIG:
                 logger.info("Supervisor requested config reload from disk.")
                 # Off the control loop: the resolve is network-bound and must not stall the worker.
@@ -5758,48 +5780,57 @@ class HordeWorkerProcessManager:
     def _sample_system_memory(self) -> SystemMemorySummary:
         """Build the current system-RAM summary: total/available plus the worker's per-role RSS share.
 
-        Inference and safety processes self-report their RSS in their periodic memory reports (already
-        kept on the process map), so those are summed from there. The orchestrator (this process) and the
-        background download process do not, so their RSS is sampled directly via psutil. All figures are
+        Every child on the process map (inference, safety, and the component/VAE/post-processing/utilities
+        lanes) self-reports its RSS in its periodic memory reports, so those are summed from the map keyed by
+        process type. The orchestrator (this process) and the background download process do not report, so
+        their RSS is sampled directly via psutil. A child whose type maps to no role is left out of the
+        worker subtotal and so falls into ``other`` rather than being mislabelled. All figures are
         resident-set size; see :mod:`system_memory` for why the per-role sum is an upper bound.
         """
         import psutil
 
         from horde_worker_regen.process_management.resources.system_memory import (
+            ROLE_COMPONENT,
             ROLE_DOWNLOAD,
             ROLE_INFERENCE,
             ROLE_ORCHESTRATOR,
+            ROLE_POST_PROCESS,
             ROLE_SAFETY,
+            ROLE_UTILITIES,
+            ROLE_VAE_LANE,
             build_system_memory_summary,
         )
 
         virtual_memory = psutil.virtual_memory()
 
-        inference_rss = 0
-        safety_rss = 0
+        process_type_roles: dict[HordeProcessType, str] = {
+            HordeProcessType.INFERENCE: ROLE_INFERENCE,
+            HordeProcessType.SAFETY: ROLE_SAFETY,
+            HordeProcessType.POST_PROCESS: ROLE_POST_PROCESS,
+            HordeProcessType.COMPONENT: ROLE_COMPONENT,
+            HordeProcessType.VAE_LANE: ROLE_VAE_LANE,
+            HordeProcessType.UTILITIES: ROLE_UTILITIES,
+        }
+        worker_rss_by_role: dict[str, int] = dict.fromkeys(process_type_roles.values(), 0)
         for process_info in self._process_map.values():
-            if process_info.process_type == HordeProcessType.INFERENCE:
-                inference_rss += max(0, process_info.ram_usage_bytes)
-            elif process_info.process_type == HordeProcessType.SAFETY:
-                safety_rss += max(0, process_info.ram_usage_bytes)
+            role = process_type_roles.get(process_info.process_type)
+            if role is not None:
+                worker_rss_by_role[role] += max(0, process_info.ram_usage_bytes)
 
         download_info = self._process_lifecycle.download_process_info
-        download_rss = self._process_rss_bytes(download_info.os_pid if download_info is not None else None)
+        worker_rss_by_role[ROLE_DOWNLOAD] = self._process_rss_bytes(
+            download_info.os_pid if download_info is not None else None,
+        )
 
         try:
-            orchestrator_rss = int(psutil.Process().memory_info().rss)
+            worker_rss_by_role[ROLE_ORCHESTRATOR] = int(psutil.Process().memory_info().rss)
         except (psutil.Error, OSError):
-            orchestrator_rss = 0
+            worker_rss_by_role[ROLE_ORCHESTRATOR] = 0
 
         return build_system_memory_summary(
             total_bytes=virtual_memory.total,
             available_bytes=virtual_memory.available,
-            worker_rss_by_role={
-                ROLE_ORCHESTRATOR: orchestrator_rss,
-                ROLE_INFERENCE: inference_rss,
-                ROLE_SAFETY: safety_rss,
-                ROLE_DOWNLOAD: download_rss,
-            },
+            worker_rss_by_role=worker_rss_by_role,
         )
 
     def _whole_card_residency_status(self) -> WholeCardResidencyStatus:
@@ -6096,6 +6127,7 @@ class HordeWorkerProcessManager:
             for bench_entry in self._model_pool.bench()
         ]
         lane = self._job_popper.latest_pool_lane()
+        tally = self._job_popper.latest_pool_lane_tally()
         demand_snapshot = self._model_demand_poller.latest()
         demand_age = max(0.0, now - demand_snapshot.fetched_at) if demand_snapshot is not None else None
 
@@ -6108,6 +6140,10 @@ class HordeWorkerProcessManager:
             demand_age_seconds=demand_age,
             download_budget_gb=pool_config.download_budget_gb,
             download_bytes_charged=self._model_pool_download_bytes_charged,
+            fixed_pops=tally.fixed_pops,
+            fixed_fulfilled=tally.fixed_fulfilled,
+            free_pops=tally.free_pops,
+            free_fulfilled=tally.free_fulfilled,
         )
 
     def _model_pool_seat_row(self, seat: SeatView, now: float) -> ModelPoolSeatRow:
@@ -6270,6 +6306,23 @@ class HordeWorkerProcessManager:
         return bool(
             coordinator.num_forms_pending or coordinator.num_forms_in_flight or coordinator.num_forms_awaiting_submit,
         )
+
+    def _build_disagg_job_stages(self) -> list[DisaggStageRow]:
+        """Project the orchestrator's in-flight disaggregated jobs into wire rows for the snapshot.
+
+        Empty when disaggregation is off or no disaggregated job is in flight (the orchestrator always
+        exists, so no None-guard is needed; it simply reports no jobs). The stage is carried as its
+        ``DisaggJobStage`` string value.
+        """
+        return [
+            DisaggStageRow(
+                job_id=entry.job_id,
+                stage=str(entry.stage),
+                process_id=entry.process_id,
+                process_launch_identifier=entry.process_launch_identifier,
+            )
+            for entry in self._disaggregation_orchestrator.stage_snapshot()
+        ]
 
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
@@ -6480,6 +6533,7 @@ class HordeWorkerProcessManager:
             pending_jobs=self._build_pending_jobs_list(),
             orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),
+            disagg_job_stages=self._build_disagg_job_stages(),
             whole_card_residency=self._whole_card_residency_status(),
             pop_governors=self._pop_governors_status(),
             scheduling_governance=self._scheduling_governance_status(),

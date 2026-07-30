@@ -2,7 +2,8 @@
 
 The worker spawns several processes that each keep model weights resident in system RAM for fast
 reload, so its memory footprint is spread across the orchestrator, the inference processes, the
-safety process, and the background download process. Neither the console status block nor the TUI
+safety process, the background download process, and the auxiliary lanes (component, VAE,
+post-processing, and the out-of-venv image-utilities lane). Neither the console status block nor the TUI
 made the *total* system-RAM picture, or that per-role split, legible: an operator could see free VRAM
 but had no clear read on whether the machine was close to paging, nor which part of the worker was
 holding the RAM. This module turns a few cheap psutil reads plus the per-process RSS the worker
@@ -27,23 +28,39 @@ ROLE_ORCHESTRATOR = "orchestrator"
 """The main worker process: job orchestration, scheduling, the TUI/supervisor channel."""
 ROLE_INFERENCE = "inference"
 """All inference processes combined; this is where resident model weights dominate the footprint."""
+ROLE_POST_PROCESS = "post_process"
+"""All dedicated post-processing lanes combined: the upscaler/face-fixer models kept resident off inference."""
+ROLE_COMPONENT = "component"
+"""All dedicated component lanes combined: the shared VAE/text-encoder hot-set held for inference to adopt."""
+ROLE_VAE_LANE = "vae_lane"
+"""All dedicated VAE lanes combined: the disaggregated pipeline's encode/decode stage."""
 ROLE_SAFETY = "safety"
 """The safety-checker process."""
+ROLE_UTILITIES = "utilities"
+"""The out-of-venv image-utilities lane: the annotator/background-removal stack in its own environment."""
 ROLE_DOWNLOAD = "download"
 """The background model-download process (lives outside the process map)."""
 
 WORKER_ROLE_ORDER: tuple[str, ...] = (
     ROLE_INFERENCE,
+    ROLE_COMPONENT,
+    ROLE_VAE_LANE,
+    ROLE_POST_PROCESS,
     ROLE_SAFETY,
     ROLE_ORCHESTRATOR,
+    ROLE_UTILITIES,
     ROLE_DOWNLOAD,
 )
-"""Display order for the per-role breakdown: heaviest-first (inference), with download last."""
+"""Display order for the per-role breakdown: inference and the model-holding lanes first, download last."""
 
 ROLE_LABELS: dict[str, str] = {
     ROLE_ORCHESTRATOR: "orchestrator",
     ROLE_INFERENCE: "inference",
+    ROLE_COMPONENT: "component lane",
+    ROLE_VAE_LANE: "VAE lane",
+    ROLE_POST_PROCESS: "post-processing",
     ROLE_SAFETY: "safety",
+    ROLE_UTILITIES: "utilities lane",
     ROLE_DOWNLOAD: "download",
 }
 """Human-readable labels for each role, for the console/TUI breakdown."""

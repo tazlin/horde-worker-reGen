@@ -715,6 +715,83 @@ def test_pause_and_restore_vae_lane_stops_and_restarts_it_for_whole_card() -> No
     assert plm.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
 
 
+def test_recycle_lane_process_arms_each_lane_type_as_intentional() -> None:
+    """The operator recycle lever arms each service lane's replacement machine, marked intentional.
+
+    A recycle routes through the same end -> respawn machine a crash would, but as a deliberate cycle: the
+    intentional flag keeps its completion out of the crash-recovery count so a commit-charge reset is never
+    read as a lane crash.
+    """
+    post_process = make_mock_process_info(1, process_type=HordeProcessType.POST_PROCESS)
+    component = make_mock_process_info(2, process_type=HordeProcessType.COMPONENT)
+    vae_lane = make_mock_process_info(3, process_type=HordeProcessType.VAE_LANE)
+    utilities = make_mock_process_info(4, process_type=HordeProcessType.UTILITIES)
+    plm = _make_plm(
+        process_map=ProcessMap({1: post_process, 2: component, 3: vae_lane, 4: utilities}),
+    )
+
+    assert plm.recycle_lane_process(post_process) is True
+    assert plm.post_process_processes_should_be_replaced is True
+    assert plm._post_process_replacement_intentional is True
+
+    assert plm.recycle_lane_process(component) is True
+    assert plm._component_processes_should_be_replaced is True
+    assert plm._component_lane_replacement_intentional is True
+
+    assert plm.recycle_lane_process(vae_lane) is True
+    assert plm.vae_lane_processes_should_be_replaced is True
+    assert plm._vae_lane_replacement_intentional is True
+
+    assert plm.recycle_lane_process(utilities) is True
+    assert plm.utilities_processes_should_be_replaced is True
+    assert plm._utilities_replacement_intentional is True
+
+
+def test_recycle_lane_process_rejects_non_lane_process_types() -> None:
+    """The recycle lever is a lane-only path: inference and safety processes are not recyclable through it."""
+    inference = make_mock_process_info(1, process_type=HordeProcessType.INFERENCE)
+    safety = make_mock_process_info(0, process_type=HordeProcessType.SAFETY)
+    plm = _make_plm(process_map=ProcessMap({0: safety, 1: inference}))
+
+    assert plm.recycle_lane_process(inference) is False
+    assert plm.recycle_lane_process(safety) is False
+    # No lane replacement machine was armed by the rejected calls.
+    assert plm.post_process_processes_should_be_replaced is False
+    assert plm._component_processes_should_be_replaced is False
+    assert plm.vae_lane_processes_should_be_replaced is False
+    assert plm.utilities_processes_should_be_replaced is False
+
+
+def test_recycle_vae_lane_respawns_through_start_path_without_counting_a_recovery() -> None:
+    """A recycled VAE lane ends, drains, and respawns through the boot start path, not as a crash recovery.
+
+    Drives the replacement machine to completion and asserts a fresh lane process exists afterward while the
+    crash-recovery count stays put (the recycle is intentional).
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+    fake_ctx.Process.return_value.exitcode = None
+
+    running_lane = make_mock_process_info(1, process_type=HordeProcessType.VAE_LANE)
+    plm = _make_plm(ctx=fake_ctx, process_map=ProcessMap({1: running_lane}))
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+    plm._runtime_config.bridge_data.dry_run_skip_inference = False
+    recoveries_before = plm._num_process_recoveries
+
+    assert plm.recycle_lane_process(running_lane) is True
+
+    # Drive the end -> delete -> start machine to completion.
+    for _ in range(4):
+        plm._replace_all_vae_lane_process()
+
+    assert plm._process_map.num_vae_lane_processes() == 1  # a fresh lane came up
+    assert plm.vae_lane_processes_should_be_replaced is False  # machine finished
+    assert plm._vae_lane_replacement_intentional is False  # intentional flag consumed
+    assert plm._num_process_recoveries == recoveries_before  # not counted as a crash recovery
+
+
 def test_restore_vae_lane_starts_it_when_none_running() -> None:
     """Restoring after a whole-card pause must itself relaunch the VAE lane.
 

@@ -105,6 +105,12 @@ The full verb set: `PAUSE`, `RESUME`, `DRAIN`, `RESTART_PROCESS`, `RELOAD_CONFIG
 `PAUSE_DOWNLOADS`, `RESUME_DOWNLOADS`, `SET_DOWNLOAD_RATE_LIMIT`, `DOWNLOADS_ONLY_HOLD`, `GO_LIVE`,
 `DOWNLOAD_MODELS`, `SET_SERVER_MAINTENANCE`, `SET_STATS_EXPORT`, and `SHUTDOWN` / `GRACEFUL_SHUTDOWN`.
 
+`RESTART_PROCESS` addresses an inference slot by its `process_id`, or the download process id to revive a
+stuck downloader. Targeting a service-lane id (COMPONENT, VAE_LANE, POST_PROCESS, or UTILITIES) recycles
+that lane through its normal respawn machine: the sanctioned way to reset a lane whose host commit charge
+has ballooned past what an in-process model unload can return (a lane's permanent CUDA context and
+allocator arenas are only freed by the process exiting). The safety process (id 0) is not restartable this way.
+
 ## The auto-guard (one pre-authorized action)
 
 The supervisor is otherwise observe-only, with one exception. When either the `gpu_idle_with_pending` or

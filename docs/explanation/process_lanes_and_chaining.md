@@ -46,6 +46,16 @@ or absent) continuously past a short window, the parent emits one edge-latched W
 down and why, re-armed when routing returns. This surfaces a lane that fails to come back rather than leaving
 the advertised disaggregation silently dead.
 
+A disaggregated job's mid-pipeline progress is visible the same way a monolithic job's is. The pinned
+sampler forwards its per-step sampling progress as `INFERENCE_STEP` heartbeats through a stage-scoped
+emitter, so the process advances from primed to sampling and the dashboard shows a step progress bar,
+without touching the monolithic path's VAE-decode/inference-slot handoff (which a sampler must not, since it
+never performs its own decode). The VAE lane forwards a tiled decode's per-tile steps the same way, giving a
+decode progress bar; a single-shot (non-tiled) decode reports no intermediate steps, so its already-reported
+processing state stands as the active-decode signal. Separately, the orchestrator's per-job stage (awaiting
+conditioning, sampling, awaiting decode) and its current dispatch target are exported on the supervisor
+snapshot, so the dashboard can show where each in-flight disaggregated job sits in its pipeline.
+
 When safety runs on GPU, only CLIP remains resident while the lane is idle. DeepDanbooru stages from CPU for a
 conditional anime check; BLIP captioning and the aesthetic head are also offloaded after use, and completion
 trims the allocator before `WAITING_FOR_JOB`. This bounds the lane's fixed card cost without making every

@@ -459,3 +459,66 @@ def test_restart_process_command_still_rejects_unknown_id() -> None:
 
     manager._process_lifecycle.restart_download_process.assert_not_called()
     manager._process_lifecycle._replace_inference_process.assert_not_called()
+
+
+# --- the operator path to recycle a bloated service lane (reset its committed VRAM) ----------------------
+
+
+def test_restart_process_command_recycles_each_service_lane() -> None:
+    """A RESTART_PROCESS command for a service-lane id recycles that lane, never the inference replace path.
+
+    A lane accrues committed VRAM (its CUDA context and allocator arenas) an in-process model unload cannot
+    return; the recycle is the sanctioned reset. The command routes each lane type to the lane recycle rather
+    than the inference-slot replacement.
+    """
+    lane_types = (
+        HordeProcessType.POST_PROCESS,
+        HordeProcessType.COMPONENT,
+        HordeProcessType.VAE_LANE,
+        HordeProcessType.UTILITIES,
+    )
+    for lane_type in lane_types:
+        manager = make_testable_process_manager()
+        manager._process_lifecycle._replace_inference_process = Mock()  # type: ignore[method-assign]
+        manager._process_lifecycle.recycle_lane_process = Mock(return_value=True)  # type: ignore[method-assign]
+        lane = make_mock_process_info(5, process_type=lane_type)
+        manager._process_map[5] = lane
+
+        manager._apply_supervisor_command(
+            SupervisorControlMessage(command=SupervisorCommand.RESTART_PROCESS, process_id=5),
+        )
+
+        manager._process_lifecycle.recycle_lane_process.assert_called_once_with(lane)
+        manager._process_lifecycle._replace_inference_process.assert_not_called()
+
+
+def test_restart_process_command_still_replaces_an_inference_slot() -> None:
+    """An inference-slot id still routes to the inference replacement path, not the lane recycle."""
+    manager = make_testable_process_manager()
+    manager._process_lifecycle._replace_inference_process = Mock()  # type: ignore[method-assign]
+    manager._process_lifecycle.recycle_lane_process = Mock(return_value=True)  # type: ignore[method-assign]
+    inference = make_mock_process_info(1, process_type=HordeProcessType.INFERENCE)
+    manager._process_map[1] = inference
+
+    manager._apply_supervisor_command(
+        SupervisorControlMessage(command=SupervisorCommand.RESTART_PROCESS, process_id=1),
+    )
+
+    manager._process_lifecycle._replace_inference_process.assert_called_once_with(inference)
+    manager._process_lifecycle.recycle_lane_process.assert_not_called()
+
+
+def test_restart_process_command_rejects_the_safety_process() -> None:
+    """The safety process (id 0) is not restartable via RESTART_PROCESS: not inference-replaced, not recycled."""
+    manager = make_testable_process_manager()
+    manager._process_lifecycle._replace_inference_process = Mock()  # type: ignore[method-assign]
+    manager._process_map[0] = make_mock_process_info(0, process_type=HordeProcessType.SAFETY)
+
+    manager._apply_supervisor_command(
+        SupervisorControlMessage(command=SupervisorCommand.RESTART_PROCESS, process_id=0),
+    )
+
+    manager._process_lifecycle._replace_inference_process.assert_not_called()
+    # The safety process is not a recyclable lane, so no lane replacement machine was armed by the rejection.
+    assert manager._process_lifecycle.safety_processes_should_be_replaced is False
+    assert manager._process_lifecycle.post_process_processes_should_be_replaced is False

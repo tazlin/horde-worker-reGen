@@ -2251,4 +2251,89 @@ class TestPoolOutcomeSink:
         assert outcome["popped_model"] == "model_a"
 
 
+def _empty_pop_response() -> Mock:
+    """A stand-in job-pop response with no job (``id_`` None) that the full-flow parse accepts."""
+    response = Mock()
+    response.id_ = None
+    response.skipped = Mock()
+    response.skipped.model_dump.return_value = {}
+    response.skipped.model_extra = None
+    response.messages = None
+    return response
+
+
+class TestPoolLaneTally:
+    """A pool-routed pop advances the cumulative per-lane pop/fulfillment tally the status snapshot reads."""
+
+    @_full_flow_patches
+    async def test_fulfilled_fixed_pop_counts_pop_and_fulfillment(self, _mock_req_cls: Mock) -> None:
+        """A fixed-lane pop that returns a job counts one fixed pop and one fixed fulfillment."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=make_job_pop_response(model="model_a"))
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b"],
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: frozenset({"model_a", "model_b"}),
+        )
+
+        await popper.api_job_pop()
+
+        tally = popper.latest_pool_lane_tally()
+        assert (tally.fixed_pops, tally.fixed_fulfilled) == (1, 1)
+        assert (tally.free_pops, tally.free_fulfilled) == (0, 0)
+
+    @_full_flow_patches
+    async def test_empty_fixed_pop_counts_pop_without_fulfillment(self, _mock_req_cls: Mock) -> None:
+        """A fixed-lane pop that comes back empty counts the pop but not a fulfillment."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=_empty_pop_response())
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b"],
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: frozenset({"model_a", "model_b"}),
+        )
+
+        await popper.api_job_pop()
+
+        tally = popper.latest_pool_lane_tally()
+        assert (tally.fixed_pops, tally.fixed_fulfilled) == (1, 0)
+        assert (tally.free_pops, tally.free_fulfilled) == (0, 0)
+
+    @_full_flow_patches
+    async def test_free_lane_pop_counts_under_free_lane(self, _mock_req_cls: Mock) -> None:
+        """A free-lane pop is tallied under the free lane, leaving the fixed-lane counts untouched."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=_empty_pop_response())
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["model_a", "model_b", "model_c"],
+                model_pool=ModelPoolConfig(enabled=True),
+            ),
+            pool_active_seats_provider=lambda: frozenset({"model_a"}),
+        )
+        # A seated model that is a strict subset of the eligible set leaves a non-empty free offer; the
+        # weighted round-robin then picks the free lane when its credit dominates.
+        popper._pool_lane_state = PoolLaneState(free_credit=1000)
+
+        await popper.api_job_pop()
+
+        assert popper.latest_pool_lane() is PopLane.FREE
+        tally = popper.latest_pool_lane_tally()
+        assert (tally.free_pops, tally.free_fulfilled) == (1, 0)
+        assert (tally.fixed_pops, tally.fixed_fulfilled) == (0, 0)
+
+
 # endregion

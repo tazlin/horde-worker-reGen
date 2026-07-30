@@ -140,6 +140,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.process_peak_reserved_mb = 6500
         msg.process_aimdo_mb = 10000
         msg.sampled_at = 1234.5
+        msg.held_components = None
         msg.info = "memory"
 
         _enqueue(message_dispatcher, msg)
@@ -157,6 +158,7 @@ class TestReceiveAndHandleProcessMessages:
             process_peak_reserved_mb=6500,
             process_aimdo_mb=10000,
             report_sampled_at=1234.5,
+            held_components=None,
         )
 
     def test_record_completed_job_increments_producing_process(self) -> None:

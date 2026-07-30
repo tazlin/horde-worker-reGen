@@ -11,6 +11,7 @@ from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
@@ -214,6 +215,14 @@ class HordeProcessInfo:
     batch_amount: int
     """The total amount of batching being run by this process."""
 
+    held_components: list[HeldComponentSnapshot] | None
+    """The component-cache entries this process last reported holding resident in RAM, or None off that path.
+
+    Populated from each memory report of a GPU-bearing hordelib child (inference, the VAE lane, the component
+    lane); None for a process that carries no component cache (safety, download, utilities) or has not yet
+    reported. Only the transport view: it is the cache's own listing, so ``ram_usage_bytes`` minus the summed
+    ``approx_ram_mb`` is the allocator-retained/other remainder the cache does not account for."""
+
     last_iterations_per_second: float | None
     """The most recent sampling rate reported by this process (-1.0 = not yet known)."""
     last_current_step: int | None
@@ -327,6 +336,7 @@ class HordeProcessInfo:
         self.process_peak_reserved_mb = None
         self.process_aimdo_mb = None
         self.report_sampled_at = None
+        self.held_components = None
         self.vram_materialized_monotonic = None
         self.open_fds: int | None = None
         """Open descriptors/handles last reported by the process, or None if the platform metric is absent."""

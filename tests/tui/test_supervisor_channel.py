@@ -7,8 +7,10 @@ import pickle
 import time
 from types import SimpleNamespace
 
+from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
+    DisaggStageRow,
     ModelPoolBenchRow,
     ModelPoolSeatRow,
     ModelPoolSnapshot,
@@ -51,7 +53,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 19
+    assert SUPERVISOR_PROTOCOL_VERSION == 20
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -187,6 +189,7 @@ def _fake_process_info() -> SimpleNamespace:
         vram_used_high_water_mb=2200,
         ram_used_high_water_mb=512,
         num_jobs_completed=7,
+        held_components=None,
     )
 
 
@@ -201,6 +204,25 @@ def test_process_snapshot_from_process_info() -> None:
     assert snapshot.current_job_width is None
     assert snapshot.current_job_height is None
     assert snapshot.current_job_steps is None
+    # No residency reported (held_components None) yields an empty list, not None.
+    assert snapshot.resident_components == []
+
+
+def test_process_snapshot_carries_reported_residency() -> None:
+    """A process's reported component-cache residency is projected onto the snapshot for the dashboard."""
+    info = _fake_process_info()
+    info.held_components = [
+        HeldComponentSnapshot(kind="checkpoint", identity="Deliberate", approx_ram_mb=2600.0),
+        HeldComponentSnapshot(kind="vae", identity="Deliberate::vae", approx_ram_mb=160.0),
+    ]
+    snapshot = ProcessSnapshot.from_process_info(info)  # type: ignore[arg-type]
+
+    assert [entry.identity for entry in snapshot.resident_components] == ["Deliberate", "Deliberate::vae"]
+    assert [entry.kind for entry in snapshot.resident_components] == ["checkpoint", "vae"]
+
+    # The residency survives the wire (JSON proves it is plain data).
+    restored = ProcessSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert restored.resident_components == snapshot.resident_components
 
 
 def test_process_snapshot_carries_busy_job_resolution() -> None:
@@ -240,6 +262,24 @@ def test_snapshot_roundtrip_preserves_new_pipeline_and_job_fields() -> None:
     assert restored.jobs_pending_submit == 3
     assert restored.processes[0].current_job_width == 1024
     assert restored.processes[0].current_job_steps == 30
+
+
+def test_disagg_job_stages_survive_json_roundtrip() -> None:
+    """Per-job pipeline-disaggregation stage rows survive a JSON round-trip and default empty."""
+    snapshot = _make_snapshot()
+    assert snapshot.disagg_job_stages == []
+
+    snapshot.disagg_job_stages = [
+        DisaggStageRow(job_id="job-a", stage="sampling", process_id=3, process_launch_identifier=11),
+        DisaggStageRow(job_id="job-b", stage="awaiting_latent_decode"),
+    ]
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert [row.stage for row in restored.disagg_job_stages] == ["sampling", "awaiting_latent_decode"]
+    assert restored.disagg_job_stages[0].process_id == 3
+    assert restored.disagg_job_stages[0].process_launch_identifier == 11
+    assert restored.disagg_job_stages[1].process_id is None
 
 
 def _recv_first(parent: object, frame_type: type, *, timeout: float = 3.0) -> object | None:
@@ -394,6 +434,10 @@ def test_model_pool_snapshot_survives_json_roundtrip() -> None:
         demand_age_seconds=42.0,
         download_budget_gb=10.0,
         download_bytes_charged=1024,
+        fixed_pops=8,
+        fixed_fulfilled=6,
+        free_pops=3,
+        free_fulfilled=1,
     )
 
     restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
@@ -407,3 +451,7 @@ def test_model_pool_snapshot_survives_json_roundtrip() -> None:
     assert restored.model_pool.current_lane == "FIXED"
     assert restored.model_pool.demand_age_seconds == 42.0
     assert restored.model_pool.download_bytes_charged == 1024
+    assert restored.model_pool.fixed_pops == 8
+    assert restored.model_pool.fixed_fulfilled == 6
+    assert restored.model_pool.free_pops == 3
+    assert restored.model_pool.free_fulfilled == 1

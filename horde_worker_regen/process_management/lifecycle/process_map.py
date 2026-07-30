@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.fd_limits import (
     descriptor_headroom_fraction,
 )
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
     HordeHeartbeatType,
     HordeProcessState,
 )
@@ -323,6 +324,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         process_peak_reserved_mb: int | None = None,
         process_aimdo_mb: int | None = None,
         report_sampled_at: float | None = None,
+        held_components: list[HeldComponentSnapshot] | None = None,
     ) -> None:
         """Update the memory usage for the given process ID.
 
@@ -343,9 +345,14 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 off-GPU. Disjoint from ``process_reserved_mb``.
             report_sampled_at (float | None): Wall-clock epoch when the child sampled these figures, or None \
                 (older children). Used to age the process's contribution for staleness-aware VRAM reconciliation.
+            held_components (list[HeldComponentSnapshot] | None): The component-cache entries the process \
+                reported holding resident in RAM, or None when it carries no component cache. A None report \
+                leaves any prior residency untouched (None means no data, not an empty cache).
         """
         process_info = self[process_id]
         process_info.ram_usage_bytes = ram_usage_bytes
+        if held_components is not None:
+            process_info.held_components = held_components
         process_info.vram_usage_mb = vram_usage_mb or 0
         process_info.total_vram_mb = total_vram_mb or 0
         process_info.process_reserved_mb = process_reserved_mb
@@ -1434,6 +1441,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
         return base_string
 
+    @staticmethod
+    def _held_components_suffix(process_info: HordeProcessInfo) -> str:
+        """Return a compact ``held N comp ~X MB`` suffix for a process's residency, or empty when none.
+
+        Summarises the process's reported component-cache residency (count and summed approximate RAM) for
+        the console status line. Empty for a process with no reported residency, so a line without a cache is
+        unchanged.
+        """
+        held = process_info.held_components
+        if not held:
+            return ""
+        total_mb = sum(entry.approx_ram_mb for entry in held)
+        return f" <fg #7b7d7d>held {len(held)} comp ~{round(total_mb)} MB</>"
+
     def get_process_info_strings(self) -> list[str]:
         """Return a list of strings containing information about each process."""
         info_strings = []
@@ -1471,6 +1492,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                         f"({horde_model_name_and_baseline}) "
                         f"<fg #7b7d7d>[last message: {time_passed_seconds} secs ago: {safe_last_control_flag} "
                         f"heartbeat delta: {last_heartbeat_delta_now}]</>"
+                        f"{self._held_components_suffix(process_info)}"
                     ),
                     # f"ram: {process_info.ram_usage_bytes} vram: {process_info.vram_usage_mb} ",
                 )
@@ -1478,7 +1500,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             else:
                 info_strings.append(
                     f"Process {process_id}: ({process_info.process_type.name}) "
-                    f"{process_info.last_process_state.name} ",
+                    f"{process_info.last_process_state.name} "
+                    f"{self._held_components_suffix(process_info)}",
                 )
 
         return info_strings

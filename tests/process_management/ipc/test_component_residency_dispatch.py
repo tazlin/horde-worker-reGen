@@ -93,3 +93,26 @@ def test_dispatcher_without_a_map_registered_is_unaffected() -> None:
     dispatcher._handle_memory_report(
         _memory_message(1, held=[HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=7000.0)]),
     )
+
+
+def test_report_stores_residency_on_the_process_info() -> None:
+    """A report's residency is stored on the process info so the snapshot/dashboard can render it."""
+    process_map = ProcessMap({1: make_mock_process_info(1, model_name="ModelA")})
+    dispatcher = _dispatcher(process_map, None)
+
+    held = [HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=7000.0)]
+    dispatcher._handle_memory_report(_memory_message(1, held=held))
+
+    assert process_map[1].held_components == held
+
+
+def test_none_residency_report_leaves_prior_residency_on_the_process_info() -> None:
+    """A later report with held_components=None means 'no data', so it never clears a stored residency."""
+    process_map = ProcessMap({1: make_mock_process_info(1, model_name="ModelA")})
+    dispatcher = _dispatcher(process_map, None)
+
+    held = [HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=7000.0)]
+    dispatcher._handle_memory_report(_memory_message(1, held=held))
+    dispatcher._handle_memory_report(_memory_message(1, held=None))
+
+    assert process_map[1].held_components == held

@@ -844,6 +844,7 @@ class MessageDispatcher:
             process_peak_reserved_mb=message.process_peak_reserved_mb,
             process_aimdo_mb=message.process_aimdo_mb,
             report_sampled_at=message.sampled_at,
+            held_components=message.held_components,
         )
         self._observe_footprint_peak(message)
 

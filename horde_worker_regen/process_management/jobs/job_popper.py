@@ -37,7 +37,9 @@ from horde_worker_regen.process_management.jobs.large_model_pop_governor import 
 from horde_worker_regen.process_management.jobs.pool_lanes import (
     LaneDecision,
     PoolLaneState,
+    PoolLaneTally,
     decide_pool_lane,
+    fold_pool_lane_outcome,
     record_fixed_pop_outcome,
 )
 from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
@@ -510,6 +512,7 @@ class JobPopper:
         self._pool_active_seats_provider = pool_active_seats_provider
         self._pool_pop_outcome_sink = pool_pop_outcome_sink
         self._pool_lane_state = PoolLaneState()
+        self._pool_lane_tally = PoolLaneTally()
         self._pool_lane_narrowing = False
         self._pool_last_fixed_seat_count = 0
         self._pool_lane_this_cycle: PopLane | None = None
@@ -877,13 +880,20 @@ class JobPopper:
     def _report_pool_pop_outcome(self, pool_lane: LaneDecision | None, *, popped_model: str | None) -> None:
         """Report a pool-routed pop's outcome and fold fixed-lane emptiness into the interleave.
 
-        A no-op for cycles the pool did not route (``pool_lane`` is None). A fixed-lane pop records whether it
-        came back empty (feeding the free-weight boost that yields the offer back when the fixed lane stops
-        earning work) independently of the sink, then the wired sink is handed the lane, advertised set, popped
-        model (or None), and a monotonic timestamp.
+        A no-op for cycles the pool did not route (``pool_lane`` is None). Every pool-routed pop advances the
+        cumulative lane tally (its lane's pop count, and its fulfilled count when a model came back), which the
+        status snapshot reads. A fixed-lane pop also records whether it came back empty (feeding the
+        free-weight boost that yields the offer back when the fixed lane stops earning work) independently of
+        the sink, then the wired sink is handed the lane, advertised set, popped model (or None), and a
+        monotonic timestamp.
         """
         if pool_lane is None:
             return
+        self._pool_lane_tally = fold_pool_lane_outcome(
+            self._pool_lane_tally,
+            lane=pool_lane.lane,
+            fulfilled=popped_model is not None,
+        )
         if pool_lane.lane is PopLane.FIXED:
             self._pool_lane_state = record_fixed_pop_outcome(
                 self._pool_lane_state,
@@ -939,6 +949,10 @@ class JobPopper:
     def latest_pool_fixed_seat_count(self) -> int:
         """The seated-model count advertised on the most recent fixed-lane pop (status snapshot)."""
         return self._pool_last_fixed_seat_count
+
+    def latest_pool_lane_tally(self) -> PoolLaneTally:
+        """The session-cumulative fixed/free lane pop and fulfillment counts (status snapshot)."""
+        return self._pool_lane_tally
 
     def latest_pool_lane_narrowing(self) -> bool:
         """Whether the most recent pool-routed pop narrowed to the fixed lane (status snapshot)."""

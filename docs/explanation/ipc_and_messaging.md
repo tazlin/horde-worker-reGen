@@ -106,6 +106,10 @@ path evicts the idle, unprotected ones (via `HordeEvictComponentsControlMessage`
 the coarser whole-RAM unload. `held_components` is additive and optimistic: an older
 child omits it (reported as `None`, which the parent reads as "no data", never "nothing
 resident"), and a child with no loaded backend reports `None` without importing hordelib.
+The parent also stores each report's residency on the process info and projects it onto
+`ProcessSnapshot.resident_components`, so the dashboard can show which components a process
+holds and derive a retained/unattributed remainder (its resident-set size minus the listed
+approximation).
 
 ## Process state machine
 

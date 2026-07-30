@@ -448,6 +448,9 @@ class ProcessLifecycleManager:
         # adapter) reuses the post-processing lane's simple end -> delete -> start replacement machine.
         self._utilities_processes_should_be_replaced = False
         self._utilities_processes_ending = False
+        # Marks the *next* image-utilities-lane rebuild as a deliberate cycle (an operator recycle), so its
+        # completion is not counted as a crash recovery (mirrors ``_post_process_replacement_intentional``).
+        self._utilities_replacement_intentional = False
         # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
         # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
         # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
@@ -1383,12 +1386,55 @@ class ProcessLifecycleManager:
             self.start_utilities_processes()
             self._utilities_processes_ending = False
             self._utilities_processes_should_be_replaced = False
-            self._num_process_recoveries += 1
+            if self._utilities_replacement_intentional:
+                # A deliberate operator recycle, not a lane crash: keep it out of the recovery count so a
+                # commit-charge reset is not read as a crash loop.
+                self._utilities_replacement_intentional = False
+            else:
+                self._num_process_recoveries += 1
 
     @property
     def utilities_processes_should_be_replaced(self) -> bool:
         """Whether the dedicated image-utilities lane is flagged for replacement."""
         return self._utilities_processes_should_be_replaced
+
+    def recycle_lane_process(self, process_info: HordeProcessInfo) -> bool:
+        """Recycle one service lane through its end -> respawn machine to reset its host commit charge.
+
+        The operator lever for a lane whose host commit charge has ballooned past what an in-process model
+        unload can return: a lane accrues a permanent CUDA context and allocator arenas that only a process
+        recycle frees (an in-process unload can leave a small resident set behind tens of GB of commit).
+        Routes through the same per-lane replacement state machine a crash would (the ``_initiate_*`` flag
+        consumed by the per-tick ``_replace_all_*``), so the fresh lane respawns through the boot ``start_*``
+        path with coherent process-id and process-type bookkeeping and its slot id reused from the freed one.
+        The recycle is marked intentional so its completion is not counted as a crash recovery nor fed to the
+        crash-loop breaker. Any stage in flight on a COMPONENT/VAE lane is re-dispatched from held state by the
+        disaggregation orchestrator once the replacement launch appears; an in-flight post-processing result is
+        recorded known-lost and requeued by the replacement machine itself.
+
+        Args:
+            process_info: The lane process to recycle.
+
+        Returns:
+            True if a lane recycle was initiated, False if the process is not a recyclable service lane
+            (safety and inference processes are handled by their own restart paths).
+        """
+        match process_info.process_type:
+            case HordeProcessType.POST_PROCESS:
+                self._post_process_replacement_intentional = True
+                self._initiate_post_process_replacement()
+            case HordeProcessType.COMPONENT:
+                self._component_lane_replacement_intentional = True
+                self._initiate_component_replacement()
+            case HordeProcessType.VAE_LANE:
+                self._vae_lane_replacement_intentional = True
+                self._initiate_vae_lane_replacement()
+            case HordeProcessType.UTILITIES:
+                self._utilities_replacement_intentional = True
+                self._initiate_utilities_replacement()
+            case _:
+                return False
+        return True
 
     def _component_lane_enabled(self) -> bool:
         """Whether the dedicated text-encode service should run.

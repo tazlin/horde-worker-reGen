@@ -8,7 +8,11 @@ from contextlib import contextmanager
 
 from loguru import logger
 
-from horde_worker_regen.process_management.ipc.messages import HordeHeartbeatType, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
+    HordeHeartbeatType,
+    HordeProcessState,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from tests.process_management.conftest import make_mock_process_info
@@ -192,6 +196,35 @@ class TestSamplingProgressReset:
         assert proc.last_iterations_per_second is None
 
 
+class TestDisaggSamplerProgressGate:
+    """A disaggregated sampler's step heartbeats must open the dashboard progress gate.
+
+    A pinned sampler enters INFERENCE_PRIMED and previously never emitted a step, so it stayed primed
+    and the TUI progress cell (which requires a sampling state plus a populated total-step count) never
+    rendered. The dedicated sample-stage emitter now sends INFERENCE_STEP heartbeats, which the parent
+    turns into the INFERENCE_PRIMED -> INFERENCE_STARTING flip and the populated step fields.
+    """
+
+    def test_first_inference_step_flips_primed_to_starting_and_populates_steps(self) -> None:
+        """The first INFERENCE_STEP flips a primed sampler to INFERENCE_STARTING and records the steps."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_PRIMED)
+        process_map = ProcessMap({0: proc})
+
+        process_map.on_heartbeat(
+            0,
+            HordeHeartbeatType.INFERENCE_STEP,
+            percent_complete=10,
+            current_step=3,
+            total_steps=30,
+            iterations_per_second=7.5,
+        )
+
+        assert proc.last_process_state == HordeProcessState.INFERENCE_STARTING
+        assert proc.last_current_step == 3
+        assert proc.last_total_steps == 30
+        assert proc.last_iterations_per_second == 7.5
+
+
 class TestFirstStepTimeout:
     """The first sampling step gets a longer grace than a steady step.
 
@@ -322,3 +355,46 @@ class TestIsLaunchActive:
         proc.process_launch_identifier = 8  # the replacement launch now occupies pid 0
         process_map = ProcessMap({0: proc})
         assert process_map.is_launch_active(0, 7) is False
+
+
+class TestHeldComponentResidency:
+    """A memory report's residency is stored on the process info and summarised for the console line."""
+
+    def test_memory_report_stores_held_components(self) -> None:
+        """``on_memory_report`` records the reported residency so the snapshot and console can read it."""
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+        held = [HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=2600.0)]
+
+        process_map.on_memory_report(process_id=0, ram_usage_bytes=1024, held_components=held)
+
+        assert process_map[0].held_components == held
+
+    def test_none_report_leaves_prior_residency(self) -> None:
+        """A None residency report means 'no data', so a prior residency is retained, not cleared."""
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+        held = [HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=2600.0)]
+
+        process_map.on_memory_report(process_id=0, ram_usage_bytes=1024, held_components=held)
+        process_map.on_memory_report(process_id=0, ram_usage_bytes=2048, held_components=None)
+
+        assert process_map[0].held_components == held
+
+    def test_info_string_carries_compact_residency_suffix(self) -> None:
+        """An inference line gains a compact ``held N comp ~X MB`` suffix from the reported residency."""
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name="ModelA")})
+        process_map.on_memory_report(
+            process_id=0,
+            ram_usage_bytes=1024,
+            held_components=[
+                HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=2600.0),
+                HeldComponentSnapshot(kind="vae", identity="ModelA::vae", approx_ram_mb=160.0),
+            ],
+        )
+
+        line = process_map.get_process_info_strings()[0]
+        assert "held 2 comp ~2760 MB" in line
+
+    def test_info_string_has_no_suffix_without_residency(self) -> None:
+        """A process that reported no residency adds nothing, leaving the line unchanged."""
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name="ModelA")})
+        assert "held" not in process_map.get_process_info_strings()[0]

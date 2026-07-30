@@ -439,6 +439,7 @@ class JobTracker:
 
         self._sequence_counter = 0
         self._finalize_observer: Callable[[TrackedJob, HordeJobInfo], None] | None = None
+        self._inference_failure_release_observer: Callable[[GenerationID], None] | None = None
 
         # Circuit-breaker / self-throttle bookkeeping (raw counts + timestamps; the scheduler and process
         # manager apply the configured thresholds). A model the device genuinely cannot run faults every
@@ -689,6 +690,19 @@ class JobTracker:
         worker-wide metrics snapshot without wrapping tracker methods.
         """
         self._finalize_observer = observer
+
+    def set_inference_failure_release_observer(self, observer: Callable[[GenerationID], None]) -> None:
+        """Register a callback invoked with each job id whose inference failure this tracker resolves.
+
+        The disaggregation orchestrator holds per-job pipeline state (pin, reservation, held intermediates)
+        that a crash-path resolution here bypasses entirely: on a requeue the orchestrator would otherwise
+        re-dispatch its held copy in parallel with the tracker's fresh attempt (the pending head then parks
+        behind its own duplicate's sampler pin), and on a terminal fault the held state becomes a zombie that
+        can re-dispatch a job the tracker no longer knows. The manager registers the orchestrator's
+        ``release_job`` here so both branches drop that state first; it is idempotent and a no-op for jobs
+        the orchestrator does not hold, so calling it for monolithic jobs is safe.
+        """
+        self._inference_failure_release_observer = observer
 
     # region internal helpers
 
@@ -2035,6 +2049,13 @@ class JobTracker:
 
         if process_info is not None:
             logger.error(f"Job {faulted_job.id_} faulted due to process {process_info.process_id} crashing")
+
+        # Drop any disaggregation pipeline state held for this job BEFORE deciding requeue-vs-fault: a requeue
+        # must not race the orchestrator's own held-state re-dispatch (the same job would run twice and the
+        # pending copy parks behind its duplicate's sampler pin), and a terminal fault must not leave a zombie
+        # registration that later re-dispatches a job this tracker no longer knows.
+        if faulted_job.id_ is not None and self._inference_failure_release_observer is not None:
+            self._inference_failure_release_observer(faulted_job.id_)
 
         # A slot that crashed/hung while running a job the scheduler knowingly over-committed (admitted
         # against the VRAM budget's verdict) is a resource failure even though the dead slot left no

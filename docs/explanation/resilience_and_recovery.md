@@ -418,6 +418,16 @@ An operator can force a revival of a dead or stuck downloader with the
 routes to the dedicated download-restart path (the command otherwise addresses
 inference slots).
 
+The same command also recycles a service lane (COMPONENT, VAE_LANE,
+POST_PROCESS, or UTILITIES) when its id is targeted: a lane accrues host commit
+charge (its permanent CUDA context and allocator arenas) that an in-process model
+unload cannot return, so a full process recycle is the only way to reset a lane
+whose commit has ballooned. The recycle routes through the lane's normal end and
+respawn machine, marked intentional so it is not counted as a crash recovery; any
+stage in flight is re-dispatched from held state by the disaggregation
+orchestrator once the fresh lane appears. The safety process (id 0) and the
+download process remain excluded from the lane-recycle path.
+
 ## The action ledger
 
 [`ActionLedger`][horde_worker_regen.process_management.ipc.action_ledger.ActionLedger]

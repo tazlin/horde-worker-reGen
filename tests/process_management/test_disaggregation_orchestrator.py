@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.workers.disaggregation_orchestrator i
     _RESOURCE_DEFER_SECONDS,
     _SAMPLING_LIVENESS_GRACE_SECONDS,
     _STAGE_PATIENCE_SECONDS,
+    DisaggJobStage,
     DisaggregatedFault,
     DisaggregationOrchestrator,
 )
@@ -263,6 +264,73 @@ async def test_txt2img_dag_runs_to_completion() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stage_snapshot_tracks_stage_and_dispatch_target() -> None:
+    """stage_snapshot() projects each in-flight job's current stage and its dispatch target.
+
+    The projection tracks the stage as it advances (awaiting conditioning -> sampling), reflects the
+    process a stage is dispatched to, and drops a job's row once it completes and leaves the pipeline.
+    """
+    h = _make_harness()
+    job = _job()
+    job_id = job.sdk_api_job_info.id_
+
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+
+    # Registered but not yet dispatched: awaiting conditioning with no dispatch target.
+    entries = h.orchestrator.stage_snapshot()
+    assert len(entries) == 1
+    assert entries[0].job_id == str(job_id)
+    assert entries[0].stage == DisaggJobStage.AWAITING_CONDITIONING
+    assert entries[0].process_id is None
+    assert entries[0].process_launch_identifier is None
+
+    h.orchestrator.tick()  # text-encode dispatched to the encode service (pid 1)
+    encode_entry = h.orchestrator.stage_snapshot()[0]
+    assert encode_entry.stage == DisaggJobStage.AWAITING_CONDITIONING
+    assert encode_entry.process_id == 1
+
+    await h.orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    h.orchestrator.tick()  # sample dispatched to the pinned sampler
+
+    sample_entry = h.orchestrator.stage_snapshot()[0]
+    assert sample_entry.stage == DisaggJobStage.SAMPLING
+    assert sample_entry.process_id == _SAMPLER_PID
+    assert sample_entry.process_launch_identifier == 0
+
+    # Drive the job to completion: its row must disappear once it leaves the pipeline.
+    await h.orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=_SAMPLER_PID,
+            process_launch_identifier=0,
+            info="",
+            results=[SampleSliceResult(job_id=job_id, latent_bytes=b"latent", state=GENERATION_STATE.ok)],
+        ),
+    )
+    h.orchestrator.tick()  # decode dispatched to the image lane
+    await h.orchestrator.handle_stage_result(
+        HordeVaeDecodeResultMessage(
+            process_id=3,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            job_image_results=[HordeImageResult(image_bytes=b"img")],
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    assert h.orchestrator.stage_snapshot() == []
+
+
+@pytest.mark.asyncio
 async def test_img2img_waits_for_both_source_latent_and_conditioning() -> None:
     """An img2img job only samples once both the source latent and the conditioning are in."""
     h = _make_harness()
@@ -402,6 +470,26 @@ def test_reconcile_redispatches_when_stage_process_crashes() -> None:
     h.orchestrator.reconcile_retired_processes(alive_launches={(_SAMPLER_PID, 0), (3, 0)})
     h.orchestrator.tick()
     assert len(h.encode_service.sent) == 2  # crash detected -> re-dispatched from held state
+
+
+def test_reconcile_redispatches_when_service_lane_recycled_reuses_id() -> None:
+    """An operator recycle of a service lane (same slot id, new launch) does not strand its in-flight stage.
+
+    The recycle respawns the lane through the boot start path, reusing the freed slot id under a new launch
+    identifier. Reconcile compares full ``(id, launch)`` pairs, so the stale launch its stage was dispatched
+    on is retired and the held stage re-dispatches onto the fresh lane rather than sitting dispatched forever.
+    """
+    h = _make_harness()
+    job = _job()
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.tick()
+    assert len(h.encode_service.sent) == 1  # dispatched on (pid 1, launch 0)
+
+    # The encode lane (pid 1) is recycled: the respawn reuses the slot id under a new launch identifier.
+    h.encode_service.process_launch_identifier = 1
+    h.orchestrator.reconcile_retired_processes(alive_launches={(1, 1), (_SAMPLER_PID, 0), (3, 0)})
+    h.orchestrator.tick()
+    assert len(h.encode_service.sent) == 2  # stale-launch dispatch retired -> re-dispatched onto the fresh lane
 
 
 @pytest.mark.asyncio

@@ -151,6 +151,22 @@ class DisaggJobStage(StrEnum):
     """The job's images are ready and have been handed off."""
 
 
+@dataclass(frozen=True)
+class DisaggStageEntry:
+    """Represents one in-flight disaggregated job's current stage and dispatch target, for reporting.
+
+    A pure read-only projection of a job's held state so the process manager can surface per-job disagg
+    progress in the supervisor snapshot without reaching into the orchestrator's private job map. The
+    ``process_id``/``process_launch_identifier`` pair is the stage's current dispatch target (both None
+    while the stage waits to be dispatched).
+    """
+
+    job_id: str
+    stage: DisaggJobStage
+    process_id: int | None
+    process_launch_identifier: int | None
+
+
 @dataclass
 class _DisaggJobState:
     """The parent-held state of one in-flight disaggregated job.
@@ -383,6 +399,23 @@ class DisaggregationOrchestrator:
         orchestrator.
         """
         return sum(1 for state in self._jobs.values() if state.stage == DisaggJobStage.AWAITING_LATENT_DECODE)
+
+    def stage_snapshot(self) -> list[DisaggStageEntry]:
+        """Return each in-flight disaggregated job's current stage and dispatch target (read-only).
+
+        A cheap O(jobs) projection over the held-job map for the supervisor snapshot. It exposes no
+        mutable internal state: neither the private ``_jobs`` map nor its ``_DisaggJobState`` entries
+        escape, only immutable :class:`DisaggStageEntry` copies.
+        """
+        return [
+            DisaggStageEntry(
+                job_id=key,
+                stage=state.stage,
+                process_id=state.dispatched_to[0] if state.dispatched_to is not None else None,
+                process_launch_identifier=state.dispatched_to[1] if state.dispatched_to is not None else None,
+            )
+            for key, state in self._jobs.items()
+        ]
 
     # -- registration ------------------------------------------------------------------------------
 

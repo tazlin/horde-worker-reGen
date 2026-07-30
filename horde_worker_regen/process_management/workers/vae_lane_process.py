@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeEvictComponentsControlMessage,
+    HordeHeartbeatType,
     HordeImageResult,
     HordeProcessState,
     HordeVaeDecodeControlMessage,
@@ -48,7 +49,7 @@ from horde_worker_regen.utils.oom_signature import is_out_of_memory_text, is_res
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
     from horde_sdk.generation_parameters.image import ImageGenerationParameters
-    from hordelib.api import HordeLib, SharedModelManager
+    from hordelib.api import HordeLib, ProgressReport, SharedModelManager
 else:
 
     class HordeLib:
@@ -286,6 +287,36 @@ class HordeVaeLaneProcess(HordeProcess):
         self.send_stage_job_metrics_message(str(message.job_id), stage=PipelineStageTag.VAE_ENCODE)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
+    def _emit_decode_progress(self, progress_report: ProgressReport) -> None:
+        """Forward a tiled VAE decode's per-tile step progress as an INFERENCE_STEP heartbeat.
+
+        A tiled decode reports one step per tile; the parent stores the current/total step against
+        this lane (whose state is ``POST_PROCESSING`` throughout decode) so the dashboard shows a
+        decode progress bar. The lane never enters ``INFERENCE_STARTING``, so the sampling-hang and
+        non-advancing-step watchdogs (both gated on that state) never apply to it. A single-shot,
+        non-tiled decode reports no intermediate steps, so nothing is emitted and the
+        ``POST_PROCESSING`` state alone signals the active decode.
+        """
+        from hordelib.api import ComfyUIProgressUnit
+
+        comfyui_progress = progress_report.comfyui_progress
+        if comfyui_progress is None or comfyui_progress.current_step <= 0:
+            return
+
+        # Normalize the rate to iterations/second regardless of how it was reported (-1.0 means not
+        # yet known and is passed through).
+        rate = comfyui_progress.rate
+        if comfyui_progress.rate_unit == ComfyUIProgressUnit.SECONDS_PER_ITERATION:
+            rate = 1.0 / rate if rate > 0 else -1.0
+
+        self.send_heartbeat_message(
+            heartbeat_type=HordeHeartbeatType.INFERENCE_STEP,
+            percent_complete=comfyui_progress.percent,
+            current_step=comfyui_progress.current_step,
+            total_steps=comfyui_progress.total_steps,
+            iterations_per_second=rate,
+        )
+
     def _run_vae_decode(self, message: HordeVaeDecodeControlMessage) -> None:
         """Decode a LATENT to raw images, loading only the VAE (post-processing runs on its own lane)."""
         self.send_process_state_change_message(HordeProcessState.POST_PROCESSING, info=f"VAE-decode {message.job_id}")
@@ -306,7 +337,11 @@ class HordeVaeLaneProcess(HordeProcess):
                 params = self._job_generation_parameters(message.sdk_api_job_info)
 
                 def _decode() -> list[HordeImageResult]:
-                    results, _faults = self._horde.decode_stage(params, latent_bytes=message.latent_bytes)
+                    results, _faults = self._horde.decode_stage(
+                        params,
+                        latent_bytes=message.latent_bytes,
+                        progress_callback=self._emit_decode_progress,
+                    )
                     return [
                         HordeImageResult(image_bytes=r.rawpng.getvalue(), generation_faults=r.faults)
                         for r in results

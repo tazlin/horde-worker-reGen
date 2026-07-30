@@ -34,7 +34,9 @@ from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 __all__ = [
     "LaneDecision",
     "PoolLaneState",
+    "PoolLaneTally",
     "decide_pool_lane",
+    "fold_pool_lane_outcome",
     "record_fixed_pop_outcome",
 ]
 
@@ -73,6 +75,41 @@ class LaneDecision:
     advertised: frozenset[str]
     next_state: PoolLaneState
     reason: str
+
+
+@dataclass(frozen=True)
+class PoolLaneTally:
+    """Session-cumulative pool-routed pop counts, split by advertising lane.
+
+    Each lane counts its pops and how many of them were fulfilled (returned a job), so a reader forms the
+    lane's hit rate as ``fulfilled / pops``. The two lanes are counted apart so a fixed lane the horde keeps
+    feeding and a free lane it does not (or the reverse) are distinguishable. The empty default is the state
+    before any pool-routed pop.
+    """
+
+    fixed_pops: int = 0
+    fixed_fulfilled: int = 0
+    free_pops: int = 0
+    free_fulfilled: int = 0
+
+
+def fold_pool_lane_outcome(tally: PoolLaneTally, *, lane: PopLane, fulfilled: bool) -> PoolLaneTally:
+    """Add one pool-routed pop's outcome to the cumulative lane tally.
+
+    The pop is counted under its advertising ``lane``, and additionally as fulfilled when it returned a job.
+    Only the counted lane's fields advance, so the two lanes' hit rates stay independent.
+    """
+    if lane is PopLane.FIXED:
+        return replace(
+            tally,
+            fixed_pops=tally.fixed_pops + 1,
+            fixed_fulfilled=tally.fixed_fulfilled + (1 if fulfilled else 0),
+        )
+    return replace(
+        tally,
+        free_pops=tally.free_pops + 1,
+        free_fulfilled=tally.free_fulfilled + (1 if fulfilled else 0),
+    )
 
 
 def _recent_run_all_empty(recent_fixed_empty: tuple[bool, ...]) -> bool:

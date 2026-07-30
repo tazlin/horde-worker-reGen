@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import (
     ModelPool,
@@ -139,6 +140,40 @@ def test_snapshot_populates_model_pool_when_enabled() -> None:
         assert seat_row.rescue_expires_in_seconds is None or seat_row.rescue_expires_in_seconds >= 0.0
     for bench_row in pool_snapshot.bench:
         assert bench_row.cooldown_remaining_seconds >= 0.0
+
+
+def test_snapshot_projects_pool_lane_tally() -> None:
+    """The cumulative per-lane pop/fulfillment tally the popper accrues is projected onto the snapshot.
+
+    Drives the popper's real outcome-reporting path (the same call ``api_job_pop`` makes) with a fixed-lane
+    fulfilled pop, a fixed-lane empty pop, and a free-lane empty pop, then reads the projected counts.
+    """
+    manager = make_testable_process_manager()
+    manager.bridge_data.model_pool.enabled = True
+
+    fixed = LaneDecision(
+        lane=PopLane.FIXED,
+        advertised=frozenset({"Deliberate"}),
+        next_state=PoolLaneState(),
+        reason="fixed",
+    )
+    free = LaneDecision(
+        lane=PopLane.FREE,
+        advertised=frozenset({"AlbedoBase XL"}),
+        next_state=PoolLaneState(),
+        reason="free",
+    )
+    manager._job_popper._report_pool_pop_outcome(fixed, popped_model="Deliberate")
+    manager._job_popper._report_pool_pop_outcome(fixed, popped_model=None)
+    manager._job_popper._report_pool_pop_outcome(free, popped_model=None)
+
+    pool_snapshot = manager._build_worker_state_snapshot().model_pool
+
+    assert pool_snapshot is not None
+    assert pool_snapshot.fixed_pops == 2
+    assert pool_snapshot.fixed_fulfilled == 1
+    assert pool_snapshot.free_pops == 1
+    assert pool_snapshot.free_fulfilled == 0
 
 
 def test_publish_is_dirty_gated_with_a_floor() -> None:

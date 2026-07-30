@@ -300,6 +300,28 @@ class TestCommandInbox:
         rejected = _alerts(tmp_path, "command_rejected")
         assert len(rejected) == 2  # the torn JSON and the unknown verb
 
+    def test_lines_present_at_bind_are_history_not_work(self, tmp_path: Path) -> None:
+        """Inbox lines that predate the supervisor's bind are never applied (no replay on rebind).
+
+        A predecessor's consumed commands stay in the file; replaying them re-applies stale operator
+        intent against a fresh worker (observed live: a leftover GRACEFUL_SHUTDOWN killed the relaunch
+        it preceded). Only lines appended after bind may act.
+        """
+        controller = FakeController()
+        (tmp_path / "commands.jsonl").write_text(
+            json.dumps({"command": "GRACEFUL_SHUTDOWN"}) + "\n" + json.dumps({"command": "PAUSE"}) + "\n",
+            encoding="utf-8",
+        )
+        attach = _attach(controller, tmp_path)
+        attach.poll_once(now=0.0)
+        assert controller.graceful_stops == 0
+        assert controller.sent == []
+
+        with (tmp_path / "commands.jsonl").open("a", encoding="utf-8") as inbox:
+            inbox.write(json.dumps({"command": "PAUSE"}) + "\n")
+        attach.poll_once(now=1.0)
+        assert [message.command for message in controller.sent] == [SupervisorCommand.PAUSE]
+
     def test_shutdown_routes_through_graceful_stop(self, tmp_path: Path) -> None:
         """SHUTDOWN/GRACEFUL_SHUTDOWN uses the orphan-proof graceful path, not a raw control command."""
         controller = FakeController()
@@ -454,11 +476,13 @@ class TestInboxShutdownExit:
     def test_run_forever_returns_after_inbox_shutdown_completes(self, tmp_path: Path) -> None:
         """A GRACEFUL_SHUTDOWN inbox line drives a graceful stop and then exits the loop with a final state line."""
         controller = FakeController()
+        attach = AttachSupervisor(controller, session_dir=tmp_path, log_dir=None, interval=0.0)
+        # Appended after bind: lines already present at bind are history (a fresh supervisor must not replay
+        # a predecessor's shutdown against the worker it just launched).
         (tmp_path / "commands.jsonl").write_text(
             json.dumps({"command": "GRACEFUL_SHUTDOWN"}) + "\n",
             encoding="utf-8",
         )
-        attach = AttachSupervisor(controller, session_dir=tmp_path, log_dir=None, interval=0.0)
 
         finished = threading.Event()
 

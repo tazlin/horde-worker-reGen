@@ -178,3 +178,26 @@ async def test_finalize_drops_fault_entries(job_tracker: JobTracker) -> None:
     await job_tracker.finalize_submitted(tracked.job_info)
 
     assert await job_tracker.get_faults_for_job(job.id_) == []  # type: ignore[union-attr]
+
+
+async def test_release_observer_fires_on_requeue_and_terminal_fault(job_tracker: JobTracker) -> None:
+    """Every inference-failure resolution first releases the job's disaggregation pipeline state.
+
+    Observed live: a sampler crash requeued the job while the orchestrator re-dispatched its held copy,
+    so the pending head parked behind its own duplicate's pin; and a terminal fault left a zombie
+    registration. The tracker must announce both resolutions so the manager-registered release keeps the
+    retry single-flight and purges state on a terminal fault.
+    """
+    released: list[object] = []
+    job_tracker.set_inference_failure_release_observer(released.append)
+    job_tracker.set_retry_policy(2)
+    job = await _pop_and_start(job_tracker)
+
+    first = await job_tracker.handle_job_fault(faulted_job=job)  # pyrefly: ignore
+    assert first is InferenceFailureResolution.RETRY
+    assert released == [job.id_]  # type: ignore[union-attr]
+
+    await job_tracker.mark_inference_started(job)  # pyrefly: ignore
+    second = await job_tracker.handle_job_fault(faulted_job=job)  # pyrefly: ignore
+    assert second is InferenceFailureResolution.FAULTED
+    assert released == [job.id_, job.id_]  # type: ignore[union-attr]

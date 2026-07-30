@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 19
+SUPERVISOR_PROTOCOL_VERSION = 20
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -65,6 +65,14 @@ v17 added the operator-facing reason post-processing was session-disabled.
 v19 added the snapshot's ``model_pool`` field (:class:`ModelPoolSnapshot`): the fixed model pool's seats,
 bench, current advertising lane, demand-reading age, and download budget. Omitted (None) when the pool is
 disabled, so a worker with no pool leaves the field unset and older supervisors are unaffected.
+v20 added the snapshot's ``disagg_job_stages`` list (:class:`DisaggStageRow`): each in-flight
+pipeline-disaggregated job's current stage and the process its stage is dispatched to, so the dashboard
+can show mid-pipeline progress (encode / sample / decode) per job. Empty when disaggregation is disabled
+or no disaggregated jobs are in flight. v20 also added ``ProcessSnapshot.resident_components``
+(:class:`ResidentComponentEntry` entries): the model components a GPU-bearing child holds resident in its
+RAM component cache, so the dashboard can show which models/components a lane actually holds. Empty for a
+process with no component cache. The model-pool snapshot also gained cumulative fixed/free lane pop and
+fulfillment counts for per-lane hit rates.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -178,6 +186,23 @@ class WorkLedgerEntry(BaseModel):
     faulted: bool = False
 
 
+class DisaggStageRow(BaseModel):
+    """Represents one in-flight pipeline-disaggregated job's current stage and dispatch target.
+
+    Carried on :attr:`WorkerStateSnapshot.disagg_job_stages` so the dashboard can show where each
+    disaggregated job is in its pipeline (awaiting conditioning, sampling, awaiting decode, ...). The
+    ``process_id``/``process_launch_identifier`` pair is the process the current stage is dispatched to,
+    both None while the stage is queued for a role process that is not yet available.
+    """
+
+    job_id: str
+    stage: str
+    """The :class:`~horde_worker_regen.process_management.workers.disaggregation_orchestrator.DisaggJobStage`
+    value (e.g. ``sampling``, ``awaiting_latent_decode``)."""
+    process_id: int | None = None
+    process_launch_identifier: int | None = None
+
+
 class OrchestrationIntentSnapshot(BaseModel):
     """The scheduler/popper's current plain-English intent for the Overview Now/Next/Why strip."""
 
@@ -230,6 +255,24 @@ class WorkerConfigSummary(BaseModel):
     alchemy_forms: list[str] = Field(default_factory=list)
 
 
+class ResidentComponentEntry(BaseModel):
+    """Represents one model component a process holds resident in its RAM component cache, for the dashboard.
+
+    The wire twin of the child-reported ``HeldComponentSnapshot``
+    (:mod:`~horde_worker_regen.process_management.ipc.messages`), duplicated here rather than imported so this
+    module stays a leaf the message layer can depend on without a cycle (as ``SystemMemorySnapshot`` twins
+    ``SystemMemorySummary``). The fields carry the cache's own view, so ``approx_ram_mb`` is only the
+    accounted portion of the process's resident-set size.
+    """
+
+    kind: str
+    """The component kind (``unet``/``clip``/``vae``/``checkpoint``); a ``str`` so an unknown future kind survives."""
+    identity: str
+    """The content identity of the cached entry (a checkpoint entry's identity is the bare horde model name)."""
+    approx_ram_mb: float
+    """The entry's approximate resident RAM cost in megabytes, as the component cache's budget estimates it."""
+
+
 class ProcessSnapshot(BaseModel):
     """A serializable projection of one child process's live state (from ``HordeProcessInfo``)."""
 
@@ -277,6 +320,14 @@ class ProcessSnapshot(BaseModel):
 
     current_job_features: JobFeatureSummary | None = None
     """Notable features of the active job (LoRAs, ControlNet, etc.); None when idle."""
+
+    resident_components: list[ResidentComponentEntry] = Field(default_factory=list)
+    """The model components this process last reported holding resident in its RAM component cache.
+
+    Empty for a process that carries no component cache (safety, download, utilities) or has not reported.
+    This is the component cache's own listing, so it is approximate: the entries' summed ``approx_ram_mb``
+    is only the accounted portion of ``ram_usage_bytes``, and allocator-retained or comfy-held stale pages
+    the cache no longer lists are the remainder (RSS minus the listed approximation)."""
 
     @classmethod
     def from_process_info(cls, info: HordeProcessInfo) -> ProcessSnapshot:
@@ -326,6 +377,12 @@ class ProcessSnapshot(BaseModel):
             ram_used_high_water_mb=info.ram_used_high_water_mb,
             num_jobs_completed=info.num_jobs_completed,
             current_job_features=features,
+            resident_components=[
+                ResidentComponentEntry(kind=held.kind, identity=held.identity, approx_ram_mb=held.approx_ram_mb)
+                for held in info.held_components
+            ]
+            if info.held_components
+            else [],
         )
 
 
@@ -962,6 +1019,14 @@ class ModelPoolSnapshot(BaseModel):
     """Configured disk budget (GB) the pool may spend auto-downloading a model to seat it (0 = never)."""
     download_bytes_charged: int = 0
     """Bytes the pool has charged against the download budget this session."""
+    fixed_pops: int = 0
+    """Session-cumulative pops the pool advertised on the fixed (seated-model) lane."""
+    fixed_fulfilled: int = 0
+    """How many of ``fixed_pops`` returned a job (the fixed lane's hit rate is this over ``fixed_pops``)."""
+    free_pops: int = 0
+    """Session-cumulative pops the pool advertised on the free (unseated-model) lane."""
+    free_fulfilled: int = 0
+    """How many of ``free_pops`` returned a job (the free lane's hit rate is this over ``free_pops``)."""
 
 
 class WorkerStateSnapshot(BaseModel):
@@ -1135,6 +1200,11 @@ class WorkerStateSnapshot(BaseModel):
     work_ledger: list[WorkLedgerEntry] = Field(default_factory=list)
     """Active and recent job rows for the Overview work ledger."""
 
+    disagg_job_stages: list[DisaggStageRow] = Field(default_factory=list)
+    """Per-job pipeline-disaggregation stage and dispatch target for in-flight disaggregated jobs.
+
+    Empty when disaggregation is off or no disaggregated job is in flight."""
+
     whole_card_residency: WholeCardResidencyStatus = Field(default_factory=WholeCardResidencyStatus)
     """Whole-card exclusive-residency posture: whether it can engage, and live detail when it has."""
 
@@ -1161,7 +1231,11 @@ class SupervisorCommand(enum.Enum):
     DRAIN = enum.auto()
     """Stop popping and let in-flight jobs finish without exiting (alias of PAUSE for now)."""
     RESTART_PROCESS = enum.auto()
-    """Replace one inference process by ``process_id`` (e.g. a stuck slot)."""
+    """Replace one process by ``process_id``: an inference slot (e.g. a stuck slot) or a service lane.
+
+    Targeting a service lane (COMPONENT/VAE_LANE/POST_PROCESS/UTILITIES) recycles it through its normal
+    respawn machine, the sanctioned way to reset a lane whose host commit charge has ballooned past what an
+    in-process model unload can return. The safety and download processes are not restartable this way."""
     RELOAD_CONFIG = enum.auto()
     """Re-read ``bridgeData.yaml`` from disk and hot-swap the runtime config."""
     SET_CONCURRENCY = enum.auto()
@@ -1199,7 +1273,8 @@ class SupervisorControlMessage(BaseModel):
 
     command: SupervisorCommand
     process_id: int | None = None
-    """The target process slot, required for :attr:`SupervisorCommand.RESTART_PROCESS`."""
+    """The target process slot (an inference slot or a service-lane id), required for \
+:attr:`SupervisorCommand.RESTART_PROCESS`."""
     target_threads: int | None = None
     """The new concurrent-inference cap, for :attr:`SupervisorCommand.SET_CONCURRENCY` (clamped to \
     the session ceiling)."""

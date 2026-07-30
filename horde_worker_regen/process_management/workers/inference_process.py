@@ -833,6 +833,56 @@ class HordeInferenceProcess(HordeProcess):
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
 
+    def _emit_sample_stage_progress(self, progress_report: ProgressReport) -> None:
+        """Translate a disaggregated sample stage's progress into step heartbeats, nothing more.
+
+        A pinned sampler never performs the VAE decode itself (the VAE lane does), and it does not
+        hold the inference or VAE-decode semaphores the monolithic ``progress_callback`` manages, so
+        this emitter deliberately touches none of that handoff state. It only forwards the sampler's
+        per-step progress: an ``INFERENCE_STEP`` heartbeat per advancing step (which flips the
+        process ``INFERENCE_PRIMED`` -> ``INFERENCE_STARTING`` on the parent side so the dashboard's
+        progress gate opens) and a terminal ``PIPELINE_STATE_CHANGE`` on the final step. The
+        non-advancing-repeat counter is maintained so the parent's hang watchdog still sees a wedged
+        sampler that loops on one step.
+        """
+        from hordelib.api import ComfyUIProgressUnit
+
+        comfyui_progress = progress_report.comfyui_progress
+        reported_step = comfyui_progress.current_step if comfyui_progress is not None else None
+        if reported_step is not None:
+            if reported_step == self._last_progress_step_seen:
+                self._nonadvancing_progress_repeats += 1
+            else:
+                self._nonadvancing_progress_repeats = 0
+                self._last_progress_step_seen = reported_step
+
+        is_advancing_step = (
+            comfyui_progress is not None
+            and comfyui_progress.current_step > 0
+            and comfyui_progress.current_step != comfyui_progress.total_steps
+        )
+        if comfyui_progress is None or not is_advancing_step:
+            self.send_heartbeat_message(
+                heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
+            )
+            return
+
+        # Normalize the rate to iterations/second regardless of how it was reported (-1.0 means not
+        # yet known and is passed through), mirroring the monolithic path's display.
+        rate = comfyui_progress.rate
+        if comfyui_progress.rate_unit == ComfyUIProgressUnit.SECONDS_PER_ITERATION:
+            rate = 1.0 / rate if rate > 0 else -1.0
+
+        self.send_heartbeat_message(
+            heartbeat_type=HordeHeartbeatType.INFERENCE_STEP,
+            percent_complete=comfyui_progress.percent,
+            current_step=comfyui_progress.current_step,
+            total_steps=comfyui_progress.total_steps,
+            iterations_per_second=rate,
+            nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
+        )
+
     def _send_job_metrics_message(self, job_id: str, *, is_alchemy: bool = False) -> None:
         """Snapshot hordelib's per-job metrics and forward them to the main process.
 
@@ -1049,6 +1099,11 @@ class HordeInferenceProcess(HordeProcess):
         results: list[SampleSliceResult] = []
 
         for job_slice in message.slices:
+            # Reset the step-tracking state per slice so every slice in a batch emits its own step
+            # progress from step one (the first step of a slice always differs from the prior slice's
+            # final step, so the non-advancing watchdog counter also starts clean).
+            self._last_progress_step_seen = None
+            self._nonadvancing_progress_repeats = 0
             try:
                 if self._dry_run_skip_inference:
                     latent_bytes = self._make_dummy_latent_bytes()
@@ -1062,6 +1117,7 @@ class HordeInferenceProcess(HordeProcess):
                         positive_conditioning_bytes=job_slice.positive_conditioning_bytes,
                         negative_conditioning_bytes=job_slice.negative_conditioning_bytes,
                         source_latent_bytes=job_slice.source_latent_bytes,
+                        progress_callback=self._emit_sample_stage_progress,
                     )
                 results.append(
                     SampleSliceResult(job_id=job_slice.job_id, latent_bytes=latent_bytes, state=GENERATION_STATE.ok),

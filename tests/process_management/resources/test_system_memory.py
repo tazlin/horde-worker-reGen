@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import SystemMemorySnapshot
 from horde_worker_regen.process_management.resources.system_memory import (
+    ROLE_COMPONENT,
     ROLE_DOWNLOAD,
     ROLE_INFERENCE,
+    ROLE_LABELS,
     ROLE_ORCHESTRATOR,
+    ROLE_POST_PROCESS,
     ROLE_SAFETY,
+    ROLE_UTILITIES,
+    ROLE_VAE_LANE,
+    WORKER_ROLE_ORDER,
     SystemMemorySummary,
     build_system_memory_summary,
 )
@@ -83,6 +89,55 @@ def test_nonzero_role_items_orders_and_filters() -> None:
     assert summary.nonzero_role_items() == [
         (ROLE_INFERENCE, 18 * _GB),
         (ROLE_ORCHESTRATOR, 1 * _GB),
+        (ROLE_DOWNLOAD, _GB),
+    ]
+    # safety contributed nothing, so it is omitted.
+    assert all(role != ROLE_SAFETY for role, _ in summary.nonzero_role_items())
+
+
+def test_lane_roles_count_toward_worker_total_and_shrink_other() -> None:
+    """The auxiliary lanes (component/VAE/post-processing/utilities) join the worker subtotal, not 'other'."""
+    lane_only = _summary(
+        component=3 * _GB,
+        vae_lane=2 * _GB,
+        post_process=4 * _GB,
+        utilities=1 * _GB,
+    )
+    # used = 44 GB; every lane RSS is attributed to the worker rather than mislabelled as other apps.
+    assert lane_only.worker_total_bytes == 10 * _GB
+    assert lane_only.other_bytes == 34 * _GB
+
+    # Adding a lane's RSS to a sample moves that RSS out of 'other' and into the worker subtotal.
+    without_lane = _summary(inference=8 * _GB)
+    with_lane = _summary(inference=8 * _GB, vae_lane=2 * _GB)
+    assert with_lane.worker_total_bytes == without_lane.worker_total_bytes + 2 * _GB
+    assert with_lane.other_bytes == without_lane.other_bytes - 2 * _GB
+
+
+def test_every_role_has_a_label() -> None:
+    """Every ordered role carries a human-readable label so the console/TUI never render a raw key."""
+    for role in WORKER_ROLE_ORDER:
+        assert role in ROLE_LABELS
+
+
+def test_nonzero_role_items_includes_lanes_in_order() -> None:
+    """The lane roles appear in the breakdown, ordered between inference and the orchestrator."""
+    summary = _summary(
+        orchestrator=1 * _GB,
+        inference=18 * _GB,
+        component=3 * _GB,
+        vae_lane=2 * _GB,
+        post_process=4 * _GB,
+        utilities=1 * _GB,
+        download=_GB,
+    )
+    assert summary.nonzero_role_items() == [
+        (ROLE_INFERENCE, 18 * _GB),
+        (ROLE_COMPONENT, 3 * _GB),
+        (ROLE_VAE_LANE, 2 * _GB),
+        (ROLE_POST_PROCESS, 4 * _GB),
+        (ROLE_ORCHESTRATOR, 1 * _GB),
+        (ROLE_UTILITIES, 1 * _GB),
         (ROLE_DOWNLOAD, _GB),
     ]
     # safety contributed nothing, so it is omitted.

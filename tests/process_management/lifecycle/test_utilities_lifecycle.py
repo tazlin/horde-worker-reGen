@@ -233,3 +233,23 @@ def test_crashed_lane_is_recovered_by_the_reaper() -> None:
         plm._replace_all_utilities_process()
     assert plm._process_map.num_utilities_processes() == 1
     assert len(constructed) == 2
+
+
+def test_operator_recycle_respawns_utilities_lane_without_counting_a_recovery() -> None:
+    """An operator recycle of the utilities lane respawns it but, being intentional, is not a crash recovery."""
+    constructed: list[_FakeAdapter] = []
+    plm = _make_utilities_plm(constructed=constructed)
+    assert plm.start_utilities_processes() is True
+    utilities = plm._process_map.get_capable_processes(WorkerCapability.IMAGE_UTILITIES)[0]
+    recoveries_before = plm._num_process_recoveries
+
+    assert plm.recycle_lane_process(utilities) is True
+    assert plm._utilities_replacement_intentional is True
+
+    for _ in range(4):
+        plm._replace_all_utilities_process()
+
+    assert plm._process_map.num_utilities_processes() == 1  # a fresh lane came up
+    assert len(constructed) == 2
+    assert plm._utilities_replacement_intentional is False  # intentional flag consumed
+    assert plm._num_process_recoveries == recoveries_before  # not counted as a crash recovery
