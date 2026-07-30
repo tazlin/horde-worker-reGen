@@ -153,10 +153,40 @@ the ranker.
 Every seat transition (seated, demoted with its reason, rescue engaged/released, download pending/ready) is
 logged once at INFO and recorded as a `MODEL_POOL_*` action-ledger event, and the advertising lanes log their
 narrowing edges the same way the residency-bias duty cycle does. The supervisor status snapshot (protocol v19)
-carries an optional `model_pool` section: per-seat rows (model, source, state, dwell, empty pops, rescue
-countdown), the bench with cooldowns, the current lane, demand-snapshot age, and the auto-download budget
-spent. The TUI renders this as a "Model pool" section in the insights view; the section is hidden entirely
-while the pool is disabled, and older supervisors simply never see the optional field.
+carries an optional `model_pool` section: per-seat rows (model, source, state, dwell, last-fulfilled age,
+empty pops, rescue countdown), the bench with cooldowns, the current lane, demand-snapshot age, and the
+auto-download budget spent. The TUI renders this as a "Model pool" panel in the Insights view. With the pool
+enabled the panel shows the live seats, lanes, and bench; with the pool disabled it shows a one-line
+`Model pool: off` state and a note on what turning it on would trade, so the subsystem is discoverable rather
+than invisible. Older supervisors simply never send the optional field, and the panel still reads as off.
+
+## How to read the pool at a glance
+
+The Insights view and the config editor share one vocabulary, so what you configure maps directly onto what you
+watch:
+
+- **A seat** is one committed model the worker keeps ready to serve. The seats table lists each seat's model,
+  its **source** (`M`anual pin, `R`anker fill, re`S`cue), its **state** (serving, or `dl:` while it downloads a
+  model to swap in), how long it has held the seat (**dwell**), how long since it last served work
+  (**fulfilled**), its charged **empty** pops, and any **rescue** countdown. A seat with a fresh fulfilled age
+  is earning its place; a seat with a growing fulfilled age and rising empty pops is heading for the bench.
+- **The two lanes** are how the worker advertises while the pool holds seats. The **fixed** lane offers only the
+  seated models (work the card runs swap-free); the **free** lane offers everything else, so cold and rare-model
+  demand still reaches you. The status line shows which lane the most recent pool-routed pop used.
+- **Demotion and the bench** are what unseating looks like on screen: a model that stops earning its seat
+  (sustained empty pops against near-zero demand, or a stretch with no fulfillment) is demoted to the **bench**
+  with a cooldown, shown as its own line under the seats. A benched model does not immediately re-seat, so it
+  will not thrash between the seat and the bench.
+- **The throughput-versus-variety choice** is the whole point of the pool. Off, the worker serves your entire
+  model list evenly and earns the widest variety of jobs, but pays a model swap whenever a popped job needs a
+  model that is not loaded. On, it commits to a small ready set for more kudos per wall-second, at the cost of
+  serving fewer distinct models. Neither is "correct": it is an operator preference about what the card should
+  optimise for.
+- **When to leave the pool off:** if the worker is rarely idle and rarely swaps models (a small, evenly-demanded
+  model list already fits its inference processes), the pool has little to add. It earns its keep when the card
+  either idles waiting for rare-model demand or churns swapping between many models; the Insights advisors
+  surface both cases (a "serving many models with the pool off" nudge, and, once on, seat-health lines) so you
+  do not have to infer it from the raw numbers.
 
 ## See also
 

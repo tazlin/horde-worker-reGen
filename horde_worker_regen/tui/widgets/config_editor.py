@@ -40,11 +40,13 @@ from horde_worker_regen.tui.config_form import (
     coerce_value,
     current_value,
     describe_process_plan,
+    field_key_present,
     format_number,
     format_yaml_value,
     load_config,
     read_gpu_device_indices,
     save_config,
+    set_field_value,
     validate_identity_names,
 )
 from horde_worker_regen.tui.config_presets import BUILT_IN_PRESETS, ConfigPreset, PresetChange, diff_preset
@@ -849,8 +851,8 @@ class ConfigEditorView(Vertical):
             return True
 
         for field, value in coerced:
-            if self._key_present(field.key) or value != field.default():
-                self._data[field.key] = value
+            if field_key_present(field, self._data) or value != field.default():
+                set_field_value(field, self._data, value)
 
         try:
             save_config(self._data, self._config_path)
@@ -1052,13 +1054,6 @@ class ConfigEditorView(Vertical):
         details = "; ".join(message for _field, message in errors)
         location = f"  See the {tab_label} tab." if tab_label else ""
         self._set_status(f"Couldn't save: {details}.{location}", "red")
-
-    def _key_present(self, key: str) -> bool:
-        """Whether a key already exists in the loaded YAML mapping."""
-        try:
-            return key in self._data
-        except TypeError:
-            return False
 
     def _set_status(self, message: str, colour: str) -> None:
         """Update the status line with a coloured message."""

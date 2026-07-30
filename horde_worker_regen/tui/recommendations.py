@@ -11,7 +11,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSnapshot, WorkerStateSnapshot
+from horde_worker_regen.tui.formatters import human_duration
 
 
 class Severity(enum.IntEnum):
@@ -51,6 +52,17 @@ _LOW_DUTY_CYCLE = 50.0
 _HIGH_VRAM_FRACTION = 0.92
 _HIGH_FAULT_RATE = 0.10
 
+# Pool-off: how much recent model variety, over how many jobs, before suggesting the throughput-for-variety trade.
+_POOL_OFF_DISTINCT_MODELS = 4
+_POOL_OFF_MIN_JOBS = 8
+# Pool-on thresholds: a demand reading this old means the ranker is acting on a frozen signal; a seat with this
+# many charged empty pops (or seated this long with nothing served) is not earning its residency; a seat that
+# served within this window is actively earning.
+_POOL_STALE_DEMAND_SECONDS = 900.0
+_POOL_HIGH_EMPTY_POPS = 5
+_POOL_UNPRODUCTIVE_SEAT_SECONDS = 600.0
+_POOL_FRESH_FULFILLED_SECONDS = 180.0
+
 
 def analyze(snapshot: WorkerStateSnapshot) -> list[Recommendation]:
     """Return insights for a worker-state snapshot, most severe first."""
@@ -71,6 +83,7 @@ def analyze(snapshot: WorkerStateSnapshot) -> list[Recommendation]:
     _check_vram_pressure(snapshot, recommendations)
     _check_duty_cycle(snapshot, recommendations)
     _check_idle(snapshot, recommendations)
+    _check_model_pool(snapshot, recommendations)
 
     if config.extra_slow_worker and config.max_batch > 1:
         recommendations.append(
@@ -156,5 +169,129 @@ def _check_idle(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> Non
                 "Frequently idle (low demand)",
                 f"~{minutes:.0f} minutes without jobs this session. Offering more models or raising "
                 "max_power can increase the jobs you receive.",
+            ),
+        )
+
+
+def _check_model_pool(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> None:
+    """Route to the pool-off or pool-on advisors depending on whether the fixed model pool is active."""
+    pool = snapshot.model_pool
+    if pool is None or not pool.enabled:
+        _check_pool_off_diversity(snapshot, out)
+        return
+    _check_pool_on(snapshot, pool, out)
+
+
+def _check_pool_off_diversity(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> None:
+    """With the pool off, offer (not push) the throughput-for-variety trade when the worker serves many models.
+
+    Serving many distinct models is a legitimate operator choice, so this is framed as a preference: enabling the
+    pool earns more kudos/hr on a committed set, at the cost of that variety.
+    """
+    image_jobs = [job for job in snapshot.recent_jobs if not job.is_alchemy]
+    distinct_models = {job.model_name for job in image_jobs if job.model_name}
+    if len(image_jobs) >= _POOL_OFF_MIN_JOBS and len(distinct_models) >= _POOL_OFF_DISTINCT_MODELS:
+        out.append(
+            Recommendation(
+                Severity.SUGGESTION,
+                f"Serving {len(distinct_models)} models with the pool off",
+                "Recent work spanned many distinct models while the fixed model pool is off. If the card spends "
+                "time swapping between them, enabling the model pool (or Max throughput mode) commits it to a "
+                "small, ready seat set for more kudos/hr, trading away some model variety. This is a genuine "
+                "preference: leave the pool off if serving that variety is the point.",
+            ),
+        )
+
+
+def _check_pool_on(
+    snapshot: WorkerStateSnapshot,
+    pool: ModelPoolSnapshot,
+    out: list[Recommendation],
+) -> None:
+    """Read the live seats and demand age, flagging what to review and noting a pool that is clearly earning."""
+    before = len(out)
+    _check_pool_demand_staleness(pool, out)
+    _check_pool_stuck_download(pool, out)
+    _check_pool_unproductive_seats(pool, out)
+    if len(out) == before:
+        _note_pool_earning(pool, out)
+
+
+def _check_pool_demand_staleness(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
+    """Flag a demand reading old enough that the ranker is ranking against a frozen signal."""
+    age = pool.demand_age_seconds
+    if age is not None and age >= _POOL_STALE_DEMAND_SECONDS:
+        out.append(
+            Recommendation(
+                Severity.WARNING,
+                "Model pool demand reading is stale",
+                f"The pool's demand ranking last refreshed {human_duration(age)} ago, so the ranker is flying "
+                "blind and has frozen rotations until a fresh reading arrives. Check the worker's connectivity to "
+                "the horde demand endpoint; while the signal is stale it holds the current seats rather than "
+                "re-ranking them.",
+            ),
+        )
+
+
+def _check_pool_stuck_download(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
+    """Explain a seat stuck downloading when the auto-download budget for the session is spent."""
+    pending = [seat.pending_model for seat in pool.seats if seat.pending_model is not None]
+    if not pending or pool.download_budget_gb <= 0:
+        return
+    budget_bytes = pool.download_budget_gb * 1024**3
+    if pool.download_bytes_charged >= budget_bytes:
+        names = ", ".join(pending)
+        out.append(
+            Recommendation(
+                Severity.WARNING,
+                "Model pool download budget exhausted",
+                f"A seat is waiting on a download ({names}) but the pool has spent its "
+                f"{pool.download_budget_gb:.0f} GB session auto-download budget, so the pending seat cannot "
+                "resolve. Raise model_pool.download_budget_gb to let it finish, or pre-download the model.",
+            ),
+        )
+
+
+def _check_pool_unproductive_seats(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
+    """Flag seats that keep taking empty fixed-lane pops or have served nothing since seating."""
+    flagged: list[str] = []
+    for seat in pool.seats:
+        if seat.model is None or seat.pending_model is not None:
+            continue
+        seated_long_without_work = (
+            seat.last_fulfilled_age_seconds is None and (seat.dwell_seconds or 0.0) >= _POOL_UNPRODUCTIVE_SEAT_SECONDS
+        )
+        if seated_long_without_work or seat.empty_pops >= _POOL_HIGH_EMPTY_POPS:
+            flagged.append(seat.model)
+    if flagged:
+        out.append(
+            Recommendation(
+                Severity.SUGGESTION,
+                "Model pool seats are not earning",
+                f"Seat(s) {', '.join(flagged)} keep taking fixed-lane pops that come back empty (or have served "
+                "nothing since seating), which is what charges a seat toward demotion. If it persists, the horde "
+                "has little demand for those models on this card: review your pins, or let the demand ranker "
+                "rotate them out (model_pool.ranker_enabled) so the seats go to models with live demand.",
+            ),
+        )
+
+
+def _note_pool_earning(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
+    """Note a pool whose seats are serving work swap-free, so a healthy pool reads as working, not silent."""
+    earning = [
+        seat
+        for seat in pool.seats
+        if seat.model is not None
+        and seat.pending_model is None
+        and seat.last_fulfilled_age_seconds is not None
+        and seat.last_fulfilled_age_seconds <= _POOL_FRESH_FULFILLED_SECONDS
+    ]
+    if earning:
+        out.append(
+            Recommendation(
+                Severity.INFO,
+                "Model pool is earning",
+                f"{len(earning)} seat(s) served work swap-free within the last few minutes. The pool is holding a "
+                "set the horde is feeding; no action needed.",
             ),
         )

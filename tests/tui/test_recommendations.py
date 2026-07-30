@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    ModelPoolSeatRow,
+    ModelPoolSnapshot,
     ProcessSnapshot,
+    RecentJobRecord,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -68,3 +71,79 @@ def test_low_duty_cycle_with_work_suggests_tuning() -> None:
         ),
     )
     assert any("duty cycle" in item.title.lower() for item in result)
+
+
+def _jobs(models: list[str]) -> list[RecentJobRecord]:
+    return [RecentJobRecord(job_id=f"j{index}", model_name=model) for index, model in enumerate(models)]
+
+
+def _seat(model: str, **overrides: object) -> ModelPoolSeatRow:
+    base: dict[str, object] = {"model": model, "source": "RANKER", "state": "ACTIVE"}
+    base.update(overrides)
+    return ModelPoolSeatRow(**base)  # type: ignore[arg-type]
+
+
+def test_pool_off_many_models_offers_the_trade() -> None:
+    """With the pool off and many distinct models served recently, a variety-vs-throughput nudge appears."""
+    result = analyze(_snapshot(recent_jobs=_jobs(["A", "B", "C", "D", "E", "F", "G", "H"])))
+    hit = next((item for item in result if "pool off" in item.title.lower()), None)
+    assert hit is not None
+    assert hit.severity is Severity.SUGGESTION
+    # Framed as a genuine preference, not a directive.
+    assert "variety" in hit.detail.lower()
+
+
+def test_pool_off_few_models_stays_quiet() -> None:
+    """Serving only a couple of models with the pool off does not trigger the pool nudge."""
+    result = analyze(_snapshot(recent_jobs=_jobs(["A", "B", "A", "B", "A", "B", "A", "B"])))
+    assert not any("pool off" in item.title.lower() for item in result)
+
+
+def test_pool_on_stale_demand_warns() -> None:
+    """A pool whose demand reading is far too old warns that the ranker is flying blind."""
+    pool = ModelPoolSnapshot(enabled=True, seats=[_seat("A")], demand_age_seconds=1200.0)
+    result = analyze(_snapshot(model_pool=pool))
+    assert any(item.severity is Severity.WARNING and "stale" in item.title.lower() for item in result)
+
+
+def test_pool_on_unproductive_seat_suggests_review() -> None:
+    """A seat taking many empty pops is flagged for rotation/ranker review."""
+    pool = ModelPoolSnapshot(enabled=True, seats=[_seat("A", empty_pops=6)], demand_age_seconds=30.0)
+    result = analyze(_snapshot(model_pool=pool))
+    assert any("not earning" in item.title.lower() for item in result)
+
+
+def test_pool_on_exhausted_download_budget_explains_stuck_seat() -> None:
+    """A pending-download seat with the budget spent explains why the seat cannot resolve."""
+    pool = ModelPoolSnapshot(
+        enabled=True,
+        seats=[_seat("A", state="PENDING_DOWNLOAD", pending_model="Flux.1-dev")],
+        demand_age_seconds=30.0,
+        download_budget_gb=10.0,
+        download_bytes_charged=10 * 1024**3,
+    )
+    result = analyze(_snapshot(model_pool=pool))
+    assert any("budget" in item.title.lower() for item in result)
+
+
+def test_pool_on_earning_seats_are_noted_positively() -> None:
+    """A pool whose seats served work recently and cleanly gets a positive 'earning' line."""
+    pool = ModelPoolSnapshot(
+        enabled=True,
+        seats=[_seat("A", last_fulfilled_age_seconds=20.0, dwell_seconds=300.0)],
+        demand_age_seconds=30.0,
+    )
+    result = analyze(_snapshot(model_pool=pool))
+    assert any("earning" in item.title.lower() for item in result)
+
+
+def test_pool_on_earning_line_suppressed_when_a_pool_issue_fires() -> None:
+    """The positive line is withheld while a pool problem (here, stale demand) is outstanding."""
+    pool = ModelPoolSnapshot(
+        enabled=True,
+        seats=[_seat("A", last_fulfilled_age_seconds=20.0, dwell_seconds=300.0)],
+        demand_age_seconds=1200.0,
+    )
+    result = analyze(_snapshot(model_pool=pool))
+    assert not any("earning" in item.title.lower() for item in result)
+    assert any("stale" in item.title.lower() for item in result)

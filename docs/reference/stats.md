@@ -66,6 +66,24 @@ So a sustained hold reads as one opening record, occasional heartbeats, and one 
 `verdict` is one of `admit`, `defer`, `deny`, `withhold`, `freed`, or `no_op` (the last three of which are
 *resolving*).
 
+## Stats tab: the Model pool section
+
+When the [fixed model pool](../explanation/model_pool.md) is enabled, the dashboard's **Stats** tab grows a
+**Model pool** section (it is absent entirely when the pool is off, so a worker that does not run the pool
+sees an unchanged tab). It reports the pool's advertising throughput split by lane:
+
+- **Seats** and **Bench**: how many seats currently hold a model (of the total) and how many models are
+  cooling down on the bench.
+- **Current lane**: the advertising lane the most recent pool-routed pop used (`FIXED` for the seated-model
+  offer, `FREE` for the wider offer).
+- **Fixed lane** and **Free lane**: each lane's session-cumulative `fulfilled / pops` with its hit rate (the
+  share of that lane's pops that returned a job). A lane with no pops yet shows `-`. A low fixed-lane hit rate
+  points to seated models the horde is not feeding; a low free-lane rate points to a thin wider offer.
+
+In the same tab, the **By model totals** table marks any model that currently holds a pool seat with a `◆`
+suffix (the panel subtitle carries the legend), so a seated model's jobs, megapixelsteps, and latency read in
+place rather than in a duplicate per-seat table.
+
 ## See also
 
 - [Logs](logs.md): the human-readable side of the same run.

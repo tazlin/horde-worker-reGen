@@ -14,6 +14,7 @@ from textual.message import Message
 from textual.widgets import Button, Static
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    ModelPoolSnapshot,
     PopGovernorsSnapshot,
     StatsRollupRow,
     WorkerStateSnapshot,
@@ -68,6 +69,7 @@ class StatsView(Vertical):
         with VerticalScroll(id="stats-body"):
             yield Static(id="stats-headlines")
             yield Static(id="stats-governors")
+            yield Static(id="stats-model-pool")
             yield Static(id="stats-export")
             yield Static(id="stats-by-model")
             yield Static(id="stats-by-baseline")
@@ -114,9 +116,18 @@ class StatsView(Vertical):
         governors_static.display = has_governors
         if has_governors:
             governors_static.update(self._render_governors(snapshot.pop_governors))
+        pool = snapshot.model_pool
+        pool_static = self.query_one("#stats-model-pool", Static)
+        if pool is not None and pool.enabled:
+            pool_static.display = True
+            pool_static.update(self._render_model_pool(pool))
+            seated_models = frozenset(seat.model for seat in pool.seats if seat.model is not None)
+        else:
+            pool_static.display = False
+            seated_models = frozenset()
         self.query_one("#stats-export", Static).update(self._render_export(snapshot))
         self.query_one("#stats-by-model", Static).update(
-            self._render_rollups("By model totals", snapshot.stats_model_rollups)
+            self._render_rollups("By model totals", snapshot.stats_model_rollups, seated_models=seated_models)
         )
         self.query_one("#stats-by-baseline", Static).update(
             self._render_rollups("By baseline totals", snapshot.stats_baseline_rollups),
@@ -218,7 +229,43 @@ class StatsView(Vertical):
         return Panel(table, title="Pop governors", title_align="left", border_style="grey37", padding=(0, 1))
 
     @staticmethod
-    def _render_rollups(title: str, rows: list[StatsRollupRow]) -> Panel:
+    def _render_model_pool(pool: ModelPoolSnapshot) -> Panel:
+        """Render the fixed model pool's lane throughput: per-lane pops, fulfillment rate, seats, and bench.
+
+        The fixed and free lanes are shown apart (fulfilled over pops, plus the hit rate) so an operator can
+        see whether the seated-model lane and the wider free lane are each earning the work they advertise for.
+        """
+        grid = Table.grid(padding=(0, 3))
+        grid.add_column(style="bold cyan", no_wrap=True)
+        grid.add_column(no_wrap=True)
+        active_seats = sum(1 for seat in pool.seats if seat.model is not None)
+        grid.add_row("Seats", f"{active_seats} active / {len(pool.seats)} total")
+        grid.add_row("Bench", str(len(pool.bench)))
+        grid.add_row("Current lane", pool.current_lane or "-")
+        grid.add_row("Fixed lane", StatsView._lane_throughput(pool.fixed_fulfilled, pool.fixed_pops))
+        grid.add_row("Free lane", StatsView._lane_throughput(pool.free_fulfilled, pool.free_pops))
+        return Panel(grid, title="Model pool", title_align="left", border_style="grey37", padding=(0, 1))
+
+    @staticmethod
+    def _lane_throughput(fulfilled: int, pops: int) -> str:
+        """Format a lane's fulfilled-over-pops throughput with its hit rate, or a dash before any pop."""
+        if pops <= 0:
+            return "-"
+        return f"{fulfilled:,} / {pops:,} fulfilled ({fulfilled / pops * 100:.0f}%)"
+
+    @staticmethod
+    def _render_rollups(
+        title: str,
+        rows: list[StatsRollupRow],
+        *,
+        seated_models: frozenset[str] = frozenset(),
+    ) -> Panel:
+        """Render a by-model or by-baseline totals table.
+
+        On the by-model table, a model that currently holds a pool seat is marked with a ``◆`` suffix (a
+        legend rides the panel subtitle) so an operator reads a seated model's jobs/megapixelsteps/latency in
+        place, without a duplicate per-seat table.
+        """
         table = Table(expand=True, border_style="grey37", header_style="bold")
         is_model_table = title == "By model totals"
         first = "Model" if is_model_table else "Baseline"
@@ -230,12 +277,22 @@ class StatsView(Vertical):
         table.add_column("Sampling", justify="right")
         table.add_column("E2E", justify="right")
         table.add_column("Batch>1", justify="right")
+        any_seated_shown = False
         if not rows:
             empty = ["no finalized image jobs yet"] + ([""] if is_model_table else []) + ["", "", "", "", ""]
             table.add_row(*empty)
         else:
             for row in rows:
-                cells = [shorten(row.model, 32) if is_model_table else short_baseline(row.baseline)]
+                seated = is_model_table and row.model is not None and row.model in seated_models
+                any_seated_shown = any_seated_shown or seated
+                first_cell: str | Text
+                if not is_model_table:
+                    first_cell = short_baseline(row.baseline)
+                elif seated:
+                    first_cell = Text.assemble((shorten(row.model, 32), ""), (" ◆", "cyan"))
+                else:
+                    first_cell = shorten(row.model, 32)
+                cells: list[str | Text] = [first_cell]
                 if is_model_table:
                     cells.append(short_baseline(row.baseline))
                 cells.extend(
@@ -248,7 +305,16 @@ class StatsView(Vertical):
                     ],
                 )
                 table.add_row(*cells)
-        return Panel(table, title=title, title_align="left", border_style="grey37", padding=(0, 1))
+        subtitle = "◆ holds a model-pool seat" if any_seated_shown else None
+        return Panel(
+            table,
+            title=title,
+            title_align="left",
+            subtitle=subtitle,
+            subtitle_align="right",
+            border_style="grey37",
+            padding=(0, 1),
+        )
 
     @staticmethod
     def _render_form_rollups(rows: list[StatsRollupRow]) -> Panel:

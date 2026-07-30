@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     OrchestrationIntentSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
+    ResidentComponentEntry,
     SupervisorChannel,
     SupervisorCommand,
     SystemMemorySnapshot,
@@ -204,7 +205,18 @@ class _MockProcess:
             vram_used_high_water_mb=self.vram_high_water_mb,
             ram_used_high_water_mb=self.ram_bytes // 1024**2,
             num_jobs_completed=self.num_jobs_completed,
+            resident_components=self._mock_resident_components(),
         )
+
+    def _mock_resident_components(self) -> list[ResidentComponentEntry]:
+        """Return a synthetic component-cache residency for a loaded slot, or empty when it holds no model."""
+        if not self.is_busy:
+            return []
+        return [
+            ResidentComponentEntry(kind="checkpoint", identity=self.model, approx_ram_mb=2600.0),
+            ResidentComponentEntry(kind="vae", identity=f"{self.model}::vae", approx_ram_mb=160.0),
+            ResidentComponentEntry(kind="clip", identity=f"{self.model}::clip", approx_ram_mb=1200.0),
+        ]
 
 
 class _MockSafetyProcess:

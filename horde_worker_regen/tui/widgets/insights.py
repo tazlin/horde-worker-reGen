@@ -42,13 +42,32 @@ class InsightsView(VerticalScroll):
         self._update_model_pool(snapshot.model_pool)
 
     def _update_model_pool(self, pool: ModelPoolSnapshot | None) -> None:
-        """Render the model-pool panel, or hide it entirely when the pool is disabled or absent."""
+        """Render the model-pool panel, showing a one-line off-state with guidance when the pool is disabled."""
         panel = self.query_one("#insights-model-pool", Static)
-        if pool is None or not pool.enabled:
-            panel.display = False
-            return
         panel.display = True
+        if pool is None or not pool.enabled:
+            panel.update(self._render_model_pool_disabled())
+            return
         panel.update(self._render_model_pool(pool))
+
+    @staticmethod
+    def _render_model_pool_disabled() -> Panel:
+        """Render the pool panel's off-state: a plain 'off' line plus what turning it on would trade.
+
+        Kept visible (rather than hidden) so an operator who has never seen the pool learns it exists and can
+        weigh the throughput-versus-variety choice from the same place the live seats would otherwise appear.
+        """
+        body = Text.assemble(
+            ("Model pool: ", "grey70"),
+            ("off", "bold grey62"),
+            (
+                "  ·  the worker serves your whole model list evenly, for the widest variety of jobs. Enabling "
+                "the pool (or Max throughput mode) commits it to a small, ready seat set: fewer model swaps and "
+                "higher kudos/hr, at the cost of serving less model variety.",
+                "grey62",
+            ),
+        )
+        return Panel(body, title="Model pool", title_align="left", border_style="grey37")
 
     def _render_recommendations(self, snapshot: WorkerStateSnapshot) -> Panel:
         """Render the recommendation list as a bordered panel."""
@@ -114,11 +133,16 @@ class InsightsView(VerticalScroll):
         return Text("  ·  ").join(parts)
 
     def _render_pool_seats(self, pool: ModelPoolSnapshot) -> Table:
-        """Render the pool's seats as a compact table (model, source glyph, state, dwell, empty pops, rescue)."""
+        """Render the pool's seats as a compact table (model, source, state, dwell, fulfilled age, empty, rescue).
+
+        The fulfilled-age column is how long since each seat last served work: a fresh age is a seat earning
+        its place, while a growing age alongside empty pops is what pushes a seat toward demotion.
+        """
         table = Table.grid(padding=(0, 2))
         table.add_column(justify="left")
         table.add_column(justify="center")
         table.add_column(justify="left")
+        table.add_column(justify="right")
         table.add_column(justify="right")
         table.add_column(justify="right")
         table.add_column(justify="right")
@@ -127,6 +151,7 @@ class InsightsView(VerticalScroll):
             Text("Src", style="bold grey70"),
             Text("State", style="bold grey70"),
             Text("Dwell", style="bold grey70"),
+            Text("Fulfilled", style="bold grey70"),
             Text("Empty", style="bold grey70"),
             Text("Rescue", style="bold grey70"),
         )
@@ -134,6 +159,9 @@ class InsightsView(VerticalScroll):
             model = seat.model if seat.model is not None else "-"
             state = f"dl:{seat.pending_model}" if seat.pending_model is not None else str(seat.state)
             dwell = human_duration(seat.dwell_seconds) if seat.dwell_seconds is not None else "-"
+            fulfilled = (
+                human_duration(seat.last_fulfilled_age_seconds) if seat.last_fulfilled_age_seconds is not None else "-"
+            )
             rescue = (
                 human_duration(seat.rescue_expires_in_seconds) if seat.rescue_expires_in_seconds is not None else "-"
             )
@@ -142,6 +170,7 @@ class InsightsView(VerticalScroll):
                 self._source_glyph(seat.source),
                 Text(state, style="grey70"),
                 Text(dwell),
+                Text(fulfilled),
                 Text(str(seat.empty_pops)),
                 Text(rescue),
             )

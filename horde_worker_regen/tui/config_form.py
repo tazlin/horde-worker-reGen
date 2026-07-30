@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from collections.abc import Sequence
+from collections.abc import MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +90,8 @@ class ConfigField:
     requires_restart: bool = False
     secret: bool = False
     minimum: float | None = None
+    exclusive_minimum: bool = False
+    """Whether ``minimum`` is an excluded lower bound instead of an allowed value."""
     maximum: float | None = None
     unit: str = ""
     choices: tuple[str, ...] = ()
@@ -117,6 +119,15 @@ class ConfigField:
     """Category used by preset previews when this field is changed."""
     yaml_only_reason: str = ""
     """Why a meaningful config field remains YAML-only or hidden."""
+    yaml_parent: str = ""
+    """When set, the field's value lives nested under ``data[yaml_parent][leaf]`` instead of at ``data[key]``.
+
+    The leaf name is derived from ``key`` by stripping the ``{yaml_parent}_`` prefix, so a field with
+    ``key='model_pool_seats'`` and ``yaml_parent='model_pool'`` round-trips to ``model_pool.seats`` in the
+    YAML while keeping a flat, DOM-safe widget id (a dotted key cannot be a Textual widget id). This lets the
+    flat editor present a nested Pydantic sub-model's scalars (the ``model_pool`` block) without a separate
+    nested-widget path.
+    """
 
     def default(self) -> Any:  # noqa: ANN401 - heterogeneous defaults by kind
         """The value used when the key is absent from the file."""
@@ -149,6 +160,7 @@ SECTIONS = (
     "Features",
     "LoRA",
     "Models",
+    "Model pool",
     "Model downloads",
     "Alchemist",
     "Logs",
@@ -169,6 +181,7 @@ SECTIONS = (
 CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Essentials", ("Connection", "Identity", "Roles")),
     ("Models", ("Models", "Workload policy")),
+    ("Model pool", ("Model pool",)),
     ("Throughput", ("Throughput", "Memory & performance")),
     ("Content", ("Content & safety",)),
     ("Features", ("Features",)),
@@ -208,6 +221,13 @@ SECTION_GUIDANCE: dict[str, str] = {
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
     "Workload policy": "These switches shape the model set produced by the load/skip rules. Presets may replace "
     "the model list; review the preset diff before saving.",
+    "Model pool": "The fixed model pool trades model variety for kudos/hr: it commits the worker to a small set "
+    "of seated models it keeps ready, so the horde returns work it can run without a per-job model swap. Leave it "
+    "off (the default) to serve your whole model list evenly, which earns the widest variety of jobs; turn it on "
+    "when you would rather the card stay busy on a committed set than idle waiting for rarer models. These fields "
+    "match the Insights and Overview 'Model pool' panels (seats, bench, the fixed and free lanes, rotation, "
+    "rescue, download budget); flip Max throughput mode for a one-switch ranker-fed pool with an auto-download "
+    "budget, then adjust the individual knobs below where you want tighter control.",
     "Model downloads": "Controls background download behaviour. The Downloads tab provides a live pause/resume "
     "toggle; downloads_paused here sets the default at worker startup.",
     "LoRA": "Offering LoRA jobs downloads resources on demand and requires a CivitAI API token. Without a token, "
@@ -574,6 +594,150 @@ CONFIG_FIELDS: list[ConfigField] = [
         risk_level="advanced",
         explicit_default=[],
     ),
+    # Model pool
+    ConfigField(
+        "max_throughput_mode",
+        "Max throughput mode",
+        FieldKind.BOOL,
+        "Model pool",
+        "One-switch preset for kudos/hr over variety: turns the fixed model pool on with its demand ranker and a "
+        "50 GB auto-download budget, so the worker serves a ranker-fed, slowly-rotating seat set and may fetch a "
+        "strong model it does not yet hold. Applied only where you left the individual model_pool fields below at "
+        "their defaults, so an explicit value here always wins.",
+    ),
+    ConfigField(
+        "model_pool_enabled",
+        "Enable model pool",
+        FieldKind.BOOL,
+        "Model pool",
+        "Commit the worker to a bounded set of seats, each holding one model it keeps ready, and shape pops so the "
+        "horde returns work for the seated models (swap-free). A free lane still reaches the models you are not "
+        "seating, so the pool biases what you hold without hiding everything else. Off by default: model selection "
+        "is unchanged.",
+        yaml_parent="model_pool",
+    ),
+    ConfigField(
+        "model_pool_seats",
+        "Seats to hold",
+        FieldKind.INT,
+        "Model pool",
+        "How many seated models to hold. 0 (the default) means auto: one seat per inference process. Seating more "
+        "models than you have inference processes weakens the swap-free promise (not every seat can keep a home "
+        "process), so keep this at or below your inference-process count unless you want that trade.",
+        minimum=0,
+        maximum=64,
+        yaml_parent="model_pool",
+        explicit_default=0,
+    ),
+    ConfigField(
+        "model_pool_ranker_enabled",
+        "Enable demand ranker",
+        FieldKind.BOOL,
+        "Model pool",
+        "Let the demand ranker fill the seats your pins do not claim, choosing the highest live-demand models this "
+        "card runs quickly. On by default; turn it off to run a pins-only pool.",
+        yaml_parent="model_pool",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "model_pool_rotation_minutes",
+        "Rotation window",
+        FieldKind.FLOAT,
+        "Model pool",
+        "Minutes a seat serves before it becomes eligible for a timed re-contest against a stronger candidate. A "
+        "pin's affinity extends its own window on top of this. Lower rotates the seat set faster (more variety, "
+        "more swaps); higher holds a committed set longer.",
+        minimum=0.0,
+        exclusive_minimum=True,
+        unit="min",
+        yaml_parent="model_pool",
+        explicit_default=60.0,
+    ),
+    ConfigField(
+        "model_pool_min_dwell_minutes",
+        "Minimum dwell",
+        FieldKind.FLOAT,
+        "Model pool",
+        "Minutes a freshly-seated model is held before any rotation or demotion may unseat it, so a seat is never "
+        "churned before it has had a fair chance to earn its place.",
+        minimum=0.0,
+        unit="min",
+        yaml_parent="model_pool",
+        explicit_default=10.0,
+    ),
+    ConfigField(
+        "model_pool_rescue_enabled",
+        "Enable rescue seat",
+        FieldKind.BOOL,
+        "Model pool",
+        "Donate one seat, time-boxed, to the single most-starved model (a very high requester wait) so otherwise-"
+        "impossible jobs still get done. Off by default; never displaces a manual pin and engages at most one seat.",
+        yaml_parent="model_pool",
+    ),
+    ConfigField(
+        "model_pool_rescue_eta_seconds",
+        "Rescue starvation wait",
+        FieldKind.FLOAT,
+        "Model pool",
+        "The requester wait (seconds) at or above which a model counts as starved enough to warrant the borrowed "
+        "rescue seat. Only consulted when rescue is enabled.",
+        minimum=0.0,
+        exclusive_minimum=True,
+        unit="s",
+        yaml_parent="model_pool",
+        explicit_default=10000.0,
+    ),
+    ConfigField(
+        "model_pool_rescue_window_minutes",
+        "Rescue seat window",
+        FieldKind.FLOAT,
+        "Model pool",
+        "Minutes a rescued model holds its borrowed seat before it is released back to the ranker. Only consulted "
+        "when rescue is enabled.",
+        minimum=0.0,
+        exclusive_minimum=True,
+        unit="min",
+        yaml_parent="model_pool",
+        explicit_default=15.0,
+    ),
+    ConfigField(
+        "model_pool_demand_poll_seconds",
+        "Demand poll interval",
+        FieldKind.FLOAT,
+        "Model pool",
+        "How often (seconds) the pool refreshes its live demand ranking. Floored at 60 to keep the poll gentle on "
+        "the horde's demand endpoint; a stale reading freezes rotations rather than guessing.",
+        minimum=60.0,
+        unit="s",
+        yaml_parent="model_pool",
+        explicit_default=90.0,
+    ),
+    ConfigField(
+        "model_pool_download_budget_gb",
+        "Auto-download budget",
+        FieldKind.FLOAT,
+        "Model pool",
+        "Disk (GB) the pool may spend auto-downloading a high-demand model it does not yet have, so the ranker can "
+        "seat a strong candidate you have not pre-fetched. 0 (the default) never auto-downloads: the pool only "
+        "seats models already on disk. Exhausting this budget is what leaves a seat stuck downloading.",
+        minimum=0.0,
+        unit="GB",
+        yaml_parent="model_pool",
+        explicit_default=0.0,
+    ),
+    ConfigField(
+        "model_pool_pinned",
+        "Pinned models",
+        FieldKind.YAML,
+        "Model pool",
+        "Models you pin into seats yourself, as a YAML list of {name, affinity} entries. Affinity is a bias, not a "
+        "lock (higher fills its seat earlier and bolsters it in a re-contest, but a stronger candidate can still "
+        "take the seat). Edit this list directly in bridgeData.yaml.",
+        yaml_parent="model_pool",
+        hidden=True,
+        yaml_only_reason="Structured list of {name, affinity} entries; edited directly in bridgeData.yaml rather "
+        "than through a scalar widget.",
+    ),
     # Model downloads
     ConfigField(
         "cache_home",
@@ -846,8 +1010,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Model stickiness",
         FieldKind.FLOAT,
         "Retry & scheduling",
-        "Probability (0.0–1.0) that the currently-loaded model is favored when popping a job. "
-        "Higher values reduce model switches at the cost of throughput diversity.",
+        "Deprecated: superseded by the model pool. This was a per-pop probability (0.0 to 1.0) of favoring the "
+        "currently-loaded model, trading job variety for fewer swaps. The fixed model pool delivers that "
+        "standing-residency intent as a committed seat set instead of a per-pop gamble. A positive value here "
+        "with the pool off is mapped onto a modest pool for you (ranker on, a 30-minute rotation); with the pool "
+        "enabled it is ignored entirely. Prefer the Model pool section and leave this at 0.",
         minimum=0.0,
         maximum=1.0,
     ),
@@ -1397,7 +1564,8 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Dynamic models",
         FieldKind.BOOL,
         "Models",
-        "Let this card swap in popular models on demand beyond its configured list.",
+        "Deprecated and inert: this flag has no effect in reGen. To serve a demand-following model set, enable "
+        "the fixed model pool (Model pool section) with its demand ranker instead.",
     ),
     # -- Feature flags --
     ConfigField("allow_lora", "Offer LoRA jobs", FieldKind.BOOL, "Features", "Accept LoRA jobs on this card."),
@@ -1597,8 +1765,11 @@ def coerce_value(field: ConfigField, raw: object) -> object:
         except ValueError as error:
             noun = "a whole number" if is_int else "a number"
             raise ValueError(f"{field.label} must be {noun}") from error
-        if field.minimum is not None and value < field.minimum:
-            raise ValueError(f"{field.label} must be at least {format_number(field.minimum)}")
+        below_minimum = field.minimum is not None and value < field.minimum
+        at_excluded_minimum = field.minimum is not None and field.exclusive_minimum and value == field.minimum
+        if below_minimum or at_excluded_minimum:
+            qualifier = "greater than" if field.exclusive_minimum else "at least"
+            raise ValueError(f"{field.label} must be {qualifier} {format_number(field.minimum)}")
         if field.maximum is not None and value > field.maximum:
             raise ValueError(f"{field.label} must be at most {format_number(field.maximum)}")
         # Write a clean integer to the YAML when a float field holds a whole number (2, not 2.0); the
@@ -1685,12 +1856,63 @@ def validate_identity_names(
     return errors
 
 
+def field_yaml_path(field: ConfigField) -> tuple[str, ...]:
+    """The YAML key path a field reads from and writes to (a single key, or a nested parent/leaf pair)."""
+    if not field.yaml_parent:
+        return (field.key,)
+    leaf = field.key.removeprefix(field.yaml_parent + "_") or field.key
+    return (field.yaml_parent, leaf)
+
+
+def _read_yaml_path(data: Any, path: tuple[str, ...]) -> Any:  # noqa: ANN401 - ruamel CommentedMap
+    """Follow a key path through nested mappings, returning None if any hop is missing or not a mapping."""
+    node = data
+    for part in path:
+        try:
+            node = node.get(part)
+        except AttributeError:
+            return None
+        if node is None:
+            return None
+    return node
+
+
+def field_key_present(field: ConfigField, data: Any) -> bool:  # noqa: ANN401 - ruamel CommentedMap
+    """Whether a field's key (or its nested leaf under an existing parent) already exists in the YAML."""
+    node = data
+    for part in field_yaml_path(field):
+        if not isinstance(node, MutableMapping):
+            return False
+        try:
+            if part not in node:
+                return False
+            node = node[part]
+        except (KeyError, TypeError):
+            return False
+    return True
+
+
+def set_field_value(field: ConfigField, data: Any, value: object) -> None:  # noqa: ANN401 - ruamel CommentedMap
+    """Write a field's value into the YAML at its path, creating the parent mapping for a nested field.
+
+    A nested parent that already exists is mutated in place so its comments and sibling keys survive; an
+    absent parent is created as a fresh mapping holding only this leaf.
+    """
+    path = field_yaml_path(field)
+    if len(path) == 1:
+        data[path[0]] = value
+        return
+    parent, leaf = path
+    node = data.get(parent)
+    if not isinstance(node, MutableMapping):
+        node = {}
+        data[parent] = node
+    node[leaf] = value
+
+
 def current_value(field: ConfigField, data: Any) -> Any:  # noqa: ANN401 - kind-dependent
     """Read a field's current value from loaded YAML data, falling back to its default."""
-    try:
-        value = data.get(field.key)
-    except AttributeError:
-        value = None
+    value = _read_yaml_path(data, field_yaml_path(field))
     if value is None:
         return field.default()
     if field.kind in (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI) and not isinstance(

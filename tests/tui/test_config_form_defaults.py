@@ -15,12 +15,13 @@ from typing import Any
 
 from pydantic_core import PydanticUndefined
 
-from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.bridge_data.data_model import ModelPoolConfig, reGenBridgeData
 from horde_worker_regen.tui.config_form import (
     ALCHEMIST_NAME_RESERVED_DEFAULT,
     CONFIG_FIELDS,
     DREAMER_NAME_RESERVED_DEFAULT,
     FieldKind,
+    field_yaml_path,
     validate_identity_names,
 )
 
@@ -79,6 +80,28 @@ def test_editor_defaults_match_worker_defaults() -> None:
             )
 
     assert not mismatches, "config editor defaults drift from reGenBridgeData:\n" + "\n".join(mismatches)
+
+
+def test_model_pool_editor_defaults_match_model() -> None:
+    """Each nested model_pool editor field shows the exact default its ModelPoolConfig field carries.
+
+    The general parity guard above only covers top-level model fields, so the nested pool scalars (which live
+    under ``model_pool`` in the YAML) need their own check against ``ModelPoolConfig`` to catch drift.
+    """
+    pool_defaults = {name: field.get_default() for name, field in ModelPoolConfig.model_fields.items()}
+    skip_kinds = (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI, FieldKind.YAML)
+    mismatches: list[str] = []
+
+    for field in CONFIG_FIELDS:
+        if field.yaml_parent != "model_pool" or field.kind in skip_kinds:
+            continue
+        leaf = field_yaml_path(field)[-1]
+        expected = pool_defaults[leaf]
+        actual = field.default()
+        if actual != expected:
+            mismatches.append(f"model_pool.{leaf}: editor shows {actual!r} but model defaults to {expected!r}")
+
+    assert not mismatches, "model pool editor defaults drift from ModelPoolConfig:\n" + "\n".join(mismatches)
 
 
 def test_reserved_name_constants_match_model_defaults() -> None:

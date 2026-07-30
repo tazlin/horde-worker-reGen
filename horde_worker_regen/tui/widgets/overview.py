@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardSnapshot,
     FeatureReadinessSummary,
     JobQueueEntry,
+    ModelPoolSnapshot,
     PopGovernorsSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
@@ -97,6 +98,14 @@ _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SERVING_PULSE = ("dark_green", "green", "green3", "bright_green", "green3", "green")
+
+_POOL_SOURCE_GLYPHS: dict[str, tuple[str, str]] = {
+    "MANUAL": ("M", "yellow"),
+    "RANKER": ("R", "cyan"),
+    "RESCUE": ("S", "magenta"),
+}
+"""Seat-source glyphs mirroring the Insights seats table (M manual pin, R ranker fill, S rescue), so the two
+model-pool surfaces read as one feature."""
 
 
 def _join_styled(parts: list[tuple[str, str]], separator: str) -> list[tuple[str, str] | str]:
@@ -312,6 +321,7 @@ class OverviewView(Vertical):
                 yield Static(id="overview-queue")
                 yield Static(id="overview-intent")
                 yield Static(id="overview-governance")
+            yield Static(id="overview-model-pool")
             yield Static(id="overview-work")
             yield Static(id="overview-processes")
             with Container(id="overview-ops-row", classes="overview-row"):
@@ -406,6 +416,7 @@ class OverviewView(Vertical):
         residency = snapshot.whole_card_residency if snapshot is not None else None
         governors = snapshot.pop_governors if snapshot is not None else None
         scheduling = snapshot.scheduling_governance if snapshot is not None else None
+        model_pool = snapshot.model_pool if snapshot is not None else None
         governors_have_history = detailed and governors is not None and bool(governors.governors)
         show_pop = governors is not None and (governors.any_active or governors_have_history)
         show_sched = detailed and scheduling is not None
@@ -433,6 +444,10 @@ class OverviewView(Vertical):
                 detailed and residency is not None and (residency.active or residency.possible),
             ),
             "#overview-recent": visible("#overview-recent", detailed and snapshot is not None),
+            "#overview-model-pool": visible(
+                "#overview-model-pool",
+                not thin and model_pool is not None and model_pool.enabled,
+            ),
         }
         for node_id, is_shown in show.items():
             self.query_one(node_id, Static).display = is_shown
@@ -509,6 +524,8 @@ class OverviewView(Vertical):
             )
         if show["#overview-residency"] and residency is not None:
             self.query_one("#overview-residency", Static).update(self._render_residency_panel(residency))
+        if show["#overview-model-pool"] and model_pool is not None:
+            self.query_one("#overview-model-pool", Static).update(self._render_model_pool_panel(model_pool))
 
     def _maybe_record_trends(self, snapshot: WorkerStateSnapshot) -> None:
         """Record a trend sample at most once per :data:`_TREND_SAMPLE_INTERVAL` of wall-clock time."""
@@ -876,6 +893,56 @@ class OverviewView(Vertical):
             border_style=border,
             padding=(0, 1),
             expand=False,
+        )
+
+    @staticmethod
+    def _render_model_pool_panel(pool: ModelPoolSnapshot) -> Panel:
+        """Render a compact fixed model pool panel: seated models, current lane, and the fixed-lane hit rate.
+
+        Shares the Insights seats-table vocabulary (Model pool, seats, fixed/free lane, bench) so an operator
+        reads the two surfaces as one feature. The caller hides the panel entirely when the pool is disabled;
+        the fixed-lane hit rate is added only once at least one fixed-lane pop has been tallied.
+        """
+        seats_line = Text()
+        active_seats = [seat for seat in pool.seats if seat.model is not None]
+        if not active_seats:
+            seats_line.append("no seated models yet", style="grey50")
+        else:
+            for index, seat in enumerate(active_seats):
+                if index:
+                    seats_line.append("   ")
+                glyph, glyph_style = _POOL_SOURCE_GLYPHS.get(seat.source or "", ((seat.source or "?")[:1], "grey70"))
+                downloading = seat.pending_model is not None or seat.state == "PENDING_DOWNLOAD"
+                seats_line.append(seat.model or "-", style="grey70")
+                seats_line.append(" ")
+                seats_line.append(glyph, style=glyph_style)
+                seats_line.append("  ")
+                seats_line.append(
+                    "downloading" if downloading else "active",
+                    style="yellow" if downloading else "green",
+                )
+
+        status_line = Text.assemble(
+            ("lane ", "grey50"),
+            (pool.current_lane or "-", "bold"),
+            ("   ·   seats ", "grey50"),
+            (str(pool.last_fixed_seat_count), "grey70"),
+        )
+        if pool.fixed_pops > 0:
+            rate = pool.fixed_fulfilled / pool.fixed_pops * 100
+            status_line.append("   ·   fixed hits ", style="grey50")
+            status_line.append(f"{pool.fixed_fulfilled}/{pool.fixed_pops}", style="grey70")
+            status_line.append(f" ({rate:.0f}%)", style="grey50")
+        if pool.bench:
+            status_line.append("   ·   bench ", style="grey50")
+            status_line.append(str(len(pool.bench)), style="grey70")
+
+        return Panel(
+            Group(seats_line, status_line),
+            title="Model pool",
+            title_align="left",
+            border_style="green",
+            padding=(0, 1),
         )
 
     @staticmethod
@@ -1387,14 +1454,18 @@ class OverviewView(Vertical):
             for entry in visible_entries:
                 table.add_row(*[spec.render(entry) for spec in layout.columns])
         subtitle = shed_hint(layout)
-        body = table
         completed = sum(1 for entry in recent_entries if not entry.faulted)
         faulted = len(recent_entries) - completed
+        extra_lines: list[Text] = []
         if not show_recent_jobs and recent_entries:
             summary = f"{completed} job{'s' if completed != 1 else ''} completed recently"
             if faulted:
                 summary += f"; {faulted} faulted"
-            body = Group(table, Text(f"({summary})", style="grey62"))
+            extra_lines.append(Text(f"({summary})", style="grey62"))
+        disagg_line = self._disagg_stage_line(snapshot)
+        if disagg_line is not None:
+            extra_lines.append(disagg_line)
+        body: RenderableType = Group(table, *extra_lines) if extra_lines else table
         # Surface the active/finished tally in the title so the ledger's scale reads without scanning rows.
         active_count = sum(1 for entry in snapshot.work_ledger if entry.stage not in recent_stages)
         title = "Work ledger"
@@ -1409,6 +1480,33 @@ class OverviewView(Vertical):
             border_style="green" if visible_entries else "grey37",
             padding=(0, 1),
         )
+
+    _DISAGG_STAGE_LINE_CAP = 6
+    """How many disaggregated jobs the work-ledger stage line names before eliding the rest."""
+
+    @classmethod
+    def _disagg_stage_line(cls, snapshot: WorkerStateSnapshot) -> Text | None:
+        """Summarize in-flight pipeline-disaggregated jobs as one compact per-job stage line.
+
+        Returns None when no disaggregated job is in flight, so a monolithic worker (or an idle
+        disaggregated one) shows nothing extra. Each entry names the short job id, its current stage,
+        and the process the stage is dispatched to (``→…`` while it waits for a role process).
+        """
+        rows = snapshot.disagg_job_stages
+        if not rows:
+            return None
+        line = Text("Disagg: ", style="bold grey62")
+        for index, row in enumerate(rows[: cls._DISAGG_STAGE_LINE_CAP]):
+            if index:
+                line.append("   ", style="grey50")
+            target = f"→p{row.process_id}" if row.process_id is not None else "→…"
+            line.append(f"{row.job_id[-8:]} ", style="grey70")
+            line.append(f"{row.stage.replace('_', ' ')} ", style="cyan")
+            line.append(target, style="grey50")
+        remaining = len(rows) - cls._DISAGG_STAGE_LINE_CAP
+        if remaining > 0:
+            line.append(f"   +{remaining} more", style="grey50")
+        return line
 
     _PIPELINE_BAR_WIDTH = 8
     """Maximum block-bar width (chars) for one job-pipeline stage; bars scale to the busiest stage."""

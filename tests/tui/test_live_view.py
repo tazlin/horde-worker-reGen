@@ -8,10 +8,12 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PreloadAdmissionSnapshot,
     ProcessSnapshot,
     RamGovernanceSnapshot,
+    ResidentComponentEntry,
     SchedulingGovernanceSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.tui.formatters import human_mb
 from horde_worker_regen.tui.widgets.live_view import LiveView
 
 
@@ -74,6 +76,51 @@ def test_resolution_row_shows_by_default_and_job_id_is_gated() -> None:
     detailed = _render(LiveView()._render_process_panel(process, detailed=True))
     assert "job-xyz" in detailed
     assert "Heartbeat" in detailed
+
+
+_MB = 1024 * 1024
+
+
+def test_no_residency_rows_without_reported_components() -> None:
+    """A process that reported no residency shows neither the Resident nor the Retained row."""
+    text = _render(LiveView()._render_process_panel(_process("INFERENCE_STARTING")))
+    assert "Resident" not in text
+    assert "Retained" not in text
+
+
+def test_residency_rows_list_components_and_retained_remainder() -> None:
+    """The panel lists each resident component and a retained row of RSS minus the listed approximation."""
+    process = _process("INFERENCE_STARTING")
+    process.ram_usage_bytes = 5000 * _MB
+    process.resident_components = [
+        ResidentComponentEntry(kind="checkpoint", identity="Deliberate", approx_ram_mb=2600.0),
+        ResidentComponentEntry(kind="vae", identity="Deliberate::vae", approx_ram_mb=160.0),
+    ]
+
+    text = _render(LiveView()._render_process_panel(process))
+
+    assert "Resident" in text
+    assert "Deliberate" in text
+    assert "checkpoint" in text
+    assert "vae" in text
+    # Retained = 5000 MB RSS minus the listed 2760 MB approximation.
+    assert "Retained" in text
+    assert "unattributed" in text
+    assert human_mb(5000 - 2760) in text
+
+
+def test_retained_row_floors_at_zero_when_listing_exceeds_rss() -> None:
+    """When the listed approximation exceeds RSS, the retained remainder floors at zero rather than negative."""
+    process = _process("INFERENCE_STARTING")
+    process.ram_usage_bytes = 100 * _MB
+    process.resident_components = [
+        ResidentComponentEntry(kind="checkpoint", identity="Deliberate", approx_ram_mb=2600.0),
+    ]
+
+    text = _render(LiveView()._render_process_panel(process))
+
+    assert "Retained" in text
+    assert human_mb(0) in text
 
 
 class _RecordingBody:

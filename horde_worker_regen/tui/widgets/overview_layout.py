@@ -50,6 +50,7 @@ OVERVIEW_ELEMENTS: tuple[OverviewElement, ...] = (
     OverviewElement("pipeline", "#overview-pipeline", "Job pipeline", "Workload"),
     OverviewElement("intent", "#overview-intent", "Now / Next / Why", "Workload"),
     OverviewElement("queue", "#overview-queue", "Queue", "Workload"),
+    OverviewElement("model-pool", "#overview-model-pool", "Model pool", "Workload"),
     OverviewElement("governance", "#overview-governance", "Governance", "Governance"),
     OverviewElement("work", "#overview-work", "Work ledger", "Jobs"),
     OverviewElement("processes", "#overview-processes", "Processes", "Jobs"),

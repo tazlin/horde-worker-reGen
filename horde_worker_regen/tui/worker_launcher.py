@@ -587,7 +587,7 @@ class WorkerSupervisor:
         return self.send_command(SupervisorControlMessage(command=SupervisorCommand.RELOAD_CONFIG))
 
     def request_restart_process(self, process_id: int) -> bool:
-        """Ask the worker to replace one inference process slot."""
+        """Ask the worker to replace one process by id: an inference slot or a service lane it recycles."""
         return self.send_command(
             SupervisorControlMessage(command=SupervisorCommand.RESTART_PROCESS, process_id=process_id),
         )

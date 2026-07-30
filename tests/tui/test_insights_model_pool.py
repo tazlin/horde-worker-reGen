@@ -85,3 +85,22 @@ def test_model_pool_bench_line_summarizes_overflow() -> None:
     text = _render(InsightsView()._render_pool_bench(pool))
 
     assert "+2 more" in text
+
+
+def test_model_pool_seats_table_shows_fulfilled_age() -> None:
+    """The seats table carries a Fulfilled column rendering each seat's last-fulfilled age."""
+    text = _render(InsightsView()._render_pool_seats(_pool_snapshot()))
+
+    assert "Fulfilled" in text
+    # The first seat last served 12 seconds ago; that age must appear as a rendered duration.
+    assert "12s" in text
+
+
+def test_model_pool_disabled_panel_shows_off_state() -> None:
+    """With the pool disabled the panel renders a one-line off state plus the trade-off guidance."""
+    text = _render(InsightsView._render_model_pool_disabled())
+
+    assert "Model pool" in text
+    assert "off" in text
+    # It names the throughput-versus-variety trade so the choice is legible where the seats would be.
+    assert "variety" in text

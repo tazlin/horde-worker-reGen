@@ -328,6 +328,7 @@ class LiveView(VerticalScroll):
             "RAM",
             f"{human_mb(process.ram_usage_bytes / 1024 / 1024)}   (peak {human_mb(process.ram_used_high_water_mb)})",
         )
+        self._add_residency_rows(body, process)
         if detailed:
             body.add_row(
                 "Heartbeat",
@@ -350,6 +351,32 @@ class LiveView(VerticalScroll):
             (f"· {_process_type_label(process.process_type)} ", "grey62"),
         )
         return Panel(body, title=title, border_style=state_colour, title_align="left", padding=(0, 1))
+
+    @staticmethod
+    def _add_residency_rows(body: Table, process: ProcessSnapshot) -> None:
+        """Add the resident-component listing and the derived retained/unattributed row, if any is reported.
+
+        The listing is the process's own component-cache view (checkpoint/unet/clip/vae entries with their
+        approximate RAM), so it never claims the whole RSS: the retained row is ``ram_usage_bytes`` minus the
+        summed listed approximation, floored at zero, which surfaces the allocator-retained or comfy-held
+        pages the cache no longer accounts for. A process with no reported residency (no component cache, or
+        no report yet) adds nothing.
+        """
+        if not process.resident_components:
+            return
+
+        resident_text = Text()
+        listed_mb = 0.0
+        for entry_index, entry in enumerate(process.resident_components):
+            listed_mb += entry.approx_ram_mb
+            if entry_index:
+                resident_text.append("\n")
+            resident_text.append(shorten(entry.identity, 32), style="grey78")
+            resident_text.append(f"  {entry.kind} · {human_mb(entry.approx_ram_mb)}", style="grey54")
+        body.add_row("Resident", resident_text)
+
+        retained_mb = max(0.0, process.ram_usage_bytes / 1024 / 1024 - listed_mb)
+        body.add_row("Retained", Text(f"{human_mb(retained_mb)} unattributed", style="grey54"))
 
     @staticmethod
     def _state_colour(state: str) -> str:

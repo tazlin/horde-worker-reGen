@@ -8,12 +8,17 @@ import pytest
 
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
+    CONFIG_SUBTABS,
+    GPU_OVERRIDE_FIELDS,
     ConfigField,
     FieldKind,
     coerce_value,
     current_value,
+    field_key_present,
+    field_yaml_path,
     load_config,
     save_config,
+    set_field_value,
 )
 
 _SAMPLE_YAML = """\
@@ -136,3 +141,106 @@ def test_load_missing_file_returns_empty_mapping(tmp_path: Path) -> None:
     """Loading an absent file yields an empty mapping rather than raising."""
     data = load_config(tmp_path / "does_not_exist.yaml")
     assert current_value(_field("max_threads", FieldKind.INT), data) == 0
+
+
+def _nested_field(key: str, kind: FieldKind, **kwargs: object) -> ConfigField:
+    return ConfigField(key=key, label=key, kind=kind, section="Model pool", yaml_parent="model_pool", **kwargs)  # type: ignore[arg-type]
+
+
+def test_nested_field_yaml_path_derives_leaf() -> None:
+    """A nested field's YAML path is (parent, leaf), with the leaf stripped of the parent prefix."""
+    assert field_yaml_path(_nested_field("model_pool_enabled", FieldKind.BOOL)) == ("model_pool", "enabled")
+    assert field_yaml_path(_field("max_threads", FieldKind.INT)) == ("max_threads",)
+
+
+def test_nested_field_round_trips_under_parent(tmp_path: Path) -> None:
+    """A nested field defaults when absent, writes under its parent, and survives a save/reload."""
+    field = _nested_field("model_pool_enabled", FieldKind.BOOL)
+    data = load_config(tmp_path / "absent.yaml")
+
+    assert field_key_present(field, data) is False
+    assert current_value(field, data) is False  # kind default when the whole block is absent
+
+    set_field_value(field, data, True)
+    assert field_key_present(field, data) is True
+    assert current_value(field, data) is True
+
+    path = tmp_path / "bridgeData.yaml"
+    save_config(data, path)
+    reloaded = load_config(path)
+    assert current_value(field, reloaded) is True
+    assert reloaded["model_pool"]["enabled"] is True
+
+
+def test_nested_write_preserves_sibling_keys_and_comments(tmp_path: Path) -> None:
+    """Writing one nested leaf keeps the parent's other keys and comments intact."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text(
+        "model_pool:\n  enabled: true  # keep this comment\n  seats: 2\n",
+        encoding="utf-8",
+    )
+    data = load_config(path)
+
+    seats = _nested_field("model_pool_seats", FieldKind.INT, minimum=0, maximum=64)
+    set_field_value(seats, data, coerce_value(seats, "4"))
+    save_config(data, path)
+
+    written = path.read_text(encoding="utf-8")
+    assert "# keep this comment" in written
+
+    reloaded = load_config(path)
+    assert current_value(seats, reloaded) == 4
+    assert current_value(_nested_field("model_pool_enabled", FieldKind.BOOL), reloaded) is True
+
+
+def test_nested_presence_returns_false_for_non_mapping_parent() -> None:
+    """A malformed scalar parent is reported absent instead of raising while the editor tries to save."""
+    field = _nested_field("model_pool_enabled", FieldKind.BOOL)
+
+    assert field_key_present(field, {"model_pool": "invalid"}) is False
+
+
+@pytest.mark.parametrize(
+    "field_key",
+    [
+        "model_pool_rotation_minutes",
+        "model_pool_rescue_eta_seconds",
+        "model_pool_rescue_window_minutes",
+    ],
+)
+def test_strictly_positive_model_pool_fields_reject_zero(field_key: str) -> None:
+    """The editor enforces the runtime model's strict-positive bounds for pool timing fields."""
+    field = next(candidate for candidate in CONFIG_FIELDS if candidate.key == field_key)
+
+    with pytest.raises(ValueError, match="must be greater than 0"):
+        coerce_value(field, "0")
+
+
+def test_model_pool_section_is_configurable() -> None:
+    """The editor exposes a Model pool sub-tab with the throughput switch and the nested pool scalars."""
+    subtab_sections = {section for _label, sections in CONFIG_SUBTABS for section in sections}
+    assert "Model pool" in subtab_sections
+
+    pool_fields = [field for field in CONFIG_FIELDS if field.section == "Model pool"]
+    keys = {field.key for field in pool_fields}
+    assert "max_throughput_mode" in keys
+    assert "model_pool_enabled" in keys
+    assert "model_pool_download_budget_gb" in keys
+
+    for field in pool_fields:
+        # max_throughput_mode is a top-level flag; every other pool field nests under model_pool.
+        if field.key == "max_throughput_mode":
+            assert field.yaml_parent == ""
+        else:
+            assert field.yaml_parent == "model_pool"
+
+
+def test_deprecated_field_help_names_the_pool() -> None:
+    """The deprecated stickiness and per-card dynamic_models help must say so and point at the pool."""
+    stickiness = next(field for field in CONFIG_FIELDS if field.key == "model_stickiness")
+    assert "deprecated" in stickiness.help.lower()
+    assert "model pool" in stickiness.help.lower()
+
+    dynamic_models = next(field for field in GPU_OVERRIDE_FIELDS if field.key == "dynamic_models")
+    assert "inert" in dynamic_models.help.lower()
+    assert "model pool" in dynamic_models.help.lower()
