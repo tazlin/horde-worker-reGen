@@ -230,9 +230,10 @@ class HordeDownloadProcess(HordeProcess):
 
         self._lock = threading.Lock()
         # Per-manager locks serialize the hordelib calls that mutate one manager's shared lists
-        # (available_models/tainted_models) and our reads of them, without serializing downloads on
-        # *different* managers (which own independent state and may run truly in parallel). Created lazily.
+        # Manager-wide maintenance/probes retain a broad lock. Ordinary file transfers use the model-scoped
+        # map below so unrelated destinations on one manager can run in parallel. Both maps are created lazily.
         self._manager_locks: dict[str, threading.Lock] = {}
+        self._model_download_locks: dict[tuple[str, str], threading.Lock] = {}
         # Per-task retry accounting (keyed by the scheduler dedup key) so a transient fetch failure is
         # re-attempted a bounded number of times instead of being abandoned until the next config reload.
         self._attempts: dict[tuple[DownloadKind, str, str], int] = {}
@@ -1583,9 +1584,9 @@ class HordeDownloadProcess(HordeProcess):
     def _dispatch_task(self, task: DownloadTask, callback: Callable[[int, int], None]) -> bool:
         """Run *task* against the right manager method for its kind; return whether it succeeded.
 
-        Per-file fetches hold the per-manager lock so the hordelib call that mutates that manager's shared
-        model lists never races a sibling download (or our present-set read) on the *same* manager;
-        downloads on *different* managers still run truly in parallel.
+        Per-file fetches hold a model-scoped lock. Duplicate work targeting the same destination therefore
+        remains serialized, while independent model files on one hordelib manager can use the scheduler's
+        host-level parallelism instead of queueing behind an unrelated transfer.
         """
         from hordelib.api import SharedModelManager
 
@@ -1595,7 +1596,7 @@ class HordeDownloadProcess(HordeProcess):
             if compvis is None:
                 self._record_failure(task.model_name, task.feature, "compvis manager unavailable")
                 return False
-            with self._manager_lock("compvis"):
+            with self._model_download_lock("compvis", task.model_name):
                 connections = self._connections_per_file
                 if download_one_model(compvis, task.model_name, callback=callback, connections=connections):
                     logger.success(f"Download process: downloaded {task.model_name}")
@@ -1605,7 +1606,7 @@ class HordeDownloadProcess(HordeProcess):
             aux_manager = _aux_sub_manager(manager, task.manager_key)
             if aux_manager is None:
                 return False
-            with self._manager_lock(task.manager_key):
+            with self._model_download_lock(task.manager_key, task.model_name):
                 # Validated fetch (sha256-where-known, else presence) with a re-download on mismatch, so a
                 # truncated aux file is repaired here instead of being trusted and faulting a later job.
                 return ensure_aux_model_present(
@@ -1641,6 +1642,21 @@ class HordeDownloadProcess(HordeProcess):
             if lock is None:
                 lock = threading.Lock()
                 self._manager_locks[manager_key] = lock
+            return lock
+
+    def _model_download_lock(self, manager_key: str, model_name: str) -> threading.Lock:
+        """Return the lock protecting one manager/model download destination.
+
+        Hordelib downloads for distinct records operate on distinct files. Scoping the transfer lock to the
+        record preserves duplicate-download protection without serializing every network request owned by the
+        same category manager.
+        """
+        key = (manager_key, model_name)
+        with self._lock:
+            lock = self._model_download_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._model_download_locks[key] = lock
             return lock
 
     def _forget_attempts(self, task: DownloadTask) -> None:

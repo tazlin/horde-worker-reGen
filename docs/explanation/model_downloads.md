@@ -358,10 +358,11 @@ removed from config mid-flight is dropped from the queue and aborted if running;
 required safety and aux work is never aborted by an image-model removal. The
 Downloads tab lists every concurrent download, grouped by host.
 
-Two correctness invariants underpin the threading. First, the hordelib calls that
-mutate one model manager's shared state (its on-disk model lists) are serialized
-**per manager**, so two downloads on different managers run truly in parallel while
-two on the same manager never corrupt that shared state; the annotator **verify**
+Two correctness invariants underpin the threading. First, ordinary file downloads
+are serialized **per manager/model destination**: duplicate requests for the same
+file cannot write it concurrently, while independent model records on the same
+manager can use the scheduler's host-level parallelism. Manager-wide maintenance
+operations retain their broader manager lock. The annotator **verify**
 (`ANNOTATOR_VERIFY`), which needs a full ComfyUI init, runs **exclusively** (no other
 download alongside it), while the annotator *files* download per-file like any other
 aux model. Second, a per-file fetch (image or aux) that fails transiently is re-queued a
@@ -387,7 +388,13 @@ ranged probe: only a `206` with a known total over the segmentation threshold
 (~64 MiB) is split into per-connection byte ranges written to a sparse `.spart` at
 their offsets; anything else (a small file, or a server that answers the probe with
 a `200` because it ignores `Range`) drops straight to the original single-stream,
-resumable `.part` path. Segmented downloads do **not** resume an interruption (the
+resumable `.part` path. HTTP sessions persist for the lifetime of each download
+executor thread, allowing later requests to reuse keep-alive connections. A fresh
+single-stream transfer also computes SHA-256 while writing, avoiding a second full
+disk read after the final byte; resumed and segmented files still require an ordered
+post-transfer hash pass. Transient HTTP errors on one range consume that range's
+retry budget before the engine abandons the other completed ranges and falls back.
+Segmented downloads do **not** resume an interruption (the
 sparse partial is discarded and refetched), which is why the resumable single stream
 is kept for the cases that benefit from it. The gated R2 mirror is left single-stream
 (it is already the fast accelerator); only the origin fetch is segmented.

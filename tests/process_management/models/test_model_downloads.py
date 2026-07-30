@@ -1255,7 +1255,7 @@ class TestFeaturePresenceValidation:
 
 
 class TestDownloadProcessConcurrencyFixes:
-    """The threaded download path's correctness guards: per-manager locking, retry, bandwidth, pool growth."""
+    """The threaded download path's correctness guards: destination locking, retry, bandwidth, pool growth."""
 
     def _make_process(
         self,
@@ -1281,8 +1281,8 @@ class TestDownloadProcessConcurrencyFixes:
         fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
 
-    def test_same_manager_downloads_serialize(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Two AUX tasks on the *same* manager never run that manager's download_model concurrently."""
+    def test_distinct_models_on_same_manager_download_in_parallel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Independent AUX files on one manager use the available host-level parallelism."""
         probe = _ConcurrencyProbe()
         gfpgan = SimpleNamespace(download_model=lambda _name, callback=None, connections=1: probe.run(0.05))
         self._inject_aux_managers(monkeypatch, {"gfpgan": gfpgan})
@@ -1292,7 +1292,20 @@ class TestDownloadProcessConcurrencyFixes:
         task_b = _aux_task("b", "h2", "gfpgan")
         self._run_dispatch_concurrently(process, [task_a, task_b])
 
-        assert probe.max_active == 1  # the per-manager lock serialized them
+        assert probe.max_active == 2
+
+    def test_duplicate_model_downloads_serialize(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two calls targeting the same manager/model destination cannot write it concurrently."""
+        probe = _ConcurrencyProbe()
+        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None, connections=1: probe.run(0.05))
+        self._inject_aux_managers(monkeypatch, {"gfpgan": gfpgan})
+        process = self._make_process()
+
+        task_a = _aux_task("same", "h1", "gfpgan")
+        task_b = _aux_task("same", "h2", "gfpgan")
+        self._run_dispatch_concurrently(process, [task_a, task_b])
+
+        assert probe.max_active == 1
 
     def test_different_managers_download_in_parallel(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AUX tasks on *different* managers run truly in parallel (independent shared state)."""
@@ -1306,7 +1319,7 @@ class TestDownloadProcessConcurrencyFixes:
         task_b = _aux_task("b", "h2", "esrgan")
         self._run_dispatch_concurrently(process, [task_a, task_b])
 
-        assert probe.max_active == 2  # distinct manager locks, so both ran at once
+        assert probe.max_active == 2
 
     @staticmethod
     def _run_dispatch_concurrently(process: HordeDownloadProcess, tasks: list[DownloadTask]) -> None:
