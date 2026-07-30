@@ -32,6 +32,7 @@ from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
     DEFAULT_CONFIG_PATH,
+    MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES,
     MODELS_TO_LOAD_KEY,
     MODELS_TO_SKIP_KEY,
     SECTION_GUIDANCE,
@@ -588,8 +589,23 @@ class ConfigEditorView(Vertical):
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         """Refresh the process-count preview when any toggle changes."""
+        if event.switch.id == "cfg-max_throughput_mode":
+            self._apply_max_throughput_inherited_values(event.value)
         self._update_process_preview()
         self._refresh_action_variants()
+
+    def _apply_max_throughput_inherited_values(self, enabled: bool) -> None:
+        """Refresh absent pool fields to show the preset values that the worker will inherit.
+
+        An explicitly present nested key is an operator override and is never changed. The refreshed absent
+        controls remain ordinary editable controls: entering a value different from the inherited one writes an
+        explicit override on save.
+        """
+        for key, inherited_value in MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES.items():
+            field = _FIELD_BY_KEY[key]
+            if field_key_present(field, self._data):
+                continue
+            self._set_widget_value(key, inherited_value if enabled else field.default())
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Refresh restart-action emphasis when a select value changes."""
@@ -806,6 +822,21 @@ class ConfigEditorView(Vertical):
             changed_keys = {field.key for field in _RENDERED_FIELDS}
         else:
             changed_keys = {key for key, value in current.items() if baseline.get(key) != value}
+
+        # Toggling Max throughput mode refreshes its three absent pool controls to their effective values. Those
+        # display-only changes must not be persisted as explicit overrides: doing so would freeze the preset's
+        # current bundle into YAML and defeat its "operator values win, absent values inherit" contract. A value
+        # that differs from the new inherited value is a real operator edit and remains in changed_keys.
+        if "max_throughput_mode" in changed_keys:
+            mode_enabled = bool(current.get("max_throughput_mode")) if current is not None else False
+            for key, bundle_value in MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES.items():
+                field = _FIELD_BY_KEY[key]
+                if field_key_present(field, self._data) or key not in changed_keys:
+                    continue
+                inherited_value = bundle_value if mode_enabled else field.default()
+                with contextlib.suppress(ValueError):
+                    if self._coerce_field(field) == inherited_value:
+                        changed_keys.discard(key)
 
         errors: list[tuple[ConfigField, str]] = []
         coerced: list[tuple[ConfigField, object]] = []

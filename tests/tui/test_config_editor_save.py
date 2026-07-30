@@ -107,6 +107,45 @@ async def test_select_field_round_trips(tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
+async def test_max_throughput_mode_refreshes_effective_pool_values_without_freezing_them(tmp_path: Path) -> None:
+    """Enabling the preset shows inherited pool values and writes only the top-level mode switch."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "n"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-max_throughput_mode", Switch).value = True
+        await pilot.pause()
+
+        assert editor.query_one("#cfg-model_pool_enabled", Switch).value is True
+        assert editor.query_one("#cfg-model_pool_ranker_enabled", Switch).value is True
+        assert editor.query_one("#cfg-model_pool_download_budget_gb", Input).value == "50.0"
+        assert editor._save() is True
+        await pilot.pause()
+
+    reloaded = load_config(path)
+    assert reloaded["max_throughput_mode"] is True
+    assert "model_pool" not in reloaded
+
+
+@pytest.mark.e2e
+async def test_max_throughput_mode_allows_an_explicit_pool_override(tmp_path: Path) -> None:
+    """Editing an inherited pool control writes that nested override while leaving its siblings inherited."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "n"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-max_throughput_mode", Switch).value = True
+        await pilot.pause()
+        editor.query_one("#cfg-model_pool_download_budget_gb", Input).value = "12"
+        assert editor._save() is True
+        await pilot.pause()
+
+    reloaded = load_config(path)
+    assert reloaded["max_throughput_mode"] is True
+    assert reloaded["model_pool"] == {"download_budget_gb": 12.0}
+
+
+@pytest.mark.e2e
 async def test_preexisting_invalid_value_does_not_block_unrelated_save(tmp_path: Path) -> None:
     """A value already out of bounds on disk (and untouched) cannot block an unrelated edit."""
     app, path = await _mount(

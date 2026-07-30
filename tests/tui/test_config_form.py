@@ -200,6 +200,22 @@ def test_nested_presence_returns_false_for_non_mapping_parent() -> None:
     assert field_key_present(field, {"model_pool": "invalid"}) is False
 
 
+def test_max_throughput_mode_shows_effective_absent_pool_values() -> None:
+    """The raw editor reflects the runtime preset while preserving explicit nested overrides."""
+    enabled = _nested_field("model_pool_enabled", FieldKind.BOOL)
+    ranker = _nested_field("model_pool_ranker_enabled", FieldKind.BOOL, explicit_default=True)
+    budget = _nested_field("model_pool_download_budget_gb", FieldKind.FLOAT, explicit_default=0.0)
+    inherited = {"max_throughput_mode": True}
+
+    assert current_value(enabled, inherited) is True
+    assert current_value(ranker, inherited) is True
+    assert current_value(budget, inherited) == 50.0
+
+    explicit = {"max_throughput_mode": True, "model_pool": {"enabled": False, "download_budget_gb": 5.0}}
+    assert current_value(enabled, explicit) is False
+    assert current_value(budget, explicit) == 5.0
+
+
 @pytest.mark.parametrize(
     "field_key",
     [

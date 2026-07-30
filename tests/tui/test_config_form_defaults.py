@@ -20,6 +20,7 @@ from horde_worker_regen.tui.config_form import (
     ALCHEMIST_NAME_RESERVED_DEFAULT,
     CONFIG_FIELDS,
     DREAMER_NAME_RESERVED_DEFAULT,
+    MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES,
     FieldKind,
     field_yaml_path,
     validate_identity_names,
@@ -102,6 +103,16 @@ def test_model_pool_editor_defaults_match_model() -> None:
             mismatches.append(f"model_pool.{leaf}: editor shows {actual!r} but model defaults to {expected!r}")
 
     assert not mismatches, "model pool editor defaults drift from ModelPoolConfig:\n" + "\n".join(mismatches)
+
+
+def test_max_throughput_editor_bundle_matches_runtime_bundle() -> None:
+    """The import-light editor copy of the preset cannot drift from the runtime model bundle."""
+    from horde_worker_regen.bridge_data.data_model import _MAX_THROUGHPUT_MODE_BUNDLE
+
+    editor_bundle = {
+        key.removeprefix("model_pool_"): value for key, value in MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES.items()
+    }
+    assert editor_bundle == _MAX_THROUGHPUT_MODE_BUNDLE
 
 
 def test_reserved_name_constants_match_model_defaults() -> None:

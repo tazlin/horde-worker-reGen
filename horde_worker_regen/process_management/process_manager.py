@@ -5045,6 +5045,7 @@ class HordeWorkerProcessManager:
             download_status=self._model_availability.status,
             download_plan=self._download_coordinator.get_download_plan_summary(),
             stage_age_line=self._build_stage_age_line(),
+            model_pool_status=self._model_pool_status(),
         )
 
         self._last_status_message_time = reporter.last_status_message_time

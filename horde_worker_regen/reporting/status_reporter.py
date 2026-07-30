@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.supervisor_channel import (
         DownloadPlanSummary,
         DownloadStatusSnapshot,
+        ModelPoolSnapshot,
     )
     from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
     from horde_worker_regen.process_management.resources.device_info import TorchDeviceMap
@@ -115,6 +116,7 @@ class StatusReporter:
         download_status: DownloadStatusSnapshot | None = None,
         download_plan: DownloadPlanSummary | None = None,
         stage_age_line: str | None = None,
+        model_pool_status: ModelPoolSnapshot | None = None,
     ) -> float:
         """Print the status of the worker.
 
@@ -149,6 +151,8 @@ class StatusReporter:
             download_plan: The config's disk-budget summary, or None when the reference is not loaded.
             stage_age_line: A pre-formatted per-stage census (count + oldest age) to print under the job
                 info, or None to omit it (nothing is aging).
+            model_pool_status: Live fixed-pool seats, lane tallies, and download budget. None means the pool
+                is disabled or has not produced a snapshot yet; ``bridge_data`` distinguishes those cases.
 
         Returns:
             The updated status message frequency.
@@ -191,6 +195,12 @@ class StatusReporter:
         # in SAFETY_CHECKING or PENDING_SUBMIT while inference keeps finishing) visible at a glance.
         if stage_age_line:
             logging_function(f"<fg #7dcea0>  {stage_age_line}</>")
+
+        self._print_model_pool(
+            logging_function,
+            enabled=bridge_data.model_pool.enabled,
+            pool=model_pool_status,
+        )
 
         logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
 
@@ -236,6 +246,62 @@ class StatusReporter:
         logging_function("<fg #dddddd>" + str("v" * 80) + "</>")
 
         return updated_frequency
+
+    @staticmethod
+    def _print_model_pool(
+        logging_function: Callable[[str], None],
+        *,
+        enabled: bool,
+        pool: ModelPoolSnapshot | None,
+    ) -> None:
+        """Print one compact model-pool runtime line in headless status output.
+
+        The disabled line names the normal advertising behavior so operators can distinguish an intentional
+        default from a missing feature. The enabled line carries the same seats, lane, hit-rate, bench, demand,
+        and budget vocabulary as the TUI without turning the periodic status block into another table.
+        """
+        if not enabled:
+            logging_function(
+                "<fg #7dcea0>  Model pool: off; normal eligible-model advertising has no persistent seat bias.</>",
+            )
+            return
+        if pool is None:
+            logging_function("<fg #f4d03f>  Model pool: on; waiting for the first runtime snapshot.</>")
+            return
+
+        seats: list[str] = []
+        for seat in pool.seats:
+            model = seat.model or seat.pending_model
+            if model is None:
+                seats.append("empty")
+                continue
+            source = {"MANUAL": "M", "RANKER": "R", "RESCUE": "S"}.get(seat.source or "", "?")
+            if seat.model is not None and seat.pending_model is not None:
+                model = f"{seat.model}->{seat.pending_model}"
+            suffix = " downloading" if seat.pending_model is not None else ""
+            seats.append(f"{model}[{source}]{suffix}")
+        seat_summary = ", ".join(seats) if seats else "none"
+
+        fixed_rate = StatusReporter._pool_hit_rate(pool.fixed_fulfilled, pool.fixed_pops)
+        free_rate = StatusReporter._pool_hit_rate(pool.free_fulfilled, pool.free_pops)
+        budget = (
+            f"{_human_bytes(pool.download_bytes_charged)}/{pool.download_budget_gb:g} GB"
+            if pool.download_budget_gb > 0
+            else "off"
+        )
+        demand = _human_duration(pool.demand_age_seconds)
+        logging_function(
+            "<fg #7dcea0>  Model pool: "
+            f"seats {seat_summary} | lane {pool.current_lane or '-'} | fixed {fixed_rate} | free {free_rate} | "
+            f"bench {len(pool.bench)} | demand age {demand} | download budget {budget}</>",
+        )
+
+    @staticmethod
+    def _pool_hit_rate(fulfilled: int, pops: int) -> str:
+        """Format one model-pool lane's fulfilled/popped count and percentage."""
+        if pops <= 0:
+            return "0/0"
+        return f"{fulfilled}/{pops} ({fulfilled / pops * 100:.0f}%)"
 
     def _print_api_messages(
         self,

@@ -185,8 +185,8 @@ def _check_model_pool(snapshot: WorkerStateSnapshot, out: list[Recommendation]) 
 def _check_pool_off_diversity(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> None:
     """With the pool off, offer (not push) the throughput-for-variety trade when the worker serves many models.
 
-    Serving many distinct models is a legitimate operator choice, so this is framed as a preference: enabling the
-    pool earns more kudos/hr on a committed set, at the cost of that variety.
+    Serving many distinct models is a legitimate operator choice, so this is framed as a preference. A pool can
+    improve throughput when model swaps are the bottleneck, at the cost of biasing work toward fewer models.
     """
     image_jobs = [job for job in snapshot.recent_jobs if not job.is_alchemy]
     distinct_models = {job.model_name for job in image_jobs if job.model_name}
@@ -197,7 +197,8 @@ def _check_pool_off_diversity(snapshot: WorkerStateSnapshot, out: list[Recommend
                 f"Serving {len(distinct_models)} models with the pool off",
                 "Recent work spanned many distinct models while the fixed model pool is off. If the card spends "
                 "time swapping between them, enabling the model pool (or Max throughput mode) commits it to a "
-                "small, ready seat set for more kudos/hr, trading away some model variety. This is a genuine "
+                "small, ready seat set. That can improve throughput when swaps are the bottleneck, while trading "
+                "away some model variety. This is a genuine "
                 "preference: leave the pool off if serving that variety is the point.",
             ),
         )
@@ -211,7 +212,6 @@ def _check_pool_on(
     """Read the live seats and demand age, flagging what to review and noting a pool that is clearly earning."""
     before = len(out)
     _check_pool_demand_staleness(pool, out)
-    _check_pool_stuck_download(pool, out)
     _check_pool_unproductive_seats(pool, out)
     if len(out) == before:
         _note_pool_earning(pool, out)
@@ -229,25 +229,6 @@ def _check_pool_demand_staleness(pool: ModelPoolSnapshot, out: list[Recommendati
                 "blind and has frozen rotations until a fresh reading arrives. Check the worker's connectivity to "
                 "the horde demand endpoint; while the signal is stale it holds the current seats rather than "
                 "re-ranking them.",
-            ),
-        )
-
-
-def _check_pool_stuck_download(pool: ModelPoolSnapshot, out: list[Recommendation]) -> None:
-    """Explain a seat stuck downloading when the auto-download budget for the session is spent."""
-    pending = [seat.pending_model for seat in pool.seats if seat.pending_model is not None]
-    if not pending or pool.download_budget_gb <= 0:
-        return
-    budget_bytes = pool.download_budget_gb * 1024**3
-    if pool.download_bytes_charged >= budget_bytes:
-        names = ", ".join(pending)
-        out.append(
-            Recommendation(
-                Severity.WARNING,
-                "Model pool download budget exhausted",
-                f"A seat is waiting on a download ({names}) but the pool has spent its "
-                f"{pool.download_budget_gb:.0f} GB session auto-download budget, so the pending seat cannot "
-                "resolve. Raise model_pool.download_budget_gb to let it finish, or pre-download the model.",
             ),
         )
 

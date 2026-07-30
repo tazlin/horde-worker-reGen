@@ -83,6 +83,17 @@ def test_panel_handles_no_seated_models() -> None:
     assert "no seated models yet" in text
 
 
+def test_panel_names_a_pending_only_seat() -> None:
+    """A seat downloading its first model is visible even before it has an active seated model."""
+    pool = _pool_snapshot()
+    pool.seats = [ModelPoolSeatRow(state="PENDING_DOWNLOAD", pending_model="Flux.1-dev")]
+    text = _render(OverviewView._render_model_pool_panel(pool))
+
+    assert "Flux.1-dev" in text
+    assert "downloading" in text
+    assert "no seated models yet" not in text
+
+
 def test_model_pool_panel_is_a_hideable_layout_element() -> None:
     """The panel node is registered in the layout registry so an operator can hide it like other panels."""
     assert element_for_node("#overview-model-pool") is not None

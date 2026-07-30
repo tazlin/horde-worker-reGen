@@ -22,6 +22,14 @@ supervisor, 10 for benchmark runs). This keeps total disk use bounded under a he
 and keeps any single file small enough that the **Logs** tab can tail it without buffering a multi-GB file.
 The dashboard reads only the trailing window of a log, so a large file scrolls quickly to the latest lines.
 
+## Headless model-pool status
+
+The headless worker's periodic status block always names the model-pool mode. With the pool off, it says that
+normal eligible-model advertising has no persistent seat bias. With the pool on, one compact line lists the
+seats and their source (`M`, `R`, or `S`), the current fixed/free advertising lane, each lane's fulfilled/popped
+hit rate, bench size, demand-reading age, and charged/session download budget. A pending seat names its target
+model and reads `downloading`; reaching the charged budget does not cancel that already-started transfer.
+
 ## Which process is which
 
 The numbered logs map to the worker's child processes:

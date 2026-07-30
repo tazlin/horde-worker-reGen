@@ -47,6 +47,15 @@ DEDICATED_POST_PROCESSING_CHOICES = ("auto", "on", "off")
 DREAMER_NAME_RESERVED_DEFAULT = "An Awesome Dreamer"
 ALCHEMIST_NAME_RESERVED_DEFAULT = "An Awesome Alchemist"
 
+# Kept import-light on purpose: importing bridge_data.data_model here pulls the SDK into the TUI process.
+# A drift test pins this presentation bundle to the authoritative runtime bundle.
+MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES: dict[str, object] = {
+    "model_pool_enabled": True,
+    "model_pool_ranker_enabled": True,
+    "model_pool_download_budget_gb": 50.0,
+}
+"""Effective editor values inherited from ``max_throughput_mode`` when a pool field is absent."""
+
 
 class FieldKind(enum.StrEnum):
     """How a config field is edited and coerced."""
@@ -221,10 +230,10 @@ SECTION_GUIDANCE: dict[str, str] = {
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
     "Workload policy": "These switches shape the model set produced by the load/skip rules. Presets may replace "
     "the model list; review the preset diff before saving.",
-    "Model pool": "The fixed model pool trades model variety for kudos/hr: it commits the worker to a small set "
-    "of seated models it keeps ready, so the horde returns work it can run without a per-job model swap. Leave it "
-    "off (the default) to serve your whole model list evenly, which earns the widest variety of jobs; turn it on "
-    "when you would rather the card stay busy on a committed set than idle waiting for rarer models. These fields "
+    "Model pool": "The fixed model pool biases work toward a small set of seated models the worker keeps ready, "
+    "which can reduce model swaps when the horde has demand for that set. Leave it off (the default) to advertise "
+    "the normal eligible model set without a persistent seat bias; turn it on when reducing swap churn matters "
+    "more than serving the broadest mix of models. These fields "
     "match the Insights and Overview 'Model pool' panels (seats, bench, the fixed and free lanes, rotation, "
     "rescue, download budget); flip Max throughput mode for a one-switch ranker-fed pool with an auto-download "
     "budget, then adjust the individual knobs below where you want tighter control.",
@@ -600,10 +609,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max throughput mode",
         FieldKind.BOOL,
         "Model pool",
-        "One-switch preset for kudos/hr over variety: turns the fixed model pool on with its demand ranker and a "
+        "One-switch preset for reducing model-swap churn: turns the fixed model pool on with its demand ranker and a "
         "50 GB auto-download budget, so the worker serves a ranker-fed, slowly-rotating seat set and may fetch a "
-        "strong model it does not yet hold. Applied only where you left the individual model_pool fields below at "
-        "their defaults, so an explicit value here always wins.",
+        "strong model it does not yet hold. Applied only where an individual model_pool field below is absent, so "
+        "an explicit value always wins. Inherited values are shown directly in the form.",
     ),
     ConfigField(
         "model_pool_enabled",
@@ -718,8 +727,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.FLOAT,
         "Model pool",
         "Disk (GB) the pool may spend auto-downloading a high-demand model it does not yet have, so the ranker can "
-        "seat a strong candidate you have not pre-fetched. 0 (the default) never auto-downloads: the pool only "
-        "seats models already on disk. Exhausting this budget is what leaves a seat stuck downloading.",
+        "seat a strong candidate you have not pre-fetched. 0 (the default) prevents ranker-selected automatic "
+        "downloads; models already configured or pinned remain governed by their normal download rules. The budget "
+        "is charged when a pool download starts, so reaching the limit does not stop an in-progress transfer.",
         minimum=0.0,
         unit="GB",
         yaml_parent="model_pool",
@@ -1765,11 +1775,13 @@ def coerce_value(field: ConfigField, raw: object) -> object:
         except ValueError as error:
             noun = "a whole number" if is_int else "a number"
             raise ValueError(f"{field.label} must be {noun}") from error
-        below_minimum = field.minimum is not None and value < field.minimum
-        at_excluded_minimum = field.minimum is not None and field.exclusive_minimum and value == field.minimum
+        minimum = field.minimum
+        below_minimum = minimum is not None and value < minimum
+        at_excluded_minimum = minimum is not None and field.exclusive_minimum and value == minimum
         if below_minimum or at_excluded_minimum:
             qualifier = "greater than" if field.exclusive_minimum else "at least"
-            raise ValueError(f"{field.label} must be {qualifier} {format_number(field.minimum)}")
+            assert minimum is not None
+            raise ValueError(f"{field.label} must be {qualifier} {format_number(minimum)}")
         if field.maximum is not None and value > field.maximum:
             raise ValueError(f"{field.label} must be at most {format_number(field.maximum)}")
         # Write a clean integer to the YAML when a float field holds a whole number (2, not 2.0); the
@@ -1911,9 +1923,16 @@ def set_field_value(field: ConfigField, data: Any, value: object) -> None:  # no
 
 
 def current_value(field: ConfigField, data: Any) -> Any:  # noqa: ANN401 - kind-dependent
-    """Read a field's current value from loaded YAML data, falling back to its default."""
+    """Read a field's effective value from loaded YAML data, falling back to inherited or schema defaults.
+
+    ``max_throughput_mode`` supplies three runtime defaults only where their nested pool keys are absent. Showing
+    those effective values here keeps the editor aligned with what the worker actually runs while preserving an
+    explicit nested value, including an explicit ``false`` or zero, as the operator's override.
+    """
     value = _read_yaml_path(data, field_yaml_path(field))
     if value is None:
+        if field.key in MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES and bool(_read_yaml_path(data, ("max_throughput_mode",))):
+            return MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES[field.key]
         return field.default()
     if field.kind in (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI) and not isinstance(
         value, list

@@ -113,8 +113,8 @@ def test_pool_on_unproductive_seat_suggests_review() -> None:
     assert any("not earning" in item.title.lower() for item in result)
 
 
-def test_pool_on_exhausted_download_budget_explains_stuck_seat() -> None:
-    """A pending-download seat with the budget spent explains why the seat cannot resolve."""
+def test_pool_on_charged_download_is_not_reported_as_budget_blocked() -> None:
+    """A charged pending transfer may finish and must not be described as blocked by its own budget charge."""
     pool = ModelPoolSnapshot(
         enabled=True,
         seats=[_seat("A", state="PENDING_DOWNLOAD", pending_model="Flux.1-dev")],
@@ -123,7 +123,7 @@ def test_pool_on_exhausted_download_budget_explains_stuck_seat() -> None:
         download_bytes_charged=10 * 1024**3,
     )
     result = analyze(_snapshot(model_pool=pool))
-    assert any("budget" in item.title.lower() for item in result)
+    assert not any("budget" in item.title.lower() for item in result)
 
 
 def test_pool_on_earning_seats_are_noted_positively() -> None:

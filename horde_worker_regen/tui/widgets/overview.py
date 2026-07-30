@@ -904,16 +904,18 @@ class OverviewView(Vertical):
         the fixed-lane hit rate is added only once at least one fixed-lane pop has been tallied.
         """
         seats_line = Text()
-        active_seats = [seat for seat in pool.seats if seat.model is not None]
-        if not active_seats:
+        visible_seats = [seat for seat in pool.seats if seat.model is not None or seat.pending_model is not None]
+        if not visible_seats:
             seats_line.append("no seated models yet", style="grey50")
         else:
-            for index, seat in enumerate(active_seats):
+            for index, seat in enumerate(visible_seats):
                 if index:
                     seats_line.append("   ")
                 glyph, glyph_style = _POOL_SOURCE_GLYPHS.get(seat.source or "", ((seat.source or "?")[:1], "grey70"))
                 downloading = seat.pending_model is not None or seat.state == "PENDING_DOWNLOAD"
-                seats_line.append(seat.model or "-", style="grey70")
+                seats_line.append(seat.model or seat.pending_model or "-", style="grey70")
+                if seat.model is not None and seat.pending_model is not None:
+                    seats_line.append(f" -> {seat.pending_model}", style="yellow")
                 seats_line.append(" ")
                 seats_line.append(glyph, style=glyph_style)
                 seats_line.append("  ")

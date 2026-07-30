@@ -143,7 +143,8 @@ Two operator audiences reach the pool from opposite directions:
   pins-only pool). This suits an operator who knows their audience and wants deterministic residency.
 - **Max-throughput** operators want the worker to chase demand for them. The `max_throughput_mode` preset turns
   the pool on with its ranker and a 50GB auto-download budget in one switch, applied only where the matching
-  `model_pool` fields were left at their defaults, so an explicit value always wins.
+  `model_pool` fields were left absent, so an explicit value always wins. The config form shows the inherited
+  values while the switch is on; editing one writes only that nested override.
 
 Both share the same engine; the difference is only how many seats the operator claims by hand versus leaves to
 the ranker.
@@ -152,10 +153,11 @@ the ranker.
 
 Every seat transition (seated, demoted with its reason, rescue engaged/released, download pending/ready) is
 logged once at INFO and recorded as a `MODEL_POOL_*` action-ledger event, and the advertising lanes log their
-narrowing edges the same way the residency-bias duty cycle does. The supervisor status snapshot (protocol v19)
+narrowing edges the same way the residency-bias duty cycle does. The supervisor status snapshot (protocol v20)
 carries an optional `model_pool` section: per-seat rows (model, source, state, dwell, last-fulfilled age,
 empty pops, rescue countdown), the bench with cooldowns, the current lane, demand-snapshot age, and the
-auto-download budget spent. The TUI renders this as a "Model pool" panel in the Insights view. With the pool
+auto-download budget spent. The headless periodic status block prints the same seats, lane hit rates, bench,
+demand age, and budget in one compact line. The TUI renders this as a "Model pool" panel in the Insights view. With the pool
 enabled the panel shows the live seats, lanes, and bench; with the pool disabled it shows a one-line
 `Model pool: off` state and a note on what turning it on would trade, so the subsystem is discoverable rather
 than invisible. Older supervisors simply never send the optional field, and the panel still reads as off.
@@ -177,11 +179,11 @@ watch:
   (sustained empty pops against near-zero demand, or a stretch with no fulfillment) is demoted to the **bench**
   with a cooldown, shown as its own line under the seats. A benched model does not immediately re-seat, so it
   will not thrash between the seat and the bench.
-- **The throughput-versus-variety choice** is the whole point of the pool. Off, the worker serves your entire
-  model list evenly and earns the widest variety of jobs, but pays a model swap whenever a popped job needs a
-  model that is not loaded. On, it commits to a small ready set for more kudos per wall-second, at the cost of
-  serving fewer distinct models. Neither is "correct": it is an operator preference about what the card should
-  optimise for.
+- **The throughput-versus-variety choice** is the whole point of the pool. Off, the worker advertises its normal
+  eligible model set without a persistent seat bias. On, it biases work toward a small ready set. This can reduce
+  swap time and improve throughput when swaps are the bottleneck, at the cost of serving a narrower model mix.
+  Demand still decides which jobs arrive, so neither even distribution nor a throughput gain is guaranteed.
+  Neither choice is universally correct; it expresses what the operator wants the card to optimise for.
 - **When to leave the pool off:** if the worker is rarely idle and rarely swaps models (a small, evenly-demanded
   model list already fits its inference processes), the pool has little to add. It earns its keep when the card
   either idles waiting for rare-model demand or churns swapping between many models; the Insights advisors
