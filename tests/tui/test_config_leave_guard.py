@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
 from textual.widgets import Input, TabbedContent
 
 from horde_worker_regen.app_state import AppStateStore
-from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
-from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
+from tests.tui._fake_supervisor import FakeSupervisor
+
+pytestmark = pytest.mark.slow
 
 
-def _make_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[HordeWorkerTUI, WorkerSupervisor]:
+def _make_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[HordeWorkerTUI, FakeSupervisor]:
     """Build a fake-worker app with the first-run prompts suppressed so the only modal is the guard's."""
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     store.set_auto_start_worker(True)
-    supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="LeaveGuard"), mode=WorkerProcessMode.FAKE)
+    supervisor = FakeSupervisor(alive=True)
     app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
     monkeypatch.setattr(app, "_maybe_prompt_onboarding", lambda: None)
     return app, supervisor
@@ -30,7 +30,6 @@ async def _boot(app: HordeWorkerTUI, pilot: object) -> ConfigEditorView:
     for _ in range(5):
         app._tick()
         await pilot.pause()  # type: ignore[attr-defined]
-        await asyncio.sleep(0.05)
     return app.query_one(ConfigEditorView)
 
 

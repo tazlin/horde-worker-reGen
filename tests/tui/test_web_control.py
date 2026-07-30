@@ -52,8 +52,8 @@ def _running_host() -> tuple[WorkerHost, threading.Thread]:
 def test_status_reports_not_running_on_free_port() -> None:
     """Against a port with no host, status reports nothing running and yields a non-zero exit code."""
     address = ("127.0.0.1", _free_port())
-    assert web._query_host_status(address, timeout=0.5) is None
-    assert web._print_host_status(address) == 1
+    assert web._query_host_status(address, timeout=0.05) is None
+    assert web._print_host_status(address, timeout=0.05) == 1
 
 
 def test_status_reports_a_running_host() -> None:
@@ -85,7 +85,7 @@ def test_stop_shuts_a_running_host_down() -> None:
 
 def test_stop_reports_when_no_host() -> None:
     """``--stop`` against a free port reports nothing to stop and returns a non-zero exit code."""
-    assert web._request_host_stop(("127.0.0.1", _free_port())) == 1
+    assert web._request_host_stop(("127.0.0.1", _free_port()), timeout=0.05) == 1
 
 
 def test_main_status_exits_with_query_result(monkeypatch: pytest.MonkeyPatch) -> None:

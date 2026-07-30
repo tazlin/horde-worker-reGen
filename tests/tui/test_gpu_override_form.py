@@ -28,6 +28,8 @@ from horde_worker_regen.tui.config_form import (
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 
+pytestmark = pytest.mark.slow
+
 
 def _model_keys() -> set[str]:
     """Every GpuOverride field name plus its alias (the spellings the YAML may legitimately use)."""

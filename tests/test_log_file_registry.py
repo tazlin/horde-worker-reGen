@@ -119,6 +119,7 @@ def _run_probe(mode: str, tmp_path: Path) -> list[str]:
         ("supervisor-host", {"bridge_host.log"}),
     ],
 )
+@pytest.mark.slow
 def test_registered_loguru_sinks_are_all_in_the_registry(mode: str, must_include: set[str], tmp_path: Path) -> None:
     """The loguru file sinks each real setup registers are all described by a loguru-sink spec.
 

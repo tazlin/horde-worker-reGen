@@ -352,9 +352,9 @@ def _query_host_status(address: tuple[str, int], *, timeout: float = 2.0) -> dic
         return None
 
 
-def _print_host_status(address: tuple[str, int]) -> int:
+def _print_host_status(address: tuple[str, int], *, timeout: float = 2.0) -> int:
     """Print whether a worker host runs at ``address`` and its status; return a process exit code."""
-    status = _query_host_status(address)
+    status = _query_host_status(address, timeout=timeout)
     if status is None:
         print(f"No worker host is running on {address[0]}:{address[1]}.")
         return 1
@@ -375,7 +375,7 @@ def _request_host_stop(address: tuple[str, int], *, timeout: float = 5.0) -> int
     process-terminate backstop this command has no handle for).
     """
     try:
-        with socket.create_connection(address, timeout=2.0) as sock:
+        with socket.create_connection(address, timeout=min(timeout, 2.0)) as sock:
             sp.send_frame(sock, sp.lifecycle_message(sp.LIFECYCLE_SHUTDOWN))
             sock.shutdown(socket.SHUT_WR)
             sock.settimeout(timeout)

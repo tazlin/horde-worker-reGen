@@ -179,6 +179,8 @@ class ChunkPacer:
         self._last_bytes = 0
         self._last_time = 0.0
         self._speed_bps: float | None = None
+        self._clock: Callable[[], float] = time.time
+        self._sleep: Callable[[float], None] = time.sleep
 
     def step(
         self,
@@ -202,7 +204,7 @@ class ChunkPacer:
         if should_abort():
             raise DownloadAborted
 
-        now = time.time()
+        now = self._clock()
 
         # The first observation only establishes a baseline: there is no prior sample to rate-limit
         # against, and the first callback often carries the whole chunk already read, so pacing it would
@@ -234,7 +236,7 @@ class ChunkPacer:
                 on_wait=on_wait,
                 poll_seconds=poll_seconds,
             )
-            now = time.time()
+            now = self._clock()
             elapsed = now - self._last_time
 
         if elapsed > 0 and delta > 0:
@@ -282,7 +284,7 @@ class ChunkPacer:
             if on_wait is not None:
                 on_wait(make_progress())
             nap = min(poll_seconds, remaining)
-            time.sleep(nap)
+            self._sleep(nap)
             remaining -= nap
         if should_abort():
             raise DownloadAborted
@@ -300,7 +302,7 @@ class ChunkPacer:
         while is_paused() and not should_abort():
             if on_wait is not None:
                 on_wait(progress)
-            time.sleep(poll_seconds)
+            self._sleep(poll_seconds)
         if should_abort():
             raise DownloadAborted
 

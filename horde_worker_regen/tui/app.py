@@ -474,8 +474,14 @@ class HordeWorkerTUI(App[None]):
         """Begin the refresh loop, then run first-run setup or the usual start/onboarding prompts."""
         self._start_time = time.monotonic()
         configure_fidelity(self._detect_low_fidelity(self.console.encoding))
-        self.set_interval(0.1, self._tick)
-        self.set_interval(1.0, self._refresh_title)
+        # Pilot tests drive state changes explicitly. Letting these timers run as well creates an ever-growing
+        # render/message backlog that makes teardown take seconds per test without exercising extra behaviour.
+        testing = bool(os.environ.get("AI_HORDE_TESTING"))
+        if testing:
+            self.call_after_refresh(self._tick)
+        else:
+            self.set_interval(0.1, self._tick)
+            self.set_interval(1.0, self._refresh_title)
         # Resolve the models volume from config before any disk figures are computed, so free space and
         # on-disk checks match the worker's configured cache_home instead of defaulting to ./models.
         with contextlib.suppress(Exception):
@@ -487,7 +493,8 @@ class HordeWorkerTUI(App[None]):
         self._maybe_check_for_updates()
         from horde_worker_regen.update_check import UPDATE_CHECK_INTERVAL_SECONDS
 
-        self.set_interval(UPDATE_CHECK_INTERVAL_SECONDS, self._periodic_update_check)
+        if not testing:
+            self.set_interval(UPDATE_CHECK_INTERVAL_SECONDS, self._periodic_update_check)
         self._warm_model_catalog()
         if self._should_run_setup_wizard():
             self._run_setup_wizard()

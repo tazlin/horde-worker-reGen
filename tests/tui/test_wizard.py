@@ -22,6 +22,8 @@ from horde_worker_regen.tui.wizard import (
     suggested_default_models,
 )
 
+pytestmark = pytest.mark.slow
+
 
 def _write_config(path: Path, *, api_key: str, dreamer_name: str) -> None:
     """Write a minimal bridgeData with the given identity fields using the editor's YAML path."""

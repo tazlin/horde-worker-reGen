@@ -112,11 +112,13 @@ def test_readiness_invariant_holds_under_adversarial_drift() -> None:
         num_present = rng.randint(0, 200)
         num_to_download = rng.randint(0, 200)
         plan = _plan(num_present, num_to_download)
-        pending = [_item(f"p{rng.randint(0, 400)}") for _ in range(rng.randint(0, 400))]
+        # Queue size is deliberately irrelevant to the function and already has a 101-entry regression case
+        # above. Keep fuzzing queue *shape* without constructing millions of validated Pydantic objects.
+        pending = [_item(f"p{rng.randint(0, 400)}") for _ in range(rng.randint(0, 3))]
         current = _current(f"c{rng.randint(0, 400)}") if rng.random() < 0.7 else None
         failures = [
             DownloadFailure(model_name=f"f{rng.randint(0, 400)}", feature="image model", reason="x")
-            for _ in range(rng.randint(0, 400))
+            for _ in range(rng.randint(0, 3))
         ]
         downloads = DownloadStatusSnapshot(pending=pending, current=current, failures=failures)
 

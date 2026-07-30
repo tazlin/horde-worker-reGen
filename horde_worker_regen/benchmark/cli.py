@@ -193,7 +193,7 @@ def _prepare_catalog(
     # hordelib's empty ./models fallback. Passing the tiers also opts into the beta reference when a beta
     # tier (qwen/zimage) is requested.
     ensure_worker_env(args.process_mode, tiers)
-    machine = detect_machine_info(probe_devices=probe_devices)
+    machine = detect_machine_info(probe_devices=probe_devices and args.process_mode == "real")
 
     options = CatalogOptions(
         tiers=tiers,

@@ -15,6 +15,8 @@ from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
 from horde_worker_regen.tui.widgets.custom_model_builder import CustomModelBuilderResult
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 
+pytestmark = pytest.mark.slow
+
 
 class _EditorHarness(App[None]):
     """A minimal app that mounts only the config editor over a given file."""

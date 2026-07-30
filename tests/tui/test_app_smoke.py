@@ -19,6 +19,8 @@ from horde_worker_regen.tui.wizard import WizardOutcome
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 from tests.tui._fake_supervisor import FakeSupervisor
 
+pytestmark = pytest.mark.slow
+
 # Headless run_test throttles timers, so the test drives the app's tick directly.
 _LIVE_PHASES = {
     WorkerPhase.WARMING_UP,
@@ -184,7 +186,7 @@ async def test_view_mode_density_propagates_to_every_tab(tmp_path: Path) -> None
 
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     store.set_auto_start_worker(True)
-    supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="DensityApp"), mode=WorkerProcessMode.FAKE)
+    supervisor = FakeSupervisor(alive=True)
     app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
     essentials_id = _subtab_id(CONFIG_SUBTABS[0][0])
     advanced_id = _subtab_id(CONFIG_SUBTABS[-1][0])

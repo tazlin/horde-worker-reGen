@@ -8,18 +8,27 @@ from pathlib import Path
 
 import pytest
 
+from horde_worker_regen import _guarded_purge as guarded_purge_module
 from horde_worker_regen.logging_purge import (
-    _BYTES_PER_GB,
     _SECONDS_PER_DAY,
     LogPurgeResult,
     purge_log_directory,
     purge_worker_logs_safely,
 )
 
+_BYTES_PER_GB = 1024
+
+
+@pytest.fixture(autouse=True)
+def _use_small_gigabytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scale the byte unit down while preserving every retention-boundary assertion."""
+    monkeypatch.setattr(guarded_purge_module, "_BYTES_PER_GB", _BYTES_PER_GB)
+
 
 def _write(path: Path, size_bytes: int, *, age_days: float) -> Path:
     """Create a file of *size_bytes* whose mtime is *age_days* in the past."""
-    path.write_bytes(b"\0" * size_bytes)
+    with path.open("wb") as file:
+        file.truncate(size_bytes)
     mtime = time.time() - age_days * _SECONDS_PER_DAY
     os.utime(path, (mtime, mtime))
     return path

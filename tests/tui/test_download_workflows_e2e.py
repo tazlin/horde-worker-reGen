@@ -46,6 +46,8 @@ from horde_worker_regen.tui.widgets.downloads import DownloadsView
 from horde_worker_regen.tui.widgets.onboarding import WorkerStartModal
 from tests.tui._fake_supervisor import FakeSupervisor
 
+pytestmark = pytest.mark.slow
+
 
 def _make_app(
     tmp_path: Path,

@@ -27,6 +27,7 @@ from horde_sdk.generic_api.apimodels import RequestErrorResponse
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+from horde_worker_regen.process_management.jobs import job_submitter as job_submitter_module
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
@@ -179,7 +180,7 @@ def _pop_is_withholding(popper: JobPopper, bridge_data: reGenBridgeData, state: 
     )
 
 
-async def test_repeated_submit_failures_back_off_the_pop_side() -> None:
+async def test_repeated_submit_failures_back_off_the_pop_side(monkeypatch: pytest.MonkeyPatch) -> None:
     """A run of failed submit attempts against a dead endpoint should make the pop side back off.
 
     A single submit pass against a timing-out endpoint re-attempts one generation many times with zero
@@ -187,6 +188,7 @@ async def test_repeated_submit_failures_back_off_the_pop_side() -> None:
     continuing to accept new work at full rate onto a queue it cannot drain). The pop side's own decision
     surface is read here: an active error backoff or an engaged consecutive-failure skip.
     """
+    monkeypatch.setattr(job_submitter_module, "_submit_retry_backoff_seconds", lambda _wave_index: 0.0)
     state = WorkerState()
     tracker = JobTracker()
     tracker.set_retry_policy(1)

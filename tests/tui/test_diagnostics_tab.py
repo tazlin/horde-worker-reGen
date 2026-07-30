@@ -23,6 +23,8 @@ from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView
 from tests.tui._fake_supervisor import FakeSupervisor
 
+pytestmark = pytest.mark.slow
+
 
 def _diagnosis(index: int, *findings: Finding, version: str = "12.29.0") -> SessionDiagnosisView:
     """A lightweight session-diagnosis view (what the off-process pass returns) with the given findings."""

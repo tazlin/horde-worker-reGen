@@ -18,6 +18,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 # Parent-process and torch-free-by-contract planning modules. Importing any of these must not pull torch:
 # they run in the orchestrator (or the no-boot benchmark ``plan`` preview), which is torch-free.
 _TORCH_FREE_IMPORT_MODULES = [
@@ -67,21 +69,33 @@ def _run_torch_free_snippet(body: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.mark.parametrize("module_name", _TORCH_FREE_IMPORT_MODULES)
-def test_orchestrator_module_import_is_torch_free(module_name: str) -> None:
-    """Importing a parent/planning module must not drag torch in (guards against a stray ``hordelib.api``)."""
-    result = _run_torch_free_snippet(f"import {module_name}")
+def test_orchestrator_module_imports_are_torch_free() -> None:
+    """Import all parent/planning modules in one clean interpreter and report the first torch offender."""
+    body = (
+        "import importlib, sys\n"
+        f"modules = {_TORCH_FREE_IMPORT_MODULES!r}\n"
+        "for module_name in modules:\n"
+        "    importlib.import_module(module_name)\n"
+        "    torch_mods = [m for m in sys.modules if m == 'torch' or m.startswith('torch.')]\n"
+        "    if torch_mods:\n"
+        "        print('TORCH_LOADED_AFTER:' + module_name)\n"
+        "        sys.exit(7)\n"
+    )
+    result = _run_torch_free_snippet(body)
     assert result.returncode == 0, (
-        f"importing {module_name} pulled in torch:\n{result.stdout}\n{result.stderr}\n"
+        f"an orchestrator module pulled in torch:\n{result.stdout}\n{result.stderr}\n"
         "Import pure-Python helpers from their torch-free hordelib submodule (feature_impact / "
         "feature_requirements / metrics / utils.torch_memory / utils.logger), never from hordelib.api."
     )
 
 
 def test_system_resources_detect_does_not_load_torch_in_caller() -> None:
-    """Calling ``SystemResources.detect()`` enumerates devices out-of-process, so the caller stays torch-free."""
+    """``SystemResources.detect()`` itself stays clean while the real probe is covered separately below."""
     result = _run_torch_free_snippet(
-        "from horde_worker_regen.process_management.process_manager import SystemResources\nSystemResources.detect()",
+        "from horde_worker_regen.utils import accelerator_probe\n"
+        "accelerator_probe.probe_accelerators = lambda: []\n"
+        "from horde_worker_regen.process_management.process_manager import SystemResources\n"
+        "SystemResources.detect()",
     )
     assert result.returncode == 0, (
         f"SystemResources.detect() loaded torch into the orchestrator:\n{result.stdout}\n{result.stderr}\n"

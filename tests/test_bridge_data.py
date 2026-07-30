@@ -166,20 +166,14 @@ def test_pipeline_disaggregation_config_enables_flag() -> None:
 def test_bridge_data_loader_yaml_template() -> None:
     """Test that the bridge data template file can be loaded and parsed by a BridgeDataLoader.
 
-    Synchronous on purpose: ``BridgeDataLoader.load`` initializes the model reference manager via
-    ``asyncio.run`` internally, which cannot run inside a pytest-asyncio event loop.
+    Meta-instruction resolution has dedicated coverage; this parser test intentionally omits a reference
+    manager so it cannot initialize or refresh network-backed references.
     """
     bridge_data_loader = BridgeDataLoader()
-
-    if not ModelReferenceManager.has_instance():
-        horde_model_reference_manager = ModelReferenceManager()
-    else:
-        horde_model_reference_manager = ModelReferenceManager.get_instance()
 
     bridge_data = bridge_data_loader.load(
         file_path="bridgeData_template.yaml",
         file_format=ConfigFormat.yaml,
-        horde_model_reference_manager=horde_model_reference_manager,
     )
 
     assert bridge_data is not None
@@ -187,6 +181,7 @@ def test_bridge_data_loader_yaml_template() -> None:
     assert bridge_data.api_key == ANON_API_KEY
 
 
+@pytest.mark.slow
 async def test_bridge_data_loader_yaml_local_if_present() -> None:
     """Test that the bridge data file can be loaded and parsed by a BridgeDataLoader (if present)."""
     bridge_data_loader = BridgeDataLoader()

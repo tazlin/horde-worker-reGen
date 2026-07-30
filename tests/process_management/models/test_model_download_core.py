@@ -101,6 +101,31 @@ def _prime(pacer: ChunkPacer, total: int, *, rate: int) -> None:
     pacer.step(0, total, is_paused=lambda: False, rate_limit_kbps=lambda: rate, should_abort=lambda: False)
 
 
+class _FakeClock:
+    """Advance deterministic pacer time whenever the test double sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1.0
+        self.slept = 0.0
+
+    def time(self) -> float:
+        """Return the current synthetic wall time."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Advance synthetic time without blocking the test process."""
+        self.slept += seconds
+        self.now += seconds
+
+
+def _use_fake_clock(pacer: ChunkPacer) -> _FakeClock:
+    """Install a deterministic clock on a pacer and return it for assertions."""
+    clock = _FakeClock()
+    pacer._clock = clock.time
+    pacer._sleep = clock.sleep
+    return clock
+
+
 def test_chunk_pacer_does_not_stall_on_large_first_chunk() -> None:
     """A large *first* chunk under a cap returns at once: pacing it would freeze before any feedback.
 
@@ -162,25 +187,19 @@ def test_chunk_pacer_caps_throttle_wait() -> None:
     leaving the connection idle (servers drop it) and breaking the in-flight download.
     """
     pacer = ChunkPacer()
+    clock = _use_fake_clock(pacer)
     _prime(pacer, 50_000_000, rate=10)
-    done = threading.Event()
 
-    def run() -> None:
-        # 50 MB at 10 kB/s is ~4880s uncapped.
-        pacer.step(
-            50_000_000, 50_000_000, is_paused=lambda: False, rate_limit_kbps=lambda: 10, should_abort=lambda: False
-        )
-        done.set()
+    # 50 MB at 10 kB/s is ~4880s uncapped.
+    pacer.step(50_000_000, 50_000_000, is_paused=lambda: False, rate_limit_kbps=lambda: 10, should_abort=lambda: False)
 
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(timeout=ChunkPacer.MAX_THROTTLE_SECONDS + 3.0)
-    assert done.is_set(), "a single chunk's throttle wait must be capped, not unbounded"
+    assert clock.slept == pytest.approx(ChunkPacer.MAX_THROTTLE_SECONDS)
 
 
 def test_chunk_pacer_heartbeats_during_throttle_wait() -> None:
     """The pacer emits periodic heartbeats during a throttle wait, so the UI refreshes mid-wait."""
     pacer = ChunkPacer()
+    clock = _use_fake_clock(pacer)
     _prime(pacer, 10_000_000, rate=100)
     beats: list[ModelProgress] = []
 
@@ -195,6 +214,7 @@ def test_chunk_pacer_heartbeats_during_throttle_wait() -> None:
     )
     assert len(beats) >= 2
     assert all(beat.downloaded_bytes == 2_000_000 for beat in beats)
+    assert clock.slept == pytest.approx(ChunkPacer.MAX_THROTTLE_SECONDS)
 
 
 # --- download_one_model: validate + retry-once --------------------------------------------------------

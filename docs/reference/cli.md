@@ -218,7 +218,9 @@ horde-benchmark plan --tiers flux --json
 `--no-features`, `--no-alchemy`, `--exclude-capability`, `--include-downloads`, `--force`), so the
 preview matches exactly what the run would do. The same plan table is also printed at the top of every
 `run` (emitted on the progress channel as a `RampPlanned` event), so `monitor` and the dashboard show it
-too. Pass `--force` to see probes that do not fit (or lack a token) reported as `RUN` instead of `SKIP`.
+too. Fake-mode plans skip device discovery because fake runs do not use or gate on GPU resources; real-mode
+plans still probe the machine for their fit verdicts. Pass `--force` to see probes that do not fit (or lack a
+token) reported as `RUN` instead of `SKIP`.
 
 ## `horde-log`
 

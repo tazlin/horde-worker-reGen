@@ -195,6 +195,7 @@ def test_dry_run_plan_lists_a_missing_controlnet_checkpoint(
     assert controlnet_rows[0].on_disk is False
 
 
+@pytest.mark.slow
 def test_dry_run_plan_does_not_import_torch() -> None:
     """The dry-run plan stays torch-free: a short-lived preview must never pay the cold torch import.
 

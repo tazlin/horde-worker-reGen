@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api.apimodels import (
@@ -301,11 +302,14 @@ class TestApiJobPopGuardClauses:
         popper = _make_popper(process_map=ProcessMap({10: safety_proc}))
         await popper.api_job_pop()
 
-    async def test_no_models_configured_returns_early(self) -> None:
+    async def test_no_models_configured_returns_early(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Empty model list should prevent pops (with a sleep penalty)."""
+        sleep = AsyncMock()
+        monkeypatch.setattr("horde_worker_regen.process_management.jobs.job_popper.asyncio.sleep", sleep)
         process_map = _make_process_map_with_available_processes()
         popper = _make_popper(process_map=process_map, image_models_to_load=[])
         await popper.api_job_pop()
+        sleep.assert_awaited_once_with(3)
 
     async def test_too_frequent_pop_returns_early(self) -> None:
         """Popping again within the throttle window should be skipped."""
