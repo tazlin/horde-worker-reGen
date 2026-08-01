@@ -93,6 +93,14 @@ Screen.level-developer .level-developer-only {
     display: block;
 }
 
+/* Config fields carry their risk tier as a class. Withholding them in CSS leaves the widget mounted and
+   its value intact, so a field the current level does not show is still written back on save. */
+Screen.level-simple .field-advanced,
+Screen.level-simple .field-dangerous,
+Screen.level-advanced .field-dangerous {
+    display: none;
+}
+
 Screen.density-compact .horde-card {
     padding: 0 1;
     margin-bottom: 0;

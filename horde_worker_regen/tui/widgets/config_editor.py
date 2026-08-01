@@ -78,6 +78,16 @@ _ADVANCED_SECTIONS: set[str] = {
     section for label, sections in CONFIG_SUBTABS if label == "Advanced" for section in sections
 }
 
+_SIMPLE_SUBTABS: frozenset[str] = frozenset({"Essentials", "Models", "Content", "Features"})
+"""Sub-tab labels offered in the Simple experience.
+
+These cover the decisions a contributor actually makes: who the worker is, what it runs, what content it
+accepts, and which capabilities it offers. The rest are tuning surfaces whose settings only mean
+something next to the measurements that justify changing them, so they are withheld rather than
+presented without that context. The Dashboard page is always offered regardless, since it is the way
+back to a fuller view.
+"""
+
 # Only fields whose section is bundled into a sub-tab get widgets in ``compose``. A section that is
 # absent from ``CONFIG_SUBTABS`` (e.g. the developer-only "Dry-run" flags, which stay editable via YAML
 # but are deliberately kept out of the operator UI) is never laid out, so the loops that walk every
@@ -435,10 +445,37 @@ class ConfigEditorView(Vertical):
         self._clean_state: dict[str, object] | None = None
 
     def set_experience_level(self, level: ExperienceLevel) -> None:
-        """Record the level that governs which fields are offered and which are guarded."""
+        """Offer the sub-tabs and fields this level is meant to edit.
+
+        Simple keeps the pages a contributor has reason to change and withholds the tuning pages, whose
+        settings are meaningful only alongside the diagnostics that justify changing them. Nothing is
+        lost by withholding them: the values stay in the file and are written back untouched on save,
+        and the Dashboard page is never withheld, so the way back to a fuller view is always present.
+        """
         self._experience_level = level
         with contextlib.suppress(Exception):
             self.query_one(DashboardPreferencesView).set_experience_level(level)
+        simple = level is ExperienceLevel.SIMPLE
+        with contextlib.suppress(Exception):
+            subtabs = self.query_one("#config-subtabs", TabbedContent)
+            for label, _sections in CONFIG_SUBTABS:
+                tab_id = _subtab_id(label)
+                with contextlib.suppress(Exception):
+                    if simple and label not in _SIMPLE_SUBTABS:
+                        subtabs.hide_tab(tab_id)
+                    else:
+                        subtabs.show_tab(tab_id)
+            with contextlib.suppress(Exception):
+                if simple:
+                    subtabs.hide_tab(_GPU_SUBTAB_ID)
+                else:
+                    subtabs.show_tab(_GPU_SUBTAB_ID)
+            if simple and subtabs.active not in {_subtab_id(label) for label in _SIMPLE_SUBTABS} | {
+                "cfgtab-dashboard",
+            }:
+                subtabs.active = "cfgtab-dashboard"
+        with contextlib.suppress(Exception):
+            self.query_one("#config-simple-note", Static).display = simple
 
     def compose(self) -> ComposeResult:
         """Lay out the pinned action bar and status line, then the grouped fields in sub-tabs."""
@@ -453,6 +490,12 @@ class ConfigEditorView(Vertical):
             f"Editing {self._config_path}  ·  Save applies automatically (the worker watches the file)  ·  "
             "⟳ marks fields that only take effect on restart",
             id="config-status",
+        )
+        yield Static(
+            "Showing the settings most contributors need. Switch to the Advanced experience on the "
+            "Dashboard page below to see performance tuning, timeouts, and per-GPU settings.",
+            id="config-simple-note",
+            classes="config-guidance",
         )
         yield Static("", id="config-effective-summary")
         yield Static("", id="config-change-summary")
@@ -596,6 +639,11 @@ class ConfigEditorView(Vertical):
                 Static(field.help, classes="config-help"),
                 classes="config-field",
             )
+        # Tag the group with its risk tier so the level stylesheet can withhold it. Gating in CSS keeps
+        # the widget mounted and its value intact, so a field hidden at one level is still saved from the
+        # form rather than being dropped from the config on the next write.
+        if field.risk_level and field.risk_level != "normal":
+            control.add_class(f"field-{field.risk_level}")
         return control
 
     def on_mount(self) -> None:
