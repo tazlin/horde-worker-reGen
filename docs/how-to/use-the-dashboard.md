@@ -55,7 +55,41 @@ After you start, your selected models download in the background and the dashboa
 your selection and connection. The worker serves each model as soon as it finishes, so keep the
 window open.
 
+## Experience levels
+
+The dashboard opens in **Simple**, which leads with plain-language status and live progress. Two fuller
+levels are available:
+
+| Level | What it is for |
+|-------|----------------|
+| **Simple** | Contributing without needing to understand the worker. Plain wording, live per-request progress, and the settings most contributors change. |
+| **Advanced** | The complete operator surface: queues, per-process state, scheduler behaviour, download detail, and the whole configuration. |
+| **Developer** | Advanced plus forensic detail and settings that can stop a healthy worker. Entering it once asks you to confirm. |
+
+Change level in the **Dashboard** section of the Config tab, or press `Ctrl+P` and search for the level
+you want. The choice is remembered between runs.
+
+Every tab exists at every level. The level changes how much detail each tab shows, never which tabs you
+have, so anything you learn to find in Simple is in the same place in Developer. Two things are
+withheld in Simple rather than merely simplified: the Config tab offers only its Dashboard, Essentials,
+Models, Content, and Features pages, and the GPU table drops its tuning columns. Settings you cannot see
+are still preserved: saving from Simple writes back everything already in `bridgeData.yaml`, so
+switching level never rewrites a tuned config.
+
+If you upgraded from a version without levels, the dashboard tells you the default changed on first
+launch and offers to keep the full view.
+
+### Appearance
+
+The same Dashboard section chooses a theme (**Horde Dark**, **Horde Light**, or **Terminal colours**,
+which follows your terminal's own 16-colour palette and suits low-colour or high-contrast setups) and a
+spacing density (comfortable or compact) for the Advanced and Developer surfaces.
+
 ## Tabs
+
+The descriptions below are the **Advanced** presentation of each tab. In Simple, Overview, Live, and
+Downloads show plain-language equivalents instead, and the remaining tabs keep these widgets with a
+one-line explanation of what the page is for above them.
 
 | Tab | What it shows |
 |-----|---------------|
@@ -119,9 +153,16 @@ health summary and overall RAM are always in the status bar.
 
 ## Keyboard shortcuts
 
+The bar at the bottom of the screen shows as many shortcuts as the terminal is wide enough to hold, so
+on a narrow window it shows only the first few. The full list is always available two ways: press `?`
+for help, or `Ctrl+P` for the command palette, which lists every tab and every shortcut by name and
+shows the key beside each one. Both of those keys stay visible even at 80 columns.
+
 | Key | Action |
 |-----|--------|
 | `F3` | Start / stop the worker without quitting |
+| `?` | Help for the level you are using, and the complete shortcut list |
+| `Ctrl+P` | Command palette: jump to any tab, run any shortcut, or change level |
 | `F6` | Cycle dashboard density: normal, details, thin |
 | `C` | Open the customize-layout overlay to show/hide individual Overview panels |
 | `H` | Reveal all hidden Overview panels (press again to re-hide them) |

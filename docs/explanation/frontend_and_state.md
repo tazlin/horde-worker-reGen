@@ -219,6 +219,55 @@ fails fast *before* any process spawns:
    unreachable (after a small bounded retry), so the worker never silently runs
    under a name the horde will reject.
 
+## Progressive experience levels
+
+The dashboard serves two audiences whose needs pull in opposite directions: a
+contributor who wants to donate GPU time without learning what a sampling lane is,
+and an operator tuning throughput. Rather than averaging them into one surface that
+serves neither,
+[`ExperienceLevel`][horde_worker_regen.app_state.ExperienceLevel] selects how much
+implementation detail each destination renders.
+
+The load-bearing constraint is that the level changes *depth*, never *navigation*.
+Every tab exists and is reachable at every level. Overview, Live, and Downloads each
+host both presentations and swap which is displayed; the rest keep their operator
+widgets and gain only an explanatory line. Consolidating destinations by level was
+considered and rejected: hiding tabs makes the dashboard's shape depend on a setting
+the user may not know they changed, and someone who learns where a thing lives in
+Simple would have to relearn it on promotion.
+
+Withholding is deliberately reversible and non-destructive. Config fields are gated
+through the stylesheet rather than skipped during composition, so a withheld widget
+stays mounted holding its value and is written back on save; skipping composition
+would silently drop those keys from `bridgeData.yaml` the next time an unrelated
+setting was saved. The Config editor's Dashboard page is never withheld, so the
+control that changes level cannot be hidden by the level.
+
+Because the default is Simple, an installation that predates the levels would
+otherwise appear to have lost its detail. A state file stamped before schema 2 sets
+`needs_experience_introduction`, and the notice is answered before the setup and
+start prompts, so the changed default is visible rather than inferred. This is the
+one thing the schema version is used for: reads never reject an older file, since
+every field carries a default.
+
+### Liveness that the failure cannot satisfy
+
+Simple's indicator exists to distinguish a working worker from a wedged one, which
+constrains what may drive it. A spinner advanced by the render loop animates just as
+happily over a dead worker, and so proves nothing (see
+[Liveness proofs must be failure-independent](resilience_and_recovery.md)). The
+indicator therefore advances on `heartbeats_inference_steps`, a counter the worker
+increments only by actually sampling, and freezes when that counter does.
+
+The snapshot timestamp is tracked separately because it fails differently: it
+advances whenever the worker's loop runs at all, which makes it the right signal for
+an idle worker with no work to do, and the wrong one while a job is in hand. It is
+therefore not allowed to satisfy the stall check, so a worker whose loop still ticks
+while sampling has stopped is still reported as stalled. Progress percentages come
+from the worker's own reported values and fall back to its step counters; when it
+reports neither, the view shows an indeterminate state rather than inventing a
+number.
+
 ## Durable app state
 
 [`app_state.py`][horde_worker_regen.app_state] is the structured, on-disk
@@ -226,10 +275,13 @@ counterpart to the in-memory [`WorkerState`](architecture.md#the-shared-state-pa
 it records what the application needs to remember *between* invocations: the last
 benchmark and where its results live, the last worker run, the last-known-good
 settings, which worker version last ran (so a version bump can mark a stale
-benchmark for re-running), and the operator's durable UI preferences (the Overview
-density mode, the trend window, and which Overview panels are hidden). A hidden-panel
-key that no longer names a live element is dropped on load, so a stale preference can
-never block the Overview from rendering.
+benchmark for re-running), and the operator's durable UI preferences (the experience
+level, the theme and display density, the Overview density mode, the trend window,
+and which Overview panels are hidden). A hidden-panel key that no longer names a live
+element is dropped on load, so a stale preference can never block the Overview from
+rendering; a `theme_name` this build cannot restore falls back to the default for the
+same reason. The known theme names are duplicated in `app_state` rather than imported
+from the TUI, because the worker reads this module too and it stays free of Textual.
 
 The store lives in a grouped working-directory folder
 (`.horde_worker_regen/state.json`), alongside `bridgeData.yaml`, `logs/`,
