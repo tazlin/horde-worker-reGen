@@ -9,7 +9,12 @@ went in flight and faults only a stalled in-flight transfer, and a late outcome 
 
 from __future__ import annotations
 
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
+from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
@@ -95,6 +100,17 @@ def _make(
         clock=the_clock,
     )
     return coordinator, sender, state, the_clock
+
+
+@contextmanager
+def _captured_info() -> Iterator[list[str]]:
+    """Collect the INFO-and-above messages emitted inside the block, for assertions on operator-facing lines."""
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
 
 
 def _ok_message(job: ImageGenerateJobPopResponse, name: str) -> HordeAuxPrefetchResultMessage:
@@ -819,3 +835,132 @@ async def test_deferral_never_resurrects_a_job_that_moved_on() -> None:
     assert tracker.are_job_aux_models_prepared(job) is False
     assert state.lora_download_backoff.strikes == 0
     assert coordinator.has_live_deadline(job.id_) is False
+
+
+class TestAuxHoldReporting:
+    """A job held on its auxiliary files states that fact, so an idle-looking worker is explained.
+
+    An aux-held job holds no lane, so every inference process reports WAITING_FOR_JOB while the queue is
+    non-empty. Without a stated cause that reads as a stall. These cover the census the status dump prints
+    and the one-shot log line that names a hold once it has lasted long enough to be worth explaining.
+    """
+
+    @staticmethod
+    def _held_setup(
+        tracker: JobTracker,
+        *,
+        timeout: float = 600.0,
+    ) -> tuple[AuxPrefetchCoordinator, _Clock]:
+        """A coordinator whose clock is anchored to real time, so held ages match the tracker's pop stamps."""
+        clock = _Clock()
+        clock.now = time.time()
+        coordinator, _sender, _state, _clock = _make(tracker, clock=clock, timeout=timeout)
+        return coordinator, clock
+
+    async def test_summary_reports_held_job_count_outstanding_files_and_age(self) -> None:
+        """The census names how many jobs wait, how many files they wait on, and how long."""
+        tracker = JobTracker()
+        job = _job(loras=[_lora("styleA"), _lora("styleB")])
+        await track_popped_job_async(tracker, job)
+        coordinator, clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+
+        clock.now += 45.0
+        summary = coordinator.hold_summary()
+
+        assert summary is not None
+        assert "1 job(s)" in summary
+        assert "2 pending LoRA/TI file(s)" in summary
+        assert "oldest 45s" in summary
+
+    async def test_summary_counts_only_files_still_outstanding(self) -> None:
+        """A file that has landed stops being counted, so the census tracks remaining work, not the request."""
+        tracker = JobTracker()
+        job = _job(loras=[_lora("styleA"), _lora("styleB")])
+        await track_popped_job_async(tracker, job)
+        coordinator, _clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+
+        coordinator.on_prefetch_result(_ok_message(job, "styleA"))
+        summary = coordinator.hold_summary()
+
+        assert summary is not None
+        assert "1 pending LoRA/TI file(s)" in summary
+
+    async def test_no_summary_when_nothing_is_held(self) -> None:
+        """A worker with no auxiliary holds prints no line at all rather than an empty census."""
+        tracker = JobTracker()
+        job = _job()
+        await track_popped_job_async(tracker, job)
+        coordinator, _clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+
+        assert coordinator.hold_summary() is None
+
+    async def test_no_summary_once_the_job_is_prepared(self) -> None:
+        """The hold ends when the files land, so the explanation stops with it."""
+        tracker = JobTracker()
+        job = _job(loras=[_lora("styleA")])
+        await track_popped_job_async(tracker, job)
+        coordinator, _clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+        assert coordinator.hold_summary() is not None
+
+        coordinator.on_prefetch_result(_ok_message(job, "styleA"))
+
+        assert coordinator.hold_summary() is None
+
+    async def test_slow_hold_is_named_once_not_every_scan(self) -> None:
+        """A long hold explains itself once; repeated scans do not re-log the same job."""
+        tracker = JobTracker()
+        job = _job(loras=[_lora("styleA")])
+        await track_popped_job_async(tracker, job)
+        coordinator, clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+
+        clock.now += 30.0
+        with _captured_info() as messages:
+            coordinator.announce_slow_holds()
+            coordinator.announce_slow_holds()
+            clock.now += 30.0
+            coordinator.announce_slow_holds()
+
+        holds_named = [message for message in messages if "waiting on 1 auxiliary file(s)" in message]
+        assert len(holds_named) == 1
+        assert str(job.id_)[:8] in holds_named[0]
+
+    async def test_short_hold_is_not_named(self) -> None:
+        """A brief wait is ordinary scheduling noise and stays out of the log."""
+        tracker = JobTracker()
+        job = _job(loras=[_lora("styleA")])
+        await track_popped_job_async(tracker, job)
+        coordinator, clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+
+        clock.now += 1.0
+        with _captured_info() as messages:
+            coordinator.announce_slow_holds()
+
+        assert not [message for message in messages if "auxiliary file(s)" in message]
+
+    async def test_a_later_hold_of_the_same_job_is_named_again(self) -> None:
+        """The one-shot marker belongs to a hold, not to a job, so a genuinely new hold explains itself too."""
+        tracker = JobTracker()
+        job = _job(loras=[_lora("styleA")])
+        await track_popped_job_async(tracker, job)
+        coordinator, clock = self._held_setup(tracker)
+        coordinator.on_job_popped(job)
+        clock.now += 30.0
+        with _captured_info() as first:
+            coordinator.announce_slow_holds()
+
+        # The download process dies and restarts, so the still-uncached job is re-requested against the
+        # fresh downloader: a new hold, which the operator has not been told about.
+        coordinator.on_downloader_reset()
+        coordinator.on_job_popped(job)
+        clock.now += 30.0
+        with _captured_info() as second:
+            coordinator.announce_slow_holds()
+
+        assert [message for message in first if "auxiliary file(s)" in message]
+        assert [message for message in second if "auxiliary file(s)" in message]

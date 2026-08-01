@@ -8,6 +8,8 @@ docs/plans/**/*.md
 kudos_training_data*
 .claude/**
 
+_testing/
+
 benchmark_results/runs
 benchmark_results/**/*
 benchmark_results/*_validate/*

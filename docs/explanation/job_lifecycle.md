@@ -169,9 +169,14 @@ depend on this queue-gated cycle running; see
    pop the parent asks the dedicated download process to place the job's not-yet-cached auxiliary files on
    disk while the job stays `PENDING_INFERENCE`, so dispatch finds them already cached (see
    [pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch)). While unprepared, the job
-   is invisible to both dispatch selection and preload: it is never chosen as the dispatch head, never
-   preloaded or staged, and owns no lane and no VRAM reservation, so a fitting sibling behind it is fed
-   instead. Once its prepared flag is set it re-enters the ordinary dispatch gates like any other job. A
+   is invisible to dispatch selection: it is never chosen as the dispatch head and owns no lane and no VRAM
+   reservation, so a fitting sibling behind it is fed instead. Preload is the one exception, and only when it
+   is free: an unprepared job may stage its checkpoint into a wholly unoccupied slot when no other pending
+   job is competing for one, so the load runs alongside the auxiliary download rather than after it (on a
+   cold start that is the whole checkpoint load added to the wait). It never displaces a resident model,
+   cycles a process, or escalates eviction, and any job that can actually sample outranks it. Staging is not
+   dispatch: the job still cannot sample until its files land. Once its prepared flag is set it re-enters the
+   ordinary dispatch gates like any other job. A
    per-job prefetch deadline is the backstop (a job whose outstanding files have no in-flight download is
    served without them rather than waiting forever, since the inference path would run without them; only a
    stalled in-flight transfer faults); the periodic reconcile sweep is the liveness that heals a lost or

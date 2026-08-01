@@ -116,6 +116,7 @@ class StatusReporter:
         download_status: DownloadStatusSnapshot | None = None,
         download_plan: DownloadPlanSummary | None = None,
         stage_age_line: str | None = None,
+        aux_hold_line: str | None = None,
         model_pool_status: ModelPoolSnapshot | None = None,
     ) -> float:
         """Print the status of the worker.
@@ -151,6 +152,9 @@ class StatusReporter:
             download_plan: The config's disk-budget summary, or None when the reference is not loaded.
             stage_age_line: A pre-formatted per-stage census (count + oldest age) to print under the job
                 info, or None to omit it (nothing is aging).
+            aux_hold_line: A pre-formatted census of jobs held awaiting LoRA/TI downloads, or None to omit it
+                (nothing is held). Explains a pending queue that every idle process would otherwise
+                contradict.
             model_pool_status: Live fixed-pool seats, lane tallies, and download admission budget. None means the pool
                 is disabled or has not produced a snapshot yet; ``bridge_data`` distinguishes those cases.
 
@@ -195,6 +199,10 @@ class StatusReporter:
         # in SAFETY_CHECKING or PENDING_SUBMIT while inference keeps finishing) visible at a glance.
         if stage_age_line:
             logging_function(f"<fg #7dcea0>  {stage_age_line}</>")
+
+        # Why the queue can be non-empty while every inference process reports WAITING_FOR_JOB.
+        if aux_hold_line:
+            logging_function(f"<fg #f0c674>  {aux_hold_line}</>")
 
         self._print_model_pool(
             logging_function,
@@ -453,17 +461,21 @@ class StatusReporter:
         if download_status.error_message:
             logging_function(f"  <fg #ff5555>error: {download_status.error_message}</>")
 
-        current = download_status.current
-        if current is not None:
-            percent = current.percent
+        # Downloads run in parallel (several ad-hoc LoRA fetches to one host, or one per host), so rendering
+        # only the primary names one transfer while others move unreported, and the one named is whichever
+        # the downloader happened to list first rather than the one the reader is waiting on. Prefer the full
+        # in-flight set; `current` remains the fallback for a snapshot that predates it.
+        active = download_status.active or ([download_status.current] if download_status.current else [])
+        for item in active:
+            percent = item.percent
             percent_text = f"{percent:.1f}%" if percent is not None else "?"
-            speed = f"{_human_bytes(current.speed_bps)}/s" if current.speed_bps else "-"
+            speed = f"{_human_bytes(item.speed_bps)}/s" if item.speed_bps else "-"
             logging_function(
-                f"  Now: {current.model_name} [{current.feature}] -> {current.target_dir}",
+                f"  Now: {item.model_name} [{item.feature}] -> {item.target_dir}",
             )
             logging_function(
-                f"       {_human_bytes(current.downloaded_bytes)}/{_human_bytes(current.total_bytes)} "
-                f"({percent_text}) | {speed} | ETA {_human_duration(current.eta_seconds)}",
+                f"       {_human_bytes(item.downloaded_bytes)}/{_human_bytes(item.total_bytes)} "
+                f"({percent_text}) | {speed} | ETA {_human_duration(item.eta_seconds)}",
             )
 
         if download_status.pending:

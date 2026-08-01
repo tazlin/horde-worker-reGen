@@ -94,6 +94,54 @@ def test_print_downloads_renders_current_queue_and_failures() -> None:
     assert "limit 5000 KB/s" in blob
 
 
+def test_print_downloads_renders_every_concurrent_transfer() -> None:
+    """All in-flight downloads are shown, not just the primary one.
+
+    Several ad-hoc LoRA fetches run at once (they are exempt from the per-host limit), so rendering only
+    ``current`` names one transfer while the others move unreported, and the one named is whichever the
+    downloader listed first rather than the one a reader is waiting on.
+    """
+    reporter = StatusReporter(0.0, 0.0)
+    record, lines = _collector()
+    first = CurrentDownloadStatus(
+        model_name="1447787",
+        feature="LoRa (job)",
+        target_dir="models/lora",
+        downloaded_bytes=6 * 1024 * 1024,
+        total_bytes=12 * 1024 * 1024,
+        speed_bps=4 * 1024 * 1024,
+        eta_seconds=2.0,
+    )
+    second = CurrentDownloadStatus(
+        model_name="3013688",
+        feature="LoRa (job)",
+        target_dir="models/lora",
+        downloaded_bytes=10 * 1024 * 1024,
+        total_bytes=55 * 1024 * 1024,
+        speed_bps=5 * 1024 * 1024,
+        eta_seconds=9.0,
+    )
+    third = CurrentDownloadStatus(
+        model_name="1111112",
+        feature="LoRa (job)",
+        target_dir="models/lora",
+        downloaded_bytes=0,
+        total_bytes=218 * 1024 * 1024,
+        speed_bps=0,
+        eta_seconds=None,
+    )
+    status = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        current=first,
+        active=[first, second, third],
+    )
+
+    assert reporter._print_downloads(record, status, None) is True
+    blob = "\n".join(lines)
+    for name in ("1447787", "3013688", "1111112"):
+        assert name in blob
+
+
 def test_print_download_status_shows_paused() -> None:
     """A paused snapshot is labelled as paused in the phase line."""
     reporter = StatusReporter(0.0, 0.0)

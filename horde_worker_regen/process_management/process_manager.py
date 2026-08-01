@@ -3581,6 +3581,9 @@ class HordeWorkerProcessManager:
                 self._sweep_download_process_liveness()
                 self._aux_prefetch_coordinator.scan_deadlines()
                 self._aux_prefetch_coordinator.reconcile_and_refresh_pins()
+                # An aux-held job leaves the queue non-empty with every process idle, which is indistinguishable
+                # from a stall unless the hold says so. Named once per job past its threshold.
+                self._aux_prefetch_coordinator.announce_slow_holds()
 
             # Pre-annotate controlnet jobs off-GPU before scheduling: parks eligible jobs (removing them
             # from the inference-eligible set until their control map arrives) and releases resolved,
@@ -5123,6 +5126,7 @@ class HordeWorkerProcessManager:
             download_status=self._model_availability.status,
             download_plan=self._download_coordinator.get_download_plan_summary(),
             stage_age_line=self._build_stage_age_line(),
+            aux_hold_line=self._aux_prefetch_coordinator.hold_summary(),
             model_pool_status=self._model_pool_status(),
         )
 

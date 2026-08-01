@@ -115,9 +115,26 @@ set (every auxiliary file any tracked job still references) so a file one pendin
 needs is not evicted before that job dispatches.
 
 The prefetch pipeline is the only preparation path. Until it clears a job's gate the job
-is invisible to both dispatch selection and model preload: it is never chosen as the
-dispatch head, never preloaded or staged, and holds no lane and no VRAM reservation, so
-a fitting sibling behind it is preloaded and sampled instead of idling. Before the
+is invisible to dispatch selection: it is never chosen as the dispatch head and holds no
+lane and no VRAM reservation, so a fitting sibling behind it is preloaded and sampled
+instead of idling.
+
+Model preload is the one thing a gated job may still do, and only when it is free. When no
+other pending job is competing for a slot, the gated job may stage its checkpoint into a
+wholly *unoccupied* slot, so the checkpoint load overlaps the auxiliary download instead of
+being serialized after it. Withholding it costs the full load time on top of the transfer,
+which on a cold start (an empty worker whose first job carries uncached LoRAs) is the
+difference between a wait that ends when the files land and one that ends a checkpoint load
+later. The allowance never displaces a resident model, cycles a process, or escalates
+eviction, and any job that can actually sample takes the slot first. Staging weights is not
+dispatch: the job still cannot sample until its files land, and LoRAs are resolved and
+applied at generation time from live disk state, never snapshotted at preload.
+
+While the operator-facing view is concerned: a job held on its auxiliary files leaves every
+inference process reporting `WAITING_FOR_JOB` with a non-empty queue, which is otherwise
+indistinguishable from a stall. The status dump therefore carries a census of current holds
+(how many jobs, how many files, the oldest age) and the log names a hold once it has lasted
+longer than a few seconds. Before the
 enforced disk floor a missing LoRA is fetched, the download process constrains the shared
 ad-hoc cache to its free-space floor, evicting least-recently-used ad-hoc LoRAs through the
 manager's own pin-aware eviction so a file another pending job still references is never

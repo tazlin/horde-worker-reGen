@@ -6841,10 +6841,15 @@ class InferenceScheduler:
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
 
-        # An aux-unprepared job never holds a preload: staging its model would reserve a lane and price VRAM
-        # around a job that cannot yet sample. It is invisible to preload until the pop-time prefetch pipeline
-        # clears its gate; the pass moves on so a fitting sibling is preloaded instead.
-        if self._job_requires_aux_preparation(job):
+        # An aux-unprepared job must not compete for capacity: staging its model reserves a lane and prices
+        # VRAM around work that cannot sample yet, so any job able to run outranks it and the pass moves on so
+        # that fitting sibling is preloaded instead. With no such sibling the reservation costs nobody
+        # anything, and withholding it only serializes the checkpoint load behind the auxiliary download that
+        # the load could have run alongside. The slot must still be unoccupied (checked once a target is
+        # chosen), and dispatch stays gated on preparation either way: this moves when weights enter RAM,
+        # never when the job samples.
+        aux_gated = self._job_requires_aux_preparation(job)
+        if aux_gated and head_job is not None:
             return _PreloadJobOutcome.NEXT_JOB
 
         if (unserviceable_reason := self._unserviceable_job_reason(job)) is not None:
@@ -6940,6 +6945,17 @@ class InferenceScheduler:
                 AdmissionDecision.NO_TARGET, job=job, reason="no idle inference slot available"
             )
 
+        # An aux-gated preload takes a wholly unoccupied slot or none at all. Displacing a resident model,
+        # cycling a process, or evicting to make room are all costs paid on behalf of a job that cannot sample
+        # until its auxiliary files land, and the model thrown away may be one a dispatchable job still wants.
+        if aux_gated and not self._slot_is_unoccupied(available_process):
+            return self._preload_outcome(
+                AdmissionDecision.NEXT_JOB,
+                job=job,
+                process=available_process,
+                reason="aux-gated preload would displace an occupied slot",
+            )
+
         # Device-free governor growth hold: while the target card's device-level free VRAM sits below the
         # soft floor (PRESSURE or SATURATED), bringing this model to a slot that does not already hold it
         # would grow a footprint already near the WDDM paging cliff. Defer until the card recovers. A job
@@ -7020,6 +7036,18 @@ class InferenceScheduler:
             )
         return self._preload_outcome(
             AdmissionDecision.STOP_PASS, job=job, process=available_process, reason="preload send failed"
+        )
+
+    @staticmethod
+    def _slot_is_unoccupied(process_info: HordeProcessInfo) -> bool:
+        """Whether a slot holds no model and is idle, so loading onto it displaces nothing.
+
+        Distinct from ``can_accept_job()``, which is also true of a slot holding a resident model: a caller
+        that must not throw any load away needs the stronger property that there is nothing there to throw.
+        """
+        return (
+            process_info.loaded_horde_model_name is None
+            and process_info.last_process_state == HordeProcessState.WAITING_FOR_JOB
         )
 
     def _select_head_room_process(self) -> HordeProcessInfo | None:

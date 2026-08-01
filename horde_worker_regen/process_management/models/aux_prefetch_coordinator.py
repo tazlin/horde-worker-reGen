@@ -74,6 +74,15 @@ without the missing file while its result can still be submitted in time. Sized 
 tail budget so the freed remainder of the ttl still covers the job's own inference and submission."""
 
 
+_AUX_HOLD_ANNOUNCE_SECONDS = 5.0
+"""How long a job may wait on its auxiliary files before the hold is named once in the log.
+
+An aux-held job holds no lane and leaves every process reporting WAITING_FOR_JOB, so a reader of the status
+dump sees an idle worker with a pending queue and no stated cause. Below this threshold the wait is ordinary
+scheduling noise not worth a line; above it the hold is the reason the worker looks idle and is stated. The
+line is emitted once per job, not per scan, so a long hold does not repeat."""
+
+
 def _no_in_flight() -> dict[str, tuple[int, int]]:
     """Default in-flight provider: report nothing downloading (a coordinator wired without downloader status)."""
     return {}
@@ -137,6 +146,10 @@ class AuxPrefetchCoordinator:
         # Last observed downloaded-byte count per in-flight file name, so a repeat expiry can tell a download
         # that is advancing (or cannot report bytes at all) from one whose reported bytes have not moved.
         self._last_inflight_bytes: dict[str, int] = {}
+        # Jobs whose auxiliary hold has already been named in the log, so a long hold states its cause once
+        # rather than on every scan. Cleared with the rest of a job's per-attempt bookkeeping when its
+        # deadline is dropped or superseded, so a genuinely new hold explains itself again.
+        self._hold_announced: set[GenerationID] = set()
         # Canonical identity of the pin set last sent to the download process, so an unchanged set is never
         # re-sent (the eviction-pin update is edge-triggered). Starts empty, which matches a fresh download
         # process's own empty pins, so a worker with no aux-bearing jobs never emits a spurious pin message.
@@ -391,6 +404,7 @@ class AuxPrefetchCoordinator:
         self._deadlines.clear()
         self._deferrals.clear()
         self._deferral_logged.clear()
+        self._hold_announced.clear()
         self._last_inflight_bytes.clear()
         # The cooldowns protect against re-entering the *same* failing download path; a replacement downloader
         # is a fresh path, so a pending reference deserves an immediate attempt against it rather than waiting
@@ -429,12 +443,13 @@ class AuxPrefetchCoordinator:
         """Clear a job's deferral count, one-shot log flag, and cooling-hold marker.
 
         Called wherever a job's deadline is dropped or superseded (prepare, fault, a fresh in-flight request,
-        or departure): the deferral bookkeeping and the bounding-hold marker both belong to the attempt that
-        just ended, so a later attempt starts clean.
+        or departure): the deferral bookkeeping, the bounding-hold marker, and the announce marker all belong
+        to the attempt that just ended, so a later attempt starts clean and explains itself afresh.
         """
         self._deferrals.pop(job_id, None)
         self._deferral_logged.discard(job_id)
         self._cooling_deadline_jobs.discard(job_id)
+        self._hold_announced.discard(job_id)
 
     @staticmethod
     def _outcome_key(outcome: AuxPrefetchOutcome) -> tuple[AuxModelKind, str, bool]:
@@ -540,6 +555,75 @@ class AuxPrefetchCoordinator:
         """
         reference = self._clock() if now is None else now
         return {job_id for job_id, deadline in self._deadlines.items() if reference < deadline}
+
+    def _outstanding_reference_count(self, job: ImageGenerateJobPopResponse) -> int:
+        """How many of a job's auxiliary references are still neither cached nor skipped.
+
+        Mirrors the request builder's own cached/skipped predicate, so the count an operator reads is the
+        same set the prefetch is working through. A reference inside its post-failure cooldown counts as
+        outstanding: the job is still waiting on it.
+        """
+        outstanding = 0
+        for lora in job.payload.loras or []:
+            if not self._job_tracker.is_lora_cached(lora) and not self._job_tracker.is_lora_skipped(lora):
+                outstanding += 1
+        for ti in job.payload.tis or []:
+            if not self._job_tracker.is_ti_cached(ti.name) and not self._job_tracker.is_ti_skipped(ti.name):
+                outstanding += 1
+        return outstanding
+
+    def _live_holds(self, now: float) -> list[tuple[GenerationID, float, int]]:
+        """Every job currently held on its auxiliary prefetch, as ``(job_id, held_seconds, outstanding)``.
+
+        Held time is measured from the job's pop, which is when its prefetch was requested, so the figure is
+        the whole time the job has been unable to dispatch rather than the age of the latest re-request. A job
+        whose tracking has gone (submitted, faulted) contributes nothing. The age is floored at zero: it is a
+        reported figure, and a clock that disagrees with the tracker's stamp should read as "just now" rather
+        than emit a negative duration.
+        """
+        holds: list[tuple[GenerationID, float, int]] = []
+        for job_id in self.job_ids_with_live_deadlines(now):
+            tracked = self._job_tracker.get_tracked_job(job_id)
+            if tracked is None or tracked.stage != JobStage.PENDING_INFERENCE:
+                continue
+            held = max(0.0, now - tracked.time_popped) if tracked.time_popped is not None else 0.0
+            holds.append((job_id, held, self._outstanding_reference_count(tracked.sdk_api_job_info)))
+        return holds
+
+    def announce_slow_holds(self, now: float | None = None) -> None:
+        """Name, once per job, any auxiliary hold that has outlasted ``_AUX_HOLD_ANNOUNCE_SECONDS``.
+
+        An aux-held job leaves every inference process idle and the queue non-empty, which reads as a stalled
+        worker. Stating the cause turns that into an explained wait. Run from the same periodic step as
+        ``scan_deadlines``.
+        """
+        reference = self._clock() if now is None else now
+        for job_id, held, outstanding in self._live_holds(reference):
+            if held < _AUX_HOLD_ANNOUNCE_SECONDS or job_id in self._hold_announced:
+                continue
+            self._hold_announced.add(job_id)
+            logger.info(
+                f"Job {str(job_id)[:8]} is waiting on {outstanding} auxiliary file(s) (LoRA/TI) to download "
+                f"before it can dispatch; held {held:.0f}s so far. Inference processes stay idle by design "
+                "while this runs, and the job is dispatched without the missing file(s) if they do not land.",
+            )
+
+    def hold_summary(self, now: float | None = None) -> str | None:
+        """A one-line census of the current auxiliary holds for the status dump, or None when nothing is held.
+
+        Reported alongside the pending-stage census so a non-empty queue with idle processes carries its
+        reason in the same block a reader is already looking at.
+        """
+        reference = self._clock() if now is None else now
+        holds = self._live_holds(reference)
+        if not holds:
+            return None
+        outstanding = sum(count for _job_id, _held, count in holds)
+        oldest = max(held for _job_id, held, _count in holds)
+        return (
+            f"Aux prefetch: {len(holds)} job(s) held on {outstanding} pending LoRA/TI file(s) "
+            f"(oldest {oldest:.0f}s); these jobs cannot dispatch until their files land."
+        )
 
     @staticmethod
     def _pins_key(pins: list[AuxModelRef]) -> frozenset[tuple[AuxModelKind, str, bool]]:
