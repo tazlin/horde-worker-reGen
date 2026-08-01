@@ -87,6 +87,11 @@ from horde_worker_regen.tui.widgets.onboarding import (
 )
 from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.widgets.overview_layout import OverviewLayoutModal, valid_hidden_keys
+from horde_worker_regen.tui.widgets.simple import (
+    SimpleActivityView,
+    SimpleHomeView,
+    SimpleModelStatusView,
+)
 from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
@@ -450,6 +455,7 @@ class HordeWorkerTUI(App[None]):
         yield Static(id="status-bar")
         with TabbedContent(initial="tab-overview", id="main-tabs"):
             with TabPane("Overview", id="tab-overview"):
+                yield SimpleHomeView()
                 yield OverviewView()
             with TabPane("Stats", id="tab-stats"):
                 yield StatsView()
@@ -458,8 +464,10 @@ class HordeWorkerTUI(App[None]):
             with TabPane("GPUs", id="tab-gpus"):
                 yield GpusView()
             with TabPane("Live", id="tab-live"):
+                yield SimpleActivityView()
                 yield LiveView()
             with TabPane("Downloads", id="tab-downloads"):
+                yield SimpleModelStatusView()
                 yield DownloadsView()
             with TabPane("Logs", id="tab-logs"):
                 yield LogsView()
@@ -801,6 +809,14 @@ class HordeWorkerTUI(App[None]):
                 hidden_keys=frozenset(self._overview_hidden),
                 reveal_hidden=self._reveal_hidden_elements,
             )
+            # The Simple presentations are fed every tick regardless of level, so their trend history and
+            # recent-request feed accumulate continuously; switching to Simple then shows real history
+            # rather than starting from an empty chart.
+            simple_home = self.query_one(SimpleHomeView)
+            simple_home.set_setup_required(self._should_run_setup_wizard())
+            simple_home.update_view(report, snapshot, is_alive=self._supervisor.is_alive())
+            self.query_one(SimpleActivityView).update_view(snapshot)
+            self.query_one(SimpleModelStatusView).update_view(snapshot)
             self.query_one(GpusView).update_view(snapshot, mode=self._view_mode)
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
             self.query_one(ControlView).update_view(
@@ -1288,6 +1304,18 @@ class HordeWorkerTUI(App[None]):
         screen.add_class(f"density-{self._display_density.value}")
         with contextlib.suppress(NoMatches):
             self.query_one("#level-indicator", Static).update(level.value.title())
+        # Overview, Live and Downloads each host a Simple presentation beside the operator one and swap
+        # between them. The destination itself never moves, so this changes depth in place.
+        simple = level is ExperienceLevel.SIMPLE
+        for simple_view, operator_view in (
+            (SimpleHomeView, OverviewView),
+            (SimpleActivityView, LiveView),
+            (SimpleModelStatusView, DownloadsView),
+        ):
+            with contextlib.suppress(NoMatches):
+                self.query_one(simple_view).display = simple
+            with contextlib.suppress(NoMatches):
+                self.query_one(operator_view).display = not simple
         with contextlib.suppress(NoMatches):
             self.query_one(ConfigEditorView).set_experience_level(level)
 
@@ -1396,6 +1424,27 @@ class HordeWorkerTUI(App[None]):
         """Explain the dashboard at the level currently in effect, listing every shortcut."""
         with contextlib.suppress(Exception):
             self.push_screen(HelpModal(self._experience_level, self.keyboard_actions()))
+
+    def on_simple_home_view_start_stop_requested(self, message: SimpleHomeView.StartStopRequested) -> None:
+        """Start or stop the worker from the Simple home action."""
+        self.action_start_stop_worker()
+
+    def on_simple_home_view_setup_requested(self, message: SimpleHomeView.SetupRequested) -> None:
+        """Reopen the guided setup wizard, which stays the single first-run path."""
+        self._run_setup_wizard()
+
+    def on_simple_home_view_navigate_requested(self, message: SimpleHomeView.NavigateRequested) -> None:
+        """Follow a Simple home link to another destination."""
+        self._navigate_to(message.destination)
+
+    def on_simple_model_status_view_manage_requested(
+        self,
+        message: SimpleModelStatusView.ManageRequested,
+    ) -> None:
+        """Send the contributor to the one place models are chosen."""
+        self._navigate_to("tab-config")
+        with contextlib.suppress(NoMatches, ValueError):
+            self.query_one(ConfigEditorView).query_one("#config-subtabs", TabbedContent).active = "cfgtab-models"
 
     def on_dashboard_preferences_view_experience_level_changed(
         self,

@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 from textual.widgets import Static, TabbedContent
 
-from horde_worker_regen.app_state import AppStateStore, OnboardingChoice, OverviewTrendWindow, OverviewViewMode
+from horde_worker_regen.app_state import (
+    AppStateStore,
+    ExperienceLevel,
+    OnboardingChoice,
+    OverviewTrendWindow,
+    OverviewViewMode,
+)
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
@@ -38,6 +44,8 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
     """The app boots the fake worker, renders the status hero, and cycles all tabs without error."""
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     store.set_auto_start_worker(True)  # opt in so the worker auto-starts instead of prompting
+    # Cycles every tab expecting the operator widgets to be the ones rendered.
+    store.set_experience_level(ExperienceLevel.ADVANCED)
     supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="SmokeApp"), mode=WorkerProcessMode.FAKE)
     app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
     try:
@@ -373,6 +381,9 @@ def _overview_app(tmp_path: Path) -> tuple[HordeWorkerTUI, AppStateStore, FakeSu
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     store.set_auto_start_worker(True)
     store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    # These assert the operator Overview's layout, which is the Advanced presentation of this
+    # destination; Simple shows its own plain-language home there instead.
+    store.set_experience_level(ExperienceLevel.ADVANCED)
     supervisor = FakeSupervisor(alive=True)
     supervisor.latest_snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Layout", worker_version="0.0.0"),

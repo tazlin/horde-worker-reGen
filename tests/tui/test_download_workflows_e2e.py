@@ -22,7 +22,7 @@ from textual.pilot import Pilot
 from textual.widgets import Button, Input, Static, TabbedContent
 
 import horde_worker_regen.tui.app as app_module
-from horde_worker_regen.app_state import AppStateStore, OnboardingChoice
+from horde_worker_regen.app_state import AppStateStore, ExperienceLevel, OnboardingChoice
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
@@ -64,6 +64,9 @@ def _make_app(
     config_path.write_text("api_key: test\ndreamer_name: TestWorker\n", encoding="utf-8")
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    # These drive the operator Downloads controls (pause, rate cap, picker), which are the Advanced
+    # presentation of that destination; Simple shows read-only model readiness there instead.
+    store.set_experience_level(ExperienceLevel.ADVANCED)
     if auto_start:
         store.set_auto_start_worker(True)
     fake = FakeSupervisor()
