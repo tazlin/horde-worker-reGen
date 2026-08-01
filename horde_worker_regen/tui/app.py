@@ -349,7 +349,8 @@ class HordeWorkerTUI(App[None]):
     BINDINGS = [
         ("f3", "start_stop_worker", "Start/Stop"),
         ("?", "show_help", "Help"),
-        ("ctrl+p", "command_palette", "Commands"),
+        # No ctrl+p entry: Textual's Footer already pins its own command-palette key, so declaring one
+        # here renders it twice and spends a slot in a list that is already truncated on real terminals.
         ("f6", "cycle_view_mode", "View mode"),
         ("c", "customize_overview", "Customize"),
         ("h", "toggle_hidden_reveal", "Reveal hidden"),
@@ -1332,8 +1333,33 @@ class HordeWorkerTUI(App[None]):
         with contextlib.suppress(OSError):
             self._app_state_store.set_theme_name(theme_name)
 
+    def keyboard_actions(self) -> list[tuple[str, str, str]]:
+        """Return ``(keys, description, action)`` for every shown binding, in declaration order.
+
+        Derived from the live binding table rather than a hand-kept list, so the command palette and the
+        help modal can never drift from ``BINDINGS``. Keys that share an action are grouped onto one
+        entry, so the two quit keys read as one command with two shortcuts instead of two commands.
+        """
+        by_action: dict[str, tuple[list[str], str]] = {}
+        for key, bindings in self._bindings.key_to_bindings.items():
+            for binding in bindings:
+                if not binding.show:
+                    continue
+                try:
+                    display = self.get_key_display(binding)
+                except Exception:  # noqa: BLE001 - a display failure must not cost discoverability
+                    display = key
+                keys, _description = by_action.setdefault(binding.action, ([], binding.description))
+                if display not in keys:
+                    keys.append(display)
+        return [(", ".join(keys), description, action) for action, (keys, description) in by_action.items()]
+
+    def _invoke_action(self, action: str) -> None:
+        """Run a named action off the palette, scheduled so the palette can close first."""
+        self.call_later(self.run_action, action)
+
     def get_system_commands(self, screen: object) -> Iterable[SystemCommand]:
-        """Add every destination and experience level to Textual's command palette."""
+        """Add every destination, keyboard action, and experience level to Textual's command palette."""
         yield from super().get_system_commands(screen)  # type: ignore[arg-type]
         for label, destination in self._DESTINATIONS:
             yield SystemCommand(
@@ -1341,13 +1367,21 @@ class HordeWorkerTUI(App[None]):
                 "Open this dashboard destination",
                 partial(self._navigate_to, destination),
             )
+        # Every keyboard action is offered here with its shortcut attached. The Footer can only fit a
+        # handful of hints on a real terminal (and drops the tail entirely when narrow), so the palette
+        # is the surface that stays complete, and it teaches the shortcut rather than merely running it.
+        for keys, description, action in self.keyboard_actions():
+            yield SystemCommand(
+                f"{description}  ({keys})",
+                "Keyboard action",
+                partial(self._invoke_action, action),
+            )
         for level in ExperienceLevel:
             yield SystemCommand(
                 f"Use {level.value.title()} experience",
                 "Change how much worker detail is shown",
                 partial(self._request_experience_level, level),
             )
-        yield SystemCommand("Show help", "Explain the current dashboard experience", self.action_show_help)
 
     def _navigate_to(self, destination: str) -> None:
         """Activate a destination by tab id.
@@ -1359,9 +1393,9 @@ class HordeWorkerTUI(App[None]):
             self.query_one("#main-tabs", TabbedContent).active = destination
 
     def action_show_help(self) -> None:
-        """Explain the dashboard at the level currently in effect."""
+        """Explain the dashboard at the level currently in effect, listing every shortcut."""
         with contextlib.suppress(Exception):
-            self.push_screen(HelpModal(self._experience_level))
+            self.push_screen(HelpModal(self._experience_level, self.keyboard_actions()))
 
     def on_dashboard_preferences_view_experience_level_changed(
         self,

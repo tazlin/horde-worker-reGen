@@ -6,6 +6,9 @@ destinations exist. Every tab is present at every level, so nothing here hides o
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -324,36 +327,49 @@ class HelpModal(ModalScreen[None]):
 
     BINDINGS = [("escape", "close", "Close"), ("question_mark", "close", "Close")]
 
-    def __init__(self, level: ExperienceLevel) -> None:
-        """Render help for ``level``."""
+    def __init__(self, level: ExperienceLevel, shortcuts: Sequence[tuple[str, str, str]] = ()) -> None:
+        """Render help for ``level``, listing every ``(keys, description, action)`` shortcut given."""
         super().__init__()
         self._level = level
+        self._shortcuts = tuple(shortcuts)
 
     def compose(self) -> ComposeResult:
-        """Lay out the level explanation and key bindings."""
+        """Lay out the level explanation, then the complete shortcut list."""
         with Vertical(id="help-dialog"):
             yield Static(self._message(self._level), id="help-message")
+            yield Static(self._shortcut_table(self._shortcuts), id="help-shortcuts")
             yield Button("Close", id="help-close", variant="primary")
 
     @staticmethod
     def _message(level: ExperienceLevel) -> Text:
-        """Build help text describing ``level`` and the always-available keys."""
+        """Build help text describing ``level`` and how to navigate."""
         name, summary = _LEVEL_SUMMARIES[level]
         return Text.assemble(
             (f"You are using the {name} experience\n\n", "bold"),
             (f"{summary}\n\n", "grey70"),
-            ("Changing level\n", "bold"),
-            ("Config tab, or Ctrl+P and search for the level you want.\n\n", "grey70"),
-            ("Keys\n", "bold"),
+            ("Finding things\n", "bold"),
             (
-                "F3 start or stop the worker\n"
-                "Ctrl+P command palette, including every tab by name\n"
-                "?  this help\n"
-                "F6 cycle how densely the Overview renders\n"
-                "Ctrl+Q quit\n",
+                "Ctrl+P opens the command palette: every tab, every shortcut, and the experience levels "
+                "are listed there by name. The bar at the bottom shows as many shortcuts as fit, so on a "
+                "narrow terminal it shows only the first few; the palette and this list are always "
+                "complete.\n\n",
                 "grey70",
             ),
+            ("Changing level\n", "bold"),
+            ("The Dashboard section of the Config tab, or Ctrl+P.\n", "grey70"),
         )
+
+    @staticmethod
+    def _shortcut_table(shortcuts: Sequence[tuple[str, str, str]]) -> Table | Text:
+        """Render every shortcut, so this list is complete regardless of terminal width."""
+        if not shortcuts:
+            return Text("")
+        table = Table(expand=True, box=None, pad_edge=False)
+        table.add_column("Key", style="bold cyan", no_wrap=True)
+        table.add_column("Action")
+        for keys, description, _action in shortcuts:
+            table.add_row(keys, description)
+        return table
 
     def action_close(self) -> None:
         """Dismiss the help."""
