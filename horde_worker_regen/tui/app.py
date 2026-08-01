@@ -14,15 +14,15 @@ import multiprocessing
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
 from rich.text import Text
-from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.app import App, ComposeResult, SystemCommand
+from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane
@@ -30,6 +30,8 @@ from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPa
 from horde_worker_regen import __version__
 from horde_worker_regen.app_state import (
     AppStateStore,
+    DisplayDensity,
+    ExperienceLevel,
     OnboardingChoice,
     OverviewTrendWindow,
     OverviewViewMode,
@@ -52,6 +54,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
 from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
+from horde_worker_regen.tui.design import HORDE_THEME_NAMES, register_horde_themes
 from horde_worker_regen.tui.formatters import configure_fidelity, format_percent
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
@@ -66,6 +69,12 @@ from horde_worker_regen.tui.widgets.download_picker import (
     DownloadSelection,
 )
 from horde_worker_regen.tui.widgets.downloads import DownloadsView
+from horde_worker_regen.tui.widgets.experience import (
+    DashboardPreferencesView,
+    DeveloperWarningModal,
+    ExperienceIntroductionModal,
+    HelpModal,
+)
 from horde_worker_regen.tui.widgets.gpus import GpusView
 from horde_worker_regen.tui.widgets.insights import InsightsView
 from horde_worker_regen.tui.widgets.live_view import LiveView
@@ -292,6 +301,9 @@ class HordeWorkerTUI(App[None]):
     """A Textual dashboard that owns and visualises the reGen worker."""
 
     TITLE = f"AI Horde Worker - v{__version__}"
+    CSS_PATH = "horde.tcss"
+    """The Horde design system projection. Layout rules that depend on runtime intent stay in ``CSS``
+    below; this file carries the shared surfaces (hero, card, muted) and the level/density policy."""
 
     HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-normal"), (150, "-wide")]
     """Width bands Textual stamps onto the Screen as classes, mirroring the table column tiers.
@@ -336,6 +348,8 @@ class HordeWorkerTUI(App[None]):
 
     BINDINGS = [
         ("f3", "start_stop_worker", "Start/Stop"),
+        ("?", "show_help", "Help"),
+        ("ctrl+p", "command_palette", "Commands"),
         ("f6", "cycle_view_mode", "View mode"),
         ("c", "customize_overview", "Customize"),
         ("h", "toggle_hidden_reveal", "Reveal hidden"),
@@ -390,6 +404,17 @@ class HordeWorkerTUI(App[None]):
         persisted_state = self._app_state_store.load()
         self._view_mode = persisted_state.overview_view_mode
         self._trend_window = persisted_state.overview_trend_window
+        self._experience_level = persisted_state.experience_level
+        self._display_density = persisted_state.display_density
+        self._developer_warning_acknowledged = persisted_state.developer_warning_acknowledged
+        # Owed to an installation that predates the levels; consumed once on mount so the Simple default
+        # is announced rather than looking like the dashboard lost its detail.
+        self._needs_experience_introduction = persisted_state.needs_experience_introduction
+        register_horde_themes(self)
+        self._theme_name = (
+            persisted_state.theme_name if persisted_state.theme_name in HORDE_THEME_NAMES else "horde-dark"
+        )
+        self.theme = self._theme_name
         # Operator-hidden Overview elements (registry keys), restored from durable state. Unknown/renamed
         # keys are dropped on load so a stale preference never blocks rendering.
         self._overview_hidden: set[str] = valid_hidden_keys(persisted_state.overview_hidden_elements)
@@ -438,14 +463,23 @@ class HordeWorkerTUI(App[None]):
             with TabPane("Logs", id="tab-logs"):
                 yield LogsView()
             with TabPane("Config", id="tab-config"):
-                yield ConfigEditorView(self._config_path)
+                yield ConfigEditorView(
+                    self._config_path,
+                    experience_level=self._experience_level,
+                    display_density=self._display_density,
+                    theme_name=self._theme_name,
+                )
             with TabPane("Insights", id="tab-insights"):
                 yield InsightsView()
             with TabPane("Diagnostics", id="tab-diagnostics"):
                 yield DiagnosticsView()
             with TabPane("Benchmark", id="tab-benchmark"):
                 yield BenchmarkView(worker_mode=self._supervisor.mode.value)
-        yield Footer()
+        # The level rides the Footer's row rather than claiming one of its own: at the 80x24 floor a
+        # dedicated indicator strip costs a line of content for information that changes rarely.
+        with Horizontal(id="footer-bar"):
+            yield Footer()
+            yield Static(id="level-indicator")
 
     @staticmethod
     def _detect_low_fidelity(encoding: str) -> bool:
@@ -496,6 +530,25 @@ class HordeWorkerTUI(App[None]):
         if not testing:
             self.set_interval(UPDATE_CHECK_INTERVAL_SECONDS, self._periodic_update_check)
         self._warm_model_catalog()
+        self._apply_experience_level(self._experience_level)
+        # An installation that predates the levels answers the notice before anything else, so the choice
+        # is made against an untouched dashboard rather than behind a start prompt.
+        if self._needs_experience_introduction:
+            self.push_screen(ExperienceIntroductionModal(), self._on_experience_introduction)
+        else:
+            self._resume_launch_flow()
+
+    def _on_experience_introduction(self, level: ExperienceLevel | None) -> None:
+        """Apply and persist the answer to the one-time level notice, then resume launching."""
+        chosen = level if level is not None else ExperienceLevel.ADVANCED
+        self._needs_experience_introduction = False
+        with contextlib.suppress(OSError):
+            self._app_state_store.resolve_experience_introduction(chosen)
+        self._apply_experience_level(chosen)
+        self._resume_launch_flow()
+
+    def _resume_launch_flow(self) -> None:
+        """Run first-run setup or the usual start/onboarding prompts."""
         if self._should_run_setup_wizard():
             self._run_setup_wizard()
         elif self._should_auto_start():
@@ -1199,6 +1252,137 @@ class HordeWorkerTUI(App[None]):
         OverviewViewMode.DETAILS: "View: details (every diagnostic: extra columns, log tally, all config sub-tabs).",
         OverviewViewMode.THIN: "View: thin (essentials only: status bar, slim downloads, bare log, Essentials).",
     }
+
+    _DESTINATIONS = (
+        ("Overview", "tab-overview"),
+        ("Stats", "tab-stats"),
+        ("Control", "tab-control"),
+        ("GPUs", "tab-gpus"),
+        ("Live", "tab-live"),
+        ("Downloads", "tab-downloads"),
+        ("Logs", "tab-logs"),
+        ("Config", "tab-config"),
+        ("Insights", "tab-insights"),
+        ("Diagnostics", "tab-diagnostics"),
+        ("Benchmark", "tab-benchmark"),
+    )
+    """Every destination, in tab order, for the command palette.
+
+    The labels match the tab captions at every level: the level changes what a destination renders, not
+    what it is called, so a name learned in Simple still finds the same place in Developer.
+    """
+
+    def _apply_experience_level(self, level: ExperienceLevel) -> None:
+        """Apply ``level`` to the screen classes, the footer indicator, and the views that vary by level.
+
+        Deliberately does not touch tab visibility. Every destination exists at every level, so raising
+        the level reveals detail in place rather than making navigation appear or disappear underneath
+        someone who has just learned where things are.
+        """
+        self._experience_level = level
+        screen = self.screen
+        screen.remove_class("level-simple", "level-advanced", "level-developer")
+        screen.add_class(f"level-{level.value}")
+        screen.remove_class("density-comfortable", "density-compact")
+        screen.add_class(f"density-{self._display_density.value}")
+        with contextlib.suppress(NoMatches):
+            self.query_one("#level-indicator", Static).update(level.value.title())
+        with contextlib.suppress(NoMatches):
+            self.query_one(ConfigEditorView).set_experience_level(level)
+
+    def _request_experience_level(self, level: ExperienceLevel) -> None:
+        """Change level, guarding the first entry into Developer behind its one-time warning."""
+        if level is self._experience_level:
+            return
+        if level is ExperienceLevel.DEVELOPER and not self._developer_warning_acknowledged:
+            self.push_screen(DeveloperWarningModal(), self._on_developer_warning)
+            return
+        self._commit_experience_level(level)
+
+    def _on_developer_warning(self, accepted: bool | None) -> None:
+        """Enter Developer only if the warning was accepted, remembering the acknowledgement."""
+        if not accepted:
+            return
+        self._developer_warning_acknowledged = True
+        with contextlib.suppress(OSError):
+            self._app_state_store.acknowledge_developer_warning()
+        self._commit_experience_level(ExperienceLevel.DEVELOPER)
+
+    def _commit_experience_level(self, level: ExperienceLevel) -> None:
+        """Persist and apply ``level``, then refresh so the change is visible immediately."""
+        with contextlib.suppress(OSError):
+            self._app_state_store.set_experience_level(level)
+        self._apply_experience_level(level)
+        self.notify(f"Experience: {level.value.title()}.")
+        self._tick()
+
+    def set_display_density(self, density: DisplayDensity) -> None:
+        """Persist and apply the Advanced/Developer spacing density."""
+        self._display_density = density
+        with contextlib.suppress(OSError):
+            self._app_state_store.set_display_density(density)
+        self._apply_experience_level(self._experience_level)
+
+    def set_theme_name(self, theme_name: str) -> None:
+        """Persist and apply a registered Horde theme."""
+        if theme_name not in HORDE_THEME_NAMES:
+            return
+        self._theme_name = theme_name
+        self.theme = theme_name
+        with contextlib.suppress(OSError):
+            self._app_state_store.set_theme_name(theme_name)
+
+    def get_system_commands(self, screen: object) -> Iterable[SystemCommand]:
+        """Add every destination and experience level to Textual's command palette."""
+        yield from super().get_system_commands(screen)  # type: ignore[arg-type]
+        for label, destination in self._DESTINATIONS:
+            yield SystemCommand(
+                f"Go to {label}",
+                "Open this dashboard destination",
+                partial(self._navigate_to, destination),
+            )
+        for level in ExperienceLevel:
+            yield SystemCommand(
+                f"Use {level.value.title()} experience",
+                "Change how much worker detail is shown",
+                partial(self._request_experience_level, level),
+            )
+        yield SystemCommand("Show help", "Explain the current dashboard experience", self.action_show_help)
+
+    def _navigate_to(self, destination: str) -> None:
+        """Activate a destination by tab id.
+
+        No level promotion is needed: every tab is reachable at every level, so a palette jump never has
+        to change the operator's chosen depth to satisfy itself.
+        """
+        with contextlib.suppress(NoMatches, ValueError):
+            self.query_one("#main-tabs", TabbedContent).active = destination
+
+    def action_show_help(self) -> None:
+        """Explain the dashboard at the level currently in effect."""
+        with contextlib.suppress(Exception):
+            self.push_screen(HelpModal(self._experience_level))
+
+    def on_dashboard_preferences_view_experience_level_changed(
+        self,
+        message: DashboardPreferencesView.ExperienceLevelChanged,
+    ) -> None:
+        """Apply a level chosen from the Config tab."""
+        self._request_experience_level(message.level)
+
+    def on_dashboard_preferences_view_density_changed(
+        self,
+        message: DashboardPreferencesView.DensityChanged,
+    ) -> None:
+        """Apply a density chosen from the Config tab."""
+        self.set_display_density(message.density)
+
+    def on_dashboard_preferences_view_theme_changed(
+        self,
+        message: DashboardPreferencesView.ThemeChanged,
+    ) -> None:
+        """Apply a theme chosen from the Config tab."""
+        self.set_theme_name(message.theme_name)
 
     def action_cycle_view_mode(self) -> None:
         """Cycle (and persist) the shared density mode: normal -> details -> thin, then refresh now.

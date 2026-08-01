@@ -1,0 +1,116 @@
+/* Terminal projection of @haidra-org/horde-design-system. See tui/design.py for provenance. */
+
+Screen {
+    background: $background;
+    color: $foreground;
+}
+
+Header {
+    background: $panel;
+    color: $foreground;
+}
+
+Footer {
+    background: $panel;
+}
+
+/* The level indicator shares the Footer's row rather than taking one of its own, which matters at
+   the 80x24 floor where every content line is contested. */
+#footer-bar {
+    height: 1;
+    dock: bottom;
+    background: $panel;
+}
+
+/* Footer docks itself to the bottom by default, which would lift it out of this row's flow and stack
+   it on top of the indicator. Releasing the dock lets the two share the row side by side. */
+#footer-bar Footer {
+    dock: none;
+    width: 1fr;
+}
+
+#level-indicator {
+    width: auto;
+    min-width: 10;
+    padding: 0 1;
+    background: $panel;
+    color: $text-muted;
+    content-align: right middle;
+}
+
+.horde-hero {
+    height: auto;
+    padding: 1 2;
+    margin-bottom: 1;
+    border: tall $primary;
+    background: $panel;
+}
+
+.horde-card {
+    height: auto;
+    padding: 1 2;
+    margin-bottom: 1;
+    border: round $horde-edge;
+    background: $surface;
+}
+
+.horde-card-title {
+    text-style: bold;
+    color: $foreground;
+}
+
+.horde-muted {
+    color: $text-muted;
+}
+
+.horde-actions {
+    height: auto;
+    margin-top: 1;
+}
+
+.horde-actions Button {
+    margin-right: 1;
+    min-width: 18;
+}
+
+/* A one-line plain-language framing shown above the real widgets on the technical tabs in Simple.
+   The tabs keep their own presentation; only this explanatory line is level-dependent. */
+.horde-tab-intro {
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+    color: $text-muted;
+}
+
+.level-simple-only, .level-operator-only, .level-developer-only {
+    display: none;
+}
+
+Screen.level-simple .level-simple-only,
+Screen.level-advanced .level-operator-only,
+Screen.level-developer .level-operator-only,
+Screen.level-developer .level-developer-only {
+    display: block;
+}
+
+Screen.density-compact .horde-card {
+    padding: 0 1;
+    margin-bottom: 0;
+}
+
+Screen.density-compact .horde-hero {
+    padding: 0 1;
+    margin-bottom: 0;
+}
+
+Screen.-narrow .horde-hero,
+Screen.-narrow .horde-card {
+    padding: 0 1;
+    margin-bottom: 0;
+    border: none;
+}
+
+Screen.-narrow #level-indicator {
+    min-width: 6;
+    padding: 0;
+}

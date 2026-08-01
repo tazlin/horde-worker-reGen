@@ -36,13 +36,27 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
 
-APP_STATE_SCHEMA_VERSION = 1
-"""Bumped when the persisted schema changes incompatibly; an older file is discarded on read."""
+APP_STATE_SCHEMA_VERSION = 2
+"""The schema version stamped onto every state file this build writes.
+
+Reads never reject an older file: every field carries a default, so an unknown or absent key degrades
+to that default rather than discarding accumulated state. The number exists so a load can tell which
+migrations a file predates, which is how the dashboard knows an installation existed before the
+progressive experience levels and therefore needs to be told the default changed.
+"""
 
 APP_STATE_DIR_NAME = ".horde_worker_regen"
 """The grouped state directory, created in the working directory next to ``bridgeData.yaml``."""
 
 APP_STATE_FILENAME = "state.json"
+
+_KNOWN_THEME_NAMES = frozenset({"horde-dark", "horde-light", "horde-ansi"})
+"""Theme names this build can restore, duplicated from ``tui.design`` rather than imported.
+
+State is read by the worker as well as the dashboard, so this module stays free of Textual; the cost of
+that boundary is this literal. A name absent here (a theme from a newer build, or a hand-edited file)
+falls back to the default instead of failing the load, so an unknown theme can never block startup.
+"""
 
 
 class KnownGoodSource(enum.StrEnum):
@@ -63,6 +77,29 @@ class OverviewViewMode(enum.StrEnum):
     """Normal plus the demoted panels (worker config, alchemy, queue, recent jobs) and extra columns."""
     THIN = "thin"
     """A single compact status bar only; the rest of the dashboard is hidden."""
+
+
+class ExperienceLevel(enum.StrEnum):
+    """How much worker implementation detail the dashboard exposes.
+
+    The level changes the depth and vocabulary of what each destination renders. It never changes which
+    destinations exist: every tab is reachable at every level, so raising the level reveals detail in
+    place rather than unlocking somewhere new.
+    """
+
+    SIMPLE = "simple"
+    """Plain-language status and guided contribution tasks."""
+    ADVANCED = "advanced"
+    """The complete everyday operator surface."""
+    DEVELOPER = "developer"
+    """Sensitive controls, uncommon tuning, and forensic detail."""
+
+
+class DisplayDensity(enum.StrEnum):
+    """Spacing density for the technical operator experiences."""
+
+    COMFORTABLE = "comfortable"
+    COMPACT = "compact"
 
 
 class OverviewTrendWindow(enum.StrEnum):
@@ -168,6 +205,22 @@ class WorkerAppState(BaseModel):
     Persisted so a curated dashboard survives restarts; an unknown key is ignored rather than rejected,
     so the list stays forward-compatible when elements are renamed or removed."""
     worker_version_last_ran: str | None = None
+    experience_level: ExperienceLevel = ExperienceLevel.SIMPLE
+    """How much detail the dashboard exposes. Simple is the default so an unattended first launch is
+    approachable; an installation that predates this field is told the default changed rather than being
+    demoted silently (see ``needs_experience_introduction``)."""
+    needs_experience_introduction: bool = False
+    """Whether the operator is owed the one-time notice that the dashboard now starts in Simple.
+
+    False on a fresh state because a new contributor has no prior experience to be surprised by. Set true
+    only when loading a state file stamped before the experience levels existed, and cleared once the
+    operator has answered the notice."""
+    display_density: DisplayDensity = DisplayDensity.COMFORTABLE
+    """Spacing for the Advanced and Developer surfaces; Simple stays responsive on its own."""
+    theme_name: str = "horde-dark"
+    """Registered Textual theme name. An unrecognised value falls back to the default on load."""
+    developer_warning_acknowledged: bool = False
+    """Whether the one-time Developer-level warning has been accepted."""
     onboarding: OnboardingState = Field(default_factory=OnboardingState)
     last_worker_run: WorkerRunRecord | None = None
     last_benchmark: BenchmarkRecord | None = None
@@ -291,13 +344,23 @@ class AppStateStore:
         if not self._path.exists():
             return WorkerAppState()
         try:
-            state = WorkerAppState.model_validate_json(self._path.read_text(encoding="utf-8"))
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            state = WorkerAppState.model_validate(raw)
         except (OSError, ValueError) as read_error:
             logger.debug(f"Could not read app state at {self._path} ({read_error}); using a fresh state.")
             return WorkerAppState()
         # Migrate a pre-view-mode state: a stored detailed_info flag maps onto the new view mode.
         if state.overview_view_mode is OverviewViewMode.NORMAL and state.detailed_info:
             state.overview_view_mode = OverviewViewMode.DETAILS
+        # A file stamped before the experience levels belongs to an installation that has been using the
+        # full dashboard all along. Reading it as Simple is correct (that is the new default) but doing so
+        # without saying anything would look like the dashboard lost its detail, so the notice is owed.
+        persisted_version = raw.get("schema_version", 1) if isinstance(raw, dict) else 1
+        if not isinstance(persisted_version, int) or persisted_version < 2:
+            state.needs_experience_introduction = True
+        if state.theme_name not in _KNOWN_THEME_NAMES:
+            state.theme_name = WorkerAppState.model_fields["theme_name"].default
+        state.schema_version = APP_STATE_SCHEMA_VERSION
         return state
 
     def save(self, state: WorkerAppState) -> None:
@@ -373,6 +436,43 @@ class AppStateStore:
         state.overview_hidden_elements = sorted(set(keys))
         self.save(state)
 
+    def set_experience_level(self, level: ExperienceLevel) -> None:
+        """Persist the selected experience level."""
+        state = self.load()
+        state.experience_level = level
+        self.save(state)
+
+    def resolve_experience_introduction(self, level: ExperienceLevel) -> None:
+        """Persist the operator's answer to the one-time Simple-default notice.
+
+        Clears the debt in the same write that stores the chosen level, so an interrupted launch either
+        shows the notice again or records an answer, never both.
+        """
+        state = self.load()
+        state.experience_level = level
+        state.needs_experience_introduction = False
+        self.save(state)
+
+    def set_display_density(self, density: DisplayDensity) -> None:
+        """Persist the selected Advanced/Developer display density."""
+        state = self.load()
+        state.display_density = density
+        self.save(state)
+
+    def set_theme_name(self, theme_name: str) -> None:
+        """Persist a theme name, ignoring one this build cannot restore."""
+        if theme_name not in _KNOWN_THEME_NAMES:
+            return
+        state = self.load()
+        state.theme_name = theme_name
+        self.save(state)
+
+    def acknowledge_developer_warning(self) -> None:
+        """Remember that the operator accepted the one-time Developer warning."""
+        state = self.load()
+        state.developer_warning_acknowledged = True
+        self.save(state)
+
     # endregion
 
 
@@ -381,6 +481,8 @@ __all__ = [
     "AppStateStore",
     "BenchmarkAvailability",
     "BenchmarkRecord",
+    "DisplayDensity",
+    "ExperienceLevel",
     "KnownGoodSettings",
     "KnownGoodSource",
     "OnboardingChoice",

@@ -27,7 +27,7 @@ from textual.widgets import (
     TextArea,
 )
 
-from horde_worker_regen.app_state import OverviewViewMode
+from horde_worker_regen.app_state import DisplayDensity, ExperienceLevel, OverviewViewMode
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
@@ -53,6 +53,7 @@ from horde_worker_regen.tui.config_form import (
 from horde_worker_regen.tui.config_presets import BUILT_IN_PRESETS, ConfigPreset, PresetChange, diff_preset
 from horde_worker_regen.tui.config_validation import ConfigValidationSeverity, validate_config_interlocks
 from horde_worker_regen.tui.widgets.custom_model_builder import CustomModelBuilderModal, CustomModelBuilderResult
+from horde_worker_regen.tui.widgets.experience import DashboardPreferencesView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
@@ -411,13 +412,33 @@ class ConfigEditorView(Vertical):
             super().__init__()
             self.restart = restart
 
-    def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-        """Load the config file so widgets can be pre-filled."""
+    def __init__(
+        self,
+        config_path: Path = DEFAULT_CONFIG_PATH,
+        *,
+        experience_level: ExperienceLevel = ExperienceLevel.SIMPLE,
+        display_density: DisplayDensity = DisplayDensity.COMFORTABLE,
+        theme_name: str = "horde-dark",
+    ) -> None:
+        """Load the config file so widgets can be pre-filled.
+
+        The dashboard preferences are passed in rather than read from durable state here, so this view
+        stays a pure form over what it is given and remains constructible in isolation by tests.
+        """
         super().__init__()
         self._config_path = config_path
         self._data = load_config(config_path)
         self._mode = OverviewViewMode.NORMAL
+        self._experience_level = experience_level
+        self._display_density = display_density
+        self._theme_name = theme_name
         self._clean_state: dict[str, object] | None = None
+
+    def set_experience_level(self, level: ExperienceLevel) -> None:
+        """Record the level that governs which fields are offered and which are guarded."""
+        self._experience_level = level
+        with contextlib.suppress(Exception):
+            self.query_one(DashboardPreferencesView).set_experience_level(level)
 
     def compose(self) -> ComposeResult:
         """Lay out the pinned action bar and status line, then the grouped fields in sub-tabs."""
@@ -438,6 +459,8 @@ class ConfigEditorView(Vertical):
         yield Static("", id="config-live-warnings")
 
         with TabbedContent(id="config-subtabs"):
+            with TabPane("Dashboard", id="cfgtab-dashboard"), VerticalScroll(classes="config-subtab-scroll"):
+                yield DashboardPreferencesView(self._experience_level, self._display_density, self._theme_name)
             for label, sections in CONFIG_SUBTABS:
                 with TabPane(label, id=_subtab_id(label)), VerticalScroll(classes="config-subtab-scroll"):
                     for section in sections:
