@@ -91,6 +91,7 @@ from horde_worker_regen.tui.widgets.simple import (
     SimpleActivityView,
     SimpleHomeView,
     SimpleModelStatusView,
+    tab_intro,
 )
 from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
@@ -458,10 +459,21 @@ class HordeWorkerTUI(App[None]):
                 yield SimpleHomeView()
                 yield OverviewView()
             with TabPane("Stats", id="tab-stats"):
+                yield tab_intro(
+                    "Totals and averages for the work this computer has done. Nothing here needs "
+                    "changing; it is a record of what happened.",
+                )
                 yield StatsView()
             with TabPane("Control", id="tab-control"):
+                yield tab_intro(
+                    "The background programs that do the work. The worker starts and restarts these on "
+                    "its own; this is where you would look if one stopped.",
+                )
                 yield ControlView()
             with TabPane("GPUs", id="tab-gpus"):
+                yield tab_intro(
+                    "What your graphics card is doing, and how much of its memory the worker is using.",
+                )
                 yield GpusView()
             with TabPane("Live", id="tab-live"):
                 yield SimpleActivityView()
@@ -470,6 +482,10 @@ class HordeWorkerTUI(App[None]):
                 yield SimpleModelStatusView()
                 yield DownloadsView()
             with TabPane("Logs", id="tab-logs"):
+                yield tab_intro(
+                    "The worker's running commentary. Useful to copy from when asking for help; you do "
+                    "not need to read it to contribute.",
+                )
                 yield LogsView()
             with TabPane("Config", id="tab-config"):
                 yield ConfigEditorView(
@@ -479,10 +495,21 @@ class HordeWorkerTUI(App[None]):
                     theme_name=self._theme_name,
                 )
             with TabPane("Insights", id="tab-insights"):
+                yield tab_intro(
+                    "Where the time goes, and what is holding throughput back. Worth a look if you want "
+                    "to earn more kudos per hour.",
+                )
                 yield InsightsView()
             with TabPane("Diagnostics", id="tab-diagnostics"):
+                yield tab_intro(
+                    "Checks on this computer's setup, and the details to include when reporting a problem.",
+                )
                 yield DiagnosticsView()
             with TabPane("Benchmark", id="tab-benchmark"):
+                yield tab_intro(
+                    "Measures what this computer can handle and suggests settings to match. Running one "
+                    "is the easiest way to get good settings without tuning by hand.",
+                )
                 yield BenchmarkView(worker_mode=self._supervisor.mode.value)
         # The level rides the Footer's row rather than claiming one of its own: at the 80x24 floor a
         # dedicated indicator strip costs a line of content for information that changes rarely.
@@ -817,7 +844,11 @@ class HordeWorkerTUI(App[None]):
             simple_home.update_view(report, snapshot, is_alive=self._supervisor.is_alive())
             self.query_one(SimpleActivityView).update_view(snapshot)
             self.query_one(SimpleModelStatusView).update_view(snapshot)
-            self.query_one(GpusView).update_view(snapshot, mode=self._view_mode)
+            self.query_one(GpusView).update_view(
+                snapshot,
+                mode=self._view_mode,
+                simple=self._experience_level is ExperienceLevel.SIMPLE,
+            )
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
             self.query_one(ControlView).update_view(
                 snapshot,

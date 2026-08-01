@@ -172,6 +172,7 @@ class GpusView(VerticalScroll):
         snapshot: WorkerStateSnapshot | None,
         *,
         mode: OverviewViewMode = OverviewViewMode.NORMAL,
+        simple: bool = False,
     ) -> None:
         """Refresh the per-card view for the active ``mode`` from the snapshot's ``per_card`` section."""
         body = self.query_one("#gpus-body", Static)
@@ -186,7 +187,14 @@ class GpusView(VerticalScroll):
             return
 
         width = self.content_size.width or None
-        body.update(self._render_table(snapshot, detailed=mode is OverviewViewMode.DETAILS, available_width=width))
+        body.update(
+            self._render_table(
+                snapshot,
+                detailed=mode is OverviewViewMode.DETAILS,
+                available_width=width,
+                simple=simple,
+            ),
+        )
 
     def _maybe_record(self, snapshot: WorkerStateSnapshot) -> None:
         """Append one per-card jobs-completed sample at most once per :data:`_TREND_SAMPLE_INTERVAL`."""
@@ -241,9 +249,14 @@ class GpusView(VerticalScroll):
         *,
         detailed: bool,
         available_width: int | None,
+        simple: bool = False,
     ) -> RenderableType:
         """Build the per-card table whose columns shed to fit ``available_width``."""
-        layout = select_columns(_CARD_COLUMNS, ceiling=intent_ceiling(detailed), available_width=available_width)
+        layout = select_columns(
+            _CARD_COLUMNS,
+            ceiling=intent_ceiling(detailed, simple=simple),
+            available_width=available_width,
+        )
         table = Table(
             title="GPUs",
             title_style="bold",

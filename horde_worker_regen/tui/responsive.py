@@ -104,8 +104,16 @@ def _budget[T](specs: Sequence[ColumnSpec[T]]) -> int:
     return content + 2 * count + (count + 1)
 
 
-def intent_ceiling(detailed: bool) -> DensityTier:
-    """Map the F6 view intent to the highest tier it permits: details unlocks DETAILS, else WIDE."""
+def intent_ceiling(detailed: bool, *, simple: bool = False) -> DensityTier:
+    """Map the view intent to the highest tier it permits.
+
+    Details unlocks DETAILS and the everyday intent allows WIDE. The Simple experience clamps to
+    ESSENTIAL: the columns beyond it answer questions ("how much VRAM is this slot holding") that only
+    matter to someone tuning the worker, and a first-time contributor reading a table of them learns
+    nothing but that the dashboard is complicated.
+    """
+    if simple:
+        return DensityTier.ESSENTIAL
     return DensityTier.DETAILS if detailed else DensityTier.WIDE
 
 
