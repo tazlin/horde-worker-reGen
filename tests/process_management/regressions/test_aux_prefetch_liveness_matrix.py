@@ -1,11 +1,12 @@
 """Bounded-idleness liveness for the pop-time auxiliary (LoRA/TI) prefetch pipeline, over a variation matrix.
 
-A job whose auxiliary files are not yet on disk is invisible to both dispatch and preload: it holds no
-sampling lane and no VRAM reservation, and nothing prices around it while the dedicated download process
-places its files. This module proves the campaign's core liveness claims over a parametrized matrix rather
-than re-checking any single mechanism, driving the real scheduler, the real pop-time prefetch coordinator,
-and the real job tracker together across scheduling cycles with a hand-advanced clock and a scripted
-download process.
+A job whose auxiliary files are not yet on disk is invisible to dispatch: it holds no sampling lane or
+sampling-peak reservation while the dedicated download process places its files. It may stage its checkpoint
+into a wholly empty slot once no runnable sibling is competing, overlapping two otherwise-serial waits without
+letting the gated job sample. This module proves the campaign's core liveness claims over a parametrized matrix
+rather than re-checking any single mechanism, driving the real scheduler, the real pop-time prefetch
+coordinator, and the real job tracker together across scheduling cycles with a hand-advanced clock and a
+scripted download process.
 
 Three contracts are held:
 
@@ -17,9 +18,9 @@ Three contracts are held:
 - Admit implies dispatchable: a job the scheduler admits to a lane is one it actually dispatches to sampling
   in the same act. The scheduler never selects a job it cannot dispatch while another job's outstanding
   demand is priced in, so no job is admitted into a lane it can never be released from.
-- Cold-path no-reservation: a cold-model job with uncached LoRAs holds neither a lane nor a VRAM reservation
-  while its files download; a fitting sibling samples throughout that window; and when the prefetch completes
-  the head is preloaded and sampled.
+- Cold-path safe overlap: a fitting sibling gets capacity first; after it samples, the gated cold model may
+  preload into the still-empty slot while its LoRA finishes, but it holds no sampling lane and cannot dispatch
+  until the prefetch completes.
 
 The capacity axis is expressed through the enforced simultaneous-sampling limit (the concurrency cap): a
 two-lane pool with ample VRAM lets both jobs reach sampling, while a single-lane pool serializes them so the
@@ -633,13 +634,13 @@ async def test_gated_head_never_admitted_while_sibling_cycles(cell: _Cell) -> No
     assert world.sampled(head), f"{cell.id}: the head never dispatched after its gate cleared"
 
 
-async def test_cold_uncached_head_holds_no_reservation_while_sibling_samples() -> None:
-    """A cold head with uncached LoRAs holds no lane and no VRAM reservation while its files download.
+async def test_cold_uncached_head_preloads_only_after_sibling_samples() -> None:
+    """A cold head may use a spare slot after runnable sibling work has won capacity.
 
     The tightest cell: a cold base model whose LoRAs are not on disk, a single sampling lane so only one
-    job's peak fits at a time, and a slow download. Throughout the download the head must own neither a lane
-    nor a VRAM reservation, a resident sibling must keep the card sampling, and once the prefetch completes
-    the head must be preloaded and sampled.
+    job's peak fits at a time, and a slow download. The sibling must sample first. Once no runnable work is
+    competing, the head may stage into the wholly empty second process while the download continues, but it
+    must not sample until the files land.
     """
     resolve_cycle = 4
     cell = _Cell(
@@ -656,25 +657,28 @@ async def test_cold_uncached_head_holds_no_reservation_while_sibling_samples() -
     assert head.id_ is not None
 
     # Drive the download window (strictly before the files land): the head is gated the whole time.
-    for _ in range(resolve_cycle - 1):
+    for cycle in range(1, resolve_cycle):
         await world.step()
 
-        # No lane holds the head's cold base model, and no preload for it is in flight, so it reserves no
-        # VRAM by any path: a VRAM reservation would require the head to have been admitted to preload
-        # (its model LOADING/resident) or to dispatch (in progress), and it is none of these.
-        assert all(
-            process.loaded_horde_model_name != _HEAD_MODEL for process in world.scheduler._process_map.values()
-        ), "the cold head's model became resident while its LoRAs were still downloading"
-        assert not world.scheduler._horde_model_map.is_model_loading(_HEAD_MODEL)
-        assert _HEAD_MODEL not in world.scheduler._horde_model_map.root
+        # The dispatchable sibling owns the first cycle. Once it has sampled, the gated head may overlap its
+        # checkpoint load only on process 2, which began wholly empty; process 1's resident sibling is never
+        # displaced. Preloading is still not sampling admission.
+        if cycle == 1:
+            assert _HEAD_MODEL not in world.scheduler._horde_model_map.root
+        elif _HEAD_MODEL in world.scheduler._horde_model_map.root:
+            assert world.scheduler._horde_model_map.root[_HEAD_MODEL].process_id == 2
+        assert world.scheduler._process_map[1].loaded_horde_model_name == _SIBLING_MODEL
         assert head not in world.job_tracker.jobs_in_progress
         assert world.job_tracker.get_stage(head.id_) == JobStage.PENDING_INFERENCE
 
     # The resident sibling kept the single lane fed throughout the head's wait.
     assert world.sampled(sibling), "the resident sibling never sampled during the head's download window"
+    assert _HEAD_MODEL in world.scheduler._horde_model_map.root, (
+        "the cold head did not overlap its checkpoint preload after runnable sibling work drained"
+    )
 
     # Once the files land, the cold head is preloaded and sampled within the bound; no permanent shadow.
     await world.run(_SAMPLING_BOUND + 1)
     assert world.sampled(head), "the head never sampled after its prefetch completed"
     first = world.first_sampled_cycle(head)
-    assert first is not None and first > resolve_cycle, "the head sampled before its LoRAs were on disk"
+    assert first is not None and first >= resolve_cycle, "the head sampled before its LoRAs were on disk"

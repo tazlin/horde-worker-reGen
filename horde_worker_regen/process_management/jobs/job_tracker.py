@@ -358,10 +358,11 @@ class TrackedJob:
     """Whether every auxiliary file (LoRA/TI) this job references is known present on disk.
 
     Set by the prefetch pipeline once the job's full auxiliary set has been placed by the download
-    process; until then the job is invisible to dispatch and preload, holding no lane and no VRAM
-    reservation. Withdrawn (see :meth:`JobTracker.invalidate_job_aux_preparation`) when an inference
-    child later fails to resolve one of the files, so the prefetch is re-armed instead of the job being
-    re-dispatched into the same failure.
+    process; until then the job is invisible to dispatch and holds no sampling lane or sampling-peak
+    reservation. Its checkpoint may still preload into a wholly empty slot when no runnable job competes.
+    Withdrawn (see :meth:`JobTracker.invalidate_job_aux_preparation`) when an inference child later fails
+    to resolve one of the files, so the prefetch is re-armed instead of the job being re-dispatched into
+    the same failure.
     """
     chain_context: ChainExecutionContext | None = None
     """The chain-stage state for this job's unit of work, or None for jobs registered outside the pop path.

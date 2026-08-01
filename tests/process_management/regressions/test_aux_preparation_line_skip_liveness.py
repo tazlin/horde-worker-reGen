@@ -1,9 +1,10 @@
 """An auxiliary-gated job must hold no sampling slot before it can sample.
 
 A resident-model job may still need its LoRAs/TIs placed on disk. The pop-time prefetch pipeline does that
-while the job stays pending, so the job is invisible to dispatch (and preload) until its files land and its
-preparation gate clears. It reserves no future activation peak in the meantime, so a fitting sibling for an
-idle lane is dispatched instead of being withheld behind a phantom reservation.
+while the job stays pending, so the job is invisible to dispatch until its files land and its preparation gate
+clears. It reserves no future activation peak in the meantime, so a fitting sibling for an idle lane is
+dispatched instead of being withheld behind a phantom reservation. A non-displacing checkpoint preload into
+an otherwise-unused slot is allowed, but does not alter this dispatch contract.
 
 These tests hold that contract: a gated head keeps its queue position without owning a sampling reservation;
 a fitting backfill sibling is fed while it waits; and once its files are cached it competes at the ordinary

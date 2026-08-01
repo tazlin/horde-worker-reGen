@@ -376,11 +376,14 @@ pop-time prefetch pipeline is the only preparation path. At pop the parent asks 
 process to place the files on disk while the job stays `PENDING_INFERENCE`, off the inference lanes, so
 dispatch finds them already cached (see
 [pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch)). While unprepared, the job is
-invisible to both dispatch selection and model preload: it is never chosen as the dispatch head, never
-preloaded or staged, and owns no inference-concurrency slot and no future sampling reservation. Nothing
-prices around it, so a fitting sibling behind it is preloaded and sampled while it waits rather than the card
-idling. Its dispatch gate clears via the prefetch outcome onto the normal `START_INFERENCE` path, where it
-then passes every ordinary VRAM, concurrency, and post-processing gate like any other job.
+invisible to dispatch selection: it is never chosen as the dispatch head and owns no inference-concurrency
+slot or future sampling reservation. Nothing prices around it, so a fitting sibling behind it is preloaded and
+sampled while it waits rather than the card idling. When no runnable sibling competes and a process is wholly
+empty, the gated job may stage its checkpoint there without displacement, overlapping model load with the
+remaining download; this still grants no sampling admission. Its dispatch gate clears via the prefetch outcome
+onto the normal `START_INFERENCE` path, where it then passes every ordinary VRAM, concurrency, and
+post-processing gate like any other job. See
+[pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch) for the full restraint rules.
 
 Two mechanisms keep this live. A per-job prefetch deadline (derived from the configured download timeout and
 checked in the periodic scheduling scan) faults a job whose files never land, so it is never left pending

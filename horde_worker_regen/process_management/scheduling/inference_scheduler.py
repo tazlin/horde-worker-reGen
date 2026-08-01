@@ -6743,10 +6743,11 @@ class InferenceScheduler:
         # model (see the budget-defer branches in the admission pipeline); a later job whose turn has
         # not come never displaces a resident head.
         in_progress_jobs = self._job_tracker.jobs_in_progress
-        # An aux-unprepared job never anchors preload as the head: it holds no reservation and nothing prices
-        # around it, so the first job eligible to hold capacity is the first pending one that is both not in
-        # progress and not awaiting auxiliary preparation. A fitting sibling behind a gated job is thus the
-        # head that may escalate eviction to become resident, while the gated job stays invisible to preload.
+        # An aux-unprepared job never anchors preload as the priority head: it holds no sampling reservation
+        # and nothing prices around it, so the first job eligible to hold capacity is the first pending one that
+        # is both not in progress and not awaiting auxiliary preparation. A fitting sibling behind a gated job
+        # is thus the head that may escalate eviction to become resident. Only when no such sibling exists may
+        # the gated job take the strictly non-displacing, empty-slot preload path below.
         head_job = next(
             (
                 j
