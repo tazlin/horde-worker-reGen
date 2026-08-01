@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def dynamically_create_library_markdown_stubs() -> None:
-    """Create markdown stubs for the library documentation."""
+    """Create current markdown stubs and remove generated stubs for modules that no longer exist."""
     project_root = Path(__file__).parent.parent
     code_root = Path(__file__).parent.parent / "horde_worker_regen"
 
@@ -22,6 +22,8 @@ def dynamically_create_library_markdown_stubs() -> None:
     folder_lookup = convert_list_of_paths_to_namespaces(code_root_paths, project_root)
     # Remove any files from the folder_lookup
 
+    expected_stubs: set[Path] = set()
+
     # For each folder in the folder_lookup, create a file in the docs folder
     for folder, _namespace in folder_lookup.items():
         # Only document importable packages. A directory without an __init__.py is not a real
@@ -31,8 +33,7 @@ def dynamically_create_library_markdown_stubs() -> None:
         if not (folder / "__init__.py").exists():
             continue
 
-        relative_folder = folder.relative_to(project_root)
-        relative_folder = "docs" / relative_folder
+        relative_folder = project_root / "docs" / folder.relative_to(project_root)
         relative_folder.mkdir(parents=True, exist_ok=True)
 
         with open(relative_folder / ".pages", "w", encoding="utf-8") as f:
@@ -57,10 +58,28 @@ def dynamically_create_library_markdown_stubs() -> None:
             if "process-management-legacy-shim" in file.read_text(encoding="utf-8"):
                 continue
 
-            with open(relative_folder / f"{file.stem}.md", "w", encoding="utf-8") as f:
+            stub_path = relative_folder / f"{file.stem}.md"
+            expected_stubs.add(stub_path)
+            with open(stub_path, "w", encoding="utf-8") as f:
                 f.write(f"# {file.stem}\n")
                 file_namespace = pyfile_lookup[file]
                 f.write(f"::: {file_namespace}\n")
+
+    _remove_stale_generated_stubs(project_root / "docs" / "horde_worker_regen", expected_stubs)
+
+
+def _remove_stale_generated_stubs(docs_code_root: Path, expected_stubs: set[Path]) -> None:
+    """Delete only two-line generated API stubs whose source module has disappeared."""
+    for stub_path in docs_code_root.glob("**/*.md"):
+        if stub_path in expected_stubs:
+            continue
+        lines = stub_path.read_text(encoding="utf-8").splitlines()
+        relative_module = stub_path.relative_to(docs_code_root).with_suffix("").as_posix().replace("/", ".")
+        if lines == [
+            f"# {stub_path.stem}",
+            f"::: horde_worker_regen.{relative_module}",
+        ]:
+            stub_path.unlink()
 
 
 def convert_list_of_paths_to_namespaces(paths: list[Path], root: Path) -> dict[Path, str]:
