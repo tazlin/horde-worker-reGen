@@ -64,17 +64,28 @@ levels are available:
 |-------|----------------|
 | **Simple** | Contributing without needing to understand the worker. Plain wording, live per-request progress, and the settings most contributors change. |
 | **Advanced** | The complete operator surface: queues, per-process state, scheduler behaviour, download detail, and the whole configuration. |
-| **Developer** | Advanced plus forensic detail and settings that can stop a healthy worker. Entering it once asks you to confirm. |
+| **Developer** | Advanced plus the worker's internal safety levers: hung-process timeouts, the VRAM and RAM budget, and the fault breakers. Entering it once asks you to confirm. |
 
 Change level in the **Dashboard** section of the Config tab, or press `Ctrl+P` and search for the level
 you want. The choice is remembered between runs.
 
 Every tab exists at every level. The level changes how much detail each tab shows, never which tabs you
-have, so anything you learn to find in Simple is in the same place in Developer. Two things are
-withheld in Simple rather than merely simplified: the Config tab offers only its Dashboard, Essentials,
-Models, Content, and Features pages, and the GPU table drops its tuning columns. Settings you cannot see
-are still preserved: saving from Simple writes back everything already in `bridgeData.yaml`, so
-switching level never rewrites a tuned config.
+have, so anything you learn to find in Simple is in the same place in Developer.
+
+Simple leaves out three things. The Config tab offers its Dashboard, Essentials, Models, Content,
+Features, Alchemy, and LoRA & Downloads pages, holding back the tuning pages whose settings only mean
+something next to the measurements that would justify changing them. The GPU table drops its tuning
+columns. And the three shortcuts that act on the Advanced Overview (`c` customize, `h` reveal hidden,
+`F6` view mode) do nothing, since the view they act on is not the one Simple shows.
+
+Advanced adds the tuning pages. Developer adds one further group: the settings the worker uses to police
+itself. Timeouts that decide when a process counts as hung, the VRAM and RAM budget the arbiter enforces
+against, whole-card residency, and the circuit breakers for post-processing faults, unservable models,
+and self-maintenance. Set carelessly, these remove a protection without saying so or trip on healthy
+work, which is why they sit behind a level you have to choose on purpose.
+
+Settings you cannot see are still preserved. Saving from any level writes back everything already in
+`bridgeData.yaml`, so moving between levels never rewrites a tuned config.
 
 If you upgraded from a version without levels, the dashboard tells you the default changed on first
 launch and offers to keep the full view.
@@ -88,8 +99,12 @@ spacing density (comfortable or compact) for the Advanced and Developer surfaces
 ## Tabs
 
 The descriptions below are the **Advanced** presentation of each tab. In Simple, Overview, Live, and
-Downloads show plain-language equivalents instead, and the remaining tabs keep these widgets with a
-one-line explanation of what the page is for above them.
+Downloads show plain-language equivalents instead. The remaining tabs keep these widgets, with a
+one-line explanation of what the page is for and an **Example** panel above them that walks through the
+figures that tab is showing *right now*, saying what each one means and what a healthy value looks like.
+The example uses your worker's own numbers rather than illustrative ones, and a figure the worker cannot
+report yet says so instead of showing a zero. Fold the panel away with its ▼ once you have read it; on a
+short terminal it is longer than the screen, so collapsing it is how you get the table back.
 
 | Tab | What it shows |
 |-----|---------------|

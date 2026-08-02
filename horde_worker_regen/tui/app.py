@@ -17,18 +17,21 @@ import time
 from collections.abc import Callable, Iterable
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, override
 
 from loguru import logger
 from rich.text import Text
 from textual.app import App, ComposeResult, SystemCommand
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane
 
 from horde_worker_regen import __version__
 from horde_worker_regen.app_state import (
+    DEFAULT_THEME_NAME,
+    KNOWN_THEME_NAMES,
     AppStateStore,
     DisplayDensity,
     ExperienceLevel,
@@ -54,13 +57,18 @@ from horde_worker_regen.tui.benchmark_launcher import (
 from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
-from horde_worker_regen.tui.design import HORDE_THEME_NAMES, register_horde_themes
+from horde_worker_regen.tui.design import register_horde_themes
 from horde_worker_regen.tui.formatters import configure_fidelity, format_percent
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import UpdateInfo, check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
-from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
+from horde_worker_regen.tui.widgets.config_editor import (
+    MODELS_SUBTAB_ID,
+    ConfigEditorView,
+    ConfigLeaveChoice,
+    ConfigLeaveModal,
+)
 from horde_worker_regen.tui.widgets.control import ControlView
 from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView
 from horde_worker_regen.tui.widgets.download_picker import (
@@ -88,10 +96,12 @@ from horde_worker_regen.tui.widgets.onboarding import (
 from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.widgets.overview_layout import OverviewLayoutModal, valid_hidden_keys
 from horde_worker_regen.tui.widgets.simple import (
+    PRIMERS,
     SimpleActivityView,
+    SimpleDestination,
     SimpleHomeView,
     SimpleModelStatusView,
-    tab_intro,
+    TabPrimer,
 )
 from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
@@ -111,6 +121,13 @@ _BENCHMARK_SCALE_TIMEOUT_SECONDS = 45.0
 """How long to wait for the scaled-down inference processes (and their GPU contexts) to actually exit."""
 _BENCHMARK_DRAIN_POLL_SECONDS = 0.5
 """How often the drain wait re-checks the worker's latest snapshot."""
+
+_DESTINATION_ID_PREFIX = "tab-"
+"""Identifier prefix marking a top-level destination, as opposed to a nested sub-tab."""
+
+_CONFIG_TAB_ID = "tab-config"
+_DOWNLOADS_TAB_ID = "tab-downloads"
+_LIVE_TAB_ID = "tab-live"
 
 
 def _no_inference_contexts(snapshot: WorkerStateSnapshot) -> bool:
@@ -417,9 +434,13 @@ class HordeWorkerTUI(App[None]):
         # Owed to an installation that predates the levels; consumed once on mount so the Simple default
         # is announced rather than looking like the dashboard lost its detail.
         self._needs_experience_introduction = persisted_state.needs_experience_introduction
+        # Cached because the render loop asks every frame and the answer costs a YAML parse; invalidated
+        # by the config file's own change stamp rather than by a save hook, so an external edit counts.
+        self._setup_required = False
+        self._setup_config_stamp: tuple[int, int] | None = None
         register_horde_themes(self)
         self._theme_name = (
-            persisted_state.theme_name if persisted_state.theme_name in HORDE_THEME_NAMES else "horde-dark"
+            persisted_state.theme_name if persisted_state.theme_name in KNOWN_THEME_NAMES else DEFAULT_THEME_NAME
         )
         self.theme = self._theme_name
         # Operator-hidden Overview elements (registry keys), restored from durable state. Unknown/renamed
@@ -459,20 +480,23 @@ class HordeWorkerTUI(App[None]):
                 yield SimpleHomeView()
                 yield OverviewView()
             with TabPane("Stats", id="tab-stats"):
-                yield tab_intro(
+                yield TabPrimer(
                     "Totals and averages for the work this computer has done. Nothing here needs "
                     "changing; it is a record of what happened.",
+                    PRIMERS.get("Stats", ()),
                 )
                 yield StatsView()
             with TabPane("Control", id="tab-control"):
-                yield tab_intro(
+                yield TabPrimer(
                     "The background programs that do the work. The worker starts and restarts these on "
                     "its own; this is where you would look if one stopped.",
+                    PRIMERS.get("Control", ()),
                 )
                 yield ControlView()
             with TabPane("GPUs", id="tab-gpus"):
-                yield tab_intro(
+                yield TabPrimer(
                     "What your graphics card is doing, and how much of its memory the worker is using.",
+                    PRIMERS.get("GPUs", ()),
                 )
                 yield GpusView()
             with TabPane("Live", id="tab-live"):
@@ -482,9 +506,10 @@ class HordeWorkerTUI(App[None]):
                 yield SimpleModelStatusView()
                 yield DownloadsView()
             with TabPane("Logs", id="tab-logs"):
-                yield tab_intro(
+                yield TabPrimer(
                     "The worker's running commentary. Useful to copy from when asking for help; you do "
                     "not need to read it to contribute.",
+                    PRIMERS.get("Logs", ()),
                 )
                 yield LogsView()
             with TabPane("Config", id="tab-config"):
@@ -495,20 +520,23 @@ class HordeWorkerTUI(App[None]):
                     theme_name=self._theme_name,
                 )
             with TabPane("Insights", id="tab-insights"):
-                yield tab_intro(
+                yield TabPrimer(
                     "Where the time goes, and what is holding throughput back. Worth a look if you want "
                     "to earn more kudos per hour.",
+                    PRIMERS.get("Insights", ()),
                 )
                 yield InsightsView()
             with TabPane("Diagnostics", id="tab-diagnostics"):
-                yield tab_intro(
+                yield TabPrimer(
                     "Checks on this computer's setup, and the details to include when reporting a problem.",
+                    PRIMERS.get("Diagnostics", ()),
                 )
                 yield DiagnosticsView()
             with TabPane("Benchmark", id="tab-benchmark"):
-                yield tab_intro(
+                yield TabPrimer(
                     "Measures what this computer can handle and suggests settings to match. Running one "
                     "is the easiest way to get good settings without tuning by hand.",
+                    PRIMERS.get("Benchmark", ()),
                 )
                 yield BenchmarkView(worker_mode=self._supervisor.mode.value)
         # The level rides the Footer's row rather than claiming one of its own: at the 80x24 floor a
@@ -651,7 +679,37 @@ class HordeWorkerTUI(App[None]):
         Skipped for the fake/demo worker and for env-var config (both are power-user paths). When the
         config is already complete, the durable setup-complete flag is set so existing installs never
         see the wizard.
+
+        Answering this reads and parses ``bridgeData.yaml`` (comment-preserving, so not cheap) and may
+        read the durable state, so the answer is cached and refreshed only when the config file itself
+        changes. See :meth:`_refresh_setup_required`.
         """
+        self._setup_required = self._compute_setup_required()
+        self._setup_config_stamp = self._config_stamp()
+        return self._setup_required
+
+    def _config_stamp(self) -> tuple[int, int] | None:
+        """Return a cheap change stamp for the config file, or None when it is absent."""
+        try:
+            stat_result = self._config_path.stat()
+        except OSError:
+            return None
+        return (stat_result.st_mtime_ns, stat_result.st_size)
+
+    def _refresh_setup_required(self) -> bool:
+        """Return whether setup is outstanding, re-reading the config only when the file has changed.
+
+        The render loop asks this every frame, so the steady-state cost is one ``stat`` rather than a
+        comment-preserving YAML parse. Watching the file (rather than only the dashboard's own save path)
+        keeps this correct when the config is edited in another editor while the dashboard is open.
+        """
+        stamp = self._config_stamp()
+        if stamp != self._setup_config_stamp:
+            return self._should_run_setup_wizard()
+        return self._setup_required
+
+    def _compute_setup_required(self) -> bool:
+        """Read the config from disk and decide whether first-run setup is still outstanding."""
         if self._supervisor.mode is not WorkerProcessMode.REAL or self._load_config_from_env_vars:
             return False
         try:
@@ -840,8 +898,10 @@ class HordeWorkerTUI(App[None]):
             # recent-request feed accumulate continuously; switching to Simple then shows real history
             # rather than starting from an empty chart.
             simple_home = self.query_one(SimpleHomeView)
-            simple_home.set_setup_required(self._should_run_setup_wizard())
+            simple_home.set_setup_required(self._refresh_setup_required())
             simple_home.update_view(report, snapshot, is_alive=self._supervisor.is_alive())
+            for primer in self.query(TabPrimer):
+                primer.update_view(snapshot, report)
             self.query_one(SimpleActivityView).update_view(snapshot)
             self.query_one(SimpleModelStatusView).update_view(snapshot)
             self.query_one(GpusView).update_view(
@@ -1301,24 +1361,27 @@ class HordeWorkerTUI(App[None]):
         OverviewViewMode.THIN: "View: thin (essentials only: status bar, slim downloads, bare log, Essentials).",
     }
 
-    _DESTINATIONS = (
-        ("Overview", "tab-overview"),
-        ("Stats", "tab-stats"),
-        ("Control", "tab-control"),
-        ("GPUs", "tab-gpus"),
-        ("Live", "tab-live"),
-        ("Downloads", "tab-downloads"),
-        ("Logs", "tab-logs"),
-        ("Config", "tab-config"),
-        ("Insights", "tab-insights"),
-        ("Diagnostics", "tab-diagnostics"),
-        ("Benchmark", "tab-benchmark"),
-    )
-    """Every destination, in tab order, for the command palette.
+    def destinations(self) -> list[tuple[str, str]]:
+        """Return ``(label, tab id)`` for every top-level destination, in tab order.
 
-    The labels match the tab captions at every level: the level changes what a destination renders, not
-    what it is called, so a name learned in Simple still finds the same place in Developer.
-    """
+        Read from the mounted tab bar rather than a hand-kept list, so a destination added to ``compose``
+        is offered in the command palette without a second edit; a copy kept alongside would silently
+        omit it. The labels are the tab captions themselves: the level changes what a destination renders,
+        not what it is called, so a name learned in Simple still finds the same place in Developer.
+        """
+        try:
+            tabs = self.query_one("#main-tabs", TabbedContent)
+        except NoMatches:
+            return []
+        found: list[tuple[str, str]] = []
+        for pane in tabs.query(TabPane):
+            # Config nests its own TabbedContent, whose panes carry the "cfgtab-" prefix; only the
+            # top-level destinations belong in the palette.
+            if not pane.id or not pane.id.startswith(_DESTINATION_ID_PREFIX):
+                continue
+            with contextlib.suppress(ValueError):
+                found.append((tabs.get_tab(pane.id).label_text, pane.id))
+        return found
 
     def _apply_experience_level(self, level: ExperienceLevel) -> None:
         """Apply ``level`` to the screen classes, the footer indicator, and the views that vary by level.
@@ -1328,11 +1391,13 @@ class HordeWorkerTUI(App[None]):
         someone who has just learned where things are.
         """
         self._experience_level = level
-        screen = self.screen
-        screen.remove_class("level-simple", "level-advanced", "level-developer")
-        screen.add_class(f"level-{level.value}")
-        screen.remove_class("density-comfortable", "density-compact")
-        screen.add_class(f"density-{self._display_density.value}")
+        # Each class mutation on the Screen re-applies the stylesheet across every node beneath it, and
+        # this DOM runs to hundreds of widgets. Compute the target set and write it once, skipping the
+        # write entirely when it already matches, rather than dropping and re-adding four classes.
+        wanted = {f"level-{level.value}", f"density-{self._display_density.value}"}
+        current = {name for name in self.screen.classes if name.startswith(("level-", "density-"))}
+        if current != wanted:
+            self.screen.set_classes(sorted((set(self.screen.classes) - current) | wanted))
         with contextlib.suppress(NoMatches):
             self.query_one("#level-indicator", Static).update(level.value.title())
         # Overview, Live and Downloads each host a Simple presentation beside the operator one and swap
@@ -1343,12 +1408,28 @@ class HordeWorkerTUI(App[None]):
             (SimpleActivityView, LiveView),
             (SimpleModelStatusView, DownloadsView),
         ):
-            with contextlib.suppress(NoMatches):
-                self.query_one(simple_view).display = simple
-            with contextlib.suppress(NoMatches):
-                self.query_one(operator_view).display = not simple
+            for view_type, wanted in ((simple_view, simple), (operator_view, not simple)):
+                with contextlib.suppress(NoMatches):
+                    view = self.query_one(view_type)
+                    # Assigning display re-applies the stylesheet beneath the widget even when the value
+                    # is unchanged, and this runs on every level application.
+                    if view.display != wanted:
+                        view.display = wanted
         with contextlib.suppress(NoMatches):
             self.query_one(ConfigEditorView).set_experience_level(level)
+
+    _OPERATOR_VIEW_ACTIONS = frozenset({"customize_overview", "toggle_hidden_reveal", "cycle_view_mode"})
+    """Actions whose subject is the operator Overview, which Simple replaces with its own view.
+
+    Customising the Overview layout, revealing elements hidden from it, and cycling its density all
+    address a widget that is off screen at that level, so a footer hint for one of them offers a control
+    with nothing to act on. Navigation is unaffected: every destination stays reachable everywhere.
+    """
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Withhold the operator-view actions in Simple so no shortcut is offered without a subject."""
+        withheld = action in self._OPERATOR_VIEW_ACTIONS and self._experience_level is ExperienceLevel.SIMPLE
+        return not withheld
 
     def _request_experience_level(self, level: ExperienceLevel) -> None:
         """Change level, guarding the first entry into Developer behind its one-time warning."""
@@ -1377,50 +1458,78 @@ class HordeWorkerTUI(App[None]):
         self._tick()
 
     def set_display_density(self, density: DisplayDensity) -> None:
-        """Persist and apply the Advanced/Developer spacing density."""
+        """Persist and apply the Advanced/Developer spacing density.
+
+        A no-op change returns early. Textual emits ``Select.Changed`` when the control takes its
+        starting value during compose, so without this guard simply opening the Config tab restyles the
+        whole DOM and rewrites the state file for a density nobody chose.
+        """
+        if density is self._display_density:
+            return
         self._display_density = density
         with contextlib.suppress(OSError):
             self._app_state_store.set_display_density(density)
         self._apply_experience_level(self._experience_level)
 
     def set_theme_name(self, theme_name: str) -> None:
-        """Persist and apply a registered Horde theme."""
-        if theme_name not in HORDE_THEME_NAMES:
+        """Persist and apply a registered Horde theme, ignoring an unknown or unchanged one."""
+        if theme_name not in KNOWN_THEME_NAMES or theme_name == self._theme_name:
             return
         self._theme_name = theme_name
         self.theme = theme_name
         with contextlib.suppress(OSError):
             self._app_state_store.set_theme_name(theme_name)
 
-    def keyboard_actions(self) -> list[tuple[str, str, str]]:
-        """Return ``(keys, description, action)`` for every shown binding, in declaration order.
+    def keyboard_actions(self, screen: Screen[Any] | None = None) -> list[tuple[str, str, str]]:
+        """Return ``(keys, description, action)`` for every shortcut ``screen`` currently offers.
 
-        Derived from the live binding table rather than a hand-kept list, so the command palette and the
-        help modal can never drift from ``BINDINGS``. Keys that share an action are grouped onto one
-        entry, so the two quit keys read as one command with two shortcuts instead of two commands.
+        Read from Textual's own active-binding table, which is the same source the Footer renders from,
+        so the palette and the help modal list exactly what the Footer would show if it had the room:
+        a disabled or level-withheld key drops out of all three together, and a binding added to
+        ``BINDINGS`` appears in all three without a second edit.
+
+        Keys that share an action are grouped onto one entry, so the two quit keys read as one command
+        with two shortcuts rather than as two commands.
+
+        Args:
+            screen: The screen whose bindings to describe; defaults to the active one. The command
+                palette passes the screen it was opened over, since by then it is itself on top and its
+                own bindings are not what the operator is looking for.
         """
+        source = screen if screen is not None else self.screen
         by_action: dict[str, tuple[list[str], str]] = {}
-        for key, bindings in self._bindings.key_to_bindings.items():
-            for binding in bindings:
-                if not binding.show:
-                    continue
-                try:
-                    display = self.get_key_display(binding)
-                except Exception:  # noqa: BLE001 - a display failure must not cost discoverability
-                    display = key
-                keys, _description = by_action.setdefault(binding.action, ([], binding.description))
-                if display not in keys:
-                    keys.append(display)
+        for key, active in source.active_bindings.items():
+            binding = active.binding
+            if not binding.show or not active.enabled:
+                continue
+            display = self._key_display(binding, fallback=key)
+            keys, _description = by_action.setdefault(binding.action, ([], binding.description))
+            if display not in keys:
+                keys.append(display)
         return [(", ".join(keys), description, action) for action, (keys, description) in by_action.items()]
+
+    def _key_display(self, binding: Binding, *, fallback: str) -> str:
+        """Return the printable form of a binding's key, falling back to the raw key name.
+
+        Textual derives this from the active keymap and terminal capabilities, so it can fail on an
+        unusual key definition. The raw key name still identifies the shortcut, and this list has to stay
+        complete for the palette and the help modal to remain usable when the footer truncates.
+        """
+        try:
+            return self.get_key_display(binding)
+        except (KeyError, ValueError) as display_error:
+            self.log(f"Could not render the key for {binding.action}: {display_error}")
+            return fallback
 
     def _invoke_action(self, action: str) -> None:
         """Run a named action off the palette, scheduled so the palette can close first."""
         self.call_later(self.run_action, action)
 
-    def get_system_commands(self, screen: object) -> Iterable[SystemCommand]:
+    @override
+    def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
         """Add every destination, keyboard action, and experience level to Textual's command palette."""
-        yield from super().get_system_commands(screen)  # type: ignore[arg-type]
-        for label, destination in self._DESTINATIONS:
+        yield from super().get_system_commands(screen)
+        for label, destination in self.destinations():
             yield SystemCommand(
                 f"Go to {label}",
                 "Open this dashboard destination",
@@ -1429,7 +1538,7 @@ class HordeWorkerTUI(App[None]):
         # Every keyboard action is offered here with its shortcut attached. The Footer can only fit a
         # handful of hints on a real terminal (and drops the tail entirely when narrow), so the palette
         # is the surface that stays complete, and it teaches the shortcut rather than merely running it.
-        for keys, description, action in self.keyboard_actions():
+        for keys, description, action in self.keyboard_actions(screen):
             yield SystemCommand(
                 f"{description}  ({keys})",
                 "Keyboard action",
@@ -1453,8 +1562,7 @@ class HordeWorkerTUI(App[None]):
 
     def action_show_help(self) -> None:
         """Explain the dashboard at the level currently in effect, listing every shortcut."""
-        with contextlib.suppress(Exception):
-            self.push_screen(HelpModal(self._experience_level, self.keyboard_actions()))
+        self.push_screen(HelpModal(self._experience_level, self.keyboard_actions()))
 
     def on_simple_home_view_start_stop_requested(self, message: SimpleHomeView.StartStopRequested) -> None:
         """Start or stop the worker from the Simple home action."""
@@ -1464,18 +1572,25 @@ class HordeWorkerTUI(App[None]):
         """Reopen the guided setup wizard, which stays the single first-run path."""
         self._run_setup_wizard()
 
+    _SIMPLE_DESTINATION_TABS: dict[SimpleDestination, str] = {
+        SimpleDestination.ACTIVITY: _LIVE_TAB_ID,
+        SimpleDestination.MODELS: _DOWNLOADS_TAB_ID,
+    }
+    """Where each Simple intent lands. The dashboard owns this mapping so the Simple views need not
+    know any tab identifier."""
+
     def on_simple_home_view_navigate_requested(self, message: SimpleHomeView.NavigateRequested) -> None:
         """Follow a Simple home link to another destination."""
-        self._navigate_to(message.destination)
+        self._navigate_to(self._SIMPLE_DESTINATION_TABS[message.destination])
 
     def on_simple_model_status_view_manage_requested(
         self,
         message: SimpleModelStatusView.ManageRequested,
     ) -> None:
         """Send the contributor to the one place models are chosen."""
-        self._navigate_to("tab-config")
+        self._navigate_to(_CONFIG_TAB_ID)
         with contextlib.suppress(NoMatches, ValueError):
-            self.query_one(ConfigEditorView).query_one("#config-subtabs", TabbedContent).active = "cfgtab-models"
+            self.query_one(ConfigEditorView).open_subtab(MODELS_SUBTAB_ID)
 
     def on_dashboard_preferences_view_experience_level_changed(
         self,

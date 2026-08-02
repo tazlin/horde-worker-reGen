@@ -111,11 +111,22 @@ Screen.density-compact .horde-hero {
     margin-bottom: 0;
 }
 
+/* At the 80x24 floor a full box border costs two rows per card, which is more than the layout can
+   afford. A single left edge keeps each card visually separate for one column and no rows at all;
+   dropping the border outright ran the hero and every card together into one wall of text. */
 Screen.-narrow .horde-hero,
 Screen.-narrow .horde-card {
     padding: 0 1;
     margin-bottom: 0;
     border: none;
+}
+
+Screen.-narrow .horde-hero {
+    border-left: thick $primary;
+}
+
+Screen.-narrow .horde-card {
+    border-left: solid $horde-edge;
 }
 
 Screen.-narrow #level-indicator {

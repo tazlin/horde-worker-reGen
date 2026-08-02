@@ -13,6 +13,8 @@ from typing import Any
 from textual.app import App
 from textual.theme import BUILTIN_THEMES, Theme
 
+from horde_worker_regen.app_state import KNOWN_THEME_NAMES
+
 DESIGN_SYSTEM_COMMIT = "33fd5c412e5ba0a9d85867dcd52ee963722aa57d"
 
 HORDE_DARK = Theme(
@@ -95,7 +97,15 @@ HORDE_ANSI = Theme(
 )
 
 HORDE_THEMES = (HORDE_DARK, HORDE_LIGHT, HORDE_ANSI)
-HORDE_THEME_NAMES = tuple(theme.name for theme in HORDE_THEMES)
+HORDE_THEME_NAMES = frozenset(theme.name for theme in HORDE_THEMES)
+
+# Consistency check at import: the two sets are declared apart and must not drift.
+if HORDE_THEME_NAMES != KNOWN_THEME_NAMES:  # pragma: no cover
+    raise RuntimeError(
+        "The themes defined here and the names persisted state will restore have diverged: "
+        f"{sorted(HORDE_THEME_NAMES)} vs {sorted(KNOWN_THEME_NAMES)}. "
+        "app_state holds the names because it must stay free of Textual; add the theme in both places.",
+    )
 
 
 def register_horde_themes(app: App[Any]) -> None:

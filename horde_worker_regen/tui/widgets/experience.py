@@ -6,17 +6,26 @@ destinations exist. Every tab is present at every level, so nothing here hides o
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Rule, Select, Static
 
 from horde_worker_regen.app_state import DisplayDensity, ExperienceLevel
+
+_LEVEL_BUTTON_IDS: dict[ExperienceLevel, str] = {
+    ExperienceLevel.SIMPLE: "experience-simple",
+    ExperienceLevel.ADVANCED: "experience-advanced",
+    ExperienceLevel.DEVELOPER: "experience-developer",
+}
+"""The button that selects each level, shared by the composer and the active-state styling."""
 
 _LEVEL_SUMMARIES: dict[ExperienceLevel, tuple[str, str]] = {
     ExperienceLevel.SIMPLE: (
@@ -52,10 +61,10 @@ _DENSITY_CHOICES = (
 class DashboardPreferencesView(Vertical):
     """Dashboard appearance controls: experience level, density, and theme.
 
-    These are frontend preferences held in the durable app state, not worker configuration. It lives on
-    the Config tab because that is where people look to change things, but it deliberately writes nothing
-    to ``bridgeData.yaml`` and never marks the config form dirty: every raw widget event is stopped here
-    and re-emitted as a typed message, so the surrounding editor's save tracking cannot observe it.
+    These are frontend preferences held in the durable app state. They sit on the Config tab because
+    that is where people look to change settings, but nothing here reaches ``bridgeData.yaml``, and the
+    surrounding editor never sees the form as dirty: every raw widget event is stopped at this widget and
+    re-emitted as a typed message, beyond the reach of the editor's save tracking.
     """
 
     class ExperienceLevelChanged(Message):
@@ -128,9 +137,8 @@ class DashboardPreferencesView(Vertical):
             classes="config-guidance",
         )
         with Horizontal(classes="experience-row"):
-            yield Button("Simple", id="experience-simple")
-            yield Button("Advanced", id="experience-advanced")
-            yield Button("Developer", id="experience-developer")
+            for level, button_id in _LEVEL_BUTTON_IDS.items():
+                yield Button(_LEVEL_SUMMARIES[level][0], id=button_id)
         yield Static(id="experience-summary")
         with Horizontal(classes="experience-choice"):
             yield Label("Spacing")
@@ -144,32 +152,24 @@ class DashboardPreferencesView(Vertical):
         self.set_experience_level(self._level)
 
     def set_experience_level(self, level: ExperienceLevel) -> None:
-        """Highlight ``level`` as active and describe what it shows."""
+        """Highlight ``level`` as active and describe what it shows.
+
+        Tolerates being called before ``compose`` has mounted the controls: the level is recorded either
+        way and ``on_mount`` re-applies it, so the only effect of an early call is that there is nothing
+        yet to restyle.
+        """
         self._level = level
-        active = {
-            ExperienceLevel.SIMPLE: "experience-simple",
-            ExperienceLevel.ADVANCED: "experience-advanced",
-            ExperienceLevel.DEVELOPER: "experience-developer",
-        }
-        for candidate, button_id in active.items():
-            try:
-                button = self.query_one(f"#{button_id}", Button)
-            except Exception:  # noqa: BLE001 - the control may not be mounted yet
-                continue
-            button.variant = "primary" if candidate is level else "default"
+        for candidate, button_id in _LEVEL_BUTTON_IDS.items():
+            with contextlib.suppress(NoMatches):
+                self.query_one(f"#{button_id}", Button).variant = "primary" if candidate is level else "default"
         _name, summary = _LEVEL_SUMMARIES[level]
-        try:
+        with contextlib.suppress(NoMatches):
             self.query_one("#experience-summary", Static).update(summary)
-        except Exception:  # noqa: BLE001 - the summary may not be mounted yet
-            return
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Request a level change, keeping the press away from the surrounding config form."""
-        requested = {
-            "experience-simple": ExperienceLevel.SIMPLE,
-            "experience-advanced": ExperienceLevel.ADVANCED,
-            "experience-developer": ExperienceLevel.DEVELOPER,
-        }.get(event.button.id or "")
+        by_button_id = {button_id: level for level, button_id in _LEVEL_BUTTON_IDS.items()}
+        requested = by_button_id.get(event.button.id or "")
         if requested is None:
             return
         event.stop()

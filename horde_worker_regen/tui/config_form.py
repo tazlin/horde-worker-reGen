@@ -495,6 +495,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "text-encode service, UNet-only sampling, a dedicated VAE lane, and the post-processing lane. "
         "Ineligible jobs fall back to the whole-job path.",
         requires_restart=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "allow_controlnet",
@@ -913,6 +914,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=3600,
         unit="s",
         explicit_default=300,
+        risk_level="dangerous",
     ),
     ConfigField(
         "post_process_timeout",
@@ -924,6 +926,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=120,
+        risk_level="dangerous",
     ),
     ConfigField(
         "preload_timeout",
@@ -935,6 +938,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=150,
+        risk_level="dangerous",
     ),
     ConfigField(
         "inference_step_timeout",
@@ -946,6 +950,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=60,
         unit="s",
         explicit_default=20,
+        risk_level="dangerous",
     ),
     ConfigField(
         "inference_first_step_timeout",
@@ -958,6 +963,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=90,
+        risk_level="dangerous",
     ),
     ConfigField(
         "contended_step_timeout",
@@ -970,6 +976,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=120,
+        risk_level="dangerous",
     ),
     ConfigField(
         "inference_stuck_step_repeat_limit",
@@ -982,6 +989,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=3,
         maximum=100,
         explicit_default=20,
+        risk_level="dangerous",
     ),
     ConfigField(
         "download_timeout",
@@ -993,6 +1001,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=3600,
         unit="s",
         explicit_default=211,
+        risk_level="dangerous",
     ),
     # Retry & scheduling
     ConfigField(
@@ -1004,6 +1013,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=1,
         maximum=5,
         explicit_default=2,
+        risk_level="dangerous",
     ),
     ConfigField(
         "minutes_allowed_without_jobs",
@@ -1039,6 +1049,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Gate preloads and dispatch on measured VRAM. When off, uses availability-only behavior "
         "(not recommended on a shared/consumer GPU).",
         explicit_default=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "vram_reserve_mb",
@@ -1050,6 +1061,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=49152,
         unit="MB",
         explicit_default=2048,
+        risk_level="dangerous",
     ),
     ConfigField(
         "ram_reserve_mb",
@@ -1061,6 +1073,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=131072,
         unit="MB",
         explicit_default=4096,
+        risk_level="dangerous",
     ),
     ConfigField(
         "ram_pressure_pause_percent",
@@ -1075,6 +1088,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=100.0,
         unit="%",
         explicit_default=85.0,
+        risk_level="dangerous",
     ),
     ConfigField(
         "ram_pressure_min_free_mb",
@@ -1087,6 +1101,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=131072,
         unit="MB",
         explicit_default=1024,
+        risk_level="dangerous",
     ),
     ConfigField(
         "ram_per_process_max_mb",
@@ -1101,6 +1116,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=1048576,
         unit="MB",
         explicit_default=18432,
+        risk_level="dangerous",
     ),
     ConfigField(
         "vram_per_process_overhead_mb",
@@ -1113,6 +1129,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=49152,
         unit="MB",
         explicit_default=0,
+        risk_level="dangerous",
     ),
     # Post-processing budget
     ConfigField(
@@ -1124,6 +1141,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "latched) so the worker does not trip the horde's forced maintenance. Only used when the VRAM "
         "budget is enabled.",
         explicit_default=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "post_processing_fault_threshold",
@@ -1135,6 +1153,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=1,
         maximum=100,
         explicit_default=4,
+        risk_level="dangerous",
     ),
     ConfigField(
         "post_processing_fault_window_seconds",
@@ -1146,6 +1165,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=86400,
         unit="s",
         explicit_default=1800,
+        risk_level="dangerous",
     ),
     # Exclusive residency
     ConfigField(
@@ -1156,6 +1176,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "When a model is admitted over budget (best-effort head-of-queue), evict all other residents "
         "and suppress concurrent dispatch so it runs on an uncontended device.",
         explicit_default=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "whole_card_exclusive_residency",
@@ -1165,6 +1186,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Proactively give a model that needs most of the card sole residency before it streams, "
         "rather than reacting after a fault.",
         explicit_default=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "whole_card_residency_safety_off_gpu",
@@ -1174,6 +1196,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Move the safety process off-GPU while a whole-card model holds the device, freeing its "
         "~1 GB CUDA context. Only applies when both enable_vram_budget and safety_on_gpu are true.",
         explicit_default=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "whole_card_residency_cooldown_seconds",
@@ -1186,6 +1209,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=45,
+        risk_level="dangerous",
     ),
     ConfigField(
         "overbudget_step_timeout",
@@ -1198,6 +1222,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=120,
+        risk_level="dangerous",
     ),
     ConfigField(
         "large_model_switch_min_seconds",
@@ -1211,6 +1236,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=0,
+        risk_level="dangerous",
     ),
     ConfigField(
         "large_model_reentry_cooldown_seconds",
@@ -1223,6 +1249,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=-1,
+        risk_level="dangerous",
     ),
     # Unservable model breaker
     ConfigField(
@@ -1235,6 +1262,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=0,
         maximum=20,
         explicit_default=3,
+        risk_level="dangerous",
     ),
     ConfigField(
         "unservable_model_cooldown_seconds",
@@ -1246,6 +1274,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=86400,
         unit="s",
         explicit_default=900,
+        risk_level="dangerous",
     ),
     # Self-maintenance
     ConfigField(
@@ -1257,6 +1286,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=0,
         maximum=100,
         explicit_default=6,
+        risk_level="dangerous",
     ),
     ConfigField(
         "self_maintenance_window_seconds",
@@ -1268,6 +1298,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=3600,
         unit="s",
         explicit_default=600,
+        risk_level="dangerous",
     ),
     ConfigField(
         "self_maintenance_cooldown_seconds",
@@ -1279,6 +1310,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=3600,
         unit="s",
         explicit_default=300,
+        risk_level="dangerous",
     ),
     # GPU sampling lease
     ConfigField(
@@ -1289,6 +1321,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Serialize GPU denoising loops so spare processes stage their next pipeline while one samples. "
         "Counterproductive with unload_models_from_vram_often (no staged residency to overlap).",
         requires_restart=True,
+        risk_level="dangerous",
     ),
     ConfigField(
         "gpu_sampling_lease_slots",
@@ -1303,6 +1336,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=16,
         optional=True,
         explicit_default=None,
+        risk_level="dangerous",
     ),
     # Other
     ConfigField(
@@ -1332,6 +1366,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Other",
         "Exit on an unhandled fault (useful when run as a system service).",
+        risk_level="dangerous",
     ),
     ConfigField(
         "stats_output_frequency",

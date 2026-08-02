@@ -50,12 +50,18 @@ APP_STATE_DIR_NAME = ".horde_worker_regen"
 
 APP_STATE_FILENAME = "state.json"
 
-_KNOWN_THEME_NAMES = frozenset({"horde-dark", "horde-light", "horde-ansi"})
-"""Theme names this build can restore, duplicated from ``tui.design`` rather than imported.
+DEFAULT_THEME_NAME = "horde-dark"
+"""The theme a state file falls back to when it names one this build cannot restore."""
 
-State is read by the worker as well as the dashboard, so this module stays free of Textual; the cost of
-that boundary is this literal. A name absent here (a theme from a newer build, or a hand-edited file)
-falls back to the default instead of failing the load, so an unknown theme can never block startup.
+KNOWN_THEME_NAMES = frozenset({DEFAULT_THEME_NAME, "horde-light", "horde-ansi"})
+"""Theme names this build can restore, declared here rather than in ``tui.design``.
+
+State is read by the worker as well as the dashboard, so this module must stay free of Textual, which
+rules out importing the names from the module that builds the themes. Declaring them here and having
+``tui.design`` assert its themes against this set keeps one source of truth without the import.
+
+A name absent here (a theme from a newer build, or a hand-edited file) falls back to
+:data:`DEFAULT_THEME_NAME` instead of failing the load, so an unknown theme can never block startup.
 """
 
 
@@ -217,7 +223,7 @@ class WorkerAppState(BaseModel):
     operator has answered the notice."""
     display_density: DisplayDensity = DisplayDensity.COMFORTABLE
     """Spacing for the Advanced and Developer surfaces; Simple stays responsive on its own."""
-    theme_name: str = "horde-dark"
+    theme_name: str = DEFAULT_THEME_NAME
     """Registered Textual theme name. An unrecognised value falls back to the default on load."""
     developer_warning_acknowledged: bool = False
     """Whether the one-time Developer-level warning has been accepted."""
@@ -358,8 +364,8 @@ class AppStateStore:
         persisted_version = raw.get("schema_version", 1) if isinstance(raw, dict) else 1
         if not isinstance(persisted_version, int) or persisted_version < 2:
             state.needs_experience_introduction = True
-        if state.theme_name not in _KNOWN_THEME_NAMES:
-            state.theme_name = WorkerAppState.model_fields["theme_name"].default
+        if state.theme_name not in KNOWN_THEME_NAMES:
+            state.theme_name = DEFAULT_THEME_NAME
         state.schema_version = APP_STATE_SCHEMA_VERSION
         return state
 
@@ -461,7 +467,7 @@ class AppStateStore:
 
     def set_theme_name(self, theme_name: str) -> None:
         """Persist a theme name, ignoring one this build cannot restore."""
-        if theme_name not in _KNOWN_THEME_NAMES:
+        if theme_name not in KNOWN_THEME_NAMES:
             return
         state = self.load()
         state.theme_name = theme_name
@@ -480,6 +486,8 @@ __all__ = [
     "APP_STATE_SCHEMA_VERSION",
     "AppStateStore",
     "BenchmarkAvailability",
+    "DEFAULT_THEME_NAME",
+    "KNOWN_THEME_NAMES",
     "BenchmarkRecord",
     "DisplayDensity",
     "ExperienceLevel",

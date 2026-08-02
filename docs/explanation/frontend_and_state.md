@@ -243,6 +243,39 @@ would silently drop those keys from `bridgeData.yaml` the next time an unrelated
 setting was saved. The Config editor's Dashboard page is never withheld, so the
 control that changes level cannot be hidden by the level.
 
+The seven destinations that keep their operator widget at every level are framed in
+Simple by a [`TabPrimer`][horde_worker_regen.tui.widgets.simple.TabPrimer]: one line
+on what the page is for, then a collapsible worked example naming each headline figure
+and what to conclude from it. The figures are read from the live snapshot rather than
+illustrated, so the explanation and the widget beneath it cannot describe different
+numbers, and a figure the worker does not report is named as absent rather than shown
+as zero. Relabelling the columns themselves was rejected: it would fork the vocabulary
+by level, so a contributor who learned a term in Simple would meet a different one on
+promotion. The example runs longer than a short terminal has rows, which is why it
+folds; it opens expanded so it is read before it is dismissed.
+
+Config audience is decided at two granularities, which answer different questions.
+The sub-tab list decides which *pages* a level offers, and
+[`ConfigField.risk_level`][horde_worker_regen.tui.config_form.ConfigField] decides
+which *fields* within an offered page it shows. The `dangerous` tier is what
+distinguishes Developer from Advanced: it carries the worker's self-policing settings
+(hung-process timeouts, the VRAM and RAM budget, whole-card residency, the fault
+breakers), which fail differently from a setting that merely trades throughput. A
+section whose fields all share one tier carries that tier on its heading as well, so a
+withheld group does not leave a titled empty block behind.
+
+The level and the F6 density mode both narrow the Config editor's sub-tabs, so a
+single arbiter reads both and decides visibility. Letting each setter write that
+state directly made the result depend on which ran last: cycling density in Simple
+re-showed every tuning page Simple had withheld.
+
+Shortcuts follow the same rule as tabs, with one narrow exception. Customising the
+Overview layout, revealing elements hidden from it, and cycling its density all act on
+a widget Simple replaces with its own view, so `check_action` withholds those three
+keys at that level: a footer hint for a control that is off screen offers something
+with nothing to act on. The exception extends no further. Every destination, and every
+other shortcut, remains available.
+
 Because the default is Simple, an installation that predates the levels would
 otherwise appear to have lost its detail. A state file stamped before schema 2 sets
 `needs_experience_introduction`, and the notice is answered before the setup and
@@ -253,20 +286,34 @@ every field carries a default.
 ### Liveness that the failure cannot satisfy
 
 Simple's indicator exists to distinguish a working worker from a wedged one, which
-constrains what may drive it. A spinner advanced by the render loop animates just as
-happily over a dead worker, and so proves nothing (see
-[Liveness proofs must be failure-independent](resilience_and_recovery.md)). The
-indicator therefore advances on `heartbeats_inference_steps`, a counter the worker
-increments only by actually sampling, and freezes when that counter does.
+constrains what may drive it. A spinner advanced by the render loop keeps turning over
+a dead worker, so it carries no information (see
+[Liveness proofs must be failure-independent](resilience_and_recovery.md)). Only
+signals the worker itself produces may advance it, and which of those is truthful
+depends on whether there is work in hand.
 
-The snapshot timestamp is tracked separately because it fails differently: it
-advances whenever the worker's loop runs at all, which makes it the right signal for
-an idle worker with no work to do, and the wrong one while a job is in hand. It is
-therefore not allowed to satisfy the stall check, so a worker whose loop still ticks
-while sampling has stopped is still reported as stalled. Progress percentages come
-from the worker's own reported values and fall back to its step counters; when it
-reports neither, the view shows an indeterminate state rather than inventing a
-number.
+While a job is in hand, the frame advances on the child processes' own reporting:
+their sampling counter, or their heartbeat timestamps. The supervisor's snapshot
+timestamp is excluded in that state. A supervisor whose loop is healthy goes on
+stamping snapshots over a wedged child, so admitting it would let the failure supply
+its own proof of life. With nothing in hand the snapshot timestamp becomes the correct
+signal: the worker is alive with nothing to do, and no child is reporting.
+
+Both child signals are read, because they answer different questions. The worker
+resets `heartbeats_inference_steps` to zero on every heartbeat that is not a sampling
+step, so alone it reads a model load or a post-processing pass as a wedge, and those
+routinely run for tens of seconds. The heartbeat timestamp advances on any heartbeat,
+which separates a busy non-sampling stage from an absent process.
+
+Whether a stall amounts to a *fault* is settled by
+[`derive`][horde_worker_regen.tui.health.derive], against tuned, download-aware
+thresholds the whole dashboard shares. Reaching a second verdict here, from a subset
+of the same evidence, would put the Simple view at odds with every other surface. The
+indicator supplies the animation and takes its alarm state from the health report.
+
+Progress percentages come from the worker's own reported values and fall back to its
+step counters; when it reports neither, the view shows an indeterminate state rather
+than inventing a number.
 
 ## Durable app state
 

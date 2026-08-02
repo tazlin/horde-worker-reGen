@@ -194,6 +194,10 @@ async def test_view_mode_density_propagates_to_every_tab(tmp_path: Path) -> None
 
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     store.set_auto_start_worker(True)
+    # The density contract this asserts is an operator one, and the experience level narrows the same
+    # config sub-tabs. Stating the level makes that precondition explicit instead of leaving the result
+    # to depend on which of the two wrote sub-tab visibility last.
+    store.set_experience_level(ExperienceLevel.ADVANCED)
     supervisor = FakeSupervisor(alive=True)
     app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
     essentials_id = _subtab_id(CONFIG_SUBTABS[0][0])

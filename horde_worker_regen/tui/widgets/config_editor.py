@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import enum
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
@@ -78,14 +80,23 @@ _ADVANCED_SECTIONS: set[str] = {
     section for label, sections in CONFIG_SUBTABS if label == "Advanced" for section in sections
 }
 
-_SIMPLE_SUBTABS: frozenset[str] = frozenset({"Essentials", "Models", "Content", "Features"})
+_SIMPLE_SUBTABS: frozenset[str] = frozenset(
+    {"Essentials", "Models", "Content", "Features", "Alchemy", "LoRA & Downloads"},
+)
 """Sub-tab labels offered in the Simple experience.
 
-These cover the decisions a contributor actually makes: who the worker is, what it runs, what content it
-accepts, and which capabilities it offers. The rest are tuning surfaces whose settings only mean
-something next to the measurements that justify changing them, so they are withheld rather than
-presented without that context. The Dashboard page is always offered regardless, since it is the way
-back to a fuller view.
+These carry the decisions a contributor makes about their own worker: its identity, the models and forms
+it offers, and the content it accepts. Alchemy belongs here because an alchemist is a worker role in the
+same sense a dreamer is; its role switch, name, and offered forms answer the same questions the dreamer
+settings on Essentials and Features do, and Simple is the level an alchemist lands in by default.
+
+LoRA & Downloads belongs here for a different reason: bandwidth, cache size and the disk floor decide
+how much of a contributor's machine the worker consumes, which they have a direct stake in whatever they
+know about inference.
+
+The remaining pages are tuning surfaces. Their settings are interpretable only alongside the
+measurements that would justify changing them, so this level does not offer them. The Dashboard page is
+always offered, since it is the route to a fuller view.
 """
 
 # Only fields whose section is bundled into a sub-tab get widgets in ``compose``. A section that is
@@ -103,6 +114,31 @@ def _subtab_id(label: str) -> str:
     while "--" in slug:
         slug = slug.replace("--", "-")
     return f"cfgtab-{slug.strip('-')}"
+
+
+_DASHBOARD_SUBTAB_LABEL = "Dashboard"
+DASHBOARD_SUBTAB_ID = _subtab_id(_DASHBOARD_SUBTAB_LABEL)
+"""The appearance page. Always offered, at every level and every density: it is the way back."""
+
+MODELS_SUBTAB_ID = _subtab_id("Models")
+"""The single place model selection is edited; other surfaces link here rather than duplicating it."""
+
+
+_NORMAL_RISK_LEVEL = "normal"
+"""The tier every level shows; a field at this tier needs no gating class."""
+
+
+def _section_risk_classes(section_fields: Sequence[ConfigField]) -> str:
+    """Return the leading-space class suffix a section heading should carry for its fields' risk tier.
+
+    Empty unless every field in the section shares one non-normal tier, since a heading may only vanish
+    at a level that withholds all of the fields beneath it.
+    """
+    tiers = {field.risk_level for field in section_fields}
+    if len(tiers) != 1:
+        return ""
+    tier = tiers.pop()
+    return "" if tier == _NORMAL_RISK_LEVEL else f" field-{tier}"
 
 
 def _normalise_form(value: str) -> str:
@@ -453,29 +489,54 @@ class ConfigEditorView(Vertical):
         and the Dashboard page is never withheld, so the way back to a fuller view is always present.
         """
         self._experience_level = level
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(NoMatches):
             self.query_one(DashboardPreferencesView).set_experience_level(level)
-        simple = level is ExperienceLevel.SIMPLE
-        with contextlib.suppress(Exception):
+        self._apply_subtab_visibility()
+        with contextlib.suppress(NoMatches):
+            self.query_one("#config-simple-note", Static).display = level is ExperienceLevel.SIMPLE
+
+    def open_subtab(self, subtab_id: str) -> None:
+        """Activate a config sub-tab by id, ignoring one the current level does not offer."""
+        with contextlib.suppress(NoMatches, ValueError):
+            self.query_one("#config-subtabs", TabbedContent).active = subtab_id
+
+    def _visible_subtab_ids(self) -> set[str]:
+        """Return the sub-tabs both the density mode and the experience level permit.
+
+        Single arbiter over both inputs. They are independent controls that constrain the same set, so
+        deciding visibility in each setter separately would let the later call re-show what the other had
+        withheld: pressing F6 in Simple would reveal every tuning page, and choosing a level while thin
+        would undo thin.
+        """
+        every_id = {_subtab_id(label) for label, _sections in CONFIG_SUBTABS} | {_GPU_SUBTAB_ID}
+        if self._mode is OverviewViewMode.THIN:
+            return {_subtab_id(CONFIG_SUBTABS[0][0])}
+        if self._experience_level is ExperienceLevel.SIMPLE:
+            return {_subtab_id(label) for label in _SIMPLE_SUBTABS} | {DASHBOARD_SUBTAB_ID}
+        return every_id | {DASHBOARD_SUBTAB_ID}
+
+    def _apply_subtab_visibility(self) -> None:
+        """Show exactly the permitted sub-tabs, redirecting off one that has just been withheld."""
+        try:
             subtabs = self.query_one("#config-subtabs", TabbedContent)
-            for label, _sections in CONFIG_SUBTABS:
-                tab_id = _subtab_id(label)
-                with contextlib.suppress(Exception):
-                    if simple and label not in _SIMPLE_SUBTABS:
-                        subtabs.hide_tab(tab_id)
-                    else:
-                        subtabs.show_tab(tab_id)
-            with contextlib.suppress(Exception):
-                if simple:
-                    subtabs.hide_tab(_GPU_SUBTAB_ID)
+        except NoMatches:
+            return
+        visible = self._visible_subtab_ids()
+        for tab_id in [*(_subtab_id(label) for label, _sections in CONFIG_SUBTABS), _GPU_SUBTAB_ID]:
+            with contextlib.suppress(ValueError, NoMatches):
+                wanted = tab_id in visible
+                # Each show/hide restyles the pane beneath it, so only tabs that are actually changing
+                # state are touched; this runs on every level and density application.
+                if subtabs.get_tab(tab_id).display == wanted:
+                    continue
+                if wanted:
+                    subtabs.show_tab(tab_id)
                 else:
-                    subtabs.show_tab(_GPU_SUBTAB_ID)
-            if simple and subtabs.active not in {_subtab_id(label) for label in _SIMPLE_SUBTABS} | {
-                "cfgtab-dashboard",
-            }:
-                subtabs.active = "cfgtab-dashboard"
-        with contextlib.suppress(Exception):
-            self.query_one("#config-simple-note", Static).display = simple
+                    subtabs.hide_tab(tab_id)
+        if subtabs.active not in visible:
+            fallback = DASHBOARD_SUBTAB_ID if DASHBOARD_SUBTAB_ID in visible else next(iter(sorted(visible)))
+            with contextlib.suppress(ValueError):
+                subtabs.active = fallback
 
     def compose(self) -> ComposeResult:
         """Lay out the pinned action bar and status line, then the grouped fields in sub-tabs."""
@@ -502,7 +563,10 @@ class ConfigEditorView(Vertical):
         yield Static("", id="config-live-warnings")
 
         with TabbedContent(id="config-subtabs"):
-            with TabPane("Dashboard", id="cfgtab-dashboard"), VerticalScroll(classes="config-subtab-scroll"):
+            with (
+                TabPane(_DASHBOARD_SUBTAB_LABEL, id=DASHBOARD_SUBTAB_ID),
+                VerticalScroll(classes="config-subtab-scroll"),
+            ):
                 yield DashboardPreferencesView(self._experience_level, self._display_density, self._theme_name)
             for label, sections in CONFIG_SUBTABS:
                 with TabPane(label, id=_subtab_id(label)), VerticalScroll(classes="config-subtab-scroll"):
@@ -529,14 +593,18 @@ class ConfigEditorView(Vertical):
         section_fields = [field for field in CONFIG_FIELDS if field.section == section and not field.hidden]
         if not section_fields:
             return
-        yield Label(section, classes="config-section")
-        yield Rule()
+        # A section whose every field shares one risk tier carries that tier on its heading too. Without
+        # it a level that withholds all the fields still renders the title, rule and guidance, leaving a
+        # labelled section with nothing under it.
+        heading = _section_risk_classes(section_fields)
+        yield Label(section, classes=f"config-section{heading}")
+        yield Rule(classes=heading.strip() or None)
         if section in SECTION_GUIDANCE:
-            yield Static(SECTION_GUIDANCE[section], classes="config-guidance")
+            yield Static(SECTION_GUIDANCE[section], classes=f"config-guidance{heading}")
         if section in _ADVANCED_SECTIONS:
             yield Static(
                 "Advanced: change these only when a log message, benchmark, or support instruction points here.",
-                classes="config-advanced-banner",
+                classes=f"config-advanced-banner{heading}",
             )
         for field in section_fields:
             yield self._compose_field(field)
@@ -642,7 +710,7 @@ class ConfigEditorView(Vertical):
         # Tag the group with its risk tier so the level stylesheet can withhold it. Gating in CSS keeps
         # the widget mounted and its value intact, so a field hidden at one level is still saved from the
         # form rather than being dropped from the config on the next write.
-        if field.risk_level and field.risk_level != "normal":
+        if field.risk_level and field.risk_level != _NORMAL_RISK_LEVEL:
             control.add_class(f"field-{field.risk_level}")
         return control
 
@@ -800,27 +868,14 @@ class ConfigEditorView(Vertical):
         """Apply the shared F6 density contract to the config sub-tabs.
 
         Thin narrows the editor to Essentials (the four fields a worker needs to register), so a quick
-        glance is not buried under every advanced sub-tab. Normal and detailed expose all sub-tabs
-        (detailed never hides anything normal shows); the action bar and restart markers stay pinned.
+        glance is not buried under every advanced sub-tab. Normal and detailed expose the sub-tabs the
+        experience level offers (detailed never hides anything normal shows); the action bar and restart
+        markers stay pinned.
         """
         if mode is self._mode:
             return
         self._mode = mode
-        thin = mode is OverviewViewMode.THIN
-        essentials_id = _subtab_id(CONFIG_SUBTABS[0][0])
-        with contextlib.suppress(Exception):
-            tabs = self.query_one("#config-subtabs", TabbedContent)
-            for label, _sections in CONFIG_SUBTABS:
-                tab_id = _subtab_id(label)
-                if thin and tab_id != essentials_id:
-                    tabs.hide_tab(tab_id)
-                else:
-                    tabs.show_tab(tab_id)
-            if thin:
-                tabs.hide_tab(_GPU_SUBTAB_ID)
-                tabs.active = essentials_id
-            else:
-                tabs.show_tab(_GPU_SUBTAB_ID)
+        self._apply_subtab_visibility()
 
     def update_worker_models(self, active_models: list[str]) -> None:
         """Forward the running worker's currently-loaded model list to the model panel (best-effort)."""
