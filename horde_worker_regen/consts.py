@@ -1,5 +1,9 @@
 """Constants for the reGen bridge."""
 
+from typing import Protocol
+
+from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ANNOTATION_CONTROL_TYPES
 
 BRIDGE_CONFIG_FILENAME = "bridgeData.yaml"
@@ -166,6 +170,56 @@ def sampler_truncation_disclosure_ref(*, iterations: int, nominal_steps: int, mu
         f"({multiplier:g}x the {nominal_steps}-step schedule); best-effort converged sample delivered"
     )
     return ref[:GEN_METADATA_REF_MAX_LENGTH]
+
+
+class SamplerTruncationRecord(Protocol):
+    """The shape a sampler-truncation record must present to be disclosed.
+
+    Structural rather than imported so the worker keeps building and running against an engine build
+    that predates the bounded sampler, and so the parent can disclose the record a child forwarded over
+    IPC using the same code path the child uses for hordelib's own record.
+    """
+
+    nominal_steps: int
+    iterations: int
+    budget_multiplier: float
+
+
+def sampler_truncation_disclosure(truncation: SamplerTruncationRecord | None) -> list[GenMetadataEntry]:
+    """Turn a sampler-truncation record into the disclosure ``gen_metadata`` entry.
+
+    hordelib bounds the one sampler that chooses its own iteration count and delivers the best-effort
+    sample rather than letting the job burn indefinitely (see
+    ``hordelib.execution.adaptive_sampler_bound``). That coercion changes what the requester receives,
+    so it is disclosed on the successful submission. ``METADATA_TYPE.information`` is non-reportable
+    (see :attr:`HordeInferenceResultMessage.non_reportable_faults`), so the entry describes the
+    generation without counting against the job's fault total.
+
+    Composed here, rather than on either inference path, so the monolithic and the disaggregated
+    submissions disclose the same coercion in exactly the same shape.
+
+    Args:
+        truncation: The record the engine attached to the result (directly on the monolithic path, or
+            forwarded from the sample stage on the disaggregated one), or None if the sampler ran to
+            its own completion.
+
+    Returns:
+        list[GenMetadataEntry]: One disclosure entry, or an empty list when nothing was truncated.
+    """
+    if truncation is None:
+        return []
+
+    return [
+        GenMetadataEntry(
+            type=METADATA_TYPE.information,
+            value=METADATA_VALUE.see_ref,
+            ref=sampler_truncation_disclosure_ref(
+                iterations=truncation.iterations,
+                nominal_steps=truncation.nominal_steps,
+                multiplier=truncation.budget_multiplier,
+            ),
+        ),
+    ]
 
 
 WORKER_KNOWN_BETA_UPSCALERS = frozenset(

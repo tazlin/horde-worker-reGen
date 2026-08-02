@@ -36,6 +36,7 @@ from enum import StrEnum, auto
 
 from loguru import logger
 
+from horde_worker_regen.consts import sampler_truncation_disclosure
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
     HordeControlMessage,
@@ -50,6 +51,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeVaeDecodeResultMessage,
     HordeVaeEncodeControlMessage,
     HordeVaeEncodeResultMessage,
+    SamplerTruncationReport,
     SampleSliceSpec,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
@@ -189,6 +191,13 @@ class _DisaggJobState:
     positive_conditioning_bytes: bytes | None = None
     negative_conditioning_bytes: bytes | None = None
     source_latent_bytes: bytes | None = None
+    sampler_truncation: SamplerTruncationReport | None = None
+    """The sample stage's truncation record, held from the sample result until the images are handed off.
+
+    The sampler bounded a solver-chosen sampler in another process, but the coercion is disclosed on the
+    submitted generation, which is only assembled once the decode returns the images. Held per job here so
+    the record can never be attributed to a neighbouring job, and dropped with the rest of the job's state
+    at completion or release. None whenever the sampler ran to its own completion."""
     dispatched_to: tuple[int, int] | None = None
     """The stage's dispatch target as ``(process_id, process_launch_identifier)`` (None when idle awaiting
     dispatch).
@@ -1121,6 +1130,9 @@ class DisaggregationOrchestrator:
             # arbiter's escalation ladder targets this process's cache when a competing demand needs it.
             # The sampled latent flows into the decode stage; reuse source_latent_bytes as the carrier.
             state.source_latent_bytes = result.latent_bytes
+            # A re-sampled stage overwrites the record (including back to None), so the job discloses the
+            # sampling it actually delivered rather than an earlier attempt's.
+            state.sampler_truncation = result.sampler_truncation
             state.stage = DisaggJobStage.AWAITING_LATENT_DECODE
 
     def _on_vae_decode_result(self, message: HordeVaeDecodeResultMessage) -> None:
@@ -1219,6 +1231,12 @@ class DisaggregationOrchestrator:
         fault: DisaggregatedFault | None = None,
     ) -> None:
         state.stage = DisaggJobStage.DONE
+        # The sampler's coercion is disclosed on the delivered generation, exactly as the monolithic path
+        # discloses it on its own results; the entries are composed once here, at the only point where the
+        # job's images and its held sample-stage record are both in hand.
+        disclosure = sampler_truncation_disclosure(state.sampler_truncation)
+        for image in images:
+            image.generation_faults = image.generation_faults + disclosure
         # Any still-held pin is released so a fault before/during sampling never leaks its sampler as booked.
         self._release_pin(state)
         # And any in-flight sampling peak is freed so a fault mid-sampling never leaks its device headroom.

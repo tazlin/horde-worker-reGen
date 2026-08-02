@@ -110,6 +110,17 @@ the iterations run and the schedule they were measured against
 type, so the disclosure does not inflate the submission's fault count: the
 generation was delivered, not faulted.
 
+Both inference paths disclose it, in the same shape. On the monolithic path the
+child reads the record straight off its result. On the disaggregated path the
+sampler and the decode that produces the image run in different processes, so the
+sample stage returns the record alongside its LATENT
+(`hordelib.horde.SampleStageResult`), forwards it on the optional
+`SampleSliceResult.sampler_truncation` field, and the orchestrator holds it with
+the rest of the job's stage state until the decode returns the images, attaching
+the entry at the completion hand-off. The record is held per job and dropped with
+the job's state at completion or `release_job`, so it cannot follow a job out of
+the pipeline or attach to a neighbour.
+
 The ordering matters for reading incidents. A bounded solver terminates on its
 own well inside the watchdog's ceiling, so a `sampler_overtime_reap` after this
 landed means the bound did not hold (a sampler the patch does not cover, an

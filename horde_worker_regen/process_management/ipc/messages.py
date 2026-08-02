@@ -1127,6 +1127,22 @@ class HordeSampleControlMessage(HordeControlMessage, HordeStageModelMixin):
     """W3C traceparent string for cross-process span correlation."""
 
 
+class SamplerTruncationReport(BaseModel):
+    """A sampler stopped at its iteration bound while producing a slice's LATENT.
+
+    Mirrors the fields of hordelib's ``SamplerTruncation`` that the disclosure quotes, declared
+    worker-side so the message stays a plain worker model (the parent never imports the engine) and so
+    an engine build without the bounded sampler simply never produces one.
+    """
+
+    nominal_steps: int
+    """The step count the requested schedule advertised."""
+    iterations: int
+    """The solver iterations run before the bound stopped the loop."""
+    budget_multiplier: float
+    """The multiple of the nominal schedule the bound allowed, quoted from the engine's own record."""
+
+
 class SampleSliceResult(BaseModel):
     """One job's sample-stage output."""
 
@@ -1136,6 +1152,12 @@ class SampleSliceResult(BaseModel):
     """The serialized LATENT, or None if this slice faulted."""
     state: GENERATION_STATE
     """The state of this slice to be sent to the API (``ok`` or ``faulted``)."""
+    sampler_truncation: SamplerTruncationReport | None = None
+    """The sampler-truncation record for this slice, or None if the sampler ran to its own completion.
+
+    The coercion happens in the sampler process but is disclosed on the submitted generation, which the
+    parent assembles after the decode stage, so the record has to cross the lane split here. None on
+    every slice from an engine build without the bounded sampler."""
 
 
 class HordeSampleResultMessage(HordeProcessMessage):

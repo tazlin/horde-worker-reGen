@@ -11,7 +11,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 
+from horde_worker_regen.consts import sampler_truncation_disclosure
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
     HordeImageResult,
@@ -20,6 +22,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeTextEncodeResultMessage,
     HordeVaeDecodeResultMessage,
     HordeVaeEncodeResultMessage,
+    SamplerTruncationReport,
     SampleSliceResult,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
@@ -1319,3 +1322,151 @@ async def test_paused_image_lane_reroutes_a_decode_stage() -> None:
     assert h.rerouted == [job]
     assert h.completed == []
     assert h.reserved == set()
+
+
+async def _run_to_completion_with(
+    h: SimpleNamespace,
+    job: HordeJobInfo,
+    *,
+    sampler_truncation: SamplerTruncationReport | None,
+) -> list[HordeImageResult]:
+    """Drive one txt2img job encode -> sample -> decode, sampling with *sampler_truncation*."""
+    job_id = job.sdk_api_job_info.id_
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=_SAMPLER_PID,
+            process_launch_identifier=0,
+            info="",
+            results=[
+                SampleSliceResult(
+                    job_id=job_id,
+                    latent_bytes=b"latent",
+                    state=GENERATION_STATE.ok,
+                    sampler_truncation=sampler_truncation,
+                ),
+            ],
+        ),
+    )
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeVaeDecodeResultMessage(
+            process_id=3,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            job_image_results=[HordeImageResult(image_bytes=b"img")],
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    _ji, images, _state, _fault = h.completed[-1]
+    return images
+
+
+@pytest.mark.asyncio
+async def test_sampler_truncation_is_disclosed_on_the_delivered_images() -> None:
+    """A truncated disaggregated sample discloses exactly once, in the monolithic path's shape.
+
+    The submitter forwards a delivered image's ``generation_faults`` verbatim as the submission's
+    ``gen_metadata``, so the entry the hand-off carries is the entry the requester receives.
+    """
+    h = _make_harness()
+
+    images = await _run_to_completion_with(
+        h,
+        _job(),
+        sampler_truncation=SamplerTruncationReport(nominal_steps=20, iterations=25, budget_multiplier=1.25),
+    )
+
+    assert len(images) == 1
+    assert images[0].generation_faults == sampler_truncation_disclosure(
+        SamplerTruncationReport(nominal_steps=20, iterations=25, budget_multiplier=1.25),
+    )
+    assert len(images[0].generation_faults) == 1
+    assert images[0].generation_faults[0].type_ == METADATA_TYPE.information
+    assert images[0].generation_faults[0].value == METADATA_VALUE.see_ref
+
+
+@pytest.mark.asyncio
+async def test_an_untruncated_disaggregated_job_discloses_nothing() -> None:
+    """The common case: a sampler that ran to its own completion adds no metadata to the images."""
+    h = _make_harness()
+
+    images = await _run_to_completion_with(h, _job(), sampler_truncation=None)
+
+    assert images[0].generation_faults == []
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_does_not_leak_into_the_next_job() -> None:
+    """The record is held per job, so a following untruncated job is delivered undisclosed."""
+    h = _make_harness()
+
+    truncated = await _run_to_completion_with(
+        h,
+        _job(),
+        sampler_truncation=SamplerTruncationReport(nominal_steps=20, iterations=25, budget_multiplier=1.25),
+    )
+    untruncated = await _run_to_completion_with(h, _job(), sampler_truncation=None)
+
+    assert len(truncated[0].generation_faults) == 1
+    assert untruncated[0].generation_faults == []
+
+
+@pytest.mark.asyncio
+async def test_release_job_drops_a_held_truncation() -> None:
+    """A job forced out of the pipeline takes its held record with it, re-registration included."""
+    h = _make_harness()
+    job = _job()
+    job_id = job.sdk_api_job_info.id_
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=_SAMPLER_PID,
+            process_launch_identifier=0,
+            info="",
+            results=[
+                SampleSliceResult(
+                    job_id=job_id,
+                    latent_bytes=b"latent",
+                    state=GENERATION_STATE.ok,
+                    sampler_truncation=SamplerTruncationReport(
+                        nominal_steps=20,
+                        iterations=25,
+                        budget_multiplier=1.25,
+                    ),
+                ),
+            ],
+        ),
+    )
+    assert h.orchestrator._jobs[str(job_id)].sampler_truncation is not None
+
+    h.orchestrator.release_job(job_id)
+
+    assert str(job_id) not in h.orchestrator._jobs

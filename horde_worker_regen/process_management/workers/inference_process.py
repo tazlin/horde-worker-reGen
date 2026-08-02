@@ -14,17 +14,16 @@ try:
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock, Semaphore
-from typing import TYPE_CHECKING, Protocol, override
+from typing import TYPE_CHECKING, override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
-from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
-from horde_worker_regen.consts import sampler_truncation_disclosure_ref
+from horde_worker_regen.consts import SamplerTruncationRecord, sampler_truncation_disclosure
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_RESOLVE_FAILED_INFO,
@@ -47,6 +46,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSampleResultMessage,
     ModelLoadState,
     PipelineStageTag,
+    SamplerTruncationReport,
     SampleSliceResult,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
@@ -136,19 +136,6 @@ def reportable_step_counts(comfyui_progress: ComfyUIProgress | None) -> tuple[in
     return comfyui_progress.current_step, comfyui_progress.total_steps
 
 
-class SamplerTruncationRecord(Protocol):
-    """The shape the worker reads off hordelib's ``SamplerTruncation``.
-
-    Structural rather than imported so the worker keeps building and running against an engine
-    build that predates the bounded sampler; :func:`read_sampler_truncation` is what tolerates
-    the record's absence at runtime.
-    """
-
-    nominal_steps: int
-    iterations: int
-    budget_multiplier: float
-
-
 @dataclass
 class _DryRunResultingImage:
     """Duck-type stand-in for hordelib's `ResultingImageReturn` used in dry-run mode."""
@@ -168,37 +155,19 @@ def read_sampler_truncation(result: object) -> SamplerTruncationRecord | None:
     return truncation
 
 
-def sampler_truncation_disclosure(truncation: SamplerTruncationRecord | None) -> list[GenMetadataEntry]:
-    """Turn hordelib's sampler-truncation record into the disclosure ``gen_metadata`` entry.
+def sampler_truncation_report(truncation: SamplerTruncationRecord | None) -> SamplerTruncationReport | None:
+    """Convert an engine truncation record into the IPC report the parent disclosure path reads.
 
-    hordelib bounds the one sampler that chooses its own iteration count and delivers the
-    best-effort sample rather than letting the job burn indefinitely (see
-    ``hordelib.execution.adaptive_sampler_bound``). That coercion changes what the requester
-    receives, so it is disclosed on the successful submission. ``METADATA_TYPE.information`` is
-    non-reportable (see :attr:`HordeInferenceResultMessage.non_reportable_faults`), so the entry
-    describes the generation without counting against the job's fault total.
-
-    Args:
-        truncation: The record hordelib attached to the result, or None if the sampler ran to its
-            own completion.
-
-    Returns:
-        list[GenMetadataEntry]: One disclosure entry, or an empty list when nothing was truncated.
+    The engine's record is a hordelib type; the parent never imports the engine, so the sample stage
+    forwards the quoted numbers as a worker-owned message model instead. None passes through.
     """
     if truncation is None:
-        return []
-
-    return [
-        GenMetadataEntry(
-            type=METADATA_TYPE.information,
-            value=METADATA_VALUE.see_ref,
-            ref=sampler_truncation_disclosure_ref(
-                iterations=truncation.iterations,
-                nominal_steps=truncation.nominal_steps,
-                multiplier=truncation.budget_multiplier,
-            ),
-        ),
-    ]
+        return None
+    return SamplerTruncationReport(
+        nominal_steps=truncation.nominal_steps,
+        iterations=truncation.iterations,
+        budget_multiplier=truncation.budget_multiplier,
+    )
 
 
 class HordeInferenceProcess(HordeProcess):
@@ -1196,6 +1165,7 @@ class HordeInferenceProcess(HordeProcess):
             self._last_progress_step_seen = None
             self._nonadvancing_progress_repeats = 0
             try:
+                truncation: SamplerTruncationRecord | None = None
                 if self._dry_run_skip_inference:
                     latent_bytes = self._make_dummy_latent_bytes()
                 else:
@@ -1203,15 +1173,24 @@ class HordeInferenceProcess(HordeProcess):
                         api_response=job_slice.sdk_api_job_info,
                         model_reference_manager=reference_manager,
                     )
-                    latent_bytes = self._horde.sample_stage(
+                    sample_result = self._horde.sample_stage(
                         conversion.generation_parameters,
                         positive_conditioning_bytes=job_slice.positive_conditioning_bytes,
                         negative_conditioning_bytes=job_slice.negative_conditioning_bytes,
                         source_latent_bytes=job_slice.source_latent_bytes,
                         progress_callback=self._emit_sample_stage_progress,
                     )
+                    latent_bytes = sample_result.latent_bytes
+                    truncation = read_sampler_truncation(sample_result)
                 results.append(
-                    SampleSliceResult(job_id=job_slice.job_id, latent_bytes=latent_bytes, state=GENERATION_STATE.ok),
+                    SampleSliceResult(
+                        job_id=job_slice.job_id,
+                        latent_bytes=latent_bytes,
+                        state=GENERATION_STATE.ok,
+                        # The disclosure is attached by the parent after decode, so the record it needs
+                        # travels with the LATENT rather than being composed in this process.
+                        sampler_truncation=sampler_truncation_report(truncation),
+                    ),
                 )
             except Exception as sample_error:  # noqa: BLE001 - one slice's fault must not drop the batch
                 logger.error(f"Sample stage faulted for job {job_slice.job_id}: {sample_error}")
