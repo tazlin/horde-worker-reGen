@@ -16,7 +16,7 @@ What is pinned here:
     - A quarantined model comes off the pop offer, which is what stops the horde assigning more of its jobs,
       with a floor so the exclusion can never leave the worker advertising nothing.
     - A native crash while a model is preloading (a child that dies before it can report the failure) counts
-      as a load failure for that model.
+      as a load failure for that model, as does a live child reaped for outstaying its preload window.
 """
 
 from __future__ import annotations
@@ -169,14 +169,16 @@ class TestSamplerHangStorm:
         manager = _make_storm_manager()
         lifecycle = manager._process_lifecycle
 
-        lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG)
+        lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-old")
         aged = [
-            (kind, when - MODEL_INCIDENT_WINDOW_SECONDS - 1.0)
-            for kind, when in lifecycle._model_incident_history[_HANGING_MODEL]
+            incident._replace(at=incident.at - MODEL_INCIDENT_WINDOW_SECONDS - 1.0)
+            for incident in lifecycle._model_incident_history[_HANGING_MODEL]
         ]
         lifecycle._model_incident_history[_HANGING_MODEL] = aged
 
-        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG) is False
+        assert (
+            lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-new") is False
+        )
         assert lifecycle.is_model_load_quarantined(_HANGING_MODEL) is False
 
     def test_kinds_are_counted_against_their_own_thresholds(self) -> None:
@@ -185,11 +187,11 @@ class TestSamplerHangStorm:
         lifecycle = manager._process_lifecycle
 
         lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.LOAD_FAILURE)
-        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG) is False
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="a") is False
         assert lifecycle.is_model_load_quarantined(_HANGING_MODEL) is False
         # The hang threshold is the lower of the two, so it is the one the second hang crosses.
         assert MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD < MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD
-        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG) is True
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="b") is True
 
     async def test_hang_attribution_leaves_the_slot_breaker_alone(self) -> None:
         """Attributing a hang to the model must not change how the slot's own crash-loop breaker counts.
@@ -206,6 +208,79 @@ class TestSamplerHangStorm:
 
         assert len(lifecycle._slot_recovery_history[1]) == CRASH_LOOP_MAX_REPLACEMENTS + 1
         assert 1 in lifecycle._quarantined_inference_slots
+
+
+class TestHangsAreCountedPerJob:
+    """The hang threshold asks whether the model fails *jobs*, not how many kills one job cost.
+
+    A job that hangs is requeued when its slot is replaced, so it can reach the watchdog again on the next
+    slot. Counting those kills would let a single unlucky generation quarantine a model that runs
+    everything else fine, which is the opposite of what the counter is for.
+    """
+
+    async def test_the_watchdog_records_the_job_the_slot_was_holding(self) -> None:
+        """The reap carries the hung job's id into the incident, which is what the dedupe reads."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+        job = await track_popped_job_async(manager._job_tracker, make_job_pop_response(model=_HANGING_MODEL))
+        slot = _hung_slot(1, _HANGING_MODEL)
+        slot.last_job_referenced = job
+        manager._process_map[1] = slot
+
+        _run_watchdog(lifecycle)
+
+        assert [incident.job_id for incident in lifecycle._model_incident_history[_HANGING_MODEL]] == [str(job.id_)]
+
+    def test_one_job_hanging_twice_is_one_piece_of_evidence(self) -> None:
+        """The same job reaching the watchdog again after its requeue must not cross the threshold."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        for _ in range(MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD + 1):
+            assert (
+                lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-1")
+                is False
+            )
+
+        assert lifecycle.is_model_load_quarantined(_HANGING_MODEL) is False
+
+    def test_distinct_jobs_still_quarantine(self) -> None:
+        """Different jobs hanging on the same model is the pattern the quarantine exists for."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-1") is False
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-2") is True
+
+    def test_a_repeat_and_a_new_job_count_as_two(self) -> None:
+        """A mix of a repeat and a fresh job counts the jobs, so the fresh one is what crosses."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-1") is False
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-1") is False
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG, job_id="job-2") is True
+
+    def test_an_unknown_job_id_stands_on_its_own(self) -> None:
+        """An unrecorded id identifies nothing, so it can never be assumed to be a repeat of another."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG) is False
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.SAMPLER_HANG) is True
+
+    def test_load_failures_are_unaffected_by_the_job_dedupe(self) -> None:
+        """A load failure happens before any job-specific work, so it is counted per occurrence."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        for _ in range(MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD - 1):
+            assert (
+                lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.LOAD_FAILURE, job_id="job-1")
+                is False
+            )
+
+        assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.LOAD_FAILURE, job_id="job-1") is True
 
 
 class TestPreloadCrashAttribution:
@@ -257,6 +332,70 @@ class TestPreloadCrashAttribution:
         # Two reported-and-reaped failures: double counting would already have crossed the threshold of 3.
         assert lifecycle.is_model_load_quarantined(_HANGING_MODEL) is False
         assert len(lifecycle._model_incident_history[_HANGING_MODEL]) == MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD - 1
+
+
+class TestStuckPreloadAttribution:
+    """A slot still alive but wedged loading a model is the same evidence against it as one that died."""
+
+    @staticmethod
+    def _stuck_preloading_slot(process_id: int, model: str) -> HordeProcessInfo:
+        """A live slot silent past ``preload_timeout`` while still in ``PRELOADING_MODEL``."""
+        slot = make_mock_process_info(process_id, model_name=model, state=HordeProcessState.PRELOADING_MODEL)
+        stale = time.time() - 10_000
+        slot.last_heartbeat_timestamp = stale
+        slot.last_received_timestamp = stale
+        slot.last_process_state_started_at = stale
+        return slot
+
+    def test_the_preload_watchdog_attributes_the_reap_to_the_model(self) -> None:
+        """Reaping one wedged preload records a load-failure incident for the model being loaded."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        slot = self._stuck_preloading_slot(1, _HANGING_MODEL)
+        manager._process_map[slot.process_id] = slot
+        _run_watchdog(lifecycle)
+
+        assert slot.process_id not in manager._process_map, "the wedged slot was reaped"
+        assert len(lifecycle._model_incident_history[_HANGING_MODEL]) == 1
+
+    def test_repeated_stuck_preloads_quarantine_the_model(self) -> None:
+        """A model that wedges the loader on slot after slot crosses the load-failure threshold."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        for attempt in range(MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD):
+            slot = self._stuck_preloading_slot(1 + attempt, _HANGING_MODEL)
+            manager._process_map[slot.process_id] = slot
+            _run_watchdog(lifecycle)
+
+        assert lifecycle.is_model_load_quarantined(_HANGING_MODEL) is True
+
+    def test_a_stuck_preload_says_nothing_about_another_model(self) -> None:
+        """Incidents stay keyed to the model that was loading, so a healthy model is never dragged in."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        for attempt in range(MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD):
+            slot = self._stuck_preloading_slot(1 + attempt, _HANGING_MODEL)
+            manager._process_map[slot.process_id] = slot
+            _run_watchdog(lifecycle)
+
+        assert lifecycle.is_model_load_quarantined(_HEALTHY_MODEL) is False
+        assert _HEALTHY_MODEL not in lifecycle._model_incident_history
+
+    def test_a_bulk_replacement_mid_preload_is_not_attributed_to_the_model(self) -> None:
+        """Only the preload-window watchdog charges a live slot's model; a bulk cycle carries no evidence."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+
+        for attempt in range(MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD):
+            slot = self._stuck_preloading_slot(1 + attempt, _HANGING_MODEL)
+            manager._process_map[slot.process_id] = slot
+            lifecycle._replace_inference_process(slot)
+
+        assert lifecycle.is_model_load_quarantined(_HANGING_MODEL) is False
+        assert _HANGING_MODEL not in lifecycle._model_incident_history
 
 
 def _make_popper(

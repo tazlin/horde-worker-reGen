@@ -114,14 +114,15 @@ and never replaces a slot itself.
 Every timeout above measures *silence*, the time since the last message or
 heartbeat. That misses one wedge: a generation that loops on a single sampling
 step without ever returning. ComfyUI keeps invoking the progress callback at
-that step (in practice the **final** step, after a corrupt or incompatible
-model+LoRA pairing), so the child keeps emitting heartbeats; the slot is never
-silent, and the per-step timeout never fires. The slot would sit in
-`INFERENCE_STARTING` indefinitely, holding VRAM and a queue slot. A healthy job
-reports each step (including the last) exactly once, so the child counts
+that step, so the child keeps emitting heartbeats; the slot is never silent, and
+the per-step timeout never fires. The slot would sit in `INFERENCE_STARTING`
+indefinitely, holding VRAM and a queue slot. The child therefore counts
 consecutive *non-advancing* progress reports and forwards the running count on
-its heartbeats. Once it crosses `inference_stuck_step_repeat_limit` the
-stuck-step watchdog reaps the slot despite its liveness. (The child cannot abort
+its heartbeats. Once it crosses the effective ceiling
+(`inference_stuck_step_repeat_limit` below the final step, twice the step count
+at it, where an adaptive solver legitimately overshoots: see
+[the watchdog's final-step allowance](resilience_and_recovery.md#the-stuck-step-watchdog-and-its-final-step-allowance))
+the stuck-step watchdog reaps the slot despite its liveness. (The child cannot abort
 the wedged call itself: hordelib swallows exceptions raised inside the progress
 callback, so reaping is the parent's job.) The `detect_stuck_inference_step`
 [log detector](../reference/logs.md) recognizes the reap line after the fact.

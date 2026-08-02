@@ -111,6 +111,34 @@ class TestSampleStageEmitter:
         assert len(fake.heartbeats) == 1
         assert fake.heartbeats[0].heartbeat_type == HordeHeartbeatType.PIPELINE_STATE_CHANGE
 
+    def test_saturated_final_step_beats_still_carry_the_step_counts(self) -> None:
+        """Repeats at the final step report N/N, so the parent sees the true position, not one step short.
+
+        The watchdog only widens its repeat ceiling for repeats it can see are at the end of the schedule;
+        a beat that dropped the counts would leave the parent's view frozen at the last advancing step and
+        the overtime would be judged as a mid-run repeat loop.
+        """
+        fake = _SamplerHeartbeatFake()
+
+        _emit_sample(fake, _progress(current_step=30, total_steps=30))
+        _emit_sample(fake, _progress(current_step=30, total_steps=30))
+
+        for beat in fake.heartbeats:
+            assert beat.heartbeat_type == HordeHeartbeatType.PIPELINE_STATE_CHANGE
+            assert beat.current_step == 30
+            assert beat.total_steps == 30
+        assert fake.heartbeats[-1].nonadvancing_step_repeats == 1
+
+    def test_a_report_with_no_position_carries_no_step_counts(self) -> None:
+        """A pre-sampling report (step 0) has no position to forward, so the fields stay unset."""
+        fake = _SamplerHeartbeatFake()
+
+        _emit_sample(fake, _progress(current_step=0, total_steps=0))
+
+        assert fake.heartbeats[0].heartbeat_type == HordeHeartbeatType.PIPELINE_STATE_CHANGE
+        assert fake.heartbeats[0].current_step is None
+        assert fake.heartbeats[0].total_steps is None
+
     def test_seconds_per_iteration_rate_is_normalized_to_iterations_per_second(self) -> None:
         """A seconds/iteration rate is inverted to iterations/second for the heartbeat."""
         fake = _SamplerHeartbeatFake()

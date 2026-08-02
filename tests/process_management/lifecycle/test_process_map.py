@@ -283,6 +283,34 @@ class TestStuckOnNonAdvancingStep:
 
         assert proc.nonadvancing_step_repeats == 9
 
+    def test_a_pipeline_beat_carrying_a_position_updates_the_stored_step(self) -> None:
+        """Final-step repeats arrive as pipeline-state beats, and their position must still be recorded."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: proc})
+        process_map.on_heartbeat(0, HordeHeartbeatType.INFERENCE_STEP, current_step=21, total_steps=22)
+
+        process_map.on_heartbeat(
+            0,
+            HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+            current_step=22,
+            total_steps=22,
+            nonadvancing_step_repeats=3,
+        )
+
+        assert proc.last_current_step == 22
+        assert proc.last_total_steps == 22
+
+    def test_a_pipeline_beat_without_a_position_leaves_the_stored_step_alone(self) -> None:
+        """A position-less beat (a staging phase) must not erase the last known sampling position."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: proc})
+        process_map.on_heartbeat(0, HordeHeartbeatType.INFERENCE_STEP, current_step=7, total_steps=22)
+
+        process_map.on_heartbeat(0, HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+
+        assert proc.last_current_step == 7
+        assert proc.last_total_steps == 22
+
     def test_advancing_heartbeat_clears_the_count(self) -> None:
         """An advancing step (the child sends 0) resets the stored count, so a wedge must be sustained."""
         proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)

@@ -565,11 +565,12 @@ inference_first_step_timeout: 90
 contended_step_timeout: 120
 
 # How many times a slot may report the SAME sampling step without advancing before it is reaped. Catches
-# a wedge the time-based timeouts cannot see: when ComfyUI loops on a single step (in practice the final
-# step, after a corrupt/incompatible model+LoRA combination) the slot keeps emitting heartbeats, so it
-# never looks silent, yet it never returns a result. A healthy job reports each step exactly once, so any
-# sustained repeat is anomalous. Lower for faster recovery; raise if a legitimate pipeline re-reports a
-# step a few times before advancing.
+# a wedge the time-based timeouts cannot see: when ComfyUI loops on a single step the slot keeps emitting
+# heartbeats, so it never looks silent, yet it never returns a result. This limit governs repeats below
+# the final step; repeats AT the final step are judged against a wider ceiling the worker derives itself
+# (twice the job's step count), because an adaptive sampler chooses its own iteration count and
+# legitimately overshoots there. Lower for faster recovery; raise if a legitimate pipeline re-reports an
+# earlier step a few times before advancing.
 inference_stuck_step_repeat_limit: 20
 
 # Maximum time (seconds) to allow an auxiliary model (LoRA, etc.) to download before it is killed.

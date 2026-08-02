@@ -16,7 +16,11 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    ModelIncidentKind,
+    PauseOwner,
+    ProcessLifecycleManager,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
@@ -171,6 +175,27 @@ class TestFinalShutdownReap:
         download_process.mp_process.kill.assert_called_once()
         download_process.mp_process.join.assert_called_once_with(1)
         assert process_lifecycle.download_process_info is None
+
+    def test_hard_kill_marks_the_end_as_intended_so_the_reaper_leaves_the_dead_alone(self) -> None:
+        """A killed child must read as an intended end, not as a crash to recover from.
+
+        The crash reaper keys on intent alone, so a kill that left the flag unset would have the dead
+        children looking like unexpected exits and would spawn replacements for a worker on its way down.
+        """
+        inference = _make_exiting_process_info(1, HordeProcessType.INFERENCE, exits_gracefully=False)
+        safety = _make_exiting_process_info(2, HordeProcessType.SAFETY, exits_gracefully=False)
+        process_lifecycle = _make_plm(process_map=ProcessMap({1: inference, 2: safety}))
+        process_lifecycle._replace_inference_process = Mock()  # type: ignore[method-assign]
+        process_lifecycle._replace_all_safety_process = Mock()  # type: ignore[method-assign]
+
+        process_lifecycle._hard_kill_processes()
+
+        assert inference.end_intended is True
+        assert safety.end_intended is True
+        assert process_lifecycle._reap_if_crashed(inference) is False
+        assert process_lifecycle._reap_if_crashed(safety) is False
+        process_lifecycle._replace_inference_process.assert_not_called()
+        process_lifecycle._replace_all_safety_process.assert_not_called()
 
 
 class TestRecoveryParkLifecycleQuiescence:
@@ -502,7 +527,13 @@ class TestStuckOnNonAdvancingStep:
     child-forwarded non-advancing-repeat count crosses the configured limit.
     """
 
-    def _starting_slot(self, *, repeats: int) -> HordeProcessInfo:
+    def _starting_slot(
+        self,
+        *,
+        repeats: int,
+        current_step: int | None = 24,
+        total_steps: int | None = 25,
+    ) -> HordeProcessInfo:
         """An INFERENCE_STARTING slot with a fresh heartbeat (not silent) and the given repeat count."""
         proc = make_mock_process_info(1, model_name="m", state=HordeProcessState.INFERENCE_STARTING)
         now = time.time()
@@ -510,8 +541,8 @@ class TestStuckOnNonAdvancingStep:
         proc.last_heartbeat_timestamp = now
         proc.last_received_timestamp = now
         proc.last_process_state_started_at = now
-        proc.last_current_step = 24
-        proc.last_total_steps = 25
+        proc.last_current_step = current_step
+        proc.last_total_steps = total_steps
         proc.nonadvancing_step_repeats = repeats
         return proc
 
@@ -545,6 +576,84 @@ class TestStuckOnNonAdvancingStep:
         plm.replace_hung_processes()
 
         plm._replace_inference_process.assert_not_called()
+
+
+class TestFinalStepOvertimeAllowance:
+    """A sampler saturated at its last step gets a wider repeat ceiling than one looping mid-run.
+
+    An error-controlled solver decides its own iteration count and legitimately runs past the nominal
+    schedule; the backend clamps its reported position at the total, so every overtime iteration arrives
+    as another report of the final step while real work continues. Reaping those at the flat configured
+    limit kills healthy jobs, so the ceiling at the final step becomes twice the step count. A generation
+    that has actually stopped doing work emits nothing at all, which the silence-based timeout catches.
+    """
+
+    _CONFIGURED_LIMIT = 20
+    _TOTAL_STEPS = 22
+
+    def _saturated_slot(self, *, repeats: int) -> HordeProcessInfo:
+        """A slot heart-beating at its final step (N/N) with the given non-advancing repeat count."""
+        proc = make_mock_process_info(1, model_name="m", state=HordeProcessState.INFERENCE_STARTING)
+        now = time.time()
+        proc.last_heartbeat_timestamp = now
+        proc.last_received_timestamp = now
+        proc.last_process_state_started_at = now
+        proc.last_current_step = self._TOTAL_STEPS
+        proc.last_total_steps = self._TOTAL_STEPS
+        proc.nonadvancing_step_repeats = repeats
+        return proc
+
+    def _run_watchdog(self, proc: HordeProcessInfo) -> Mock:
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        replace = Mock()
+        plm._replace_inference_process = replace  # type: ignore[method-assign]
+        plm.replace_hung_processes()
+        return replace
+
+    @pytest.mark.parametrize("repeats", [21, 30, 43])
+    def test_overtime_at_the_final_step_is_not_reaped(self, repeats: int) -> None:
+        """Past the configured limit but within twice the step count, the overshoot is left to finish."""
+        replace = self._run_watchdog(self._saturated_slot(repeats=repeats))
+
+        replace.assert_not_called()
+
+    def test_overtime_past_twice_the_step_count_is_reaped(self) -> None:
+        """Beyond the doubled ceiling the overshoot is no longer explainable and the slot is replaced."""
+        proc = self._saturated_slot(repeats=2 * self._TOTAL_STEPS)
+
+        replace = self._run_watchdog(proc)
+
+        replace.assert_called_once_with(proc)
+
+    def test_the_reaped_overtime_still_charges_the_model(self) -> None:
+        """The wider ceiling changes when a hang is called, not whether the model is held responsible."""
+        proc = self._saturated_slot(repeats=2 * self._TOTAL_STEPS)
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+        plm.replace_hung_processes()
+
+        assert len(plm._model_incident_history["m"]) == 1
+        assert plm._model_incident_history["m"][0].kind is ModelIncidentKind.SAMPLER_HANG
+
+    def test_a_mid_run_repeat_loop_keeps_the_configured_limit(self) -> None:
+        """A step the schedule has already passed has no legitimate reason to repeat, so nothing widens."""
+        proc = self._saturated_slot(repeats=self._CONFIGURED_LIMIT)
+        proc.last_current_step = 10
+
+        replace = self._run_watchdog(proc)
+
+        replace.assert_called_once_with(proc)
+
+    @pytest.mark.parametrize("total_steps", [0, None])
+    def test_an_unknown_step_count_falls_back_to_the_configured_limit(self, total_steps: int | None) -> None:
+        """With no usable schedule there is nothing to double, so the configured limit stands."""
+        proc = self._saturated_slot(repeats=self._CONFIGURED_LIMIT)
+        proc.last_total_steps = total_steps
+
+        replace = self._run_watchdog(proc)
+
+        replace.assert_called_once_with(proc)
 
 
 def test_empty_process_map_is_not_declared_all_unresponsive() -> None:
@@ -1395,7 +1504,7 @@ def test_operation_timeout_uses_state_duration_not_recent_liveness() -> None:
     )
 
     assert replaced is True
-    plm._replace_inference_process.assert_called_once_with(loading)
+    plm._replace_inference_process.assert_called_once_with(loading, preload_deadline_exceeded=True)
 
 
 def test_silence_timeout_still_uses_recent_liveness_by_default() -> None:

@@ -1347,6 +1347,15 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Clear maintenance mode at startup. Maintenance is a safety feature; investigate if frequent.",
     ),
     ConfigField(
+        "auto_clear_server_maintenance",
+        "Auto-clear forced maintenance",
+        FieldKind.BOOL,
+        "Other",
+        "Clear maintenance the horde forced on this worker (for dropping too many jobs) once it can serve "
+        "again, retried on a widening backoff. Maintenance you set yourself is never touched.",
+        explicit_default=True,
+    ),
+    ConfigField(
         "limited_console_messages",
         "Limited console",
         FieldKind.BOOL,

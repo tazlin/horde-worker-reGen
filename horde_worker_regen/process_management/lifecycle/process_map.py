@@ -243,7 +243,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             heartbeat_type (HordeHeartbeatType): The type of the heartbeat.
             percent_complete (int | None, optional): The percentage of the job that has been completed, \
                 if applicable. Defaults to None.
-            current_step (int | None, optional): The current sampling step, if applicable. Defaults to None.
+            current_step (int | None, optional): The current sampling step, if applicable (carried by \
+                pipeline-state beats at the final step as well as by step beats). Defaults to None.
             total_steps (int | None, optional): The total sampling steps, if applicable. Defaults to None.
             iterations_per_second (float | None, optional): The instantaneous sampling rate, \
                 if applicable. Defaults to None.
@@ -274,9 +275,15 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 if self[process_id].last_process_state == HordeProcessState.INFERENCE_PRIMED:
                     self[process_id].last_process_state = HordeProcessState.INFERENCE_STARTING
                     self[process_id].last_process_state_started_at = time.time()
+            self[process_id].last_iterations_per_second = iterations_per_second
+
+        # Step counts are taken from any beat that carries a real position, not only from INFERENCE_STEP.
+        # A sampler saturated at the final step reports that position on pipeline-state beats, and the
+        # stuck-step watchdog can only grant the final-step overtime allowance if the parent's view of the
+        # position is the true one rather than the last advancing step.
+        if current_step is not None:
             self[process_id].last_current_step = current_step
             self[process_id].last_total_steps = total_steps
-            self[process_id].last_iterations_per_second = iterations_per_second
 
     def on_process_ending(self, process_id: int) -> None:
         """Update the process map when a process has ended.
@@ -643,8 +650,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         a result. The child counts those non-advancing reports and forwards the running count; once it
         crosses ``repeat_limit`` the generation is wedged and the slot must be reaped despite its liveness.
 
-        The limit sits far above the healthy ceiling of one same-step report, so a job that briefly
-        re-reports its final step before returning is never mistaken for a wedge.
+        This is a plain comparison against whatever ceiling the caller has decided applies. The policy
+        that picks it (in particular the wider ceiling a legitimate final-step overshoot earns) lives with
+        the watchdog, in
+        :func:`~horde_worker_regen.process_management.lifecycle.process_lifecycle.effective_stuck_step_repeat_limit`.
         """
         process_info = self[process_id]
         if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:

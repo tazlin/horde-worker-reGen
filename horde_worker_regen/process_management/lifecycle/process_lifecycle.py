@@ -8,14 +8,14 @@ import math
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import psutil
 from loguru import logger
@@ -211,6 +211,46 @@ class ModelIncidentKind(enum.StrEnum):
     """Sampling on the model stopped advancing and the stuck-step watchdog had to kill the slot."""
 
 
+class ModelIncident(NamedTuple):
+    """One recorded incident against a model: what happened, when, and on which job."""
+
+    kind: ModelIncidentKind
+    """Which kind of incident this is; each kind counts against its own threshold."""
+
+    at: float
+    """When it was recorded, for ageing entries out of ``MODEL_INCIDENT_WINDOW_SECONDS``."""
+
+    job_id: str | None
+    """The job in flight at the time, where the recording site knows it."""
+
+
+def count_model_incidents(incidents: Iterable[ModelIncident], kind: ModelIncidentKind) -> int:
+    """Count the incidents of ``kind`` that the quarantine threshold for that kind is judged against.
+
+    Sampler hangs are counted per *distinct job*. The evidence a hang carries is that the model cannot
+    finish a generation, and one generation reaching the watchdog more than once (it is requeued after the
+    slot is replaced, and can hang again on the next slot) is a single piece of evidence however many
+    slots it costs. Counting the kills instead would let one unlucky job quarantine a model that runs
+    everything else fine. An unrecorded job id says nothing about which job it was, so each stands on its
+    own rather than collapsing with other unknowns. Load failures happen before any job-specific work and
+    are counted per occurrence.
+    """
+    if kind is not ModelIncidentKind.SAMPLER_HANG:
+        return sum(1 for incident in incidents if incident.kind is kind)
+
+    counted = 0
+    seen_job_ids: set[str] = set()
+    for incident in incidents:
+        if incident.kind is not kind:
+            continue
+        if incident.job_id is None:
+            counted += 1
+        elif incident.job_id not in seen_job_ids:
+            seen_job_ids.add(incident.job_id)
+            counted += 1
+    return counted
+
+
 MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD: int = 3
 """Load failures of one model within ``MODEL_INCIDENT_WINDOW_SECONDS`` before it is quarantined.
 
@@ -299,6 +339,31 @@ def _job_is_feature_heavy(process_info: HordeProcessInfo) -> bool:
     )
 
 
+def is_sampling_at_final_step(process_info: HordeProcessInfo) -> bool:
+    """Whether the slot's last reported sampling position is the last step of its schedule."""
+    total_steps = process_info.last_total_steps
+    current_step = process_info.last_current_step
+    return total_steps is not None and total_steps > 0 and current_step is not None and current_step >= total_steps
+
+
+def effective_stuck_step_repeat_limit(configured_limit: int, process_info: HordeProcessInfo) -> int:
+    """Return how many non-advancing reports this slot may make before the stuck-step watchdog reaps it.
+
+    Repeats below the final step have no legitimate explanation and keep the configured limit. Repeats
+    *at* the final step do: an error-controlled ("adaptive") solver decides its own iteration count and
+    routinely runs past the nominal schedule, and the backend clamps the reported position at the total,
+    so every overtime iteration arrives as another report of the last step at full per-iteration cadence.
+    Those reports are real GPU work, which is why the ceiling there is raised to twice the nominal step
+    count: an overshoot of roughly the schedule's own length is within what such a solver asks for, and
+    anything beyond it is no longer explainable that way. A genuinely wedged generation emits no work at
+    all, and the silence-based ``inference_step_timeout`` remains the proof for that case.
+    """
+    total_steps = process_info.last_total_steps
+    if total_steps is None or not is_sampling_at_final_step(process_info):
+        return configured_limit
+    return max(configured_limit, 2 * total_steps)
+
+
 class ProcessLifecycleManager:
     """Owns process start/stop/replace logic and related state."""
 
@@ -338,7 +403,7 @@ class ProcessLifecycleManager:
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
     _safety_recovery_history: list[float]
-    _model_incident_history: dict[str, list[tuple[ModelIncidentKind, float]]]
+    _model_incident_history: dict[str, list[ModelIncident]]
     _quarantined_models: set[str]
     _recent_load_failure_by_process: dict[int, tuple[str, float]]
     _on_model_quarantined: Callable[[str], None] | None
@@ -3017,6 +3082,7 @@ class ProcessLifecycleManager:
         kind: ModelIncidentKind,
         *,
         reported_by_process_id: int | None = None,
+        job_id: str | None = None,
     ) -> bool:
         """Record that ``model_name`` killed an inference process this way; return whether it is quarantined.
 
@@ -3034,6 +3100,9 @@ class ProcessLifecycleManager:
                 recovery a model-load failure rather than a process crash, and keeps it out of the slot
                 breakers. A crash or a hang carries no such report, so it leaves the mapping alone and takes
                 the ordinary slot bookkeeping.
+            job_id: The job the incident happened on, where the site knows it. Hangs are counted per
+                distinct job (see :func:`count_model_incidents`), so an unknown id is never merged with
+                another unknown one.
 
         Returns:
             Whether the model is quarantined after this incident.
@@ -3042,14 +3111,14 @@ class ProcessLifecycleManager:
         if reported_by_process_id is not None:
             self._recent_load_failure_by_process[reported_by_process_id] = (model_name, now)
         prior = self._model_incident_history.get(model_name, [])
-        recent = [entry for entry in prior if now - entry[1] <= MODEL_INCIDENT_WINDOW_SECONDS]
-        recent.append((kind, now))
+        recent = [entry for entry in prior if now - entry.at <= MODEL_INCIDENT_WINDOW_SECONDS]
+        recent.append(ModelIncident(kind=kind, at=now, job_id=job_id))
         self._model_incident_history[model_name] = recent
 
         if model_name in self._quarantined_models:
             return True
 
-        of_kind = sum(1 for entry in recent if entry[0] is kind)
+        of_kind = count_model_incidents(recent, kind)
         if of_kind < MODEL_INCIDENT_QUARANTINE_THRESHOLDS[kind]:
             return False
 
@@ -3261,6 +3330,7 @@ class ProcessLifecycleManager:
         recovery_requeue: bool = False,
         end_join_deadline: float | None = None,
         allow_while_recovery_parked: bool = False,
+        preload_deadline_exceeded: bool = False,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -3297,6 +3367,10 @@ class ProcessLifecycleManager:
                 victims already sent END_PROCESS can be reaped in parallel under a single bounded window.
             allow_while_recovery_parked: Permit an explicit operator-requested replacement while automatic
                 lifecycle recovery is parked. Shutdown also overrides the park without this flag.
+            preload_deadline_exceeded: When True, the slot is being reaped for outstaying ``preload_timeout``
+                in ``PRELOADING_MODEL``, so the model it was loading earns a load-failure incident even
+                though the child is still alive. Only the preload-window watchdog sets this: a bulk
+                replacement that happens to catch a slot mid-preload is no evidence against its model.
         """
         if self._automatic_replacement_is_parked() and not allow_while_recovery_parked:
             return
@@ -3407,14 +3481,16 @@ class ProcessLifecycleManager:
         else:
             # A child that dies natively while preloading (an access violation reading a bad checkpoint, say)
             # never gets to report PRELOADING_FAILED, so the model would escape the per-model counter entirely
-            # and keep being dispatched. Attribute the crash to the model it was loading. The slot bookkeeping
-            # below still runs: unlike a reported load failure this really was a process death, and the slot
-            # breakers remain the backstop for a slot that dies on every model.
+            # and keep being dispatched. A child still alive but reaped for outstaying its preload window is
+            # the same evidence: it never finishes the load and never reports the failure either. Attribute
+            # both to the model being loaded. The slot bookkeeping below still runs: unlike a reported load
+            # failure the slot really did die or wedge, and the slot breakers remain the backstop for a slot
+            # that fails on every model.
             preloading_model = process_info.loaded_horde_model_name
             if (
                 preloading_model is not None
                 and process_info.last_process_state is HordeProcessState.PRELOADING_MODEL
-                and not process_info.mp_process.is_alive()
+                and (preload_deadline_exceeded or not process_info.mp_process.is_alive())
             ):
                 self.record_model_incident(preloading_model, ModelIncidentKind.LOAD_FAILURE)
             replacements_in_window = self._record_slot_recovery(process_info.process_id)
@@ -3513,6 +3589,10 @@ class ProcessLifecycleManager:
                 or (all_)
             ):
                 try:
+                    # Mark the end as intended before the signal lands, exactly as the graceful end paths
+                    # do. ``_reap_if_crashed`` keys on this flag alone, so a kill that skipped it reads as
+                    # an unexpected exit and can spawn replacements for processes the worker is stopping.
+                    process_info.end_intended = True
                     process_info.mp_process.kill()
                     process_info.mp_process.join(1)
                 except Exception as e:
@@ -3597,7 +3677,10 @@ class ProcessLifecycleManager:
                 self._initiate_post_process_replacement()
                 self._replace_all_post_process_process()
             if process_info.process_type == HordeProcessType.INFERENCE:
-                self._replace_inference_process(process_info)
+                self._replace_inference_process(
+                    process_info,
+                    preload_deadline_exceeded=state is HordeProcessState.PRELOADING_MODEL,
+                )
             return True
         return False
 
@@ -3936,15 +4019,28 @@ class ProcessLifecycleManager:
                 ).start()
             elif stuck_step_limit is not None and self._process_map.is_stuck_on_nonadvancing_step(
                 process_info.process_id,
-                stuck_step_limit,
+                effective_stuck_step_repeat_limit(stuck_step_limit, process_info),
             ):
+                if is_sampling_at_final_step(process_info):
+                    overtime_reason = (
+                        f"past the doubled ceiling its {process_info.last_total_steps}-step schedule earns for a "
+                        f"legitimate adaptive-solver overshoot"
+                    )
+                else:
+                    overtime_reason = f"past the configured limit of {stuck_step_limit}"
                 logger.error(
                     f"Inference slot {process_info.process_id} is stuck on a non-advancing sampling step "
                     f"(reported step {process_info.last_current_step}/{process_info.last_total_steps} without "
-                    f"advancing {process_info.nonadvancing_step_repeats} times); the ComfyUI generation will "
-                    f"not return a result, replacing it (stuck-step watchdog).",
+                    f"advancing {process_info.nonadvancing_step_repeats} times, {overtime_reason}); treating the "
+                    f"generation as wedged and replacing it (stuck-step watchdog).",
                 )
                 hung_model = process_info.loaded_horde_model_name
+                # Captured before the replacement, which clears the slot's job reference: the quarantine
+                # counter needs to know which job hung so repeated kills of one job cannot look like a
+                # pattern across jobs.
+                hung_job_id = (
+                    str(process_info.last_job_referenced.id_) if process_info.last_job_referenced is not None else None
+                )
                 self._action_ledger.record(
                     LedgerEventType.TIMEOUT_DETECTED,
                     process_id=process_info.process_id,
@@ -3960,7 +4056,11 @@ class ProcessLifecycleManager:
                 # Recorded after the replacement so the quarantine sweep also catches the job this slot was
                 # holding, which the replacement has just requeued.
                 if hung_model is not None:
-                    self.record_model_incident(hung_model, ModelIncidentKind.SAMPLER_HANG)
+                    self.record_model_incident(
+                        hung_model,
+                        ModelIncidentKind.SAMPLER_HANG,
+                        job_id=hung_job_id,
+                    )
                 any_replaced = True
                 self._recently_recovered = True
                 threading.Thread(

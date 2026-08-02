@@ -102,7 +102,7 @@ def test_idle_slot_stuck_with_work_pending_is_detected() -> None:
 
     plm.replace_hung_processes()
 
-    plm._replace_inference_process.assert_called_once_with(stuck)
+    plm._replace_inference_process.assert_called_once_with(stuck, preload_deadline_exceeded=False)
 
 
 def test_crash_in_postprocessing_releases_inference_semaphore() -> None:

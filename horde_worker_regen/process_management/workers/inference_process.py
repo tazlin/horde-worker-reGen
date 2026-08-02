@@ -72,7 +72,13 @@ def inject_premade_control_map(
 
 if TYPE_CHECKING:
     from horde_sdk.generation_parameters.image.object_models import ImageGenerationParameters
-    from hordelib.api import HordeLib, ProgressReport, ResultingImageReturn, SharedModelManager
+    from hordelib.api import (
+        ComfyUIProgress,
+        HordeLib,
+        ProgressReport,
+        ResultingImageReturn,
+        SharedModelManager,
+    )
 else:
     # Create a dummy class to prevent type errors at runtime
     # This is so we can defer the import of these classes until runtime
@@ -110,6 +116,22 @@ def _gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> bo
         if kind == "compute" and (major, minor) <= (dev_major, dev_minor):
             return True
     return False
+
+
+def reportable_step_counts(comfyui_progress: ComfyUIProgress | None) -> tuple[int | None, int | None]:
+    """Return the (current, total) step counts worth forwarding from a progress report, or (None, None).
+
+    Every progress report that carries a real sampling position is worth reporting, including the ones
+    that do not advance the step. ComfyUI clamps an error-controlled solver's progress at the nominal
+    total, so its overshoot iterations all report the final step; a heartbeat that omitted the counts
+    there would leave the parent's view of the slot frozen one step short of the truth, which is exactly
+    the position the stuck-step watchdog needs in order to tell a final-step overshoot apart from a
+    mid-run repeat loop. A report with no position yet (step 0, or a zero-step pipeline) carries nothing
+    to forward.
+    """
+    if comfyui_progress is None or comfyui_progress.current_step <= 0 or comfyui_progress.total_steps <= 0:
+        return None, None
+    return comfyui_progress.current_step, comfyui_progress.total_steps
 
 
 @dataclass
@@ -764,6 +786,8 @@ class HordeInferenceProcess(HordeProcess):
                 self._nonadvancing_progress_repeats = 0
                 self._last_progress_step_seen = reported_step
 
+        saturated_current_step, saturated_total_steps = reportable_step_counts(progress_report.comfyui_progress)
+
         if self._current_job_inference_steps_complete:
             if not self._vae_lock_was_acquired:
                 self._vae_lock_was_acquired = True
@@ -777,6 +801,8 @@ class HordeInferenceProcess(HordeProcess):
 
             self.send_heartbeat_message(
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                current_step=saturated_current_step,
+                total_steps=saturated_total_steps,
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
             return
@@ -786,6 +812,8 @@ class HordeInferenceProcess(HordeProcess):
         ):
             self.send_heartbeat_message(
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                current_step=saturated_current_step,
+                total_steps=saturated_total_steps,
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
             self._current_job_inference_steps_complete = True
@@ -841,9 +869,10 @@ class HordeInferenceProcess(HordeProcess):
         this emitter deliberately touches none of that handoff state. It only forwards the sampler's
         per-step progress: an ``INFERENCE_STEP`` heartbeat per advancing step (which flips the
         process ``INFERENCE_PRIMED`` -> ``INFERENCE_STARTING`` on the parent side so the dashboard's
-        progress gate opens) and a terminal ``PIPELINE_STATE_CHANGE`` on the final step. The
-        non-advancing-repeat counter is maintained so the parent's hang watchdog still sees a wedged
-        sampler that loops on one step.
+        progress gate opens) and a terminal ``PIPELINE_STATE_CHANGE`` on the final step, which carries the
+        step counts too so the parent's view lands on the true final position. The non-advancing-repeat
+        counter is maintained so the parent's hang watchdog still sees a wedged sampler that loops on one
+        step.
         """
         from hordelib.api import ComfyUIProgressUnit
 
@@ -862,8 +891,11 @@ class HordeInferenceProcess(HordeProcess):
             and comfyui_progress.current_step != comfyui_progress.total_steps
         )
         if comfyui_progress is None or not is_advancing_step:
+            saturated_current_step, saturated_total_steps = reportable_step_counts(comfyui_progress)
             self.send_heartbeat_message(
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                current_step=saturated_current_step,
+                total_steps=saturated_total_steps,
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
             return

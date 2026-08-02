@@ -1,8 +1,9 @@
 """Attribution of the shared self-throttle pop pause to the backstop that armed it.
 
-Three independent subsystems arm the single pop-pause deadline (:attr:`WorkerState.self_throttle_paused`):
-the resource/OOM-fault self-maintenance backstop, the host-RAM-pressure governor, and the safety
-soft-pause. These tests pin the disentangled observability: each arming site stamps its own
+Four arming paths share the single pop-pause deadline (:attr:`WorkerState.self_throttle_paused`) under three
+owners: the resource/OOM-fault self-maintenance backstop and the terminal-fault-rate breaker (both
+:attr:`PopPauseOwner.FAULT_THROTTLE`, told apart by the reason they carry), the host-RAM-pressure governor,
+and the safety soft-pause. These tests pin the disentangled observability: each arming site stamps its own
 :class:`PopPauseOwner` and a truthful reason, the pop-governor reading reports that owner's reason (not a
 single hardcoded string), the action ledger records the arm and the lapse with the owner and its numeric
 context, and an overlapping arm never shortens a longer standing deadline (the later deadline wins the

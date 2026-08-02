@@ -716,14 +716,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """How many times a slot may report the *same* sampling step without advancing before it is reaped.
 
     Guards a wedge the time-based ``inference_step_timeout`` cannot see: when the underlying ComfyUI
-    generation loops on a single step (in practice the final step, after a corrupt model+LoRA combination
-    or a pipeline fault), the child keeps receiving identical progress callbacks and keeps emitting
-    heartbeats, so the slot never goes silent and the hang watchdog never fires. It would otherwise sit in
-    ``INFERENCE_STARTING`` indefinitely, holding VRAM and a queue slot while never returning a result. A
-    healthy job reports each step (including the last) exactly once, so any sustained repeat is anomalous;
-    the default leaves headroom above a stray duplicate yet reaps a genuine wedge within seconds (progress
-    reports arrive roughly once a second). Lower it for faster recovery, raise it if a legitimate pipeline
-    on your hardware re-reports a step a handful of times before advancing."""
+    generation loops on a single step, the child keeps receiving identical progress callbacks and keeps
+    emitting heartbeats, so the slot never goes silent and the hang watchdog never fires. It would
+    otherwise sit in ``INFERENCE_STARTING`` indefinitely, holding VRAM and a queue slot. This limit
+    governs repeats reported *below* the final step, where a fixed schedule has no reason to revisit a
+    step it has already done.
+
+    Repeats at the final step are different and are judged against a wider ceiling the worker derives
+    itself (twice the job's step count): an adaptive solver chooses its own iteration count, routinely
+    runs past the nominal schedule, and has its reported position clamped at the total, so a healthy job
+    of that kind reports its last step many times over while doing real work. Lower this for faster
+    recovery from a mid-run repeat loop, raise it if a legitimate pipeline on your hardware re-reports an
+    earlier step several times before advancing."""
     contended_step_timeout: int = Field(default=120, ge=15, le=600)
     """Per-step hang timeout (seconds) for a slot doing legitimate but heartbeat-silent heavy work.
 

@@ -91,6 +91,31 @@ always OOMs on load, say) stops consuming respawn churn. A merely slow,
 replacing, or model-loading slot is **not** quarantined; only repeated fast
 crashes trip the breaker.
 
+### The stuck-step watchdog and its final-step allowance
+
+Every other hang check measures **silence**. The stuck-step watchdog covers the
+opposite shape: a generation that keeps invoking the progress callback on the
+same step, so the slot never goes quiet and the silence checks never fire. The
+child counts consecutive non-advancing progress reports and forwards the running
+count on its heartbeats; `inference_stuck_step_repeat_limit` reaps on it.
+
+That count alone is not evidence of a wedge at the **end** of sampling. An
+error-controlled ("adaptive") solver such as `k_dpm_adaptive` chooses its own
+iteration count from the local error estimate and routinely runs past the
+nominal schedule, and the backend clamps the reported position at the total, so
+each overtime iteration arrives as another report of the final step at full
+per-iteration cadence while real GPU work continues. The watchdog therefore
+applies `effective_stuck_step_repeat_limit`: repeats below the final step keep
+the configured limit, and repeats at the final step (the parent knows the true
+`N/N` because the saturated heartbeats carry the step counts) are judged against
+`max(configured_limit, 2 × total_steps)`. An overshoot of roughly the schedule's
+own length is within what such a solver asks for; beyond that the reports are no
+longer explainable as overtime. The reap line names which ceiling was crossed.
+
+A generation that has genuinely stopped doing work stops reporting altogether,
+and that silence is what `inference_step_timeout` proves. The repeat count only
+ever sees a slot that is still calling back.
+
 ## Poison-model quarantine
 
 The slot breaker keys on the **slot**, so it cannot see a bad *model*. A
@@ -107,15 +132,32 @@ strength:
 
 | Kind | Threshold | Fed by |
 | ---- | --------- | ------ |
-| `LOAD_FAILURE` | `MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD` (3) | A child reporting `PRELOADING_FAILED`, **and** a child that dies natively (no report) while its last known state was `PRELOADING_MODEL` |
+| `LOAD_FAILURE` | `MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD` (3) | A child reporting `PRELOADING_FAILED`, a child that dies natively (no report) while its last known state was `PRELOADING_MODEL`, **and** a live child reaped for outstaying `preload_timeout` in that state |
 | `SAMPLER_HANG` | `MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD` (2) | The stuck-step watchdog killing a slot that had this model loaded |
 
 The second feed for `LOAD_FAILURE` covers a checkpoint that crashes the process
 outright (an access violation while the backend mmaps a bad file), which never
-produces the child-side report the first feed depends on. The hang feed covers a
-model that loads perfectly and then wedges the sampler at its last step: each
-occurrence costs a full stuck-step timeout, a kill, and a double-faulted job, so
-two within the window is already a verdict. Attributing a hang to the model does
+produces the child-side report the first feed depends on. The third covers the
+same silence from the other direction: a checkpoint whose load never returns
+leaves the child alive and mute, and the preload-window watchdog reaps it without
+any report either. Only that watchdog charges a live slot's model; a bulk
+replacement that happens to catch a slot mid-preload carries no evidence about
+what it was loading. The hang feed covers a
+model that loads perfectly and then wedges the sampler: each occurrence costs a
+full stuck-step timeout, a kill, and a double-faulted job, so two within the
+window is already a verdict.
+
+Hangs are counted per **distinct job** (`count_model_incidents`), which is why
+`record_model_incident` takes the `job_id` the watchdog read from the slot's
+`last_job_referenced`. A hung job is requeued when its slot is replaced and can
+reach the watchdog again on the next slot, and one generation failing repeatedly
+is a single piece of evidence however many slots it costs; without the dedupe a
+lone unlucky job could quarantine a model that runs everything else fine. An
+incident recorded without a job id identifies nothing, so it stands on its own
+rather than merging with other unknowns. Load failures happen before any
+job-specific work and are still counted per occurrence.
+
+Attributing a hang to the model does
 **not** change the slot bookkeeping: the slot really did die, so its own breaker
 still counts the replacement.
 
