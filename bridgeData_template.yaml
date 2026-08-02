@@ -753,6 +753,13 @@ self_maintenance_fault_threshold: 6
 self_maintenance_window_seconds: 600
 self_maintenance_cooldown_seconds: 300
 
+# Let the worker clear horde-forced maintenance itself once it is fit to serve again. The horde force-sets
+# maintenance on a worker that drops too many jobs and never lifts it, so without this the worker stays
+# rejected even after the local cause is gone. Retried on a widening backoff (10m, 30m, then hourly) and only
+# while the pool is healthy, no pop pause is in force, and nothing has faulted recently. Maintenance an
+# operator or a supervisor guard set deliberately is never touched. Set false to require human intervention.
+auto_clear_server_maintenance: true
+
 # Keep ComfyUI's smart memory management on so inference children hold model weights resident in VRAM
 # across jobs. When true, a back-to-back same-model job reuses the resident UNet/CLIP/VAE instead of
 # re-uploading them from RAM. False (the default) restores per-job offloading: cross-process residency is

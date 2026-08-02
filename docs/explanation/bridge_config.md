@@ -334,6 +334,22 @@ bare GPU context; that structural case does not auto-recover, so the worker logs
 an operator warning and the TUI health view shows post-processing as disabled
 until restart.
 
+### Recovery from horde-forced maintenance
+
+| Field                             | Default | Effect                                                                                                                                              |
+| --------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto_clear_server_maintenance`   | `true`  | Let the worker clear *horde-forced* maintenance itself once it is fit to serve again. Attempts widen (10 min, 30 min, then hourly) and only go out while an inference slot is free, no pop pause stands, and nothing has faulted recently. Maintenance an operator or a supervisor guard set deliberately is never touched. |
+
+The horde force-sets maintenance on a worker that drops too many jobs, and it
+never lifts that again: the worker's pop is rejected on every retry, and the local
+latch that mutes its status output is only cleared by a successful pop. Left to
+itself a worker therefore sat rejected and silent until a human intervened, even
+long after the local remedy (a model quarantine, a fault-rate pause) had removed
+the cause. With this on, the worker asks the horde to clear the flag on a widening
+backoff, gated on being able to serve, and it never stops retrying. Set it to
+`false` to keep a forced pause standing until you clear it yourself. See
+[Rejoining after horde-forced maintenance](resilience_and_recovery.md#rejoining-after-horde-forced-maintenance).
+
 ### Pipeline disaggregation (experimental)
 
 `enable_pipeline_disaggregation` opts the worker into the disaggregated stage

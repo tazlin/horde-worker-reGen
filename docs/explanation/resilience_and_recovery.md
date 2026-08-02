@@ -554,6 +554,73 @@ quarantine with a deep backlog trips the breaker at once. That is the intent: th
 pause lets the backlog drain and the horde reissue that work elsewhere, and the
 worker rejoins with the poison model already off its offer.
 
+## Rejoining after horde-forced maintenance
+
+Every throttle above exists so the horde never has to force this worker into
+maintenance. When one does fire too late, the worker has to be able to come back,
+and until this existed it could not: **horde-forced maintenance has no expiry and
+no horde-side release**. The local latch
+(`WorkerState.last_pop_maintenance_mode`) is cleared only by a successful pop,
+which cannot happen while every pop is rejected, so a forced pause lasted until an
+operator noticed and cleared it by hand. Worse, it was nearly invisible: the pop
+rejection is logged once, the periodic status print is suppressed while the latch
+holds, and the kudos loop returns early, so hours of five-second retries read in
+the log exactly like a dead pop loop.
+
+The episode is driven once per control-loop tick by
+`HordeWorkerProcessManager._drive_server_maintenance_recovery`, and it has two
+halves.
+
+**The heartbeat.** While the latch holds, a WARNING every
+`SERVER_MAINTENANCE_HEARTBEAT_INTERVAL_SECONDS` (600 s) restates how long the
+worker has been in maintenance, how many pops have been rejected since it engaged
+(counted in the popper, since the log line is edge-triggered), and what the worker
+intends to do next: the time of the next clear attempt, the health condition
+holding that attempt back, or the reason auto-clear will not run at all. One line
+makes a maintenance episode unmistakable for as long as it lasts.
+
+**The bounded auto-clear.** The worker may lift the horde's own pause, and only
+the horde's own pause:
+
+- **Eligibility.** The rejected pop carries the horde's maintenance reason, and
+  the return code is the same whichever side set the flag, so that reason is the
+  only discriminator the API offers. A reason the horde writes itself ("dropping
+  too many jobs") marks the episode server-forced; any other reason is treated as
+  somebody's deliberate choice and left standing. Separately, every deliberate
+  local set (the dashboard key, a supervisor command, the attach supervisor's
+  frozen-parent guard) arrives as the same `SET_SERVER_MAINTENANCE` command and
+  records `WorkerState.server_maintenance_locally_intended`, which disqualifies
+  auto-clear until the same surface unsets it.
+- **Fitness.** An attempt only goes out while the worker can actually serve: an
+  inference process free to take a job, no pop pause standing (self-throttle,
+  fault-rate breaker, or operator), and no terminal fault in the last
+  `SERVER_MAINTENANCE_FAULT_QUIET_SECONDS` (180 s). This is remediation evidence
+  rather than a timer: after a poison-model storm the quarantine has already taken
+  the cause out of rotation, and a quiet, healthy pool is the signal that rejoining
+  is safe. An unfit worker **defers without consuming the attempt**, so the clear
+  goes out the moment the pool recovers instead of waiting out another interval.
+- **Backoff.** `SERVER_MAINTENANCE_CLEAR_BACKOFF_SECONDS` schedules the attempts
+  at 600 s after the latch engaged, then 1800 s, then 3600 s, then every 3600 s.
+  It never stops: a worker that gives up on rejoining is a worker an operator has
+  to rescue by hand, which is the outcome this exists to prevent.
+- **Re-trip escalation.** If the horde re-forces maintenance within
+  `SERVER_MAINTENANCE_RETRIP_WINDOW_SECONDS` (1800 s) of a clear that worked, the
+  worker was not as fit as its checks believed, so the next episode's intervals
+  double, capped at `SERVER_MAINTENANCE_CLEAR_MAX_INTERVAL_SECONDS` (6 h). Going
+  `SERVER_MAINTENANCE_ESCALATION_DECAY_SECONDS` (3600 s) of healthy popping
+  between the clear and the next pause resets the escalation.
+
+A successful API call is **not** treated as the end of the episode. The worker
+leaves its own latch alone and lets the next successful pop clear it, exactly as
+before, because work arriving is the only end-to-end proof the horde is sending
+this worker jobs again. That successful pop is also what dates the escalation:
+an episode the worker made attempts in and then left is the evidence one of those
+attempts worked.
+
+`auto_clear_server_maintenance` (default `true`) is the recovery path's own
+config key, not a preference flag that could switch it off as a side effect (see
+[Bridge configuration](bridge_config.md#recovery-from-horde-forced-maintenance)).
+
 ## The background download process
 
 The singleton [download process](model_downloads.md) lives **outside** the process

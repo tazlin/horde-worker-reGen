@@ -1422,6 +1422,39 @@ class TestHandlePopErrorResponse:
         # Should not raise; just quietly update
         popper._handle_pop_error_response(resp)
 
+    def test_every_rejection_is_counted_even_though_only_the_first_warns(self) -> None:
+        """The warning is edge-triggered, so the count is what measures a long maintenance episode."""
+        state = WorkerState()
+        popper = _make_popper(state=state)
+
+        for _ in range(3):
+            popper._handle_pop_error_response(self._make_error_response("Server is in maintenance mode"))
+
+        assert state.server_maintenance_pop_rejections == 3
+        assert state.server_maintenance_latched_at > 0.0
+
+    def test_the_hordes_own_reason_marks_the_pause_as_forced(self) -> None:
+        """The horde writes this reason itself when it pauses a worker for dropping too many jobs."""
+        state = WorkerState()
+        popper = _make_popper(state=state)
+
+        popper._handle_pop_error_response(
+            self._make_error_response("Maintenance mode activated because worker is dropping too many jobs"),
+        )
+
+        assert state.server_maintenance_forced_by_server is True
+
+    def test_any_other_reason_is_treated_as_deliberate(self) -> None:
+        """A pause the horde did not impose belongs to whoever set it, so the worker leaves it alone."""
+        state = WorkerState()
+        popper = _make_popper(state=state)
+
+        popper._handle_pop_error_response(
+            self._make_error_response("This worker has been put into maintenance mode by its owner"),
+        )
+
+        assert state.server_maintenance_forced_by_server is False
+
     def test_wrong_credentials_message(self) -> None:
         """Wrong credentials messages cause last_pop_no_jobs_available to be True."""
         state = WorkerState()
@@ -1692,11 +1725,18 @@ class TestApiJobPopFullFlow:
             state=state,
         )
         popper._state.last_pop_maintenance_mode = True
+        popper._state.server_maintenance_latched_at = time.time()
+        popper._state.server_maintenance_forced_by_server = True
+        popper._state.server_maintenance_pop_rejections = 12
 
         await popper.api_job_pop()
 
         assert popper._state.last_pop_maintenance_mode is False  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
         assert popper._state.server_maintenance_cleared_by_job_pop is True
+        # Work arriving is the end-to-end proof the episode is over, so it retires the whole episode.
+        assert popper._state.server_maintenance_latched_at == 0.0
+        assert popper._state.server_maintenance_forced_by_server is False
+        assert popper._state.server_maintenance_pop_rejections == 0
 
     @_full_flow_patches
     async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:

@@ -1295,6 +1295,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     self_maintenance_cooldown_seconds: int = Field(default=300, ge=0)
     """How long the worker holds its self-imposed local pop-pause before resuming after a self-throttle."""
 
+    auto_clear_server_maintenance: bool = Field(default=True)
+    """Let the worker clear *horde-forced* maintenance itself once it is fit to serve again.
+
+    The horde force-sets maintenance on a worker that drops too many jobs, and nothing on the horde side
+    lifts it again: without this the worker sits rejected indefinitely, even after the local remedy (a model
+    quarantine, a fault-rate pause) has removed the cause. When enabled the worker retries the clear on a
+    widening backoff, and only while a healthy pool, no pop pause, and no recent terminal fault say it can
+    serve. It never touches maintenance an operator or a supervisor guard set deliberately, and it never
+    gives up: the attempts settle to a long interval rather than stopping.
+
+    Turn it off only to keep a forced pause in place until a human intervenes."""
+
     comfy_smart_memory: bool = Field(default=False)
     """Keep ComfyUI's smart memory management on so inference children hold model weights resident in VRAM
     across jobs.

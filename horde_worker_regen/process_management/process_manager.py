@@ -855,6 +855,52 @@ A re-trip inside this period doubles the cooldown (a condition the first pause d
 longer one); a worker that goes this long without tripping has demonstrated the condition passed, so the
 next trip starts from the base cooldown rather than inheriting an old escalation."""
 
+SERVER_MAINTENANCE_CLEAR_BACKOFF_SECONDS = (600.0, 1800.0, 3600.0)
+"""Delays between successive attempts to clear horde-forced maintenance, measured from when it engaged.
+
+The first delay is long enough for the remedy that answered the drop storm (a model quarantine, a fault-rate
+pause) to have taken effect and for the horde to have reissued the dropped work elsewhere, so the worker
+rejoins with the cause already gone rather than immediately re-earning the pause. Successive delays widen
+because a clear that did not stick is evidence the worker is not yet fit."""
+
+SERVER_MAINTENANCE_CLEAR_MAX_INTERVAL_SECONDS = 21600.0
+"""Ceiling on the interval between clear attempts, including escalation.
+
+The schedule settles here instead of stopping: a worker that gives up on rejoining is a worker an operator
+must notice and rescue by hand, which is the outcome this exists to prevent. Retrying every few hours costs
+one API call and leaves the worker able to recover from a condition that clears long after it engaged."""
+
+SERVER_MAINTENANCE_RETRIP_WINDOW_SECONDS = 1800.0
+"""How soon after a successful auto-clear a re-forced maintenance counts as the same unresolved condition.
+
+Inside this window the worker rejoined and was pushed straight back out, so the next episode's attempts are
+spaced at double the interval rather than repeating a clear the horde has already reversed."""
+
+SERVER_MAINTENANCE_ESCALATION_DECAY_SECONDS = 3600.0
+"""Healthy stretch after an auto-clear that resets the interval escalation to its base.
+
+A worker that popped jobs this long before the horde forced maintenance again has demonstrated the earlier
+condition passed, so the new episode is treated as unrelated to the old one."""
+
+SERVER_MAINTENANCE_MAX_CLEAR_ESCALATION = 8
+"""Bound on the doubling exponent the re-trip escalation applies to the attempt interval.
+
+The interval ceiling is reached long before this, so the bound exists only to keep the exponent finite
+across a worker the horde re-forces many times over a long run."""
+
+SERVER_MAINTENANCE_HEARTBEAT_INTERVAL_SECONDS = 600.0
+"""How often the worker restates that it is in horde maintenance.
+
+The pop rejection is logged once and the periodic status print is suppressed while maintenance holds, so
+without this line an episode is indistinguishable in the log from a dead pop loop for as long as it lasts."""
+
+SERVER_MAINTENANCE_FAULT_QUIET_SECONDS = 180.0
+"""Quiet stretch since the last terminal job fault before the worker considers itself fit to rejoin.
+
+Rejoining with a fault still in living memory offers the horde work the worker is still dropping, which
+re-earns the pause. This is a remediation check rather than a timer: the cause is expected to have been
+removed (quarantined model, breaker pause) and the quiet is the evidence."""
+
 
 class HordeWorkerProcessManager:
     """Manages and controls processes to act as a horde worker."""
@@ -1498,6 +1544,17 @@ class HordeWorkerProcessManager:
         self._terminal_fault_breaker_escalation = 0
         self._job_tracker.set_terminal_fault_observer(self._on_terminal_job_fault)
 
+        # Horde-maintenance episode bookkeeping. The episode marker is the latch timestamp the popper writes,
+        # so a new episode is detected by the marker changing rather than by any flag this side owns. The
+        # escalation and last-clear time deliberately outlive an episode: they are what makes a worker the
+        # horde keeps pushing back out back off, instead of retrying the same clear forever.
+        self._server_maintenance_episode_marker = 0.0
+        self._server_maintenance_clear_attempts = 0
+        self._server_maintenance_next_clear_at = 0.0
+        self._server_maintenance_last_clear_at = 0.0
+        self._server_maintenance_clear_escalation = 0
+        self._server_maintenance_next_heartbeat_at = 0.0
+
         self._disk_monitor = DiskSpaceMonitor(self._disk_paths_to_monitor())
         self._last_disk_sample_time = 0.0
         self._lora_paths = self._resolve_lora_paths()
@@ -2085,6 +2142,175 @@ class HordeWorkerProcessManager:
             "jobs. In-flight jobs will finish.",
         )
 
+    def _drive_server_maintenance_recovery(self) -> None:
+        """Keep a horde-maintenance episode audible and, when the worker is fit again, ask the horde to end it.
+
+        Horde-forced maintenance has no expiry and no horde-side release: the worker is rejected on every pop
+        until something clears the flag. The rejection is logged once and the periodic status print is muted
+        while it holds, so an episode is otherwise silent for however long it lasts. This drives both halves
+        of the answer: a heartbeat that keeps the episode in the log, and a bounded, remediation-gated
+        sequence of attempts to clear the flag so the worker rejoins on its own once its local remedies have
+        removed the cause.
+        """
+        if not self._state.last_pop_maintenance_mode:
+            self._close_server_maintenance_episode()
+            return
+        now = time.time()
+        # The popper stamps the latch; stamp it here for a latch set by anything that did not, so the episode
+        # keeps one stable anchor. Deriving a fresh fallback every tick would re-open the episode each pass
+        # and push the attempt and heartbeat deadlines forever forward.
+        if not self._state.server_maintenance_latched_at:
+            self._state.server_maintenance_latched_at = now
+        latched_at = self._state.server_maintenance_latched_at
+        if self._server_maintenance_episode_marker != latched_at:
+            self._open_server_maintenance_episode(latched_at, now=now)
+        self._maybe_attempt_server_maintenance_clear(now)
+        self._maybe_log_server_maintenance_heartbeat(now, latched_at=latched_at)
+
+    def _open_server_maintenance_episode(self, latched_at: float, *, now: float) -> None:
+        """Start the attempt schedule for a newly observed maintenance episode.
+
+        A new episode that follows soon after the worker cleared the previous one is the horde reversing that
+        clear, so the interval doubles: the worker was not as fit as its local checks believed, and repeating
+        the same clear at the same cadence would only repeat that. A long healthy stretch between the two
+        instead says the conditions are unrelated and the schedule starts over.
+        """
+        self._server_maintenance_episode_marker = latched_at
+        self._server_maintenance_clear_attempts = 0
+        if self._server_maintenance_last_clear_at > 0.0:
+            since_clear = now - self._server_maintenance_last_clear_at
+            if since_clear <= SERVER_MAINTENANCE_RETRIP_WINDOW_SECONDS:
+                self._server_maintenance_clear_escalation = min(
+                    self._server_maintenance_clear_escalation + 1,
+                    SERVER_MAINTENANCE_MAX_CLEAR_ESCALATION,
+                )
+            elif since_clear >= SERVER_MAINTENANCE_ESCALATION_DECAY_SECONDS:
+                self._server_maintenance_clear_escalation = 0
+        self._server_maintenance_next_clear_at = latched_at + self._server_maintenance_clear_interval(0)
+        self._server_maintenance_next_heartbeat_at = latched_at + SERVER_MAINTENANCE_HEARTBEAT_INTERVAL_SECONDS
+
+    def _close_server_maintenance_episode(self) -> None:
+        """Retire the episode bookkeeping once the worker is out of maintenance.
+
+        An episode the worker made attempts in and then left is the evidence that one of those attempts
+        worked, since only a successful pop clears the latch. That timestamp is what a later episode measures
+        its re-trip escalation against; the escalation itself deliberately survives, so a worker the horde
+        keeps pushing back out widens its interval across episodes rather than resetting each time.
+        """
+        if self._server_maintenance_episode_marker == 0.0:
+            return
+        if self._server_maintenance_clear_attempts > 0:
+            self._server_maintenance_last_clear_at = time.time()
+        self._server_maintenance_episode_marker = 0.0
+        self._server_maintenance_clear_attempts = 0
+        self._server_maintenance_next_clear_at = 0.0
+        self._server_maintenance_next_heartbeat_at = 0.0
+
+    def _server_maintenance_clear_interval(self, attempts_made: int) -> float:
+        """Return the delay before the attempt that follows ``attempts_made`` already-made attempts."""
+        index = min(attempts_made, len(SERVER_MAINTENANCE_CLEAR_BACKOFF_SECONDS) - 1)
+        base = SERVER_MAINTENANCE_CLEAR_BACKOFF_SECONDS[index]
+        return min(
+            base * (2**self._server_maintenance_clear_escalation), SERVER_MAINTENANCE_CLEAR_MAX_INTERVAL_SECONDS
+        )
+
+    def _server_maintenance_clear_disallowed_reason(self) -> str | None:
+        """Return why auto-clear may not run for this episode at all, or None when it is allowed.
+
+        These are properties of the episode rather than of the moment: none of them can change while the
+        episode lasts, so a disallowed episode simply never attempts a clear.
+        """
+        if not self.bridge_data.auto_clear_server_maintenance:
+            return "auto_clear_server_maintenance is off"
+        if self._state.server_maintenance_locally_intended:
+            return "this worker's maintenance was set deliberately from the dashboard or a supervisor"
+        if not self._state.server_maintenance_forced_by_server:
+            return "the horde's maintenance reason is not one it imposed on this worker"
+        return None
+
+    def _server_maintenance_unfit_reason(self, now: float) -> str | None:
+        """Return why the worker is not currently fit to rejoin the horde, or None when it is.
+
+        Clearing maintenance while the worker still cannot serve hands the horde jobs it will drop, which
+        re-earns the pause and teaches the horde the worker is worse than it is. The three checks are the
+        remediation evidence: a slot free to take work, no pop pause standing over the worker, and a quiet
+        stretch since the last terminal fault (the quarantine or breaker that answered the storm has by then
+        removed its cause).
+        """
+        if not self.is_free_inference_process_available():
+            return "no inference process is free to take a job"
+        if self._state.self_throttle_paused:
+            reason = self._state.self_throttle_pause_reason or "a local pop pause is in force"
+            return f"job pops are paused locally ({reason})"
+        if self._state.supervisor_paused:
+            return "job pops are paused by the operator"
+        cutoff = now - SERVER_MAINTENANCE_FAULT_QUIET_SECONDS
+        recent_faults = sum(1 for when, _model in self._terminal_fault_history if when >= cutoff)
+        if recent_faults:
+            return f"{recent_faults} job(s) faulted in the last {SERVER_MAINTENANCE_FAULT_QUIET_SECONDS:.0f}s"
+        return None
+
+    def _maybe_attempt_server_maintenance_clear(self, now: float) -> None:
+        """Ask the horde to clear this worker's maintenance when the schedule and the worker's health allow.
+
+        An unfit worker defers without consuming the attempt, so the clear happens as soon as the pool
+        recovers rather than waiting out another interval. The local latch is deliberately left alone: only a
+        successful pop proves the horde is sending work again, so that remains the single signal that ends
+        the episode.
+        """
+        if self._server_maintenance_clear_disallowed_reason() is not None:
+            return
+        if now < self._server_maintenance_next_clear_at:
+            return
+        unfit_reason = self._server_maintenance_unfit_reason(now)
+        if unfit_reason is not None:
+            logger.debug(f"Holding the horde-maintenance clear attempt: {unfit_reason}.")
+            return
+
+        self._server_maintenance_clear_attempts += 1
+        attempt = self._server_maintenance_clear_attempts
+        next_interval = self._server_maintenance_clear_interval(attempt)
+        self._server_maintenance_next_clear_at = now + next_interval
+        logger.warning(
+            f"Asking the horde to clear this worker's forced maintenance (attempt {attempt}); the pool is "
+            f"healthy and the condition that earned it is no longer producing faults. Retrying in "
+            f"{next_interval:.0f}s if the horde keeps rejecting pops.",
+        )
+        # The horde API call is blocking; run it off the control loop so a slow or unreachable horde can
+        # never stall the worker's tick.
+        threading.Thread(
+            target=self._set_server_maintenance_safe,
+            args=(False,),
+            name="auto-clear-maintenance",
+            daemon=True,
+        ).start()
+
+    def _maybe_log_server_maintenance_heartbeat(self, now: float, *, latched_at: float) -> None:
+        """Restate an ongoing maintenance episode on the heartbeat interval."""
+        if now < self._server_maintenance_next_heartbeat_at:
+            return
+        self._server_maintenance_next_heartbeat_at = now + SERVER_MAINTENANCE_HEARTBEAT_INTERVAL_SECONDS
+        elapsed_minutes = (now - latched_at) / 60
+        rejections = self._state.server_maintenance_pop_rejections
+        disallowed = self._server_maintenance_clear_disallowed_reason()
+        if disallowed is not None:
+            outlook = f"The worker will not clear it itself: {disallowed}."
+        else:
+            unfit_reason = self._server_maintenance_unfit_reason(now)
+            if unfit_reason is not None:
+                outlook = (
+                    f"Auto-clear attempt {self._server_maintenance_clear_attempts + 1} is waiting for the "
+                    f"worker to be fit to serve: {unfit_reason}."
+                )
+            else:
+                wait = max(0.0, self._server_maintenance_next_clear_at - now)
+                outlook = f"Auto-clear attempt {self._server_maintenance_clear_attempts + 1} in {wait:.0f}s."
+        logger.warning(
+            f"The horde still has this worker in maintenance ({elapsed_minutes:.0f} minutes so far): "
+            f"{rejections} job pops have been rejected since it engaged and no work is being taken. "
+            f"{outlook}",
+        )
+
     def _apply_post_processing_fault_breaker(self) -> None:
         """Trip, auto-recover, or reclaim for the reactive post-processing over-commit breaker.
 
@@ -2322,6 +2548,15 @@ class HordeWorkerProcessManager:
         Thin convenience wrapper over :meth:`set_maintenance` (``set_maintenance(False)``).
         """
         self.set_maintenance(False)
+
+    def _note_deliberate_server_maintenance(self, enabled: bool) -> None:
+        """Record that a local surface asked for this worker's maintenance state, so recovery honours it.
+
+        Recorded where the decision is made rather than where the API call happens: the intent stands even if
+        the call is slow or fails, and the worker's own maintenance recovery uses the same helper to reach
+        the horde without that being mistaken for somebody asking for the pause.
+        """
+        self._state.server_maintenance_locally_intended = enabled
 
     def _set_server_maintenance_safe(self, enabled: bool) -> None:
         """Best-effort off-loop ``set_maintenance`` for the supervisor toggle; never raises into the thread."""
@@ -3635,6 +3870,7 @@ class HordeWorkerProcessManager:
             # fleet to one inference process per card so a sentinel-less CPU install matches the startup sizing.
             self._enforce_alchemist_only_scale_down()
             self._apply_self_maintenance_throttle()
+            self._drive_server_maintenance_recovery()
             self._apply_post_processing_fault_breaker()
             self._apply_post_processing_headroom_gate()
             if self._state.server_maintenance_cleared_by_job_pop and self._worker_details_maintenance:
@@ -5305,6 +5541,7 @@ class HordeWorkerProcessManager:
                 # when the operator opted into that via remove_maintenance_on_init; otherwise a local
                 # resume must never silently clear server-side maintenance (use the explicit toggle).
                 if self.bridge_data.remove_maintenance_on_init:
+                    self._note_deliberate_server_maintenance(False)
                     threading.Thread(
                         target=self._set_server_maintenance_safe,
                         args=(False,),
@@ -5378,6 +5615,9 @@ class HordeWorkerProcessManager:
                 logger.warning(
                     f"Supervisor requested server-side maintenance {'ON' if enabled else 'OFF'} (horde API).",
                 )
+                # A deliberate request, from the dashboard key or the attach supervisor's frozen-parent
+                # guard: while it stands the worker's own maintenance recovery leaves the flag alone.
+                self._note_deliberate_server_maintenance(enabled)
                 # The horde API call is blocking; run it off the control loop so a slow or unreachable
                 # horde can never stall the worker's tick.
                 threading.Thread(

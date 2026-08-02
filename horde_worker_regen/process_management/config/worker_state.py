@@ -66,6 +66,32 @@ class WorkerState:
     last_pop_maintenance_mode: bool = False
     server_maintenance_cleared_by_job_pop: bool = False
     """A real popped job proved the horde is sending work again, even if worker-details polling is stale."""
+
+    server_maintenance_latched_at: float = 0.0
+    """Wall-clock time ``last_pop_maintenance_mode`` engaged; 0 while the worker is not in horde maintenance.
+
+    The pop rejection is logged once (edge-triggered) and the periodic status print is suppressed while the
+    latch holds, so this timestamp is what lets the worker report the age of the episode instead of going
+    silent for as long as the horde keeps rejecting its pops."""
+
+    server_maintenance_forced_by_server: bool = False
+    """The horde placed this worker in maintenance itself, rather than an operator asking for it.
+
+    Read off the maintenance reason the horde returns on the rejected pop. The return code is the same
+    whichever side set the flag, so the reason text is the only discriminator the API offers, and it is what
+    the worker's bounded auto-clear keys off: a worker may rejoin from a server-forced pause once it is fit
+    again, but must never undo a pause a human asked for."""
+
+    server_maintenance_pop_rejections: int = 0
+    """Pops the horde has rejected for maintenance since :attr:`server_maintenance_latched_at` engaged."""
+
+    server_maintenance_locally_intended: bool = False
+    """A local surface (dashboard key, supervisor command, attach-supervisor guard) last set maintenance on.
+
+    Every deliberate set arrives as the same supervisor command, so recording the intent where that command
+    is applied covers all of them. While true the worker will not auto-clear its maintenance: the flag says a
+    human or a guard wanted this worker held back, and only the same surface unsetting it releases that
+    intent."""
     last_pop_skipped_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
     """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...).
 

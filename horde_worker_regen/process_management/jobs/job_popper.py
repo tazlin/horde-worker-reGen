@@ -121,6 +121,22 @@ tick (thrash) and defeating the purpose of letting the slow stage catch up. Half
 stage a full margin to work down before more inference work is admitted, and because it is a fraction of the
 same deadline-derived cap it tracks that cap as measured safety speed and the horde ttl move."""
 
+_SERVER_FORCED_MAINTENANCE_MARKER = "dropping too many jobs"
+"""Phrase in the horde's maintenance reason that identifies maintenance the horde imposed on the worker.
+
+The horde returns the same return code whichever side set maintenance and carries the reason as free text,
+so the reason is the only discriminator available: the horde writes its own reason when it pauses a worker
+for dropping too many jobs, where an owner-set pause carries the owner's (or the default owner) message. The
+worker treats a reason it does not recognise as operator intent and leaves it alone, so a phrasing change on
+the horde costs an auto-clear, never an unwanted one.
+"""
+
+
+def _is_server_forced_maintenance(message_lower: str) -> bool:
+    """Return whether a maintenance pop-rejection reason is one the horde imposed on the worker itself."""
+    return _SERVER_FORCED_MAINTENANCE_MARKER in message_lower
+
+
 _POST_PROCESSING_OFFER_COMMITMENT_LIMIT = 2
 """Accepted post-processing chains at which the next pop stops advertising post-processing.
 
@@ -1481,6 +1497,12 @@ class JobPopper:
                 MaintenanceModeMessenger.print_maintenance_mode_messages()
                 self._state.last_pop_maintenance_mode = True
                 self._state.server_maintenance_cleared_by_job_pop = False
+                self._state.server_maintenance_latched_at = time.time()
+                self._state.server_maintenance_pop_rejections = 0
+                self._state.server_maintenance_forced_by_server = _is_server_forced_maintenance(message_lower)
+            # Counted on every rejection, not only on the edge: the log line above fires once per episode, so
+            # this counter is the worker's only measure of how much work the maintenance is costing it.
+            self._state.server_maintenance_pop_rejections += 1
         elif "we cannot accept workers serving" in message_lower:
             logger.warning(f"Failed to pop job (Unrecognized Model): {response}")
             logger.error(
@@ -1920,6 +1942,9 @@ class JobPopper:
             logger.info("Clearing horde maintenance latch: a new job was popped successfully.")
             self._state.server_maintenance_cleared_by_job_pop = True
         self._state.last_pop_maintenance_mode = False
+        self._state.server_maintenance_latched_at = 0.0
+        self._state.server_maintenance_forced_by_server = False
+        self._state.server_maintenance_pop_rejections = 0
         self._replaced_due_to_maintenance = False
         self._state.last_pop_no_jobs_available = False
         self._state.last_pop_skipped_reasons = {}
