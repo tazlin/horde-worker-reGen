@@ -364,6 +364,19 @@ def effective_stuck_step_repeat_limit(configured_limit: int, process_info: Horde
     return max(configured_limit, 2 * total_steps)
 
 
+SAMPLER_OVERTIME_FAULT_REASON = (
+    "stuck-step watchdog: non-advancing final-step reports exceeded 2x the step schedule; "
+    "adaptive-sampler runaway suspected; faulted without retry"
+)
+"""Why a job reaped past the final-step overtime ceiling is faulted terminally.
+
+Rides the faulted submit's ``gen_metadata`` (see
+:meth:`~horde_worker_regen.process_management.jobs.job_tracker.JobTracker._record_fault_diagnostics`)
+so the horde is told what the worker concluded about the payload, and is worded to stay inside the
+255-character ``ref`` budget once the diagnostic's attempt-count prefix is applied.
+"""
+
+
 class ProcessLifecycleManager:
     """Owns process start/stop/replace logic and related state."""
 
@@ -3331,6 +3344,7 @@ class ProcessLifecycleManager:
         end_join_deadline: float | None = None,
         allow_while_recovery_parked: bool = False,
         preload_deadline_exceeded: bool = False,
+        sampler_overtime_reap: bool = False,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -3371,6 +3385,13 @@ class ProcessLifecycleManager:
                 in ``PRELOADING_MODEL``, so the model it was loading earns a load-failure incident even
                 though the child is still alive. Only the preload-window watchdog sets this: a bulk
                 replacement that happens to catch a slot mid-preload is no evidence against its model.
+            sampler_overtime_reap: When True, the stuck-step watchdog is reaping this slot for running past
+                the final-step overtime ceiling, so the in-flight job is faulted terminally instead of
+                requeued. The solver is deterministic: a payload that asks for more iterations than the
+                doubled schedule allows asks for them again on whichever slot picks it up next, and the
+                second burn only shadows the queue until the job misses the horde's dispatch deadline
+                anyway. Faulting immediately hands it back for reissue on another worker. Only the
+                overtime branch sets this; a mid-run stuck-step reap keeps the ordinary retry.
         """
         if self._automatic_replacement_is_parked() and not allow_while_recovery_parked:
             return
@@ -3407,14 +3428,18 @@ class ProcessLifecycleManager:
         if job_to_remove is not None:
             # A slot crash/hang mid-job is retryable: the job is requeued to a fresh slot (bounded by
             # max_inference_attempts) rather than faulted outright. The crash gives no resource signal, so
-            # it takes the ordinary retry, not the degraded path.
+            # it takes the ordinary retry, not the degraded path. The final-step overtime reap is the one
+            # exception: that verdict is about the payload, which would burn the next slot identically.
+            fault_reason = resource_fault_reason
+            if fault_reason is None and sampler_overtime_reap:
+                fault_reason = SAMPLER_OVERTIME_FAULT_REASON
             self._job_tracker.handle_job_fault_now(
                 faulted_job=job_to_remove,
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
-                retryable=True,
+                retryable=not sampler_overtime_reap,
                 is_resource_failure=resource_fault_reason is not None,
-                fault_reason=resource_fault_reason,
+                fault_reason=fault_reason,
                 recovery_requeue=recovery_requeue,
             )
 
@@ -4021,10 +4046,13 @@ class ProcessLifecycleManager:
                 process_info.process_id,
                 effective_stuck_step_repeat_limit(stuck_step_limit, process_info),
             ):
-                if is_sampling_at_final_step(process_info):
+                # Captured before the replacement clears the slot's sampling position, since it decides
+                # whether the in-flight job is retried or handed straight back to the horde.
+                overtime_reap = is_sampling_at_final_step(process_info)
+                if overtime_reap:
                     overtime_reason = (
                         f"past the doubled ceiling its {process_info.last_total_steps}-step schedule earns for a "
-                        f"legitimate adaptive-solver overshoot"
+                        f"legitimate adaptive-solver overshoot; faulting the job without retry"
                     )
                 else:
                     overtime_reason = f"past the configured limit of {stuck_step_limit}"
@@ -4049,12 +4077,12 @@ class ProcessLifecycleManager:
                     reason="stuck on a non-advancing sampling step (stuck-step watchdog)",
                     detail={"model": hung_model},
                 )
-                self._replace_inference_process(process_info)
+                self._replace_inference_process(process_info, sampler_overtime_reap=overtime_reap)
                 # Attribute the hang to the model that was sampling. A checkpoint that cannot finish a
                 # generation here kills whichever slot it lands on, and those kills round-robin across slots,
                 # so the per-slot breaker never sees them; only the per-model counter can stop the storm.
                 # Recorded after the replacement so the quarantine sweep also catches the job this slot was
-                # holding, which the replacement has just requeued.
+                # holding, whatever the replacement did with it.
                 if hung_model is not None:
                     self.record_model_incident(
                         hung_model,

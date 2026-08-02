@@ -14,15 +14,17 @@ try:
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock, Semaphore
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Protocol, override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
+from horde_worker_regen.consts import sampler_truncation_disclosure_ref
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_RESOLVE_FAILED_INFO,
@@ -134,12 +136,69 @@ def reportable_step_counts(comfyui_progress: ComfyUIProgress | None) -> tuple[in
     return comfyui_progress.current_step, comfyui_progress.total_steps
 
 
+class SamplerTruncationRecord(Protocol):
+    """The shape the worker reads off hordelib's ``SamplerTruncation``.
+
+    Structural rather than imported so the worker keeps building and running against an engine
+    build that predates the bounded sampler; :func:`read_sampler_truncation` is what tolerates
+    the record's absence at runtime.
+    """
+
+    nominal_steps: int
+    iterations: int
+    budget_multiplier: float
+
+
 @dataclass
 class _DryRunResultingImage:
     """Duck-type stand-in for hordelib's `ResultingImageReturn` used in dry-run mode."""
 
     rawpng: io.BytesIO
     faults: list[GenMetadataEntry] = field(default_factory=list)
+    sampler_truncation: SamplerTruncationRecord | None = None
+
+
+def read_sampler_truncation(result: object) -> SamplerTruncationRecord | None:
+    """Read the sampler-truncation record off an inference result, if the engine attached one.
+
+    Absent on every result from an engine without the bounded sampler, and on results whose
+    sampler ran to its own completion.
+    """
+    truncation: SamplerTruncationRecord | None = getattr(result, "sampler_truncation", None)
+    return truncation
+
+
+def sampler_truncation_disclosure(truncation: SamplerTruncationRecord | None) -> list[GenMetadataEntry]:
+    """Turn hordelib's sampler-truncation record into the disclosure ``gen_metadata`` entry.
+
+    hordelib bounds the one sampler that chooses its own iteration count and delivers the
+    best-effort sample rather than letting the job burn indefinitely (see
+    ``hordelib.execution.adaptive_sampler_bound``). That coercion changes what the requester
+    receives, so it is disclosed on the successful submission. ``METADATA_TYPE.information`` is
+    non-reportable (see :attr:`HordeInferenceResultMessage.non_reportable_faults`), so the entry
+    describes the generation without counting against the job's fault total.
+
+    Args:
+        truncation: The record hordelib attached to the result, or None if the sampler ran to its
+            own completion.
+
+    Returns:
+        list[GenMetadataEntry]: One disclosure entry, or an empty list when nothing was truncated.
+    """
+    if truncation is None:
+        return []
+
+    return [
+        GenMetadataEntry(
+            type=METADATA_TYPE.information,
+            value=METADATA_VALUE.see_ref,
+            ref=sampler_truncation_disclosure_ref(
+                iterations=truncation.iterations,
+                nominal_steps=truncation.nominal_steps,
+                multiplier=truncation.budget_multiplier,
+            ),
+        ),
+    ]
 
 
 class HordeInferenceProcess(HordeProcess):
@@ -1339,7 +1398,8 @@ class HordeInferenceProcess(HordeProcess):
                 all_image_results.append(
                     HordeImageResult(
                         image_bytes=result.rawpng.getvalue(),
-                        generation_faults=result.faults,
+                        generation_faults=result.faults
+                        + sampler_truncation_disclosure(read_sampler_truncation(result)),
                     ),
                 )
 

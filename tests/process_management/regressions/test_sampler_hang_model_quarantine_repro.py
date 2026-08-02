@@ -26,6 +26,8 @@ from unittest.mock import AsyncMock, Mock
 
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
@@ -38,6 +40,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     MODEL_INCIDENT_WINDOW_SECONDS,
     MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD,
     MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD,
+    SAMPLER_OVERTIME_FAULT_REASON,
     ModelIncidentKind,
     ProcessLifecycleManager,
 )
@@ -281,6 +284,112 @@ class TestHangsAreCountedPerJob:
             )
 
         assert lifecycle.record_model_incident(_HANGING_MODEL, ModelIncidentKind.LOAD_FAILURE, job_id="job-1") is True
+
+
+class TestFinalStepOvertimeReapIsTerminal:
+    """A reap past the final-step overtime ceiling hands the job back rather than burning a second slot.
+
+    An error-controlled solver's iteration count is a property of the payload, not of the slot, so a job
+    reaped for outrunning the doubled schedule outruns it again wherever it lands next. Live, the requeue
+    bought a second identical burn whose queue shadow pushed a healthy neighbour past the horde's dispatch
+    deadline. Faulting terminally lets the horde reissue the job immediately.
+    """
+
+    @staticmethod
+    def _overtime_slot(process_id: int, model: str, *, total_steps: int = 25) -> HordeProcessInfo:
+        """A slot heart-beating at its final step past the doubled ceiling that schedule earns."""
+        slot = make_mock_process_info(process_id, model_name=model, state=HordeProcessState.INFERENCE_STARTING)
+        now = time.time()
+        slot.last_heartbeat_timestamp = now
+        slot.last_received_timestamp = now
+        slot.last_process_state_started_at = now
+        slot.last_current_step = total_steps
+        slot.last_total_steps = total_steps
+        slot.nonadvancing_step_repeats = 2 * total_steps
+        return slot
+
+    @staticmethod
+    async def _slot_holding_a_started_job(
+        manager: HordeWorkerProcessManager,
+        slot: HordeProcessInfo,
+    ) -> ImageGenerateJobPopResponse:
+        """Register the slot and give it an in-flight job that has already entered inference."""
+        job = await track_popped_job_async(manager._job_tracker, make_job_pop_response(model=_HANGING_MODEL))
+        await manager._job_tracker.mark_inference_started(job)
+        slot.last_job_referenced = job
+        manager._process_map[slot.process_id] = slot
+        return job
+
+    async def test_the_overtime_reap_faults_the_job_in_one_attempt(self) -> None:
+        """The job goes straight to submit as faulted: no requeue, so no second slot burns on it."""
+        manager = _make_storm_manager()
+        job_tracker = manager._job_tracker
+        job = await self._slot_holding_a_started_job(manager, self._overtime_slot(1, _HANGING_MODEL))
+
+        _run_watchdog(manager._process_lifecycle)
+
+        assert job not in job_tracker.jobs_pending_inference
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        assert [info.state for info in job_tracker.jobs_pending_submit] == [GENERATION_STATE.faulted]
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.inference_attempts == 1, "the fault was terminal on the first burn"
+
+    async def test_the_reap_faults_non_retryably(self) -> None:
+        """The overtime fact reaches the tracker as ``retryable=False``, which is what forbids the requeue."""
+        manager = _make_storm_manager()
+        job_tracker = manager._job_tracker
+        await self._slot_holding_a_started_job(manager, self._overtime_slot(1, _HANGING_MODEL))
+        fault_spy = Mock(wraps=job_tracker.handle_job_fault_now)
+        job_tracker.handle_job_fault_now = fault_spy  # type: ignore[method-assign]
+
+        _run_watchdog(manager._process_lifecycle)
+
+        fault_spy.assert_called_once()
+        assert fault_spy.call_args.kwargs["retryable"] is False
+
+    async def test_the_faulted_submission_carries_the_overtime_diagnostic(self) -> None:
+        """The submit's ``gen_metadata`` explains the verdict, so the horde is not left guessing."""
+        manager = _make_storm_manager()
+        job_tracker = manager._job_tracker
+        job = await self._slot_holding_a_started_job(manager, self._overtime_slot(1, _HANGING_MODEL))
+
+        _run_watchdog(manager._process_lifecycle)
+
+        faults = await job_tracker.get_faults_for_job(job.id_)
+        assert len(faults) == 1, "one diagnostic, not a second entry parallel to the tracker's own"
+        entry = faults[0]
+        assert entry.type_ is METADATA_TYPE.information
+        assert entry.value is METADATA_VALUE.see_ref
+        assert entry.ref is not None
+        assert SAMPLER_OVERTIME_FAULT_REASON in entry.ref
+        # The server rejects a ref over its column width, which would drop the whole submission.
+        assert len(entry.ref) <= 255
+
+    async def test_a_mid_run_reap_still_retries(self) -> None:
+        """A step the schedule already passed is an ordinary wedge, and its job keeps its retry budget."""
+        manager = _make_storm_manager()
+        job_tracker = manager._job_tracker
+        slot = _hung_slot(1, _HANGING_MODEL)
+        job = await self._slot_holding_a_started_job(manager, slot)
+
+        _run_watchdog(manager._process_lifecycle)
+
+        assert job in job_tracker.jobs_pending_inference
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+        assert await job_tracker.get_faults_for_job(job.id_) == []
+
+    async def test_the_overtime_reap_still_charges_the_model_and_the_job(self) -> None:
+        """The terminal fault changes the job's fate, not the evidence the quarantine counter collects."""
+        manager = _make_storm_manager()
+        lifecycle = manager._process_lifecycle
+        job = await self._slot_holding_a_started_job(manager, self._overtime_slot(1, _HANGING_MODEL))
+
+        _run_watchdog(lifecycle)
+
+        incidents = lifecycle._model_incident_history[_HANGING_MODEL]
+        assert [incident.kind for incident in incidents] == [ModelIncidentKind.SAMPLER_HANG]
+        assert [incident.job_id for incident in incidents] == [str(job.id_)]
 
 
 class TestPreloadCrashAttribution:

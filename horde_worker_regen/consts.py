@@ -138,6 +138,35 @@ a warn-only validator, so the string round-trips. The SDK member is added in par
 validator's warning once released.
 """
 
+GEN_METADATA_REF_MAX_LENGTH = 255
+"""The ``GenMetadataEntry.ref`` length the AI-Horde API accepts.
+
+Mirrored from the SDK's field constraint so worker-composed ``ref`` text can be truncated to fit
+rather than failing validation at submit time, when the generation is already paid for.
+"""
+
+
+def sampler_truncation_disclosure_ref(*, iterations: int, nominal_steps: int, multiplier: float) -> str:
+    """Compose the ``gen_metadata`` ref disclosing that a sampler was stopped at its bound.
+
+    The requester is owed the fact that the sample it received is the solver's best effort rather
+    than its converged output, along with the numbers that make the coercion checkable.
+
+    Args:
+        iterations: The solver iterations run before the bound stopped the loop.
+        nominal_steps: The step count the requested schedule advertised.
+        multiplier: hordelib's iteration-budget multiplier, quoted so the disclosure cannot drift
+            from the bound that produced it.
+
+    Returns:
+        str: The disclosure text, truncated to :data:`GEN_METADATA_REF_MAX_LENGTH`.
+    """
+    ref = (
+        f"adaptive sampler iteration cap: solver truncated at {iterations} iterations "
+        f"({multiplier:g}x the {nominal_steps}-step schedule); best-effort converged sample delivered"
+    )
+    return ref[:GEN_METADATA_REF_MAX_LENGTH]
+
 
 WORKER_KNOWN_BETA_UPSCALERS = frozenset(
     {

@@ -123,6 +123,46 @@ class TestSubmitSingleGeneration:
         new_submit.fault.assert_not_called()
         horde_session.submit_request.assert_awaited_once()
 
+    async def test_a_faulted_submission_carries_the_trackers_diagnostic(self) -> None:
+        """The tracker's fault diagnostic is what the faulted submit reports as ``gen_metadata``.
+
+        A faulted job has no image, so the per-image fault list is empty and this diagnostic is the only
+        thing that tells the horde why the worker gave the job back.
+        """
+        job_tracker = JobTracker()
+        job = await track_popped_job_async(job_tracker, make_job_pop_response(model="stable_diffusion"))
+        await job_tracker.mark_inference_started(job)
+        job_tracker.handle_job_fault_now(job, retryable=False, fault_reason="stuck-step watchdog: overtime")
+
+        submitted_kwargs: dict[str, object] = {}
+
+        def _capture_request(**kwargs: object) -> Mock:
+            submitted_kwargs.update(kwargs)
+            return Mock()
+
+        horde_session = AsyncMock()
+        horde_session.submit_request = AsyncMock(return_value=None)
+        submitter = _make_submitter(job_tracker=job_tracker, horde_client_session=horde_session)
+
+        completed_info = Mock()
+        completed_info.sdk_api_job_info = job
+        completed_info.state = GENERATION_STATE.faulted
+        completed_info.get_follow_up_default_request_type = Mock(return_value=_capture_request)
+
+        new_submit = Mock(spec=PendingSubmitJob)
+        new_submit.job_id = job.id_
+        new_submit.image_result = None
+        new_submit.is_faulted = False
+        new_submit.completed_job_info = completed_info
+
+        with patch.object(type(job), "get_follow_up_default_request_type", return_value=_capture_request):
+            await submitter.submit_single_generation(new_submit)
+
+        metadata = submitted_kwargs["gen_metadata"]
+        assert isinstance(metadata, list) and len(metadata) == 1
+        assert metadata[0].ref is not None
+        assert "stuck-step watchdog: overtime" in metadata[0].ref
+
 
 class TestApiSubmitJob:
     """Tests for api_submit_job."""

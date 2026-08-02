@@ -554,7 +554,7 @@ class TestStuckOnNonAdvancingStep:
 
         plm.replace_hung_processes()
 
-        plm._replace_inference_process.assert_called_once_with(proc)
+        plm._replace_inference_process.assert_called_once_with(proc, sampler_overtime_reap=False)
 
     def test_slot_below_the_limit_is_left_alone(self) -> None:
         """A stray duplicate report (under the limit) is not a wedge and must not be reaped."""
@@ -623,7 +623,7 @@ class TestFinalStepOvertimeAllowance:
 
         replace = self._run_watchdog(proc)
 
-        replace.assert_called_once_with(proc)
+        replace.assert_called_once_with(proc, sampler_overtime_reap=True)
 
     def test_the_reaped_overtime_still_charges_the_model(self) -> None:
         """The wider ceiling changes when a hang is called, not whether the model is held responsible."""
@@ -643,7 +643,7 @@ class TestFinalStepOvertimeAllowance:
 
         replace = self._run_watchdog(proc)
 
-        replace.assert_called_once_with(proc)
+        replace.assert_called_once_with(proc, sampler_overtime_reap=False)
 
     @pytest.mark.parametrize("total_steps", [0, None])
     def test_an_unknown_step_count_falls_back_to_the_configured_limit(self, total_steps: int | None) -> None:
@@ -653,7 +653,7 @@ class TestFinalStepOvertimeAllowance:
 
         replace = self._run_watchdog(proc)
 
-        replace.assert_called_once_with(proc)
+        replace.assert_called_once_with(proc, sampler_overtime_reap=False)
 
 
 def test_empty_process_map_is_not_declared_all_unresponsive() -> None:

@@ -141,6 +141,25 @@ At every stage, faults are recorded as `GenMetadataEntry` objects in
 `JobTracker.job_faults`. The submitter includes all accumulated faults in the
 API submission so the horde can track why a job failed.
 
+### The diagnostic on a faulted submission
+
+A terminally faulted job carries no image, so there is no per-image fault list
+for the submission to report and no other channel that tells the horde why the
+worker gave the job back. `JobTracker._record_fault_diagnostics` fills that gap:
+on every terminal fault it appends one entry to `job_faults[job_id]` naming the
+attempt count and the reason, and `JobSubmitter.submit_single_generation` reads
+that list back through `get_faults_for_job` for any submission whose state is
+`faulted`, passing it as the request's `gen_metadata`.
+`JobTracker.finalize_submitted` drops the entries once the job is submitted.
+
+Entries must be schema-legal or the server rejects the whole submission, so the
+diagnostic uses `METADATA_TYPE.information` with `METADATA_VALUE.see_ref` and
+puts its free text in `ref`, truncated to the 255-character column width. A
+caller that wants specific wording on the submission passes it as
+`fault_reason`, which the diagnostic embeds; a second, parallel entry is neither
+needed nor wanted. The stuck-step watchdog's overtime reap does exactly that
+(see [Resilience and Recovery](resilience_and_recovery.md#the-stuck-step-watchdog-and-its-final-step-allowance)).
+
 ## Consecutive failure backoff
 
 `WorkerState` tracks `consecutive_failed_jobs`. After 3 consecutive failures,

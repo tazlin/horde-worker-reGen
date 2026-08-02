@@ -170,6 +170,10 @@ When a process dies unexpectedly (crash, OOM kill, hung timeout):
    (see [Layer 1](resilience_and_recovery.md#layer-1-bounded-and-degraded-job-retry)).
    A job left stranded in progress despite this (e.g. a lost result) is caught by
    the [orphaned-job backstops](resilience_and_recovery.md#stranded-in-progress-jobs).
+   The one exception is the stuck-step watchdog's final-step overtime reap, which
+   passes `sampler_overtime_reap` so the job is faulted non-retryably: that reap is
+   a verdict on the payload, which the next slot would burn on identically (see
+   [the stuck-step watchdog](resilience_and_recovery.md#the-stuck-step-watchdog-and-its-final-step-allowance)).
 4. A new process is started with a fresh `process_launch_identifier`, or queued
    as a deferred GPU start if the assigned card is below its start headroom.
 5. The `process_launch_identifier` bump ensures any stale messages from the dead

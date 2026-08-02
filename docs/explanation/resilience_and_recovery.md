@@ -91,6 +91,31 @@ always OOMs on load, say) stops consuming respawn churn. A merely slow,
 replacing, or model-loading slot is **not** quarantined; only repeated fast
 crashes trip the breaker.
 
+### Coercing the adaptive solver instead of reaping it
+
+The watchdog below is a **backstop**, not the first response to a runaway
+adaptive sampler. The inference engine bounds the solver itself: hordelib's
+`hordelib.execution.adaptive_sampler_bound` replaces ComfyUI's `dpm_adaptive`
+sampler function with one that stops the solver's loop at 1.25 times the nominal
+step count and returns the sample it has. Iterations past the nominal schedule
+are the solver polishing against its error tolerance, which buys approximately no
+perceptible quality while costing a full model evaluation each, so the bounded
+run delivers what the requester asked for at the cost the schedule advertised.
+
+Because the bound produces a usable sample, the job **succeeds**. That makes the
+coercion invisible unless it is declared, so the child turns the engine's
+truncation record into one `information` / `see_ref` `gen_metadata` entry naming
+the iterations run and the schedule they were measured against
+(`sampler_truncation_disclosure`). `information` is a non-reportable metadata
+type, so the disclosure does not inflate the submission's fault count: the
+generation was delivered, not faulted.
+
+The ordering matters for reading incidents. A bounded solver terminates on its
+own well inside the watchdog's ceiling, so a `sampler_overtime_reap` after this
+landed means the bound did not hold (a sampler the patch does not cover, an
+engine build without it, or a hang outside the solver loop) rather than an
+ordinary long adaptive run.
+
 ### The stuck-step watchdog and its final-step allowance
 
 Every other hang check measures **silence**. The stuck-step watchdog covers the
@@ -115,6 +140,23 @@ longer explainable as overtime. The reap line names which ceiling was crossed.
 A generation that has genuinely stopped doing work stops reporting altogether,
 and that silence is what `inference_step_timeout` proves. The repeat count only
 ever sees a slot that is still calling back.
+
+An overtime reap is **terminal for its job**, unlike every other slot
+replacement. The two reaps carry different verdicts: a mid-run repeat loop says
+nothing about the payload, so its job takes the ordinary Layer 1 retry, but a
+run past the doubled ceiling is a statement about how many iterations *this*
+payload asks for, and the solver is deterministic. Requeuing it buys an
+identical second burn on another slot, whose queue shadow can push a healthy
+neighbouring job past the horde's dispatch deadline before the retry is
+abandoned anyway. The watchdog therefore passes `sampler_overtime_reap` to
+`_replace_inference_process`, which faults the in-flight job with
+`retryable=False` so the horde reissues it immediately. Both reaps still record
+a `SAMPLER_HANG` incident against the model, keyed to the job that hung.
+
+The terminal fault carries `SAMPLER_OVERTIME_FAULT_REASON` as its fault reason,
+which rides the faulted submission's `gen_metadata` (see
+[Shutdown and faults → fault propagation](shutdown_and_faults.md#fault-propagation)),
+so the horde is told what the worker concluded about the payload.
 
 ## Poison-model quarantine
 
