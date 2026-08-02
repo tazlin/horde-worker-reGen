@@ -4,10 +4,13 @@
     - [The layered recovery model](#the-layered-recovery-model)
     - [Layer 1: bounded and degraded job retry](#layer-1-bounded-and-degraded-job-retry)
     - [Layer 2: slot replacement and crash-loop quarantine](#layer-2-slot-replacement-and-crash-loop-quarantine)
+    - [Poison-model quarantine](#poison-model-quarantine)
     - [Stranded in-progress jobs](#stranded-in-progress-jobs)
     - [Stranded safety-check jobs](#stranded-safety-check-jobs)
     - [Stranded post-processing jobs](#stranded-post-processing-jobs)
     - [Layer 3: save-our-ship (SOS) escalation](#layer-3-save-our-ship-sos-escalation)
+    - [Self-protective feature throttles](#self-protective-feature-throttles)
+    - [The terminal-fault-rate breaker](#the-terminal-fault-rate-breaker)
     - [The background download process](#the-background-download-process)
     - [The action ledger](#the-action-ledger)
     - [The owned-PID registry](#the-owned-pid-registry)
@@ -87,6 +90,54 @@ A slot that **crash-loops** (repeatedly dies shortly after being replaced) is
 always OOMs on load, say) stops consuming respawn churn. A merely slow,
 replacing, or model-loading slot is **not** quarantined; only repeated fast
 crashes trip the breaker.
+
+## Poison-model quarantine
+
+The slot breaker keys on the **slot**, so it cannot see a bad *model*. A
+checkpoint that kills whichever slot it is dispatched to is re-dispatched
+round-robin across fresh slots, and no single slot is ever replaced often enough
+to trip its own breaker while the whole pool burns down. `ProcessLifecycleManager`
+therefore keeps a second, model-keyed counter: `record_model_incident` records a
+`ModelIncidentKind` against the model, and once one kind crosses its threshold
+within `MODEL_INCIDENT_WINDOW_SECONDS` (600 s) the model joins
+`quarantined_models`.
+
+Two kinds are counted, with separate thresholds because the evidence differs in
+strength:
+
+| Kind | Threshold | Fed by |
+| ---- | --------- | ------ |
+| `LOAD_FAILURE` | `MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD` (3) | A child reporting `PRELOADING_FAILED`, **and** a child that dies natively (no report) while its last known state was `PRELOADING_MODEL` |
+| `SAMPLER_HANG` | `MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD` (2) | The stuck-step watchdog killing a slot that had this model loaded |
+
+The second feed for `LOAD_FAILURE` covers a checkpoint that crashes the process
+outright (an access violation while the backend mmaps a bad file), which never
+produces the child-side report the first feed depends on. The hang feed covers a
+model that loads perfectly and then wedges the sampler at its last step: each
+occurrence costs a full stuck-step timeout, a kill, and a double-faulted job, so
+two within the window is already a verdict. Attributing a hang to the model does
+**not** change the slot bookkeeping: the slot really did die, so its own breaker
+still counts the replacement.
+
+Crossing a threshold calls the one quarantine handler every feed site shares
+(`HordeWorkerProcessManager._on_model_quarantined`, registered via
+`set_model_quarantine_handler`), and that handler is the single downstream:
+
+- Every **queued** job for the model is faulted non-retryably, so the horde
+  reissues them to a worker that can run the model instead of the worker
+  re-dispatching a model that kills slots.
+- The **scheduler** refuses to preload a quarantined model, or to select a head
+  job that needs one.
+- The **popper** stops advertising it. This is the part that actually stops the
+  bleeding: a model left on the offer keeps being assigned, every assignment is
+  faulted, and a steady drop stream is exactly what makes the horde server
+  force-set maintenance for "dropping too many jobs".
+
+The pop exclusion has a **non-empty floor**. If dropping the quarantined models
+would leave nothing to advertise (a worker configured with only that model), the
+offer is sent unchanged and a warning is logged once per episode. A worker that
+advertises nothing is sent nothing, so it can never produce the work that would
+let it recover; taking the faults is a recoverable state, going silent is not.
 
 ## Stranded in-progress jobs
 
@@ -451,6 +502,57 @@ jobs until the server intervenes. The dedicated post-processing lane (see
 complement that keeps the breaker from being needed in the first place: its
 fixed resident footprint replaces the transient per-job peak that caused the
 over-commits.
+
+## The terminal-fault-rate breaker
+
+Every throttle above withdraws a *specific* thing: a model, a capability, a card.
+That leaves the generic case uncovered. A drop stream attributable to no single
+model and to no single capability still counts against the worker on the horde's
+side, and the server's own breaker fires on the raw rate: a worker faulting jobs
+steadily is force-set into maintenance for "dropping too many jobs" whether or not
+it has diagnosed why. The **terminal-fault-rate breaker** is the worker's own
+reading of that same rate, so it can stop taking work on its own terms first.
+
+It is armed from the tracker's terminal-fault *decision*
+([`JobTracker.set_terminal_fault_observer`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.set_terminal_fault_observer]),
+not from the session faulted counter. That counter only moves when a faulted
+result is submitted, so a breaker reading it would learn of a burst well after
+the horde had already counted the drops.
+
+Only faults whose [`JobFaultOrigin`][horde_worker_regen.process_management.jobs.job_tracker.JobFaultOrigin]
+is `GENERATION` are counted, matching the exclusions the consecutive-failure pause
+already applies. A scheduling-recovery fault, an auxiliary-prefetch give-up, and a
+remote-submit failure are each a verdict on something other than the worker's
+ability to generate, so none may pause intake of unrelated work; a retryable
+failure that requeues dropped nothing at all. The shutdown drain is excluded too:
+it faults the remaining backlog deliberately, and a worker on its way out accepts
+nothing either way.
+
+The policy is fixed in module constants (no configuration keys):
+`TERMINAL_FAULT_BREAKER_THRESHOLD` (3) faults within
+`TERMINAL_FAULT_BREAKER_WINDOW_SECONDS` (600 s) pause new pops for
+`TERMINAL_FAULT_BREAKER_COOLDOWN_SECONDS` (300 s). A re-trip within
+`TERMINAL_FAULT_BREAKER_ESCALATION_DECAY_SECONDS` (3600 s) doubles the cooldown,
+up to `TERMINAL_FAULT_BREAKER_MAX_COOLDOWN_SECONDS` (1800 s); going a full decay
+window without tripping resets the escalation to the base. The faults a trip acts
+on are consumed by it, so the same evidence cannot re-trip the breaker the instant
+the cooldown lifts.
+
+The pause reuses the shared self-throttle deadline (see
+[Self-throttle pause ownership](performance_and_backpressure.md#self-throttle-pause-ownership)),
+stamped with `PopPauseOwner.FAULT_THROTTLE`, so there is one pop-pause surface
+rather than a parallel one. In-flight jobs are unaffected; only new pops stop.
+**Nothing but the deadline lifts the pause.** A lift conditioned on the faults
+stopping would be a liveness proof the failure itself could withhold, and a
+persistent condition would then hold the worker silent indefinitely; instead each
+pause is bounded and the breaker simply re-trips, which is a repeating signal an
+operator can read.
+
+The poison-model quarantine feeds this breaker rather than bypassing it. The
+backlog sweep's non-retryable faults are real drops the horde counts, so a
+quarantine with a deep backlog trips the breaker at once. That is the intent: the
+pause lets the backlog drain and the horde reissue that work elsewhere, and the
+worker rejoins with the poison model already off its offer.
 
 ## The background download process
 

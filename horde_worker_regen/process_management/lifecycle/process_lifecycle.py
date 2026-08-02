@@ -189,18 +189,51 @@ PENDING_GPU_START_NO_PROGRESS_SECONDS: float = 600.0
 PENDING_GPU_START_PROGRESS_EPSILON_MB: float = 128.0
 """Minimum free-VRAM increase that counts as drain progress for deferred GPU starts."""
 
-MODEL_LOAD_FAILURE_WINDOW_SECONDS: float = 600.0
-"""Sliding window over which a single model's load failures are counted for quarantine."""
+MODEL_INCIDENT_WINDOW_SECONDS: float = 600.0
+"""Sliding window over which a single model's incidents are counted for quarantine.
+
+Wider than the slot crash-loop window because a poison model surfaces once per job dispatch, not once per
+fast respawn."""
+
+
+class ModelIncidentKind(enum.StrEnum):
+    """How a model implicated itself in the loss of an inference process.
+
+    Each kind is counted separately against its own threshold, because the evidence they carry differs in
+    strength, but they share one history and one quarantine set: a model is poison whichever way it kills
+    the slots it is dispatched to.
+    """
+
+    LOAD_FAILURE = "load_failure"
+    """The model could not be loaded: reported by the child, or a native crash while it was being preloaded."""
+
+    SAMPLER_HANG = "sampler_hang"
+    """Sampling on the model stopped advancing and the stuck-step watchdog had to kill the slot."""
+
 
 MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD: int = 3
-"""Load failures of one model within ``MODEL_LOAD_FAILURE_WINDOW_SECONDS`` before it is quarantined.
+"""Load failures of one model within ``MODEL_INCIDENT_WINDOW_SECONDS`` before it is quarantined.
 
 A model that faults the backend every time it is loaded (an unsupported/corrupt checkpoint) is poison: the
 slot crash-loop breaker keys on the *slot*, not the model, so re-dispatching the model round-robin across
 fresh slots burns the whole pool down without any single slot tripping its breaker. Past this count the
-model itself is taken out of rotation (its queued jobs faulted for reissue, further preloads skipped) so
-one bad model can no longer cascade into a pool-wide recovery storm. The window is wider than the slot
-breaker's because a poison model surfaces once per job dispatch, not once per fast respawn."""
+model itself is taken out of rotation (its queued jobs faulted for reissue, further preloads skipped, and
+the model dropped from the pop offer) so one bad model can no longer cascade into a pool-wide storm."""
+
+MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD: int = 2
+"""Sampler hangs of one model within ``MODEL_INCIDENT_WINDOW_SECONDS`` before it is quarantined.
+
+Lower than the load-failure threshold because each hang is far more expensive: the model reaches the
+sampler, occupies a slot for the whole stuck-step timeout, takes a kill, and double-faults the job it held,
+so a second occurrence within the window is already enough evidence that the checkpoint cannot finish a
+generation here. Two also stays above the noise floor of a one-off hang caused by something other than the
+model (a driver hiccup, a paging stall)."""
+
+MODEL_INCIDENT_QUARANTINE_THRESHOLDS: dict[ModelIncidentKind, int] = {
+    ModelIncidentKind.LOAD_FAILURE: MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD,
+    ModelIncidentKind.SAMPLER_HANG: MODEL_SAMPLER_HANG_QUARANTINE_THRESHOLD,
+}
+"""How many incidents of each kind, within the window, quarantine the model."""
 
 SLOWDOWN_NOTICE_RATIO: float = 2.0
 """Sampling time past this multiple of the job's expected time logs a soft notice (rung 1 of the ladder)."""
@@ -305,9 +338,10 @@ class ProcessLifecycleManager:
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
     _safety_recovery_history: list[float]
-    _model_load_failure_history: dict[str, list[float]]
+    _model_incident_history: dict[str, list[tuple[ModelIncidentKind, float]]]
     _quarantined_models: set[str]
     _recent_load_failure_by_process: dict[int, tuple[str, float]]
+    _on_model_quarantined: Callable[[str], None] | None
 
     def __init__(
         self,
@@ -537,9 +571,10 @@ class ProcessLifecycleManager:
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
         self._safety_recovery_history = []
-        self._model_load_failure_history = {}
+        self._model_incident_history = {}
         self._quarantined_models = set()
         self._recent_load_failure_by_process = {}
+        self._on_model_quarantined = None
         self._pending_gpu_starts: dict[tuple[HordeProcessType, int], _PendingGpuStart] = {}
         self._pending_gpu_start_last_free_mb_by_device: dict[int, float] = {}
         self._pending_gpu_start_last_progress_at_by_device: dict[int, float] = {}
@@ -2967,38 +3002,73 @@ class ProcessLifecycleManager:
                 f"{', '.join(released)}",
             )
 
-    def record_model_load_failure(self, process_id: int, model_name: str) -> bool:
-        """Record that ``model_name`` failed to load on ``process_id``; return whether it is now quarantined.
+    def set_model_quarantine_handler(self, handler: Callable[[str], None]) -> None:
+        """Register the callback invoked with a model name the moment that model becomes quarantined.
 
-        Keyed on the *model*, not the slot: a deterministically-unloadable checkpoint is re-dispatched
+        Every feed site (a child-reported load failure, a native crash during preload, the stuck-step
+        watchdog) reaches the same downstream through this one handler, so the backlog sweep that hands the
+        model's remaining jobs back to the horde cannot depend on which evidence tripped the quarantine.
+        """
+        self._on_model_quarantined = handler
+
+    def record_model_incident(
+        self,
+        model_name: str,
+        kind: ModelIncidentKind,
+        *,
+        reported_by_process_id: int | None = None,
+    ) -> bool:
+        """Record that ``model_name`` killed an inference process this way; return whether it is quarantined.
+
+        Keyed on the *model*, not the slot: a deterministically-poison checkpoint is re-dispatched
         round-robin across fresh slots, so without a per-model counter no single slot's crash-loop breaker
-        ever trips and the bad model burns the whole pool down. Once a model crosses
-        ``MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD`` failures within the window it is taken out of rotation
-        (see :meth:`is_model_load_quarantined`). The process->model mapping is remembered so the imminent
-        slot replacement can label the recovery as a model-load failure rather than a process crash.
+        ever trips and the bad model burns the whole pool down. Once a model crosses its kind's threshold
+        within ``MODEL_INCIDENT_WINDOW_SECONDS`` it is taken out of rotation (see
+        :meth:`is_model_load_quarantined`) and the quarantine handler is called once.
+
+        Args:
+            model_name: The model implicated in the loss.
+            kind: Which kind of incident this is; each kind counts against its own threshold.
+            reported_by_process_id: Set only when a child explicitly reported the failure from that slot.
+                The process->model mapping is then remembered so the imminent slot replacement labels the
+                recovery a model-load failure rather than a process crash, and keeps it out of the slot
+                breakers. A crash or a hang carries no such report, so it leaves the mapping alone and takes
+                the ordinary slot bookkeeping.
+
+        Returns:
+            Whether the model is quarantined after this incident.
         """
         now = time.time()
-        self._recent_load_failure_by_process[process_id] = (model_name, now)
-        prior = self._model_load_failure_history.get(model_name, [])
-        recent = [t for t in prior if now - t <= MODEL_LOAD_FAILURE_WINDOW_SECONDS]
-        recent.append(now)
-        self._model_load_failure_history[model_name] = recent
-        if len(recent) >= MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD and model_name not in self._quarantined_models:
-            self._quarantined_models.add(model_name)
-            logger.error(
-                f"Model {model_name} failed to load {len(recent)} times within "
-                f"{MODEL_LOAD_FAILURE_WINDOW_SECONDS:.0f}s; quarantining it (its jobs will be reissued and it "
-                f"will not be preloaded) to stop it churning the inference pool.",
-            )
+        if reported_by_process_id is not None:
+            self._recent_load_failure_by_process[reported_by_process_id] = (model_name, now)
+        prior = self._model_incident_history.get(model_name, [])
+        recent = [entry for entry in prior if now - entry[1] <= MODEL_INCIDENT_WINDOW_SECONDS]
+        recent.append((kind, now))
+        self._model_incident_history[model_name] = recent
+
+        if model_name in self._quarantined_models:
             return True
-        return model_name in self._quarantined_models
+
+        of_kind = sum(1 for entry in recent if entry[0] is kind)
+        if of_kind < MODEL_INCIDENT_QUARANTINE_THRESHOLDS[kind]:
+            return False
+
+        self._quarantined_models.add(model_name)
+        logger.error(
+            f"Model {model_name} caused {of_kind} {kind.value} incident(s) within "
+            f"{MODEL_INCIDENT_WINDOW_SECONDS:.0f}s; quarantining it (its jobs will be reissued, it will not "
+            "be preloaded, and it will not be advertised in pops) to stop it churning the inference pool.",
+        )
+        if self._on_model_quarantined is not None:
+            self._on_model_quarantined(model_name)
+        return True
 
     def is_model_load_quarantined(self, model_name: str | None) -> bool:
-        """Whether ``model_name`` has been quarantined for repeatedly failing to load."""
+        """Whether ``model_name`` has been quarantined for repeatedly killing the slots it is dispatched to."""
         return model_name is not None and model_name in self._quarantined_models
 
     def quarantined_models(self) -> frozenset[str]:
-        """The set of models currently quarantined for repeated load failures."""
+        """The set of models currently quarantined for repeated load failures or sampler hangs."""
         return frozenset(self._quarantined_models)
 
     def _take_recent_load_failure_for_process(self, process_id: int) -> str | None:
@@ -3320,7 +3390,7 @@ class ProcessLifecycleManager:
             # model-load failure (not the misleading "crashed or hung") and is deliberately kept out of
             # the slot crash-loop/start-failure breakers: those count *slot* sickness, and feeding a poison
             # model's failures into them would quarantine a perfectly healthy slot. The model itself is
-            # quarantined by record_model_load_failure once it crosses the threshold.
+            # quarantined by record_model_incident once it crosses the threshold.
             will_quarantine = False
             quarantine_reason = ""
             recovery_reason = f"inference process replaced (failed to load model {failed_model})"
@@ -3335,6 +3405,18 @@ class ProcessLifecycleManager:
             quarantine_reason = ""
             recovery_reason = "inference process replaced (likely OS OOM-killed; system RAM critically low)"
         else:
+            # A child that dies natively while preloading (an access violation reading a bad checkpoint, say)
+            # never gets to report PRELOADING_FAILED, so the model would escape the per-model counter entirely
+            # and keep being dispatched. Attribute the crash to the model it was loading. The slot bookkeeping
+            # below still runs: unlike a reported load failure this really was a process death, and the slot
+            # breakers remain the backstop for a slot that dies on every model.
+            preloading_model = process_info.loaded_horde_model_name
+            if (
+                preloading_model is not None
+                and process_info.last_process_state is HordeProcessState.PRELOADING_MODEL
+                and not process_info.mp_process.is_alive()
+            ):
+                self.record_model_incident(preloading_model, ModelIncidentKind.LOAD_FAILURE)
             replacements_in_window = self._record_slot_recovery(process_info.process_id)
             consecutive_start_failures = self._record_start_failure(process_info)
             crash_looped = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS
@@ -3862,14 +3944,23 @@ class ProcessLifecycleManager:
                     f"advancing {process_info.nonadvancing_step_repeats} times); the ComfyUI generation will "
                     f"not return a result, replacing it (stuck-step watchdog).",
                 )
+                hung_model = process_info.loaded_horde_model_name
                 self._action_ledger.record(
                     LedgerEventType.TIMEOUT_DETECTED,
                     process_id=process_info.process_id,
                     os_pid=process_info.os_pid,
                     launch_identifier=process_info.process_launch_identifier,
                     reason="stuck on a non-advancing sampling step (stuck-step watchdog)",
+                    detail={"model": hung_model},
                 )
                 self._replace_inference_process(process_info)
+                # Attribute the hang to the model that was sampling. A checkpoint that cannot finish a
+                # generation here kills whichever slot it lands on, and those kills round-robin across slots,
+                # so the per-slot breaker never sees them; only the per-model counter can stop the storm.
+                # Recorded after the replacement so the quarantine sweep also catches the job this slot was
+                # holding, which the replacement has just requeued.
+                if hung_model is not None:
+                    self.record_model_incident(hung_model, ModelIncidentKind.SAMPLER_HANG)
                 any_replaced = True
                 self._recently_recovered = True
                 threading.Thread(

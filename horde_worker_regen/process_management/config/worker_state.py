@@ -18,9 +18,11 @@ from horde_worker_regen.process_management.models.aux_download_backoff import Au
 class PopPauseOwner(enum.StrEnum):
     """Which backstop armed the worker's self-throttle pop pause, so its cause and lapse can be attributed.
 
-    Three independent subsystems share the single pop-pause deadline (:attr:`WorkerState.self_throttle_paused`
-    with :attr:`WorkerState.self_throttle_paused_until`): the resource/OOM-fault self-maintenance backstop, the
-    host-RAM-pressure governor, and the safety soft-pause. They do not each keep a private deadline. There is
+    Every arming backstop shares the single pop-pause deadline (:attr:`WorkerState.self_throttle_paused`
+    with :attr:`WorkerState.self_throttle_paused_until`): the resource/OOM-fault self-maintenance backstop and
+    the terminal-fault-rate breaker (both labelled ``FAULT_THROTTLE``, told apart by the pause reason they
+    carry), the host-RAM-pressure governor, and the safety soft-pause. They do not each keep a private
+    deadline. There is
     one effective deadline and whichever site sets the later one holds the pause, so the owner recorded here is
     the subsystem whose deadline is currently in force. No site shortens a deadline it does not own (each arming
     site writes only when its own deadline would be the later one), so the recorded owner tracks the standing
@@ -28,7 +30,10 @@ class PopPauseOwner(enum.StrEnum):
     """
 
     FAULT_THROTTLE = "fault_throttle"
-    """The resource/OOM-fault self-maintenance backstop armed the pause."""
+    """A fault backstop armed the pause: either the resource/OOM self-maintenance one or the terminal
+    fault-rate breaker. Both answer the same hazard (the horde force-setting maintenance on a worker that
+    drops too many jobs) with the same remedy, and the standing pause carries whichever tripped in its
+    reason string."""
     RAM_PRESSURE = "ram_pressure"
     """The host-RAM-pressure governor armed the pause while system RAM was under its danger floor."""
     SAFETY = "safety"
@@ -108,7 +113,7 @@ class WorkerState:
     self_throttle_pause_owner: PopPauseOwner | None = None
     """Which backstop set the standing self-throttle deadline, or None when not paused.
 
-    The three arming subsystems share the single deadline above rather than each holding a private one: the
+    The arming subsystems share the single deadline above rather than each holding a private one: the
     owner recorded here is whichever set the deadline currently in force (the later of any overlapping arms).
     Used to attribute the pop-governor reading, the arm/lapse ledger records, and the resume log line to the
     subsystem that actually caused the pause, instead of reporting a single hardcoded reason for all three."""

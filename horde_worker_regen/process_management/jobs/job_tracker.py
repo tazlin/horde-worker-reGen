@@ -441,6 +441,7 @@ class JobTracker:
         self._sequence_counter = 0
         self._finalize_observer: Callable[[TrackedJob, HordeJobInfo], None] | None = None
         self._inference_failure_release_observer: Callable[[GenerationID], None] | None = None
+        self._terminal_fault_observer: Callable[[str | None], None] | None = None
 
         # Circuit-breaker / self-throttle bookkeeping (raw counts + timestamps; the scheduler and process
         # manager apply the configured thresholds). A model the device genuinely cannot run faults every
@@ -704,6 +705,21 @@ class JobTracker:
         the orchestrator does not hold, so calling it for monolithic jobs is safe.
         """
         self._inference_failure_release_observer = observer
+
+    def set_terminal_fault_observer(self, observer: Callable[[str | None], None]) -> None:
+        """Register a callback invoked with the model of every job this tracker faults terminally.
+
+        Called at the fault decision, not at submit time. The session's faulted counter is only incremented
+        when a faulted result is delivered, so a rate breaker reading that counter would learn of a burst
+        well after the horde had already counted the drops against the worker.
+
+        Only :attr:`JobFaultOrigin.GENERATION` faults are reported. A scheduling-recovery fault, an
+        auxiliary-prefetch give-up, and a remote-submit failure are each a verdict on something other than
+        the worker's ability to generate (see :class:`JobFaultOrigin`), so none of them may drive a
+        worker-wide intake pause; a quarantine sweep's non-retryable faults are generation faults and are
+        reported.
+        """
+        self._terminal_fault_observer = observer
 
     # region internal helpers
 
@@ -2157,6 +2173,12 @@ class JobTracker:
             # worker's own queue-drain logic) waits forever on a job that has, in fact, finished
             # (as a fault). The faulted-kudos counter is still incremented once at submit time.
             self._total_num_completed_jobs += 1
+
+        # Announced last, so the tracker's own bookkeeping for this job is complete before any observer
+        # reads it back. A generation fault is a job the horde will count as dropped, whatever produced it,
+        # which is what the worker's fault-rate breaker needs to see.
+        if fault_origin is JobFaultOrigin.GENERATION and self._terminal_fault_observer is not None:
+            self._terminal_fault_observer(faulted_job.model)
         return InferenceFailureResolution.FAULTED
 
     def _record_fault_diagnostics(

@@ -84,6 +84,17 @@ def _make_plm(
     )
 
 
+def _record_load_failure(plm: ProcessLifecycleManager, process_id: int, model_name: str) -> bool:
+    """Record a child-reported load failure of ``model_name`` on ``process_id``; return the quarantine state."""
+    from horde_worker_regen.process_management.lifecycle.process_lifecycle import ModelIncidentKind
+
+    return plm.record_model_incident(
+        model_name,
+        ModelIncidentKind.LOAD_FAILURE,
+        reported_by_process_id=process_id,
+    )
+
+
 def _make_exiting_process_info(
     process_id: int,
     process_type: HordeProcessType,
@@ -429,9 +440,9 @@ class TestModelLoadFailureQuarantine:
         # Each failure lands on a different slot, mirroring the round-robin re-dispatch that the per-slot
         # crash-loop breaker cannot catch.
         for attempt in range(1, MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD):
-            assert plm.record_model_load_failure(process_id=attempt, model_name=model) is False
+            assert _record_load_failure(plm, attempt, model) is False
             assert plm.is_model_load_quarantined(model) is False
-        assert plm.record_model_load_failure(process_id=99, model_name=model) is True
+        assert _record_load_failure(plm, 99, model) is True
         assert plm.is_model_load_quarantined(model) is True
         assert model in plm.quarantined_models()
 
@@ -439,8 +450,8 @@ class TestModelLoadFailureQuarantine:
         """Failures for different models are counted independently."""
         plm = _make_plm()
         # Two different models each failing under the threshold must not combine to a quarantine.
-        plm.record_model_load_failure(process_id=1, model_name="model_a")
-        plm.record_model_load_failure(process_id=2, model_name="model_b")
+        _record_load_failure(plm, 1, "model_a")
+        _record_load_failure(plm, 2, "model_b")
         assert plm.is_model_load_quarantined("model_a") is False
         assert plm.is_model_load_quarantined("model_b") is False
 
@@ -471,7 +482,7 @@ class TestModelLoadFailureQuarantine:
                 state=HordeProcessState.PROCESS_ENDED,
             )
             process_info.mp_process = Mock(is_alive=Mock(return_value=False), exitcode=0)
-            plm.record_model_load_failure(process_id=3, model_name="Z-Image-Turbo")
+            _record_load_failure(plm, 3, "Z-Image-Turbo")
             plm._replace_inference_process(process_info)
 
         assert captured, "a recovery should have been reported"

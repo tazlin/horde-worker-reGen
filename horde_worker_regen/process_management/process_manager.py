@@ -128,7 +128,11 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Job
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    ModelIncidentKind,
+    PauseOwner,
+    ProcessLifecycleManager,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
@@ -816,6 +820,41 @@ POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB = (
 )
 """Free VRAM (MB) a driven card must sustain before the worker will advertise or re-enable post-processing."""
 
+TERMINAL_FAULT_BREAKER_THRESHOLD = 3
+"""Terminal generation faults within the window that trip the worker's fault-rate breaker.
+
+The horde force-sets maintenance on a worker that drops too many jobs, and it does so on its own count, with
+no regard for whether the worker has noticed. The per-model quarantine catches storms attributable to one
+checkpoint; this breaker is the generic backstop for the rest (and for the burst of non-retryable faults a
+quarantine sweep itself emits), so the worker stops taking work on its own terms before the server does it
+for the worker."""
+
+TERMINAL_FAULT_BREAKER_WINDOW_SECONDS = 600.0
+"""Sliding window the terminal faults are counted over.
+
+Wide enough to catch a poison condition that surfaces once per job dispatch rather than in a tight burst,
+narrow enough that a worker faulting the occasional job over an hour never accumulates a trip."""
+
+TERMINAL_FAULT_BREAKER_COOLDOWN_SECONDS = 300.0
+"""How long a first trip pauses new job pops.
+
+Long enough for the accepted backlog to drain and for the horde to reissue the affected work elsewhere,
+short enough that a worker recovering from a transient condition is back earning within one pop cycle."""
+
+TERMINAL_FAULT_BREAKER_MAX_COOLDOWN_SECONDS = 1800.0
+"""Ceiling on the escalated cooldown, so a persistent condition can never pause the worker indefinitely.
+
+Every pause is bounded and lifts on time regardless of whether the condition cleared: the worker re-trips
+if the faults continue, which is a diagnosable repeating signal, where an unbounded hold would be a silent
+worker no operator can distinguish from a wedge."""
+
+TERMINAL_FAULT_BREAKER_ESCALATION_DECAY_SECONDS = 3600.0
+"""Quiet period after a trip that resets the cooldown escalation to its base.
+
+A re-trip inside this period doubles the cooldown (a condition the first pause did not resolve deserves a
+longer one); a worker that goes this long without tripping has demonstrated the condition passed, so the
+next trip starts from the base cooldown rather than inheriting an old escalation."""
+
 
 class HordeWorkerProcessManager:
     """Manages and controls processes to act as a horde worker."""
@@ -1448,6 +1487,16 @@ class HordeWorkerProcessManager:
         self._message_dispatcher.set_inference_step_observer(self._observe_inference_step)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
+        self._process_lifecycle.set_model_quarantine_handler(self._on_model_quarantined)
+
+        # Terminal-generation-fault history for the fault-rate breaker, as (time, model) pairs pruned to the
+        # breaker's window. Fed by the tracker's fault decision rather than the submit-time faulted counter,
+        # which only moves once a faulted result is delivered. The escalation state survives each pause so a
+        # condition the first cooldown did not resolve earns a longer second one.
+        self._terminal_fault_history: list[tuple[float, str | None]] = []
+        self._terminal_fault_breaker_last_trip_at = 0.0
+        self._terminal_fault_breaker_escalation = 0
+        self._job_tracker.set_terminal_fault_observer(self._on_terminal_job_fault)
 
         self._disk_monitor = DiskSpaceMonitor(self._disk_paths_to_monitor())
         self._last_disk_sample_time = 0.0
@@ -1674,6 +1723,7 @@ class HordeWorkerProcessManager:
             background_downloads_enabled=self._enable_background_downloads,
             pool_active_seats_provider=self._model_pool.active_seat_models,
             pool_pop_outcome_sink=self._model_pool.on_pop_outcome,
+            quarantined_models_provider=self._process_lifecycle.quarantined_models,
         )
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
@@ -1897,16 +1947,17 @@ class HordeWorkerProcessManager:
                 time.sleep(5)
 
     def _apply_self_maintenance_throttle(self) -> None:
-        """Local-pause popping when resource/OOM faults approach the horde's server-side drop tolerance.
+        """Lapse an elapsed pop pause, then let each fault backstop arm one.
 
-        A backstop above the per-model circuit-breaker: if terminal resource faults across all models
-        accumulate fast enough within the configured window, enter a worker-initiated local pop-pause
-        (in-flight jobs finish) for a cooldown, so the worker stops the bleeding on its own terms before
-        the horde forces it into maintenance for "dropping too many jobs". Auto-resumes after the cooldown.
+        Two backstops share this site. The resource/OOM one counts the faults a card cannot serve; the
+        fault-rate breaker counts terminal generation faults of any cause, so a drop stream not attributable
+        to one model or to VRAM still stops before the horde force-sets maintenance for "dropping too many
+        jobs". Both pause new pops only: in-flight jobs finish, and the pause auto-resumes on its deadline.
         """
         now = time.time()
-        # The reset is unified across all three arming backstops: whichever owner set the standing deadline,
-        # the pause lapses here once it elapses, and the resume log/ledger name that owner.
+        # The reset is unified across every arming backstop: whichever owner set the standing deadline, the
+        # pause lapses here once it elapses, and the resume log/ledger name that owner. Nothing but the
+        # deadline gates the lift, so a condition that keeps faulting cannot hold the worker paused.
         if self._state.self_throttle_paused:
             if now >= self._state.self_throttle_paused_until:
                 owner = self._state.self_throttle_pause_owner
@@ -1924,13 +1975,24 @@ class HordeWorkerProcessManager:
                 logger.info(f"Self-throttle cooldown elapsed ({owner_label}); resuming job pops.")
             return
 
+        if self._arm_resource_fault_throttle(now):
+            return
+        self._arm_terminal_fault_breaker(now)
+
+    def _arm_resource_fault_throttle(self, now: float) -> bool:
+        """Pause pops when terminal resource/OOM faults accumulate fast enough; return whether it armed.
+
+        A model the device genuinely cannot run faults every attempt no matter how it is isolated, so
+        without this the worker keeps popping and dropping its jobs until the horde forces it into
+        maintenance.
+        """
         threshold = self.bridge_data.self_maintenance_fault_threshold
         if threshold <= 0:
-            return
+            return False
         window = self.bridge_data.self_maintenance_window_seconds
         recent = self._job_tracker.count_recent_resource_faults(window, now=now)
         if recent < threshold:
-            return
+            return False
         cooldown = self.bridge_data.self_maintenance_cooldown_seconds
         pause_reason = f"{recent} resource/OOM faults in the last {window:.0f}s (threshold {threshold})"
         self._state.self_throttle_paused = True
@@ -1950,6 +2012,77 @@ class HordeWorkerProcessManager:
         logger.warning(
             f"Self-throttle engaged: {pause_reason}; pausing job pops locally for {cooldown:.0f}s so the "
             "horde does not force the worker into maintenance. In-flight jobs will finish.",
+        )
+        return True
+
+    def _on_terminal_job_fault(self, model: str | None) -> None:
+        """Record one terminally faulted generation against the fault-rate breaker's window.
+
+        Shutdown is excluded: the drain deliberately faults the remaining backlog so the horde reissues it
+        promptly, and pausing intake on a worker that is already leaving accepts nothing either way.
+        """
+        if self._state.shutting_down:
+            return
+        now = time.time()
+        self._terminal_fault_history.append((now, model))
+        cutoff = now - TERMINAL_FAULT_BREAKER_WINDOW_SECONDS
+        self._terminal_fault_history = [entry for entry in self._terminal_fault_history if entry[0] >= cutoff]
+
+    def _arm_terminal_fault_breaker(self, now: float) -> None:
+        """Pause pops when terminal generation faults of any cause spike, escalating on a repeat trip.
+
+        The horde counts dropped jobs regardless of what caused them, so this breaker does too: a fault
+        class tied to no single model, and the burst of non-retryable faults a model quarantine's backlog
+        sweep emits, both trip it. A quarantine with a deep backlog therefore pauses intake immediately,
+        which is the intent; the backlog drains, the horde reissues that work elsewhere, and the worker
+        rejoins with the poison model already out of rotation.
+        """
+        cutoff = now - TERMINAL_FAULT_BREAKER_WINDOW_SECONDS
+        recent = [entry for entry in self._terminal_fault_history if entry[0] >= cutoff]
+        if len(recent) < TERMINAL_FAULT_BREAKER_THRESHOLD:
+            return
+
+        escalating = (
+            self._terminal_fault_breaker_last_trip_at > 0.0
+            and now - self._terminal_fault_breaker_last_trip_at <= TERMINAL_FAULT_BREAKER_ESCALATION_DECAY_SECONDS
+        )
+        self._terminal_fault_breaker_escalation = self._terminal_fault_breaker_escalation + 1 if escalating else 0
+        cooldown = min(
+            TERMINAL_FAULT_BREAKER_COOLDOWN_SECONDS * (2**self._terminal_fault_breaker_escalation),
+            TERMINAL_FAULT_BREAKER_MAX_COOLDOWN_SECONDS,
+        )
+        self._terminal_fault_breaker_last_trip_at = now
+        # The pause is this evidence's answer, so the same faults must not re-trip the breaker the instant
+        # the cooldown lifts: only faults occurring after the resume count towards the next trip.
+        self._terminal_fault_history = []
+
+        models = sorted({model for _when, model in recent if model is not None})
+        models_label = ", ".join(models)
+        pause_reason = (
+            f"{len(recent)} terminal job faults in the last {TERMINAL_FAULT_BREAKER_WINDOW_SECONDS:.0f}s "
+            f"(threshold {TERMINAL_FAULT_BREAKER_THRESHOLD})"
+        )
+        self._state.self_throttle_paused = True
+        self._state.self_throttle_paused_until = now + cooldown
+        self._state.self_throttle_pause_owner = PopPauseOwner.FAULT_THROTTLE
+        self._state.self_throttle_pause_reason = pause_reason
+        self._action_ledger.record(
+            LedgerEventType.POP_PAUSE_ARMED,
+            reason=pause_reason,
+            detail={
+                "owner": PopPauseOwner.FAULT_THROTTLE.value,
+                "duration_seconds": round(cooldown, 1),
+                "terminal_faults": len(recent),
+                "threshold": TERMINAL_FAULT_BREAKER_THRESHOLD,
+                "escalation": self._terminal_fault_breaker_escalation,
+                "models": models_label,
+            },
+        )
+        across = f" across {models_label}" if models_label else ""
+        logger.warning(
+            f"Fault-rate breaker engaged: {pause_reason}{across}; pausing job pops locally for "
+            f"{cooldown:.0f}s so the horde does not force the worker into maintenance for dropping too many "
+            "jobs. In-flight jobs will finish.",
         )
 
     def _apply_post_processing_fault_breaker(self) -> None:
@@ -4252,17 +4385,26 @@ class HordeWorkerProcessManager:
     def _on_model_load_failure(self, process_id: int, model_name: str) -> None:
         """Handle a child's report that it failed to load ``model_name`` (the poison-model path).
 
-        Records the failure against the model (not the slot). Once the model crosses the quarantine
-        threshold it is taken out of rotation: every queued job for it is faulted non-retryably so the horde
-        reissues them elsewhere instead of the worker re-dispatching the same unloadable model into a
-        pool-wide recovery storm. The scheduler separately refuses to preload a quarantined model. The job the
-        failing process itself held is faulted by the slot-replacement path; this sweeps the *rest* of the
-        backlog for that model.
+        Records the failure against the model (not the slot), naming the reporting slot so the imminent
+        replacement is labelled a model-load failure rather than a slot crash. Crossing the threshold trips
+        the quarantine, whose downstream runs in :meth:`_on_model_quarantined`.
         """
-        newly_quarantined = self._process_lifecycle.record_model_load_failure(process_id, model_name)
-        if not newly_quarantined:
-            return
+        self._process_lifecycle.record_model_incident(
+            model_name,
+            ModelIncidentKind.LOAD_FAILURE,
+            reported_by_process_id=process_id,
+        )
 
+    def _on_model_quarantined(self, model_name: str) -> None:
+        """Take a newly quarantined model out of rotation across the whole worker.
+
+        Every queued job for the model is faulted non-retryably so the horde reissues them elsewhere instead
+        of the worker re-dispatching a model that kills the slot it lands on. The scheduler separately
+        refuses to preload a quarantined model and the popper stops advertising it, which is what stops the
+        horde assigning more of its jobs (a steady drop stream is what trips the "dropping too many jobs"
+        maintenance guard). The job the failing process itself held is faulted by the slot-replacement path;
+        this sweeps the *rest* of the backlog for that model.
+        """
         faulted = 0
         for job in list(self._job_tracker.jobs_pending_inference):
             if job.model == model_name and job not in self._job_tracker.jobs_in_progress:

@@ -1328,8 +1328,11 @@ in [`governor_signatures`][horde_worker_regen.analysis.governor_signatures].
 
 The `self_throttle_pause` governor is a single shared pop-pause deadline
 ([`WorkerState.self_throttle_paused`][horde_worker_regen.process_management.config.worker_state.WorkerState] with
-`self_throttle_paused_until`), but three independent backstops arm it: the resource/OOM-fault self-maintenance
-throttle, the host-RAM-pressure governor, and the safety soft-pause. There is one effective deadline, and
+`self_throttle_paused_until`), but four independent backstops arm it: the resource/OOM-fault self-maintenance
+throttle, the [terminal-fault-rate breaker](resilience_and_recovery.md#the-terminal-fault-rate-breaker), the
+host-RAM-pressure governor, and the safety soft-pause. The two fault backstops share the
+`PopPauseOwner.FAULT_THROTTLE` label and are told apart by the pause reason they carry. There is one
+effective deadline, and
 whichever site sets the later one holds the pause; no site shortens a deadline it does not own, so a short
 RAM-pressure reading arriving under a longer fault throttle leaves the fault throttle's deadline (and its
 attribution) standing. The subsystem that set the standing deadline is recorded as the pause's

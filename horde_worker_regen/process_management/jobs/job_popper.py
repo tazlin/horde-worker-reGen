@@ -424,6 +424,7 @@ class JobPopper:
         background_downloads_enabled: bool = True,
         pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
         pool_pop_outcome_sink: Callable[..., None] | None = None,
+        quarantined_models_provider: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -486,6 +487,11 @@ class JobPopper:
         :meth:`~horde_worker_regen.process_management.scheduling.model_pool.ModelPool.on_pop_outcome`. It is
         called only for cycles the pool actually routed, never for pool-disabled or idle-fill pops. It defaults
         to None (no outcome reporting).
+
+        `quarantined_models_provider` reports the models the lifecycle manager has taken out of rotation for
+        repeatedly killing the slots they are dispatched to. They come off the offer so the horde stops
+        assigning their jobs, which is what ends the drop stream a quarantine would otherwise keep feeding. It
+        defaults to "nothing quarantined", so a popper wired without it (and the tests) advertises as before.
         """
         self._state = state
         self._process_map = process_map
@@ -523,6 +529,11 @@ class JobPopper:
         self._staged_models_provider = (
             staged_models_provider if staged_models_provider is not None else (lambda: frozenset())
         )
+        self._quarantined_models_provider = (
+            quarantined_models_provider if quarantined_models_provider is not None else (lambda: frozenset())
+        )
+        # Latch for the edge-triggered warning about a quarantine exclusion that would have emptied the offer.
+        self._quarantine_offer_floor_held = False
         self._action_ledger = action_ledger
         # Duty-cycle state for residency-biased advertising, advanced once per built pop request. The
         # narrowing latch is the edge-log/ledger anchor (only offer-narrowing transitions are surfaced), and
@@ -806,6 +817,38 @@ class JobPopper:
             return models
         self._log_vram_pressure_narrowing_edge(narrowing=True, withheld_count=len(models) - len(narrowed))
         return narrowed
+
+    def _apply_quarantine_model_exclusion(self, models: set[str]) -> set[str]:
+        """Drop quarantined models from the offer, unless doing so would leave nothing to advertise.
+
+        A quarantined model kills the slot it is dispatched to, so every job the horde sends for it is
+        faulted. Continuing to advertise it therefore keeps the drop stream running until the horde force-sets
+        maintenance for "dropping too many jobs", which is the failure the quarantine exists to prevent; the
+        offer is where that loop is actually cut.
+
+        The exclusion never empties the offer. A worker whose only configured model is quarantined would
+        otherwise advertise nothing, be sent nothing, and never reach the work that could clear the
+        quarantine, so it keeps offering the model and takes the faults instead of going permanently silent.
+        """
+        quarantined = self._quarantined_models_provider()
+        if not quarantined:
+            self._quarantine_offer_floor_held = False
+            return models
+        remaining = models.difference(quarantined)
+        if not remaining:
+            if not self._quarantine_offer_floor_held:
+                self._quarantine_offer_floor_held = True
+                logger.warning(
+                    f"Every offered model is quarantined ({sorted(models & quarantined)}); still advertising "
+                    "them because a worker that offers nothing is sent nothing and can never recover. Their jobs "
+                    "will keep faulting until the quarantine clears or the configuration changes.",
+                )
+            return models
+        self._quarantine_offer_floor_held = False
+        withheld = models - remaining
+        if withheld:
+            logger.debug(f"Not popping quarantined models: {sorted(withheld)}")
+        return remaining
 
     def _log_vram_pressure_narrowing_edge(self, *, narrowing: bool, withheld_count: int) -> None:
         """Emit the edge-triggered engage/release line for the VRAM-pressure offer narrowing."""
@@ -1672,6 +1715,10 @@ class JobPopper:
         )
         if models is None:
             return
+
+        # Stop advertising a model the lifecycle manager has taken out of rotation, so the horde stops sending
+        # its jobs for the worker to fault. Floored so the offer never empties.
+        models = self._apply_quarantine_model_exclusion(models)
 
         # Tame pathological mixed very-large-model queues: withhold a switched-to or just-drained large model
         # from this offer so the worker is not whipsawed into repeated whole-card teardowns and multi-GB
