@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Unified diffs require a one-character context prefix on otherwise blank lines.
+requirements/jetpack5/*.patch whitespace=-blank-at-eol

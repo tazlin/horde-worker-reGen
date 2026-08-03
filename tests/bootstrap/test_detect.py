@@ -7,6 +7,12 @@ import pytest
 from worker_bootstrap import detect
 
 
+@pytest.fixture(autouse=True)
+def no_jetpack5_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep generic GPU tests independent of the host running the test suite."""
+    monkeypatch.setattr(detect, "_jetpack_major_release", lambda: None)
+
+
 @pytest.mark.parametrize(
     ("smi_output", "expected"),
     [
@@ -156,6 +162,18 @@ def test_describe_backend_selection_non_nvidia(monkeypatch: pytest.MonkeyPatch) 
     assert decision.amd_present is False
 
 
+def test_describe_backend_selection_prefers_jetpack5(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JetPack 5 is a separate legacy profile, not an old driver that should receive cu126."""
+    monkeypatch.setattr(detect, "_jetpack_major_release", lambda: 35)
+    monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
+
+    decision = detect.describe_backend_selection()
+
+    assert decision.final_token == detect.JETPACK5
+    assert decision.reason == "NVIDIA JetPack 5 (L4T R35) requires the legacy CUDA 11.4 runtime"
+    assert decision.nvidia_present is True
+
+
 @pytest.mark.parametrize(
     ("token", "compute_cap", "expected_token", "expected_action"),
     [
@@ -182,7 +200,10 @@ def test_describe_reconcile_records_clamp_action(
     assert decision.clamp_action == expected_action
 
 
-@pytest.mark.parametrize("token", [detect.CPU, detect.ROCM, detect.ROCM_WINDOWS, detect.AMD_UNSUPPORTED])
+@pytest.mark.parametrize(
+    "token",
+    [detect.CPU, detect.ROCM, detect.ROCM_WINDOWS, detect.AMD_UNSUPPORTED, detect.JETPACK5],
+)
 def test_reconcile_backend_leaves_non_cuda_tokens_untouched(
     monkeypatch: pytest.MonkeyPatch,
     token: str,

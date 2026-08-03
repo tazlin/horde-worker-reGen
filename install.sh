@@ -11,8 +11,11 @@
 # Options (environment variables, so they work with the curl | sh form):
 #   HORDE_WORKER_DIR         install location (default: ./horde-worker in the current directory)
 #   HORDE_WORKER_REPO        install from a fork (owner/repo; default Haidra-Org/horde-worker-reGen)
-#   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | rocm-windows | cpu
+#   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | rocm-windows | jetpack5 | cpu
 #                            (default: detected from the GPU/driver)
+#   HORDE_WORKER_JETPACK5_WHEELS
+#                            local directory containing the pinned NVIDIA aarch64 CUDA 11.4 wheels
+#                            required by the explicit JetPack 5 / L4T R35 compatibility profile
 #   HORDE_WORKER_FEATURES    optional feature extras to install: comma/space list of post-processing,
 #                            controlnet, or 'none' (default: all on NVIDIA/CPU, none on other backends)
 #   HORDE_WORKER_VERSION     install a specific release tag (e.g. v1.2.3) instead of the latest release

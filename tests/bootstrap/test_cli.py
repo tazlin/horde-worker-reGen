@@ -76,6 +76,61 @@ def test_sync_calls_uv_sync(env: tuple[Path, list]) -> None:
     assert calls == [("sync", "cu126")]
 
 
+def test_sync_routes_jetpack5_to_legacy_profile(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """JetPack 5 never enters the modern locked Torch sync."""
+    root, calls = env
+    legacy_calls: list[tuple[str, Path]] = []
+    monkeypatch.setattr(cli.detect, "describe_backend_selection", lambda: _decision("jetpack5"))
+
+    def sync_jetpack5(uv: str, *, root: Path) -> int:
+        legacy_calls.append((uv, root))
+        return 0
+
+    monkeypatch.setattr(cli.jetpack5, "sync_jetpack5", sync_jetpack5)
+
+    assert cli.main(["sync"]) == 0
+    assert len(legacy_calls) == 1
+    assert Path(legacy_calls[0][0]).name == "uv"
+    assert legacy_calls[0][1] == root
+    assert calls == []
+
+
+def test_launch_routes_jetpack5_to_legacy_runtime(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The standard launcher dispatches into the preserved legacy runtime after syncing it."""
+    root, calls = env
+    backend.write_backend_file(root / "bin" / "backend", "jetpack5")
+    legacy_calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(cli.jetpack5, "sync_jetpack5", lambda uv, *, root: 0)
+
+    def launch_jetpack5(*, root: Path, mode: str, rest: list[str]) -> int:
+        legacy_calls.append((mode, (root, rest)))
+        return 0
+
+    monkeypatch.setattr(cli.jetpack5, "launch_jetpack5", launch_jetpack5)
+
+    assert cli.main(["launch", "terminal", "--", "--foo"]) == 0
+    assert legacy_calls == [("terminal", (root, ["--foo"]))]
+    assert calls == []
+
+
+def test_preload_routes_jetpack5_to_legacy_runtime(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model preloading uses the legacy runtime's compatible dependencies and interpreter."""
+    root, calls = env
+    backend.write_backend_file(root / "bin" / "backend", "jetpack5")
+    legacy_calls: list[Path] = []
+    monkeypatch.setattr(cli.jetpack5, "sync_jetpack5", lambda uv, *, root: 0)
+
+    def preload_jetpack5(*, root: Path) -> int:
+        legacy_calls.append(root)
+        return 0
+
+    monkeypatch.setattr(cli.jetpack5, "preload_jetpack5", preload_jetpack5)
+
+    assert cli.main(["preload"]) == 0
+    assert legacy_calls == [root]
+    assert calls == []
+
+
 def test_sync_backend_flag_overrides(env: tuple[Path, list]) -> None:
     """`sync --backend cu130` forces that build."""
     _, calls = env

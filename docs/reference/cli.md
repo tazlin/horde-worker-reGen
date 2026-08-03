@@ -299,7 +299,8 @@ The same generator is available in the dashboard: the **Logs** tab has a **Suppo
 | Variable | Effect |
 |----------|--------|
 | `HORDE_WORKER_DIR` | Install location for the one-line installer. |
-| `HORDE_WORKER_BACKEND` | Force a PyTorch build: `cu126`, `cu130`, `cu132`, `rocm`, `rocm-windows`, or `cpu` (default: detected). |
+| `HORDE_WORKER_BACKEND` | Force a PyTorch build/profile: `cu126`, `cu130`, `cu132`, `rocm`, `rocm-windows`, `jetpack5`, or `cpu` (default: detected). |
+| `HORDE_WORKER_JETPACK5_WHEELS` | Directory containing the pinned NVIDIA CUDA 11.4 aarch64 wheel set used by the `jetpack5` profile (default: `$HOME/jetson`). |
 | `HORDE_WORKER_NO_SHORTCUTS` | Skip creating Desktop/Start Menu shortcuts. |
 | `HORDE_WORKER_NO_LAUNCH` | Skip auto-launching the dashboard after install. |
 | `HORDE_WORKER_ENABLE_LONG_PATHS` | Opt in to Windows system-wide long-path support (changes an HKLM setting; needs administrator). |

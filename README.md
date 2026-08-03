@@ -52,6 +52,7 @@ common first-run questions.
 | **Linux + NVIDIA GPU** | Supported | Full features. |
 | **Linux + AMD GPU** | Experimental | Uses ROCm (installed ad-hoc). Core features; opt into the rest. See [Run on AMD ROCm](docs/how-to/run-on-amd-rocm.md). |
 | **Linux + Intel Arc / XPU** | Experimental | Core features. Install the XPU torch wheel ad-hoc (see [Compute backends](docs/explanation/compute_backends.md)). |
+| **NVIDIA JetPack 5 / L4T R35** | Legacy | Explicit `jetpack5` profile using Python 3.10 and local NVIDIA CUDA 11.4 aarch64 wheels. See [Compute backends](docs/explanation/compute_backends.md). |
 | **Apple Silicon (macOS / MPS)** | Experimental | Core features on the default macOS PyTorch wheel; much slower than a discrete GPU. |
 | **Windows + AMD GPU** | Experimental | Supported for the Radeon/Ryzen AI devices in AMD's ROCm Windows compatibility matrix. See [Run on AMD ROCm](docs/how-to/run-on-amd-rocm.md). |
 | **Windows + Intel GPU** | Not straightforward | DirectML is temporarily unavailable, so the realistic route is Linux. |

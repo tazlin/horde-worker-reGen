@@ -2,8 +2,9 @@
 
 Ported from ``packaging/detect-backend.ps1`` and the ``install.sh`` detection block so a single
 standard-library implementation backs every install channel and platform. ``detect_backend`` returns a
-build token that the locked uv extras (``cu126``/``cu130``/``cu132``/``cpu``) or an ad-hoc ROCm path
-consume. For NVIDIA it selects the newest CUDA build the driver's reported max CUDA version can run
+build token that the locked uv extras (``cu126``/``cu130``/``cu132``/``cpu``), an ad-hoc ROCm path, or
+the isolated JetPack 5 legacy profile consume. L4T R35 selects ``jetpack5`` before generic NVIDIA probing.
+For desktop/server NVIDIA it selects the newest CUDA build the driver's reported max CUDA version can run
 (13.2+ -> ``cu132``, 13.0/13.1 -> ``cu130``, anything older or unreadable -> the safe ``cu126``), then
 applies an architecture floor: a GPU whose compute capability exceeds what the ``cu126`` wheel carries
 kernels for (Hopper sm_90) gets at least ``cu130`` even on an older driver, because ``cu126`` has no
@@ -24,6 +25,7 @@ from pathlib import Path
 CU126 = "cu126"
 CU130 = "cu130"
 CU132 = "cu132"
+JETPACK5 = "jetpack5"
 AMD_UNSUPPORTED = "amd-unsupported"
 ROCM = "rocm"
 ROCM_WINDOWS = "rocm-windows"
@@ -34,6 +36,8 @@ CPU = "cpu"
 
 _CUDA_VERSION_RE = re.compile(r"CUDA Version:\s*(\d+)\.(\d+)")
 _COMPUTE_CAP_RE = re.compile(r"(\d+)\.(\d+)")
+_L4T_MAJOR_RE = re.compile(r"^#\s*R(\d+)\b")
+_L4T_RELEASE_PATH = Path("/etc/nv_tegra_release")
 # The locked wheels cover overlapping but different architecture windows (verified against PyTorch's
 # CUDA build matrix and the NVIDIA CUDA 13 release notes):
 #   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
@@ -50,6 +54,23 @@ _DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11c
 def _is_windows() -> bool:
     """Return True when running on Windows."""
     return os.name == "nt"
+
+
+def _jetpack_major_release() -> int | None:
+    """Return NVIDIA's L4T major release on Linux aarch64, or None elsewhere.
+
+    JetPack 5 is L4T R35 and needs an explicit legacy runtime. It must be recognized before generic NVIDIA
+    detection: Jetson commonly has no ``nvidia-smi``, and treating its CUDA 11.4 driver as an unreadable
+    desktop driver would incorrectly select the modern cu126 lock.
+    """
+    if _is_windows() or os.uname().machine not in ("aarch64", "arm64"):
+        return None
+    try:
+        release = _L4T_RELEASE_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _L4T_MAJOR_RE.search(release.strip())
+    return int(match.group(1)) if match else None
 
 
 def _nvidia_smi_path() -> str | None:
@@ -437,6 +458,13 @@ def describe_backend_selection() -> BackendDecision:
     so the install path can persist the hardware signals and the reasoning behind the pick (the breadcrumb
     a support bundle reads to diagnose a wrong-build install).
     """
+    if _jetpack_major_release() == 35:
+        return BackendDecision(
+            stage="detect",
+            final_token=JETPACK5,
+            nvidia_present=True,
+            reason="NVIDIA JetPack 5 (L4T R35) requires the legacy CUDA 11.4 runtime",
+        )
     if _nvidia_present():
         smi = _nvidia_smi_path()
         driver = _nvidia_cuda_version()
@@ -493,7 +521,8 @@ def detect_backend() -> str:
     """Return the torch build token for this machine.
 
     Returns:
-        ``cu132``/``cu130``/``cu126`` (NVIDIA: the newest build the driver's max CUDA version supports,
+        ``jetpack5`` (NVIDIA JetPack 5 / L4T R35), ``cu132``/``cu130``/``cu126`` (desktop/server NVIDIA:
+        the newest build the driver's max CUDA version supports,
         clamped to the GPU's valid architecture window, see :func:`_cuda_build`), ``rocm`` (AMD with a
         ROCm runtime on Linux), ``rocm-windows`` for
         supported AMD Windows Radeon/Ryzen AI devices, ``amd-unsupported`` for an AMD card with no known

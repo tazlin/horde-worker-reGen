@@ -1,5 +1,30 @@
 # Compute backends (NVIDIA, ROCm, XPU, MPS, CPU)
 
+## JetPack 5 / CUDA 11.4 legacy profile
+
+JetPack 5 (L4T R35) is detected as the explicit `jetpack5` backend. It is
+not treated as a desktop NVIDIA driver and it does not use the modern
+`cu126` lock. The current worker requires Python 3.12 and newer Torch;
+PyPI's `cu118` index also does not provide a compatible aarch64 stack for
+this platform. The bootstrap therefore keeps the current installer as a
+control plane and provisions a pinned v9.0.7 worker runtime in the preserved
+data directory with Python 3.10 and NVIDIA's JetPack CUDA 11.4 wheels.
+
+Place the tested wheel set in `$HOME/jetson`, or set
+`HORDE_WORKER_JETPACK5_WHEELS` to another directory:
+
+- `torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl`
+- `torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl`
+- `torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl`
+- one `xformers-0.0.23+e1b36f7.d*-cp310-cp310-linux_aarch64.whl`
+
+The xFormers wheel must be compiled on JetPack 5 for compute capability 7.2.
+The compatibility runtime includes `build-xformers-jetson-jp5.sh`; it forces
+one build worker and CUDA 11.4. To force this profile on an L4T R35 host, set
+`HORDE_WORKER_BACKEND=jetpack5`. It refuses to run on another OS,
+architecture, or L4T major rather than installing a wheel set that cannot
+execute there.
+
 The worker runs on `hordelib`, which wraps ComfyUI, and **ComfyUI's `model_management` is already
 backend-agnostic**: it detects and drives NVIDIA (CUDA), AMD (ROCm), Intel (XPU), Apple Silicon
 (MPS), Ascend/NPU, Cambricon/MLU, DirectML and CPU, and exposes safe wrappers (`get_torch_device`,

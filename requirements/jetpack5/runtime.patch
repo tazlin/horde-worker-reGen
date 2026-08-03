@@ -1,0 +1,306 @@
+diff --git a/build-xformers-jetson-jp5.sh b/build-xformers-jetson-jp5.sh
+new file mode 100755
+index 00000000..1b115c8c
+--- /dev/null
++++ b/build-xformers-jetson-jp5.sh
+@@ -0,0 +1,56 @@
++#!/bin/sh
++set -eu
++
++build_root=${XFORMERS_BUILD_ROOT:-/mnt/xavier-ssd/build}
++source_dir=$build_root/xformers-e1b36f7
++wheel_dir=${JETSON_WHEEL_DIR:-${HOME}/jetson}
++wheel_torch=$wheel_dir/torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl
++python_bin=${PYTHON_BIN:-${HOME}/.pyenv/versions/3.10.20/bin/python}
++venv_dir=${XFORMERS_BUILD_VENV:-$build_root/xformers-build-venv}
++
++if [ ! -f "$wheel_torch" ]; then
++	printf 'Required Jetson PyTorch wheel not found: %s\n' "$wheel_torch" >&2
++	exit 1
++fi
++if [ -e "$source_dir" ]; then
++	printf 'Refusing to overwrite existing build directory: %s\n' "$source_dir" >&2
++	exit 1
++fi
++
++"$python_bin" -m venv "$venv_dir"
++python=$venv_dir/bin/python
++"$python" -m pip install --upgrade pip "setuptools==80.9.0" wheel ninja numpy==1.26.4
++"$python" -m pip install --no-deps "$wheel_torch"
++
++git clone --recursive https://github.com/facebookresearch/xformers.git "$source_dir"
++git -C "$source_dir" checkout --detach e1b36f781ba1c9d10f36fc0ec87170e0b381fdad
++git -C "$source_dir" submodule update --init --recursive
++
++python3 - "$source_dir/setup.py" <<'PY'
++from pathlib import Path
++import sys
++
++path = Path(sys.argv[1])
++text = path.read_text()
++old = '                "--threads",\n                "4",\n'
++new = '                "--threads",\n                "1",\n'
++if old not in text:
++    raise SystemExit("xFormers NVCC thread block was not found")
++path.write_text(text.replace(old, new, 1))
++PY
++
++mkdir -p "$wheel_dir"
++cd "$source_dir"
++export CUDA_HOME=/usr/local/cuda-11.4
++export PATH="$CUDA_HOME/bin:$PATH"
++export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++export TORCH_CUDA_ARCH_LIST=7.2
++export XFORMERS_DISABLE_FLASH_ATTN=1
++export XFORMERS_BUILD_TYPE=Release
++export FORCE_CUDA=1
++export MAX_JOBS=1
++export CMAKE_BUILD_PARALLEL_LEVEL=1
++export NVCC_THREADS=1
++export NINJAFLAGS=-j1
++
++"$python" setup.py bdist_wheel --dist-dir "$wheel_dir"
+diff --git a/horde_worker_regen/bridge_data/data_model.py b/horde_worker_regen/bridge_data/data_model.py
+index fc26e0ee..de584a62 100644
+--- a/horde_worker_regen/bridge_data/data_model.py
++++ b/horde_worker_regen/bridge_data/data_model.py
+@@ -235,6 +235,16 @@ class reGenBridgeData(CombinedHordeBridgeData):
+     def load_env_vars(self) -> None:
+         """Load the environment variables into the config model."""
+         # See load_env_vars.py's `def load_env_vars(self) -> None:`
++        api_key = os.getenv("AIWORKER_API_KEY")
++        if api_key:
++            self.api_key = type(self).model_validate({"api_key": api_key}).api_key
++
++        civitai_api_token = os.getenv("AIWORKER_CIVITAI_API_TOKEN")
++        if civitai_api_token:
++            self.CIVIT_API_TOKEN = civitai_api_token
++            if os.getenv("CIVIT_API_TOKEN") is None:
++                os.environ["CIVIT_API_TOKEN"] = civitai_api_token
++
+         if self.models_folder_parent and os.getenv("AIWORKER_CACHE_HOME") is None:
+             os.environ["AIWORKER_CACHE_HOME"] = self.models_folder_parent
+         if self.horde_url:
+diff --git a/horde_worker_regen/process_management/process_manager.py b/horde_worker_regen/process_management/process_manager.py
+index 63022950..4d3cb73e 100644
+--- a/horde_worker_regen/process_management/process_manager.py
++++ b/horde_worker_regen/process_management/process_manager.py
+@@ -219,7 +219,10 @@ class HordeProcessInfo:
+         """Return true if the process is alive."""
+         if not self.mp_process.is_alive():
+             return False
+-        return not (self.last_process_state == HordeProcessState.PROCESS_ENDING or HordeProcessState.PROCESS_ENDED)
++        return self.last_process_state not in (
++            HordeProcessState.PROCESS_ENDING,
++            HordeProcessState.PROCESS_ENDED,
++        )
+ 
+     def safe_send_message(self, message: HordeControlMessage) -> bool:
+         """Send a message to the process.
+@@ -234,7 +237,14 @@ class HordeProcessInfo:
+             self.pipe_connection.send(message)
+             return True
+         except Exception as e:
+-            logger.error(f"Failed to send message to process {self.process_id}: {e}")
++            pipe_expected_to_close = (
++                self.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
++                or not self.mp_process.is_alive()
++            )
++            if pipe_expected_to_close and isinstance(e, (BrokenPipeError, EOFError, OSError)):
++                logger.debug(f"Process {self.process_id} control channel already closed: {e}")
++            else:
++                logger.error(f"Failed to send message to process {self.process_id}: {e}")
+             return False
+ 
+     def __repr__(self) -> str:
+diff --git a/install-jetson-jp5.sh b/install-jetson-jp5.sh
+new file mode 100755
+index 00000000..4ea7aa9d
+--- /dev/null
++++ b/install-jetson-jp5.sh
+@@ -0,0 +1,74 @@
++#!/bin/sh
++set -eu
++
++script_dir=$(
++	CDPATH=
++	cd -P "$(dirname "$0")"
++	pwd
++)
++python_bin=${PYTHON_BIN:-${HOME}/.pyenv/versions/3.10.20/bin/python}
++wheel_dir=${JETSON_WHEEL_DIR:-${HOME}/jetson}
++venv_dir=$script_dir/.venv
++
++if [ "${XFORMERS_WHEEL+x}" = x ]; then
++	xformers_wheel=$XFORMERS_WHEEL
++else
++	set -- "$wheel_dir"/xformers-0.0.23+e1b36f7.d*-cp310-cp310-linux_aarch64.whl
++	if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
++		printf 'Expected exactly one Xavier xFormers wheel in %s\n' "$wheel_dir" >&2
++		exit 1
++	fi
++	xformers_wheel=$1
++fi
++
++export CMAKE_BUILD_PARALLEL_LEVEL=1
++export MAKEFLAGS=-j1
++export MAX_JOBS=1
++export NINJAFLAGS=-j1
++export OMP_NUM_THREADS=1
++
++for wheel in \
++	"$wheel_dir/torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl" \
++	"$wheel_dir/torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl" \
++	"$wheel_dir/torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl" \
++	"$xformers_wheel"; do
++	if [ ! -f "$wheel" ]; then
++		printf 'Required Jetson wheel not found: %s\n' "$wheel" >&2
++		exit 1
++	fi
++done
++
++"$python_bin" -m venv "$venv_dir"
++python=$venv_dir/bin/python
++
++"$python" -m pip install --upgrade pip "setuptools==80.9.0" wheel
++"$python" -m pip install --no-deps \
++	"$wheel_dir/torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl" \
++	"$wheel_dir/torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl" \
++	"$wheel_dir/torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl"
++"$python" -m pip install -r "$script_dir/requirements.txt"
++"$python" -m pip install -r "$script_dir/requirements.jetson-engine.txt"
++"$python" -m pip install --no-deps horde-engine==2.15.3
++"$python" -m pip install --no-deps "$xformers_wheel"
++"$python" -m pip install --no-deps -e "$script_dir"
++
++"$python" - <<'PY'
++import importlib.metadata as metadata
++
++import torch
++import xformers
++
++assert torch.__version__ == "2.1.0a0+git7bcf7da", torch.__version__
++assert torch.version.cuda == "11.4", torch.version.cuda
++assert torch.cuda.is_available(), "PyTorch cannot access Xavier's CUDA device"
++assert torch.cuda.get_device_capability(0) == (7, 2)
++assert xformers._has_cpp_library, "xFormers CUDA extension is unavailable"
++assert metadata.version("horde-worker-regen") == "9.0.7"
++assert metadata.version("horde-engine") == "2.15.3"
++print("torch", torch.__version__)
++print("cuda", torch.version.cuda)
++print("device", torch.cuda.get_device_name(0))
++print("xformers", metadata.version("xformers"))
++print("worker", metadata.version("horde-worker-regen"))
++print("engine", metadata.version("horde-engine"))
++PY
+diff --git a/requirements.jetson-engine.txt b/requirements.jetson-engine.txt
+new file mode 100644
+index 00000000..3ed8a2e5
+--- /dev/null
++++ b/requirements.jetson-engine.txt
+@@ -0,0 +1,37 @@
++torchvision==0.16.0+fbb4cc5
++torchdiffeq
++torchsde
++einops
++open-clip-torch
++transformers==4.44.2
++tokenizers==0.19.1
++sentencepiece
++safetensors>=0.4.2
++pytorch-lightning==2.0.9
++pynvml
++aiohttp
++accelerate
++pyyaml
++pillow
++GitPython
++clip-anytorch
++diffusers==0.29.2
++omegaconf
++psutil
++distro
++rembg
++opencv-python<5
++opencv-contrib-python<5
++timm==0.9.16
++scipy
++addict
++fairscale
++scikit-image
++mediapipe==0.10.18
++unidecode
++fuzzywuzzy
++kornia
++qrcode==7.4.2
++spandrel
++spandrel-extra-arches
++lpips
+diff --git a/requirements.txt b/requirements.txt
+index afd6eb0b..17ac9443 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,10 +1,11 @@
+ numpy==1.26.4
+-torch==2.3.1
++torch==2.1.0a0+git7bcf7da
+ 
+ horde_sdk~=0.14.11
+ horde_safety~=0.2.3
+-horde_engine~=2.15.3
+-horde_model_reference>=0.9.0
++# install-jetson-jp5.sh installs horde-engine without dependency resolution so
++# pip does not replace NVIDIA's JetPack 5 PyTorch wheel.
++horde_model_reference==0.10.0
+ 
+ python-dotenv
+ ruamel.yaml
+@@ -12,10 +13,11 @@ semver
+ 
+ python-Levenshtein
+ 
+-pydantic>=2.9.2
++pydantic==2.9.2
+ typing_extensions
+ requests
+ StrEnum
+ loguru
++onnxruntime==1.17.3
+ 
+ babel
+diff --git a/start-jetson-jp5.sh b/start-jetson-jp5.sh
+new file mode 100755
+index 00000000..bc01b4c2
+--- /dev/null
++++ b/start-jetson-jp5.sh
+@@ -0,0 +1,30 @@
++#!/bin/sh
++set -eu
++
++script_dir=$(
++	CDPATH=
++	cd -P "$(dirname "$0")"
++	pwd
++)
++cd "$script_dir"
++
++if [ -f "$script_dir/.env" ]; then
++	set -a
++	# shellcheck disable=SC1090,SC1091
++	. "$script_dir/.env"
++	set +a
++fi
++
++export CUDA_VISIBLE_DEVICES=0
++configured_cpus=$(getconf _NPROCESSORS_CONF)
++compute_threads=$((configured_cpus / 2))
++if [ "$compute_threads" -lt 1 ]; then
++	compute_threads=1
++fi
++export OMP_NUM_THREADS=$compute_threads
++export OPENBLAS_NUM_THREADS=$compute_threads
++export NUMEXPR_NUM_THREADS=$compute_threads
++export LD_PRELOAD="/lib/aarch64-linux-gnu/libGLdispatch.so.0${LD_PRELOAD:+:$LD_PRELOAD}"
++
++"$script_dir/.venv/bin/python" -s "$script_dir/download_models.py"
++exec "$script_dir/.venv/bin/python" -s "$script_dir/run_worker.py" "$@"

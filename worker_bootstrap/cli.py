@@ -17,6 +17,7 @@ from worker_bootstrap import (
     consent,
     detect,
     gitbin,
+    jetpack5,
     paths,
     runner,
     sync_plan,
@@ -445,6 +446,9 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
         print(git_resolution.message, file=sys.stderr)
         return 1
 
+    if token == detect.JETPACK5:
+        return jetpack5.sync_jetpack5(uv, root=root)
+
     config_seed.seed_config(
         template=paths.template_config(root),
         target=paths.bridge_config(root),
@@ -733,6 +737,17 @@ def _maybe_offer_update(root: Path) -> None:
 def _cmd_launch(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Start the worker in the requested mode, syncing first if the venv is missing or stale."""
     _maybe_offer_update(root)
+    token = backend_mod.resolve_backend(
+        cli_flag=args.backend,
+        env_value=os.environ.get(_BACKEND_ENV),
+        file_value=backend_mod.read_backend_file(paths.backend_file(root)),
+        detected=_detected_backend(root),
+    )
+    if token == detect.JETPACK5:
+        rc = _sync(uv, root, cli_flag=token, options=_sync_options(args))
+        if rc != 0:
+            return rc
+        return jetpack5.launch_jetpack5(root=root, mode=args.mode, rest=list(args.rest))
     rc = _ensure_synced(uv, root, cli_flag=args.backend, options=_sync_options(args))
     if rc != 0:
         return rc
@@ -746,6 +761,16 @@ def _cmd_launch(args: argparse.Namespace, root: Path, uv: str) -> int:
 
 def _cmd_preload(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Download/verify models, then exit."""
+    token = backend_mod.resolve_backend(
+        env_value=os.environ.get(_BACKEND_ENV),
+        file_value=backend_mod.read_backend_file(paths.backend_file(root)),
+        detected=_detected_backend(root),
+    )
+    if token == detect.JETPACK5:
+        rc = _sync(uv, root, cli_flag=token, options=_sync_options(args))
+        if rc != 0:
+            return rc
+        return jetpack5.preload_jetpack5(root=root)
     rc = _ensure_synced(uv, root, cli_flag=None, options=_sync_options(args))
     if rc != 0:
         return rc
@@ -871,6 +896,8 @@ def _cmd_install(args: argparse.Namespace, root: Path, uv: str) -> int:
     rc = _sync(uv, root, cli_flag=token, options=_sync_options(args))
     if rc != 0 or args.no_launch:
         return rc
+    if token == detect.JETPACK5:
+        return jetpack5.launch_jetpack5(root=root, mode="bridge", rest=[])
     return runner.uv_run(uv, _LAUNCH_COMMANDS["web"], root=root)
 
 
@@ -884,13 +911,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "--backend",
             default=None,
             help=(
-                "Force a torch build (cu126/cu130/cu132/cpu/rocm/rocm-windows) instead of "
+                "Force a torch build (cu126/cu130/cu132/cpu/rocm/rocm-windows/jetpack5) instead of "
                 "detecting/reading bin/backend."
             ),
         )
         # Convenience shortcuts kept for back-compat with the old update-runtime.cmd/sh flag interface
         # (e.g. `update-runtime.cmd --cu126`); each is just `--backend <build>`.
-        for build in ("cu126", "cu130", "cu132", "cpu", "rocm", "rocm-windows"):
+        for build in ("cu126", "cu130", "cu132", "cpu", "rocm", "rocm-windows", "jetpack5"):
             target.add_argument(
                 f"--{build}",
                 dest="backend",

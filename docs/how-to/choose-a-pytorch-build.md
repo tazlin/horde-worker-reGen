@@ -113,6 +113,11 @@ HORDE_WORKER_BACKEND=cpu   ./update-runtime.sh   # no GPU
 HORDE_WORKER_BACKEND=rocm  ./update-runtime.sh   # Linux ROCm runtime detected/installed
 ```
 
+JetPack 5 / L4T R35 is different from a desktop CUDA driver and should not be
+forced to `cu126` or `cu118`. It is detected as `jetpack5` and uses the pinned
+Python 3.10 / CUDA 11.4 compatibility runtime documented in
+[Compute backends](../explanation/compute_backends.md#jetpack-5--cuda-114-legacy-profile).
+
 torch 2.12.0 has no `cu128` wheel, so a CUDA 12.x driver uses `cu126` (a legacy `cu128` request is
 remapped to `cu126` automatically). The full list of build extras is in `pyproject.toml`.
 
