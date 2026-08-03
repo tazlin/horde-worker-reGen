@@ -8,7 +8,9 @@ not treated as a desktop NVIDIA driver and it does not use the modern
 PyPI's `cu118` index also does not provide a compatible aarch64 stack for
 this platform. The bootstrap therefore keeps the current installer as a
 control plane and provisions a pinned v9.0.7 worker runtime in the preserved
-data directory with Python 3.10 and NVIDIA's JetPack CUDA 11.4 wheels.
+data directory with Python 3.10.20 and NVIDIA's JetPack CUDA 11.4 wheels.
+The historical source archive follows the installer's recorded repository
+origin, while its content is checked against the pinned archive hash.
 
 Place the tested wheel set in `$HOME/jetson`, or set
 `HORDE_WORKER_JETPACK5_WHEELS` to another directory:
@@ -17,10 +19,13 @@ Place the tested wheel set in `$HOME/jetson`, or set
 - `torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl`
 - `torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl`
 - one `xformers-0.0.23+e1b36f7.d*-cp310-cp310-linux_aarch64.whl`
+- the matching xFormers `<wheel>.sha256` sidecar
 
-The xFormers wheel must be compiled on JetPack 5 for compute capability 7.2.
-The compatibility runtime includes `build-xformers-jetson-jp5.sh`; it forces
-one build worker and CUDA 11.4. To force this profile on an L4T R35 host, set
+The three NVIDIA wheel hashes are pinned. The xFormers wheel must be compiled
+on JetPack 5 for compute capability 7.2, and its build script writes the
+required checksum sidecar. The compatibility runtime includes
+`build-xformers-jetson-jp5.sh`; it forces one build worker and CUDA 11.4. To
+force this profile on an L4T R35 host, set
 `HORDE_WORKER_BACKEND=jetpack5`. It refuses to run on another OS,
 architecture, or L4T major rather than installing a wheel set that cannot
 execute there.

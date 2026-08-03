@@ -20,16 +20,21 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from worker_bootstrap import paths
+from worker_bootstrap import paths, updater
 
 LEGACY_COMMIT = "da894e8b63d22fe3ca7fbbafb0280f69134a60e5"
-LEGACY_ARCHIVE_URL = f"https://github.com/Haidra-Org/horde-worker-reGen/archive/{LEGACY_COMMIT}.tar.gz"
 LEGACY_ARCHIVE_SHA256 = "2dcb22bd7a351eda0d9cdcb756396c2817f194ac07b721d4a5e07b97e1bbe696"
+PYTHON_VERSION = "3.10.20"
 REQUIRED_WHEEL_NAMES: tuple[str, ...] = (
     "torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl",
     "torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl",
     "torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl",
 )
+REQUIRED_WHEEL_SHA256: dict[str, str] = {
+    REQUIRED_WHEEL_NAMES[0]: "1079d7eaf5e6be486a534bc1546ce355e53fa63494eab9bb72611ca48d3f9cdf",
+    REQUIRED_WHEEL_NAMES[1]: "0ddb4140f0827ec89349a61d47c0d6c5319c469686da501c6113b48c3faba3b1",
+    REQUIRED_WHEEL_NAMES[2]: "00204769e28772eb12bb53a3cc33b61e8d1c7be640c44edfd23b587dff4f3566",
+}
 _XFORMERS_GLOB = "xformers-0.0.23+e1b36f7.d*-cp310-cp310-linux_aarch64.whl"
 _L4T_RELEASE = Path("/etc/nv_tegra_release")
 _L4T_MAJOR_RE = re.compile(r"^#\s*R(\d+)\b")
@@ -79,8 +84,33 @@ def wheel_dir() -> Path:
     return Path(os.environ.get("HORDE_WORKER_JETPACK5_WHEELS", str(Path.home() / "jetson"))).expanduser()
 
 
-def resolve_wheels(directory: Path) -> tuple[Path, Path, Path, Path]:
-    """Resolve the exact tested CUDA 11.4 wheel set, rejecting ambiguous xFormers builds."""
+def _verify_checksum(path: Path, expected: str) -> None:
+    actual = _sha256(path)
+    if actual != expected.lower():
+        raise JetPack5Error(f"JetPack 5 wheel checksum mismatch for {path.name}: expected {expected}, got {actual}.")
+
+
+def _xformers_checksum(wheel: Path) -> str:
+    checksum_file = wheel.with_suffix(f"{wheel.suffix}.sha256")
+    try:
+        checksum = checksum_file.read_text(encoding="ascii").split()[0].lower()
+    except (OSError, IndexError) as error:
+        raise JetPack5Error(
+            f"Missing or invalid xFormers checksum sidecar: {checksum_file}. "
+            "Rebuild the wheel with build-xformers-jetson-jp5.sh."
+        ) from error
+    if re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+        raise JetPack5Error(f"Invalid SHA256 value in xFormers checksum sidecar: {checksum_file}")
+    return checksum
+
+
+def resolve_wheels(
+    directory: Path,
+    *,
+    required_hashes: dict[str, str] | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    """Resolve and verify the exact tested CUDA 11.4 wheel set."""
+    hashes = REQUIRED_WHEEL_SHA256 if required_hashes is None else required_hashes
     required = tuple(directory / name for name in REQUIRED_WHEEL_NAMES)
     for wheel in required:
         if not wheel.is_file():
@@ -89,12 +119,17 @@ def resolve_wheels(directory: Path) -> tuple[Path, Path, Path, Path]:
                 "for NVIDIA's aarch64 JetPack CUDA 11.4 builds. Set HORDE_WORKER_JETPACK5_WHEELS to the "
                 "directory containing the tested wheel set."
             )
+        expected = hashes.get(wheel.name)
+        if expected is None:
+            raise JetPack5Error(f"No pinned checksum is configured for required JetPack 5 wheel: {wheel.name}")
+        _verify_checksum(wheel, expected)
     xformers = sorted(directory.glob(_XFORMERS_GLOB))
     if len(xformers) != 1:
         raise JetPack5Error(
             f"Expected exactly one {_XFORMERS_GLOB} wheel in {directory}, found {len(xformers)}. "
             "Build it with build-xformers-jetson-jp5.sh on the Jetson, using one compiler worker."
         )
+    _verify_checksum(xformers[0], _xformers_checksum(xformers[0]))
     return required[0], required[1], required[2], xformers[0]
 
 
@@ -136,8 +171,16 @@ def _safe_extract(archive: Path, destination: Path) -> Path:
     return roots[0]
 
 
-def _download_archive(destination: Path) -> None:
-    url = os.environ.get("HORDE_WORKER_JETPACK5_SOURCE_URL", LEGACY_ARCHIVE_URL)
+def _source_archive_url(root: Path) -> str:
+    override = os.environ.get("HORDE_WORKER_JETPACK5_SOURCE_URL", "").strip()
+    if override:
+        return override
+    repo = updater.resolve_update_repo(root)
+    return f"https://github.com/{repo}/archive/{LEGACY_COMMIT}.tar.gz"
+
+
+def _download_archive(destination: Path, root: Path) -> None:
+    url = _source_archive_url(root)
     expected = os.environ.get("HORDE_WORKER_JETPACK5_SOURCE_SHA256", LEGACY_ARCHIVE_SHA256)
     print(f"Downloading the pinned JetPack 5 worker runtime ({LEGACY_COMMIT[:12]})...", flush=True)
     try:
@@ -176,7 +219,7 @@ def _materialize_runtime(root: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix="jetpack5-", dir=destination.parent) as temporary:
         temp = Path(temporary)
         archive = temp / "legacy-runtime.tar.gz"
-        _download_archive(archive)
+        _download_archive(archive, root)
         extracted = _safe_extract(archive, temp / "source")
         result = subprocess.run(
             [git, "apply", "--whitespace=nowarn", str(_patch_file(root))],
@@ -194,11 +237,11 @@ def _validate_python310(python: Path) -> Path:
     if not python.is_file():
         raise JetPack5Error(f"Python 3.10 executable not found: {python}")
     result = subprocess.run(
-        [str(python), "-c", "import sys; raise SystemExit(sys.version_info[:2] != (3, 10))"],
+        [str(python), "-c", "import sys; raise SystemExit(sys.version_info[:3] != (3, 10, 20))"],
         check=False,
     )
     if result.returncode != 0:
-        raise JetPack5Error(f"JetPack 5 requires Python 3.10, but {python} is a different version.")
+        raise JetPack5Error(f"JetPack 5 requires Python {PYTHON_VERSION}, but {python} is a different version.")
     return python
 
 
@@ -208,25 +251,25 @@ def _python310(uv: str, root: Path) -> Path:
         return _validate_python310(Path(override).expanduser())
     if found := shutil.which("python3.10"):
         return _validate_python310(Path(found))
-    pyenv = Path.home() / ".pyenv" / "versions" / "3.10.20" / "bin" / "python"
+    pyenv = Path.home() / ".pyenv" / "versions" / PYTHON_VERSION / "bin" / "python"
     if pyenv.is_file():
         return _validate_python310(pyenv)
 
-    print("Installing a managed Python 3.10 for the JetPack 5 runtime...", flush=True)
-    install = subprocess.run([uv, "python", "install", "3.10"], cwd=root, check=False)
+    print(f"Installing managed Python {PYTHON_VERSION} for the JetPack 5 runtime...", flush=True)
+    install = subprocess.run([uv, "python", "install", PYTHON_VERSION], cwd=root, check=False)
     if install.returncode != 0:
         raise JetPack5Error(
-            "Could not provision Python 3.10. Set HORDE_WORKER_JETPACK5_PYTHON to a working Python 3.10 executable."
+            f"Could not provision Python {PYTHON_VERSION}. Set HORDE_WORKER_JETPACK5_PYTHON to that exact version."
         )
     located = subprocess.run(
-        [uv, "python", "find", "3.10"],
+        [uv, "python", "find", PYTHON_VERSION],
         cwd=root,
         check=False,
         capture_output=True,
         text=True,
     )
     if located.returncode != 0 or not located.stdout.strip():
-        raise JetPack5Error("uv installed Python 3.10 but could not locate its executable.")
+        raise JetPack5Error(f"uv installed Python {PYTHON_VERSION} but could not locate its executable.")
     return _validate_python310(Path(located.stdout.strip().splitlines()[-1]))
 
 

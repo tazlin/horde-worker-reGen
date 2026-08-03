@@ -60,6 +60,12 @@ index 00000000..1b115c8c
 +export NINJAFLAGS=-j1
 +
 +"$python" setup.py bdist_wheel --dist-dir "$wheel_dir"
++set -- "$wheel_dir"/xformers-0.0.23+e1b36f7.d*-cp310-cp310-linux_aarch64.whl
++if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
++	printf 'Expected exactly one built Xavier xFormers wheel in %s\n' "$wheel_dir" >&2
++	exit 1
++fi
++sha256sum "$1" >"$1.sha256"
 diff --git a/horde_worker_regen/bridge_data/data_model.py b/horde_worker_regen/bridge_data/data_model.py
 index fc26e0ee..de584a62 100644
 --- a/horde_worker_regen/bridge_data/data_model.py
