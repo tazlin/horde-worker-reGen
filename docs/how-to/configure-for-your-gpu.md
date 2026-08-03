@@ -1,6 +1,6 @@
 # Configure the worker for your GPU
 
-The worker is configured through `bridgeData.yaml`. If you used the dashboard wizard, this file was
+The worker is configured through `bridgeData.yaml`. If you used the dashboard's Getting started page, this file was
 created for you and you can tune it later from the **Config** tab or in any text editor. This page
 gives sensible starting points by GPU class and explains the hardware that matters.
 

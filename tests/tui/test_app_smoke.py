@@ -21,7 +21,6 @@ from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.health import WorkerPhase, derive
 from horde_worker_regen.tui.widgets.overview import OverviewView
-from horde_worker_regen.tui.wizard import WizardOutcome
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 from tests.tui._fake_supervisor import FakeSupervisor
 
@@ -328,26 +327,19 @@ async def test_downloads_tab_label_badges_active_download(tmp_path: Path) -> Non
         assert tabs.get_tab("tab-downloads").label_text == "Downloads"
 
 
-async def test_wizard_start_focuses_downloads_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Choosing 'Start' in the wizard surfaces the Downloads tab so first-run downloads are visible (P1.2)."""
+async def test_saved_setup_is_recorded_as_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A save from Getting started marks setup done, so the worker is never sent back to it."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "bridgeData.yaml").write_text("api_key: real-key\ndreamer_name: MyWorker\n", encoding="utf-8")
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="FocusTest"), mode=WorkerProcessMode.FAKE)
-    started = False
-
-    def _record_start() -> None:
-        nonlocal started
-        started = True
-
-    monkeypatch.setattr(supervisor, "start", _record_start)
     app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        app._on_wizard_outcome(WizardOutcome.START)
+        assert store.load().setup_complete is False
+        app._on_getting_started_closed(True)
         await pilot.pause()
-        assert app.query_one("#main-tabs", TabbedContent).active == "tab-downloads"
-        assert started is True
+        assert store.load().setup_complete is True
 
 
 async def test_tick_clears_optimistic_maintenance_after_successful_pop(

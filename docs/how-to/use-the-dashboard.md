@@ -41,19 +41,39 @@ To try the whole interface without a GPU, models, or an API key, run a synthetic
 horde-worker --process-mode fake
 ```
 
-## First run: the setup wizard
+## First run: Getting started
 
 The first time you start a real worker whose `bridgeData.yaml` is not yet filled in, the dashboard
-opens a guided setup wizard. It collects your API key and worker name, lets you pick which models to
-serve, and offers to run a benchmark to tune your settings. When you finish you can start the worker
-straight away, start a benchmark first, or stay stopped and start later with `F3`. Existing installs
-whose config is already complete skip the wizard. The wizard is also skipped for the synthetic worker
-and for env-var config (`-e`), both of which are power-user paths.
+opens the **Getting started** page. It explains what the AI Horde is and what a worker needs (a public
+worker name, an API key so the kudos you earn are kept, and models on disk so requests can be served),
+then collects those inline, so you never have to visit the Config tab to get running.
 
-After you start, your selected models download in the background and the dashboard switches to the
-**Downloads** tab so you can watch progress. On first run this can take 30 to 60 minutes depending on
-your selection and connection. The worker serves each model as soon as it finishes, so keep the
-window open.
+The page offers three presets, each a model selection plus a stance on which kinds of work you accept:
+
+- **Essentials** serves the single most-requested model, with the smallest download. Post-processing
+  (upscaling, face fixing) is on; LoRA and ControlNet are off.
+- **Recommended** (the suggested choice) serves the most-requested models your card can hold, and
+  accepts LoRA work as well. LoRA files download on demand and build up their own cache over time.
+- **Showcase** adds larger SDXL models and ControlNet requests. It is the largest download.
+
+Each preset states what it will download and how much room there is where models are kept. A preset
+that will not fit stays visible but cannot be chosen, and says how much more space it would need.
+"Choose my own models instead" opens the same model picker the Config tab uses.
+
+The presets that accept LoRA work also ask for an optional **Civitai token**. LoRA files are fetched
+from Civitai as jobs ask for them and some downloads refuse anonymous requests, so a token from a free
+Civitai account gets those. Leaving the field empty never removes a token you already have.
+
+Setup is not one-time: the **Getting started** action stays on the Simple home, so you can revisit the
+explanations or move to a different preset later. Existing installs whose config is already complete
+are not sent to the page on launch, and it is skipped entirely for the synthetic worker and for
+env-var config (`-e`), both of which are power-user paths.
+
+Saving writes only the settings the page owns and leaves the rest of your config alone. Start the
+worker with `F3` (or **Start contributing** on the home screen) when you are ready. Your selected
+models download in the background; on first run this can take 30 to 60 minutes depending on your
+selection and connection, and you can watch progress on the **Downloads** tab. The worker serves each
+model as soon as it finishes, so keep the window open.
 
 ## Experience levels
 
@@ -90,6 +110,26 @@ Settings you cannot see are still preserved. Saving from any level writes back e
 If you upgraded from a version without levels, the dashboard tells you the default changed on first
 launch and offers to keep the full view.
 
+### The Simple home screen
+
+Simple's Overview opens on a status line naming what the worker is doing, followed by which worker this
+is: its name, version, and the horde account it is contributing for, how long it has been contributing
+this session, what it offers requesters (LoRA styles, ControlNet guidance, image-to-image,
+post-processing, alchemy), how many models it serves, and how many requests it takes at once. Under that
+sit the session totals, requests completed and kudos earned, with the kudos figure carrying the hourly
+rate the worker measures while it is working (or saying the rate is not known yet rather than showing a
+zero).
+
+The small chart under each total is a **rate**, not the total drawn again: it shows how much was
+finished in each slice of the last fifteen minutes. A worker that stops earning flattens to the baseline
+within a couple of minutes, which is the point of showing it. Below that are the requests in flight with
+their progress, and the last few finished requests.
+
+One card appears only when something is off: a health finding, maintenance holding new requests back,
+the worker waiting after repeated trouble reaching the horde, or worker processes it had to restart on
+its own during this session. A worker running normally shows no such card, so seeing one is itself the
+signal.
+
 ### Appearance
 
 The same Dashboard section chooses a theme (**Horde Dark**, **Horde Light**, or **Terminal colours**,
@@ -100,11 +140,13 @@ spacing density (comfortable or compact) for the Advanced and Developer surfaces
 
 The descriptions below are the **Advanced** presentation of each tab. In Simple, Overview, Live, and
 Downloads show plain-language equivalents instead. The remaining tabs keep these widgets, with a
-one-line explanation of what the page is for and an **Example** panel above them that walks through the
-figures that tab is showing *right now*, saying what each one means and what a healthy value looks like.
-The example uses your worker's own numbers rather than illustrative ones, and a figure the worker cannot
-report yet says so instead of showing a zero. Fold the panel away with its ▼ once you have read it; on a
-short terminal it is longer than the screen, so collapsing it is how you get the table back.
+one-line explanation of what the page is for above them. On Stats, Control, Logs, and Insights a **What
+these numbers say right now** panel joins it whenever the live figures are worth a comment: a share of
+requests faulting, restarts the worker made on its own, failures in a row, a session spent mostly
+waiting for work. Each sentence quotes your worker's own numbers and says what, if anything, to do. When
+there is nothing to comment on the panel is absent entirely, so its presence is the signal. Fold it away
+with its ▼ once you have read it; on a short terminal it can be longer than the screen, so collapsing it
+is how you get the table back.
 
 | Tab | What it shows |
 |-----|---------------|

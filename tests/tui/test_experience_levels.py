@@ -8,6 +8,7 @@ the liveness indicator draws only on signals a wedged worker cannot produce.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from horde_worker_regen.app_state import (
     WorkerAppState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    RecentJobRecord,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -583,49 +585,257 @@ async def test_every_technical_destination_is_explained(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
-async def test_the_primer_reports_live_figures_rather_than_illustrations(tmp_path: Path) -> None:
-    """The worked example reads the worker's own numbers, and says so when it has none.
+async def test_the_activity_table_prices_each_request(tmp_path: Path) -> None:
+    """Recent requests carry what each one earned, and a dash where nothing was earned.
 
-    An example carrying invented figures drifts from the table beneath it the moment either changes, and
-    teaches a contributor to read a number that is not theirs. A figure the worker does not report has to
-    be named as absent for the same reason.
+    The session total says how much came in; only a per-request figure says which work produced it. A
+    request with no known reward has to read as unknown rather than as a zero-kudos payout.
     """
     fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
     fake.latest_snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
-        num_jobs_submitted=1204,
-        num_jobs_faulted=7,
+        recent_jobs=[
+            RecentJobRecord(job_id="paid", model_name="Deliberate", e2e_seconds=8.0, kudos_reward=12.5),
+            RecentJobRecord(job_id="lost", model_name="Deliberate", e2e_seconds=3.0, faulted=True),
+        ],
     )
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#main-tabs", TabbedContent).active = "tab-live"
+        app._tick()
+        for _ in range(4):
+            await pilot.pause()
+        rendered = _screen_text(app)
+
+    assert "Kudos" in rendered
+    assert "12.5" in rendered
+    faulted_row = next(line for line in rendered.splitlines() if "Not completed" in line)
+    assert faulted_row.strip().strip("│").rstrip().endswith("-"), "a request that earned nothing shows no figure"
+
+
+def _nominal_stats_snapshot() -> WorkerStateSnapshot:
+    """A worker getting on with its work: plenty submitted, nothing a contributor need act on."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        num_jobs_submitted=1204,
+        num_jobs_faulted=0,
+    )
+
+
+def _faulting_stats_snapshot() -> WorkerStateSnapshot:
+    """A worker faulting a share of its work large enough to be worth explaining."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        num_jobs_submitted=1204,
+        num_jobs_faulted=96,
+    )
+
+
+@pytest.mark.slow
+async def test_the_callout_speaks_only_when_the_figures_warrant_it(tmp_path: Path) -> None:
+    """The callout appears on the worker's own anomalous figures and is absent otherwise.
+
+    A block that is always present teaches a contributor to skip it, so an unremarkable worker has to
+    leave the framing line standing alone. When it does speak, the sentence has to carry the live
+    figures: an invented number drifts from the table beneath it the moment either changes.
+    """
+    fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
+    fake.latest_snapshot = _nominal_stats_snapshot()
     async with app.run_test(size=(120, 40)) as pilot:
         app.query_one("#main-tabs", TabbedContent).active = "tab-stats"
         app._tick()
         for _ in range(4):
             await pilot.pause()
+        callout = app.query_one("#tab-stats", TabPane).query_one(TabPrimer).query_one(Collapsible)
+        assert not callout.display, "a worker with nothing to report shows the framing line alone"
         # Read the composited screen: what a contributor sees, not what the widget was handed.
+        assert "What these numbers say right now" not in _screen_text(app)
+
+        fake.latest_snapshot = _faulting_stats_snapshot()
+        app._tick()
+        for _ in range(4):
+            await pilot.pause()
+        assert callout.display, "a notable fault share has to surface without being unfolded"
         rendered = _screen_text(app)
-        assert "1,204" in rendered, "the example quotes the worker's own submitted count"
-        # Kudos/hr is absent from this snapshot, so it must say so rather than show a fabricated zero.
-        # Reporting and inventing are the two directions the example has to get right.
-        assert "not yet" in rendered
+        assert "96 of 1,300 requests" in rendered, "the sentence quotes the worker's own counts"
 
 
 @pytest.mark.slow
-async def test_folding_the_example_gives_the_screen_back(tmp_path: Path) -> None:
-    """The example must be dismissible, because it is longer than the 80x24 floor can spare.
+async def test_folding_the_callout_gives_the_screen_back(tmp_path: Path) -> None:
+    """A speaking callout must be dismissible, because it can outrun what the 80x24 floor can spare.
 
-    Expanded it fills the screen, which is acceptable for something meant to be read once and is why it
-    opens that way. Collapsing it has to return the operator widget the framing describes.
+    It opens expanded, which is right for something surfaced because it applies right now, and collapsing
+    it has to return the operator widget the framing describes.
     """
-    _fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
+    fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
+    fake.latest_snapshot = _faulting_stats_snapshot()
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.pause()
         app.query_one("#main-tabs", TabbedContent).active = "tab-stats"
-        await pilot.pause()
+        app._tick()
+        for _ in range(4):
+            await pilot.pause()
         stats = app.query_one(StatsView)
         collapsible = app.query_one("#tab-stats", TabPane).query_one(TabPrimer).query_one(Collapsible)
 
-        assert not collapsible.collapsed, "the example opens expanded so it is read before dismissed"
+        assert collapsible.display and not collapsible.collapsed, "it opens expanded so it is read first"
         collapsible.collapsed = True
         for _ in range(4):
             await pilot.pause()
         assert stats.region.height > 0, "collapsing must return the widget the framing describes"
+
+
+def test_the_home_trend_charts_pace_rather_than_the_running_total() -> None:
+    """A worker that stops finishing work must flatline, which a cumulative counter can never do.
+
+    The counters only rise, so a sparkline drawn from them plateaus at whatever the session reached and
+    goes on reading as a full chart through an outage. Both Home trends therefore chart the per-interval
+    delta, and the assertion here is the one that separates the two: the tail of a stalled worker's
+    series is zero.
+    """
+    home = SimpleHomeView()
+    start = time.time() - 890.0
+    home._trend_epoch = start
+    for index in range(41):
+        moment = start + index * 10.0
+        home._completed_history.append((moment, index))
+        home._kudos_history.append((moment, index * 25.0, moment - start))
+    # The counters stay exactly where they stood: the worker is up and reporting, and earning nothing.
+    for index in range(47):
+        moment = start + 410.0 + index * 10.0
+        home._completed_history.append((moment, 40))
+        home._kudos_history.append((moment, 1000.0, moment - start))
+
+    completed = home._completed_series()
+    kudos = home._kudos_series()
+    assert len(completed) == len(kudos) == 24
+    assert sum(completed[:12]) == pytest.approx(40.0), "the growth is charted where it happened"
+    assert sum(kudos[:12]) == pytest.approx(1000.0)
+    assert completed[12:] == [0.0] * 12, "a stall reads as zero, not as the plateau it reached"
+    assert kudos[12:] == [0.0] * 12
+
+
+def test_the_ticker_says_which_model_earned_what() -> None:
+    """A finished-request line names the model and the kudos the horde paid for it.
+
+    "Finished an image request" alone tells a contributor nothing about which of their models is
+    carrying the session or what the work was worth, which is the whole reason to watch the feed.
+    """
+    home = SimpleHomeView()
+    home._record_events(
+        WorkerStateSnapshot(
+            config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+            recent_jobs=[
+                RecentJobRecord(job_id="a", model_name="Deliberate", e2e_seconds=24.0, kudos_reward=8.25),
+                RecentJobRecord(job_id="b", is_alchemy=True, model_name="strip_background", e2e_seconds=2.0),
+                RecentJobRecord(job_id="c", model_name="Deliberate", faulted=True, e2e_seconds=5.0, kudos_reward=None),
+            ],
+        ),
+    )
+
+    lines = list(home._ticker)
+    assert lines[0] == "Finished an image request with Deliberate in 24s (+8.2 kudos)"
+    # An unpaid reward is simply absent: alchemy here has no figure, and a faulted request never earns one.
+    assert lines[1] == "Finished an alchemy request with strip_background in 2s"
+    assert "kudos" not in lines[2]
+
+
+def test_the_home_trend_survives_having_no_history_yet() -> None:
+    """Before two samples exist there is no rate to draw, which must render rather than raise."""
+    home = SimpleHomeView()
+    assert home._completed_series() == [0.0] * 24
+    assert home._kudos_series() == [0.0] * 24
+
+
+@pytest.mark.slow
+async def test_home_names_the_worker_and_what_it_offers(tmp_path: Path) -> None:
+    """The landing screen has to say whose worker this is and what it is contributing.
+
+    Totals alone do not tell a contributor that the machine in front of them is the one earning them,
+    nor what it is offering the horde on their behalf.
+    """
+    fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
+    fake.latest_snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(
+            dreamer_name="AuroraBox",
+            worker_version="9.9.9",
+            horde_username="aurora#1",
+            num_models=12,
+            max_threads=2,
+            allow_lora=True,
+            allow_post_processing=True,
+            allow_img2img=False,
+        ),
+        session_start_time=time.time() - 3661.0,
+        kudos_per_hour=4321.0,
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        for _ in range(4):
+            await pilot.pause()
+        rendered = _screen_text(app)
+        # The action buttons are the point of the landing screen, so nothing added above them may push
+        # them off a terminal the view is designed to fit.
+        assert app.query_one("#simple-start-stop").region.bottom <= app.query_one(SimpleHomeView).region.bottom
+
+    assert "AuroraBox, version 9.9.9, contributing as aurora#1" in rendered
+    assert "LoRA styles" in rendered
+    assert "post-processing" in rendered
+    assert "image-to-image" not in rendered, "a capability that is off must not be advertised"
+    assert "Serving 12 models, up to 2 requests at once" in rendered
+    assert "1h 01m" in rendered, "the session's uptime is on the landing screen"
+    assert "4,321 an hour working" in rendered
+
+
+@pytest.mark.slow
+async def test_home_surfaces_an_abnormal_posture_and_stays_quiet_otherwise(tmp_path: Path) -> None:
+    """Maintenance, backoff and absorbed restarts explain a worker earning nothing; silence is nominal."""
+    fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
+    nominal = WorkerConfigSummary(dreamer_name="AuroraBox", worker_version="9.9.9")
+    fake.latest_snapshot = WorkerStateSnapshot(
+        config=nominal,
+        maintenance_mode=True,
+        in_error_backoff=True,
+        num_process_recoveries=3,
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        for _ in range(4):
+            await pilot.pause()
+        abnormal_render = _screen_text(app)
+        assert app.query_one("#simple-attention").display is True
+
+        fake.latest_snapshot = WorkerStateSnapshot(config=nominal)
+        app._tick()
+        for _ in range(4):
+            await pilot.pause()
+        nominal_render = _screen_text(app)
+
+    assert "Paused for maintenance" in abnormal_render
+    assert "trouble reaching the horde" in abnormal_render
+    assert "Restarted 3 stuck worker processes" in abnormal_render
+    for phrase in ("Paused for maintenance", "trouble reaching the horde", "Restarted 3 stuck worker"):
+        assert phrase not in nominal_render, "a nominal worker adds no noise"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("button_id", "destination"),
+    [("#simple-show-activity", "tab-live"), ("#simple-show-models", "tab-downloads")],
+)
+async def test_simple_home_navigation_lands_and_stays(tmp_path: Path, button_id: str, destination: str) -> None:
+    """A Home link's destination survives the focus reset that hiding the outgoing pane triggers.
+
+    Hiding the Overview pane blurs the clicked button, and Textual's focus reset then lands on a
+    visible sibling still inside that pane, whose ``TabPane.Focused`` reactivates the tab being left
+    unless navigation drops focus before switching.
+    """
+    _fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)
+    async with app.run_test(size=(120, 40)) as pilot:
+        # Let the layout settle fully before clicking: the click is hit-tested against the compositor's
+        # map, and a click dispatched while a re-layout is pending lands on whichever card previously
+        # occupied the button's row.
+        for _ in range(4):
+            await pilot.pause()
+        await pilot.click(button_id)
+        for _ in range(4):
+            await pilot.pause()
+        assert app.query_one("#main-tabs", TabbedContent).active == destination

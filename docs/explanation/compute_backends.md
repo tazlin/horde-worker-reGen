@@ -23,7 +23,7 @@ Each helper has two paths:
 1. **ComfyUI loaded** (the inference process): it delegates to `comfy.model_management`, detected via
    `sys.modules` so the call never *triggers* a ComfyUI import. This matters because the safety
    process must never import ComfyUI.
-2. **ComfyUI not loaded** (the parent, the TUI wizard, the safety process): a plain-torch fallback
+2. **ComfyUI not loaded** (the parent, the TUI setup page, the safety process): a plain-torch fallback
    that checks each backend in turn (`torch.cuda` for CUDA/ROCm, `torch.xpu`, `torch.backends.mps`,
    else CPU) instead of assuming `torch.cuda`. `enumerate_accelerators()` always returns at least one
    device (a CPU pseudo-device), so callers never get the empty inventory a bare
@@ -34,7 +34,7 @@ Each helper has two paths:
 `torch.cuda.device_count()` returns `0` and `torch.cuda.is_available()` is `False` on MPS/XPU/
 DirectML, so any code that enumerates devices or reads VRAM directly through `torch.cuda` would see
 *no hardware at all* on those backends. The worker's hardware probe (`SystemResources.detect`), the
-inference process's cache clearing, the TUI setup wizard's VRAM sizing, and the benchmark's machine
+inference process's cache clearing, the TUI setup page's VRAM sizing, and the benchmark's machine
 info all consume the abstraction above instead.
 
 ## NVML is optional enrichment, not a requirement

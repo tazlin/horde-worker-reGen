@@ -49,19 +49,24 @@ that finishes it opens a **dashboard in your web browser**. This is where you wi
 If a window asks about your network or firewall, allowing local access is enough; the dashboard runs on
 your own machine.
 
-## Step 3: Follow the setup wizard
+## Step 3: Work through Getting started
 
-The dashboard greets you with a short wizard. It asks for:
+The dashboard greets you with the **Getting started** page. It explains what the horde is and what a
+worker needs, and asks for:
 
-1. **Your API key and a worker name.** Paste the key from registration. The worker name is how your
-   contribution shows up on the horde, so pick something recognisable. If the name is already taken you
-   will be told, just choose another.
-2. **Which models to serve.** A sensible default is chosen for your GPU. You can accept it for now and
-   change it later.
-3. **An optional benchmark.** This briefly tests your machine and tunes the settings for you. It is
-   worth doing, but you can skip it and run it later from the **Benchmark** tab.
+1. **What this computer will offer.** Three presets are shown: Essentials (one model, smallest
+   download), Recommended (the models your card can hold, and LoRA work), and Showcase (SDXL models and
+   ControlNet requests as well). Each says what it will download and how much room you have; a preset
+   that will not fit says so and cannot be chosen. Recommended is a good first answer, and you can come
+   back and change it.
+2. **A worker name.** This is how your contribution shows up on the horde, so pick something
+   recognisable. If the name is already taken you will be told, just choose another.
+3. **Your API key.** Paste the key from registration. This is what makes the kudos you earn land on
+   your account.
+4. **Whether to accept adult requests.** Leave it off if you would rather only be asked for
+   safe-for-work images.
 
-When you finish, choose **Start**.
+Choose **Save and close**, then press `F3` (or **Start contributing**) to begin.
 
 ## Step 4: Wait for the models to download
 

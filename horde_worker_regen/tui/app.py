@@ -104,7 +104,7 @@ from horde_worker_regen.tui.widgets.simple import (
     TabPrimer,
 )
 from horde_worker_regen.tui.widgets.stats import StatsView
-from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
+from horde_worker_regen.tui.wizard import GettingStartedScreen, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
 from horde_worker_regen.utils import get_system_appropriate_updater
 
@@ -347,7 +347,7 @@ class HordeWorkerTUI(App[None]):
         height: 1fr;
     }
     OverviewView, StatsView, GpusView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView,
-    DownloadsView, ControlView {
+    DownloadsView, ControlView, SimpleHomeView, SimpleActivityView, SimpleModelStatusView {
         height: 1fr;
         padding: 1 1;
     }
@@ -361,7 +361,10 @@ class HordeWorkerTUI(App[None]):
     Screen.-narrow LogsView,
     Screen.-narrow BenchmarkView,
     Screen.-narrow DownloadsView,
-    Screen.-narrow ControlView {
+    Screen.-narrow ControlView,
+    Screen.-narrow SimpleHomeView,
+    Screen.-narrow SimpleActivityView,
+    Screen.-narrow SimpleModelStatusView {
         padding: 1 0;
     }
     #overview-worker, #overview-processes {
@@ -496,7 +499,6 @@ class HordeWorkerTUI(App[None]):
             with TabPane("GPUs", id="tab-gpus"):
                 yield TabPrimer(
                     "What your graphics card is doing, and how much of its memory the worker is using.",
-                    PRIMERS.get("GPUs", ()),
                 )
                 yield GpusView()
             with TabPane("Live", id="tab-live"):
@@ -529,14 +531,12 @@ class HordeWorkerTUI(App[None]):
             with TabPane("Diagnostics", id="tab-diagnostics"):
                 yield TabPrimer(
                     "Checks on this computer's setup, and the details to include when reporting a problem.",
-                    PRIMERS.get("Diagnostics", ()),
                 )
                 yield DiagnosticsView()
             with TabPane("Benchmark", id="tab-benchmark"):
                 yield TabPrimer(
                     "Measures what this computer can handle and suggests settings to match. Running one "
                     "is the easiest way to get good settings without tuning by hand.",
-                    PRIMERS.get("Benchmark", ()),
                 )
                 yield BenchmarkView(worker_mode=self._supervisor.mode.value)
         # The level rides the Footer's row rather than claiming one of its own: at the 80x24 floor a
@@ -613,8 +613,8 @@ class HordeWorkerTUI(App[None]):
 
     def _resume_launch_flow(self) -> None:
         """Run first-run setup or the usual start/onboarding prompts."""
-        if self._should_run_setup_wizard():
-            self._run_setup_wizard()
+        if self._should_show_getting_started():
+            self._open_getting_started()
         elif self._should_auto_start():
             self._supervisor.start()
             self._maybe_prompt_onboarding()
@@ -673,12 +673,12 @@ class HordeWorkerTUI(App[None]):
             timeout=10,
         )
 
-    def _should_run_setup_wizard(self) -> bool:
-        """Whether to show the guided wizard: a real worker whose bridgeData is not yet configured.
+    def _should_show_getting_started(self) -> bool:
+        """Whether to open Getting started: a real worker whose bridgeData is not yet configured.
 
         Skipped for the fake/demo worker and for env-var config (both are power-user paths). When the
-        config is already complete, the durable setup-complete flag is set so existing installs never
-        see the wizard.
+        config is already complete, the durable setup-complete flag is set so existing installs are
+        never sent to setup.
 
         Answering this reads and parses ``bridgeData.yaml`` (comment-preserving, so not cheap) and may
         read the durable state, so the answer is cached and refreshed only when the config file itself
@@ -705,7 +705,7 @@ class HordeWorkerTUI(App[None]):
         """
         stamp = self._config_stamp()
         if stamp != self._setup_config_stamp:
-            return self._should_run_setup_wizard()
+            return self._should_show_getting_started()
         return self._setup_required
 
     def _compute_setup_required(self) -> bool:
@@ -718,46 +718,34 @@ class HordeWorkerTUI(App[None]):
                     with contextlib.suppress(Exception):
                         self._app_state_store.set_setup_complete(True)
                 return False
-        except Exception as wizard_error:  # noqa: BLE001 - detection must never block the TUI
-            self.log(f"Could not determine setup state: {wizard_error}")
+        except Exception as setup_error:  # noqa: BLE001 - detection must never block the TUI
+            self.log(f"Could not determine setup state: {setup_error}")
             return False
         return True
 
-    def _run_setup_wizard(self) -> None:
-        """Show the first-run wizard; fall back to the usual start prompt if it cannot be shown."""
+    def _open_getting_started(self) -> None:
+        """Show the Getting started page; fall back to the usual start prompt if it cannot be shown."""
         try:
-            self.push_screen(SetupWizardModal(config_path=self._config_path), self._on_wizard_outcome)
-        except Exception as wizard_error:  # noqa: BLE001 - the wizard must never block the TUI
-            self.log(f"Could not show the setup wizard: {wizard_error}")
+            self.push_screen(GettingStartedScreen(config_path=self._config_path), self._on_getting_started_closed)
+        except Exception as setup_error:  # noqa: BLE001 - setup must never block the TUI
+            self.log(f"Could not show Getting started: {setup_error}")
             self._prompt_worker_start()
 
-    def _on_wizard_outcome(self, outcome: WizardOutcome | None) -> None:
-        """Act on the wizard's result: start, benchmark, or stay stopped (None means cancelled)."""
-        if outcome is None:
-            self.notify("Setup cancelled. Edit it on the Config tab, then press F3 to start.")
+    def _on_getting_started_closed(self, saved: bool | None) -> None:
+        """Pick up a saved setup: record it, reload the config views, and say what happens next."""
+        if not saved:
+            self.notify("Nothing was saved. Reopen Getting started, or use the Config tab, when you're ready.")
             return
         with contextlib.suppress(Exception):
             self._app_state_store.set_setup_complete(True)
         with contextlib.suppress(NoMatches):
             self.query_one(ConfigEditorView).reload_from_disk()
-        if outcome is WizardOutcome.BENCHMARK:
-            self._pending_benchmark_options = BenchmarkOptions(process_mode=self._supervisor.mode.value)
-            self.notify("Saved. Starting a benchmark to tune your settings…")
-            self.run_worker(self._start_benchmark_flow, thread=True, exclusive=True, group="lifecycle")
-        elif outcome is WizardOutcome.START:
-            self.notify(
-                "Saved. Starting the worker. Your selected models download now if they are not already "
-                "on disk; on first run this can take 30-60 minutes. The worker serves models as they "
-                "finish, so keep this window open.",
-                title="Downloading models",
-                severity="warning",
-                timeout=12,
-            )
-            with contextlib.suppress(NoMatches):
-                self.query_one("#main-tabs", TabbedContent).active = "tab-downloads"
-            self._supervisor.start()
-        else:
-            self.notify("Setup saved. Press F3 to start the worker when you're ready.")
+        self.notify(
+            "Setup saved. Press F3 to start contributing. Your chosen models download on the first "
+            "start; that can take 30-60 minutes, and the worker serves each one as it finishes.",
+            title="Setup saved",
+            timeout=12,
+        )
 
     def _should_auto_start(self) -> bool:
         """Whether the persisted preference says to start the worker automatically on launch."""
@@ -1556,8 +1544,13 @@ class HordeWorkerTUI(App[None]):
 
         No level promotion is needed: every tab is reachable at every level, so a palette jump never has
         to change the operator's chosen depth to satisfy itself.
+
+        Focus is dropped before the switch. Hiding the outgoing pane would otherwise blur its focused
+        widget, and Textual's focus reset then lands on a visible sibling inside that same pane, whose
+        ``TabPane.Focused`` immediately reactivates the tab being left.
         """
         with contextlib.suppress(NoMatches, ValueError):
+            self.screen.set_focus(None)
             self.query_one("#main-tabs", TabbedContent).active = destination
 
     def action_show_help(self) -> None:
@@ -1569,8 +1562,8 @@ class HordeWorkerTUI(App[None]):
         self.action_start_stop_worker()
 
     def on_simple_home_view_setup_requested(self, message: SimpleHomeView.SetupRequested) -> None:
-        """Reopen the guided setup wizard, which stays the single first-run path."""
-        self._run_setup_wizard()
+        """Open Getting started, which is the one place setup is explained and performed."""
+        self._open_getting_started()
 
     _SIMPLE_DESTINATION_TABS: dict[SimpleDestination, str] = {
         SimpleDestination.ACTIVITY: _LIVE_TAB_ID,

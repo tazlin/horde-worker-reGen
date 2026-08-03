@@ -5,7 +5,7 @@
     - [The supervisor channel](#the-supervisor-channel)
     - [Terminal, served, and attached modes](#terminal-served-and-attached-modes)
     - [Worker-owned stats history](#worker-owned-stats-history)
-    - [The first-run wizard](#the-first-run-wizard)
+    - [The Getting started page](#the-getting-started-page)
     - [Worker identity preflight](#worker-identity-preflight)
     - [Durable app state](#durable-app-state)
     - [See also](#see-also)
@@ -48,7 +48,7 @@ defines the structured protocol over it:
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
   export toggle and disk-size warning. The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 16) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 22) so a frontend can detect a mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate
@@ -169,16 +169,34 @@ when it could not apply (a job-assignment that lost the spawn race, or a host fr
 an older build). Both verify process identity against pid reuse, and both are
 best-effort and Windows-centric, so neither can wedge startup.
 
-## The first-run wizard
+## The Getting started page
 
-On first launch, when `bridgeData.yaml` is unconfigured
+When `bridgeData.yaml` is unconfigured
 ([`is_setup_incomplete`][horde_worker_regen.tui.wizard.is_setup_incomplete]), the
-TUI shows a guided, linear setup wizard. It collects the two things a worker
-cannot run without (an API key and a unique worker name) plus an initial model
-selection, writes them through the same light YAML path the config editor uses,
-and hands off to the benchmark/start flow. It reuses existing controls (the same
-model picker the Config tab uses) and never blocks the dashboard: cancelling
-leaves the worker stopped and the tabs available for manual configuration.
+TUI opens the Getting started page
+([`GettingStartedScreen`][horde_worker_regen.tui.wizard.GettingStartedScreen]). It
+is the whole setup surface: it explains what the horde is and why a worker needs a
+name, a key and models on disk, then collects those inline, so the Config tab is
+where a working worker is refined rather than where setup happens. It stays
+reachable from the Simple home afterwards, because the presets and the
+explanations keep their value once a worker runs.
+
+The three presets pair a model selection with a feature stance. Each is priced
+against the disk its models will really need: the entries are expanded exactly as
+the worker expands them
+([`resolve_effective_models`][horde_worker_regen.tui.model_resolution.resolve_effective_models])
+and the resulting models are costed with
+[`compute_download_plan`][horde_worker_regen.model_download_plan.compute_download_plan].
+A preset the volume cannot hold is shown disabled with the shortfall rather than
+hidden, so the constraint is legible instead of surfacing as a failed download
+later.
+
+Saving writes only the keys the page owns (identity, `models_to_load`, `nsfw` and
+the preset's feature flags) through the same comment-preserving YAML path the
+config editor uses, so every other setting in an existing config survives. Nothing
+the page does depends on the network being up: key validation, the name-taken
+check and the model catalog all degrade to a quieter page, and closing without
+saving leaves the worker stopped and every tab available for manual configuration.
 
 ## Guarding unsaved config edits
 
@@ -245,14 +263,19 @@ control that changes level cannot be hidden by the level.
 
 The seven destinations that keep their operator widget at every level are framed in
 Simple by a [`TabPrimer`][horde_worker_regen.tui.widgets.simple.TabPrimer]: one line
-on what the page is for, then a collapsible worked example naming each headline figure
-and what to conclude from it. The figures are read from the live snapshot rather than
-illustrated, so the explanation and the widget beneath it cannot describe different
-numbers, and a figure the worker does not report is named as absent rather than shown
-as zero. Relabelling the columns themselves was rejected: it would fork the vocabulary
-by level, so a contributor who learned a term in Simple would meet a different one on
-promotion. The example runs longer than a short terminal has rows, which is why it
-folds; it opens expanded so it is read before it is dismissed.
+on what the page is for, plus a collapsible callout saying what the live figures mean
+right now. Each [`PrimerCallout`][horde_worker_regen.tui.widgets.simple.PrimerCallout]
+is conditional and renders only while its condition holds, so the callout carries the
+worker's current anomalies and nothing else; with no condition holding it is hidden
+outright and the framing line stands alone. Conditions are drawn from sticky signals
+(session counters and latched flags) so a callout does not flicker between frames, and
+the sentences quote the snapshot's own numbers. Stats, Control, Logs and Insights carry
+callouts; GPUs, Diagnostics and Benchmark keep the framing line alone, since their
+widgets already name and explain every figure they show. Relabelling the columns
+themselves was rejected: it would fork the vocabulary by level, so a contributor who
+learned a term in Simple would meet a different one on promotion. Several observations
+at once run longer than a short terminal has rows, which is why the callout folds; it
+opens expanded so it is read before it is dismissed.
 
 Config audience is decided at two granularities, which answer different questions.
 The sub-tab list decides which *pages* a level offers, and
@@ -314,6 +337,33 @@ indicator supplies the animation and takes its alarm state from the health repor
 Progress percentages come from the worker's own reported values and fall back to its
 step counters; when it reports neither, the view shows an indeterminate state rather
 than inventing a number.
+
+### Trends that can show a stall
+
+The same constraint governs Simple's headline trends. The figures they sit under are
+cumulative session counters, and a sparkline drawn from a counter can only rise: it
+plateaus at whatever the session reached and goes on reading as a full chart right
+through an outage, which is precisely the state a contributor most needs to see. Both
+Home trends therefore chart the per-interval *delta* over a fixed recent window,
+through the same [`trends`][horde_worker_regen.tui.trends] helpers the operator
+Overview uses, so a worker that stops finishing work draws a flat baseline while its
+totals stay where they are. The window is fixed rather than selectable here: the
+question Home answers is whether the worker is earning *now*, and a span long enough to
+average a stall away would defeat it.
+
+Rates the worker measures itself are quoted rather than recomputed, and named as
+unmeasured when it has not reported one, on the same grounds as an unreported progress
+percentage.
+
+The attention card follows the inverse convention to the rest of the view: it renders
+only for a health finding or a posture that explains a running worker earning nothing
+(maintenance, pop backoff, processes restarted during the session), and is absent
+otherwise, so its presence is the signal and a nominal worker pays no visual cost for
+it.
+
+Identity and offered features sit in the status hero rather than in a card of their
+own. The home view already fills the terminal it is designed for, and another card
+would push the action buttons past the bottom of it.
 
 ## Durable app state
 

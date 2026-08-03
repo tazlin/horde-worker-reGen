@@ -52,9 +52,9 @@ performance you need an NVIDIA GPU on Windows or Linux, or AMD on Linux via
 ## What happens on first run
 
 However you installed, the first run builds the environment (it pulls Python and PyTorch and can take
-several minutes), then opens the **dashboard in your browser**. A short wizard collects your API key
-and worker name, helps you pick models, optionally benchmarks your machine, and starts the worker. See
-[Use the dashboard](use-the-dashboard.md) for the wizard and the tabs.
+several minutes), then opens the **dashboard in your browser**. The Getting started page explains what
+a worker needs, offers three presets to pick from, and collects your worker name and API key. See
+[Use the dashboard](use-the-dashboard.md) for that page and the tabs.
 
 After you start, your chosen models download in the background. The first run can take 30 to 60
 minutes depending on your selection and connection; the worker serves each model as it finishes, so

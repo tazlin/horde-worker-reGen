@@ -1,38 +1,59 @@
-"""The guided first-run setup wizard.
+"""The Getting started page: the single surface that explains and performs worker setup.
 
-A linear, can't-get-lost flow shown on first launch when ``bridgeData.yaml`` is unconfigured (see
-[`is_setup_incomplete`][horde_worker_regen.tui.wizard.is_setup_incomplete]). It collects the only two
-things a worker cannot run without (an API key and a unique worker name) plus an initial model
-selection, writes them with the same light YAML path the config editor uses
-([`save_config`][horde_worker_regen.tui.config_form.save_config]), and then hands off to the existing
-benchmark / start flow. Every step reuses an existing control: model browsing is the same
-[`ModelPickerModal`][horde_worker_regen.tui.widgets.model_picker.ModelPickerModal] the Config tab uses,
-and starting the worker downloads the chosen models exactly as a normal run does.
+Nothing else in the dashboard tells a newcomer what a worker needs or why, so this page carries the
+whole story: what the AI Horde is, which three things a worker cannot run without, and why models have
+to be downloaded before requests can be served. It then collects those three things inline, so the
+Config tab is somewhere to refine a working worker rather than somewhere setup happens.
 
-The wizard never blocks the dashboard: cancelling leaves the worker stopped and the tabs available, so
-a power user can configure by hand instead.
+The page is shown automatically while ``bridgeData.yaml`` is unconfigured (see
+[`is_setup_incomplete`][horde_worker_regen.tui.wizard.is_setup_incomplete]) and stays reachable from the
+Simple home afterwards, because the presets and the explanations remain useful once a worker runs.
+
+What it offers is a choice between three presets, each a model selection plus a feature stance, priced
+against the disk the models will actually need
+([`compute_download_plan`][horde_worker_regen.model_download_plan.compute_download_plan] over the models
+the selection resolves to). A preset the volume cannot hold is shown disabled with the shortfall rather
+than hidden, so the constraint is legible. Model browsing is the same
+[`ModelPickerModal`][horde_worker_regen.tui.widgets.model_picker.ModelPickerModal] the Config tab uses.
+
+Saving writes only the keys this page owns through
+[`save_config`][horde_worker_regen.tui.config_form.save_config], so every other setting in an existing
+config survives untouched. Everything that needs the network (key validation, name-taken checks, the
+model catalog and its usage stats) degrades to a quieter page rather than an error: without a catalog
+the presets state that sizes are unavailable and remain choosable where they can be honoured.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import enum
 import os
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Static
+from textual.screen import Screen
+from textual.widgets import Button, Input, Static, Switch
 
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
+from horde_worker_regen.tui.formatters import human_bytes
 from horde_worker_regen.tui.horde_validation import AdvisoryStatus, check_worker_name_available, verify_api_key
 from horde_worker_regen.tui.model_catalog import MetaKind, build_meta_instruction, is_meta_instruction
+from horde_worker_regen.tui.model_resolution import resolve_effective_models
 from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal, ModelPickerResult
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from horde_model_reference.model_reference_records import GenericModelRecord
+
+    from horde_worker_regen.model_download_plan import DownloadPlan
+    from horde_worker_regen.tui.model_catalog import ModelInfo
 
 DEFAULT_API_KEY = "0000000000"
 """The placeholder key shipped in bridgeData_template.yaml; treated as "not set"."""
@@ -42,16 +63,8 @@ DEFAULT_DREAMER_NAME = "An Awesome Dreamer"
 
 REGISTER_URL = "https://aihorde.net/register"
 
-
-class WizardOutcome(enum.StrEnum):
-    """What the user chose to do once setup was saved."""
-
-    BENCHMARK = "benchmark"
-    """Tune settings with a benchmark before serving (it starts the worker afterwards)."""
-    START = "start"
-    """Start the worker now; selected models download on demand."""
-    STAY_STOPPED = "stay_stopped"
-    """Save the configuration but leave the worker stopped (start later with F3)."""
+_SHOWCASE_SDXL_VRAM_MB = 20_000
+"""Above this much VRAM the showcase preset offers a second SDXL model rather than one."""
 
 
 def _config_str(data: Any, key: str) -> str:  # noqa: ANN401 - ruamel CommentedMap / dict
@@ -66,9 +79,9 @@ def _config_str(data: Any, key: str) -> str:  # noqa: ANN401 - ruamel CommentedM
 def is_setup_incomplete(config_path: Path = DEFAULT_CONFIG_PATH) -> bool:
     """Return whether bridgeData lacks a real API key or still uses the default worker name.
 
-    This is the trigger for showing the wizard. A missing or unreadable file counts as incomplete, and
-    so do the template placeholders, so a freshly seeded config (the installer copies the template)
-    leads straight into setup.
+    This is the trigger for showing the page automatically. A missing or unreadable file counts as
+    incomplete, and so do the template placeholders, so a freshly seeded config (the installer copies
+    the template) leads straight into setup.
     """
     try:
         data = load_config(config_path)
@@ -85,9 +98,9 @@ def _detect_total_vram_mb() -> int | None:
     """Best-effort read of the primary device's total VRAM in MB, or None when unavailable.
 
     Routes through the out-of-process accelerator probe (backend-agnostic across CUDA/ROCm/XPU/MPS/CPU,
-    not NVML) so non-NVIDIA cards size the wizard correctly. The probe runs the torch-loading enumeration
-    in a subprocess, keeping the wizard process itself torch-free. Any failure or a zero reading yields
-    None so the caller falls back to a safe default rather than erroring.
+    not NVML) so non-NVIDIA cards size the presets correctly. The probe runs the torch-loading
+    enumeration in a subprocess, keeping the TUI process itself torch-free. Any failure or a zero
+    reading yields None so the caller falls back to a safe default rather than erroring.
     """
     try:
         from horde_worker_regen.utils.accelerator_probe import probe_accelerators
@@ -103,8 +116,8 @@ def _detect_total_vram_mb() -> int | None:
 def _top_n_for_vram(total_mb: int | None) -> int:
     """The default ``top N`` size for a card with *total_mb* of VRAM (None when unknown).
 
-    Bigger cards can comfortably hold more resident models, so they get a larger N; without NVML we
-    cannot tell, so we pick a conservative middle ground the user can change in the model step.
+    Bigger cards can comfortably hold more resident models, so they get a larger N; without telemetry we
+    cannot tell, so we pick a conservative middle ground the user can change by picking their own models.
     """
     if total_mb is None:
         return 3
@@ -137,180 +150,376 @@ def _detect_installed_torch_build() -> str | None:
 
 
 def _testing_mode() -> bool:
-    """Whether we are running under the test harness, where advisory network calls are skipped."""
+    """Whether we are running under the test harness, where network-touching work is skipped."""
     return bool(os.environ.get("AI_HORDE_TESTING"))
 
 
-_STEP_TITLES = (
-    "Welcome",
-    "Step 1 of 4  ·  API key",
-    "Step 2 of 4  ·  Worker name",
-    "Step 3 of 4  ·  Models",
-    "Step 4 of 4  ·  Ready",
+class PresetKind(enum.StrEnum):
+    """The three offered starting points, from smallest footprint to largest."""
+
+    ESSENTIALS = "essentials"
+    RECOMMENDED = "recommended"
+    SHOWCASE = "showcase"
+
+
+@dataclasses.dataclass(frozen=True)
+class Preset:
+    """One offered starting point: what it serves, and the feature stance that goes with it."""
+
+    kind: PresetKind
+    title: str
+    offer: str
+    """One sentence on what choosing this gives the people asking for images."""
+    stance: str
+    """Plain wording for the kinds of work this preset accepts."""
+    features: dict[str, bool]
+    """bridgeData feature keys this preset writes."""
+
+
+PRESETS: tuple[Preset, ...] = (
+    Preset(
+        kind=PresetKind.ESSENTIALS,
+        title="Essentials",
+        offer="Serves the single most commonly requested model, which is the fastest way to be useful.",
+        stance="Accepts plain image requests and the finishing touches (upscaling, face fixing).",
+        features={"allow_post_processing": True, "allow_lora": False, "allow_controlnet": False},
+    ),
+    Preset(
+        kind=PresetKind.RECOMMENDED,
+        title="Recommended",
+        offer="Serves the most-requested models your graphics card can hold, so few requests pass you by.",
+        stance=(
+            "Accepts plain image requests, finishing touches, and LoRA styles. LoRA files download on "
+            "demand and build up their own cache over time."
+        ),
+        features={"allow_post_processing": True, "allow_lora": True, "allow_controlnet": False},
+    ),
+    Preset(
+        kind=PresetKind.SHOWCASE,
+        title="Showcase",
+        offer="Adds the larger SDXL models and the guided (ControlNet) requests that fewer workers accept.",
+        stance="Accepts everything the recommended preset does, plus ControlNet work. The largest download.",
+        features={"allow_post_processing": True, "allow_lora": True, "allow_controlnet": True},
+    ),
 )
-_FINAL_STEP = len(_STEP_TITLES) - 1
+
+PRESETS_BY_KIND: dict[PresetKind, Preset] = {preset.kind: preset for preset in PRESETS}
+
+SUGGESTED_PRESET = PresetKind.RECOMMENDED
+"""The preset offered as the default choice."""
+
+FEATURE_KEYS: tuple[str, ...] = ("allow_post_processing", "allow_lora", "allow_controlnet")
+"""Every feature key a preset can write, so an unselected stance is written as False rather than left."""
 
 
-class SetupWizardModal(ModalScreen["WizardOutcome | None"]):
-    """A stepped first-run wizard that writes bridgeData and returns the user's next action."""
+@dataclasses.dataclass(frozen=True)
+class PresetPlan:
+    """A preset resolved against the catalog and the disk it would need."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel setup")]
+    kind: PresetKind
+    entries: list[str]
+    """What would be written to ``models_to_load`` (literal names and/or meta commands)."""
+    model_names: list[str]
+    """The concrete models the entries resolve to, empty when they could not be resolved."""
+    resolved: bool
+    """Whether the entries could be turned into a concrete model list at all."""
+    plan: DownloadPlan | None
+    """The disk picture for the resolved models, or None when sizes are unavailable."""
+
+    @property
+    def selectable(self) -> bool:
+        """Whether this preset can be chosen: its entries are known and nothing proves it will not fit.
+
+        A preset whose preview could not be resolved is still choosable as long as its entries are
+        known: the meta-command presets are expanded by the worker itself at startup, so a missing
+        catalog only costs the preview, never the choice. Only a preset whose entries are unknown, or
+        whose computed download does not fit the volume, is withheld.
+        """
+        if not self.entries:
+            return False
+        return self.plan is None or self.plan.fits
+
+    def disk_sentence(self) -> str:
+        """A one-line statement of what this preset costs on disk, honest about what is unknown."""
+        if not self.resolved:
+            return "The model list for this preset is not available yet."
+        if self.plan is None:
+            return "Download sizes are unavailable until the model list loads."
+        free = "an unknown amount of" if self.plan.free_disk_bytes is None else human_bytes(self.plan.free_disk_bytes)
+        qualifier = "at least " if not self.plan.sizes_complete else "about "
+        sentence = (
+            f"Needs {qualifier}{human_bytes(self.plan.to_download_bytes)} downloaded, {free} free where models go."
+        )
+        if not self.plan.fits:
+            sentence += f" That is {human_bytes(self.plan.shortfall_bytes)} more than this computer has free."
+        return sentence
+
+
+def _catalog_state() -> tuple[list[ModelInfo] | None, dict[str, int] | None]:
+    """Return the cached model catalog and usage stats without ever touching the network."""
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    snapshot = CATALOG_CACHE.snapshot()
+    return snapshot.catalog, snapshot.popularity
+
+
+def _catalog_records() -> Mapping[str, GenericModelRecord] | None:
+    """Return the loaded model reference records, or None when nothing is loaded yet."""
+    from horde_worker_regen.tui.model_catalog import cached_image_records
+
+    try:
+        return cached_image_records()
+    except Exception:  # noqa: BLE001 - sizing is enrichment; a page without it is still usable
+        return None
+
+
+def _download_plan(model_names: list[str], records: Mapping[str, GenericModelRecord]) -> DownloadPlan:
+    """Price a concrete model list against the model volume."""
+    from horde_worker_regen.model_download_plan import compute_download_plan
+
+    return compute_download_plan(model_names, records)
+
+
+def _most_used_sdxl(catalog: list[ModelInfo], popularity: dict[str, int], count: int) -> list[str]:
+    """The ``count`` most-requested SDXL models in the catalog, in popularity order."""
+    sdxl = {model.name for model in catalog if model.baseline == "stable_diffusion_xl"}
+    ranked = sorted(popularity.items(), key=lambda item: item[1], reverse=True)
+    return [name for name, _uses in ranked if name in sdxl][:count]
+
+
+def preset_entries(
+    kind: PresetKind,
+    catalog: list[ModelInfo] | None,
+    popularity: dict[str, int] | None,
+    total_vram_mb: int | None,
+) -> list[str] | None:
+    """The ``models_to_load`` entries a preset would write, or None when they cannot be determined.
+
+    Essentials and Recommended are popularity meta commands, the same instruction the worker expands at
+    startup, so they stay correct as the horde's model usage moves. Showcase names its SDXL models
+    literally because no meta command expresses "the most-requested SDXL models"; that literal choice
+    needs the catalog and the usage stats, so it is the one preset that can be undeterminable.
+    """
+    top_n = _top_n_for_vram(total_vram_mb)
+    if kind is PresetKind.ESSENTIALS:
+        return [build_meta_instruction(MetaKind.TOP_N, 1)]
+    if kind is PresetKind.RECOMMENDED:
+        return [build_meta_instruction(MetaKind.TOP_N, top_n)]
+    if catalog is None or popularity is None:
+        return None
+    wanted = 2 if (total_vram_mb or 0) >= _SHOWCASE_SDXL_VRAM_MB else 1
+    sdxl = _most_used_sdxl(catalog, popularity, wanted)
+    if not sdxl:
+        return None
+    return [build_meta_instruction(MetaKind.TOP_N, top_n), *sdxl]
+
+
+def build_preset_plans(
+    catalog: list[ModelInfo] | None,
+    popularity: dict[str, int] | None,
+    records: Mapping[str, GenericModelRecord] | None,
+    *,
+    total_vram_mb: int | None,
+) -> dict[PresetKind, PresetPlan]:
+    """Resolve every preset and price it, degrading to "unknown" rather than failing.
+
+    Args:
+        catalog: The image-model catalog, or None when it has not loaded.
+        popularity: Model-name to last-month usage count, or None when the stats have not loaded.
+        records: The model reference records used for sizing, or None when unavailable.
+        total_vram_mb: The detected VRAM, which sizes the recommended and showcase selections.
+
+    Returns:
+        A plan per preset. A plan with ``resolved`` False could not name its models; one with a None
+        ``plan`` named them but could not price them.
+    """
+    plans: dict[PresetKind, PresetPlan] = {}
+    for preset in PRESETS:
+        entries = preset_entries(preset.kind, catalog, popularity, total_vram_mb)
+        if entries is None:
+            plans[preset.kind] = PresetPlan(preset.kind, [], [], resolved=False, plan=None)
+            continue
+        names = resolve_preset_models(entries, catalog, popularity)
+        if names is None:
+            plans[preset.kind] = PresetPlan(preset.kind, entries, [], resolved=False, plan=None)
+            continue
+        download_plan = None
+        if records is not None:
+            try:
+                download_plan = _download_plan(names, records)
+            except Exception:  # noqa: BLE001 - an unpriceable preset is still a choosable one
+                download_plan = None
+        plans[preset.kind] = PresetPlan(preset.kind, entries, names, resolved=True, plan=download_plan)
+    return plans
+
+
+def resolve_preset_models(
+    entries: list[str],
+    catalog: list[ModelInfo] | None,
+    popularity: dict[str, int] | None,
+) -> list[str] | None:
+    """Expand preset entries to the concrete models the worker would load, or None when it cannot.
+
+    Uses the same expansion the Config tab shows, so the page's model list and its disk figure describe
+    what the worker will really do with the entries being written.
+    """
+    result = resolve_effective_models(entries, [], catalog, load_large_models=False, popularity=popularity)
+    if not result.catalog_loaded or result.needs_resolve:
+        return None
+    return [row.name for row in result.included]
+
+
+_WHAT_IS_THE_HORDE = (
+    "The AI Horde is a crowdsourced image service. People donate time on their graphics cards, anyone "
+    "can ask for images without paying, and the contributors earn kudos for the work they do. This "
+    "computer becomes one of those contributors."
+)
+
+_WHAT_IS_NEEDED = (
+    "Three things get a worker running:\n\n"
+    "  A worker name. This is how the horde tells your computer apart from everyone else's, and it is "
+    "shown publicly, so it has to be one nobody else has taken.\n\n"
+    "  An API key. This is what makes the kudos you earn land on your account. Anonymous contribution "
+    "works, but nothing you earn is kept. A key is free from " + REGISTER_URL + " (type that address "
+    "into a browser).\n\n"
+    "  Models on disk. A request can only be served by a computer that already holds the model it asks "
+    "for, so the models you offer are downloaded first. That is what the sizes below are: real files, "
+    "on your drive, before the first request arrives."
+)
+
+
+class GettingStartedScreen(Screen[bool]):
+    """The full-page setup surface; dismisses True once bridgeData has been written."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
 
     DEFAULT_CSS = """
-    SetupWizardModal {
-        align: center middle;
-    }
-    SetupWizardModal #wizard-dialog {
-        width: 72;
-        height: auto;
-        max-height: 90%;
-        padding: 1 2;
-        border: thick $accent;
+    GettingStartedScreen {
         background: $surface;
     }
-    SetupWizardModal #wizard-title {
-        text-style: bold;
-        padding-bottom: 1;
+    GettingStartedScreen #gs-page {
+        padding: 1 2;
     }
-    SetupWizardModal #wizard-body {
+    /* Containers default to filling their parent, which on a scrolling page squeezes the cards inside
+       them to nothing and pads the details card with dead rows. Every container here sizes to content. */
+    GettingStartedScreen #gs-presets,
+    GettingStartedScreen #gs-civitai,
+    GettingStartedScreen .gs-preset {
         height: auto;
-        max-height: 20;
     }
-    SetupWizardModal .wiz-step Input {
-        margin-top: 1;
+    GettingStartedScreen .gs-preset.-chosen {
+        border: tall $success;
     }
-    SetupWizardModal .wiz-error {
+    GettingStartedScreen .gs-error {
         color: $error;
-        padding-top: 1;
     }
-    SetupWizardModal .wiz-warn {
-        color: $warning;
-        padding-top: 1;
-    }
-    SetupWizardModal #wiz-models-summary {
-        padding: 1 0;
-    }
-    SetupWizardModal #wiz-model-buttons Button {
-        margin-right: 1;
-    }
-    SetupWizardModal #wiz-step-4 Button {
-        width: 100%;
-        margin-top: 1;
-    }
-    SetupWizardModal #wizard-nav {
+    GettingStartedScreen .gs-field-row {
         height: auto;
-        padding-top: 1;
     }
-    SetupWizardModal #wizard-nav Button {
-        margin-right: 1;
-    }
-    SetupWizardModal #wizard-progress {
+    GettingStartedScreen .gs-field-row Static {
         width: 1fr;
-        content-align: right middle;
-        color: $text-muted;
+        height: 3;
+        padding-left: 2;
+        content-align: left middle;
+    }
+    GettingStartedScreen Input {
+        margin-bottom: 1;
     }
     """
 
     def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-        """Store the config path and seed a VRAM-aware default model selection."""
+        """Store the config path and detect the card once, so the presets can be sized without re-probing."""
         super().__init__()
         self._config_path = config_path
-        self._step = 0
-        # Detect once at construction so the UI can show what we found without re-probing the GPU.
         self._detected_vram_mb = _detect_total_vram_mb()
-        self._default_top_n = _top_n_for_vram(self._detected_vram_mb)
-        self._models: list[str] = [build_meta_instruction(MetaKind.TOP_N, self._default_top_n)]
+        self._chosen = SUGGESTED_PRESET
+        self._plans: dict[PresetKind, PresetPlan] = {}
+        self._custom_models: list[str] | None = None
+        """A hand-picked model list that overrides the chosen preset's entries, when the user made one."""
 
     def compose(self) -> ComposeResult:
-        """Lay out the title, the per-step bodies (only one shown at a time), and the nav bar."""
-        with Vertical(id="wizard-dialog"):
-            yield Static(id="wizard-title")
-            with VerticalScroll(id="wizard-body"):
-                yield Vertical(
-                    Static(self._welcome_text()),
-                    Static("", id="wiz-backend-warning", classes="wiz-error"),
-                    id="wiz-step-0",
-                    classes="wiz-step",
-                )
-                yield Vertical(
-                    Static(
-                        Text.assemble(
-                            ("Paste your AI Horde API key. ", ""),
-                            (f"Register free at {REGISTER_URL}.", "grey70"),
-                        ),
-                    ),
-                    Input(placeholder="API key", password=True, id="wiz-api-key"),
-                    Static("", id="wiz-api-key-error", classes="wiz-error"),
-                    id="wiz-step-1",
-                    classes="wiz-step",
-                )
-                yield Vertical(
-                    Static(
-                        "Choose a unique name for your worker (shown publicly on the horde). "
-                        "It cannot be the default and cannot clash with an existing worker.",
-                    ),
-                    Input(placeholder="Worker name", id="wiz-name"),
-                    Static("", id="wiz-name-error", classes="wiz-error"),
-                    id="wiz-step-2",
-                    classes="wiz-step",
-                )
-                yield Vertical(
-                    Static(
-                        "Which models will you serve? The default loads the most popular models for your "
-                        "card; they download when the worker starts. You can change this any time on the "
-                        "Config tab.",
-                    ),
-                    Static(id="wiz-models-detected"),
-                    Static(id="wiz-models-summary"),
-                    Horizontal(
-                        Button("Top 1", id="wiz-models-top1"),
-                        Button("Top 3", id="wiz-models-top3"),
-                        Button("Top 5", id="wiz-models-top5"),
-                        Button("All SD 1.5", id="wiz-models-sd15"),
-                        Button("Browse all…", id="wiz-models-browse"),
-                        id="wiz-model-buttons",
-                    ),
-                    Static(id="wiz-civitai-help"),
-                    Input(placeholder="Civitai API token", password=True, id="wiz-civitai-token"),
-                    Static("", id="wiz-civitai-warning", classes="wiz-warn"),
-                    id="wiz-step-3",
-                    classes="wiz-step",
-                )
-                yield Vertical(
-                    Static(
-                        "Setup is ready to save. A benchmark briefly tests your card and tunes settings "
-                        "for you (recommended on first run); or start straight away.",
-                    ),
-                    Button("Run benchmark first (recommended)", id="wiz-finish-benchmark", variant="success"),
-                    Button("Start worker now", id="wiz-finish-start", variant="primary"),
-                    Button("Save and stay stopped", id="wiz-finish-stay", variant="default"),
-                    Static("", id="wiz-finish-error", classes="wiz-error"),
-                    id="wiz-step-4",
-                    classes="wiz-step",
-                )
-            with Horizontal(id="wizard-nav"):
-                yield Button("Back", id="wizard-back")
-                yield Button("Next", id="wizard-next", variant="primary")
-                yield Button("Cancel", id="wizard-cancel")
-                yield Static(id="wizard-progress")
+        """Lay out the explanation, the presets, the fields that must be filled, and the save action."""
+        with VerticalScroll(id="gs-page"):
+            yield Static("Getting started", classes="horde-hero horde-card-title")
+            yield Static(_WHAT_IS_THE_HORDE, id="gs-what-is", classes="horde-card")
+            yield Static(_WHAT_IS_NEEDED, id="gs-what-needed", classes="horde-card")
+            yield Static("", id="gs-backend-warning", classes="gs-error")
+            yield Static("What will this computer offer?", classes="horde-card-title")
+            with Vertical(id="gs-presets"):
+                for preset in PRESETS:
+                    with Vertical(id=f"gs-preset-{preset.kind.value}", classes="horde-card gs-preset"):
+                        yield Static(id=f"gs-preset-{preset.kind.value}-body")
+                        yield Button("Choose this", id=f"gs-choose-{preset.kind.value}")
+            yield Static(id="gs-selection", classes="horde-card")
+            with Horizontal(classes="horde-actions"):
+                yield Button("Choose my own models instead", id="gs-browse")
+            yield Static("Your details", classes="horde-card-title")
+            with Vertical(classes="horde-card"):
+                yield Static("Worker name (public, and unique on the horde)")
+                yield Input(placeholder="Worker name", id="gs-name")
+                yield Static("", id="gs-name-error", classes="gs-error")
+                yield Static(f"API key (free from {REGISTER_URL}; without one, kudos are not kept)")
+                yield Input(placeholder="API key", password=True, id="gs-api-key")
+                yield Static("", id="gs-api-key-error", classes="gs-error")
+                with Vertical(id="gs-civitai"):
+                    yield Static(
+                        "Civitai token (optional). LoRA files download from Civitai as jobs ask for "
+                        "them, and some refuse anonymous downloads; a token from a free Civitai "
+                        "account gets those.",
+                    )
+                    yield Input(placeholder="Civitai API token", password=True, id="gs-civitai-token")
+                with Horizontal(classes="gs-field-row"):
+                    yield Switch(id="gs-nsfw")
+                    yield Static(
+                        "Accept adult requests. With this off, this computer is only asked for safe-for-work images.",
+                    )
+            with Horizontal(classes="horde-actions"):
+                yield Button("Save and close", id="gs-save", variant="success")
+                yield Button("Close without saving", id="gs-close")
+            yield Static("", id="gs-save-error", classes="gs-error")
 
     def on_mount(self) -> None:
-        """Render the first step and the hardware-aware hints."""
-        self._update_backend_warning()
-        self.query_one("#wiz-models-detected", Static).update(self._vram_detection_text())
-        self._update_models_summary()
-        self._show_step(0)
+        """Initialise once the composed children are fully mounted.
 
-    def _update_backend_warning(self) -> None:
-        """Show a warning on the welcome step when an NVIDIA GPU is paired with the CPU torch build."""
-        self.query_one("#wiz-backend-warning", Static).update(self._backend_mismatch_warning())
+        The screen's own mount fires while its nested compose results can still be mounting, so a query
+        from here can miss a widget inside a nested container. Deferring one refresh removes the race.
+        """
+        self.call_after_refresh(self._initialise)
+
+    def _initialise(self) -> None:
+        """Seed the fields from any existing config, render the presets, and load the catalog if needed."""
+        self.query_one("#gs-backend-warning", Static).update(self._backend_mismatch_warning())
+        self._seed_from_config()
+        self._refresh_presets()
+        self._start_catalog_load()
+        # The page opens on its explanation, which is the reason it exists. Focusing a field would
+        # scroll the reader past it, so the first field is reached by Tab or by clicking it.
+        self.query_one("#gs-page", VerticalScroll).scroll_home(animate=False)
+
+    def _seed_from_config(self) -> None:
+        """Pre-fill the fields with what bridgeData already holds, ignoring the template placeholders."""
+        try:
+            data = load_config(self._config_path)
+        except Exception:  # noqa: BLE001 - an unreadable config just means nothing to pre-fill
+            return
+        name = _config_str(data, "dreamer_name")
+        if name and name != DEFAULT_DREAMER_NAME:
+            self.query_one("#gs-name", Input).value = name
+        api_key = _config_str(data, "api_key")
+        if api_key and api_key != DEFAULT_API_KEY:
+            self.query_one("#gs-api-key", Input).value = api_key
+        with_nsfw = data.get("nsfw") if hasattr(data, "get") else None
+        self.query_one("#gs-nsfw", Switch).value = bool(with_nsfw)
+        civitai_token = _config_str(data, "civitai_api_token")
+        if civitai_token:
+            self.query_one("#gs-civitai-token", Input).value = civitai_token
 
     def _backend_mismatch_warning(self) -> str:
         """Text warning of an installed CPU build despite a detected NVIDIA GPU, else ``""``.
 
-        NVML talks to the driver, not torch, so a present GPU still reports its VRAM even when the CPU
-        wheel is installed; pairing that with a ``+cpu`` build is the classic "why is it so slow" trap.
-        When NVML reports nothing (no NVIDIA telemetry) there is nothing to compare against.
+        The device probe talks to the driver, not torch, so a present GPU still reports its VRAM even
+        when the CPU wheel is installed; pairing that with a ``+cpu`` build is the classic "why is it so
+        slow" trap. When no device telemetry is available there is nothing to compare against.
         """
         if self._detected_vram_mb is None:
             return ""
@@ -323,114 +532,123 @@ class SetupWizardModal(ModalScreen["WizardOutcome | None"]):
             )
         return ""
 
-    def _vram_detection_text(self) -> Text:
-        """A grey hint stating the detected VRAM and the default model tier it implies."""
-        if self._detected_vram_mb is None:
-            return Text(
-                "Could not detect GPU memory; defaulting to a conservative Top 3 (change it below).",
-                "grey62",
-            )
-        gb = self._detected_vram_mb / 1024
-        return Text(
-            f"Detected ~{gb:.0f} GB VRAM; defaulting to Top {self._default_top_n} (change it below).",
-            "grey62",
+    # region presets
+
+    def _start_catalog_load(self) -> None:
+        """Load the catalog and usage stats off the UI thread when they are not already cached."""
+        if _testing_mode():
+            return
+        catalog, popularity = _catalog_state()
+        if catalog is not None and popularity is not None:
+            return
+        self.run_worker(self._load_catalog_blocking, thread=True, exclusive=True, group="getting-started-catalog")
+
+    def _load_catalog_blocking(self) -> None:
+        """Blocking catalog load for the worker thread; a failure leaves the presets unpriced."""
+        from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+        try:
+            CATALOG_CACHE.ensure_loaded(want_popularity=True)
+        except Exception:  # noqa: BLE001 - offline is a quieter page, never an error state
+            return
+        self.app.call_from_thread(self._refresh_presets)
+
+    def _refresh_presets(self) -> None:
+        """Recompute every preset's models and disk cost, and redraw the cards."""
+        catalog, popularity = _catalog_state()
+        self._plans = build_preset_plans(
+            catalog,
+            popularity,
+            _catalog_records(),
+            total_vram_mb=self._detected_vram_mb,
         )
+        for preset in PRESETS:
+            plan = self._plans[preset.kind]
+            self.query_one(f"#gs-preset-{preset.kind.value}-body", Static).update(self._preset_text(preset, plan))
+            card = self.query_one(f"#gs-preset-{preset.kind.value}", Vertical)
+            card.set_class(preset.kind is self._chosen, "-chosen")
+            button = self.query_one(f"#gs-choose-{preset.kind.value}", Button)
+            button.disabled = not plan.selectable
+            button.label = "Chosen" if preset.kind is self._chosen else "Choose this"
+        self._update_selection_text()
+        self._update_civitai_visibility()
 
-    @staticmethod
-    def _welcome_text() -> Text:
-        """The opening explanation."""
-        return Text.assemble(
-            ("Let's get your worker earning kudos.\n\n", "bold"),
-            (
-                "This quick setup asks for your API key and a worker name, lets you pick which models to "
-                "serve, and then starts the worker. It takes about a minute.",
-                "grey70",
-            ),
-        )
+    def _update_civitai_visibility(self) -> None:
+        """Show the Civitai token only while the chosen stance accepts LoRA work, which is what needs it."""
+        wants_lora = PRESETS_BY_KIND[self._chosen].features.get("allow_lora", False)
+        self.query_one("#gs-civitai", Vertical).display = wants_lora
 
-    def _show_step(self, index: int) -> None:
-        """Display step ``index`` only, and update the title, nav buttons, and progress text."""
-        self._step = index
-        for step in range(len(_STEP_TITLES)):
-            self.query_one(f"#wiz-step-{step}", Vertical).display = step == index
-        self.query_one("#wizard-title", Static).update(_STEP_TITLES[index])
-        self.query_one("#wizard-back", Button).display = index > 0
-        # The final step's own buttons commit the choice, so the generic Next is hidden there.
-        self.query_one("#wizard-next", Button).display = index < _FINAL_STEP
-        self.query_one("#wizard-progress", Static).update(f"{index + 1} / {len(_STEP_TITLES)}")
-        if index == 1:
-            self.query_one("#wiz-api-key", Input).focus()
-        elif index == 2:
-            self.query_one("#wiz-name", Input).focus()
+    def _preset_text(self, preset: Preset, plan: PresetPlan) -> Text:
+        """The body of one preset card: what it offers, what it accepts, and what it costs."""
+        heading = preset.title
+        if preset.kind is SUGGESTED_PRESET:
+            heading += "  (suggested)"
+        if preset.kind is self._chosen:
+            heading += "  ✓"
+        body = Text.assemble((f"{heading}\n", "bold"), (f"{preset.offer}\n", ""), (f"{preset.stance}\n", "grey70"))
+        style = "grey70" if plan.selectable else "yellow"
+        body.append(plan.disk_sentence(), style)
+        return body
 
-    def _update_models_summary(self) -> None:
-        """Reflect the current model selection in the step-3 summary line and Civitai guidance."""
-        summary = ", ".join(self._models) if self._models else "(none selected)"
-        self.query_one("#wiz-models-summary", Static).update(
-            Text.assemble(("Selected: ", "grey62"), (summary, "bold")),
-        )
-        self._update_civitai_help()
+    def _update_selection_text(self) -> None:
+        """List the models the current choice will load, so the download is never a surprise."""
+        static = self.query_one("#gs-selection", Static)
+        if self._custom_models is not None:
+            names = ", ".join(self._custom_models) or "(none)"
+            static.update(Text.assemble(("Your own selection: ", "grey62"), (names, "bold")))
+            return
+        plan = self._plans.get(self._chosen)
+        title = PRESETS_BY_KIND[self._chosen].title
+        if plan is None or not plan.model_names:
+            detail = "the model list loads when the catalog is available"
+            static.update(Text.assemble((f"{title}: ", "grey62"), (detail, "grey70")))
+            return
+        static.update(Text.assemble((f"{title} loads: ", "grey62"), (", ".join(plan.model_names), "bold")))
 
-    def _has_meta_selection(self) -> bool:
-        """Whether the current selection contains a meta instruction (``top N`` and friends)."""
-        return any(is_meta_instruction(name) for name in self._models)
+    def _choose(self, kind: PresetKind) -> None:
+        """Adopt a preset, discarding any hand-picked list so the two cannot silently disagree."""
+        self._chosen = kind
+        self._custom_models = None
+        self._refresh_presets()
 
-    def _update_civitai_help(self) -> None:
-        """Make the Civitai token read as recommended (not merely optional) for meta selections.
+    def _browse_models(self) -> None:
+        """Open the model picker seeded with the current selection."""
+        exclude = {entry for entry in self._model_entries() if not is_meta_instruction(entry)}
+        self.app.push_screen(ModelPickerModal(exclude=exclude), self._on_models_chosen)
 
-        ``top N`` and ``all`` style selections routinely pull popular models and LoRAs that the horde
-        cannot fetch without a token, and that failure otherwise surfaces deep into the download.
-        """
-        help_static = self.query_one("#wiz-civitai-help", Static)
-        warn_static = self.query_one("#wiz-civitai-warning", Static)
-        if self._has_meta_selection():
-            help_static.update(
-                Text.assemble(
-                    ("Civitai API token ", ""),
-                    ("(recommended). ", "yellow"),
-                    ("Top-N selections usually need it to download popular models and LoRAs.", "grey70"),
-                ),
-            )
-            warn_static.update(
-                ""
-                if self._civitai_token()
-                else "Heads up: without a Civitai token, some of these models may fail to download.",
-            )
-        else:
-            help_static.update(
-                Text.assemble(
-                    ("Civitai API token ", ""),
-                    ("(optional). ", "grey70"),
-                    ("Some models and LoRAs need it to download.", "grey70"),
-                ),
-            )
-            warn_static.update("")
+    def _on_models_chosen(self, chosen: ModelPickerResult | list[str] | None) -> None:
+        """Adopt a hand-picked model list, which replaces the chosen preset's model entries."""
+        if isinstance(chosen, ModelPickerResult):
+            chosen = chosen.add
+        if not chosen:
+            return
+        self._custom_models = list(chosen)
+        self._update_selection_text()
 
-    # region step validation / navigation
+    def _model_entries(self) -> list[str]:
+        """The ``models_to_load`` entries the current choice would write."""
+        if self._custom_models is not None:
+            return list(self._custom_models)
+        plan = self._plans.get(self._chosen)
+        if plan is not None and plan.entries:
+            return list(plan.entries)
+        return suggested_default_models()
+
+    # endregion
+
+    # region validation
 
     def _api_key(self) -> str:
         """The trimmed API key currently entered."""
-        return self.query_one("#wiz-api-key", Input).value.strip()
+        return self.query_one("#gs-api-key", Input).value.strip()
 
     def _worker_name(self) -> str:
         """The trimmed worker name currently entered."""
-        return self.query_one("#wiz-name", Input).value.strip()
-
-    def _civitai_token(self) -> str:
-        """The trimmed Civitai API token currently entered (empty when the user left it blank)."""
-        return self.query_one("#wiz-civitai-token", Input).value.strip()
-
-    def _validate_step(self, index: int) -> bool:
-        """Validate the step the user is leaving, surfacing an inline error and blocking on failure."""
-        if index == 1:
-            return self._validate_api_key()
-        if index == 2:
-            return self._validate_name()
-        return True
+        return self.query_one("#gs-name", Input).value.strip()
 
     def _validate_api_key(self) -> bool:
         """Require a non-empty, non-placeholder API key."""
-        error = self.query_one("#wiz-api-key-error", Static)
+        error = self.query_one("#gs-api-key-error", Static)
         key = self._api_key()
         if not key or key == DEFAULT_API_KEY:
             error.update("Enter your API key (the default placeholder will not work).")
@@ -440,28 +658,13 @@ class SetupWizardModal(ModalScreen["WizardOutcome | None"]):
 
     def _validate_name(self) -> bool:
         """Require a non-empty worker name that is not the default placeholder."""
-        error = self.query_one("#wiz-name-error", Static)
+        error = self.query_one("#gs-name-error", Static)
         name = self._worker_name()
         if not name or name == DEFAULT_DREAMER_NAME:
             error.update("Choose a unique worker name (not the default).")
             return False
         error.update("")
         return True
-
-    def _advance(self) -> None:
-        """Move to the next step if the current one validates, kicking off advisory horde checks."""
-        leaving = self._step
-        if not self._validate_step(leaving):
-            return
-        self._show_step(min(leaving + 1, _FINAL_STEP))
-        if leaving == 1:
-            self._run_advisory(self._advisory_key_check(self._api_key()), group="key-check")
-        elif leaving == 2:
-            self._run_advisory(self._advisory_name_check(self._worker_name()), group="name-check")
-
-    def _retreat(self) -> None:
-        """Move to the previous step."""
-        self._show_step(max(self._step - 1, 0))
 
     def _run_advisory(self, coro: Coroutine[Any, Any, None], *, group: str) -> None:
         """Run an advisory coroutine off the UI thread, or discard it under the test harness."""
@@ -498,93 +701,74 @@ class SetupWizardModal(ModalScreen["WizardOutcome | None"]):
 
     # endregion
 
-    # region model selection
-
-    def _set_meta(self, kind: MetaKind, count: int = 1) -> None:
-        """Replace the selection with a single meta instruction."""
-        self._models = [build_meta_instruction(kind, count)]
-        self._update_models_summary()
-
-    def _browse_models(self) -> None:
-        """Open the full model picker; chosen literal models replace the current selection."""
-        exclude = {name for name in self._models if not is_meta_instruction(name)}
-        self.app.push_screen(ModelPickerModal(exclude=exclude), self._on_models_chosen)
-
-    def _on_models_chosen(self, chosen: ModelPickerResult | list[str] | None) -> None:
-        """Apply the picker result, keeping any existing meta commands alongside picked models."""
-        if isinstance(chosen, ModelPickerResult):
-            chosen = chosen.add
-        if not chosen:
+    def _save(self) -> None:
+        """Write the keys this page owns into bridgeData and dismiss, leaving every other key alone."""
+        name_ok = self._validate_name()
+        key_ok = self._validate_api_key()
+        if not (name_ok and key_ok):
             return
-        metas = [name for name in self._models if is_meta_instruction(name)]
-        self._models = metas + chosen
-        self._update_models_summary()
-
-    # endregion
-
-    def _finish(self, outcome: WizardOutcome) -> None:
-        """Persist the collected settings to bridgeData and dismiss with the chosen next action."""
-        error = self.query_one("#wiz-finish-error", Static)
+        error = self.query_one("#gs-save-error", Static)
+        features = PRESETS_BY_KIND[self._chosen].features
         try:
             data = load_config(self._config_path)
             data["api_key"] = self._api_key()
             data["dreamer_name"] = self._worker_name()
-            data["models_to_load"] = self._models
-            civitai_token = self._civitai_token()
+            data["models_to_load"] = self._model_entries()
+            data["nsfw"] = self.query_one("#gs-nsfw", Switch).value
+            for key in FEATURE_KEYS:
+                data[key] = features.get(key, False)
+            civitai_token = self.query_one("#gs-civitai-token", Input).value.strip()
+            # An empty field means "leave whatever is there": the token is also settable on the Config
+            # tab, and a preset without LoRA hides this field entirely, so a blank is never a removal.
             if civitai_token:
                 data["civitai_api_token"] = civitai_token
             save_config(data, self._config_path)
         except OSError as write_error:
             error.update(f"Could not write {self._config_path}: {write_error}")
             return
-        self.dismiss(outcome)
+        self.dismiss(True)
 
-    def action_cancel(self) -> None:
-        """Abandon setup without saving; the dashboard stays usable and the worker stopped."""
-        self.dismiss(None)
+    def action_close(self) -> None:
+        """Leave the page without writing anything; the dashboard stays usable."""
+        self.dismiss(False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Route nav, model-quick-pick, and finish buttons."""
+        """Route the preset choices, the picker, and the save/close actions."""
         button_id = event.button.id or ""
-        if button_id == "wizard-next":
-            self._advance()
-        elif button_id == "wizard-back":
-            self._retreat()
-        elif button_id == "wizard-cancel":
-            self.action_cancel()
-        elif button_id == "wiz-models-top1":
-            self._set_meta(MetaKind.TOP_N, 1)
-        elif button_id == "wiz-models-top3":
-            self._set_meta(MetaKind.TOP_N, 3)
-        elif button_id == "wiz-models-top5":
-            self._set_meta(MetaKind.TOP_N, 5)
-        elif button_id == "wiz-models-sd15":
-            self._set_meta(MetaKind.ALL_SD15)
-        elif button_id == "wiz-models-browse":
+        if button_id.startswith("gs-choose-"):
+            self._choose(PresetKind(button_id.removeprefix("gs-choose-")))
+        elif button_id == "gs-browse":
             self._browse_models()
-        elif button_id == "wiz-finish-benchmark":
-            self._finish(WizardOutcome.BENCHMARK)
-        elif button_id == "wiz-finish-start":
-            self._finish(WizardOutcome.START)
-        elif button_id == "wiz-finish-stay":
-            self._finish(WizardOutcome.STAY_STOPPED)
+        elif button_id == "gs-save":
+            self._save()
+        elif button_id == "gs-close":
+            self.action_close()
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        """Refresh the Civitai guidance live as the token field is typed."""
-        if event.input.id == "wiz-civitai-token":
-            self._update_civitai_help()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Pressing Enter in a step's input advances, matching the Next button."""
-        if self._step in (1, 2):
-            self._advance()
+    def on_input_blurred(self, event: Input.Blurred) -> None:
+        """Ask the horde about a completed field, without ever blocking the page on the answer."""
+        value = event.input.value.strip()
+        if not value:
+            return
+        if event.input.id == "gs-name" and value != DEFAULT_DREAMER_NAME:
+            self._run_advisory(self._advisory_name_check(value), group="name-check")
+        elif event.input.id == "gs-api-key" and value != DEFAULT_API_KEY:
+            self._run_advisory(self._advisory_key_check(value), group="key-check")
 
 
 __all__ = [
     "DEFAULT_API_KEY",
     "DEFAULT_DREAMER_NAME",
-    "SetupWizardModal",
-    "WizardOutcome",
+    "FEATURE_KEYS",
+    "PRESETS",
+    "PRESETS_BY_KIND",
+    "SUGGESTED_PRESET",
+    "GettingStartedScreen",
+    "Preset",
+    "PresetKind",
+    "PresetPlan",
+    "build_preset_plans",
     "is_setup_incomplete",
+    "preset_entries",
+    "resolve_preset_models",
     "suggested_default_models",
 ]
