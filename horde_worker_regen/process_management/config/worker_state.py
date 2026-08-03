@@ -40,6 +40,14 @@ class PopPauseOwner(enum.StrEnum):
     """The safety soft-pause armed the pause because a generated result could not be safety-checked."""
 
 
+POP_NO_JOBS_EVIDENCE_WINDOW_SECONDS = 60.0
+"""How recently a pop attempt must have concluded for its no-jobs verdict to still describe the present.
+
+Comfortably longer than the pop loop's own cadence, so an ordinary worker's evidence never lapses between
+attempts, and short enough that a popper which has stopped attempting stops excusing anything within one
+recovery cycle."""
+
+
 class RecoveryParkReason(enum.StrEnum):
     """Which exhausted escalation put the worker into a recovery park (see :attr:`WorkerState.recovery_parked`).
 
@@ -64,6 +72,28 @@ class WorkerState:
     last_job_pop_time: float = 0.0
     last_pop_no_jobs_available: bool = False
     last_pop_maintenance_mode: bool = False
+
+    last_pop_gate: str | None = None
+    """Short stable name of the gate currently holding job pops, or None when the last cycle reached the API.
+
+    The pop coroutine returns early at any of a dozen preconditions, most of them without a log line of their
+    own, so a worker held at one of them looks exactly like a worker the horde has no work for. Naming the
+    gate is what lets the liveness sentinel and the operator surfaces report which condition is in force."""
+
+    last_pop_gate_since: float = 0.0
+    """Wall-clock time :attr:`last_pop_gate` last changed to its current name.
+
+    Stamped on the name change rather than every tick, so it measures how long this gate has held rather than
+    when it was last observed."""
+
+    last_pop_attempt_completed_at: float = 0.0
+    """Wall-clock time the most recent pop attempt against the horde concluded, whether it returned work, no
+    work, or an error.
+
+    This is the worker's proof that its only intake path is still running end to end. Seeded when the pop
+    loop starts, so a worker that never completes an attempt measures its silence from the loop's start
+    rather than from the epoch."""
+
     server_maintenance_cleared_by_job_pop: bool = False
     """A real popped job proved the horde is sending work again, even if worker-details polling is stale."""
 
@@ -390,6 +420,23 @@ class WorkerState:
         if not self.shutting_down:
             self.shutting_down = True
             self.shutting_down_time = time.time()
+
+    def pop_no_jobs_evidence_fresh(
+        self,
+        now: float,
+        *,
+        window_seconds: float = POP_NO_JOBS_EVIDENCE_WINDOW_SECONDS,
+    ) -> bool:
+        """Return whether the "the horde had no jobs" verdict still describes the present.
+
+        :attr:`last_pop_no_jobs_available` records what the *last completed* pop attempt was told. It is not
+        a live reading: once the pop loop stops producing attempts (held at a gate, or wedged mid-request)
+        the flag freezes at whatever it last said. Consumers that suppress work on the strength of it must
+        pair it with the attempt time, or a worker whose intake has stopped keeps excusing itself forever.
+        """
+        if not self.last_pop_no_jobs_available:
+            return False
+        return (now - self.last_pop_attempt_completed_at) <= window_seconds
 
     def last_pop_recently(self) -> bool:
         """Return True if a job was popped within the last 10 seconds."""

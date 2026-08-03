@@ -106,3 +106,26 @@ class TestSnapshotShape:
 
         names = [v.name for v in registry.views(now=20.0, session_elapsed_seconds=20.0)]
         assert names[0] == "b_live"  # still active sorts ahead of the released one
+
+
+class TestAnyActive:
+    """``any_active`` answers "is some known condition holding pops right now" from tracked state."""
+
+    def test_no_governors_reported_means_nothing_is_holding(self) -> None:
+        """A registry that has never been fed reports nothing engaged."""
+        assert PopGovernorRegistry(log=lambda _line: None).any_active() is False
+
+    def test_an_open_spell_reads_as_active(self) -> None:
+        """A governor mid-spell is exactly what a caller asking this question wants to know about."""
+        registry = PopGovernorRegistry(log=lambda _line: None)
+        registry.update([_reading(active=True)], now=0.0)
+
+        assert registry.any_active() is True
+
+    def test_a_closed_spell_does_not_linger(self) -> None:
+        """History is not engagement: a released governor no longer explains a quiet worker."""
+        registry = PopGovernorRegistry(log=lambda _line: None)
+        registry.update([_reading(active=True)], now=0.0)
+        registry.update([_reading(active=False)], now=10.0)
+
+        assert registry.any_active() is False

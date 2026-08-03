@@ -53,24 +53,18 @@ class SourceImageDownloader:
             logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
             return job_pop_response
 
-        source_image_is_url = job_pop_response.source_image is not None and job_pop_response.source_image.startswith(
-            "http",
-        )
+        (
+            source_image_is_url,
+            source_mask_is_url,
+            any_extra_source_images_are_urls,
+        ) = self._url_backed_media(job_pop_response)
+
         if source_image_is_url:
             logger.debug(f"Source image for job {job_pop_response.id_} is a URL")
-
-        source_mask_is_url = job_pop_response.source_mask is not None and job_pop_response.source_mask.startswith(
-            "http",
-        )
         if source_mask_is_url:
             logger.debug(f"Source mask for job {job_pop_response.id_} is a URL")
-
-        any_extra_source_images_are_urls = False
-        if job_pop_response.extra_source_images is not None:
-            for extra_source_image in job_pop_response.extra_source_images:
-                if extra_source_image.image.startswith("http"):
-                    any_extra_source_images_are_urls = True
-                    logger.debug(f"Extra source image for job {job_pop_response.id_} is a URL")
+        if any_extra_source_images_are_urls:
+            logger.debug(f"Extra source images for job {job_pop_response.id_} include URLs")
 
         attempts = 0
         while attempts < MAX_SOURCE_IMAGE_RETRIES:
@@ -131,6 +125,41 @@ class SourceImageDownloader:
             )
 
         return job_pop_response
+
+    @staticmethod
+    def _url_backed_media(job_pop_response: ImageGenerateJobPopResponse) -> tuple[bool, bool, bool]:
+        """Return whether the source image, source mask, and any extra source image are URL-backed."""
+        source_image_is_url = job_pop_response.source_image is not None and job_pop_response.source_image.startswith(
+            "http",
+        )
+        source_mask_is_url = job_pop_response.source_mask is not None and job_pop_response.source_mask.startswith(
+            "http",
+        )
+        any_extra_source_images_are_urls = job_pop_response.extra_source_images is not None and any(
+            extra_source_image.image.startswith("http") for extra_source_image in job_pop_response.extra_source_images
+        )
+
+        return source_image_is_url, source_mask_is_url, any_extra_source_images_are_urls
+
+    async def record_download_faults(self, job_pop_response: ImageGenerateJobPopResponse) -> None:
+        """Record faults for any URL-backed source media still missing from ``job_pop_response``.
+
+        Callers that abandon a download rather than letting the retry loop exhaust itself use this so the
+        job carries the same faults it would have carried had the retries run out.
+        """
+        if job_pop_response.id_ is None:
+            logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
+            return
+
+        source_image_is_url, source_mask_is_url, any_extra_source_images_are_urls = self._url_backed_media(
+            job_pop_response,
+        )
+        await self._record_download_faults(
+            job_pop_response,
+            source_image_is_url=source_image_is_url,
+            source_mask_is_url=source_mask_is_url,
+            any_extra_source_images_are_urls=any_extra_source_images_are_urls,
+        )
 
     async def _record_download_faults(
         self,

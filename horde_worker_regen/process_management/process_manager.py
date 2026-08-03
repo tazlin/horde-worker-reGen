@@ -902,6 +902,27 @@ re-earns the pause. This is a remediation check rather than a timer: the cause i
 removed (quarantined model, breaker pause) and the quiet is the evidence."""
 
 
+POP_LIVENESS_WARN_SECONDS = 60.0
+"""How long the worker may go without a pop attempt reaching the horde before it says so.
+
+Long enough that no ordinary gate (a full queue, the pop-frequency interval, a brief backlog) trips it, and
+short enough that an operator watching a live worker learns of a silent intake path within a minute."""
+
+POP_LIVENESS_ERROR_SECONDS = 300.0
+"""Silence past which a held intake path is treated as a wedge rather than a slow patch.
+
+At this point the worker has served nothing for minutes with no governor and no pause to account for it, so
+the condition is escalated from a notice to an error."""
+
+POP_LIVENESS_NON_EXPLAINING_GOVERNORS: frozenset[str] = frozenset({"pop_error_backoff"})
+"""Governor spells the pop-liveness sentinel must not accept as an explanation for absent pop attempts.
+
+Error backoff slows pops to a few seconds per attempt and never stops them, so it cannot account for a
+minute of silence; and its spell only closes when an attempt completes, so a failed pop followed by a
+latched gate would otherwise hold it open and mute the sentinel for exactly the wedges it exists to
+disclose."""
+
+
 class HordeWorkerProcessManager:
     """Manages and controls processes to act as a horde worker."""
 
@@ -1786,6 +1807,12 @@ class HordeWorkerProcessManager:
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
         # tick by _update_pop_governors so its ENTER/EXIT log lines fire regardless of whether a TUI is attached.
         self._pop_governor_registry = PopGovernorRegistry()
+
+        # Edge state for the pop-liveness sentinel: the attempt stamp each edge was armed against, so a
+        # completed attempt re-arms both, and the times the notice and the escalation last fired.
+        self._pop_liveness_attempt_seen = 0.0
+        self._pop_liveness_warned_at = 0.0
+        self._pop_liveness_errored_at = 0.0
 
         self._alchemy_coordinator = AlchemyCoordinator(
             state=self._state,
@@ -3877,6 +3904,7 @@ class HordeWorkerProcessManager:
                 logger.info("Clearing cached worker-details maintenance: a new job was popped successfully.")
                 self._worker_details_maintenance = False
             self.detect_deadlock()
+            self._check_pop_liveness(time.time())
             # A drain read wedged past its threshold with backlog present is a corrupt shared channel: the
             # dispatcher logs it and escalates to a terminal restart, since no in-place recovery can clear it.
             self._message_dispatcher.check_message_channel_health()
@@ -4745,6 +4773,61 @@ class HordeWorkerProcessManager:
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything."""
         self._message_dispatcher.detect_deadlock()
+
+    def _pop_liveness_line(self, now: float, silent_seconds: float) -> str:
+        """Compose the disclosure for a pop loop that has not reached the horde for ``silent_seconds``."""
+        gate = self._state.last_pop_gate
+        if gate is None:
+            return (
+                f"Pop liveness: no pop attempt has reached the horde for {silent_seconds:.0f}s, and no gate is "
+                "holding pops back, so a pop request is still outstanding or the pop loop is no longer running. "
+                "Restart the worker if this does not clear on its own."
+            )
+        held_seconds = now - self._state.last_pop_gate_since
+        return (
+            f"Pop liveness: no pop attempt has reached the horde for {silent_seconds:.0f}s; pops are held at "
+            f"gate '{gate}' (held {held_seconds:.0f}s). The worker is serving nothing while that gate stands, "
+            "so check whatever it waits on (the inference pool, the local queue, or the downstream stages)."
+        )
+
+    def _check_pop_liveness(self, now: float) -> None:
+        """Disclose an intake path that has gone silent, naming the gate that is holding it.
+
+        Every early return in the pop coroutine is silent by itself, so a worker held at one of them is
+        indistinguishable in the log from a worker the horde has no work for. This turns that silence into a
+        line an operator can act on. It stays quiet whenever the silence is already accounted for: intake
+        held worker-wide is the operator's own doing, and a governor with an open spell logs its own
+        boundaries. Disclosure only; the remedies live with the watchdogs that own each condition.
+        """
+        last_attempt = self._state.last_pop_attempt_completed_at
+        if last_attempt != self._pop_liveness_attempt_seen:
+            # An attempt concluded, so this episode of silence is over; re-arm for the next one.
+            self._pop_liveness_attempt_seen = last_attempt
+            self._pop_liveness_warned_at = 0.0
+            self._pop_liveness_errored_at = 0.0
+
+        silent_seconds = now - last_attempt
+        if silent_seconds < POP_LIVENESS_WARN_SECONDS:
+            return
+        if self._state.workload_intake_paused:
+            return
+        # The error-backoff spell must not excuse the silence: it only stretches the pop cadence to a few
+        # seconds and it can only close when an attempt completes, so treating it as an explanation would
+        # let one failed pop followed by a latched gate mute this sentinel forever.
+        if self._pop_governor_registry.any_active(ignore=POP_LIVENESS_NON_EXPLAINING_GOVERNORS):
+            return
+
+        if silent_seconds >= POP_LIVENESS_ERROR_SECONDS:
+            if self._pop_liveness_errored_at == 0.0 or (now - self._pop_liveness_errored_at) >= (
+                POP_LIVENESS_ERROR_SECONDS
+            ):
+                self._pop_liveness_errored_at = now
+                logger.error(self._pop_liveness_line(now, silent_seconds))
+            return
+
+        if self._pop_liveness_warned_at == 0.0:
+            self._pop_liveness_warned_at = now
+            logger.warning(self._pop_liveness_line(now, silent_seconds))
 
     def _has_post_inference_image_work(self) -> bool:
         """Return whether accepted image work remains after the inference stage."""

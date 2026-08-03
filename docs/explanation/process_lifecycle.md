@@ -142,6 +142,33 @@ post-processing stall. Post-processing runs on the dedicated lane (see
 only that lane; the affected job is requeued by the orphan watchdog and, after
 bounded re-attempts, is reported as a no-image fault so the horde can reissue it.
 
+One of these conditions is conditional on the horde having work. A slot silent in
+`WAITING_FOR_JOB` "while there is work to do" is only stuck if there *was* work,
+so that condition alone is suppressed while the last completed pop reported no
+jobs available, and a genuine lull cannot churn healthy idle processes. The
+suppression requires that evidence to be **fresh**
+(`WorkerState.pop_no_jobs_evidence_fresh`, a 60s window): the no-jobs flag
+describes the last pop attempt that reached the horde, so a worker whose pop loop
+has stopped attempting freezes it at its last value. Without the freshness
+requirement a pool whose every slot wedges in `PROCESS_STARTING` would silence the
+popper (it never reaches the API), which would in turn disable the only watchdog
+that could free a slot. The startup, preload, and post-processing conditions are
+never suppressed: those wedges have nothing to do with what the horde is sending.
+
+The pop loop's own silence is disclosed separately. Each control-loop tick,
+`_check_pop_liveness()` compares now against the last completed pop attempt; past
+60 seconds it logs one warning naming the gate the pop coroutine is currently
+held at (`WorkerState.last_pop_gate`, for example `no_inference_process` or
+`queue_full`) and how long that gate has held, escalating once to an error at 300
+seconds. It stays quiet when intake is deliberately paused worker-wide or a
+tracked [pop governor](performance_and_backpressure.md) has an open spell, since
+both already account for the silence. The pop error-backoff spell is the one
+exception: it only stretches the pop cadence to a few seconds and closes solely
+when an attempt completes, so it can never account for a total absence of
+attempts and is not accepted as an explanation. A silence with *no* gate named means a pop
+request is still outstanding or the loop is gone, and the line says so. The
+sentinel only discloses; recovery belongs to the watchdogs above.
+
 When a process exceeds its timeout, it is ended immediately within the same call
 (see below); there is no separate notification sent to the message dispatcher.
 The replacement start normally happens in that same pass, but GPU-bearing

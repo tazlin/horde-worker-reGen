@@ -4011,6 +4011,11 @@ class ProcessLifecycleManager:
         # current verdict. Read once so every slot is judged against the same snapshot this tick.
         paging_victims = self._wddm_paging_victims_provider(WDDM_PAGING_VICTIM_MAX_AGE_SECONDS)
 
+        # Read once so every condition this tick is judged against the same verdict. Freshness matters as
+        # much as the flag: a pool whose slots are all wedged silences the popper, which freezes the flag at
+        # its last value, so the raw flag alone would disable the only remedy for that wedge.
+        no_jobs_evidence_fresh = self._state.pop_no_jobs_evidence_fresh(now)
+
         for process_info in list(self._process_map.values()):
             if self._replace_if_paged_and_slow(process_info, paging_victims, now):
                 any_replaced = True
@@ -4097,11 +4102,16 @@ class ProcessLifecycleManager:
                     daemon=True,
                 ).start()
             else:
-                conditions: list[tuple[float, HordeProcessState, str, bool]] = [
+                # (timeout, state, message, use_state_duration, suppressed_by_fresh_no_jobs_evidence). Only
+                # the idle condition is about work arriving, so only it is excused while the horde is known
+                # to have nothing: a slot that cannot finish starting, preloading, or post-processing is
+                # broken whatever the horde is sending.
+                conditions: list[tuple[float, HordeProcessState, str, bool, bool]] = [
                     (
                         bridge_data.preload_timeout,
                         HordeProcessState.PRELOADING_MODEL,
                         "seems to be stuck preloading a model",
+                        False,
                         False,
                     ),
                     (
@@ -4109,11 +4119,13 @@ class ProcessLifecycleManager:
                         HordeProcessState.PROCESS_STARTING,
                         "seems to be stuck starting",
                         False,
+                        False,
                     ),
                     (
                         bridge_data.post_process_timeout + (3 * bridge_data.max_batch),
                         HordeProcessState.POST_PROCESSING,
                         "seems to be stuck post processing",
+                        False,
                         False,
                     ),
                     (
@@ -4121,12 +4133,13 @@ class ProcessLifecycleManager:
                         HordeProcessState.WAITING_FOR_JOB,
                         "seems to be stuck idle (silent) while there is work to do",
                         False,
+                        True,
                     ),
                 ]
-                if self._state.last_pop_no_jobs_available:
-                    continue
 
-                for timeout, state, error_message, use_state_duration in conditions:
+                for timeout, state, error_message, use_state_duration, suppressed_when_no_jobs in conditions:
+                    if suppressed_when_no_jobs and no_jobs_evidence_fresh:
+                        continue
                     if self._check_and_replace_process(
                         process_info,
                         timeout,
@@ -4137,7 +4150,7 @@ class ProcessLifecycleManager:
                         any_replaced = True
                         self._recently_recovered = True
 
-        if self._state.last_pop_no_jobs_available:
+        if no_jobs_evidence_fresh:
             return any_replaced or any_started_pending
 
         # ``all(...)`` over an empty map is vacuously True, which would falsely declare "all processes
@@ -4157,7 +4170,7 @@ class ProcessLifecycleManager:
 
         shutdown_timed_out = self._state.shutting_down and (now - self._state.shutting_down_time) > (60 * 5)
 
-        if (all_processes_timed_out and not (self._state.last_pop_no_jobs_available or self._recently_recovered)) or (
+        if (all_processes_timed_out and not (no_jobs_evidence_fresh or self._recently_recovered)) or (
             shutdown_timed_out
         ):
             if not self._hung_processes_detected:

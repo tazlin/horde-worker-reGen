@@ -649,6 +649,31 @@ quarantine with a deep backlog trips the breaker at once. That is the intent: th
 pause lets the backlog drain and the horde reissue that work elsewhere, and the
 worker rejoins with the poison model already off its offer.
 
+## The intake path is bounded and audible
+
+Every throttle and breaker above assumes the pop loop itself is running. It is a
+single coroutine, so any await inside it that never returns silences the
+worker's entire intake with no error and no log line; in production that looked
+like a healthy worker that simply stopped serving. Two bounds and one sentinel
+close that class:
+
+- **The pop request is bounded.** A single pop HTTP request is capped at
+  `POP_REQUEST_TIMEOUT_SECONDS` (30 s), well under the transport default, so an
+  unanswered peer or a stale pooled connection costs one bounded attempt instead
+  of minutes of silence. A pop is cheap to retry; the loop re-issues one on the
+  next tick.
+- **Source media is bounded.** Fetching an already-popped job's source images is
+  capped at `SOURCE_IMAGE_DOWNLOAD_TIMEOUT_SECONDS` (120 s); on expiry the job
+  carries the same per-item download faults an exhausted retry loop would have
+  produced and proceeds, so a dead media host cannot hold intake hostage behind
+  one job.
+- **Silence is disclosed.** Each early return in the pop coroutine stamps the
+  gate that held it (`WorkerState.last_pop_gate`), and a per-tick sentinel warns
+  when no attempt has reached the horde for 60 s with nothing deliberate to
+  account for it, naming that gate; see
+  [hung-process detection](process_lifecycle.md) for the sentinel and the
+  watchdogs that own each condition's remedy.
+
 ## Rejoining after horde-forced maintenance
 
 Every throttle above exists so the horde never has to force this worker into

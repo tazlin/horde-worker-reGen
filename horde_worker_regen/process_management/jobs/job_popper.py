@@ -98,6 +98,23 @@ if TYPE_CHECKING:
 # stage the post-inference backlog grew until jobs aged past their horde ttl and were server-aborted as
 # "too slow", which the horde answers with forced maintenance. The popper therefore refuses to pop while
 # the backlog already represents more than a budget's worth of safety work.
+POP_REQUEST_TIMEOUT_SECONDS: float = 30.0
+"""Ceiling on a single job-pop HTTP request.
+
+The pop loop is a single coroutine, so an unanswered request silences every intake decision the worker
+makes until it returns. The shared client session is deliberately left without a session-wide timeout so
+submit and upload behaviour is unchanged; the ceiling is applied per await instead. A pop is cheap to
+retry and the loop re-issues one on the next tick, so a bound well under the transport default costs
+nothing and keeps an unresponsive peer from stalling intake."""
+
+SOURCE_IMAGE_DOWNLOAD_TIMEOUT_SECONDS: float = 120.0
+"""Ceiling on fetching one job's source media.
+
+The job is already popped and its ttl clock is running when the download starts, so waiting indefinitely
+on a slow or dead media host both wastes the job and blocks the pop loop behind it. On expiry the job is
+faulted for whatever media is still missing and proceeds, which is what an exhausted retry loop inside
+the downloader produces."""
+
 _DEFAULT_SAFETY_SECONDS = 8.0
 """Per-check safety cost assumed before any real measurement exists (typical CPU safety check)."""
 _DEFAULT_JOB_TTL_SECONDS = 150.0
@@ -1193,6 +1210,18 @@ class JobPopper:
 
         return False
 
+    def _note_pop_gate(self, gate: str | None) -> None:
+        """Record which gate ended this pop cycle, or None when the cycle reached the API.
+
+        The since-stamp moves only when the gate name changes, so it measures how long the current gate has
+        held rather than when it was last observed. Kept to one comparison and at most two writes: this runs
+        on every tick of the sub-second pop loop.
+        """
+        if self._state.last_pop_gate == gate:
+            return
+        self._state.last_pop_gate = gate
+        self._state.last_pop_gate_since = time.time()
+
     def _is_queue_full(self, bridge_data: reGenBridgeData, *, extra_allowance: int = 0) -> bool:
         """Return True if the job queue already has enough jobs.
 
@@ -1589,6 +1618,7 @@ class JobPopper:
             # terminal-recovery park). Keep it centralized on WorkerState so a new flow cannot accidentally
             # accept work under a worker-wide hold.
             self._state.last_pop_no_jobs_available = False
+            self._note_pop_gate("intake_paused")
             return
 
         if self._state.ram_pressure_pop_hold:
@@ -1600,6 +1630,7 @@ class JobPopper:
             self._state.last_pop_skipped_reasons["ram_pressure"] = (
                 self._state.last_pop_skipped_reasons.get("ram_pressure", 0) + 1
             )
+            self._note_pop_gate("ram_pressure")
             return
 
         self._state.last_pop_skipped_reasons.pop("ram_pressure", None)
@@ -1608,6 +1639,7 @@ class JobPopper:
             # The installed PyTorch has no kernels for this GPU: every job would fail at the first kernel
             # launch, so never pop. Sticky for the session (a build/hardware mismatch); fixed by reinstalling.
             self._state.last_pop_no_jobs_available = False
+            self._note_pop_gate("torch_unusable")
             return
 
         if self._state.torch_build_cpu_only:
@@ -1615,6 +1647,7 @@ class JobPopper:
             # popper never pops. Alchemy runs on its own loop and is unaffected. This is the runtime
             # equivalent of a 'cpu' install sentinel; sticky for the session (a build fact).
             self._state.last_pop_no_jobs_available = False
+            self._note_pop_gate("torch_unusable")
             return
 
         cur_time = time.time()
@@ -1625,12 +1658,14 @@ class JobPopper:
             urgent = True
 
         if self._handle_consecutive_failures(bridge_data, cur_time):
+            self._note_pop_gate("consecutive_failure_pause")
             return
 
         # Admit one extra job past the configured depth when an idle-fill is wanted: that job is expected to
         # leave the queue immediately for the idle sibling, so bounding the relaxation to a single slot keeps
         # intake from running away if it cannot be placed this cycle.
         if self._is_queue_full(bridge_data, extra_allowance=1 if idle_fill_wanted else 0):
+            self._note_pop_gate("queue_full")
             return
 
         # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
@@ -1645,6 +1680,7 @@ class JobPopper:
             self._state.last_pop_skipped_reasons[backlog_reason] = (
                 self._state.last_pop_skipped_reasons.get(backlog_reason, 0) + 1
             )
+            self._note_pop_gate(backlog_reason)
             # Surface safety backpressure in prose, throttled so the sub-second pop loop never spams it: a
             # bundle should show pops were stopped *because the safety stage is backed up*, not merely that
             # pops stopped. Names the depth, the self-tuned cap, and the oldest waiting safety job so a
@@ -1677,16 +1713,20 @@ class JobPopper:
         # Warm-up rule: until the first job of the session has completed, don't queue
         # ahead (if we're doomed to fail with 1 job, we're doomed to fail with 2).
         if len(self._job_tracker.jobs_pending_inference) != 0 and self._job_tracker.total_num_completed_jobs == 0:
+            self._note_pop_gate("warmup_first_job")
             return
 
         if self._process_map.get_first_available_safety_process() is None:
+            self._note_pop_gate("no_safety_process")
             return
 
         if self._process_map.get_first_available_inference_process() is None:
+            self._note_pop_gate("no_inference_process")
             return
 
         if len(bridge_data.image_models_to_load) == 0:
             logger.error("No models are configured to be loaded, please check your config (models_to_load).")
+            self._note_pop_gate("no_models_configured")
             await asyncio.sleep(3)
             return
 
@@ -1696,9 +1736,11 @@ class JobPopper:
         if not idle_fill_wanted and self._pop_throttler.should_wait_for_megapixelsteps(
             bridge_data,
         ):
+            self._note_pop_gate("megapixelstep_wait")
             return
 
         if not urgent and self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
+            self._note_pop_gate("pop_frequency_gate")
             return
 
         self._state.last_job_pop_time = time.time()
@@ -1736,6 +1778,7 @@ class JobPopper:
             serviceability_logged=self._serviceability_exclusion_logged,
         )
         if models is None:
+            self._note_pop_gate("no_eligible_models")
             return
 
         # Stop advertising a model the lifecycle manager has taken out of rotation, so the horde stops sending
@@ -1747,6 +1790,7 @@ class JobPopper:
         # reloads. A no-op unless the operator configures a switch interval or re-entry cooldown.
         models = self._apply_large_model_pop_limits(models, bridge_data)
         if len(models) == 0:
+            self._note_pop_gate("large_model_limits")
             return
 
         # Stop promising what the card cannot host: while every governed card is under VRAM pressure, the
@@ -1853,6 +1897,12 @@ class JobPopper:
             and server_supports_extended_controlnet()
         )
 
+        # Past every gate: the offer is settled and the request is about to go out, so nothing is holding
+        # pops back. Cleared before the request rather than after it, so a request that never returns leaves
+        # no gate named; that pairing (no gate, no completed attempt) is what distinguishes a wedged request
+        # from a held one.
+        self._note_pop_gate(None)
+
         try:
             job_pop_request = ImageGenerateJobPopRequest(
                 apikey=bridge_data.api_key,
@@ -1886,10 +1936,18 @@ class JobPopper:
                     queue_depth_counter.add(1)
             else:
                 with span_job_pop(models=",".join(sorted(models))):
-                    job_pop_response = await self._api_sessions.require_horde_client_session().submit_request(
-                        job_pop_request,
-                        ImageGenerateJobPopResponse,
+                    job_pop_response = await asyncio.wait_for(
+                        self._api_sessions.require_horde_client_session().submit_request(
+                            job_pop_request,
+                            ImageGenerateJobPopResponse,
+                        ),
+                        timeout=POP_REQUEST_TIMEOUT_SECONDS,
                     )
+
+            # The attempt reached the horde and got an answer of some kind, which is the proof the worker's
+            # only intake path is still running end to end. Recorded before the answer is interpreted, since
+            # an error response is as much an answer as a job is.
+            self._state.last_pop_attempt_completed_at = time.time()
 
             self._process_api_messages(job_pop_response)
 
@@ -1898,10 +1956,16 @@ class JobPopper:
                 return
 
         except Exception as e:
+            # Name the exception type: several failure modes here (a timed-out request among them) carry an
+            # empty str(), which would otherwise leave the operator with a bare, undiagnosable line.
+            # A failed attempt still concluded, so it counts toward pop liveness: the popper is reaching the
+            # network and hearing back, however badly. Only an attempt that never returns leaves this unset.
+            self._state.last_pop_attempt_completed_at = time.time()
+            failure = f"Failed to pop job (Unexpected Error): {type(e).__name__}: {e}"
             if self._pop_throttler.current_pop_frequency == self._pop_throttler._error_pop_frequency:
-                logger.error(f"Failed to pop job (Unexpected Error): {e}")
+                logger.error(failure)
             else:
-                logger.warning(f"Failed to pop job (Unexpected Error): {e}")
+                logger.warning(failure)
             self._pop_throttler.on_pop_error()
             return
 
@@ -1972,7 +2036,17 @@ class JobPopper:
         )
 
         job_pop_response = self._apply_sdk_workarounds(job_pop_response)
-        job_pop_response = await self._source_image_downloader.download_source_images(job_pop_response)
+        try:
+            job_pop_response = await asyncio.wait_for(
+                self._source_image_downloader.download_source_images(job_pop_response),
+                timeout=SOURCE_IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.error(
+                f"Source image download for job {job_pop_response.id_} did not complete within "
+                f"{SOURCE_IMAGE_DOWNLOAD_TIMEOUT_SECONDS:.0f} seconds; continuing with whatever media arrived.",
+            )
+            await self._source_image_downloader.record_download_faults(job_pop_response)
 
         if job_pop_response.id_ is None:
             logger.error("Job has no id!")
@@ -1990,6 +2064,10 @@ class JobPopper:
         reverts to the slow cadence the moment the queue is full or no work is available.
         """
         logger.debug("In JobPopper.run")
+
+        # Seed the pop-liveness clock from here rather than the epoch, so a worker that never completes an
+        # attempt measures its silence from when its intake loop started.
+        self._state.last_pop_attempt_completed_at = time.time()
 
         while True:
             urgent = self._is_hungry(self._runtime_config.bridge_data)

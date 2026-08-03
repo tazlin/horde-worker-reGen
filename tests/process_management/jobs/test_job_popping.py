@@ -8,6 +8,7 @@ higher-level api_job_pop flow.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Callable
@@ -21,6 +22,8 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
     LorasPayloadEntry,
 )
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
+from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
 from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason, WorkerState
@@ -2607,6 +2610,348 @@ class TestPoolLaneTally:
         tally = popper.latest_pool_lane_tally()
         assert (tally.free_pops, tally.free_fulfilled) == (1, 0)
         assert (tally.fixed_pops, tally.fixed_fulfilled) == (0, 0)
+
+
+# endregion
+
+# region Bounded awaits on the pop path
+
+
+_POP_TIMEOUT_CONST = "horde_worker_regen.process_management.jobs.job_popper.POP_REQUEST_TIMEOUT_SECONDS"
+_SOURCE_IMAGE_TIMEOUT_CONST = (
+    "horde_worker_regen.process_management.jobs.job_popper.SOURCE_IMAGE_DOWNLOAD_TIMEOUT_SECONDS"
+)
+
+# The single pop coroutine must never block indefinitely: every await it performs is bounded, so one
+# unresponsive server cannot silence the worker's only intake path.
+_TEST_AWAIT_BOUND_SECONDS = 5.0
+"""Outer bound the tests hold api_job_pop to. Generous relative to the patched-in ceilings, so a failure
+here means the await was unbounded rather than merely slow."""
+
+
+async def _hang_forever(*_args: object, **_kwargs: object) -> object:
+    """Await that never completes, standing in for an unresponsive peer."""
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _capture_logs(level: str = "WARNING") -> tuple[list[str], int]:
+    """Attach a loguru sink collecting messages at or above ``level``."""
+    lines: list[str] = []
+    sink_id = logger.add(lambda message: lines.append(message.record["message"]), level=level)
+    return lines, sink_id
+
+
+class TestPopPathBoundedAwaits:
+    """The pop coroutine's network awaits are individually bounded."""
+
+    def _make_popper_with_session(self, session: AsyncMock, job_tracker: JobTracker | None = None) -> JobPopper:
+        """Create a popper past every guard clause, backed by ``session``."""
+        return _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            job_tracker=job_tracker if job_tracker is not None else JobTracker(),
+            horde_client_session=session,
+        )
+
+    @_full_flow_patches
+    async def test_hanging_pop_request_is_bounded(self, _mock_req_cls: Mock) -> None:
+        """A pop request that never answers is abandoned and handled as a pop error."""
+        session = AsyncMock()
+        session.submit_request = _hang_forever
+        popper = self._make_popper_with_session(session)
+
+        lines, sink_id = _capture_logs()
+        try:
+            with patch(_POP_TIMEOUT_CONST, 0.05):
+                await asyncio.wait_for(popper.api_job_pop(), timeout=_TEST_AWAIT_BOUND_SECONDS)
+        finally:
+            logger.remove(sink_id)
+
+        assert popper._pop_throttler.current_pop_frequency == popper._pop_throttler._error_pop_frequency
+        assert any("TimeoutError" in line for line in lines), lines
+
+    @_full_flow_patches
+    async def test_bare_timeout_error_logs_its_type(self, _mock_req_cls: Mock) -> None:
+        """``str(TimeoutError())`` is empty, so the failure log must name the exception type."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(side_effect=TimeoutError())
+        popper = self._make_popper_with_session(session)
+
+        lines, sink_id = _capture_logs()
+        try:
+            await popper.api_job_pop()
+        finally:
+            logger.remove(sink_id)
+
+        assert any("Failed to pop job" in line and "TimeoutError" in line for line in lines), lines
+
+    @_full_flow_patches
+    async def test_non_timeout_exception_logs_type_and_message(self, _mock_req_cls: Mock) -> None:
+        """Ordinary pop failures keep their message and gain the exception type."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(side_effect=ConnectionError("network down"))
+        popper = self._make_popper_with_session(session)
+
+        lines, sink_id = _capture_logs()
+        try:
+            await popper.api_job_pop()
+        finally:
+            logger.remove(sink_id)
+
+        assert any("ConnectionError" in line and "network down" in line for line in lines), lines
+
+    @_full_flow_patches
+    async def test_fast_successful_pop_is_unaffected(self, _mock_req_cls: Mock) -> None:
+        """The bound is inert for a prompt response."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=make_job_pop_response())
+        popper = self._make_popper_with_session(session)
+
+        await asyncio.wait_for(popper.api_job_pop(), timeout=_TEST_AWAIT_BOUND_SECONDS)
+
+        assert len(popper._job_tracker.jobs_pending_inference) == 1
+        assert popper._pop_throttler.current_pop_frequency == popper._pop_throttler._default_pop_frequency
+
+    @_full_flow_patches
+    async def test_slow_pop_under_the_bound_succeeds(self, _mock_req_cls: Mock) -> None:
+        """A response that arrives inside the ceiling is served normally."""
+        response = make_job_pop_response()
+
+        async def _slow_submit(*_args: object, **_kwargs: object) -> ImageGenerateJobPopResponse:
+            await asyncio.sleep(0.05)
+            return response
+
+        session = AsyncMock()
+        session.submit_request = _slow_submit
+        popper = self._make_popper_with_session(session)
+
+        with patch(_POP_TIMEOUT_CONST, 2.0):
+            await asyncio.wait_for(popper.api_job_pop(), timeout=_TEST_AWAIT_BOUND_SECONDS)
+
+        assert len(popper._job_tracker.jobs_pending_inference) == 1
+        assert popper._pop_throttler.current_pop_frequency == popper._pop_throttler._default_pop_frequency
+
+    @_full_flow_patches
+    async def test_hanging_source_image_download_faults_the_job(self, _mock_req_cls: Mock) -> None:
+        """An unanswered source-image download is abandoned and faulted like an exhausted retry loop."""
+        response = make_job_pop_response().model_copy(
+            update={"source_image": "https://example.invalid/source.webp"},
+        )
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=response)
+        job_tracker = JobTracker()
+        popper = self._make_popper_with_session(session, job_tracker=job_tracker)
+        popper._source_image_downloader.download_source_images = _hang_forever  # pyrefly: ignore - test double
+
+        with patch(_SOURCE_IMAGE_TIMEOUT_CONST, 0.05):
+            await asyncio.wait_for(popper.api_job_pop(), timeout=_TEST_AWAIT_BOUND_SECONDS)
+
+        assert response.id_ is not None
+        faults = await job_tracker.get_faults_for_job(response.id_)
+        assert [fault.type_ for fault in faults] == [METADATA_TYPE.source_image]
+        assert faults[0].value == METADATA_VALUE.download_failed
+        # The job is still queued: a missing source image is reported as a fault at submit time, exactly as
+        # it is when the downloader's own retries are exhausted.
+        assert len(job_tracker.jobs_pending_inference) == 1
+
+
+# endregion
+
+
+# region Pop gate disclosure
+
+_SELECT_MODELS_PATH = "horde_worker_regen.process_management.jobs.job_popper._select_models_for_pop"
+
+
+class TestPopGateStamping:
+    """Every silent early return in the pop coroutine names the gate that is holding pops.
+
+    The coroutine has many gates that can hold indefinitely with no log line of their own, so a worker held
+    at one of them is indistinguishable from a worker the horde simply has no work for. Recording the gate
+    (and when it took hold) is what lets the liveness sentinel and the operator surfaces say which condition
+    the worker is waiting on.
+    """
+
+    def _popper_past_the_early_gates(
+        self,
+        *,
+        process_map: ProcessMap | None = None,
+        job_tracker: JobTracker | None = None,
+    ) -> JobPopper:
+        """Build a popper whose posture, resources, and throttler let the flow reach the later gates."""
+        return _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=process_map if process_map is not None else _make_process_map_with_available_processes(),
+            job_tracker=job_tracker if job_tracker is not None else JobTracker(),
+        )
+
+    async def test_no_inference_process_is_stamped(self) -> None:
+        """The gate that wedges a pool reloading every slot at once."""
+        process_map = ProcessMap(
+            {
+                10: make_mock_process_info(
+                    10,
+                    model_name=None,
+                    state=HordeProcessState.WAITING_FOR_JOB,
+                    process_type=HordeProcessType.SAFETY,
+                ),
+                0: make_mock_process_info(0, model_name=None, state=HordeProcessState.PROCESS_STARTING),
+            },  # type: ignore[arg-type]
+        )
+        popper = self._popper_past_the_early_gates(process_map=process_map)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "no_inference_process"
+        assert popper._state.last_pop_gate_since > 0.0
+
+    async def test_no_safety_process_is_stamped(self) -> None:
+        """A pool with no safety process to hand results to holds pops just as silently."""
+        process_map = ProcessMap(
+            {0: make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)},  # type: ignore[arg-type]
+        )
+        popper = self._popper_past_the_early_gates(process_map=process_map)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "no_safety_process"
+
+    async def test_queue_full_is_stamped(self) -> None:
+        """A full local queue is a normal, healthy hold, and still has to be attributable."""
+        job_tracker = JobTracker()
+        for index in range(4):
+            await job_tracker.record_popped_job(make_job_pop_response(model=f"queued_{index}"))
+        popper = self._popper_past_the_early_gates(job_tracker=job_tracker)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "queue_full"
+
+    async def test_warmup_first_job_is_stamped(self) -> None:
+        """Queueing ahead is withheld until the session first job completes."""
+        job_tracker = JobTracker()
+        await job_tracker.record_popped_job(make_job_pop_response(model="first"))
+        popper = self._popper_past_the_early_gates(job_tracker=job_tracker)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "warmup_first_job"
+
+    async def test_megapixelstep_wait_is_stamped(self) -> None:
+        """The megapixelstep governor holds pops while large in-flight work drains."""
+        popper = self._popper_past_the_early_gates()
+        popper._pop_throttler.should_wait_for_megapixelsteps = Mock(return_value=True)  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "megapixelstep_wait"
+
+    async def test_no_eligible_models_is_stamped(self) -> None:
+        """Model selection returning nothing servable is a hold, not an attempt."""
+        popper = self._popper_past_the_early_gates()
+
+        with patch(_SELECT_MODELS_PATH, return_value=None):
+            await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "no_eligible_models"
+
+    async def test_large_model_limits_emptying_the_offer_is_stamped(self) -> None:
+        """The large-model switch and cooldown limits can empty the offer, ending the cycle silently."""
+        popper = self._popper_past_the_early_gates()
+        popper._apply_large_model_pop_limits = Mock(return_value=set())  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "large_model_limits"
+
+    async def test_the_gate_stamp_is_only_moved_when_the_gate_changes(self) -> None:
+        """The stamp measures how long this gate has held, so a repeat tick must not refresh it."""
+        popper = self._popper_past_the_early_gates()
+        popper._pop_throttler.should_wait_for_megapixelsteps = Mock(return_value=True)  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+        first_stamp = popper._state.last_pop_gate_since
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate_since == first_stamp
+
+    @_full_flow_patches
+    async def test_a_completed_pop_clears_the_gate_and_stamps_the_attempt(self, _mock_req_cls: Mock) -> None:
+        """Reaching the horde is the all-clear: no gate holds, and the attempt time is recorded."""
+        state = WorkerState(last_job_pop_time=0.0, last_pop_gate="no_inference_process")
+        session = AsyncMock()
+        session.submit_request = AsyncMock(return_value=make_job_pop_response())
+        popper = _make_popper(
+            state=state,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        assert state.last_pop_gate is None
+        assert state.last_pop_attempt_completed_at > 0.0
+
+    @_full_flow_patches
+    async def test_a_failed_pop_still_counts_as_a_completed_attempt(self, _mock_req_cls: Mock) -> None:
+        """A request that raised still proves the popper is reaching (and hearing from) the network."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(side_effect=RuntimeError("boom"))
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_attempt_completed_at > 0.0
+
+    @_full_flow_patches
+    async def test_an_error_response_counts_as_a_completed_attempt(self, _mock_req_cls: Mock) -> None:
+        """An API error response is an answer from the horde, so the attempt concluded."""
+        session = AsyncMock()
+        session.submit_request = AsyncMock(
+            return_value=RequestErrorResponse(message="Wrong credentials"),
+        )
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate is None
+        assert popper._state.last_pop_attempt_completed_at > 0.0
+
+    async def test_the_dry_run_path_also_stamps_a_completed_attempt(self) -> None:
+        """The simulated boundary stands in for the horde, so a dry run is not a silent worker."""
+        source = Mock(spec=CannedJobSource)
+        source.next_pop_response.return_value = make_empty_pop_response()
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=0.0),
+            process_map=_make_process_map_with_available_processes(),
+            dry_run_skip_api=True,
+        )
+        popper.set_canned_job_source(source)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate is None
+        assert popper._state.last_pop_attempt_completed_at > 0.0
+
+    async def test_the_popper_start_seeds_the_attempt_stamp(self) -> None:
+        """A worker that never completes an attempt measures its silence from when the loop started."""
+        state = WorkerState()
+        shutdown_manager = Mock()
+        shutdown_manager.is_time_for_shutdown.return_value = True
+        popper = _make_popper(state=state, shutdown_manager=shutdown_manager)
+
+        await popper.run()
+
+        assert state.last_pop_attempt_completed_at > 0.0
 
 
 # endregion

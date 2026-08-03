@@ -10,7 +10,10 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import (
+    POP_NO_JOBS_EVIDENCE_WINDOW_SECONDS,
+    WorkerState,
+)
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
@@ -1962,3 +1965,119 @@ class TestGiveUpDefersToAuxPrefetch:
             if tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT:
                 break
         assert tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT, "give-up should fault a head with no prefetch"
+
+
+class TestNoJobsEvidenceDoesNotDisableTheReaper:
+    """A "no jobs available" verdict must only excuse idle slots, and only while it is fresh.
+
+    The flag exists so a genuine lull in horde work does not churn healthy, idle processes. It is not
+    evidence about a slot wedged in startup, preload, or post-processing, and it says nothing at all once
+    the pop loop has stopped producing attempts: a pool whose every slot is wedged in startup silences the
+    popper (it never reaches the horde), which freezes the flag at its last value and would otherwise leave
+    the only remedy for that wedge permanently disabled.
+    """
+
+    _STALE_ATTEMPT_AGE_SECONDS = POP_NO_JOBS_EVIDENCE_WINDOW_SECONDS + 60.0
+
+    @staticmethod
+    def _silent_slot(process_id: int, state: HordeProcessState, *, silent_for: float) -> HordeProcessInfo:
+        """Build an inference slot that has been in ``state`` and silent for ``silent_for`` seconds."""
+        proc = make_mock_process_info(process_id, model_name="stable_diffusion", state=state)
+        stamp = time.time() - silent_for
+        proc.last_received_timestamp = stamp
+        proc.last_heartbeat_timestamp = stamp
+        proc.last_process_state_started_at = stamp
+        return proc
+
+    def _plm_with_stuck_slots(
+        self,
+        state: HordeProcessState,
+        *,
+        last_pop_no_jobs_available: bool,
+        attempt_age_seconds: float,
+        silent_for: float = 600.0,
+    ) -> ProcessLifecycleManager:
+        """Build a lifecycle manager whose two inference slots are both stuck in ``state``."""
+        process_map = ProcessMap(
+            {
+                0: self._silent_slot(0, state, silent_for=silent_for),
+                1: self._silent_slot(1, state, silent_for=silent_for),
+            },
+        )
+        plm = _make_plm(process_map=process_map)
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        plm._state.last_pop_no_jobs_available = last_pop_no_jobs_available
+        plm._state.last_pop_attempt_completed_at = time.time() - attempt_age_seconds
+        return plm
+
+    def test_slots_wedged_in_startup_are_reaped_despite_stale_no_jobs_evidence(self) -> None:
+        """The closed deadlock: every slot wedged starting, no pop attempts, so no-jobs evidence is stale."""
+        plm = self._plm_with_stuck_slots(
+            HordeProcessState.PROCESS_STARTING,
+            last_pop_no_jobs_available=True,
+            attempt_age_seconds=self._STALE_ATTEMPT_AGE_SECONDS,
+        )
+
+        plm.replace_hung_processes()
+
+        assert plm._replace_inference_process.call_count == 2
+
+    def test_slots_wedged_preloading_are_reaped_despite_stale_no_jobs_evidence(self) -> None:
+        """Same wedge one state later: a stalled preload is not something the no-jobs flag speaks to."""
+        plm = self._plm_with_stuck_slots(
+            HordeProcessState.PRELOADING_MODEL,
+            last_pop_no_jobs_available=True,
+            attempt_age_seconds=self._STALE_ATTEMPT_AGE_SECONDS,
+        )
+
+        plm.replace_hung_processes()
+
+        assert plm._replace_inference_process.call_count == 2
+
+    def test_startup_wedge_is_reaped_even_while_the_no_jobs_evidence_is_fresh(self) -> None:
+        """A live no-jobs verdict excuses idleness, never a slot that cannot finish starting."""
+        plm = self._plm_with_stuck_slots(
+            HordeProcessState.PROCESS_STARTING,
+            last_pop_no_jobs_available=True,
+            attempt_age_seconds=1.0,
+        )
+
+        plm.replace_hung_processes()
+
+        assert plm._replace_inference_process.call_count == 2
+
+    def test_idle_slots_are_spared_while_the_no_jobs_evidence_is_fresh(self) -> None:
+        """The flag's legitimate purpose: a no-work lull must not churn healthy, idle processes."""
+        plm = self._plm_with_stuck_slots(
+            HordeProcessState.WAITING_FOR_JOB,
+            last_pop_no_jobs_available=True,
+            attempt_age_seconds=1.0,
+        )
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+
+    def test_idle_slots_are_reaped_once_the_no_jobs_evidence_stales(self) -> None:
+        """Without a recent attempt the flag no longer excuses anything, idleness included."""
+        plm = self._plm_with_stuck_slots(
+            HordeProcessState.WAITING_FOR_JOB,
+            last_pop_no_jobs_available=True,
+            attempt_age_seconds=self._STALE_ATTEMPT_AGE_SECONDS,
+        )
+
+        plm.replace_hung_processes()
+
+        assert plm._replace_inference_process.call_count == 2
+
+    def test_idle_slots_are_reaped_when_the_flag_is_unset(self) -> None:
+        """Unchanged behaviour for a worker the horde is feeding: silent idle slots are still reaped."""
+        plm = self._plm_with_stuck_slots(
+            HordeProcessState.WAITING_FOR_JOB,
+            last_pop_no_jobs_available=False,
+            attempt_age_seconds=1.0,
+        )
+
+        plm.replace_hung_processes()
+
+        assert plm._replace_inference_process.call_count == 2

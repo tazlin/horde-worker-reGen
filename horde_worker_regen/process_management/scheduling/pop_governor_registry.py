@@ -21,7 +21,7 @@ event-loop thread, so no locking.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 
 
@@ -135,6 +135,16 @@ class PopGovernorRegistry:
                 spell.spell_started_at = None
                 spell.reason = None
                 spell.expected_remaining_seconds = None
+
+    def any_active(self, *, ignore: Collection[str] = ()) -> bool:
+        """Whether any tracked governor currently has an open spell, skipping the ``ignore`` names.
+
+        Answers "is some known condition deliberately holding pops right now" from the state the registry
+        already keeps, so a caller does not have to re-collect every governor's reading to find out. A
+        caller whose question is about *absent* pops passes the governors that only slow or reshape pops
+        (and so can never account for a total absence) in ``ignore``.
+        """
+        return any(name not in ignore and spell.active for name, spell in self._spells.items())
 
     def views(self, *, now: float, session_elapsed_seconds: float) -> list[GovernorSpellView]:
         """Project every tracked governor onto an immutable view list, newest-active first.
