@@ -359,7 +359,7 @@ class JobSubmitter:
                 logger.debug(
                     f"Job {new_submit.job_id} was already submitted; treating as delivered and removing it",
                 )
-                new_submit.succeed(0, 0.0)
+                new_submit.succeed(None, 0.0)
                 self._reset_submit_health()
                 return new_submit
 
@@ -455,7 +455,13 @@ class JobSubmitter:
         self._state.kudos_events.append((submit_time, job_submit_response.reward))
         # A landed submit proves the endpoint is draining again, clearing the pop side's submit-health signal.
         self._reset_submit_health()
-        new_submit.succeed(new_submit.kudos_reward, new_submit.kudos_per_second)
+        # The submit response is the only place the horde states what this generation earned, so it is
+        # carried on the pending job for the per-job reward the run metrics and the dashboard read. A
+        # faulted generation's submit is a fault report the horde pays nothing for, so it earns no figure.
+        delivered_reward = (
+            None if new_submit.completed_job_info.state == GENERATION_STATE.faulted else job_submit_response.reward
+        )
+        new_submit.succeed(delivered_reward, kudos_per_second)
         return new_submit
 
     async def api_submit_job(self) -> None:
@@ -527,8 +533,7 @@ class JobSubmitter:
             elif len(completed_job_info.job_image_results) > 1:
                 logger.info("Attempting to return batched jobs results")
 
-        highest_reward = 0
-        highest_kudos_per_second = 0.0
+        highest_reward = 0.0
         submit_tasks: list[Task[PendingSubmitJob]] = []
         finished_submit_jobs: list[PendingSubmitJob] = []
         iterations = 1
@@ -560,10 +565,8 @@ class JobSubmitter:
                         retry_submits.append(result)
                     else:
                         finished_submit_jobs.append(result)
-                    if highest_reward < result.kudos_reward:
+                    if result.kudos_reward is not None and highest_reward < result.kudos_reward:
                         highest_reward = result.kudos_reward
-                    if highest_kudos_per_second < result.kudos_per_second:
-                        highest_kudos_per_second = result.kudos_per_second
             submit_tasks = []
             if not retry_submits:
                 break
@@ -593,21 +596,12 @@ class JobSubmitter:
             )
             time_popped = time.time()
         time_taken = round(time.time() - time_popped, 2)
-        # If the job took a long time to generate, log a warning (unless speed warnings are suppressed)
-        if not self.bridge_data.suppress_speed_warnings:
-            if highest_reward > 0 and (highest_reward / time_taken) < 0.1:
-                logger.warning(
-                    f"This job ({completed_job_info.sdk_api_job_info.id_}) "
-                    "may have been in the queue for a long time. ",
-                )
-
-            if highest_reward > 0 and highest_kudos_per_second < 0.4:
-                logger.warning(
-                    f"This job ({completed_job_info.sdk_api_job_info.id_}) "
-                    "took longer than is ideal; if this persists consider "
-                    "lowering your max_power, using less threads, "
-                    "disabling post processing and/or controlnets.",
-                )
+        # A slow generation is already warned about (and counted) per generation at submit time, so the only
+        # job-level speed warning left here is the queue-age one.
+        if not self.bridge_data.suppress_speed_warnings and highest_reward > 0 and (highest_reward / time_taken) < 0.1:
+            logger.warning(
+                f"This job ({completed_job_info.sdk_api_job_info.id_}) may have been in the queue for a long time. ",
+            )
 
         # Finally, remove the job from the completed jobs list and reset the number of consecutive failed job
         for submit_job in finished_submit_jobs:
@@ -623,6 +617,15 @@ class JobSubmitter:
         if not job_faulted:
             # If any of the submits failed, we consider the whole job failed
             self._state.consecutive_failed_jobs = 0
+
+        # Every generation of a batch is submitted (and rewarded) separately, so the job's reward is their
+        # sum. It is handed to the tracker here because the finalize below is what drives the per-job
+        # metrics record, and the reward is only knowable once the submit responses are in.
+        delivered_rewards = [
+            submit_job.kudos_reward for submit_job in finished_submit_jobs if submit_job.kudos_reward is not None
+        ]
+        if delivered_rewards:
+            self._job_tracker.note_submit_reward(completed_job_info, sum(delivered_rewards))
 
         tracked_job_info = await self._job_tracker.ensure_submitted_job_info(completed_job_info)
 

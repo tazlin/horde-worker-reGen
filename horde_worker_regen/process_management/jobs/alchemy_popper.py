@@ -991,7 +991,13 @@ class AlchemyCoordinator:
                 return False
         return True
 
-    def _record_form_metrics(self, submit: PendingAlchemySubmitJob, *, faulted: bool) -> None:
+    def _record_form_metrics(
+        self,
+        submit: PendingAlchemySubmitJob,
+        *,
+        faulted: bool,
+        kudos_reward: float | None = None,
+    ) -> None:
         """Record a finished form's timing and outcome into run metrics (the alchemist analogue of finalize).
 
         Called once per form at its terminal outcome (submitted or faulted). The pop->submit ``e2e`` and the
@@ -1009,6 +1015,7 @@ class AlchemyCoordinator:
             faulted=faulted,
             width=width,
             height=height,
+            kudos_reward=kudos_reward,
         )
 
     async def _submit_single_form(self, submit: PendingAlchemySubmitJob) -> None:
@@ -1071,7 +1078,13 @@ class AlchemyCoordinator:
         self.num_forms_submitted += 1
         # A successfully-delivered submit can still carry a faulted generation (e.g. a source-image
         # download failure submitted as faulted), so the recorded outcome follows the form's own state.
-        self._record_form_metrics(submit, faulted=submit.result_message.state == GENERATION_STATE.faulted)
+        # Such a delivery is a fault report the horde pays nothing for, so it records no reward.
+        form_faulted = submit.result_message.state == GENERATION_STATE.faulted
+        self._record_form_metrics(
+            submit,
+            faulted=form_faulted,
+            kudos_reward=None if form_faulted else response.reward,
+        )
 
     def _canned_submit_alchemy(self) -> None:
         """Record a completed form locally instead of submitting to the API."""

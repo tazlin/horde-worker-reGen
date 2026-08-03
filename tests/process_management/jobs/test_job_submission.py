@@ -11,6 +11,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, PendingSubmitJob
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -163,6 +164,51 @@ class TestSubmitSingleGeneration:
         assert metadata[0].ref is not None
         assert "stuck-step watchdog: overtime" in metadata[0].ref
 
+    async def test_the_response_reward_lands_on_the_submitted_generation(self) -> None:
+        """The submit response is the only statement of what a generation earned, so it must be kept.
+
+        Without it the worker knows its session total and nothing about which job produced it.
+        """
+        horde_session = AsyncMock()
+        horde_session.submit_request = AsyncMock(return_value=Mock(reward=6.65))
+        submitter = _make_submitter(horde_client_session=horde_session)
+
+        job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+        job_info = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=0.0,
+            time_to_generate=5.0,
+            job_image_results=[HordeImageResult(image_bytes=b"data")],
+        )
+        # The image is already in R2, so this exercises the submit and its response without an upload.
+        new_submit = PendingSubmitJob(completed_job_info=job_info, gen_iter=0, upload_completed=True)
+
+        await submitter.submit_single_generation(new_submit)
+
+        assert new_submit.kudos_reward == 6.65
+
+    async def test_a_faulted_generation_earns_no_reward(self) -> None:
+        """A fault report is delivered like any other submit, but the horde pays nothing for it."""
+        horde_session = AsyncMock()
+        horde_session.submit_request = AsyncMock(return_value=Mock(reward=0.0))
+        submitter = _make_submitter(horde_client_session=horde_session)
+
+        job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+        job_info = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.faulted,
+            censored=False,
+            time_popped=0.0,
+            time_to_generate=5.0,
+        )
+        new_submit = PendingSubmitJob(completed_job_info=job_info, gen_iter=0)
+
+        await submitter.submit_single_generation(new_submit)
+
+        assert new_submit.kudos_reward is None
+
 
 class TestApiSubmitJob:
     """Tests for api_submit_job."""
@@ -207,6 +253,79 @@ class TestApiSubmitJob:
             await submitter.api_submit_job()
 
         assert state.consecutive_failed_jobs >= 1
+
+    async def test_the_jobs_reward_reaches_its_metrics_record(self) -> None:
+        """What the horde paid for every generation of a job is what that job's metrics record carries.
+
+        The reward is only knowable once the submits land, and the record is built at finalize, so the
+        submitter has to hand the figure to the tracker in between; a batch's generations are paid
+        separately and the job is worth their sum.
+        """
+        state = WorkerState()
+        job_tracker = JobTracker()
+        metrics = WorkerRunMetrics()
+        job_tracker.set_finalize_observer(metrics.on_job_finalized)
+        submitter = _make_submitter(state=state, job_tracker=job_tracker)
+
+        job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+        job_info = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=0.0,
+            time_to_generate=5.0,
+            safety_evaluated=True,
+            job_image_results=[HordeImageResult(image_bytes=b"one"), HordeImageResult(image_bytes=b"two")],
+        )
+        await track_popped_job_async(job_tracker, job, time_popped=0.0)
+        await queue_job_for_submit_async(job_tracker, job_info)
+
+        delivered = []
+        for gen_iter, reward in enumerate((4.0, 6.0)):
+            submitted = PendingSubmitJob(completed_job_info=job_info, gen_iter=gen_iter)
+            submitted.succeed(reward, 1.0)
+            delivered.append(submitted)
+
+        with patch.object(submitter, "submit_single_generation", new_callable=AsyncMock) as mock_submit:
+            mock_submit.side_effect = delivered
+            await submitter.api_submit_job()
+
+        records = metrics.snapshot().jobs
+        assert len(records) == 1
+        assert records[0].kudos_reward == 10.0
+
+    async def test_an_undelivered_job_records_no_reward(self) -> None:
+        """A job the horde never paid for leaves its record's reward unknown rather than zero."""
+        state = WorkerState()
+        job_tracker = JobTracker()
+        metrics = WorkerRunMetrics()
+        job_tracker.set_finalize_observer(metrics.on_job_finalized)
+        submitter = _make_submitter(state=state, job_tracker=job_tracker)
+
+        job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+        job_info = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.faulted,
+            censored=False,
+            time_popped=0.0,
+            time_to_generate=5.0,
+        )
+        await track_popped_job_async(job_tracker, job, time_popped=0.0)
+        await queue_job_for_submit_async(job_tracker, job_info)
+
+        faulted_submit = Mock(spec=PendingSubmitJob)
+        faulted_submit.is_finished = True
+        faulted_submit.is_faulted = True
+        faulted_submit.kudos_reward = None
+        faulted_submit.kudos_per_second = 0.0
+
+        with patch.object(submitter, "submit_single_generation", new_callable=AsyncMock) as mock_submit:
+            mock_submit.return_value = faulted_submit
+            await submitter.api_submit_job()
+
+        records = metrics.snapshot().jobs
+        assert len(records) == 1
+        assert records[0].kudos_reward is None
 
     async def test_unsafetychecked_job_is_punted_not_raised(self) -> None:
         """A PENDING_SUBMIT job with images but no safety verdict must be punted, not crash the loop.

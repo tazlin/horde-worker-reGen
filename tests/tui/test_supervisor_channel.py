@@ -54,7 +54,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 21
+    assert SUPERVISOR_PROTOCOL_VERSION == 22
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -138,6 +138,16 @@ def test_recent_job_record_without_features() -> None:
     lean = RecentJobRecord.from_metrics_record(record)
     assert lean.features is None
     assert lean.steps == 20
+
+
+def test_recent_job_record_carries_the_jobs_reward() -> None:
+    """The reward the worker recorded for a job rides the wire projection, unknown stays unknown."""
+    from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
+
+    paid = RecentJobRecord.from_metrics_record(JobMetricsRecord(job_id="paid", kudos_reward=9.75))
+    unpaid = RecentJobRecord.from_metrics_record(JobMetricsRecord(job_id="unpaid", faulted=True))
+    assert paid.kudos_reward == 9.75
+    assert unpaid.kudos_reward is None
 
 
 def test_recent_job_record_carries_caller_supplied_baseline() -> None:

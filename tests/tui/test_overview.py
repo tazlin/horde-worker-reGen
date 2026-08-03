@@ -609,6 +609,24 @@ def test_recent_jobs_table_shows_baseline_size_and_timings() -> None:
     assert "768×1024" in text
 
 
+def test_recent_jobs_table_prices_each_job() -> None:
+    """The recent-jobs table carries what the horde paid per job, dashing an unknown reward."""
+    from horde_worker_regen.process_management.ipc.supervisor_channel import RecentJobRecord
+
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        recent_jobs=[
+            RecentJobRecord(job_id="paid", model_name="Deliberate", e2e_seconds=2.0, kudos_reward=14.25),
+            RecentJobRecord(job_id="lost", model_name="Deliberate", e2e_seconds=1.0, faulted=True),
+        ],
+    )
+    text = _render(OverviewView()._render_recent_jobs(snapshot))
+    assert "Kudos" in text
+    assert "14.2" in text
+    faulted_row = next(line for line in text.splitlines() if "lost" in line)
+    assert "14.2" not in faulted_row and "-" in faulted_row
+
+
 def test_pipeline_strip_shows_lifecycle_stages() -> None:
     """The job-pipeline strip labels each lifecycle stage with its live count."""
     snapshot = WorkerStateSnapshot(

@@ -408,7 +408,8 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             if process.tick(paused=paused):
                 jobs_submitted += 1
                 jobs_popped += 1
-                kudos_session += random.uniform(8.0, 28.0)
+                earned = random.uniform(8.0, 28.0)
+                kudos_session += earned
                 safety.on_job_checked()
                 faulted = random.random() < 0.04
                 if faulted:
@@ -417,6 +418,8 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
                     RecentJobRecord(
                         job_id=process.job_id,
                         faulted=faulted,
+                        # A faulted job earns nothing, matching the worker's own unknown-reward reporting.
+                        kudos_reward=None if faulted else earned,
                         queue_wait_seconds=random.uniform(0.1, 3.0),
                         e2e_seconds=random.uniform(3.5, 9.0),
                         safety_seconds=random.uniform(0.05, 0.4),

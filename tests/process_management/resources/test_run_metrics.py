@@ -54,7 +54,13 @@ def _job_metrics_message(job_id: str, *, process_id: int = 0, is_alchemy: bool =
     )
 
 
-def _finalize_job(metrics: WorkerRunMetrics, *, faulted: bool = False, n_iter: int = 1) -> str:
+def _finalize_job(
+    metrics: WorkerRunMetrics,
+    *,
+    faulted: bool = False,
+    n_iter: int = 1,
+    kudos_reward: float | None = None,
+) -> str:
     """Finalize a synthetic tracked job and return its job id string."""
     job = dummy_job_factory("Deliberate")
     assert job.id_ is not None
@@ -65,6 +71,7 @@ def _finalize_job(metrics: WorkerRunMetrics, *, faulted: bool = False, n_iter: i
         sdk_api_job_info=job,
         stage=JobStage.PENDING_SUBMIT,
         time_popped=100.0,
+        kudos_reward=kudos_reward,
         stage_timestamps={
             "PENDING_INFERENCE": 100.0,
             "INFERENCE_IN_PROGRESS": 102.5,
@@ -125,6 +132,32 @@ class TestJobCorrelation:
         metrics = WorkerRunMetrics()
         _finalize_job(metrics, faulted=True)
         assert metrics.snapshot().jobs[0].faulted
+
+    def test_submit_reward_reaches_the_job_record(self) -> None:
+        """The reward the tracker holds at finalize is what the job's metrics record carries.
+
+        The horde only states a figure in the submit response, so a job's earnings are unknowable until
+        its submits land; the record has to take the tracker's recorded reward rather than derive one.
+        """
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, kudos_reward=17.5)
+        assert metrics.snapshot().jobs[0].kudos_reward == 17.5
+
+    def test_unrewarded_job_records_no_kudos(self) -> None:
+        """A job the horde paid nothing for records an unknown reward, never a zero."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, faulted=True)
+        assert metrics.snapshot().jobs[0].kudos_reward is None
+
+    def test_alchemy_form_carries_its_reward(self) -> None:
+        """An alchemy form's record carries the reward its own submit response paid."""
+        metrics = WorkerRunMetrics()
+        metrics.record_alchemy_form(form_id="f", form="caption", e2e_seconds=1.0, faulted=False, kudos_reward=3.0)
+        metrics.record_alchemy_form(form_id="g", form="caption", e2e_seconds=1.0, faulted=True)
+
+        records = {record.job_id: record for record in metrics.snapshot().jobs}
+        assert records["f"].kudos_reward == 3.0
+        assert records["g"].kudos_reward is None
 
     def test_alchemy_phase_metrics_held_until_form_recorded(self) -> None:
         """A child's alchemy phase metrics are held (not recorded alone); the coordinator records the form."""

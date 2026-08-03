@@ -262,6 +262,12 @@ class TrackedJob:
     """Result-carrying job info. None only for jobs registered outside the normal pop path."""
     time_popped: float | None = None
     """Epoch time the job was popped, or None if it was never formally popped."""
+    kudos_reward: float | None = None
+    """What the horde's submit responses paid for this job in total, or None while no figure is known.
+
+    Written by the submitter once every generation of the job has been delivered and read by the finalize
+    observers, which is the only point where the reward and the job's timings are both available. Stays
+    None for a job that faulted, was never delivered, or ran without contacting the horde."""
     pop_order: int = 0
     """Monotonic sequence assigned at registration; preserves pop/queue order."""
     stage_sequence: int = 0
@@ -1853,6 +1859,16 @@ class JobTracker:
             tracked.job_info = job_info
         job_info.time_submitted = time.time()
         return job_info
+
+    def note_submit_reward(self, completed_job_info: HordeJobInfo, kudos_reward: float) -> None:
+        """Record what the horde paid for a job, for the finalize observers to read.
+
+        Called after the job's submit responses have been received and before :meth:`finalize_submitted`,
+        since the tracked job is dropped by that call. A job no longer tracked is silently ignored.
+        """
+        tracked = self._tracked_for(completed_job_info.sdk_api_job_info)
+        if tracked is not None:
+            tracked.kudos_reward = kudos_reward
 
     async def finalize_submitted(self, completed_job_info: HordeJobInfo) -> None:
         """Finalize a submitted job, removing it from the tracker entirely."""

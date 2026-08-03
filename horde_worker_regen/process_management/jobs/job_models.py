@@ -120,7 +120,13 @@ class PendingSubmitJob(PendingJob):
 
     completed_job_info: HordeJobInfo
     gen_iter: int
-    kudos_reward: int = 0
+    kudos_reward: float | None = None
+    """The reward the horde's submit response paid for this generation, or None when no reward is known.
+
+    None covers every case where the worker was not told a figure it earned: the generation has not been
+    delivered yet, it faulted (a fault report earns nothing), or the horde answered that the result was
+    already submitted. Recording a nominal zero for those would be indistinguishable from a delivery the
+    horde genuinely valued at zero."""
     kudos_per_second: float = 0.0
     upload_completed: bool = False
     """Whether this generation's image already uploaded to R2 successfully.
@@ -155,14 +161,14 @@ class PendingSubmitJob(PendingJob):
     @override
     def succeed(
         self,
-        kudos_reward: int = 0,
+        kudos_reward: float | None = None,
         kudos_per_second: float = 0,
         **kwargs: int | float,
     ) -> None:
         """Mark the job as successfully submitted.
 
         Args:
-            kudos_reward: The amount of kudos to reward the user.
+            kudos_reward: The reward the submit response paid, or None when no figure is known.
             kudos_per_second: The amount of kudos per second to reward the user.
             **kwargs: Additional keyword arguments.
         """

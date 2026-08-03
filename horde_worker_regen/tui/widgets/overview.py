@@ -2346,6 +2346,17 @@ def _recent_size(job: RecentJobRecord) -> str:
     return f"{job.width}×{job.height}" if job.width and job.height else "-"
 
 
+def _recent_kudos(job: RecentJobRecord) -> Text:
+    """What the horde paid for a completed job, or a dash when no reward is known.
+
+    A faulted job and one the horde never accepted both read as a dash: neither earned a figure, and a
+    zero would claim the horde valued the work at nothing.
+    """
+    if job.kudos_reward is None:
+        return Text("-", style="grey50")
+    return Text(f"{job.kudos_reward:,.1f}", style="magenta")
+
+
 _RECENT_COLUMNS: list[ColumnSpec[RecentJobRecord]] = [
     ColumnSpec(
         "",
@@ -2363,6 +2374,13 @@ _RECENT_COLUMNS: list[ColumnSpec[RecentJobRecord]] = [
         lambda j: human_duration(j.e2e_seconds) if j.e2e_seconds is not None else "-",
         justify="right",
         width=8,
+    ),
+    ColumnSpec(
+        "Kudos",
+        DensityTier.NORMAL,
+        _recent_kudos,
+        justify="right",
+        width=7,
     ),
     ColumnSpec("Features", DensityTier.WIDE, _recent_features, min_width=10),
     ColumnSpec("Steps", DensityTier.WIDE, lambda j: str(j.steps) if j.steps else "-", justify="right", width=6),

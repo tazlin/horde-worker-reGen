@@ -148,6 +148,12 @@ class JobMetricsRecord(BaseModel):
     batch_count: int = 1
     megapixelsteps: float = 0.0
     sampling_seconds: float | None = None
+    kudos_reward: float | None = None
+    """What the horde's submit response paid for this job (summed over a batch's generations).
+
+    None when no reward is known: the job faulted, the worker never contacted the horde for it (canned
+    submits), or the response carried no figure. A zero here would be a reward the horde really valued at
+    nothing, so the unknown case is kept distinct."""
 
 
 class StatsSampleEvent(BaseModel):
@@ -681,6 +687,7 @@ class WorkerRunMetrics:
             batch_count=batch_count,
             megapixelsteps=megapixelsteps,
             sampling_seconds=sampling_seconds,
+            kudos_reward=tracked.kudos_reward,
         )
         self._jobs.append(record)
         baseline = self._resolve_baseline(model_name)
@@ -696,6 +703,7 @@ class WorkerRunMetrics:
         faulted: bool,
         width: int | None = None,
         height: int | None = None,
+        kudos_reward: float | None = None,
     ) -> None:
         """Record one finished alchemy form, the alchemist analogue of :meth:`on_job_finalized`.
 
@@ -721,6 +729,7 @@ class WorkerRunMetrics:
             width=width,
             height=height,
             sampling_seconds=sampling_seconds,
+            kudos_reward=kudos_reward,
         )
         self._jobs.append(record)
         self._fold_form_rollup(record)

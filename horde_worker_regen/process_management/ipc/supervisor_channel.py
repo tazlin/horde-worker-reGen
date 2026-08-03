@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 21
+SUPERVISOR_PROTOCOL_VERSION = 22
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -76,6 +76,9 @@ fulfillment counts for per-lane hit rates.
 v21 distinguishes logical model-pool seating from measured residency. Each seat carries a readiness value,
 resident process/GPU identities, and whether its last matched pop was already resident. The lane tallies add
 resident-hit counts, allowing the TUI to report observed load avoidance rather than infer it from a seat match.
+v22 added ``RecentJobRecord.kudos_reward``: what the horde's submit response paid for that job, so the
+recent-jobs views can attribute earnings per job rather than only in the session total. None when the reward
+is unknown (a faulted job, or one never delivered to the horde).
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -409,6 +412,8 @@ class RecentJobRecord(BaseModel):
     width: int | None = None
     height: int | None = None
     features: JobFeatureSummary | None = None
+    kudos_reward: float | None = None
+    """What the horde paid for this job, or None when no reward is known (faulted, or never delivered)."""
 
     @classmethod
     def from_metrics_record(cls, record: JobMetricsRecord, baseline: str | None = None) -> RecentJobRecord:
@@ -446,6 +451,7 @@ class RecentJobRecord(BaseModel):
             width=record.width,
             height=record.height,
             features=features,
+            kudos_reward=record.kudos_reward,
         )
 
 
