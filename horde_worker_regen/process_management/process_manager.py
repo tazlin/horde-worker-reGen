@@ -61,6 +61,7 @@ from horde_worker_regen.consts import (
     TOTAL_LORA_DOWNLOAD_TIMEOUT,
 )
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management._internal.util import throttled_log_level
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_identity import lookup_worker_by_name
@@ -771,6 +772,14 @@ _DOWNLOAD_RESTART_MAX_IN_WINDOW = 3
 """How many times the parent auto-restarts a silently-dead download process within the window before giving
 up. Past this bound the loss is reported once (edge-triggered) and LoRA/aux advertising is withheld until an
 operator restart, so a crash-looping downloader cannot spin the parent forever."""
+
+_STALE_DRIFT_SKIP_LOG_INTERVAL_SECONDS = 30.0
+"""Seconds between DEBUG-level "drift skipped, ledger stale" lines per device; the rest go to TRACE.
+
+Drift is evaluated every control-loop tick, so a contributor whose memory report stays stale for any
+length of time restates the same skip several times a second. The condition is worth surfacing, its
+per-tick repetition is not.
+"""
 
 _POOL_TRANSITION_LEDGER_EVENTS: Mapping[TransitionKind, LedgerEventType] = {
     TransitionKind.SEATED: LedgerEventType.MODEL_POOL_SEATED,
@@ -3717,7 +3726,11 @@ class HordeWorkerProcessManager:
                 )
 
             if committed_is_stale:
-                logger.debug(
+                logger.log(
+                    throttled_log_level(
+                        f"process_manager.stale_drift_skip:{device_index}",
+                        _STALE_DRIFT_SKIP_LOG_INTERVAL_SECONDS,
+                    ),
                     f"Skipping VRAM attribution drift on device {device_index}: a ledger contributor's memory "
                     f"report is stale ({oldest_report_age:.0f}s > {_REPORT_STALENESS_SECONDS:.0f}s), so the "
                     f"committed ledger is incomparable to the device anchor.",

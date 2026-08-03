@@ -10,8 +10,13 @@ Covers the three pure pieces of the measurement + reconciliation plumbing:
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import Mock
 
+from loguru import logger
+
+from horde_worker_regen.process_management._internal.util import reset_log_throttles
 from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessMemoryMessage,
     HordeProcessState,
@@ -889,3 +894,48 @@ class TestManagerDriftReconciliation:
         )
         snapshot = pm._format_vram_attribution_snapshot(0, observation, 200.0, now=130.0)
         assert "age=30s" in snapshot
+
+
+class TestStaleDriftSkipLogThrottle:
+    """The stale-ledger skip line is time-boxed per device, with suppressed repeats kept at TRACE."""
+
+    @contextmanager
+    def _capture_levels(self) -> Iterator[list[tuple[str, str]]]:
+        """Capture ``(level name, message)`` pairs for loguru records emitted inside the block."""
+        records: list[tuple[str, str]] = []
+        handler_id = logger.add(
+            lambda m: records.append((m.record["level"].name, m.record["message"])),
+            level="TRACE",
+        )
+        try:
+            yield records
+        finally:
+            logger.remove(handler_id)
+
+    @staticmethod
+    def _skip_levels(records: list[tuple[str, str]]) -> list[str]:
+        return [level for level, message in records if message.startswith("Skipping VRAM attribution drift")]
+
+    def _evaluate_with_stale_contributor(self, pm: HordeWorkerProcessManager) -> None:
+        """Run one drift evaluation whose only ledger contributor reported too long ago."""
+        stale = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        stale.process_reserved_mb = 5000
+        stale.report_sampled_at = time.time() - (_REPORT_STALENESS_SECONDS + 5.0)
+        pm._process_map.clear()
+        pm._process_map[0] = stale  # type: ignore[index]
+        pm._read_device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
+        pm._last_vram_attribution_time = 0.0
+        pm._evaluate_vram_attribution_drift()
+
+    def test_repeated_stale_skips_are_demoted_to_trace(self) -> None:
+        """The first skip is visible at DEBUG; the per-tick repeats stay in the log only at TRACE."""
+        reset_log_throttles()
+        pm = make_testable_process_manager()
+        pm._inference_scheduler.resolved_context_constant_mb = Mock(return_value=200.0)  # type: ignore[attr-defined]
+
+        with self._capture_levels() as records:
+            self._evaluate_with_stale_contributor(pm)
+            self._evaluate_with_stale_contributor(pm)
+            self._evaluate_with_stale_contributor(pm)
+
+        assert self._skip_levels(records) == ["DEBUG", "TRACE", "TRACE"]

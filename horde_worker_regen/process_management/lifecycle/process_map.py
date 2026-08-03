@@ -15,6 +15,7 @@ from loguru import logger
 from pydantic import ConfigDict
 
 from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
+from horde_worker_regen.process_management._internal.util import throttled_log_level
 from horde_worker_regen.process_management.fd_limits import (
     FD_HEADROOM_WARN_FRACTION,
     descriptor_headroom_fraction,
@@ -26,6 +27,14 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+
+MEMORY_REPORT_LOG_INTERVAL_SECONDS = 30.0
+"""Seconds between DEBUG-level memory-report lines per process; reports in between are logged at TRACE.
+
+Every process reports its footprint several times a second, so the unthrottled line is one of the
+highest-volume emissions in the log while carrying no per-report forensic value: the current figures
+are always available from the process map and the full series remains in the TRACE log.
+"""
 
 _EXPECTED_PROCESS_STATE_SOURCES: dict[HordeProcessState, frozenset[HordeProcessState]] = {
     HordeProcessState.DOWNLOAD_COMPLETE: frozenset({HordeProcessState.DOWNLOADING_MODEL}),
@@ -374,7 +383,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
         self._warn_on_low_descriptor_headroom(process_info)
 
-        logger.debug(
+        logger.log(
+            throttled_log_level(f"process_map.memory_report:{process_id}", MEMORY_REPORT_LOG_INTERVAL_SECONDS),
             f"Process {process_id} memory report: "
             f"ram: {ram_usage_bytes} vram: {vram_usage_mb} total vram: {total_vram_mb} "
             f"fds: {open_fds}/{fd_soft_limit}",

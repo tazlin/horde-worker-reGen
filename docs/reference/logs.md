@@ -10,9 +10,24 @@ log line it reads, and the dashboard are kept from drifting apart.
 |------|----------|
 | `bridge.log` | Main log (all info). |
 | `bridge_n.log` | Per-process log. |
-| `trace.log` | Errors and warnings only. |
-| `trace_n.log` | Per-process errors and warnings. |
+| `trace.log` | Errors, criticals, and `TRACE`-level lines (including the suppressed repeats described below). |
+| `trace_n.log` | The same, per process. |
 | `bridge_tui.log` / `bridge_host.log` | The supervisor (parent) process's own log: TUI dashboard or `--host` wrapper. Captures worker launch, crash-loop, and TUI-process crash diagnostics that never reach `bridge.log`. |
+
+## Repeating telemetry is time-boxed
+
+Some lines describe a condition that is re-evaluated on every control-loop tick: a child's memory report,
+or a reason the parent skipped a periodic reconciliation. Emitting each one at `DEBUG` puts several lines
+a second into `bridge.log` and crowds out the job-flow story an operator is actually reading.
+
+Such lines are time-boxed per subject (per process, per device): at most one emission per 30 seconds lands
+at `DEBUG`, and the repeats in between are emitted at `TRACE` instead. Nothing is dropped. `bridge.log`
+carries a periodic sample and `trace.log` carries the full series, so a per-tick reconstruction is still
+possible after the fact.
+
+If you are adding a log line that fires on a timer rather than on an event, use
+`throttled_log_level()` from `horde_worker_regen/process_management/_internal/util.py` and log at the level
+it returns.
 
 ## Rotation and retention
 

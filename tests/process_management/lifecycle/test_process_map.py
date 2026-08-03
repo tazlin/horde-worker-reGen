@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 from loguru import logger
 
+from horde_worker_regen.process_management._internal.util import reset_log_throttles
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
     HordeHeartbeatType,
@@ -426,3 +427,59 @@ class TestHeldComponentResidency:
         """A process that reported no residency adds nothing, leaving the line unchanged."""
         process_map = ProcessMap({0: make_mock_process_info(0, model_name="ModelA")})
         assert "held" not in process_map.get_process_info_strings()[0]
+
+
+@contextmanager
+def _capture_levels() -> Iterator[list[tuple[str, str]]]:
+    """Capture ``(level name, message)`` pairs for loguru records emitted inside the block."""
+    records: list[tuple[str, str]] = []
+    handler_id = logger.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="TRACE",
+    )
+    try:
+        yield records
+    finally:
+        logger.remove(handler_id)
+
+
+class TestMemoryReportLogThrottle:
+    """The per-report memory line is time-boxed per process, with suppressed repeats kept at TRACE."""
+
+    @staticmethod
+    def _memory_report_levels(records: list[tuple[str, str]]) -> list[str]:
+        return [level for level, message in records if "memory report:" in message]
+
+    def test_first_report_per_process_logs_at_debug(self) -> None:
+        """The first memory report a process sends is visible at DEBUG."""
+        reset_log_throttles()
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+
+        with _capture_levels() as records:
+            process_map.on_memory_report(process_id=0, ram_usage_bytes=1024)
+
+        assert self._memory_report_levels(records) == ["DEBUG"]
+
+    def test_repeat_report_is_demoted_to_trace(self) -> None:
+        """Back-to-back reports from one process stay in the log, but only at TRACE."""
+        reset_log_throttles()
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+
+        with _capture_levels() as records:
+            process_map.on_memory_report(process_id=0, ram_usage_bytes=1024)
+            process_map.on_memory_report(process_id=0, ram_usage_bytes=2048)
+            process_map.on_memory_report(process_id=0, ram_usage_bytes=4096)
+
+        assert self._memory_report_levels(records) == ["DEBUG", "TRACE", "TRACE"]
+
+    def test_each_process_is_throttled_independently(self) -> None:
+        """One process's report must not suppress another process's first report."""
+        reset_log_throttles()
+        process_map = ProcessMap({0: make_mock_process_info(0), 1: make_mock_process_info(1)})
+
+        with _capture_levels() as records:
+            process_map.on_memory_report(process_id=0, ram_usage_bytes=1024)
+            process_map.on_memory_report(process_id=1, ram_usage_bytes=1024)
+            process_map.on_memory_report(process_id=0, ram_usage_bytes=2048)
+
+        assert self._memory_report_levels(records) == ["DEBUG", "DEBUG", "TRACE"]

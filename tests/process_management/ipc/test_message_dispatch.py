@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import queue
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management._internal.util import reset_log_throttles
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
@@ -834,3 +838,101 @@ class TestHandleModelStateChange:
         )
 
         process_manageron_model_load_state_change.assert_not_called()
+
+
+@contextmanager
+def _capture_levels() -> Iterator[list[tuple[str, str]]]:
+    """Capture ``(level name, message)`` pairs for loguru records emitted inside the block."""
+    records: list[tuple[str, str]] = []
+    handler_id = logger.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="TRACE",
+    )
+    try:
+        yield records
+    finally:
+        logger.remove(handler_id)
+
+
+def _received_memory_levels(records: list[tuple[str, str]]) -> list[str]:
+    """Levels of the per-message "received a memory report" dispatch lines."""
+    return [level for level, message in records if message.startswith("Received HordeProcessMemoryMessage")]
+
+
+def _make_memory_message(process_id: int, ram_usage_bytes: int) -> HordeProcessMemoryMessage:
+    """Build a memory report from a process whose launch identifier matches the mock process info."""
+    return HordeProcessMemoryMessage(
+        process_id=process_id,
+        process_launch_identifier=0,
+        ram_usage_bytes=ram_usage_bytes,
+        vram_usage_mb=2048,
+        vram_total_mb=4096,
+        info="memory",
+    )
+
+
+class TestMemoryMessageDispatchLogThrottle:
+    """The per-message dispatch line for memory reports is time-boxed per process."""
+
+    async def test_first_memory_message_per_process_logs_at_debug(self) -> None:
+        """The first memory report a process sends is visible at DEBUG."""
+        reset_log_throttles()
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: make_mock_process_info(0)}))
+        _enqueue(message_dispatcher, _make_memory_message(0, 1024))
+
+        with _capture_levels() as records:
+            await message_dispatcher.receive_and_handle_process_messages()
+
+        assert _received_memory_levels(records) == ["DEBUG"]
+
+    async def test_repeat_memory_messages_are_demoted_to_trace(self) -> None:
+        """Back-to-back memory reports from one process stay in the log, but only at TRACE."""
+        reset_log_throttles()
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: make_mock_process_info(0)}))
+        _enqueue_many(
+            message_dispatcher,
+            [_make_memory_message(0, 1024), _make_memory_message(0, 2048), _make_memory_message(0, 4096)],
+        )
+
+        with _capture_levels() as records:
+            await message_dispatcher.receive_and_handle_process_messages()
+
+        assert _received_memory_levels(records) == ["DEBUG", "TRACE", "TRACE"]
+
+    async def test_each_process_is_throttled_independently(self) -> None:
+        """One process's memory report must not suppress another process's first one."""
+        reset_log_throttles()
+        process_map = ProcessMap({0: make_mock_process_info(0), 1: make_mock_process_info(1)})
+        message_dispatcher = _make_dispatcher(process_map=process_map)
+        _enqueue_many(
+            message_dispatcher,
+            [_make_memory_message(0, 1024), _make_memory_message(1, 1024), _make_memory_message(0, 2048)],
+        )
+
+        with _capture_levels() as records:
+            await message_dispatcher.receive_and_handle_process_messages()
+
+        assert _received_memory_levels(records) == ["DEBUG", "DEBUG", "TRACE"]
+
+    async def test_other_message_types_are_not_throttled(self) -> None:
+        """Non-telemetry dispatch lines keep emitting at DEBUG for every message."""
+        reset_log_throttles()
+        process_info = make_mock_process_info(0)
+        process_info.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}))
+        state_changes = [
+            HordeProcessStateChangeMessage(
+                process_id=0,
+                process_launch_identifier=0,
+                process_state=HordeProcessState.WAITING_FOR_JOB,
+                info=f"idle {index}",
+            )
+            for index in range(3)
+        ]
+        _enqueue_many(message_dispatcher, list(state_changes))
+
+        with _capture_levels() as records:
+            await message_dispatcher.receive_and_handle_process_messages()
+
+        levels = [level for level, message in records if message.startswith("Received HordeProcessStateChangeMessage")]
+        assert levels == ["DEBUG", "DEBUG", "DEBUG"]

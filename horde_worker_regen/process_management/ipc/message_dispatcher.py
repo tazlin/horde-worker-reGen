@@ -18,6 +18,7 @@ from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_f
 from loguru import logger
 
 from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
+from horde_worker_regen.process_management._internal.util import throttled_log_level
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
@@ -206,6 +207,12 @@ class MessageDispatcher:
     """How often the verbose deadlock dump (process/model maps, per-stage counts) may be emitted while a
     wedge persists. The recurring "still detected" branches run every control-loop tick, so without this
     throttle a sustained wedge floods the log with thousands of identical dumps."""
+
+    _MEMORY_REPORT_DISPATCH_LOG_INTERVAL_SECONDS = 30.0
+    """How often the per-message "received a memory report" line may be emitted at DEBUG for a given
+    process; the reports in between are logged at TRACE. Every child reports its footprint several times a
+    second, and the receipt itself carries nothing the applied report does not, so the unthrottled line is
+    pure volume in the operator-facing log."""
 
     _READER_TICK_DRAIN_BUDGET_SECONDS = 0.5
     """Longest a single control-loop drain tick waits for the reader thread to quiesce (report the queue
@@ -485,7 +492,14 @@ class MessageDispatcher:
         if isinstance(message, HordeProcessHeartbeatMessage):
             self._handle_heartbeat(message)
         else:
-            logger.debug(
+            receipt_level = "DEBUG"
+            if isinstance(message, HordeProcessMemoryMessage):
+                receipt_level = throttled_log_level(
+                    f"message_dispatcher.memory_report:{message.process_id}",
+                    self._MEMORY_REPORT_DISPATCH_LOG_INTERVAL_SECONDS,
+                )
+            logger.log(
+                receipt_level,
                 f"Received {type(message).__name__} from process {message.process_id}: {message.info}",
             )
 
