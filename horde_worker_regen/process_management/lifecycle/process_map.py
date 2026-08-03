@@ -485,7 +485,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             last_job_referenced (ImageGenerateJobPopResponse | None): The last job referenced by this process.
         """
         if last_job_referenced is not None and (last_job_referenced != self[process_id].last_job_referenced):
-            logger.debug(f"Resetting heartbeat for process {process_id}")
+            logger.trace(f"Resetting heartbeat for process {process_id}")
             self[process_id].last_heartbeat_delta = 0
             self[process_id].last_heartbeat_timestamp = time.time()
             self[process_id].heartbeats_inference_steps = 0
@@ -521,7 +521,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 self[process_id].last_job_referenced is not None
                 and last_job_referenced != self[process_id].last_job_referenced
             ):
-                logger.debug(f"Resetting heartbeat for process {process_id}")
+                logger.trace(f"Resetting heartbeat for process {process_id}")
                 self.reset_heartbeat_state(process_id)
             self[process_id].last_job_referenced = last_job_referenced
 
@@ -578,7 +578,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         Args:
             process_id (int): The ID of the process to update.
         """
-        logger.debug(f"Resetting heartbeat for process {process_id}")
+        logger.trace(f"Resetting heartbeat for process {process_id}")
         self[process_id].last_heartbeat_delta = 0
         self[process_id].last_heartbeat_timestamp = time.time()
         self[process_id].heartbeats_inference_steps = 0
