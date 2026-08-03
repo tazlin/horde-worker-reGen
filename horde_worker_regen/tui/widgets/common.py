@@ -13,6 +13,7 @@ _STATUS_STYLES: dict[SupervisorStatus, tuple[str, str]] = {
     SupervisorStatus.RUNNING: ("running", "green"),
     SupervisorStatus.CRASHED: ("crashed", "red"),
     SupervisorStatus.RESTARTING: ("restarting", "yellow"),
+    SupervisorStatus.STOPPING: ("stopping", "yellow"),
     SupervisorStatus.STOPPED: ("stopped", "grey50"),
 }
 

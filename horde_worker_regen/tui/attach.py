@@ -33,6 +33,13 @@ from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProce
 _CONNECT_TIMEOUT_SECONDS = 5.0
 _RECONNECT_BACKOFF_SECONDS = 1.0
 
+_WORKER_STILL_UP_STATUSES = frozenset({SupervisorStatus.STARTING, SupervisorStatus.RUNNING})
+"""Host statuses that mean the worker has not yet moved on from the lifecycle the client last saw.
+
+A locally-recorded stop intent stays in force while the host reports one of these, because the host keeps
+reporting the pre-stop lifecycle until its own supervisor picks the request up. Any other reported status
+means the host has acted, so the local intent is spent."""
+
 
 class SupervisorLike(Protocol):
     """The supervisor surface the TUI depends on, satisfied by both the owning and attach supervisors."""
@@ -153,6 +160,12 @@ class AttachedWorkerSupervisor:
         self._status = SupervisorStatus.STOPPED
         self._restart_attempts = 0
         self._worker_running = False
+        self._stop_requested = False
+        """Whether this session has asked the host to stop the worker and is still awaiting its verdict.
+
+        The host owns the process and keeps reporting the worker as running until its own supervisor picks
+        the request up, so without a local record the session would present a stop it initiated as a
+        running worker gone silent."""
 
         self._socket: socket.socket | None = None
         self._send_lock = threading.Lock()
@@ -194,10 +207,21 @@ class AttachedWorkerSupervisor:
 
     def start(self) -> None:
         """Ask the host to start the worker (idempotent host-side)."""
+        self._stop_requested = False
         self._send_lifecycle(sp.LIFECYCLE_START)
 
     def stop(self, *, timeout: float = 0.0) -> None:
-        """Ask the host to stop the worker (an explicit user/control action, not a session close)."""
+        """Ask the host to stop the worker, presenting the stop locally until the host confirms it.
+
+        An explicit user/control action, not a session close. The host keeps streaming the draining
+        worker's last frame and its now-frozen liveness stamp while its own status still reads running, so
+        the intent is recorded and the frames dropped here; otherwise this session would show a stop it
+        asked for as a worker that stopped responding.
+        """
+        self._stop_requested = True
+        self.latest_snapshot = None
+        self.last_liveness_wall_time = None
+        self._status = SupervisorStatus.STOPPING
         self._send_lifecycle(sp.LIFECYCLE_STOP)
 
     def request_graceful_stop(self, *, timeout: float = 0.0) -> None:
@@ -210,6 +234,7 @@ class AttachedWorkerSupervisor:
 
     def request_restart(self, *, timeout: float = 0.0) -> None:
         """Ask the host to restart and present the intent locally until the host confirms it."""
+        self._stop_requested = False
         self.latest_snapshot = None
         self.last_liveness_wall_time = None
         self._status = SupervisorStatus.RESTARTING
@@ -395,6 +420,7 @@ class AttachedWorkerSupervisor:
         """Reflect a lost/absent host connection as a stopped, not-running worker."""
         self._status = SupervisorStatus.STOPPED
         self._worker_running = False
+        self._stop_requested = False
         # Drop the last frame so a dropped connection does not age into a false UNRESPONSIVE.
         self.latest_snapshot = None
         self.last_liveness_wall_time = None
@@ -412,7 +438,14 @@ class AttachedWorkerSupervisor:
         status_value = message.get("status")
         if isinstance(status_value, str):
             with contextlib.suppress(ValueError):
-                self._status = SupervisorStatus(status_value)
+                reported = SupervisorStatus(status_value)
+                if self._stop_requested and reported in _WORKER_STILL_UP_STATUSES:
+                    # The host has not picked the stop up yet; keep presenting the intent this session
+                    # issued rather than reverting to the lifecycle it is about to leave.
+                    reported = SupervisorStatus.STOPPING
+                else:
+                    self._stop_requested = False
+                self._status = reported
                 # The host streams no snapshots while stopped/restarting; drop the last frame so it
                 # cannot age into a false UNRESPONSIVE on this attached session.
                 if self._status in (SupervisorStatus.STOPPED, SupervisorStatus.RESTARTING):
@@ -425,9 +458,13 @@ class AttachedWorkerSupervisor:
         if isinstance(mode_value, str):
             with contextlib.suppress(ValueError):
                 self._mode = WorkerProcessMode(mode_value)
-        # Ignore the host's (stale) liveness while stopped/restarting, mirroring the snapshot drop above,
-        # so it cannot age into a false UNRESPONSIVE on this attached session.
-        if self._status not in (SupervisorStatus.STOPPED, SupervisorStatus.RESTARTING):
+        # Ignore the host's (stale) liveness outside a running lifecycle, mirroring the snapshot drop
+        # above, so it cannot age into a false UNRESPONSIVE on this attached session.
+        if self._status not in (
+            SupervisorStatus.STOPPED,
+            SupervisorStatus.STOPPING,
+            SupervisorStatus.RESTARTING,
+        ):
             liveness_wall_time = message.get("last_liveness_wall_time")
             if isinstance(liveness_wall_time, int | float):
                 self.last_liveness_wall_time = float(liveness_wall_time)

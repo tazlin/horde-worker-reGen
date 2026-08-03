@@ -80,7 +80,14 @@ class ControlView(VerticalScroll):
         self._auto_start = auto_start
         self._server_maintenance = bool(snapshot is not None and snapshot.worker_details_maintenance)
 
-        self.query_one("#control-start-stop", Button).label = "Stop worker" if self._running else "Start worker"
+        # A stop already draining gets its own label: the button still routes to stop (a repeat press
+        # re-sends the request), but the operator is told the stop is under way rather than being offered
+        # an action that reads as though nothing happened.
+        if supervisor_status is SupervisorStatus.STOPPING:
+            start_stop_label = "Stopping…"
+        else:
+            start_stop_label = "Stop worker" if self._running else "Start worker"
+        self.query_one("#control-start-stop", Button).label = start_stop_label
         self.query_one("#control-pause", Button).label = "Resume worker" if self._paused else "Pause worker"
         self.query_one("#control-autostart", Button).label = f"Auto-start: {'on' if auto_start else 'off'}"
         self.query_one("#control-maintenance", Button).label = (

@@ -109,11 +109,18 @@ Lifecycle changes are cooperative state-machine intents owned by the same thread
 that calls `WorkerSupervisor.tick()`. Stop sends `SHUTDOWN` and returns; later
 ticks keep draining progress until the old PID exits or the 150-second outer
 deadline tree-kills it. Restart is the same stop followed by a spawn only after
-the old PID is confirmed dead. The supervisor drops the old snapshot immediately
-and pins `RESTARTING`, so late frames from the draining process cannot change the
-display back to `RUNNING` or age into `UNRESPONSIVE`. Terminal and served modes
-use this same supervisor transition; socket clients merely enqueue the intent on
-the host's single owner thread.
+the old PID is confirmed dead. Either way the supervisor drops the outgoing
+worker's snapshot and liveness stamp immediately and pins a status of its own,
+`STOPPING` or `RESTARTING`, so late frames from the draining process cannot
+change the display back to `RUNNING` or age into `UNRESPONSIVE`. The presentation
+therefore follows the supervisor's own intent and does not depend on the worker
+reporting `shutting_down` before it goes quiet. A repeat stop request re-sends
+the shutdown but keeps the original force-kill deadline, so pressing stop again
+cannot defer the backstop that ends a stop the worker is ignoring. A restart
+requested mid-stop upgrades that stop in place rather than starting a second
+teardown. Terminal and served modes use this same supervisor transition; socket
+clients merely enqueue the intent on the host's single owner thread and present
+`STOPPING` locally until the host reports a status of its own.
 
 In served mode (`tui/web.py`, the default for non-technical users) a single
 `WorkerHost` owns one worker independently of any browser session, so closing a

@@ -56,7 +56,10 @@ There are two termination paths:
    dashboard: once the control loop stops it no longer stamps liveness, so a
    process that lingered would age into a false `UNRESPONSIVE`; the supervisor
    also reads a `shutting_down` snapshot as "Shutting down" rather than
-   "not responding" while the teardown completes.
+   "not responding" while the teardown completes. That covers shutdowns the
+   worker decides on its own. A shutdown the operator asked for is already
+   carried by the supervisor's own `STOPPING` status, so it presents calmly even
+   if this final snapshot never reaches the frontend.
 9. Final teardown takes a snapshot of the complete process map plus the separate
    download process, sends `END_PROCESS` to all of them, and joins them against
    one short shared deadline. Any straggler is killed and joined again. Only

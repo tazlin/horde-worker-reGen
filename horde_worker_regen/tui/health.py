@@ -153,6 +153,15 @@ def derive(
             pre_flight,
             False,
         )
+    if supervisor_status is SupervisorStatus.STOPPING:
+        return HealthReport(
+            WorkerPhase.SHUTTING_DOWN,
+            HealthStatus.INFO,
+            "Stopping worker…",
+            "Finishing in-flight jobs and ending the inference processes. It can take a few minutes.",
+            pre_flight,
+            True,
+        )
     if supervisor_status is SupervisorStatus.RESTARTING:
         return HealthReport(
             WorkerPhase.RESTARTING,
@@ -177,10 +186,11 @@ def derive(
     stale = snapshot_age is not None and snapshot_age > _stale_threshold(snapshot)
     # A worker that announced it is shutting down and then goes quiet is finishing its teardown, not
     # wedged: ending its inference/safety children and unwinding the control loop legitimately stops it
-    # stamping liveness for a stretch. Reading that silence as UNRESPONSIVE is exactly the false alarm
-    # operators saw on a clean stop, so shutdown is checked *before* staleness. A genuine hang here is
-    # still bounded: the supervisor force-kills a worker that overruns its graceful-stop deadline and the
-    # phase then flips to STOPPED.
+    # stamping liveness for a stretch, so shutdown is checked *before* staleness. This covers the shutdowns
+    # the worker decides on its own; an operator-requested stop is carried by ``SupervisorStatus.STOPPING``
+    # above and does not depend on the worker reporting anything. A genuine hang here is still bounded: the
+    # supervisor force-kills a worker that overruns its graceful-stop deadline and the phase flips to
+    # STOPPED.
     if snapshot.shutting_down:
         detail = (
             "Finishing teardown; it has gone quiet while stopping its processes."

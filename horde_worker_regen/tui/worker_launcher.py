@@ -63,6 +63,13 @@ class SupervisorStatus(enum.StrEnum):
     RUNNING = "running"
     CRASHED = "crashed"
     RESTARTING = "restarting"
+    STOPPING = "stopping"
+    """A cooperative stop the operator asked for is draining; the worker is still alive but on its way out.
+
+    Distinct from RUNNING so the dashboard can present a deliberate teardown from the moment the stop is
+    requested, rather than inferring it from the worker's own ``shutting_down`` reporting. That inference
+    fails exactly when the worker goes quiet without having published a frame carrying the flag, which is
+    what made a clean stop read as UNRESPONSIVE for the whole drain."""
     STOPPED = "stopped"
 
 
@@ -280,12 +287,10 @@ class WorkerSupervisor:
         during a relaunch. ``status`` lets a restart present a single ``RESTARTING`` phase instead of
         flickering through ``STARTING``.
         """
-        self.latest_snapshot = None
-        # The new worker has not reported yet: clear the liveness baseline so the freshly-spawned process
-        # gets the startup grace and the wedge backstop only re-arms once it sends its first frame (rather
-        # than inheriting the dead worker's last stamp and reading as instantly wedged).
-        self.last_liveness_wall_time = None
-        self._last_loop_advance_wall = None
+        # The new worker has not reported yet, so it also gets the startup grace: the wedge backstop only
+        # re-arms once it sends its first frame, rather than inheriting the dead worker's last stamp and
+        # reading as instantly wedged.
+        self._drop_worker_frames()
         parent_connection, child_connection = self._ctx.Pipe(duplex=True)
         target = _target_for_mode(self._mode)
         process = self._ctx.Process(  # type: ignore[attr-defined]
@@ -316,6 +321,17 @@ class WorkerSupervisor:
             )
         self._set_status(status)
         logger.info(f"Launched worker (mode={self._mode.value}, pid={process.pid}).")
+
+    def _drop_worker_frames(self) -> None:
+        """Forget the outgoing worker's last frame, liveness stamp, and loop-advance baseline.
+
+        Retained state belongs to an incarnation that is gone or on its way out. Left in place it keeps
+        ageing, and freshness is what every downstream verdict is built on: the dashboard's responsiveness
+        phase and the wedge backstop both read a stamp that can no longer advance.
+        """
+        self.latest_snapshot = None
+        self.last_liveness_wall_time = None
+        self._last_loop_advance_wall = None
 
     def _set_status(self, status: SupervisorStatus) -> None:
         """Update status and notify any observer on change."""
@@ -665,7 +681,8 @@ class WorkerSupervisor:
         Unlike :meth:`stop`, this returns immediately instead of joining the worker, so a single-threaded
         owner (the worker host) keeps draining snapshots and serving clients while the worker finishes its
         in-flight jobs. The worker is asked to shut down; if it has not exited within ``timeout`` a later
-        tick terminates it.
+        tick terminates it. ``STOPPING`` is pinned for the whole drain so the operator sees the stop they
+        asked for rather than the outgoing worker's last frame ageing into an alarm.
 
         Concurrency:
             Intended to be driven by the same thread that calls :meth:`tick`; it is not safe to call
@@ -678,24 +695,39 @@ class WorkerSupervisor:
 
         The old snapshot and liveness baseline are dropped immediately and ``RESTARTING`` remains pinned
         while the old process drains. A replacement is spawned only after that process is confirmed dead,
-        including after the graceful-stop tree-kill backstop fires.
+        including after the graceful-stop tree-kill backstop fires. Requested while a plain stop is already
+        draining, it upgrades that stop in place: the worker still exits once, and a replacement follows.
         """
-        self.latest_snapshot = None
-        self.last_liveness_wall_time = None
-        self._last_loop_advance_wall = None
-        self._set_status(SupervisorStatus.RESTARTING)
         self._begin_graceful_stop(timeout=timeout, restart_after_stop=True)
 
     def _begin_graceful_stop(self, *, timeout: float, restart_after_stop: bool) -> None:
-        """Record one cooperative lifecycle intent without blocking the thread that owns :meth:`tick`."""
+        """Record one cooperative lifecycle intent without blocking the thread that owns :meth:`tick`.
+
+        The intent is recorded as supervisor state (the pinned status plus the dropped frames) rather than
+        left implicit, so every consumer sees a deliberate teardown without having to wait for the worker
+        to report one of its own. Re-entering while a stop already drains only revises the intent: the
+        shutdown request is repeated in case the first never landed, but the force-kill deadline keeps its
+        original value. Re-arming it would let an operator who presses stop again defer indefinitely the
+        one backstop that ends an unresponsive stop.
+        """
+        already_stopping = self._intentional_stop
         self._intentional_stop = True
         self._restart_after_stop = restart_after_stop
+        # Frames first, so any status observer already sees the pair consistently.
+        self._drop_worker_frames()
+        self._set_status(SupervisorStatus.RESTARTING if restart_after_stop else SupervisorStatus.STOPPING)
         process = self._process
         if process is None or not process.is_alive():
             self._complete_graceful_stop()
             return
         self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
-        self._graceful_stop_deadline = time.time() + timeout
+        if not already_stopping:
+            logger.info(
+                f"Asked the worker (pid={process.pid}) to shut down; it has {timeout:.0f}s to drain before "
+                "its process tree is terminated.",
+            )
+        if self._graceful_stop_deadline == 0.0:
+            self._graceful_stop_deadline = time.time() + timeout
 
     def restart(self) -> None:
         """Stop the worker and start it again (blocking; for owners that drive lifecycle synchronously).
@@ -706,7 +738,7 @@ class WorkerSupervisor:
         ageing the dead worker's last frame into the alarming ``UNRESPONSIVE``. The next fresh snapshot
         flips the status to ``RUNNING`` (see :meth:`drain_snapshots`).
         """
-        self.latest_snapshot = None
+        self._drop_worker_frames()
         self._set_status(SupervisorStatus.RESTARTING)
         self._restart_after_stop = False
         self.stop(set_stopped_status=False)
@@ -781,5 +813,5 @@ class WorkerSupervisor:
                 self._connection.close()
             self._connection = None
         self._process = None
-        # The worker that produced it is gone; keeping it would age into a false UNRESPONSIVE.
-        self.latest_snapshot = None
+        # The worker that produced them is gone; keeping them would age into a false UNRESPONSIVE.
+        self._drop_worker_frames()

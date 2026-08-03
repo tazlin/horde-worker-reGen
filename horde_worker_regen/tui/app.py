@@ -1730,9 +1730,15 @@ class HordeWorkerTUI(App[None]):
         if self._supervisor.status is SupervisorStatus.STOPPED or not self._supervisor.is_alive():
             self.notify("Starting worker…")
             self._supervisor.start()
+            return
+        already_stopping = self._supervisor.status is SupervisorStatus.STOPPING
+        self._supervisor.request_graceful_stop()
+        if already_stopping:
+            # The request is re-sent, but its force-kill deadline is not extended; say so, because the
+            # obvious reading of an unchanged screen is that the press did nothing.
+            self.notify("Stop already under way; the worker is still draining in-flight jobs.")
         else:
             self.notify("Stopping worker (in-flight jobs will finish)…")
-            self._supervisor.request_graceful_stop()
 
     def action_toggle_autostart(self) -> None:
         """Flip and persist whether the worker auto-starts on launch."""
