@@ -41,6 +41,10 @@ def mock_job_info() -> MagicMock:
     job_info.sdk_api_job_info.model = "test_model"
     job_info.sdk_api_job_info.payload.n_iter = 1
     job_info.sdk_api_job_info.payload.karras = True
+    # A MagicMock invents any attribute that is read, so an unset scheduler has to be set to None
+    # explicitly. Left to itself the mock models a payload that cannot exist: a truthy schedule object
+    # alongside the karras flag, which would then serialize into the training data.
+    job_info.sdk_api_job_info.payload.scheduler = None
     loras: list[LorasPayloadEntry] = []
     job_info.sdk_api_job_info.payload.loras = loras
     tis: list[TIPayloadEntry] = []
@@ -212,10 +216,31 @@ def test_prepare_model_dump_adds_scheduler(
         },
     }
 
-    # Test with karras=False
+    # Test with karras=False. The recorded schedule is `normal`, which is what the backend actually runs
+    # for a false flag; this asserted `simple` previously, a schedule no horde request has ever sampled
+    # on, so the training data disagreed with the renders it was labelling.
     mock_job_info.sdk_api_job_info.payload.karras = False
+    mock_job_info.sdk_api_job_info.payload.scheduler = None
     dump = recorder._prepare_model_dump(mock_job_info)
-    assert dump["sdk_api_job_info"]["payload"]["scheduler"] == "simple"
+    assert dump["sdk_api_job_info"]["payload"]["scheduler"] == "normal"
+
+
+def test_prepare_model_dump_prefers_an_explicit_scheduler(
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
+    mock_job_info: MagicMock,
+) -> None:
+    """A job naming a schedule is recorded as that schedule, not as whatever the karras flag says."""
+    recorder = KudosTrainingRecorder(
+        training_data_file="test.json",
+        stable_diffusion_reference=mock_model_reference,
+    )
+
+    mock_job_info.sdk_api_job_info.payload.karras = True
+    mock_job_info.sdk_api_job_info.payload.scheduler = "sgm_uniform"
+    dump = recorder._prepare_model_dump(mock_job_info)
+
+    assert dump["sdk_api_job_info"]["payload"]["scheduler"] == "sgm_uniform"
+    assert "karras" not in dump["sdk_api_job_info"]["payload"]
 
 
 def test_prepare_model_dump_adds_counts(

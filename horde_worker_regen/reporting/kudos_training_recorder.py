@@ -127,8 +127,15 @@ class KudosTrainingRecorder:
         if self.stable_diffusion_reference is not None and job_info.sdk_api_job_info.model is not None:
             api_job["model_baseline"] = self.stable_diffusion_reference[job_info.sdk_api_job_info.model].baseline
 
-        # Add scheduler information (preparation for multiple schedulers)
-        payload["scheduler"] = "karras" if job_info.sdk_api_job_info.payload.karras else "simple"
+        # Record the schedule that was actually sampled on. A job may name one outright, and when it does
+        # not the karras flag decides it, where false means `normal`. This previously recorded `simple` for
+        # that case, a schedule the backend never runs, which would teach the pricer a correlation that
+        # does not exist. Read through getattr rather than importing the SDK's resolver: an SDK predating
+        # the field has no attribute to read, and this module is imported at worker startup.
+        requested_scheduler = getattr(job_info.sdk_api_job_info.payload, "scheduler", None)
+        if not requested_scheduler:
+            requested_scheduler = "karras" if job_info.sdk_api_job_info.payload.karras else "normal"
+        payload["scheduler"] = requested_scheduler
         payload.pop("karras", None)
 
         # Add lora and TI counts
