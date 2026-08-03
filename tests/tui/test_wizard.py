@@ -7,6 +7,9 @@ catalog at all, and a save that writes the keys it owns without disturbing anyth
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,7 @@ import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
+from textual.pilot import Pilot
 from textual.widgets import Button, Input, Static, Switch
 
 from horde_worker_regen.app_state import AppStateStore, ExperienceLevel, OnboardingChoice
@@ -30,6 +34,7 @@ from horde_worker_regen.tui.wizard import (
     DEFAULT_DREAMER_NAME,
     GettingStartedScreen,
     PresetKind,
+    _backend_mismatch_warning,
     _top_n_for_vram,
     build_preset_plans,
     is_setup_incomplete,
@@ -134,25 +139,22 @@ def test_top_n_for_vram_tiers(total_mb: int | None, expected_top_n: int) -> None
 
 def test_backend_mismatch_warns_on_cpu_build_with_nvidia(monkeypatch: pytest.MonkeyPatch) -> None:
     """A detected NVIDIA card paired with the CPU torch build triggers a loud warning."""
-    monkeypatch.setattr(wizard, "_detect_total_vram_mb", lambda: 12_000)
     monkeypatch.setattr(wizard, "_detect_installed_torch_build", lambda: "cpu")
-    warning = GettingStartedScreen()._backend_mismatch_warning()
+    warning = _backend_mismatch_warning(12_000)
     assert "cu128" in warning
     assert "CPU build" in warning
 
 
 def test_backend_mismatch_silent_on_cuda_build(monkeypatch: pytest.MonkeyPatch) -> None:
     """No warning when the CUDA build is installed alongside the NVIDIA card."""
-    monkeypatch.setattr(wizard, "_detect_total_vram_mb", lambda: 12_000)
     monkeypatch.setattr(wizard, "_detect_installed_torch_build", lambda: "cu128")
-    assert GettingStartedScreen()._backend_mismatch_warning() == ""
+    assert _backend_mismatch_warning(12_000) == ""
 
 
 def test_backend_mismatch_silent_without_device_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without device telemetry there is nothing to compare, so we stay silent."""
-    monkeypatch.setattr(wizard, "_detect_total_vram_mb", lambda: None)
     monkeypatch.setattr(wizard, "_detect_installed_torch_build", lambda: "cpu")
-    assert GettingStartedScreen()._backend_mismatch_warning() == ""
+    assert _backend_mismatch_warning(None) == ""
 
 
 def test_preset_entries_scale_with_the_card() -> None:
@@ -240,6 +242,19 @@ def _stub_catalog(monkeypatch: pytest.MonkeyPatch, *, loaded: bool = True) -> No
     monkeypatch.setattr(wizard, "_download_plan", lambda names, records: _plan(to_download=2 * _GB, free=99 * _GB))
 
 
+async def _settle(pilot: Pilot[None], app: App[None], *, timeout: float = 5.0) -> None:
+    """Wait for the page's background pass to publish its preset plans."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        page = app.screen
+        if isinstance(page, GettingStartedScreen) and page._plans:
+            await pilot.pause()
+            return
+        await pilot.pause()
+        await asyncio.sleep(0.02)
+    raise AssertionError("the page never published its preset plans")
+
+
 async def test_page_saves_only_the_keys_it_owns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Saving writes identity, models, NSFW and the preset's features, and leaves other keys alone."""
     monkeypatch.chdir(tmp_path)
@@ -252,6 +267,7 @@ async def test_page_saves_only_the_keys_it_owns(tmp_path: Path, monkeypatch: pyt
     app = _PageHarness(config_path)
     async with app.run_test(size=(120, 60)) as pilot:
         await pilot.pause()
+        await _settle(pilot, app)
         app.screen.query_one("#gs-name", Input).value = "MyWorker"
         app.screen.query_one("#gs-api-key", Input).value = "my-real-key"
         app.screen.query_one("#gs-nsfw", Switch).value = True
@@ -282,7 +298,7 @@ async def test_page_writes_the_recommended_stance(tmp_path: Path, monkeypatch: p
 
     app = _PageHarness(config_path)
     async with app.run_test(size=(120, 60)) as pilot:
-        await pilot.pause()
+        await _settle(pilot, app)
         app.screen.query_one("#gs-name", Input).value = "MyWorker"
         app.screen.query_one("#gs-api-key", Input).value = "my-real-key"
         await pilot.pause()
@@ -307,7 +323,7 @@ async def test_civitai_token_is_saved_with_a_lora_preset(tmp_path: Path, monkeyp
         await pilot.pause()
         app.screen.query_one("#gs-name", Input).value = "MyWorker"
         app.screen.query_one("#gs-api-key", Input).value = "my-real-key"
-        await pilot.pause()
+        await _settle(pilot, app)
         await pilot.click("#gs-choose-showcase")
         await pilot.pause()
         app.screen.query_one("#gs-civitai-token", Input).value = "civ-token-123"
@@ -397,7 +413,7 @@ async def test_unfitting_preset_is_disabled_on_the_page(tmp_path: Path, monkeypa
 
     app = _PageHarness(tmp_path / "bridgeData.yaml")
     async with app.run_test(size=(120, 60)) as pilot:
-        await pilot.pause()
+        await _settle(pilot, app)
         assert app.screen.query_one("#gs-choose-essentials", Button).disabled is False
         assert app.screen.query_one("#gs-choose-showcase", Button).disabled is True
         body = _plain(app.screen.query_one("#gs-preset-showcase-body", Static))
@@ -411,7 +427,7 @@ async def test_page_renders_without_a_catalog(tmp_path: Path, monkeypatch: pytes
 
     app = _PageHarness(tmp_path / "bridgeData.yaml")
     async with app.run_test(size=(120, 60)) as pilot:
-        await pilot.pause()
+        await _settle(pilot, app)
         body = _plain(app.screen.query_one("#gs-preset-recommended-body", Static))
         assert "not available yet" in body
         # The recommended selection is still writable, because its instruction needs no catalog.
@@ -423,6 +439,89 @@ async def test_page_renders_without_a_catalog(tmp_path: Path, monkeypatch: pytes
         assert not app.screen.query_one("#gs-choose-essentials", Button).disabled
         assert not app.screen.query_one("#gs-choose-recommended", Button).disabled
         assert app.screen.query_one("#gs-choose-showcase", Button).disabled
+
+
+def _blocking_probe(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Make the hardware probe hang until the returned event is set, as a slow real probe does."""
+    release = threading.Event()
+
+    def _probe() -> int | None:
+        release.wait(timeout=10)
+        return 24_000
+
+    monkeypatch.setattr(wizard, "_detect_total_vram_mb", _probe)
+    return release
+
+
+async def test_page_paints_before_the_probe_finishes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The page is readable while the hardware probe is still running, then fills in when it lands."""
+    monkeypatch.chdir(tmp_path)
+    _stub_catalog(monkeypatch)
+    release = _blocking_probe(monkeypatch)
+
+    app = _PageHarness(tmp_path / "bridgeData.yaml")
+    async with app.run_test(size=(120, 60)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        page = app.screen
+        assert isinstance(page, GettingStartedScreen)
+        assert "crowdsourced image service" in _plain(page.query_one("#gs-what-is", Static))
+        assert "Three things get a worker running" in _plain(page.query_one("#gs-what-needed", Static))
+        for kind in ("essentials", "recommended", "showcase"):
+            body = _plain(page.query_one(f"#gs-preset-{kind}-body", Static))
+            assert "Checking what this needs on disk" in body
+            assert page.query_one(f"#gs-choose-{kind}", Button).disabled is False
+
+        release.set()
+        await _settle(pilot, app)
+        assert "2.0 GB downloaded" in _plain(page.query_one("#gs-preset-essentials-body", Static))
+
+
+async def test_late_probe_resizes_the_selection_without_moving_the_choice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card arriving late widens what recommended loads, and leaves a made choice where it was."""
+    monkeypatch.chdir(tmp_path)
+    _stub_catalog(monkeypatch)
+    release = _blocking_probe(monkeypatch)
+
+    app = _PageHarness(tmp_path / "bridgeData.yaml")
+    async with app.run_test(size=(120, 60)) as pilot:
+        await pilot.pause()
+        page = app.screen
+        assert isinstance(page, GettingStartedScreen)
+        page.on_button_pressed(Button.Pressed(page.query_one("#gs-choose-essentials", Button)))
+        await pilot.pause()
+
+        release.set()
+        await _settle(pilot, app)
+        # The 24 GB reading raises the recommended tier, but the essentials choice is still the one made.
+        assert page._plans[PresetKind.RECOMMENDED].entries == ["top 5"]
+        assert page._chosen is PresetKind.ESSENTIALS
+        assert page._model_entries() == ["top 1"]
+
+
+async def test_background_results_after_closing_are_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the page while the probe is still out leaves nothing to land on a dead screen."""
+    monkeypatch.chdir(tmp_path)
+    _stub_catalog(monkeypatch)
+    release = _blocking_probe(monkeypatch)
+
+    app = _PageHarness(tmp_path / "bridgeData.yaml")
+    async with app.run_test(size=(120, 60)) as pilot:
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.saved is False
+        release.set()
+        for _ in range(10):
+            await pilot.pause()
+            await asyncio.sleep(0.02)
+        assert app._exception is None
 
 
 def _make_app(tmp_path: Path, *, configured: bool) -> HordeWorkerTUI:

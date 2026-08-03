@@ -9,8 +9,12 @@ The page is shown automatically while ``bridgeData.yaml`` is unconfigured (see
 [`is_setup_incomplete`][horde_worker_regen.tui.wizard.is_setup_incomplete]) and stays reachable from the
 Simple home afterwards, because the presets and the explanations remain useful once a worker runs.
 
-What it offers is a choice between three presets, each a model selection plus a feature stance, priced
-against the disk the models will actually need
+Opening it costs nothing: construction and mount only paint, and every slow answer (the device probe,
+the model catalog, the disk pricing) is gathered on a worker thread and applied to the live page as it
+arrives, so the options fill in under the reader rather than delaying the first frame.
+
+What it offers is one pick-one choice between three presets, each a model selection plus a feature
+stance, priced against the disk the models will actually need
 ([`compute_download_plan`][horde_worker_regen.model_download_plan.compute_download_plan] over the models
 the selection resolves to). A preset the volume cannot hold is shown disabled with the shortfall rather
 than hidden, so the constraint is legible. Model browsing is the same
@@ -26,6 +30,7 @@ the presets state that sizes are unavailable and remain choosable where they can
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import enum
 import os
@@ -37,6 +42,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import Button, Input, Static, Switch
 
@@ -94,6 +100,10 @@ def is_setup_incomplete(config_path: Path = DEFAULT_CONFIG_PATH) -> bool:
     return not dreamer_name or dreamer_name == DEFAULT_DREAMER_NAME
 
 
+_probed_vram_mb: tuple[int | None] | None = None
+"""The probe's answer once it has been asked, wrapped so that a ``None`` reading is still "asked"."""
+
+
 def _detect_total_vram_mb() -> int | None:
     """Best-effort read of the primary device's total VRAM in MB, or None when unavailable.
 
@@ -101,16 +111,28 @@ def _detect_total_vram_mb() -> int | None:
     not NVML) so non-NVIDIA cards size the presets correctly. The probe runs the torch-loading
     enumeration in a subprocess, keeping the TUI process itself torch-free. Any failure or a zero
     reading yields None so the caller falls back to a safe default rather than erroring.
+
+    Spawning that subprocess costs seconds, and the installed VRAM does not change while the dashboard
+    runs, so the answer is kept for the life of the process. Callers must still treat this as blocking:
+    the first ask pays the full cost. Under the test harness the probe is skipped entirely, matching how
+    the other out-of-process work here behaves.
     """
+    global _probed_vram_mb
+    if _testing_mode():
+        return None
+    if _probed_vram_mb is not None:
+        return _probed_vram_mb[0]
+    total_mb: int | None = None
     try:
         from horde_worker_regen.utils.accelerator_probe import probe_accelerators
 
         accelerators = probe_accelerators()
     except Exception:  # noqa: BLE001 - "no GPU telemetry" is expected, not a crash
-        return None
-    if not accelerators:
-        return None
-    return accelerators[0].total_vram_mb or None
+        accelerators = []
+    if accelerators:
+        total_mb = accelerators[0].total_vram_mb or None
+    _probed_vram_mb = (total_mb,)
+    return total_mb
 
 
 def _top_n_for_vram(total_mb: int | None) -> int:
@@ -147,6 +169,25 @@ def _detect_installed_torch_build() -> str | None:
         return None
     _, _, local = raw.partition("+")
     return local or None
+
+
+def _backend_mismatch_warning(total_vram_mb: int | None) -> str:
+    """Text warning of an installed CPU build despite a detected NVIDIA GPU, else ``""``.
+
+    The device probe talks to the driver, not torch, so a present GPU still reports its VRAM even when
+    the CPU wheel is installed; pairing that with a ``+cpu`` build is the classic "why is it so slow"
+    trap. When no device telemetry is available there is nothing to compare against.
+    """
+    if total_vram_mb is None:
+        return ""
+    build = _detect_installed_torch_build()
+    if build is not None and build.startswith("cpu"):
+        return (
+            "An NVIDIA GPU was detected, but the CPU build of PyTorch is installed, so the worker "
+            "would run roughly 100x slower. Re-run the installer with HORDE_WORKER_BACKEND=cu128 "
+            "to fix this."
+        )
+    return ""
 
 
 def _testing_mode() -> bool:
@@ -393,6 +434,9 @@ class GettingStartedScreen(Screen[bool]):
 
     BINDINGS = [Binding("escape", "close", "Close")]
 
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (110, "-normal"), (150, "-wide")]
+    """Three readable option columns need about 110 columns; below that they stack."""
+
     DEFAULT_CSS = """
     GettingStartedScreen {
         background: $surface;
@@ -403,12 +447,38 @@ class GettingStartedScreen(Screen[bool]):
     /* Containers default to filling their parent, which on a scrolling page squeezes the cards inside
        them to nothing and pads the details card with dead rows. Every container here sizes to content. */
     GettingStartedScreen #gs-presets,
+    GettingStartedScreen #gs-preset-row,
     GettingStartedScreen #gs-civitai,
     GettingStartedScreen .gs-preset {
         height: auto;
     }
+    /* One frame around the whole choice, so the three options read as one pick-one control rather than
+       three unrelated ideas. The options themselves carry no border, only a selection background. */
+    GettingStartedScreen #gs-presets {
+        border: round $primary;
+        padding: 1 1;
+        margin-bottom: 1;
+    }
+    GettingStartedScreen #gs-preset-row {
+        layout: vertical;
+    }
+    GettingStartedScreen.-normal #gs-preset-row,
+    GettingStartedScreen.-wide #gs-preset-row {
+        layout: horizontal;
+    }
+    GettingStartedScreen .gs-preset {
+        width: 1fr;
+        padding: 0 1;
+    }
     GettingStartedScreen .gs-preset.-chosen {
-        border: tall $success;
+        background: $accent 20%;
+    }
+    GettingStartedScreen .gs-preset Button {
+        width: 100%;
+    }
+    GettingStartedScreen #gs-stance {
+        padding-top: 1;
+        color: $text-muted;
     }
     GettingStartedScreen .gs-error {
         color: $error;
@@ -428,10 +498,15 @@ class GettingStartedScreen(Screen[bool]):
     """
 
     def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-        """Store the config path and detect the card once, so the presets can be sized without re-probing."""
+        """Store the config path only.
+
+        Construction happens inside the caller's click handler, before the screen is even pushed, so
+        nothing here may touch the device probe, the disk or the catalog: all of that runs later, off
+        the UI thread, and lands on an already-painted page.
+        """
         super().__init__()
         self._config_path = config_path
-        self._detected_vram_mb = _detect_total_vram_mb()
+        self._detected_vram_mb: int | None = None
         self._chosen = SUGGESTED_PRESET
         self._plans: dict[PresetKind, PresetPlan] = {}
         self._custom_models: list[str] | None = None
@@ -446,10 +521,12 @@ class GettingStartedScreen(Screen[bool]):
             yield Static("", id="gs-backend-warning", classes="gs-error")
             yield Static("What will this computer offer?", classes="horde-card-title")
             with Vertical(id="gs-presets"):
-                for preset in PRESETS:
-                    with Vertical(id=f"gs-preset-{preset.kind.value}", classes="horde-card gs-preset"):
-                        yield Static(id=f"gs-preset-{preset.kind.value}-body")
-                        yield Button("Choose this", id=f"gs-choose-{preset.kind.value}")
+                with Horizontal(id="gs-preset-row"):
+                    for preset in PRESETS:
+                        with Vertical(id=f"gs-preset-{preset.kind.value}", classes="gs-preset"):
+                            yield Static(id=f"gs-preset-{preset.kind.value}-body")
+                            yield Button("Choose this", id=f"gs-choose-{preset.kind.value}")
+                yield Static(id="gs-stance")
             yield Static(id="gs-selection", classes="horde-card")
             with Horizontal(classes="horde-actions"):
                 yield Button("Choose my own models instead", id="gs-browse")
@@ -487,11 +564,11 @@ class GettingStartedScreen(Screen[bool]):
         self.call_after_refresh(self._initialise)
 
     def _initialise(self) -> None:
-        """Seed the fields from any existing config, render the presets, and load the catalog if needed."""
-        self.query_one("#gs-backend-warning", Static).update(self._backend_mismatch_warning())
+        """Paint the page from what is already known, then gather the rest in the background."""
         self._seed_from_config()
-        self._refresh_presets()
-        self._start_catalog_load()
+        self.query_one("#gs-presets", Vertical).border_title = "Pick one"
+        self._render_presets()
+        self._start_background_load()
         # The page opens on its explanation, which is the reason it exists. Focusing a field would
         # scroll the reader past it, so the first field is reached by Tab or by clicking it.
         self.query_one("#gs-page", VerticalScroll).scroll_home(animate=False)
@@ -514,62 +591,73 @@ class GettingStartedScreen(Screen[bool]):
         if civitai_token:
             self.query_one("#gs-civitai-token", Input).value = civitai_token
 
-    def _backend_mismatch_warning(self) -> str:
-        """Text warning of an installed CPU build despite a detected NVIDIA GPU, else ``""``.
-
-        The device probe talks to the driver, not torch, so a present GPU still reports its VRAM even
-        when the CPU wheel is installed; pairing that with a ``+cpu`` build is the classic "why is it so
-        slow" trap. When no device telemetry is available there is nothing to compare against.
-        """
-        if self._detected_vram_mb is None:
-            return ""
-        build = _detect_installed_torch_build()
-        if build is not None and build.startswith("cpu"):
-            return (
-                "An NVIDIA GPU was detected, but the CPU build of PyTorch is installed, so the worker "
-                "would run roughly 100x slower. Re-run the installer with HORDE_WORKER_BACKEND=cu128 "
-                "to fix this."
-            )
-        return ""
-
     # region presets
 
-    def _start_catalog_load(self) -> None:
-        """Load the catalog and usage stats off the UI thread when they are not already cached."""
+    def _start_background_load(self) -> None:
+        """Gather everything the presets need off the UI thread, on an already-painted page.
+
+        One worker covers the whole open path: the device probe (a subprocess that takes seconds), the
+        catalog and usage-stat fetch, and the planning that prices each preset against the disk. Results
+        arrive in two passes so the page fills in as soon as each is known rather than at the end.
+        """
+        self.run_worker(self._load_page_data_blocking, thread=True, exclusive=True, group="getting-started-load")
+
+    def _load_page_data_blocking(self) -> None:
+        """Probe, load and plan for the worker thread; every step degrades to "unknown" on failure."""
+        total_vram_mb = _detect_total_vram_mb()
+        warning = _backend_mismatch_warning(total_vram_mb)
+        self._publish_page_data(total_vram_mb, warning)
         if _testing_mode():
             return
-        catalog, popularity = _catalog_state()
-        if catalog is not None and popularity is not None:
-            return
-        self.run_worker(self._load_catalog_blocking, thread=True, exclusive=True, group="getting-started-catalog")
-
-    def _load_catalog_blocking(self) -> None:
-        """Blocking catalog load for the worker thread; a failure leaves the presets unpriced."""
         from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
 
         try:
             CATALOG_CACHE.ensure_loaded(want_popularity=True)
         except Exception:  # noqa: BLE001 - offline is a quieter page, never an error state
             return
-        self.app.call_from_thread(self._refresh_presets)
+        self._publish_page_data(total_vram_mb, warning)
 
-    def _refresh_presets(self) -> None:
-        """Recompute every preset's models and disk cost, and redraw the cards."""
+    def _publish_page_data(self, total_vram_mb: int | None, warning: str) -> None:
+        """Plan against whatever is cached now and hand the result to the UI thread (worker thread)."""
         catalog, popularity = _catalog_state()
-        self._plans = build_preset_plans(
-            catalog,
-            popularity,
-            _catalog_records(),
-            total_vram_mb=self._detected_vram_mb,
-        )
+        plans = build_preset_plans(catalog, popularity, _catalog_records(), total_vram_mb=total_vram_mb)
+        self.app.call_from_thread(self._apply_page_data, total_vram_mb, warning, plans)
+
+    def _apply_page_data(
+        self,
+        total_vram_mb: int | None,
+        warning: str,
+        plans: dict[PresetKind, PresetPlan],
+    ) -> None:
+        """Adopt background results and redraw. A late arrival on a closed page is dropped.
+
+        The card the operator picked is never taken away by data landing afterwards: only the entries
+        and the pricing behind each option are replaced, so a bigger card arriving late can widen the
+        recommended selection without moving the choice.
+        """
+        if not self.is_mounted:
+            return
+        self._detected_vram_mb = total_vram_mb
+        self._plans = plans
+        with contextlib.suppress(NoMatches):
+            self.query_one("#gs-backend-warning", Static).update(warning)
+            self._render_presets()
+
+    def _render_presets(self) -> None:
+        """Draw the options from what is currently known, including "still checking"."""
         for preset in PRESETS:
-            plan = self._plans[preset.kind]
+            plan = self._plans.get(preset.kind)
             self.query_one(f"#gs-preset-{preset.kind.value}-body", Static).update(self._preset_text(preset, plan))
             card = self.query_one(f"#gs-preset-{preset.kind.value}", Vertical)
             card.set_class(preset.kind is self._chosen, "-chosen")
             button = self.query_one(f"#gs-choose-{preset.kind.value}", Button)
-            button.disabled = not plan.selectable
+            # An option is only refused once it is priced and known not to fit; while the figures are
+            # still being gathered every option stays live.
+            button.disabled = plan is not None and not plan.selectable
             button.label = "Chosen" if preset.kind is self._chosen else "Choose this"
+        self.query_one("#gs-stance", Static).update(
+            Text.assemble(("This choice accepts: ", "grey62"), (PRESETS_BY_KIND[self._chosen].stance, "")),
+        )
         self._update_selection_text()
         self._update_civitai_visibility()
 
@@ -578,16 +666,22 @@ class GettingStartedScreen(Screen[bool]):
         wants_lora = PRESETS_BY_KIND[self._chosen].features.get("allow_lora", False)
         self.query_one("#gs-civitai", Vertical).display = wants_lora
 
-    def _preset_text(self, preset: Preset, plan: PresetPlan) -> Text:
-        """The body of one preset card: what it offers, what it accepts, and what it costs."""
-        heading = preset.title
+    def _preset_text(self, preset: Preset, plan: PresetPlan | None) -> Text:
+        """One option: its marker and title, what it offers, and what it costs (or that we are looking).
+
+        The radio marker carries the mutual exclusivity, so the three options read as one choice before
+        anything is clicked. ``plan`` is None while the figures are still being gathered.
+        """
+        chosen = preset.kind is self._chosen
+        heading = f"{'◉' if chosen else '○'} {preset.title}"
         if preset.kind is SUGGESTED_PRESET:
             heading += "  (suggested)"
-        if preset.kind is self._chosen:
-            heading += "  ✓"
-        body = Text.assemble((f"{heading}\n", "bold"), (f"{preset.offer}\n", ""), (f"{preset.stance}\n", "grey70"))
-        style = "grey70" if plan.selectable else "yellow"
-        body.append(plan.disk_sentence(), style)
+        title_style = "bold" if chosen else "bold grey70"
+        body = Text.assemble((f"{heading}\n", title_style), (f"{preset.offer}\n", ""))
+        if plan is None:
+            body.append("Checking what this needs on disk…", "grey62")
+            return body
+        body.append(plan.disk_sentence(), "grey70" if plan.selectable else "yellow")
         return body
 
     def _update_selection_text(self) -> None:
@@ -599,7 +693,10 @@ class GettingStartedScreen(Screen[bool]):
             return
         plan = self._plans.get(self._chosen)
         title = PRESETS_BY_KIND[self._chosen].title
-        if plan is None or not plan.model_names:
+        if plan is None:
+            static.update(Text.assemble((f"{title}: ", "grey62"), ("working out what it will load…", "grey70")))
+            return
+        if not plan.model_names:
             detail = "the model list loads when the catalog is available"
             static.update(Text.assemble((f"{title}: ", "grey62"), (detail, "grey70")))
             return
@@ -609,7 +706,7 @@ class GettingStartedScreen(Screen[bool]):
         """Adopt a preset, discarding any hand-picked list so the two cannot silently disagree."""
         self._chosen = kind
         self._custom_models = None
-        self._refresh_presets()
+        self._render_presets()
 
     def _browse_models(self) -> None:
         """Open the model picker seeded with the current selection."""
