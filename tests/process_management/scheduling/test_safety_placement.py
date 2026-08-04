@@ -549,3 +549,26 @@ class TestHeadroomAwarePlacement:
         scheduler._reconcile_runtime_safety_placement()
 
         scheduler._process_lifecycle.set_desired_safety_card.assert_called_with(1)
+
+    def test_residency_readiness_is_card_local_when_safety_lives_elsewhere(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A live safety process on card 1 is already clear of a residency on card 0."""
+        scheduler = self._two_card_scheduler(monkeypatch)
+        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        scheduler._process_lifecycle.is_safety_gpu_paused = False
+        scheduler._process_lifecycle.safety_gpu_card_index = Mock(return_value=1)
+
+        assert scheduler._safety_clear_of_residency_card(0) is True
+        assert scheduler._safety_clear_of_residency_card(1) is False
+
+    def test_paused_safety_is_clear_of_its_selected_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Once safety is off-GPU, the selected restore destination does not keep teardown open."""
+        scheduler = self._two_card_scheduler(monkeypatch)
+        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_gpu_card_index = Mock(return_value=None)
+        scheduler._choose_safety_gpu_card = Mock(return_value=1)
+
+        assert scheduler._safety_clear_of_residency_card(1) is True

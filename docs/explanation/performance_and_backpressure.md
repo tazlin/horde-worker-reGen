@@ -1073,9 +1073,11 @@ being staged or resident on a live process, so a pre-staged head still converges
 `WAITING_FOR_JOB`. A fresh preload also chooses *which* eligible card to
 load onto by the same sticky-then-least-loaded policy dispatch uses: a card already
 holding the model first (no duplicate load), then the eligible card running the
-fewest jobs. The single safety process is moved off-GPU only for a
-residency on the card it is pinned to (the lowest-index card), and only after
-already-pending or active safety checks have drained; this avoids interrupting a
+  fewest jobs. An exclusive admit is likewise recorded against its planned card once routing knows it, so
+  its preload/dispatch hold does not serialize an independent GPU. An admit that has not yet been attributed
+  remains worker-wide. The single safety process is moved off-GPU only for a
+  residency on the card it is actually pinned to (chosen from current headroom), and only after
+  already-pending or active safety checks have drained; this avoids interrupting a
 completed job's safety pass and paying a full safety-process restart in the
 middle of the pipeline. System RAM stays a single shared pool sized from the
 *total* process count across all cards. A
@@ -1084,11 +1086,19 @@ worker-wide exactly as before. (The per-context CUDA overhead the residency
 forecast assumes is a runtime/architecture constant and stays worker-wide; per-card
 overhead probing is a hordelib-side follow-up.)
 
-> The prediction is the conservative hordelib estimate, not a learned per-job
-> measurement. The only measurement the worker has (per-process VRAM high-water)
-> is device-wide (it reflects *every* resident model, not one job's marginal
-> cost), so feeding it back would over-throttle a multi-model worker. A true
-> marginal per-job measurement is a hordelib-side follow-up.
+> Static hordelib estimates remain the floor. The worker raises a checkpoint's resident footprint only from
+> an allocator report attributable to one idle resident model after its settle window; it never folds a
+> device-wide view into a per-model price. Sampling peaks are keyed separately by baseline, resolution band,
+> platform, and execution stage. The marginal additional-context cost remains platform-split and comes only
+> from its dedicated probe/clean-floor evidence, not by decomposing per-child device views.
+
+While a residency is held, the original forecast remains immutable for diagnostics and its admission
+guarantee. The unconditional governance tick re-forecasts the held model and may lower a separate effective
+process target when new raise-only allocator evidence or a committed reservation makes the old depth too
+roomy. Convergence and dispatch use that stricter target, and the reduction is filed with the verified reclaim
+ladder as a `ContextReduction` restore obligation. A later smaller estimate never grows the pool mid-hold;
+the residency's normal release restores it. Foreign VRAM growth after the job has dispatched stays outside
+this pricing loop: the device-free governor sees the physical fall and owns the verified reclaim response.
 
 To keep measurements fresh, GPU-bearing processes emit an interval-driven memory
 report (every `_memory_report_interval`, 5 s) in addition to the event-driven

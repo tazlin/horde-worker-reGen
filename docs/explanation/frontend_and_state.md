@@ -151,7 +151,11 @@ window can never accrue one. Charging a gap is not a restart on its own; a worke
 that resumed alongside its supervisor advances its stamp on the next drain and is
 untouched. Every re-grace is logged at INFO with a running counter, the spent
 budget is logged once on its edge, and the counters are published on the
-supervisor's `stall_stats` so a starved supervisor is visible as its own condition.
+supervisor's `stall_stats` so a starved supervisor is visible as its own condition. Served mode relays the
+complete record, not just the alarm fields: lifetime forgiven resets/seconds, refused resets, rolling-window
+resets/seconds, the allowance, the largest gap, and whether the budget is spent all cross the host socket.
+An attached dashboard therefore describes the host supervisor that actually watches the worker with the same
+figures as a local dashboard; absent fields from an older host still parse as the quiet state.
 
 In served mode (`tui/web.py`, the default for non-technical users) a single
 `WorkerHost` owns one worker independently of any browser session, so closing a

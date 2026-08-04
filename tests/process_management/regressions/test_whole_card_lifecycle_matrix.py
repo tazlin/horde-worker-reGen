@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -13,7 +14,9 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardResidencyMachine
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import make_job_pop_response, make_mock_process_info, track_popped_job_async
 from tests.process_management.regressions.test_whole_card_deadlock_fixes import (
@@ -55,6 +58,18 @@ class LifecycleHarness:
     horde_model_map: HordeModelMap
     job_tracker: JobTracker
     flux_job: ImageGenerateJobPopResponse
+
+
+@dataclass(frozen=True)
+class ResidencyScenarioCase:
+    """One invariant-matrix combination for a whole-card residency lifecycle."""
+
+    profile: str
+    total_vram_mb: float
+    footprint_mb: float
+    queue_shape: Literal["single", "burst", "alternating", "rotation"]
+    safety_posture: Literal["off_gpu", "other_card", "residency_card"]
+    residency_mode: Literal["initial", "prestaged"]
 
 
 def _forecast_for_target(target: int) -> StreamForecast:
@@ -355,6 +370,256 @@ async def test_unsized_forecast_establish_leaves_the_live_process_count_alone() 
 
     assert harness.process_map.num_loaded_inference_processes() == live_before
     assert live_before == case.total_processes
+
+
+async def test_governance_reprice_tightens_a_held_residency_without_rewriting_its_grant() -> None:
+    """New pricing lowers the live target, books one ladder debt, and preserves grant evidence."""
+    case = WholeCardLifecycleCase(
+        mode="initial",
+        target=2,
+        total_processes=4,
+        holder_state=HordeProcessState.WAITING_FOR_JOB,
+        holder_load_state=ModelLoadState.LOADED_IN_VRAM,
+        sibling_models=(_RESIDENT_SDXL, _OTHER_SDXL, None),
+        queue_tail=(),
+        max_threads=2,
+    )
+    harness = _make_flux_head_harness(case)
+    await _queue_flux_head_case(harness, case)
+    grant_forecast = _forecast_for_target(2)
+    harness.scheduler._establish_whole_card_residency(harness.flux_job, grant_forecast, announce=True)
+    reclaim_ladder = VerifiedReclaimLadder()
+    harness.scheduler.set_reclaim_ladder(reclaim_ladder)
+    harness.scheduler._forecast_streaming = Mock(return_value=_forecast_for_target(1))
+
+    harness.scheduler._reprice_held_whole_card_residencies()
+
+    state = harness.scheduler._residency_state(None)
+    assert state.forecast is grant_forecast
+    assert harness.scheduler._whole_card_ledger.effective_target(state) == 1
+    assert harness.process_map.num_loaded_inference_processes() == 1
+    assert reclaim_ladder.has_context_reduction(None) is True
+
+
+async def test_governance_reprice_never_grows_a_held_residency() -> None:
+    """A later roomier forecast cannot add contexts underneath a model that still owns the card."""
+    case = WholeCardLifecycleCase(
+        mode="initial",
+        target=1,
+        total_processes=3,
+        holder_state=HordeProcessState.WAITING_FOR_JOB,
+        holder_load_state=ModelLoadState.LOADED_IN_VRAM,
+        sibling_models=(_RESIDENT_SDXL, _OTHER_SDXL),
+        queue_tail=(),
+    )
+    harness = _make_flux_head_harness(case)
+    await _queue_flux_head_case(harness, case)
+    grant_forecast = _forecast_for_target(1)
+    harness.scheduler._establish_whole_card_residency(harness.flux_job, grant_forecast, announce=True)
+    harness.scheduler._forecast_streaming = Mock(return_value=_forecast_for_target(2))
+
+    harness.scheduler._reprice_held_whole_card_residencies()
+
+    state = harness.scheduler._residency_state(None)
+    assert state.forecast is grant_forecast
+    assert harness.scheduler._whole_card_ledger.effective_target(state) == 1
+    assert harness.process_map.num_loaded_inference_processes() == 1
+
+
+_SCENARIO_PROFILES = (
+    ("flux-knife-edge", 16_400.0, 12_600.0),
+    ("qwen-knife-edge", 27_700.0, 23_000.0),
+    ("z-image-knife-edge", 19_700.0, 15_500.0),
+    ("flux-roomy", 24_576.0, 12_600.0),
+)
+_QUEUE_SHAPES = ("single", "burst", "alternating", "rotation")
+_SAFETY_POSTURES = ("off_gpu", "other_card", "residency_card")
+_RESIDENCY_MODES = ("initial", "prestaged")
+
+
+def _residency_scenario_cases() -> list[pytest.ParameterSet]:
+    """Build the 4 x 4 x 3 x 2 invariant matrix (96 cases)."""
+    return [
+        pytest.param(
+            ResidencyScenarioCase(
+                profile=profile,
+                total_vram_mb=total_vram_mb,
+                footprint_mb=footprint_mb,
+                queue_shape=queue_shape,
+                safety_posture=safety_posture,
+                residency_mode=residency_mode,
+            ),
+            id=f"{profile}-{queue_shape}-{safety_posture}-{residency_mode}",
+        )
+        for profile, total_vram_mb, footprint_mb in _SCENARIO_PROFILES
+        for queue_shape in _QUEUE_SHAPES
+        for safety_posture in _SAFETY_POSTURES
+        for residency_mode in _RESIDENCY_MODES
+    ]
+
+
+def _scenario_forecast(case: ResidencyScenarioCase) -> StreamForecast:
+    """Build a sized forecast from a profile without pinning a golden target."""
+    overhead_mb = 1_200.0
+    marginal_mb = 700.0
+    reserve_mb = 2_200.0
+    return StreamForecast(
+        weights_mb=case.footprint_mb * 0.75,
+        footprint_mb=case.footprint_mb,
+        reserve_mb=reserve_mb,
+        base_reserve_mb=1_000.0,
+        free_now_mb=500.0,
+        free_if_alone_mb=case.total_vram_mb - overhead_mb,
+        free_after_model_evict_mb=case.total_vram_mb - overhead_mb - 3 * marginal_mb,
+        total_vram_mb=case.total_vram_mb,
+        per_process_overhead_mb=overhead_mb,
+        marginal_process_overhead_mb=marginal_mb,
+        wants_whole_card=True,
+    )
+
+
+def _queue_for_shape(shape: str) -> tuple[str, ...]:
+    """Return model classes for one queue shape; ``light`` needs no residency."""
+    return {
+        "single": ("heavy-a",),
+        "burst": ("heavy-a", "heavy-a", "heavy-a"),
+        "alternating": ("heavy-a", "light", "heavy-a", "light"),
+        "rotation": ("heavy-a", "heavy-b", "heavy-c", "heavy-a"),
+    }[shape]
+
+
+def _assert_establishment_rate(machine: WholeCardResidencyMachine) -> None:
+    """No rolling establishment window contains more grants than policy allows."""
+    stamps = tuple(machine.state_for(0).establishments)
+    for stamp in stamps:
+        in_window = [candidate for candidate in stamps if stamp <= candidate <= stamp + 240.0]
+        assert len(in_window) <= 2
+
+
+@pytest.mark.parametrize("case", _residency_scenario_cases())
+def test_residency_scenario_matrix_preserves_lifecycle_invariants(case: ResidencyScenarioCase) -> None:
+    """Every card/queue/safety/residency combination preserves the policy invariants."""
+    machine = WholeCardResidencyMachine()
+    forecast = _scenario_forecast(case)
+    target = machine.target_process_count(forecast)
+    assert target is not None
+    total_processes = 4
+    now = 10_000.0
+    dispatched = 0
+
+    for model in _queue_for_shape(case.queue_shape):
+        if model == "light":
+            dispatched += 1
+            now += 15.0
+            continue
+
+        held = machine.get(0)
+        if held is None or held.model != model:
+            if held is not None and held.model is not None:
+                machine.record_restore(0, now=now, restore_grace_seconds=60.0)
+            while machine.establish_rate_exceeded(0, now=now):
+                now += 241.0
+            machine.record_grant(
+                0,
+                model=model,
+                forecast=forecast,
+                cooldown_until=now + 90.0,
+                now=now,
+                refresh_established=True,
+                establish_grace_seconds=120.0,
+            )
+
+        effective_target = machine.effective_target(machine.state_for(0))
+        assert effective_target is not None
+        safety_initially_clear = case.safety_posture != "residency_card"
+        initial_count = (
+            total_processes if case.residency_mode == "prestaged" else min(total_processes, effective_target)
+        )
+
+        assert not machine.teardown_complete(
+            forecast,
+            loaded_process_count=effective_target + 1,
+            process_target=effective_target,
+            safety_clear_of_card=True,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+        if not safety_initially_clear:
+            assert not machine.teardown_complete(
+                forecast,
+                loaded_process_count=min(initial_count, effective_target),
+                process_target=effective_target,
+                safety_clear_of_card=False,
+                weights_fit_live=True,
+                drain_backstop_elapsed=False,
+            )
+        assert machine.teardown_complete(
+            forecast,
+            loaded_process_count=min(initial_count, effective_target),
+            process_target=effective_target,
+            safety_clear_of_card=True,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+        dispatched += 1
+        exhausted = machine.grace_budget_exhausted(0, now=now)
+        grace_active = machine.grace_active(
+            now=now,
+            establish_grace_seconds=120.0,
+            restore_grace_seconds=60.0,
+        )
+        assert not (exhausted and grace_active)
+        now += 15.0
+
+    if machine.state_for(0).model is not None:
+        machine.record_restore(0, now=now, restore_grace_seconds=60.0)
+    _assert_establishment_rate(machine)
+    assert machine.state_for(0).model is None
+    assert dispatched == len(_queue_for_shape(case.queue_shape))
+
+
+@pytest.mark.slow
+def test_db0_twenty_minute_rotation_sim_drains_every_admitted_head() -> None:
+    """A virtual 20-minute card-0 rotation remains rate-bounded and drains after each handoff."""
+    case = ResidencyScenarioCase(
+        profile="flux-knife-edge",
+        total_vram_mb=16_400.0,
+        footprint_mb=12_600.0,
+        queue_shape="rotation",
+        safety_posture="residency_card",
+        residency_mode="prestaged",
+    )
+    machine = WholeCardResidencyMachine()
+    forecast = _scenario_forecast(case)
+    target = machine.target_process_count(forecast)
+    assert target is not None
+    dispatched = 0
+
+    for now, model in zip(range(20_000, 21_200, 300), ("heavy-a", "heavy-b", "heavy-c", "heavy-a"), strict=True):
+        assert not machine.establish_rate_exceeded(0, now=float(now))
+        machine.record_grant(
+            0,
+            model=model,
+            forecast=forecast,
+            cooldown_until=float(now + 90),
+            now=float(now),
+            refresh_established=True,
+            establish_grace_seconds=120.0,
+        )
+        assert machine.teardown_complete(
+            forecast,
+            loaded_process_count=target,
+            process_target=target,
+            safety_clear_of_card=True,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+        dispatched += 1
+        machine.record_restore(0, now=float(now + 60), restore_grace_seconds=60.0)
+
+    _assert_establishment_rate(machine)
+    assert dispatched == 4
+    assert machine.state_for(0).model is None
 
 
 @pytest.mark.parametrize(

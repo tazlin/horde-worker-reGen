@@ -32,6 +32,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    make_test_card_runtimes,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -203,6 +204,67 @@ class TestOverbudgetExclusiveScope:
         scheduler._mark_overbudget_admit(job, _tight_card_demanding_forecast())
 
         assert job_tracker.is_admitted_exclusive(job) is False
+
+    async def test_attributed_exclusive_job_suppresses_only_its_card(self, job_tracker: JobTracker) -> None:
+        """A routed exclusive admit leaves an independent card available for work."""
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(job)
+        job_tracker.mark_admitted_exclusive(job, device_index=0)
+
+        assert job_tracker.has_exclusive_job_in_progress() is True
+        assert job_tracker.has_exclusive_job_in_progress(0) is True
+        assert job_tracker.has_exclusive_job_in_progress(1) is False
+
+    async def test_unattributed_exclusive_job_suppresses_every_card(self, job_tracker: JobTracker) -> None:
+        """Before routing identifies a destination, the conservative hold remains worker-wide."""
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(job)
+        job_tracker.mark_admitted_exclusive(job)
+
+        assert job_tracker.has_exclusive_job_in_progress(0) is True
+        assert job_tracker.has_exclusive_job_in_progress(1) is True
+
+    async def test_dispatch_rebases_exclusivity_on_the_card_that_committed(self, job_tracker: JobTracker) -> None:
+        """The actual dispatch card replaces a stale plan before later consumers inspect the hold."""
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(job)
+        job_tracker.mark_admitted_exclusive(job, device_index=0)
+
+        await job_tracker.mark_inference_started(job, device_index=1)
+
+        assert job_tracker.has_exclusive_job_in_progress(0) is False
+        assert job_tracker.has_exclusive_job_in_progress(1) is True
+
+    async def test_card_scoped_concurrency_cap_leaves_sibling_card_at_plan(self, job_tracker: JobTracker) -> None:
+        """An exclusive job on card 0 collapses card 0's cap without serializing card 1."""
+        bridge_data = make_mock_bridge_data(max_threads=4)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(
+                {
+                    1: make_mock_process_info(1, device_index=0),
+                    2: make_mock_process_info(2, device_index=0),
+                    3: make_mock_process_info(3, device_index=1),
+                    4: make_mock_process_info(4, device_index=1),
+                }
+            ),
+            job_tracker=job_tracker,
+            bridge_data=bridge_data,
+            max_concurrent=4,
+            max_inference=4,
+            card_runtimes=make_test_card_runtimes(
+                target_process_count=2,
+                device_indices=(0, 1),
+                max_concurrent_inference=2,
+                config=bridge_data,
+                mask_kind="cuda",
+            ),
+        )
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(job)
+        job_tracker.mark_admitted_exclusive(job, device_index=0)
+
+        assert scheduler._max_jobs_in_progress_allowed(card=scheduler._card_runtimes[0]) == 1
+        assert scheduler._max_jobs_in_progress_allowed(card=scheduler._card_runtimes[1]) == 2
 
 
 class TestFootprintEstimateDrivesIsolation:

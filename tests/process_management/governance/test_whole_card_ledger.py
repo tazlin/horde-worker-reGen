@@ -409,8 +409,7 @@ class TestWholeCardResidencyMachine:
         assert machine.teardown_complete(
             unsized,
             loaded_process_count=4,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=True,
             drain_backstop_elapsed=False,
         )
@@ -418,8 +417,7 @@ class TestWholeCardResidencyMachine:
         assert not machine.teardown_complete(
             unsized,
             loaded_process_count=4,
-            safety_pause_required=True,
-            safety_paused=False,
+            safety_clear_of_card=False,
             weights_fit_live=True,
             drain_backstop_elapsed=False,
         )
@@ -444,24 +442,21 @@ class TestWholeCardResidencyMachine:
         assert not machine.teardown_complete(
             forecast,
             loaded_process_count=2,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=True,
             drain_backstop_elapsed=False,
         )
         assert not machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=True,
-            safety_paused=False,
+            safety_clear_of_card=False,
             weights_fit_live=True,
             drain_backstop_elapsed=False,
         )
         assert machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=True,
-            safety_paused=True,
+            safety_clear_of_card=True,
             weights_fit_live=False,
             drain_backstop_elapsed=True,
         )
@@ -487,8 +482,7 @@ class TestWholeCardResidencyMachine:
         assert not machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=True,
-            safety_paused=True,
+            safety_clear_of_card=True,
             post_process_pause_required=True,
             post_process_cleared=False,
             weights_fit_live=True,
@@ -498,8 +492,7 @@ class TestWholeCardResidencyMachine:
         assert machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=True,
-            safety_paused=True,
+            safety_clear_of_card=True,
             post_process_pause_required=True,
             post_process_cleared=True,
             weights_fit_live=True,
@@ -509,8 +502,7 @@ class TestWholeCardResidencyMachine:
         assert machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=True,
             drain_backstop_elapsed=False,
         )
@@ -554,8 +546,7 @@ class TestStructuralCompletionLatch:
         assert not machine.teardown_complete(
             forecast,
             loaded_process_count=3,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=False,
             drain_backstop_elapsed=False,
             device_index=0,
@@ -571,8 +562,7 @@ class TestStructuralCompletionLatch:
         machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=False,
             drain_backstop_elapsed=False,
             device_index=0,
@@ -582,8 +572,7 @@ class TestStructuralCompletionLatch:
         machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=False,
             drain_backstop_elapsed=False,
             device_index=0,
@@ -600,8 +589,7 @@ class TestStructuralCompletionLatch:
         machine.teardown_complete(
             forecast,
             loaded_process_count=1,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=False,
             drain_backstop_elapsed=False,
             device_index=0,
@@ -624,8 +612,7 @@ class TestStructuralCompletionLatch:
         assert machine.teardown_complete(
             self._forecast(),
             loaded_process_count=1,
-            safety_pause_required=False,
-            safety_paused=False,
+            safety_clear_of_card=True,
             weights_fit_live=True,
             drain_backstop_elapsed=False,
             device_index=0,

@@ -78,6 +78,16 @@ Without that reconciliation the record would linger as a stale claim that the po
 the host stayed under its floor the governor would re-shed the pool the restore just regrew, cycle after
 cycle, without ever returning to steady state.
 
+The same unconditional tick re-prices every held whole-card residency. The forecast captured when the
+residency was granted is immutable: it remains the evidence and fit guarantee that justified the grant.
+Current allocator-derived checkpoint footprints and live reserve commitments instead produce a separate
+`repriced_target`. That target may only tighten while the residency is held. If it falls below the live
+context count, the scheduler stops idle siblings and records one `ContextReduction` restore obligation with
+the verified reclaim ladder; a roomier later reading never grows contexts back underneath the heavy model.
+The residency release owns physical regrowth and discharges the ladder debt. A foreign application's VRAM
+growth after dispatch is not folded into this model price: the device-free governor observes that device-level
+condition and drives verified reclaim independently of queue or residency pricing.
+
 ## Idle service-lane RAM containment
 
 The degrade response above sheds and cycles inference slots, but the disaggregation service lanes (the
@@ -211,7 +221,10 @@ Two scoping rules keep these last-resort remedies from taxing a healthy host:
   weights to host RAM; a card-light model that reaches the admit through reserve arithmetic alone (free
   VRAM depressed by retained sibling contexts) shares the device, and so does a card-dominating model on
   a genuinely roomy card, whose no-co-sampling contract the overlap gate enforces without freezing the
-  sibling lane through the admit.
+  sibling lane through the admit. Once routing has chosen a card, the exclusive marker carries that planned
+  device and suppresses only that card's preload and dispatch consumers. A marker created before attribution
+  remains worker-wide until a card is known, so missing routing evidence is conservative rather than permissive.
+  If dispatch commits on a different card, that actual card replaces the plan before later consumers run.
 - **RAM eviction sacrifices the cheapest cache.** When an idle RAM resident must be reclaimed, the
   victim is the smallest size-tier candidate (map order breaking ties), never a card-dominating
   checkpoint whose disk reload costs several times an ordinary model's, unless it is the only candidate.
@@ -238,6 +251,12 @@ live weight fit or the drain backstop) instead of waiting forever on a depth tha
 whole-card-intent baseline is the deliberate exception: it still sizes to one when its footprint cannot be
 sized at all, since its tier asserts it never shares the card well.
 
+The grant forecast and the target used while holding have intentionally different lifetimes. The former is
+captured once and never rewritten. The governance tick derives a separate target from current raise-only,
+allocator-attributable evidence and may lower it when the held model now needs more room. Both convergence
+and dispatch readiness consult that tighten-only target. They never raise it mid-hold; capacity returns only
+after the residency drains, through the normal restore path.
+
 The dispatch gate releases the head either on a live free-VRAM reading that genuinely holds the weights, or,
 once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized
 for a card every other context has left, safety included, so the scheduler passes in the charge of whatever
@@ -247,6 +266,11 @@ measured `SAFETY` watermark) is priced back out of the alone figure. Without tha
 the head against room only a departure the configuration forbids would free, and the weights load into a card
 short by roughly the safety footprint and stream. Which contexts stay is a configuration and lifecycle fact,
 not residency state, so the machine takes the charge as an input and remains a pure state machine.
+
+Safety readiness is card-local as well. The scheduler passes `safety_clear_of_card`, computed from the safety
+process's actual/headroom-selected card, rather than the global `safety_paused` flag. A live safety process on
+card 1 is already clear of a residency on card 0; only the residency on the card safety occupies waits for it
+to move. This avoids parking one GPU behind a service process physically resident on another.
 
 The drain backstop runs from the moment the teardown's structural legs *first all pass*, not from the moment
 the residency was granted. A slow establishment (siblings still exiting, safety still cycling off-GPU) would

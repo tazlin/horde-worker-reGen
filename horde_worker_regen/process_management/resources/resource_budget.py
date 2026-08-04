@@ -707,7 +707,11 @@ class WholeCardResidencyState:
     free_if_alone_mb: float | None = None
     """Free VRAM achievable with sole residency, for the detail view."""
     max_resident_processes: int | None = None
-    """The forecast's largest co-resident process count that still avoids streaming."""
+    """The held residency's effective process target.
+
+    Initially the grant forecast's largest safe co-resident count; the governance tick may tighten it from
+    newer raise-only allocator evidence without rewriting the grant forecast itself.
+    """
 
 
 def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:

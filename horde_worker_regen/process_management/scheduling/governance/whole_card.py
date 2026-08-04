@@ -88,7 +88,15 @@ class WholeCardResidency:
     model: str | None = None
     """The model holding (or being given) sole residency on this card; None when no residency is held."""
     forecast: StreamForecast | None = None
-    """The streaming forecast that established this residency, cached for the status snapshot's hard numbers."""
+    """The immutable forecast that granted this residency, cached for diagnostics and its fit guarantee."""
+    repriced_target: int | None = None
+    """The tighten-only live inference-process target derived after the grant.
+
+    The grant forecast is never rewritten while the residency is held: doing so would erase the evidence and
+    guarantee that justified admission. New allocator evidence may lower this separate target, but it never
+    raises it mid-hold because restoring contexts while the heavy model still owns the card would manufacture
+    the same pressure the residency removed.
+    """
     established_at: float = 0.0
     """When this residency was first established (stop siblings, cycle safety, load weights); 0.0 when none.
 
@@ -195,17 +203,20 @@ class WholeCardResidencyLedger:
     ) -> WholeCardResidency:
         """Record a residency grant (an establishment or a RAM pre-stage) for ``device_index``.
 
-        Sets the model, forecast, and cooldown; stamps ``established_at`` when ``refresh_established`` is
-        set or the residency is fresh, so the recovery supervisor's grace window is measured from when the
-        intentional hold began. A stamped establishment also opens a fresh min-hold floor, clears any
-        structural-completion latch from the previous grant (a re-established residency tears down again, so
-        it must not inherit an elapsed drain backstop), records the establishment for the rate limiter, and
+        Sets the model and cooldown; captures the grant forecast only when the residency is fresh, keeping it
+        immutable through repeated asks for the same held model. Stamps ``established_at`` when
+        ``refresh_established`` is set or the residency is fresh, so the recovery supervisor's grace window is
+        measured from when the intentional hold began. A stamped establishment also opens a fresh min-hold
+        floor and clears any structural-completion latch from the previous grant. A re-established residency
+        tears down again, so it must not inherit an elapsed drain backstop. The stamp also records the
+        establishment for the rate limiter and
         charges ``establish_grace_seconds`` against the card's rolling grace budget. Passing zero seconds
         records no charge, which is what a caller that is not claiming a grace window should do.
 
         Returns the updated state.
         """
         state = self.state_for(device_index)
+        fresh_grant = state.model is None or state.model != model
         if refresh_established or state.established_at == 0.0:
             state.established_at = now
             state.min_hold_until = now + _MIN_HOLD_SECONDS
@@ -213,8 +224,10 @@ class WholeCardResidencyLedger:
             state.establishments.append(now)
             if establish_grace_seconds > 0.0:
                 state.grace_charges.append((now, establish_grace_seconds))
+        if fresh_grant or state.forecast is None:
+            state.forecast = forecast
+            state.repriced_target = forecast.max_resident_processes() if forecast is not None else None
         state.model = model
-        state.forecast = forecast
         state.cooldown_until = cooldown_until
         return state
 
@@ -229,6 +242,7 @@ class WholeCardResidencyLedger:
         state = self.state_for(device_index)
         state.model = None
         state.forecast = None
+        state.repriced_target = None
         state.established_at = 0.0
         state.min_hold_until = 0.0
         state.structural_complete_at = 0.0
@@ -403,13 +417,42 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
             return None
         return forecast.max_resident_processes()
 
+    def effective_target(self, state: WholeCardResidency) -> int | None:
+        """Return the held residency's tighten-only process target.
+
+        ``repriced_target`` is initialized from the grant forecast and may only move down. Falling back to the
+        immutable forecast keeps directly-constructed legacy state useful in tests and adapters.
+        """
+        if state.repriced_target is not None:
+            return state.repriced_target
+        return self.target_process_count(state.forecast)
+
+    def tighten_target(self, device_index: int | None, target: int | None) -> bool:
+        """Lower a held residency's effective process target, never grow it mid-hold.
+
+        Args:
+            device_index: Card whose residency is being re-priced.
+            target: Newly calculated target, or None when the current evidence cannot size it.
+
+        Returns:
+            True when the effective target became stricter.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.model is None or target is None:
+            return False
+        current = self.effective_target(state)
+        if current is not None and target >= current:
+            return False
+        state.repriced_target = target
+        return True
+
     def teardown_complete(
         self,
         forecast: StreamForecast,
         *,
         loaded_process_count: int,
-        safety_pause_required: bool,
-        safety_paused: bool,
+        safety_clear_of_card: bool,
+        process_target: int | None = None,
         post_process_pause_required: bool = False,
         post_process_cleared: bool = True,
         component_lane_pause_required: bool = False,
@@ -423,8 +466,8 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         """Return whether a held residency has cleared enough room for the head to sample.
 
         The head must not be admitted until every VRAM consumer the residency displaces has actually vacated
-        the card: the live inference-process count is at (or below) the forecast's target, safety is off-GPU if
-        this residency needs it, and the dedicated post-processing and component lanes have left the card if
+        the card: the live inference-process count is at (or below) the effective target, safety is physically
+        clear of this card, and the dedicated post-processing and component lanes have left the card if
         they need to. A lane's context is only freed when its process exits, so ``post_process_cleared`` and
         ``component_lane_cleared`` are structural checks (the lane is gone), distinct from the pause merely
         having been requested; admitting the head while a lane's context is still resident is exactly what
@@ -448,10 +491,10 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         from. The latch lives here because the structural legs are computed here and nowhere else; callers
         that only want the question answered omit ``now`` and record nothing.
         """
-        target = self.target_process_count(forecast)
+        target = process_target if process_target is not None else self.target_process_count(forecast)
         structurally_complete = not (
             (target is not None and loaded_process_count > target)
-            or (safety_pause_required and not safety_paused)
+            or not safety_clear_of_card
             or (post_process_pause_required and not post_process_cleared)
             or (component_lane_pause_required and not component_lane_cleared)
         )

@@ -298,10 +298,17 @@ class TrackedJob:
     re-dispatch onto another equally-over-committed slot, which would only kill a second process."""
     admitted_exclusive: bool = False
     """Set with ``admitted_over_budget`` when ``overbudget_exclusive_mode`` is on: this heavy job must run
-    with the device to itself. While such a job is pending or in progress the scheduler suppresses
-    concurrent pre-staging/dispatch of other models so a second resident model cannot push free VRAM to ~0
-    and spill this job's weights to system RAM (the live storm's mechanism). It also earns a per-step hang
-    grace (``overbudget_step_timeout``) so its legitimately slow steps are not killed as a hang."""
+    with its planned device to itself. While such a job is pending or in progress the scheduler suppresses
+    concurrent pre-staging/dispatch of other models on that card so a second resident model cannot push free
+    VRAM to ~0 and spill this job's weights to system RAM. It also earns a per-step hang grace
+    (``overbudget_step_timeout``) so its legitimately slow steps are not killed as a hang."""
+    admitted_exclusive_device_index: int | None = None
+    """The card planned for an exclusive admit, or None when the admit could not yet be attributed.
+
+    An unattributed exclusive job suppresses work worker-wide. This conservative fallback preserves the
+    single-GPU contract and prevents a cold-start or pre-routing admit from being treated as safe on every
+    card merely because its destination is not known yet.
+    """
     last_dispatched_device_index: int | None = None
     """The card this job was last dispatched to, or None on a single-GPU host (no card attribution).
 
@@ -1291,10 +1298,14 @@ class JobTracker:
             new_tracked = self._tracked_for(job)
             if new_tracked is not None:
                 new_tracked.last_dispatched_device_index = device_index
+                if new_tracked.admitted_exclusive and device_index is not None:
+                    new_tracked.admitted_exclusive_device_index = device_index
             return
         if tracked.stage != JobStage.INFERENCE_IN_PROGRESS:
             self._total_num_inference_starts += 1
         tracked.last_dispatched_device_index = device_index
+        if tracked.admitted_exclusive and device_index is not None:
+            tracked.admitted_exclusive_device_index = device_index
         # The job took its dispatch opportunity, so a recovery-granted retry is no longer awaiting one: a
         # later give-up may treat it as an ordinary job.
         tracked.retry_granted_by_recovery = False
@@ -1958,31 +1969,49 @@ class JobTracker:
         tracked = self._tracked_for(job)
         return tracked is not None and tracked.measured_attempt
 
-    def mark_admitted_exclusive(self, job: ImageGenerateJobPopResponse) -> None:
-        """Record that this over-budget job must run with the device to itself.
+    def mark_admitted_exclusive(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        """Record that this over-budget job must run with its planned device to itself.
 
         See :attr:`TrackedJob.admitted_exclusive` for what exclusivity suppresses.
+
+        Args:
+            job: The exclusively admitted job.
+            device_index: The card the scheduler plans to use, or None while attribution is unavailable.
         """
         tracked = self._tracked_for(job)
         if tracked is not None:
             tracked.admitted_exclusive = True
+            tracked.admitted_exclusive_device_index = device_index
 
     def is_admitted_exclusive(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether this job was admitted to run exclusively (over-budget, device to itself)."""
         tracked = self._tracked_for(job)
         return tracked is not None and tracked.admitted_exclusive
 
-    def has_exclusive_job_in_progress(self) -> bool:
-        """Whether an exclusively-admitted over-budget job is pending or in progress.
+    def has_exclusive_job_in_progress(self, device_index: int | None = None) -> bool:
+        """Whether an exclusive over-budget job is pending or in progress in the requested scope.
 
-        While true, the scheduler must not stage or dispatch another model: the exclusive job needs the
-        whole device. Covers ``PENDING_INFERENCE`` and ``INFERENCE_IN_PROGRESS`` (so suppression spans
-        from admit through completion, including degraded retries); a terminal fault or success moves the
-        job out of those stages, naturally clearing the flag's effect.
+        With no device, answers worker-wide. With a card, matches jobs planned for that card plus every
+        unattributed exclusive job, because an admit whose destination is not known cannot safely release any
+        card. Covers ``PENDING_INFERENCE`` and ``INFERENCE_IN_PROGRESS`` so suppression spans admit through
+        completion, including degraded retries; a terminal fault or success naturally clears its effect.
+
+        Args:
+            device_index: Card to query, or None for the worker-wide answer.
         """
         return any(
             tracked.admitted_exclusive
             and tracked.stage in (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS)
+            and (
+                device_index is None
+                or tracked.admitted_exclusive_device_index is None
+                or tracked.admitted_exclusive_device_index == device_index
+            )
             for tracked in self._jobs.values()
         )
 

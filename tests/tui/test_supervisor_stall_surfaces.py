@@ -76,6 +76,10 @@ def test_the_host_status_frame_carries_the_supervisor_counters(monkeypatch: pyte
     frame = WorkerHost(supervisor, host="127.0.0.1", port=0)._status_message()
 
     assert frame["stall_resets_in_window"] == 2
+    assert frame["stall_forgiven_resets"] == 2
+    assert frame["stall_forgiven_seconds"] == 140.0
+    assert frame["stall_refused_resets"] == 0
+    assert frame["stall_forgiven_seconds_in_window"] == 140.0
     assert frame["stall_max_forgiven_resets"] == _MAX_FORGIVEN_RESETS
     assert frame["stall_budget_spent"] is False
     assert frame["largest_tick_gap_seconds"] == 70.0
@@ -93,7 +97,11 @@ def test_the_attach_client_reflects_the_host_counters() -> None:
                 restart_attempts=0,
                 mode=WorkerProcessMode.FAKE.value,
                 worker_running=True,
+                stall_forgiven_resets=7,
+                stall_forgiven_seconds=411.0,
+                stall_refused_resets=2,
                 stall_resets_in_window=3,
+                stall_forgiven_seconds_in_window=201.0,
                 stall_max_forgiven_resets=3,
                 stall_budget_spent=True,
                 largest_tick_gap_seconds=91.0,
@@ -101,6 +109,10 @@ def test_the_attach_client_reflects_the_host_counters() -> None:
         )
 
         assert client.stall_stats.resets_in_window == 3
+        assert client.stall_stats.forgiven_resets == 7
+        assert client.stall_stats.forgiven_seconds == 411.0
+        assert client.stall_stats.refused_resets == 2
+        assert client.stall_stats.forgiven_seconds_in_window == 201.0
         assert client.stall_stats.budget_spent is True
         assert client.stall_stats.largest_tick_gap_seconds == 91.0
         assert HordeWorkerTUI._supervisor_stall_markup(client.stall_stats) is not None

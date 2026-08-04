@@ -54,12 +54,22 @@ def _parse_stall_stats(message: dict[str, object]) -> SupervisorStallStats:
     A host predating these fields reports a quiet supervisor rather than a missing one: the display this
     feeds is an alarm, and inventing an alarm from an absent field would be worse than showing none.
     """
+    forgiven_resets = message.get("stall_forgiven_resets", 0)
+    forgiven_seconds = message.get("stall_forgiven_seconds", 0.0)
+    refused_resets = message.get("stall_refused_resets", 0)
     resets = message.get("stall_resets_in_window", 0)
+    forgiven_seconds_in_window = message.get("stall_forgiven_seconds_in_window", 0.0)
     maximum = message.get("stall_max_forgiven_resets", 0)
     largest_gap = message.get("largest_tick_gap_seconds", 0.0)
     return dataclasses.replace(
         SupervisorStallStats.quiet(),
+        forgiven_resets=forgiven_resets if isinstance(forgiven_resets, int) else 0,
+        forgiven_seconds=float(forgiven_seconds) if isinstance(forgiven_seconds, int | float) else 0.0,
+        refused_resets=refused_resets if isinstance(refused_resets, int) else 0,
         resets_in_window=resets if isinstance(resets, int) else 0,
+        forgiven_seconds_in_window=(
+            float(forgiven_seconds_in_window) if isinstance(forgiven_seconds_in_window, int | float) else 0.0
+        ),
         max_forgiven_resets=maximum if isinstance(maximum, int) else 0,
         budget_spent=bool(message.get("stall_budget_spent", False)),
         largest_tick_gap_seconds=float(largest_gap) if isinstance(largest_gap, int | float) else 0.0,
@@ -227,8 +237,8 @@ class AttachedWorkerSupervisor:
     def stall_stats(self) -> SupervisorStallStats:
         """The host supervisor's stall counters as last reported (quiet until a status frame carries them).
 
-        Only the fields the host puts on the wire are populated; the session-lifetime totals stay at their
-        quiet values because they belong to the host process, not to this client.
+        The complete record belongs to the host process and is relayed on the wire; this client does not
+        manufacture any local stall counters of its own.
         """
         return self._stall_stats
 

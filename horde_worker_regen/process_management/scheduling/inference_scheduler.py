@@ -1311,7 +1311,13 @@ class InferenceScheduler:
             self._process_map.residency_snapshot(),
         )
 
-    def _mark_overbudget_admit(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast | None) -> None:
+    def _mark_overbudget_admit(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast | None,
+        *,
+        device_index: int | None = None,
+    ) -> None:
         """Tag ``job`` as an over-budget physical-fit admit, opening the heavy-head load grace on first admit.
 
         Records the load-grace start the first time the job is admitted (so its multi-gigabyte load is not
@@ -1334,7 +1340,7 @@ class InferenceScheduler:
         if self._runtime_config.bridge_data.overbudget_exclusive_mode and (
             forecast is None or forecast.admit_requires_isolation
         ):
-            self._job_tracker.mark_admitted_exclusive(job)
+            self._job_tracker.mark_admitted_exclusive(job, device_index=device_index)
 
     def set_measured_per_process_overhead_mb(self, overhead_mb: int | float) -> None:
         """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast."""
@@ -1612,7 +1618,9 @@ class InferenceScheduler:
 
     @_whole_card_forecast.setter
     def _whole_card_forecast(self, value: StreamForecast | None) -> None:
-        self._residency_state(None).forecast = value
+        state = self._residency_state(None)
+        state.forecast = value
+        state.repriced_target = self._whole_card_ledger.target_process_count(value)
 
     @property
     def _whole_card_established_at(self) -> float:
@@ -1785,6 +1793,20 @@ class InferenceScheduler:
         if device_index is None or not self._card_runtimes:
             return True
         return device_index == self._safety_gpu_card()
+
+    def _safety_clear_of_residency_card(self, device_index: int | None) -> bool:
+        """Whether safety satisfies this residency's card-local teardown leg.
+
+        A residency that does not displace safety is clear by definition. When it does, a globally paused
+        safety process is clear, but so is a live safety process now pinned to another card. Reading only the
+        global pause flag would strand a residency after headroom-aware placement moved safety elsewhere.
+        """
+        if not self._residency_should_pause_safety(device_index):
+            return True
+        if self._process_lifecycle.is_safety_gpu_paused:
+            return True
+        safety_card = self._safety_gpu_card()
+        return device_index is not None and safety_card != device_index
 
     def _has_safety_backlog(self) -> bool:
         """Return whether safety has work that should not be interrupted by residency churn."""
@@ -2246,6 +2268,8 @@ class InferenceScheduler:
             refresh_established=announce,
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
+        if target_override is not None:
+            self._whole_card_ledger.tighten_target(device_index, target_override)
 
         # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
         # than the forecast's lighter resident-weight estimate, for the activation-peak context over-commit the
@@ -2428,7 +2452,7 @@ class InferenceScheduler:
             if model is None or not self._whole_card_residency_has_holder(model, device_index):
                 continue
             forecast = state.forecast
-            target = self._whole_card_ledger.target_process_count(forecast)
+            target = self._whole_card_ledger.effective_target(state)
             # A forecast that cannot size the card names no depth to converge on, so the pool is left where it
             # is rather than collapsed to sole residency on a figure nobody measured. The rest of the
             # convergence (moving the service lanes off the card) is unaffected by the missing depth.
@@ -2516,7 +2540,7 @@ class InferenceScheduler:
             return True
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
-        self._job_tracker.mark_admitted_exclusive(job)
+        self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
         self._establish_whole_card_residency(
             job,
             forecast,
@@ -2565,11 +2589,12 @@ class InferenceScheduler:
         ``device_index`` scopes the live-context count and the safety check to one card on a multi-GPU host;
         None is the single-GPU / worker-wide case.
         """
+        state = self._residency_state(device_index)
         return self._whole_card_ledger.teardown_complete(
             forecast,
             loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
-            safety_pause_required=self._residency_should_pause_safety(device_index),
-            safety_paused=self._process_lifecycle.is_safety_gpu_paused,
+            safety_clear_of_card=self._safety_clear_of_residency_card(device_index),
+            process_target=self._whole_card_ledger.effective_target(state),
             post_process_pause_required=(
                 self._residency_should_pause_post_process(device_index)
                 and not self._post_process_context_fits_with_residency(forecast, device_index=device_index)
@@ -2763,7 +2788,7 @@ class InferenceScheduler:
                 reserve_mb = forecast.reserve_mb
                 free_now_mb = forecast.free_now_mb
                 free_if_alone_mb = forecast.free_if_alone_mb
-                max_resident_processes = forecast.max_resident_processes()
+                max_resident_processes = self._whole_card_ledger.effective_target(representative)
             processes_target = max_resident_processes or 1
 
         total_vram_mb = (
@@ -2813,12 +2838,9 @@ class InferenceScheduler:
         now = time.time()
         active_models = {j.model for j in self._job_tracker.jobs_in_progress}
         active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
-        # The exclusive-job suppression is worker-wide: it holds every card's residency a little longer, which
-        # only delays restoring concurrency (conservative-safe) rather than risking an over-commit.
-        has_exclusive = self._job_tracker.has_exclusive_job_in_progress()
         for device_index, state in self._held_residencies():
             model = state.model
-            if model in active_models or has_exclusive:
+            if model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index):
                 # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
                 # back-to-back heavy jobs).
                 state.cooldown_until = now + self._whole_card_cooldown_seconds()
@@ -2840,6 +2862,8 @@ class InferenceScheduler:
                 now=time.time(),
                 restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
             )
+            if self._reclaim_ladder is not None:
+                self._reclaim_ladder.discharge_context_reduction(device_index)
             post_process_restored = (
                 self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
                 if self._residency_should_pause_post_process(device_index)
@@ -3109,8 +3133,8 @@ class InferenceScheduler:
             # The exclusive-admit hold collapses the cap to the running job; name it distinctly so the
             # serialization is attributed to the admit, not to a generic cap the operator would chase
             # through max_threads.
-            if self._job_tracker.has_exclusive_job_in_progress() and not self._job_tracker.is_admitted_exclusive(
-                head,
+            if self._job_tracker.has_exclusive_job_in_progress(process.device_index) and not (
+                self._job_tracker.is_admitted_exclusive(head)
             ):
                 return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
                     f"its model is resident and idle on process {process.process_id}, but an exclusively-"
@@ -3664,6 +3688,59 @@ class InferenceScheduler:
             self._ram_pressure_notified = False
         return under_pressure
 
+    def _reprice_held_whole_card_residencies(self) -> None:
+        """Tighten held residency targets from current pricing without rewriting their grant forecasts.
+
+        New allocator evidence and live reservation changes can show that a residency granted for two contexts
+        now safely holds only one. Each governance tick re-forecasts pending or active jobs for the held model
+        and keeps the strictest target. A target never grows mid-hold. Any resulting context reduction is booked
+        with the verified reclaim ladder as the single restore obligation; the residency's own release still
+        performs the physical regrowth and discharges that debt.
+        """
+        for device_index, state in self._held_residencies():
+            model = state.model
+            if model is None:
+                continue
+            matching_jobs = [
+                job
+                for job in (*self._job_tracker.jobs_in_progress, *self._job_tracker.jobs_pending_inference)
+                if job.model == model
+            ]
+            targets = [
+                target
+                for job in matching_jobs
+                if (
+                    target := self._whole_card_ledger.target_process_count(
+                        self._forecast_streaming(
+                            job,
+                            self._model_metadata.get_baseline(model),
+                            device_index=device_index,
+                        )
+                    )
+                )
+                is not None
+            ]
+            if not targets:
+                continue
+            self._whole_card_ledger.tighten_target(device_index, min(targets))
+            effective_target = self._whole_card_ledger.effective_target(state)
+            live_count = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if effective_target is None or live_count <= effective_target:
+                continue
+            after = self._process_lifecycle.scale_inference_processes(
+                effective_target,
+                device_index=device_index,
+                protected_model=model,
+            )
+            if after >= live_count:
+                continue
+            if self._reclaim_ladder is not None:
+                self._reclaim_ladder.record_context_reduction(device_index)
+            logger.info(
+                f"Re-priced held whole-card residency for {model} on device {device_index}: "
+                f"inference processes {live_count} -> {after}, tightened target {effective_target}."
+            )
+
     def run_governance_tick(self) -> None:
         """Drive one resource-governance tick per control-loop iteration, independent of queue depth.
 
@@ -3674,6 +3751,7 @@ class InferenceScheduler:
         """
         if self._budget_active():
             self._govern_ram_pressure_if_pressured()
+            self._reprice_held_whole_card_residencies()
             self._contain_idle_lane_ram()
 
     def reset_governance_to_baseline(self, reason: str) -> None:
@@ -4645,13 +4723,16 @@ class InferenceScheduler:
                 headroom is measured worker-wide either way (a deliberate conservatism until per-card
                 memory-report attribution is implemented).
         """
-        # An exclusively-admitted over-budget job needs the whole device; never dispatch another job
-        # alongside it. Returning the current in-progress count (floored at 1 so the exclusive job itself
-        # can still be dispatched when none is yet running) blocks any *additional* concurrent dispatch.
-        # This stays worker-wide even in the per-card path: the over-budget exclusive admission is itself
-        # whole-worker today, so an exclusive job suppresses dispatch on every card until it clears.
-        if self._job_tracker.has_exclusive_job_in_progress():
-            return max(1, len(self._job_tracker.jobs_in_progress))
+        # An exclusive admit suppresses only its planned card once routing has attributed it. Before attribution
+        # (and on the worker-wide single-GPU path), the conservative worker-wide answer still blocks every card.
+        exclusive_device = card.device_index if card is not None else None
+        if self._job_tracker.has_exclusive_job_in_progress(exclusive_device):
+            in_scope = (
+                len(self._jobs_in_progress_on_card(card.device_index))
+                if card is not None
+                else len(self._job_tracker.jobs_in_progress)
+            )
+            return max(1, in_scope)
 
         if card is not None:
             concurrent_ceiling = card.max_concurrent_inference
@@ -5220,7 +5301,7 @@ class InferenceScheduler:
             return _WholeCardDemandOutcome.DEFER
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
-        self._job_tracker.mark_admitted_exclusive(job)
+        self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
         if self._should_prestage_whole_card_head(
             job,
             baseline,
@@ -6994,8 +7075,13 @@ class InferenceScheduler:
             return False
 
         target_card: CardRuntime | None = None
-        if self._multi_gpu_routing_active and not self._job_tracker.has_exclusive_job_in_progress():
-            target_card = self._card_runtimes.get(process_with_model.device_index)
+        if self._multi_gpu_routing_active:
+            candidate_card = self._card_runtimes.get(process_with_model.device_index)
+            if candidate_card is not None and (
+                self._job_tracker.is_admitted_exclusive(head_job)
+                or not self._job_tracker.has_exclusive_job_in_progress(candidate_card.device_index)
+            ):
+                target_card = candidate_card
 
         if target_card is not None:
             jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
@@ -7099,14 +7185,6 @@ class InferenceScheduler:
                 AdmissionDecision.DEFER_RAM_PRESSURE, job=job, reason="system RAM danger floor"
             )
 
-        # An exclusively-admitted over-budget job has the whole device; do not stage another model's
-        # weights concurrently (a second resident load is exactly what spills the exclusive job's
-        # weights to system RAM). The exclusive job's own preload is still allowed through.
-        if self._job_tracker.has_exclusive_job_in_progress() and not self._job_tracker.is_admitted_exclusive(job):
-            return self._preload_outcome(
-                AdmissionDecision.EXCLUSIVE_IN_PROGRESS, job=job, reason="exclusive over-budget job in progress"
-            )
-
         is_head_blocker = head_job is not None and job is head_job
 
         # Which slots this preload may not displace: the queued-model guard, model->process affinity
@@ -7133,6 +7211,15 @@ class InferenceScheduler:
             max_inference_processes=self._max_inference_processes,
             draining_process_ids=frozenset(self._processes_draining_for_ram),
         )
+        if not self._job_tracker.is_admitted_exclusive(job):
+            preload_disallowed.update(
+                process.process_id
+                for process in self._process_map.values()
+                if process.process_type is HordeProcessType.INFERENCE
+                and self._job_tracker.has_exclusive_job_in_progress(
+                    process.device_index if self._multi_gpu_routing_active else None
+                )
+            )
 
         # On a multi-GPU host this also chooses *which* card to load onto: an eligible card already
         # holding the model first, then the least-loaded eligible card. Single-GPU returns the first
@@ -7153,6 +7240,17 @@ class InferenceScheduler:
         if available_process is None:
             return self._preload_outcome(
                 AdmissionDecision.NO_TARGET, job=job, reason="no idle inference slot available"
+            )
+
+        exclusive_scope = available_process.device_index if self._multi_gpu_routing_active else None
+        if self._job_tracker.has_exclusive_job_in_progress(exclusive_scope) and not (
+            self._job_tracker.is_admitted_exclusive(job)
+        ):
+            return self._preload_outcome(
+                AdmissionDecision.EXCLUSIVE_IN_PROGRESS,
+                job=job,
+                process=available_process,
+                reason="exclusive over-budget job in progress on target card",
             )
 
         # An aux-gated preload takes a wholly unoccupied slot or none at all. Displacing a resident model,
@@ -7654,16 +7752,16 @@ class InferenceScheduler:
         line_skip: LineSkip | None = None
 
         # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
-        # concurrency cap is scoped to that card: its own in-progress count vs its own ceilings. The scope is
-        # dropped (worker-wide, as on a single-GPU host) when the head is not yet resident (no target card) or
-        # while a worker-wide exclusive job is suppressing all dispatch.
+        # concurrency cap and exclusive hold are scoped to that card. An unattributed exclusive job still
+        # suppresses every card through JobTracker's conservative fallback.
         target_card: CardRuntime | None = None
-        if (
-            self._multi_gpu_routing_active
-            and process_with_model is not None
-            and not self._job_tracker.has_exclusive_job_in_progress()
-        ):
-            target_card = self._card_runtimes.get(process_with_model.device_index)
+        if self._multi_gpu_routing_active and process_with_model is not None:
+            candidate_card = self._card_runtimes.get(process_with_model.device_index)
+            if candidate_card is not None and (
+                self._job_tracker.is_admitted_exclusive(next_job)
+                or not self._job_tracker.has_exclusive_job_in_progress(candidate_card.device_index)
+            ):
+                target_card = candidate_card
 
         if target_card is not None:
             jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
@@ -7671,7 +7769,8 @@ class InferenceScheduler:
             jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
         max_jobs_allowed = self._max_jobs_in_progress_allowed(card=target_card)
         if jobs_in_progress_count >= max_jobs_allowed:
-            if self._job_tracker.has_exclusive_job_in_progress():
+            exclusive_scope = target_card.device_index if target_card is not None else None
+            if self._job_tracker.has_exclusive_job_in_progress(exclusive_scope):
                 logger.debug(
                     "Dispatch held at the concurrency cap while an exclusive in-progress job requires isolation "
                     f"(jobs_in_progress={jobs_in_progress_count}, cap={max_jobs_allowed}).",
@@ -7765,6 +7864,12 @@ class InferenceScheduler:
             line_skip = LineSkip(displaced_job=next_job, reason="diversity")
             next_job = diversity_job
             process_with_model = diversity_process
+
+        dispatch_scope = process_with_model.device_index if self._multi_gpu_routing_active else None
+        if self._job_tracker.has_exclusive_job_in_progress(dispatch_scope) and not (
+            self._job_tracker.is_admitted_exclusive(next_job)
+        ):
+            return None
 
         self._model_recently_missing = False
 
