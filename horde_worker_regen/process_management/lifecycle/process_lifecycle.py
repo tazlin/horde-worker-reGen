@@ -66,21 +66,21 @@ from horde_worker_regen.process_management.workers.download_process import DOWNL
 
 
 class PauseOwner(enum.StrEnum):
-    """Which subsystem holds a lane's off-GPU pause, so its restore path alone can clear it.
+    """Which subsystem initiated a GPU-bearing service process's off-GPU pause.
 
-    A lane's off-GPU pause has two independent initiators that must not clear each other's hold: the whole-card
-    residency (restored when the residency drains, by the completion loop) and the verified reclaim ladder
-    (restored when the card's saturation episode ends, by the ladder's LIFO unwind). Recording the initiator at
-    pause time lets each restore path act only on the pause it owns, so a ladder-initiated pause is never
-    stranded by a residency that has no grant to complete, and a residency pause is never lifted early by the
-    ladder unwinding its own rungs. Whichever initiator transitions the lane into the paused state owns it; a
-    second initiator finding the lane already paused is a no-op and does not take ownership.
+    Service-lane pauses have independent whole-card and reclaim-ladder restore paths, so only the initiator may
+    clear them. Safety uses the same attribution even though one scheduler reconciler owns every actual safety
+    placement transition: the owner records which request caused the CPU-only cycle, while the reconciler keeps
+    the process off-GPU until every remaining request and restore veto clears. Whichever initiator transitions a
+    process into the paused state owns it; another request arriving while it is paused does not take ownership.
     """
 
     WHOLE_CARD = "whole_card"
-    """The whole-card residency stopped the lane; its completion loop owns the restore."""
+    """Whole-card residency initiated the off-GPU placement."""
     RECLAIM_LADDER = "reclaim_ladder"
-    """The verified reclaim ladder stopped the lane; the ladder's episode-end unwind owns the restore."""
+    """The verified reclaim ladder initiated the off-GPU placement."""
+    RUNTIME_SAFETY_PLACEMENT = "runtime_safety_placement"
+    """The runtime placement policy moved safety off-GPU because its context did not fit beside sampling."""
 
 
 def _pause_owner_phrase(owner: PauseOwner) -> str:
@@ -92,6 +92,8 @@ def _pause_owner_phrase(owner: PauseOwner) -> str:
     """
     if owner is PauseOwner.WHOLE_CARD:
         return "Whole-card residency"
+    if owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT:
+        return "Runtime safety placement"
     return "Reclaim ladder"
 
 
@@ -618,9 +620,10 @@ class ProcessLifecycleManager:
         # completion is not counted as a crash recovery (mirrors ``_post_process_replacement_intentional``).
         self._utilities_replacement_intentional = False
         # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
-        # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
-        # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
+        # Whole-card residency, verified reclaim, and runtime fit policy request this through one scheduler
+        # reconciler so the safety process's CUDA context is freed without overlapping replacement cycles.
         self._safety_gpu_paused = False
+        self._safety_gpu_pause_owner: PauseOwner | None = None
         self._safety_gpu_pause_count = 0
         self._safety_gpu_restore_count = 0
         # The driven card the safety process should be pinned to when it (re)spawns on-GPU, chosen by the
@@ -633,7 +636,7 @@ class ProcessLifecycleManager:
         # None whenever safety came up cpu_only. Read as the truthful "which card is safety on" signal so a
         # whole-card residency on a different card never needlessly evicts safety from a card it does not share.
         self._safety_pinned_card: int | None = None
-        # Marks the *next* safety-pool rebuild as an intentional whole-card pause/restore cycle, so its
+        # Marks the *next* safety-pool rebuild as an intentional placement pause/restore cycle, so its
         # completion is not counted as a crash recovery and does not feed the safety crash-loop breaker.
         # Without this, repeated whole-card jobs cycling safety off/on read as a safety crash loop and trip
         # save-our-ship. Mirrors the intentional_reclaim path for inference RAM reclaim.
@@ -2783,17 +2786,37 @@ class ProcessLifecycleManager:
 
     @property
     def is_safety_gpu_paused(self) -> bool:
-        """Whether the safety process is being forced off-GPU for a whole-card job."""
+        """Whether the safety process is being forced off-GPU by runtime resource governance."""
         return self._safety_gpu_paused
 
     @property
+    def safety_pause_owner(self) -> PauseOwner | None:
+        """Return the request that initiated the current safety off-GPU placement, if any."""
+        return self._safety_gpu_pause_owner
+
+    @property
+    def safety_placement_transition_pending(self) -> bool:
+        """Whether safety is rebuilding or an intentional placement rebuild has not yet proved readiness.
+
+        A placement flip during either an ordinary recovery or its own readiness interval would chain another
+        intentional replacement onto unfinished work. That both churns a healthy slow-starting process and lets
+        successive placement requests manufacture the same suppression window used to bound crash-on-start
+        recovery. Callers must retain their desired placement and re-ask after readiness instead.
+        """
+        return bool(
+            self._safety_processes_should_be_replaced
+            or self._safety_processes_ending
+            or self._safety_replacement_intentional_until_ready
+        )
+
+    @property
     def safety_gpu_pause_count(self) -> int:
-        """How many whole-card residency safety-off-GPU pauses this lifecycle manager initiated."""
+        """How many reconciled safety-off-GPU placement changes this lifecycle manager initiated."""
         return self._safety_gpu_pause_count
 
     @property
     def safety_gpu_restore_count(self) -> int:
-        """How many whole-card residency safety-on-GPU restores this lifecycle manager initiated."""
+        """How many reconciled safety-on-GPU placement changes this lifecycle manager initiated."""
         return self._safety_gpu_restore_count
 
     def set_desired_safety_card(self, device_index: int | None) -> None:
@@ -2818,42 +2841,60 @@ class ProcessLifecycleManager:
             return None
         return self._safety_pinned_card
 
-    def pause_safety_on_gpu(self) -> bool:
-        """Move the safety process off-GPU (cpu_only) so its CUDA context frees for a whole-card model.
+    def pause_safety_on_gpu(self, *, owner: PauseOwner) -> bool:
+        """Move safety off-GPU for one reconciled resource-governance request.
 
-        A no-op (returns False) when safety is not configured on-GPU or is already paused. Otherwise sets
-        the override and triggers the existing safety-replacement state machine, which ends the on-GPU
-        safety process and brings a cpu_only one up over the next few control-loop ticks. Reusing that
-        machinery (rather than ad-hoc end/spawn) keeps the churn on the tested recovery path.
+        A no-op when safety is not configured on-GPU, is already paused, or another intentional safety
+        placement rebuild has not reached readiness. Otherwise records the initiating request and triggers the
+        existing replacement state machine, which ends the on-GPU process and brings a cpu_only one up over the
+        next few control-loop ticks. Refusing to flip during an open readiness window prevents back-to-back
+        placement requests from chaining intentional replacements.
+
+        Args:
+            owner: The request that caused the scheduler's sole placement reconciler to choose CPU safety.
 
         Returns:
             True if a pause was initiated, False if it was already paused or not applicable.
         """
-        if not self._runtime_config.bridge_data.safety_on_gpu or self._safety_gpu_paused:
+        if (
+            not self._runtime_config.bridge_data.safety_on_gpu
+            or self._safety_gpu_paused
+            or self.safety_placement_transition_pending
+        ):
             return False
         self._safety_gpu_paused = True
+        self._safety_gpu_pause_owner = owner
         self._safety_gpu_pause_count += 1
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
-        logger.info("Whole-card residency: moving the safety process off-GPU to free its VRAM context.")
+        logger.info(f"{_pause_owner_phrase(owner)}: moving the safety process off-GPU to free its VRAM context.")
         return True
 
-    def restore_safety_on_gpu(self) -> bool:
-        """Bring the safety process back on-GPU after a whole-card job has released the device.
+    def restore_safety_on_gpu(self, *, owner: PauseOwner) -> bool:
+        """Bring safety back on-GPU after every reconciled pause request and veto has cleared.
 
-        A no-op (returns False) when not currently paused. Clears the override and triggers a replacement so
-        the safety process comes back up on its configured (GPU) placement.
+        A no-op when safety is not paused, the caller does not name the request that initiated the pause, or the
+        preceding placement rebuild has not reached readiness. The scheduler reconciler retains later requests
+        without transferring ownership, then passes the recorded owner only once no request remains.
+
+        Args:
+            owner: The request recorded when the current pause began.
 
         Returns:
             True if a restore was initiated, False if it was not paused.
         """
-        if not self._safety_gpu_paused:
+        if (
+            not self._safety_gpu_paused
+            or self._safety_gpu_pause_owner is not owner
+            or self.safety_placement_transition_pending
+        ):
             return False
         self._safety_gpu_paused = False
+        self._safety_gpu_pause_owner = None
         self._safety_gpu_restore_count += 1
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
-        logger.info("Whole-card residency complete: restoring the safety process to the GPU.")
+        logger.info(f"{_pause_owner_phrase(owner)}: restoring the safety process to the GPU.")
         return True
 
     @property

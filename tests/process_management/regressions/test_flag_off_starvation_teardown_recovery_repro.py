@@ -103,7 +103,7 @@ async def _flag_off_scheduler_with_tracked_head() -> tuple[
     )
     recorder = _ScaleRecorder(process_map)
     scheduler._process_lifecycle.scale_inference_processes = recorder  # type: ignore[method-assign]
-    scheduler._process_lifecycle.restore_safety_on_gpu = lambda: False  # type: ignore[method-assign]
+    scheduler._process_lifecycle.restore_safety_on_gpu = lambda *, owner: False  # type: ignore[method-assign]
     scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
     scheduler._pause_post_process_for_residency_if_idle = Mock(return_value=False)  # type: ignore[method-assign]
     scheduler.set_reclaim_ladder(VerifiedReclaimLadder())

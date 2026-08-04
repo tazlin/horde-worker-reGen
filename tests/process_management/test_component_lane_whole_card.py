@@ -80,7 +80,6 @@ class TestComponentLaneResidencyWiring:
         lifecycle.is_safety_gpu_paused = False
         lifecycle.scale_inference_processes = Mock(return_value=0)
         # Isolate the component-lane wiring from the sibling levers.
-        scheduler._pause_safety_for_residency_if_idle = Mock(return_value=False)
         scheduler._pause_post_process_for_residency_if_idle = Mock(return_value=False)
         scheduler._residency_should_pause_vae_lane = Mock(return_value=False)
         scheduler._residency_should_pause_safety = Mock(return_value=False)

@@ -858,36 +858,84 @@ def test_safety_processes_should_be_replaced_property() -> None:
 
 
 def test_pause_and_restore_safety_on_gpu_toggles_override_and_arms_replacement() -> None:
-    """Pausing safety-on-GPU sets the cpu_only override and arms a replacement; restoring clears it.
+    """Safety placement changes are owner-scoped and cannot chain before readiness.
 
     This is how a whole-card (single-residency) job frees the safety process's CUDA context: a context is
-    only reclaimed by the process exiting, so the safety process is cycled to come back up off-GPU.
+    only reclaimed by the process exiting, so the safety process is cycled to come back up off-GPU. The
+    off-GPU process must reach readiness before a restore may open a second intentional replacement window.
     """
     plm = _make_plm()
     plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
 
     assert plm.is_safety_gpu_paused is False
-    assert plm.pause_safety_on_gpu() is True
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
     assert plm.is_safety_gpu_paused is True
+    assert plm.safety_pause_owner is PauseOwner.WHOLE_CARD
     # The existing safety-replacement state machine was armed (so the on-GPU process is cycled off-GPU)...
     assert plm.safety_processes_should_be_replaced is True
     # ...and the cycle is marked intentional so its completion is not counted as a crash recovery.
     assert plm._safety_replacement_intentional is True
     # Idempotent: a second pause does nothing.
-    assert plm.pause_safety_on_gpu() is False
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is False
 
-    assert plm.restore_safety_on_gpu() is True
+    # A contrary request arriving before the cpu_only replacement is ready cannot chain another intentional
+    # rebuild onto the first one's still-open suppression window.
+    assert plm.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is False
+    assert plm.is_safety_gpu_paused is True
+
+    plm._replace_all_safety_process()
+    plm._replace_all_safety_process()
+    assert plm._safety_replacement_intentional_until_ready is True
+    plm._process_map[0] = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    plm._observe_safety_pool_readiness()
+
+    assert plm.restore_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is False
+    assert plm.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
     assert plm.is_safety_gpu_paused is False
+    assert plm.safety_pause_owner is None
     assert plm._safety_replacement_intentional is True
     # Idempotent: restoring when not paused does nothing.
-    assert plm.restore_safety_on_gpu() is False
+    assert plm.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is False
 
 
 def test_pause_safety_on_gpu_is_noop_when_safety_not_on_gpu() -> None:
     """With safety not configured on-GPU there is no context to free, so the pause is a no-op."""
     plm = _make_plm()  # _make_plm defaults safety_on_gpu to False
-    assert plm.pause_safety_on_gpu() is False
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is False
     assert plm.is_safety_gpu_paused is False
+
+
+def test_slow_healthy_safety_placement_respawn_cannot_advance_start_failure_breaker() -> None:
+    """Contrary placement demand waits for readiness instead of chaining counted unready rebuilds."""
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT) is True
+    plm._replace_all_safety_process()
+    plm._replace_all_safety_process()
+    assert plm._safety_consecutive_start_failures == 1
+
+    for _ in range(10):
+        assert plm.restore_safety_on_gpu(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT) is False
+
+    assert plm._safety_consecutive_start_failures == 1
+    assert plm.safety_pool_start_failing is False
+
+    plm._process_map[0] = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    plm._observe_safety_pool_readiness()
+    assert plm._safety_consecutive_start_failures == 0
 
 
 def test_pause_and_restore_post_process_lane_stops_and_restarts_it_for_whole_card() -> None:
@@ -1201,7 +1249,7 @@ def test_reclaim_owned_lane_and_safety_rungs_do_not_inflate_the_recovery_count()
     assert plm.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
     assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
     assert plm.pause_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
-    assert plm.pause_safety_on_gpu() is True
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
 
     # Drive each replacement machine through its end -> delete -> completion branches.
     for _ in range(4):

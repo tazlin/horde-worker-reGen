@@ -515,12 +515,12 @@ after idle cache/weight reclaim when `whole_card_residency_safety_off_gpu` permi
 preserved: a disabled VRAM budget or a zero-peak chain always admits. The lane's non-memory guards (the
 allocator-guard cap fault and sampling co-residency hold) stay.
 
-**Safety GPU load.** The recurring safety-on-GPU seam, bringing the safety process back onto the card after a
-whole-card residency freed its context, is gated on the arbiter's `SAFETY_LOAD` verdict, charging a documented
-safety-context footprint. A `DEFER` keeps safety off-GPU this cycle; a per-tick reconciler re-asks so a
-deferred safety load is not stranded off-GPU, restoring it once the card has room and no held residency still
-requires safety off its card. The initial cold-start safety load onto the GPU (at worker bring-up, before any
-heavy residency pressure) is not gated and always proceeds.
+**Safety GPU load.** The recurring safety-on-GPU seam is gated on the arbiter's `SAFETY_LOAD` verdict, charging
+the learned safety-context footprint. One per-tick placement reconciler owns that seam for every initiator:
+runtime fit policy, whole-card residency, and verified reclaim contribute wishes or vetoes rather than calling
+lifecycle independently. A `DEFER` keeps safety off-GPU this cycle and the reconciler re-asks, so a deferred
+load is not stranded after the card has room. The initial cold-start safety load onto the GPU (at worker
+bring-up, before any heavy residency pressure) is not gated and always proceeds.
 
 ### Runtime safety placement
 
@@ -549,14 +549,17 @@ On a box where no card can host safety beside its sampler (two small cards, a la
 streak never accrues, and **CPU safety is the correct steady state**, with the post-inference backpressure above
 bounding intake to CPU-safety throughput.
 
-Both sides are **hysteresis-gated**. The off-latch turns on only after a short run of modeled-non-fit cycles
+Both runtime-policy sides are **hysteresis-gated**. The off-latch turns on only after a short run of
+modeled-non-fit cycles
 (`_SAFETY_PLACEMENT_PAUSE_STREAK`) and off only after a longer run of measured-headroom cycles
 (`_SAFETY_PLACEMENT_RESTORE_STREAK`), with a deadband (modeled fit but measured room not yet proven) that
 advances neither streak. The asymmetric streaks double as a demote-again cooldown: a promotion resets the miss
 streak, so a fresh run of non-fit cycles must pass before safety can be evicted again. Actuation is skipped
 while a safety check is pending or active (no mid-backlog churn), and re-promotion is additionally withheld
-while a whole-card residency still needs safety off its card or the device-free governor is holding growth, so
-this policy fights neither the residency machinery nor the cliff brake.
+while a whole-card residency still needs safety off its card, accepted post-processing needs the drain window,
+or the device-free governor is holding growth. Residency and reclaim bypass fit hysteresis when requesting a
+pause, but they still use this same reconciler and cannot start a second placement rebuild before the current
+one reaches readiness.
 
 The verified reclaim ladder uses the same operator permission as whole-card safety movement: if
 `whole_card_residency_safety_off_gpu` is false, safety is not added as a reclaim rung even when it is on GPU.

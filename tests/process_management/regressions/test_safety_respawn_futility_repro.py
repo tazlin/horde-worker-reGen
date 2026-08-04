@@ -45,6 +45,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SAFETY_CRASH_LOOP_MAX,
     SAFETY_PROCESS_ID,
     SAFETY_RESPAWN_BACKOFF_MAX_SECONDS,
+    PauseOwner,
     ProcessLifecycleManager,
 )
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
@@ -190,7 +191,7 @@ class TestIntentionalWindowStopsLaunderingCrashLoops:
             fake_time,
         )
 
-        assert lifecycle.pause_safety_on_gpu() is True
+        assert lifecycle.pause_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
         _drive_rebuild_to_completion(lifecycle)
         assert lifecycle._safety_replacement_intentional_until_ready is True
 
@@ -223,7 +224,7 @@ class TestIntentionalWindowStopsLaunderingCrashLoops:
             fake_time,
         )
 
-        assert lifecycle.pause_safety_on_gpu() is True
+        assert lifecycle.pause_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
         _drive_rebuild_to_completion(lifecycle)
         assert lifecycle._safety_recovery_history == []
 

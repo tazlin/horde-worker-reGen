@@ -330,12 +330,13 @@ The safety stage has the same shape of loss. A job handed to the safety process
 sits in `SAFETY_CHECKING` until its verdict returns; if the safety process is
 **replaced** while the check is in flight, the verdict arrives from a now-retired
 launch and is dropped by the same launch-identifier guard. Safety-process
-replacement is routine, not exceptional: whole-card residency moves the safety
-process off the GPU while a card-filling model holds the device and restarts it
-when the residency lifts, so a model mix that alternates between a card-filler and
-co-resident models replaces the safety process repeatedly. Nothing else moves a
-job whose verdict was dropped, so each one would pin a pipeline slot until
-recovered; let enough pile up and the pipeline wedges into an SOS soft reset.
+replacement is routine, not exceptional: the scheduler's placement reconciler may
+move safety off the GPU for whole-card residency, verified reclaim, or a runtime
+fit decision, then restart it when every request and veto clears. A model mix that
+changes that placement can therefore replace the safety process repeatedly.
+Nothing else moves a job whose verdict was dropped, so each one would pin a
+pipeline slot until recovered; let enough pile up and the pipeline wedges into an
+SOS soft reset.
 
 `WorkerRecoveryCoordinator.reconcile_orphaned_safety_jobs` recovers them each
 control-loop tick, with the same two-signal split as the in-progress case:

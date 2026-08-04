@@ -19,6 +19,7 @@ import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.vram_arbiter import VramRequest
 from horde_worker_regen.process_management.resources.vram_footprints import (
@@ -53,6 +54,8 @@ def _placement_scheduler(monkeypatch: pytest.MonkeyPatch, *, safety_on_gpu: bool
     scheduler = _make_inference_scheduler(process_map=ProcessMap({}), bridge_data=bridge_data)
     lifecycle = Mock()
     lifecycle.is_safety_gpu_paused = False
+    lifecycle.safety_pause_owner = None
+    lifecycle.safety_placement_transition_pending = False
     lifecycle.pause_safety_on_gpu = Mock(return_value=True)
     lifecycle.restore_safety_on_gpu = Mock(return_value=True)
     scheduler._process_lifecycle = lifecycle
@@ -224,7 +227,9 @@ class TestPlacementHysteresis:
             scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
 
         scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(
+            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+        )
         assert scheduler._safety_placement_wants_off is True
 
     def test_restores_only_after_consecutive_measured_headroom_cycles(
@@ -240,6 +245,7 @@ class TestPlacementHysteresis:
         scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
         scheduler._safety_restore_headroom_fits = lambda device_index: True
         scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
         scheduler._safety_placement_wants_off = True
 
         for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK - 1):
@@ -247,7 +253,9 @@ class TestPlacementHysteresis:
             scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
 
         scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
+            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+        )
         assert scheduler._safety_placement_wants_off is False
         assert scheduler._safety_placement_promotions == 1
 
@@ -265,25 +273,78 @@ class TestPlacementHysteresis:
         scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
         assert scheduler._safety_placement_wants_off is False
 
-    def test_deferred_restore_withheld_while_placement_wants_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The residency-drain safety restore does not fight the placement latch back on-GPU."""
+    def test_reconciled_restore_withheld_while_placement_wants_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A residency release does not fight the placement latch back on-GPU."""
         scheduler = _placement_scheduler(monkeypatch)
         scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.WHOLE_CARD
         scheduler._safety_placement_wants_off = True
 
-        scheduler._restore_deferred_safety_gpu_load()
+        scheduler._reconcile_runtime_safety_placement()
 
         scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    def test_unready_placement_transition_does_not_chain_a_restore(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A slow healthy off-GPU respawn reaches readiness before a contrary placement wish may replace it."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
+        scheduler._process_lifecycle.safety_placement_transition_pending = True
+        scheduler._safety_placement_wants_off = True
+        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
+        scheduler._safety_restore_headroom_fits = lambda device_index: True
+
+        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 3):
+            scheduler._reconcile_runtime_safety_placement()
+
+        assert scheduler._safety_placement_wants_off is False
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+
+
+class TestPlacementRequestOwnership:
+    """Residency and reclaim file placement demand; only the reconciler invokes the lifecycle actuator."""
+
+    def test_held_residency_is_applied_as_a_whole_card_owned_pause(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A held residency becomes one owner-attributed pause when the recurring reconciler observes it."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=100.0,
+            now=0.0,
+            refresh_established=True,
+        )
+
+        scheduler._reconcile_runtime_safety_placement()
+
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+
+    def test_reclaim_request_is_applied_without_advancing_fit_hysteresis(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ladder's one-shot request is actuated by the reconciler and does not count as a fit miss."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        scheduler._safety_fits_beside_largest_sampling_peak = Mock(return_value=False)
+
+        assert scheduler.safety_off_gpu(None) is True
+
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
+        assert scheduler._safety_placement_miss_streak == 0
 
 
 class TestResidencyRestoreRespectsPlacementWish:
     """Both owners of safety's placement must agree before safety goes back on the card.
 
-    The residency-drain reconciler (:meth:`InferenceScheduler._restore_deferred_safety_gpu_load`) already
-    stands down while the placement latch holds safety off. The residency-end restore
-    (:meth:`InferenceScheduler._restore_siblings_after_whole_card`) is the other path that puts safety back on
-    the GPU, and it must observe the same wish: with a heavy job still pending, a restore the placement policy
-    immediately re-demotes costs two full safety process rebuilds per residency.
+    The scheduler reconciler consumes both the residency veto and the runtime placement latch before it may put
+    safety back on the GPU. With a heavy job still pending, a restore the placement policy immediately
+    re-demotes would cost two full safety process rebuilds per residency.
     """
 
     def _drained_residency_scheduler(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
@@ -297,6 +358,8 @@ class TestResidencyRestoreRespectsPlacementWish:
         scheduler = _make_inference_scheduler(process_map=ProcessMap({}), bridge_data=bridge_data)
         lifecycle = Mock()
         lifecycle.is_safety_gpu_paused = True
+        lifecycle.safety_pause_owner = PauseOwner.WHOLE_CARD
+        lifecycle.safety_placement_transition_pending = False
         lifecycle.pause_safety_on_gpu = Mock(return_value=True)
         lifecycle.restore_safety_on_gpu = Mock(return_value=True)
         lifecycle.post_process_lane_enabled = Mock(return_value=False)
@@ -330,6 +393,7 @@ class TestResidencyRestoreRespectsPlacementWish:
         )
 
         scheduler._restore_siblings_after_whole_card()
+        scheduler._reconcile_runtime_safety_placement()
 
         assert scheduler._residency_state(None).model is None, (
             "precondition: the drained residency is released, so this is the restore path under test"
@@ -345,9 +409,10 @@ class TestResidencyRestoreRespectsPlacementWish:
         assert scheduler._safety_placement_wants_off is False
 
         scheduler._restore_siblings_after_whole_card()
+        scheduler._reconcile_runtime_safety_placement()
 
         assert scheduler._residency_state(None).model is None
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
 
 
 class TestDemoteThenMeasuredRepromote:
@@ -364,11 +429,14 @@ class TestDemoteThenMeasuredRepromote:
 
         assert scheduler._safety_placement_wants_off is True
         assert scheduler._safety_placement_demotions == 1
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(
+            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+        )
 
         # The pause has taken effect; the card now reports durable measured free between sampling peaks even
         # though the modeled peak (sustained load) still says it does not fit.
         scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
         scheduler._safety_restore_headroom_fits = lambda device_index: True
 
         for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK - 1):
@@ -376,7 +444,9 @@ class TestDemoteThenMeasuredRepromote:
             scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
 
         scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
+            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+        )
         assert scheduler._safety_placement_wants_off is False
         assert scheduler._safety_placement_promotions == 1
 
@@ -384,6 +454,7 @@ class TestDemoteThenMeasuredRepromote:
         """A single measured-headroom cycle inside a demoted run does not re-promote (hysteresis)."""
         scheduler = _placement_scheduler(monkeypatch)
         scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
         scheduler._safety_placement_wants_off = True
         scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
 
@@ -407,6 +478,7 @@ class TestSafetyBacklogPriority:
         """A paused safety process should return to GPU service while a backlog waits and headroom is proven."""
         scheduler = _placement_scheduler(monkeypatch)
         scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
         scheduler._safety_placement_wants_off = True
         scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
         scheduler._safety_restore_headroom_fits = lambda device_index: True
@@ -415,7 +487,9 @@ class TestSafetyBacklogPriority:
         for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK):
             scheduler._reconcile_runtime_safety_placement()
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
+            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+        )
         scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
         assert scheduler._safety_placement_wants_off is False
 

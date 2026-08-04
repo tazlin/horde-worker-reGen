@@ -26,6 +26,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, ActuatorCommandKind
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler, _PreloadActuation
@@ -99,11 +100,14 @@ async def _flag_off_scheduler_with_tracked_head() -> tuple[
     lifecycle = Mock()
     lifecycle.scale_inference_processes = _ScaleRecorder(process_map)
     lifecycle.is_safety_gpu_paused = False
+    lifecycle.safety_pause_owner = None
+    lifecycle.safety_placement_transition_pending = False
     lifecycle.pause_safety_on_gpu = Mock(return_value=True)
     lifecycle.post_process_lane_enabled = Mock(return_value=False)
     lifecycle.component_lane_enabled = Mock(return_value=False)
     lifecycle.vae_lane_enabled = Mock(return_value=False)
     scheduler._process_lifecycle = lifecycle
+    scheduler._runtime_safety_placement_enabled = Mock(return_value=True)
     scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
 
     forecast = Mock()
@@ -200,9 +204,10 @@ class TestGenuineResidencyEstablishStillClaimsTheCard:
         forecast.total_vram_mb = 16375.0
 
         scheduler._establish_whole_card_residency(heavy_job, forecast, announce=True)
+        scheduler._reconcile_runtime_safety_placement()
 
         assert process_map.num_loaded_inference_processes() == 1
-        lifecycle.pause_safety_on_gpu.assert_called_once_with()
+        lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
         assert scheduler._residency_state(None).model == _WHOLE_CARD_MODEL
 
 

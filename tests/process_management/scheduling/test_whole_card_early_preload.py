@@ -25,8 +25,10 @@ import pytest
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -212,6 +214,7 @@ class TestResidencyConvergesAfterDrain:
     ) -> None:
         """Whole-card convergence must not interrupt an already-pending safety check."""
         _seed_flux_weight_estimates(monkeypatch)
+        monkeypatch.setattr(scheduler_module, "is_cpu_only_install", lambda: False)
 
         flux_holder = make_mock_process_info(2, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
         former_busy = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
@@ -264,7 +267,7 @@ class TestResidencyConvergesAfterDrain:
         await job_tracker.abandon_pending_safety(safety_info)
         scheduler.preload_models()
 
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
 
     async def test_collapses_to_target_protecting_the_prestaged_holder(
         self,

@@ -863,6 +863,10 @@ class InferenceScheduler:
         self._safety_placement_miss_streak = 0
         self._safety_placement_fit_streak = 0
         self._safety_placement_wants_off = False
+        # The reclaim ladder files a one-shot safety placement request here. The recurring placement reconciler
+        # is the only code allowed to turn that request into a lifecycle pause or restore, so reclaim,
+        # residency, and fit hysteresis cannot issue overlapping safety rebuilds.
+        self._safety_reclaim_pause_requested = False
         # Lifetime counts of runtime safety-placement policy actuations, for the run-metrics readback: a
         # demotion moves safety off-GPU (its charge did not fit beside the sampler), a promotion restores it
         # once the chosen card's measured free proved durable room. These count only policy-initiated moves,
@@ -1794,15 +1798,9 @@ class InferenceScheduler:
         """Return whether the safety backlog is deep enough to prioritize GPU restoration."""
         return self._safety_backlog_depth() > _SAFETY_BACKLOG_PRIORITY_DEPTH
 
-    def _pause_safety_for_residency_if_idle(self, device_index: int | None) -> bool:
-        """Pause safety for whole-card residency only when no safety job is pending or active."""
-        if not self._residency_should_pause_safety(device_index):
-            return False
-        if self._process_lifecycle.is_safety_gpu_paused:
-            return False
-        if self._has_safety_backlog():
-            return False
-        return self._process_lifecycle.pause_safety_on_gpu()
+    def _held_residency_requests_safety_off_gpu(self) -> bool:
+        """Return whether any live residency requires safety to remain off its card."""
+        return any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies())
 
     def _safety_footprint_mb(self) -> float:
         """The device VRAM (MB) the safety process costs while it sits on the GPU: the single safety price.
@@ -1853,36 +1851,6 @@ class InferenceScheduler:
             ),
         )
         return verdict.admits
-
-    def _restore_deferred_safety_gpu_load(self) -> None:
-        """Bring a safety-load-gate-deferred safety process back on-GPU once the card has room to hold it.
-
-        The safety-load gate can keep safety off-GPU when the card is momentarily over-committed as a whole-card
-        residency drains; this per-tick reconciler re-asks the arbiter so a deferred safety load is not stranded
-        off-GPU for the rest of the session. It never fights the residency machinery: it acts only when no held
-        whole-card residency still requires safety off its card. It avoids churning a shallow safety backlog,
-        but a backlog deeper than :data:`_SAFETY_BACKLOG_PRIORITY_DEPTH` is urgent enough to let a paused
-        safety process return to GPU service when the arbiter admits the load. Only the recurring
-        residency-drain restore is gated this way; the initial cold-start safety load onto the GPU (at worker
-        bring-up, before any heavy residency pressure) is not gated and always proceeds.
-        """
-        if not self._whole_card_safety_off_gpu_enabled():
-            return
-        if not self._process_lifecycle.is_safety_gpu_paused:
-            return
-        if self._has_safety_backlog() and not self._has_priority_safety_backlog():
-            return
-        # The runtime safety-placement policy is the other owner of the safety process's on/off-GPU state; while
-        # it holds safety off (the charge does not fit beside the largest sampling peak) this residency-drain
-        # restore must not fight it back on-GPU. The placement reconcile performs its own restore once the card
-        # proves durable headroom.
-        if self._safety_placement_wants_off:
-            return
-        if any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies()):
-            return
-        safety_card = self._safety_gpu_card()
-        if self._arbiter_admits_safety_gpu_load(safety_card):
-            self._process_lifecycle.restore_safety_on_gpu()
 
     def _choose_safety_gpu_card(self) -> int | None:
         """Return the driven card safety should be placed on: the one with the most verified headroom.
@@ -2019,38 +1987,23 @@ class InferenceScheduler:
         margin_mb = admission_noise_buffer_mb(total_vram_mb) if require_margin else 0.0
         return (total_vram_mb - peak_mb - noise_mb - self._safety_footprint_mb() - margin_mb) >= 0.0
 
-    def _reconcile_runtime_safety_placement(self) -> None:
-        """Keep safety off the GPU while its charge cannot fit, and re-promote it once a card proves room.
+    def _reconcile_runtime_safety_placement(self, *, update_policy: bool = True) -> None:
+        """Apply the single reconciled safety placement chosen from every resource-governance request.
 
-        A scheduler-owned per-cycle policy that generalises the whole-card safety-off lever to the ordinary
-        case: on a card too tight to hold the safety context beside the heaviest sampling activation it is
-        committed to, safety cycles to a CPU-only process so its CUDA context stops competing for the card. The
-        operator's ``safety_on_gpu`` remains the maximum permission (False leaves safety off forever); this
-        policy can only degrade GPU to CPU and back, never beyond the operator's grant.
+        Runtime fit hysteresis, whole-card residency, and the reclaim ladder contribute demand rather than
+        cycling the process independently. This method is the sole caller of the lifecycle safety pause and
+        restore actuators. A live residency is a restore veto even when another request initiated the pause;
+        accepted post-processing work and the device-free governor similarly veto growth back onto the card.
 
-        The two sides read different signals so the re-promotion is satisfiable under sustained load. Demotion
-        prices a *modeled* worst case: the charge must fail to fit beside the largest learned sampling peak
-        (:meth:`_safety_fits_beside_largest_sampling_peak`), a predictive eviction that acts before the card
-        reaches the paging cliff. Re-promotion instead reads the chosen card's *measured* device-free between
-        allocation peaks (:meth:`_safety_restore_headroom_fits`): the modeled peak is always populated while
-        jobs flow, so a modeled restore predicate could never be satisfied under load, whereas the measured
-        free rises whenever the card genuinely has room. On a box where no card can host safety beside its
-        sampler the measured streak never accrues and CPU placement is the correct steady state, with pop
-        backpressure carrying the load.
+        The fit policy still uses modeled non-fit for demotion and measured device-free headroom for promotion.
+        Whole-card and reclaim requests do not wait for fit hysteresis, but residency will not interrupt an
+        active safety backlog. The reclaim request is one-shot and is consumed only after an off-GPU safety
+        process reaches readiness. No placement flip is issued while a prior intentional rebuild remains
+        unready, which bounds the intentional-replacement window independently of placement churn.
 
-        Hysteresis (:data:`_SAFETY_PLACEMENT_PAUSE_STREAK` / :data:`_SAFETY_PLACEMENT_RESTORE_STREAK`) guards
-        against flapping: the off-latch turns on only after several consecutive modeled-non-fit cycles and off
-        only after a longer run of measured-headroom cycles, with a deadband (modeled fit but measured room not
-        yet proven) that advances neither streak. The asymmetric streaks double as a demote-again cooldown: a
-        promotion resets the miss streak, so at least :data:`_SAFETY_PLACEMENT_PAUSE_STREAK` fresh non-fit
-        cycles must pass before safety can be evicted again. Demotion actuation is skipped while a safety check
-        is pending or active (no mid-backlog churn). If safety is already off-GPU and the backlog grows beyond
-        :data:`_SAFETY_BACKLOG_PRIORITY_DEPTH`, restore actuation is allowed once measured headroom satisfies
-        the normal restore hysteresis, because leaving a deep backlog on CPU safety is worse than preserving
-        placement inertia. The restore is still withheld while a whole-card residency needs safety off its card
-        and while the device-free governor holds growth, so this policy fights neither the residency machinery
-        nor the cliff brake. The card safety is placed on is the headroom-aware choice
-        (:meth:`_choose_safety_gpu_card`), pushed to the lifecycle manager so spawn and re-promotion agree.
+        Args:
+            update_policy: Whether to advance runtime fit hysteresis. Reclaim may ask this reconciler to apply a
+                freshly filed request immediately without manufacturing an extra policy observation.
         """
         # Push the headroom-aware placement choice to the lifecycle manager every cycle so any safety
         # (re)spawn (this policy's re-promotion, a residency restore, or a crash rebuild) pins to the current
@@ -2058,70 +2011,94 @@ class InferenceScheduler:
         if len(self._card_runtimes) > 1:
             self._process_lifecycle.set_desired_safety_card(self._choose_safety_gpu_card())
 
-        if not self._runtime_safety_placement_enabled():
+        placement_enabled = self._runtime_safety_placement_enabled()
+        if not placement_enabled:
             self._safety_placement_miss_streak = 0
             self._safety_placement_fit_streak = 0
             self._safety_placement_wants_off = False
+            self._safety_reclaim_pause_requested = False
             return
+
         safety_backlog_depth = self._safety_backlog_depth()
-        if safety_backlog_depth > 0 and not self._process_lifecycle.is_safety_gpu_paused:
-            self._safety_placement_miss_streak = 0
-            return
-        if 0 < safety_backlog_depth <= _SAFETY_BACKLOG_PRIORITY_DEPTH:
-            return
-
         safety_card = self._safety_gpu_card()
-        modeled_fits = self._safety_fits_beside_largest_sampling_peak(safety_card, require_margin=False)
-        measured_headroom_fits = self._safety_restore_headroom_fits(safety_card)
-        if measured_headroom_fits:
-            self._safety_placement_fit_streak += 1
-            self._safety_placement_miss_streak = 0
-        elif not modeled_fits:
-            self._safety_placement_miss_streak += 1
-            self._safety_placement_fit_streak = 0
-        else:
-            # Deadband: the modeled charge fits beside the peak but the card's measured free has not yet proven
-            # durable room to reabsorb safety. Advance neither streak so a card on the boundary neither evicts
-            # nor readmits safety.
+        if update_policy:
+            if safety_backlog_depth > 0 and not self._process_lifecycle.is_safety_gpu_paused:
+                self._safety_placement_miss_streak = 0
+            elif not (0 < safety_backlog_depth <= _SAFETY_BACKLOG_PRIORITY_DEPTH):
+                modeled_fits = self._safety_fits_beside_largest_sampling_peak(
+                    safety_card,
+                    require_margin=False,
+                )
+                measured_headroom_fits = self._safety_restore_headroom_fits(safety_card)
+                if measured_headroom_fits:
+                    self._safety_placement_fit_streak += 1
+                    self._safety_placement_miss_streak = 0
+                elif not modeled_fits:
+                    self._safety_placement_miss_streak += 1
+                    self._safety_placement_fit_streak = 0
+
+                if not self._safety_placement_wants_off:
+                    if self._safety_placement_miss_streak >= _SAFETY_PLACEMENT_PAUSE_STREAK:
+                        self._safety_placement_wants_off = True
+                elif self._safety_placement_fit_streak >= _SAFETY_PLACEMENT_RESTORE_STREAK:
+                    self._safety_placement_wants_off = False
+
+        residency_veto = self._held_residency_requests_safety_off_gpu()
+        residency_may_initiate = residency_veto and (
+            self._process_lifecycle.is_safety_gpu_paused or safety_backlog_depth == 0
+        )
+        requested_owner: PauseOwner | None = None
+        if residency_may_initiate:
+            requested_owner = PauseOwner.WHOLE_CARD
+        elif self._safety_reclaim_pause_requested:
+            requested_owner = PauseOwner.RECLAIM_LADDER
+        elif self._safety_placement_wants_off:
+            requested_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
+
+        if self._process_lifecycle.safety_placement_transition_pending is True:
             return
 
-        if not self._safety_placement_wants_off:
-            if self._safety_placement_miss_streak >= _SAFETY_PLACEMENT_PAUSE_STREAK:
-                self._safety_placement_wants_off = True
-        elif self._safety_placement_fit_streak >= _SAFETY_PLACEMENT_RESTORE_STREAK:
-            self._safety_placement_wants_off = False
-
-        if self._safety_placement_wants_off:
-            if not self._process_lifecycle.is_safety_gpu_paused:
-                peak_mb = self._largest_active_sampling_peak_mb()
-                total_mb = self._process_map.get_reported_total_vram_mb(device_index=safety_card)
-                if self._process_lifecycle.pause_safety_on_gpu():
-                    self._safety_placement_demotions += 1
-                    logger.info(
-                        f"Runtime safety placement: moving safety off-GPU. Its "
-                        f"~{self._safety_footprint_mb() / 1024:.1f}GB context does not fit beside the largest "
-                        f"active sampling peak (~{(peak_mb or 0.0) / 1024:.1f}GB) on a "
-                        f"~{(total_mb or 0.0) / 1024:.0f}GB card after "
-                        f"{self._safety_placement_miss_streak} consecutive cycles.",
-                    )
+        if self._process_lifecycle.is_safety_gpu_paused:
+            if self._safety_reclaim_pause_requested:
+                # The off-GPU child reached readiness, so the ladder's one-shot request has materialised. Other
+                # live requests still keep it off; absent one, restoration is reconsidered on the next cycle.
+                self._safety_reclaim_pause_requested = False
+                return
+            if requested_owner is not None or residency_veto:
+                return
+            if 0 < safety_backlog_depth <= _SAFETY_BACKLOG_PRIORITY_DEPTH:
+                return
+            if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+                return
+            if self.is_vram_growth_held(safety_card) or not self._arbiter_admits_safety_gpu_load(safety_card):
+                return
+            pause_owner = self._process_lifecycle.safety_pause_owner
+            if pause_owner is None:
+                return
+            restored = self._process_lifecycle.restore_safety_on_gpu(owner=pause_owner)
+            if restored and pause_owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT:
+                self._safety_placement_promotions += 1
+                logger.info(
+                    f"Runtime safety placement: restoring safety to card {safety_card} after "
+                    f"{self._safety_placement_fit_streak} consecutive cycles of measured device-free "
+                    f"headroom for its ~{self._safety_footprint_mb() / 1024:.1f}GB context.",
+                )
             return
 
-        # The policy no longer wants safety off; restore it unless a whole-card residency still needs it off
-        # that card, and only when the arbiter agrees the card can hold the load now.
-        if not self._process_lifecycle.is_safety_gpu_paused:
+        if requested_owner is None:
             return
-        if any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies()):
+        peak_mb = self._largest_active_sampling_peak_mb()
+        total_mb = self._process_map.get_reported_total_vram_mb(device_index=safety_card)
+        if not self._process_lifecycle.pause_safety_on_gpu(owner=requested_owner):
             return
-        # A safety GPU restore grows the card's committed footprint; withhold it while the device-free governor
-        # holds growth (device-level free below the soft floor), the same brake the preload path honors.
-        if self.is_vram_growth_held(safety_card):
-            return
-        if self._arbiter_admits_safety_gpu_load(safety_card) and self._process_lifecycle.restore_safety_on_gpu():
-            self._safety_placement_promotions += 1
+        if requested_owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT:
+            self._safety_placement_demotions += 1
             logger.info(
-                f"Runtime safety placement: restoring safety to card {safety_card} after "
-                f"{self._safety_placement_fit_streak} consecutive cycles of measured device-free headroom for "
-                f"its ~{self._safety_footprint_mb() / 1024:.1f}GB context.",
+                f"Runtime safety placement: moving safety off-GPU. Its "
+                f"~{self._safety_footprint_mb() / 1024:.1f}GB context does not fit beside the largest "
+                f"active sampling peak (~{(peak_mb or 0.0) / 1024:.1f}GB) on a "
+                f"~{(total_mb or 0.0) / 1024:.0f}GB card after "
+                f"{self._safety_placement_miss_streak} consecutive cycles.",
             )
 
     def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
@@ -2285,7 +2262,7 @@ class InferenceScheduler:
                 protected_model=job.model,
             )
 
-        safety_paused = self._pause_safety_for_residency_if_idle(device_index)
+        safety_pause_requested = self._residency_should_pause_safety(device_index) and not self._has_safety_backlog()
         post_process_paused = self._pause_post_process_for_residency_if_idle(
             device_index,
             model_name=job.model,
@@ -2304,8 +2281,8 @@ class InferenceScheduler:
         if self._residency_should_pause_component_lane(device_index):
             self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
-        if announce or after < current or safety_paused or post_process_paused:
-            safety_note = " and moving safety off-GPU" if safety_paused else ""
+        if announce or after < current or safety_pause_requested or post_process_paused:
+            safety_note = " and requesting safety off-GPU" if safety_pause_requested else ""
             total_mb = forecast.total_vram_mb
             card_phrase = f"the whole ~{total_mb / 1024:.0f}GB card" if total_mb else "nearly the whole card"
             logger.opt(colors=True).warning(
@@ -2462,7 +2439,6 @@ class InferenceScheduler:
                     device_index=device_index,
                     protected_model=model,
                 )
-            self._pause_safety_for_residency_if_idle(device_index)
             if forecast is not None:
                 self._pause_post_process_for_residency_if_idle(device_index, model_name=model, forecast=forecast)
 
@@ -2840,9 +2816,6 @@ class InferenceScheduler:
         # The exclusive-job suppression is worker-wide: it holds every card's residency a little longer, which
         # only delays restoring concurrency (conservative-safe) rather than risking an over-commit.
         has_exclusive = self._job_tracker.has_exclusive_job_in_progress()
-        post_processing_has_work = bool(
-            self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed
-        )
         for device_index, state in self._held_residencies():
             model = state.model
             if model in active_models or has_exclusive:
@@ -2867,18 +2840,6 @@ class InferenceScheduler:
                 now=time.time(),
                 restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
             )
-            # The runtime safety-placement policy is the other owner of safety's on/off-GPU state; while it
-            # holds safety off, promoting it here only for that policy to demote it again costs two full safety
-            # process rebuilds per residency. The residency-drain reconciler
-            # (:meth:`_restore_deferred_safety_gpu_load`) stands down for the same wish.
-            safety_restored = (
-                self._process_lifecycle.restore_safety_on_gpu()
-                if self._residency_should_pause_safety(device_index)
-                and not self._safety_placement_wants_off
-                and self._arbiter_admits_safety_gpu_load(device_index)
-                and not post_processing_has_work
-                else False
-            )
             post_process_restored = (
                 self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
                 if self._residency_should_pause_post_process(device_index)
@@ -2899,7 +2860,6 @@ class InferenceScheduler:
             current = self._process_map.num_loaded_inference_processes(device_index=device_index)
             if (
                 current >= ceiling
-                and not safety_restored
                 and not post_process_restored
                 and not vae_lane_restored
                 and not component_lane_restored
@@ -2907,14 +2867,13 @@ class InferenceScheduler:
                 continue
             after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
             self._reconcile_worker_shed_to_pool()
-            safety_note = " and restoring safety to the GPU" if safety_restored else ""
             post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
             vae_lane_note = " and restarting the VAE lane" if vae_lane_restored else ""
             component_lane_note = " and restarting the component lane" if component_lane_restored else ""
             logger.opt(colors=True).info(
                 "<fg #7b7d7d>Whole-card residency for {} complete; restoring inference processes "
                 f"({current} -> {after} of {ceiling})"
-                f"{safety_note}{post_process_note}{vae_lane_note}{component_lane_note}.</>",
+                f"{post_process_note}{vae_lane_note}{component_lane_note}.</>",
                 model,
             )
 
@@ -6597,7 +6556,7 @@ class InferenceScheduler:
 
     def cycle_safety_off_gpu(self, device_index: int | None) -> bool:
         """Cycle the safety model off the GPU to reclaim its context (:class:`VramActuator`)."""
-        return self._pause_safety_for_residency_if_idle(device_index)
+        return self.safety_off_gpu(device_index)
 
     def build_reclaim_ladder_candidates(
         self,
@@ -6776,6 +6735,7 @@ class InferenceScheduler:
             not bridge_data.safety_on_gpu
             or not bridge_data.whole_card_residency_safety_off_gpu
             or self._process_lifecycle.is_safety_gpu_paused
+            or self._process_lifecycle.safety_placement_transition_pending is True
         ):
             return None
         reserved_mb = self._reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
@@ -6907,12 +6867,20 @@ class InferenceScheduler:
     def safety_off_gpu(self, device_index: int | None) -> bool:
         """Move the on-GPU safety context off the card to reclaim it (reclaim-ladder actuator).
 
-        Unlike the lane pauses, the ladder does not restore safety when the episode ends: the runtime
-        safety-placement policy owns safety's on/off-GPU state and re-promotes it once the card demonstrably
-        fits its context beside the largest active sampling peak, so a ladder-cycled safety pause has a live,
-        independent restore path and is never stranded.
+        Unlike lane pauses, this files a one-shot request with the recurring safety-placement reconciler. The
+        reconciler applies it immediately without advancing fit hysteresis, then consumes it only after the
+        off-GPU child reaches readiness. Restoration is also reconciled there, so the ladder cannot overlap a
+        residency or runtime-policy transition.
         """
-        return self._process_lifecycle.pause_safety_on_gpu()
+        if (
+            self._safety_reclaim_pause_requested
+            or self._process_lifecycle.is_safety_gpu_paused
+            or self._process_lifecycle.safety_placement_transition_pending is True
+        ):
+            return False
+        self._safety_reclaim_pause_requested = True
+        self._reconcile_runtime_safety_placement(update_policy=False)
+        return True
 
     def restore_post_process_lane(self, device_index: int | None) -> bool:
         """Restart a ladder-paused post-processing lane once the card has recovered (reclaim-ladder actuator)."""
@@ -6947,9 +6915,8 @@ class InferenceScheduler:
             True if a model was preloaded, False otherwise.
         """
         self._restore_siblings_after_whole_card()
-        self._reconcile_runtime_safety_placement()
-        self._restore_deferred_safety_gpu_load()
         self._converge_whole_card_residency()
+        self._reconcile_runtime_safety_placement()
         self._expire_stale_model_map_entries()
 
         if self._pending_post_processing_should_hold_preload():

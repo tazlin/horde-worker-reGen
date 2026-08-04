@@ -737,15 +737,17 @@ almost none of its promised context one sample later, then the full figure a sam
 rungs are therefore given one extra verification sample before a shortfall is declared, so the engine does not
 falsely grade a pause that is still tearing down as short and escalate past a rung that is in fact working.
 
-It also **restores what it took**. A paused lane, unlike safety, has no independent mechanism to bring it
-back (the runtime safety-placement policy re-promotes safety on its own; a lane stays down until something
-restarts it). Each lane pause is therefore tagged with an **owner** so the whole-card residency and the reclaim
+It also **restores what it took**. A paused lane, unlike safety, has no recurring placement reconciler to bring
+it back. Each lane pause is therefore tagged with an **owner** so the whole-card residency and the reclaim
 ladder can never clear each other's hold: the residency's completion loop restores only residency-owned pauses,
-and the ladder restores only ladder-owned pauses. When a card's episode ends and it returns fully **HEALTHY**
+and the ladder restores only ladder-owned pauses. Safety's reclaim rung instead files a one-shot request with
+the scheduler's sole safety-placement reconciler. That reconciler applies the pause, waits for the CPU-only
+replacement to reach readiness, then reconsiders GPU placement against all residency and runtime-policy vetoes.
+When a card's episode ends and it returns fully **HEALTHY**
 (the actions are held through the intermediate PRESSURE band, since restarting a CUDA context while the card
 is still tight would risk re-crossing the cliff), the ladder **unwinds** its own **restore obligations** in
 reverse order (LIFO): the last thing taken is the first given back. Safety is excluded from the unwind on
-purpose, because the placement policy already owns its restore.
+purpose, because the placement reconciler owns its restore.
 
 The **live-context reduction** the per-cycle admission path takes (the arbiter's `REDUCE_LIVE_CONTEXTS`
 actuation, which stops idle inference processes so the VRAM a live process retains for its context returns to

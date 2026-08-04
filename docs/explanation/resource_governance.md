@@ -282,9 +282,13 @@ call sites, bound that churn:
   inside a nominal window, and the scheduler discloses the refusal once on the transition. The budget
   replenishes as old grants age out of the window.
 
-Only one owner may put safety back on its card. The residency-end restore and the residency-drain
-reconciler both stand down while the runtime safety-placement policy holds safety off, so a residency that
-ends under that wish does not promote safety only for the policy to demote it again.
+Only one reconciler may change safety placement. Whole-card residency contributes a persistent off-GPU veto,
+the reclaim ladder contributes a one-shot request, and runtime placement contributes its hysteretic fit wish;
+none calls lifecycle's safety pause or restore directly. The reconciler keeps the initiating `PauseOwner` for
+attribution, waits until the replacement reaches readiness, and restores only after every request and veto has
+cleared, the arbiter admits the safety load, and the device-free governor permits growth. A residency that ends
+under a runtime-policy wish therefore cannot promote safety only for the policy to demote it again, and two
+opposing wishes cannot chain intentional replacement windows.
 
 Whole-card residency is off unless its config flag resolves to true. A flag that never resolved at all is
 disclosed once at the scheduler, because a worker that quietly forgoes the residency simply loads heavy

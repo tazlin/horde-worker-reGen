@@ -118,7 +118,7 @@ behaviors keep an unfittable chain from parking the queue:
   work a path to measured room without repeatedly churning inference residency or weakening the recovery
   fences.
 
-### Restore ownership: every lane pause has exactly one responsible owner
+### Restore ownership: every service-process pause has exactly one initiating owner
 
 A service-lane off-GPU pause frees a real CUDA context, so it has no external trigger to bring it back: whoever
 paused it must own its restore. There are two responsible owners, keyed by `PauseOwner` at pause time so
@@ -127,6 +127,12 @@ neither lifts the other's hold:
 - a **whole-card residency** pause is restored by the residency completion loop when the residency drains; and
 - a **reclaim-ladder** pause is restored by the ladder's LIFO unwind when the card's saturation episode ends,
   or, for a lane the post-processing drain borrowed, by that drain's applied-action receipt.
+
+Safety records the same owner attribution but has a different restore shape. Whole-card residency, the reclaim
+ladder, and runtime fit hysteresis file placement demand with one scheduler reconciler; only that reconciler
+calls lifecycle's safety pause and restore methods. The owner names the request that initiated the current
+off-GPU cycle. Later requests do not take ownership or start another rebuild, and the reconciler restores only
+after all requests and vetoes have cleared and the current replacement has reached readiness.
 
 The borrowed lane's release is not gated on the *whole* PP queue draining, because a borrowed lane is a
 disaggregation lane: pausing it disables disaggregation, which routes work monolithic, raises card pressure,
