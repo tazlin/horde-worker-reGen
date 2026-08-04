@@ -45,6 +45,7 @@ def _make_shutdown_manager(
     state: WorkerState | None = None,
     job_tracker: JobTracker | None = None,
     process_map: ProcessMap | None = None,
+    main_loop_finished: threading.Event | None = None,
 ) -> ShutdownManager:
     """Build a ShutdownManager with mostly-mocked dependencies."""
     if state is None:
@@ -53,6 +54,8 @@ def _make_shutdown_manager(
         job_tracker = JobTracker()
     if process_map is None:
         process_map = ProcessMap({})
+    if main_loop_finished is None:
+        main_loop_finished = threading.Event()
 
     process_lifecycle = Mock()
     process_lifecycle.recently_recovered = False
@@ -62,6 +65,7 @@ def _make_shutdown_manager(
         job_tracker=job_tracker,
         process_map=process_map,
         process_lifecycle=process_lifecycle,
+        main_loop_finished=main_loop_finished,
     )
 
 
@@ -424,6 +428,45 @@ class TestBackstopLifecycle:
         assert thread is not None
         thread.join(timeout=3.0)
         assert not thread.is_alive()
+
+    def test_child_teardown_does_not_disarm_backstop_while_main_loop_is_still_blocked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``shut_down`` alone cannot prove the gathered asyncio task group returned.
+
+        Reproduces the incident seam: all children were reaped, but an alchemy request still occupied a
+        sibling task. The process-level backstop must force-exit instead of mistaking child teardown for a
+        completed worker lifecycle.
+        """
+        shutdown_manager = _make_shutdown_manager(state=WorkerState(shutting_down=True, shut_down=True))
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        exit_codes: list[int] = []
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+
+        shutdown_manager.start_timed_shutdown()
+
+        assert _wait_until(lambda: exit_codes == [1]), "child teardown incorrectly disarmed the process backstop"
+
+    def test_completed_main_loop_disarms_backstop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Once the gathered main loop returns, the main thread owns the ordinary process exit."""
+        main_loop_finished = threading.Event()
+        shutdown_manager = _make_shutdown_manager(main_loop_finished=main_loop_finished)
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        exit_codes: list[int] = []
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+
+        shutdown_manager.start_timed_shutdown()
+        main_loop_finished.set()
+
+        thread = shutdown_manager._backstop_thread
+        assert thread is not None
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+        assert exit_codes == []
+        shutdown_manager._process_lifecycle._hard_kill_processes.assert_not_called()
 
     def test_cancel_suppresses_force_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cancelling an armed backstop wakes its thread and suppresses the force-exit, even past the grace."""

@@ -19,8 +19,13 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 _SHUTDOWN_GRACE_BASE_SECONDS = 20.0
 """Minimum grace before the force-kill backstop fires, regardless of outstanding work."""
 
-_EMPTY_SHUTDOWN_GRACE_SECONDS = 3.0
-"""Grace before force-killing children when no accepted work remains anywhere in the pipeline."""
+_EMPTY_SHUTDOWN_GRACE_SECONDS = 10.0
+"""Grace before force-exiting an empty worker whose main loop still has not returned.
+
+Normal empty shutdowns finish promptly; this is only the backstop. Ten seconds leaves room for bounded child
+reaping, sibling-task cancellation, and session persistence without weakening the outer 150-second supervisor
+deadline.
+"""
 
 _SHUTDOWN_GRACE_PER_JOB_SECONDS = 40.0
 """Extra grace granted per outstanding job (any stage), so in-flight work can drain before a kill."""
@@ -55,6 +60,7 @@ class ShutdownManager:
     _job_tracker: JobTracker
     _process_map: ProcessMap
     _process_lifecycle: ProcessLifecycleManager
+    _main_loop_finished: threading.Event
     _caught_sigints: int
     _timed_shutdown_started: bool
     _backstop_cancelled: threading.Event
@@ -67,6 +73,7 @@ class ShutdownManager:
         job_tracker: JobTracker,
         process_map: ProcessMap,
         process_lifecycle: ProcessLifecycleManager,
+        main_loop_finished: threading.Event,
     ) -> None:
         """Initialize the manager with references to the components it needs to manage.
 
@@ -79,11 +86,14 @@ class ShutdownManager:
                 their states.
             process_lifecycle (ProcessLifecycleManager): The worker's ProcessLifecycleManager, which is responsible
                 for launching, monitoring, and killing processes as needed.
+            main_loop_finished: Set by the process manager only after its gathered asyncio task group has returned.
+                Child teardown alone is not sufficient: another main-loop task may still be blocked in I/O.
         """
         self._state = state
         self._job_tracker = job_tracker
         self._process_map = process_map
         self._process_lifecycle = process_lifecycle
+        self._main_loop_finished = main_loop_finished
         self._caught_sigints = 0
         self._timed_shutdown_started = False
         self._backstop_cancelled = threading.Event()
@@ -195,27 +205,29 @@ class ShutdownManager:
         grace = self._compute_shutdown_grace()
 
         def hard_shutdown() -> None:
-            # Wait out the grace, waking promptly on either a clean exit (shut_down) or an explicit
-            # cancel, instead of always burning the full window.
+            # Wait out the grace, waking promptly once the *whole main loop* has returned or an embedder
+            # explicitly cancels. ``WorkerState.shut_down`` only proves child teardown; treating it as
+            # process completion previously disarmed this backstop while asyncio.gather was still pinned
+            # by a sibling task blocked in network I/O.
             deadline = time.monotonic() + grace
             while time.monotonic() < deadline:
                 if self._backstop_cancelled.wait(timeout=_SHUTDOWN_POLL_INTERVAL_SECONDS):
                     return
-                if self._state.shut_down:
+                if self._main_loop_finished.is_set():
                     return
 
             # Grace expired with the worker still up: report any stuck jobs, then force the kill.
             self._fault_report_outstanding_jobs()
 
-            # A cancel or clean exit that landed during the fault-report window still suppresses the kill.
-            if self._backstop_cancelled.is_set() or self._state.shut_down:
+            # A cancel or completed main loop that landed during the fault-report window still suppresses the kill.
+            if self._backstop_cancelled.is_set() or self._main_loop_finished.is_set():
                 return
 
             self._process_lifecycle._hard_kill_processes()
 
-            # Only force-exit if the graceful shutdown hasn't completed and no embedder has taken over the
-            # process; a clean exit is left to the main thread (and embedders like the test harness).
-            if not self._state.shut_down and not self._backstop_cancelled.is_set():
+            # Only force-exit if the gathered main loop has not returned and no embedder has taken over the
+            # process. A completed loop is left to the main thread (and embedders like the test harness).
+            if not self._main_loop_finished.is_set() and not self._backstop_cancelled.is_set():
                 _force_exit_process(1)
 
         thread = threading.Thread(target=hard_shutdown, name="shutdown-backstop", daemon=True)

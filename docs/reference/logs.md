@@ -99,6 +99,9 @@ rolling hour), because an unbounded one silently disables the wedge backstop.
   now charged to the worker so wedge detection can proceed. Emitted once when the budget runs out, not per
   gap, so its absence on later gaps does not mean the condition cleared. A worker that is still advancing
   is unaffected by this; a silent one will be force-killed and relaunched.
+- `WARNING` `Worker (pid=…) survived the prior wedge tree-kill attempt; retrying …` -- the same frozen PID
+  remained alive after the orphan-proof kill. The supervisor retries every ten seconds until process death
+  reaches the ordinary bounded relaunch path; real loop progress or a replacement clears the retry state.
 
 The same counters are on the dashboard status bar as a `stalls n/3` segment (yellow while forgiving, red
 once the budget is spent), which appears only when there is something to report. See

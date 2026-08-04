@@ -49,10 +49,11 @@ There are two termination paths:
    shutdown; that cooldown only suppresses premature hang recovery.
 8. Immediately before the control loop returns, it publishes a final
    `shutting_down` supervisor snapshot. When all jobs are finalized (all stage
-   collections empty), the main loop exits. Every background loop (popper, submitter, user-info, alchemy, and the
-   periodic update check) polls the shutdown flag on a short cadence rather than
-   waiting out its own interval, so none of them holds the gathered task group
-   (and thus the process) open after the drain finishes. This matters for the
+   collections empty), the control loop cancels the remaining background tasks and the main loop exits. Every
+   background loop (popper, submitter, user-info, alchemy, and the periodic update check) normally polls the
+   shutdown flag on a short cadence; cancellation is the final bound for a task already blocked in network I/O.
+   No sibling can therefore hold the gathered task group (and thus the process) open after the control loop has
+   proved the drain and child reap complete. This matters for the
    dashboard: once the control loop stops it no longer stamps liveness, so a
    process that lingered would age into a false `UNRESPONSIVE`; the supervisor
    also reads a `shutting_down` snapshot as "Shutting down" rather than
@@ -70,7 +71,7 @@ There are two termination paths:
    buffered IPC put cannot pin interpreter finalization either.
 10. A timed backstop bounds the drain. If no accepted work remains anywhere in
    the pipeline (no inference, safety, submit, or alchemy work), the backstop
-   uses a short grace and then force-kills/reaps children because there is no
+   uses a ten-second grace and then force-kills/reaps children because there is no
    horde-owned job to lose. If work is still outstanding, the grace is scaled by
    that work and hard-capped; after it expires, any still-outstanding jobs are
    faulted so the still-running submitter reports them and the horde reissues
@@ -88,10 +89,12 @@ reporting a clean exit.
 
 The backstop is a named daemon thread (`shutdown-backstop`) scoped to the manager
 that armed it. It waits out its grace on a cancellable event, so it wakes promptly
-on either a clean exit (the `shut_down` flag) or an explicit cancel, and it
-force-exits only when neither has happened. `cancel_timed_shutdown()` sets that
-event and joins the thread, guaranteeing that once it returns no thread the manager
-created can terminate the process.
+when the **gathered asyncio main loop has returned** or an embedder explicitly
+cancels it, and it force-exits only when neither has happened. The distinction is
+intentional: `WorkerState.shut_down` proves child teardown, but a sibling coroutine
+blocked in I/O can still keep the worker process alive. `cancel_timed_shutdown()`
+sets the embedder event and joins the thread, guaranteeing that once it returns no
+thread the manager created can terminate the process.
 
 This matters for embedders that run several worker lifecycles in one interpreter
 (the end-to-end harness and the warm benchmark session). `run_harness` cancels and
@@ -111,6 +114,14 @@ a graceful shutdown that wedges past the grace is still force-killed.
 3. `start_timed_shutdown()` launches a background backstop. After a grace period,
    it kills any remaining children and force-exits the worker process with a non-zero
    status so an external supervisor can observe the death and restart it.
+
+An irreparably corrupt shared child-message channel always uses this typed terminal
+restart path. It records `RecoveryDisposition.RESTART_PROCESS` before aborting, so
+the outer entry point exits non-zero and a TUI/service supervisor sees an unexpected
+exit to relaunch. Unlike an ordinary SOS terminal rung, this condition cannot be
+withheld in headless mode: no in-process remedy can make an inherited corrupt queue
+usable again, so it exits loudly rather than remaining alive but unable to receive
+child results.
 
 ## Signal handling
 

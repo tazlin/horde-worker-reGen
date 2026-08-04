@@ -1155,6 +1155,12 @@ class HordeWorkerProcessManager:
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
+        self._main_loop_finished = threading.Event()
+        """Set only after the gathered asyncio main loop returns.
+
+        ``WorkerState.shut_down`` proves child teardown, not process-level completion: a sibling coroutine can
+        still be blocked in I/O. The shutdown backstop therefore keys off this stronger boundary.
+        """
         # Recovery-triggered shutdown uses the ordinary bounded cleanup path. Its typed disposition is retained
         # here because the run record and outer entry point both consume the same process-exit contract; it is
         # deliberately not inferred from mutable shutdown flags shared by the worker's collaborators.
@@ -1439,7 +1445,7 @@ class HordeWorkerProcessManager:
         # A shared child-to-parent channel that has wedged a physical read (a torn frame, a stalled writer
         # lock) is unrecoverable in place because every child inherits the same queue; the only correct
         # terminal is a loud abort and restart onto a fresh channel.
-        self._message_dispatcher.set_channel_corruption_handler(lambda reason: self._abort())
+        self._message_dispatcher.set_channel_corruption_handler(self._restart_after_message_channel_corruption)
         # The dispatcher decodes each memory report's component-residency snapshot into this shared map.
         self._message_dispatcher.set_component_residency_map(self._component_residency_map)
 
@@ -1611,6 +1617,7 @@ class HordeWorkerProcessManager:
             job_tracker=self._job_tracker,
             process_map=self._process_map,
             process_lifecycle=self._process_lifecycle,
+            main_loop_finished=self._main_loop_finished,
         )
 
         # The single VRAM arbiter is constructed before the scheduler and orchestrators so the same instance
@@ -7411,9 +7418,16 @@ class HordeWorkerProcessManager:
             for task in tasks:
                 task.add_done_callback(self._handle_exception)
 
+            # The control loop owns the drain and the final child reap. Once it has proved every child dead
+            # and set ``shut_down``, no sibling owns useful cleanup any longer. Cancel those siblings so a
+            # request already blocked in network I/O cannot pin the gathered task group (and therefore the
+            # worker process) after teardown has completed.
+            tasks[0].add_done_callback(lambda _task: self._cancel_main_loop_siblings(tasks))
+
             # return_exceptions=True so one failing loop does not cancel its siblings mid-flight:
             # _handle_exception has already initiated a graceful shutdown, and we want the other
-            # loops (notably the submitter) to keep draining in-flight work until done.
+            # loops (notably the submitter) to keep draining in-flight work until the control loop has
+            # completed the drain and final child reap. Its done callback then cancels any blocked remainder.
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             if not self._state.shut_down:
@@ -7421,6 +7435,19 @@ class HordeWorkerProcessManager:
             for result in results:
                 if isinstance(result, BaseException) and not isinstance(result, CancelledError):
                     logger.error(f"main loop task raised during shutdown: {result}")
+
+    def _cancel_main_loop_siblings(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Cancel background loops after the control loop has completed final child teardown.
+
+        ``tasks[0]`` is the control loop. A false ``shut_down`` means it returned unexpectedly before proving
+        teardown, in which case the timed backstop remains the owner and siblings are left alive to drain what
+        they can. A true value makes cancellation safe: accepted work is finalized and every child is reaped.
+        """
+        if not self._state.shut_down:
+            return
+        for task in tasks[1:]:
+            if not task.done():
+                task.cancel()
 
     def start(self) -> RecoveryDisposition:
         """Run the process manager and return its terminal-recovery disposition after cleanup."""
@@ -7434,7 +7461,13 @@ class HordeWorkerProcessManager:
 
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
-        asyncio.run(self._main_loop())
+        try:
+            asyncio.run(self._main_loop())
+        finally:
+            # Stronger than ``WorkerState.shut_down``: the gathered task group itself has returned (or the
+            # asyncio runner has failed and is unwinding), so the shutdown backstop must no longer os._exit
+            # this process out from under session persistence and the outer entry point.
+            self._main_loop_finished.set()
         return self._recovery_disposition
 
     def _kill_owned_children_on_exit(self) -> None:
@@ -7494,7 +7527,12 @@ class HordeWorkerProcessManager:
         """Exit as soon as possible, aborting all processes and jobs immediately."""
         self._shutdown_manager.abort()
 
-    def _request_terminal_recovery(self) -> RecoveryDisposition:
+    def _restart_after_message_channel_corruption(self, reason: str) -> None:
+        """Restart on a fresh IPC channel after the inherited child channel becomes irreparable."""
+        logger.critical(f"Terminal restart required: {reason}")
+        self._request_terminal_recovery(required=True)
+
+    def _request_terminal_recovery(self, *, required: bool = False) -> RecoveryDisposition:
         """Request a fresh process and report whether a reliable relaunch contract accepted the request.
 
         A replacement process is the one remedy that clears state an in-place rebuild cannot, so the worker
@@ -7503,17 +7541,28 @@ class HordeWorkerProcessManager:
         unattended can arrange the same with a service manager, which they signal by setting
         ``exit_on_unhandled_faults``.
 
-        With neither in place, exiting would end the worker's usefulness rather than restore it, so this rung
-        is withheld and the escalation keeps re-attempting the remedies it can perform in place. The returned
-        disposition tells the coordinator whether to stop for process replacement or keep driving its bounded
-        in-process ladder; once those remedies are spent it holds the worker quiescent rather than churning.
+        With neither in place, an ordinary recovery rung is withheld: exiting would end the worker's usefulness
+        rather than restore it, so the escalation keeps driving its bounded in-process remedies. ``required``
+        is reserved for conditions such as an irreparably corrupt inherited IPC channel where no in-process
+        remedy exists; that path exits non-zero even without a known relauncher rather than remaining alive but
+        unable to observe any child result.
+
+        The returned disposition tells the coordinator whether to stop for process replacement or keep driving
+        its bounded in-process ladder; once ordinary remedies are spent it holds the worker quiescent rather than
+        churning.
 
         Returns:
             :attr:`RecoveryDisposition.RESTART_PROCESS` when cleanup has begun under a relaunch contract;
             otherwise :attr:`RecoveryDisposition.CONTINUE_IN_PROCESS`.
         """
         supervisor_would_relaunch = self._supervisor is not None
-        if supervisor_would_relaunch or self.bridge_data.exit_on_unhandled_faults is True:
+        if supervisor_would_relaunch or self.bridge_data.exit_on_unhandled_faults is True or required:
+            if required and not supervisor_would_relaunch and self.bridge_data.exit_on_unhandled_faults is not True:
+                logger.critical(
+                    "A fresh worker process is required but no relaunch contract is configured; exiting non-zero "
+                    "because the current process cannot recover in place. Restart the worker manually or run it "
+                    "under the dashboard/service manager.",
+                )
             # ``ShutdownManager.abort`` deliberately lets the event loop unwind through bounded cleanup. The
             # outer entry point converts this same retained outcome into failure only after session persistence.
             self._recovery_disposition = RecoveryDisposition.RESTART_PROCESS

@@ -58,7 +58,10 @@ horde-log diagnose --last
 
 `sessions` lists every launch with its span, version, end-reason (clean exit, gave-up-and-aborted,
 operator shutdown, or killed/crashed), and peak process-recovery count, so a session that thrashed
-stands out. `diagnose` then runs detectors over a session and prints ranked findings: it recognizes an
+stands out. A clean exit requires the outer `Worker has finished working` marker. The earlier
+`Shutting down process manager` line records child teardown only and is deliberately not sufficient: a
+gathered background request can still hold the main process open. `diagnose` then runs detectors over a
+session and prints ranked findings: it recognizes an
 inference pool that crashes on start (and surfaces the child's actual exception, e.g. a CPU-only torch
 reporting `Torch not compiled with CUDA enabled`), a recovery storm that never gave up, GPU
 out-of-memory (naming the faulting model and whether the card was over-admitted, i.e. several models

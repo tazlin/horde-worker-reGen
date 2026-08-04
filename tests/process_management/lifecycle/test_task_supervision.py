@@ -120,3 +120,42 @@ async def test_server_capabilities_loop_refreshes_off_hot_path(monkeypatch: pyte
     pm._state.shut_down = True
     await asyncio.wait_for(task, timeout=1.0)
     assert task.exception() is None
+
+
+async def test_completed_control_teardown_cancels_a_blocked_sibling_loop() -> None:
+    """A background request cannot pin the process after the control loop has reaped every child."""
+    pm = _pm_with_spied_backstop()
+    blocker = asyncio.Event()
+
+    async def _finished_control() -> None:
+        return
+
+    control_task = asyncio.create_task(_finished_control())
+    blocked_sibling = asyncio.create_task(blocker.wait())
+    await control_task
+    pm._state.shut_down = True
+
+    pm._cancel_main_loop_siblings([control_task, blocked_sibling])
+    await asyncio.sleep(0)
+
+    assert blocked_sibling.cancelled()
+
+
+async def test_unproved_control_exit_leaves_siblings_to_the_timed_backstop() -> None:
+    """An early control-loop return must not discard cleanup work before child teardown is proved."""
+    pm = _pm_with_spied_backstop()
+    blocker = asyncio.Event()
+
+    async def _finished_control() -> None:
+        return
+
+    control_task = asyncio.create_task(_finished_control())
+    blocked_sibling = asyncio.create_task(blocker.wait())
+    await control_task
+
+    pm._cancel_main_loop_siblings([control_task, blocked_sibling])
+    await asyncio.sleep(0)
+
+    assert not blocked_sibling.done()
+    blocked_sibling.cancel()
+    await asyncio.gather(blocked_sibling, return_exceptions=True)

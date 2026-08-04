@@ -121,6 +121,35 @@ class TestRecoveryAbortRequiresSomethingToRelaunch:
 
         assert process_manager.build_run_record().clean_exit is False
 
+    def test_corrupt_message_channel_uses_the_typed_terminal_restart(self) -> None:
+        """The dispatcher's real corruption callback must retain a restart disposition before aborting.
+
+        This is the production seam the terminal-recovery tests previously skipped: wiring corruption
+        directly to ``_abort`` cleaned up children but returned a successful process status, and it bypassed
+        the disposition the supervisor relies on to identify a recovery restart.
+        """
+        process_manager = make_testable_process_manager(exit_on_unhandled_faults=False)
+        process_manager._supervisor = Mock()
+        process_manager._shutdown_manager = Mock()
+
+        handler = process_manager._message_dispatcher._on_channel_corrupt
+        assert handler is not None
+        handler("test channel corruption")
+
+        assert process_manager._recovery_disposition is RecoveryDisposition.RESTART_PROCESS
+        process_manager._shutdown_manager.abort.assert_called_once()
+
+    def test_irreparable_channel_exits_nonzero_without_a_known_relauncher(self) -> None:
+        """A process unable to receive any child result cannot truthfully remain running headless."""
+        process_manager = make_testable_process_manager(exit_on_unhandled_faults=False)
+        process_manager._supervisor = None
+        process_manager._shutdown_manager = Mock()
+
+        process_manager._restart_after_message_channel_corruption("test channel corruption")
+
+        assert process_manager._recovery_disposition is RecoveryDisposition.RESTART_PROCESS
+        process_manager._shutdown_manager.abort.assert_called_once()
+
 
 class TestRecoveryDispositionEntryPoint:
     """The outer entry point owns conversion from a session outcome to process status."""

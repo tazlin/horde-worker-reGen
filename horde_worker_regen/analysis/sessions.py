@@ -39,7 +39,10 @@ _MAIN_STARTUP_RE = re.compile(r"Setting up logger for main process")
 _ABANDON_SHIP_RE = re.compile(r"cannot restore a working process pool|abandoning ship")
 _ABORT_FILE_RE = re.compile(r"Found \.abort file")
 _SUPERVISOR_SHUTDOWN_RE = re.compile(r"Supervisor requested shutdown")
-_CLEAN_EXIT_RE = re.compile(r"Worker has finished working|Shutting down process manager")
+# This is emitted only after ``start_working`` returns through session persistence. The process manager's
+# earlier "Shutting down process manager" line proves only that child teardown began/completed; a gathered
+# sibling task can still hold the worker process open, so treating that line as final produced false clean exits.
+_CLEAN_EXIT_RE = re.compile(r"Worker has finished working")
 
 
 class SessionEndReason(enum.StrEnum):

@@ -239,8 +239,16 @@ A read that stays stuck past a threshold while the queue still reports a backlog
 a **corrupt shared channel**, which cannot be repaired in place because every child
 inherits the same queue. The dispatcher's health check (run from the same
 maintenance point as deadlock detection) logs this at `CRITICAL` and escalates once
-through the worker's terminal abort/restart machinery, the correct response to an
-unrecoverable channel rather than a silent hang.
+through the worker's typed terminal abort/restart machinery. The restart disposition
+is retained before cleanup so a supervising frontend observes a non-zero exit and
+relaunches on a fresh channel. Because this condition has no in-process remedy, the
+restart is required even when no relaunch contract is configured: a headless worker
+exits loudly rather than claiming to run while unable to receive child results.
+
+Terminal teardown does not wait indefinitely for unrelated background I/O. Once the
+control loop has drained accepted work and proved every child reaped, it cancels the
+remaining gathered loops; the process-level timed backstop remains armed until that
+gather itself has returned, not merely until child state says `shut_down`.
 
 To make torn frames rarer in the first place, ends give a busy child more grace to
 exit cleanly before it is killed: a single slot end waits several seconds (not

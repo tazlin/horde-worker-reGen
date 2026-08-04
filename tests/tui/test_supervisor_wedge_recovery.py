@@ -283,6 +283,38 @@ def test_wedge_kill_targets_the_whole_process_tree(monkeypatch: pytest.MonkeyPat
     assert killed_pids == [expected_pid], "the wedge recovery did not tree-kill the worker by pid"
 
 
+def test_wedge_tree_kill_is_retried_if_the_same_process_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One ineffective kill cannot permanently disarm the supervisor's last-resort recovery."""
+    supervisor, ctx, clock, _killed_pids = _install(monkeypatch)
+    expected_pid = ctx.last_process.pid  # type: ignore[union-attr]
+    retry_seconds = 5.0
+    monkeypatch.setattr(worker_launcher, "WEDGE_KILL_RETRY_SECONDS", retry_seconds)
+
+    attempts: list[int] = []
+
+    def _ineffective_tree_kill(pid: int, **_kwargs: object) -> list[int]:
+        attempts.append(pid)
+        return [pid]
+
+    monkeypatch.setattr(worker_launcher, "kill_process_tree", _ineffective_tree_kill)
+
+    frozen = clock.now()
+    _feed_liveness(supervisor, ctx, frozen)
+    supervisor.tick()
+    clock.advance(_TEST_WEDGE_TIMEOUT + 1.0)
+    _feed_liveness(supervisor, ctx, frozen)
+    supervisor.tick()
+    assert attempts == [expected_pid]
+
+    clock.advance(retry_seconds / 2)
+    supervisor.tick()
+    assert attempts == [expected_pid], "the retry limiter allowed a kill on every supervisor tick"
+
+    clock.advance(retry_seconds)
+    supervisor.tick()
+    assert attempts == [expected_pid, expected_pid], "the surviving wedged process was never targeted again"
+
+
 def test_repeated_wedges_are_bounded_by_the_restart_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """A worker that wedges, relaunches, and wedges again must not churn forever.
 

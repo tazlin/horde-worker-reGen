@@ -119,7 +119,7 @@ Several long-lived asyncio tasks are started by `HordeWorkerProcessManager._main
 | `_api_get_user_info_loop()`   | 15 s    | Fetch user/kudos info                                                                     |
 | `_periodic_update_check_loop()` | -     | Check for a newer worker release                                                          |
 | `ImageGenerationCoordinator.run()` | -  | Supervise the image `JobPopper` (1 s) and `JobSubmitter` (0.02 s) loops                   |
-| `AlchemyCoordinator.run()`    | 1 s     | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`; otherwise idle)     |
+| `AlchemyCoordinator.run()`    | 1 s     | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`; otherwise idle); API pops are bounded to 30 s so shutdown remains responsive |
 
 The two coordinator tasks are launched uniformly from the flow registry (`self._flows`, keyed by
 `WorkloadKind`). The image flow keeps the same per-loop shutdown supervision the popper and submitter

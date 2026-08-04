@@ -169,6 +169,15 @@ path and the dashboard projection fall back to this set. The yaml/legacy spellin
 the SDK enum value is ``post_process``.
 """
 
+ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS = 30.0
+"""Maximum time an alchemy pop may occupy its coordinator loop.
+
+The SDK session inherits aiohttp's much longer default request timeout. The coordinator is a gathered
+main-loop task, so allowing that default to govern shutdown can keep the whole worker alive after every
+child has already been reaped. Thirty seconds matches the image-generation pop bound and remains well above
+normal Horde API latency.
+"""
+
 
 def expand_offered_forms(
     bridge_data: reGenBridgeData,
@@ -772,10 +781,19 @@ class AlchemyCoordinator:
         )
 
         try:
-            pop_response = await self._api_sessions.require_horde_client_session().submit_request(
-                pop_request,
-                _AlchemyPopResponse,
+            pop_response = await asyncio.wait_for(
+                self._api_sessions.require_horde_client_session().submit_request(
+                    pop_request,
+                    _AlchemyPopResponse,
+                ),
+                timeout=ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS,
             )
+        except TimeoutError:
+            logger.warning(
+                f"Alchemy pop request timed out after {ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS:.0f} seconds",
+            )
+            self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
+            return
         except Exception as e:
             logger.warning(f"Failed to pop alchemy job (Unexpected Error): {e}")
             self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)

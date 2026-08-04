@@ -113,3 +113,17 @@ class TestEndReason:
         sessions = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))
         assert sessions[0].end_reason is SessionEndReason.KILLED_OR_CRASHED
         assert sessions[1].end_reason is SessionEndReason.STILL_RUNNING
+
+    def test_child_teardown_line_alone_is_not_a_clean_process_exit(self) -> None:
+        """The manager can reap every child while a gathered sibling still pins the worker process."""
+        log = (
+            "2026-06-24 18:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - "
+            "Setting up logger for main process\n"
+            "2026-06-24 18:00:10.000 | INFO  | "
+            "horde_worker_regen.process_management.process_manager:_process_control_loop:1 - "
+            "Shutting down process manager\n"
+        )
+
+        session = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))[0]
+
+        assert session.end_reason is SessionEndReason.STILL_RUNNING

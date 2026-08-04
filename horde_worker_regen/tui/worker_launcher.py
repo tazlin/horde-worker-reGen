@@ -96,6 +96,14 @@ still recovering a permanent wedge long before an operator would notice. A worke
 healthy stretch before wedging resets the restart budget like any other recovery, so a rare recurring
 wedge keeps being recovered while a rapid wedge-on-start loop still trips the budget and gives up."""
 
+WEDGE_KILL_RETRY_SECONDS = 10.0
+"""How often to retry the orphan-proof tree kill while a wedged worker remains alive.
+
+SIGKILL/TerminateProcess normally lands before the next supervisor tick. A process in an uninterruptible
+kernel/driver state may survive, however; one failed kill must not permanently disarm the only observer able
+to retry it. The retry is rate-limited to avoid issuing a tree walk and kill on every UI tick.
+"""
+
 _SUPERVISOR_STALL_RESET_SECONDS = 30.0
 """A gap this large between consecutive :meth:`WorkerSupervisor.tick` calls means the *supervisor itself*
 was frozen (the host slept/resumed, the process was descheduled under load, a debugger paused it), not the
@@ -325,6 +333,12 @@ class WorkerSupervisor:
         arrived, or a liveness frame carried a changed stamp). None until the worker first reports, which is
         the startup grace: a worker that has not yet sent a frame cannot be judged wedged. Drives the
         :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` backstop."""
+        self._last_wedge_kill_attempt_wall: float | None = None
+        """Parent wall-clock time of the most recent wedge tree-kill attempt for this worker incarnation.
+
+        Retained while the same frozen process remains alive so the attempt can be retried at
+        :data:`WEDGE_KILL_RETRY_SECONDS`; cleared by real loop progress or a lifecycle transition.
+        """
         self._last_tick_wall: float | None = None
         """Parent wall-clock time of the previous :meth:`tick`, used to spot a supervisor-side stall (see
         :data:`_SUPERVISOR_STALL_RESET_SECONDS`)."""
@@ -481,6 +495,7 @@ class WorkerSupervisor:
         self.latest_snapshot = None
         self.last_liveness_wall_time = None
         self._last_loop_advance_wall = None
+        self._last_wedge_kill_attempt_wall = None
 
     def _set_status(self, status: SupervisorStatus) -> None:
         """Update status and notify any observer on change.
@@ -533,6 +548,7 @@ class WorkerSupervisor:
 
         if loop_advanced:
             self._last_loop_advance_wall = time.time()
+            self._last_wedge_kill_attempt_wall = None
         if got_any_frame:
             self._note_frame_received()
         if snapshots:
@@ -700,17 +716,25 @@ class WorkerSupervisor:
             return
         if self._last_loop_advance_wall is None:
             return  # startup grace: the worker has not reported a single tick yet
-        staleness = time.time() - self._last_loop_advance_wall
+        now = time.time()
+        staleness = now - self._last_loop_advance_wall
         if staleness <= WEDGE_LIVENESS_TIMEOUT_SECONDS:
             return
-        logger.error(
-            f"Worker (pid={process.pid}) control loop has not advanced for {staleness:.0f}s "
-            f"(> {WEDGE_LIVENESS_TIMEOUT_SECONDS:.0f}s): alive but wedged. Force-killing its process tree; "
-            "it will be relaunched once the kill is observed.",
-        )
-        # Consume the baseline so this fires exactly once per wedge; detection re-arms only when the
-        # relaunched worker reports its first post-restart liveness frame.
-        self._last_loop_advance_wall = None
+        last_attempt = self._last_wedge_kill_attempt_wall
+        if last_attempt is not None and (now - last_attempt) < WEDGE_KILL_RETRY_SECONDS:
+            return
+        if last_attempt is None:
+            logger.error(
+                f"Worker (pid={process.pid}) control loop has not advanced for {staleness:.0f}s "
+                f"(> {WEDGE_LIVENESS_TIMEOUT_SECONDS:.0f}s): alive but wedged. Force-killing its process tree; "
+                "it will be relaunched once the kill is observed.",
+            )
+        else:
+            logger.warning(
+                f"Worker (pid={process.pid}) survived the prior wedge tree-kill attempt; retrying after "
+                f"{now - last_attempt:.0f}s.",
+            )
+        self._last_wedge_kill_attempt_wall = now
         self._force_kill_tree(process)
 
     def _terminate_if_graceful_stop_overran(self, process: BaseProcess) -> None:

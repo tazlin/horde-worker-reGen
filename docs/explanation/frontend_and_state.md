@@ -137,6 +137,13 @@ worker is alive and no cooperative stop is under way, a stamp that has not advan
 for `WEDGE_LIVENESS_TIMEOUT_SECONDS` (180 s) means the control loop is frozen: the
 tree is force-killed and the ordinary crash path relaunches it.
 
+A tree kill is normally visible as process death on the following tick. If the same
+PID survives (for example, while stuck in an uninterruptible kernel/driver state),
+the supervisor retries the orphan-proof tree kill every ten seconds. The attempt is
+rate-limited rather than one-shot: a failed kill cannot permanently disarm the only
+observer outside the wedged worker, but it also cannot trigger a process-tree walk on
+every UI tick. Real loop progress or a new worker incarnation clears the retry state.
+
 That measurement only holds while the supervisor is itself ticking. A gap of more
 than 30 s between two ticks is time it could not observe (the host slept, it was
 descheduled under load, a debugger paused it), so it moves the wedge baseline
