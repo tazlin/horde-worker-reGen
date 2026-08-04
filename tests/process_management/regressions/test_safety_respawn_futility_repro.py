@@ -5,7 +5,7 @@ child that dies on every start, indefinitely, while every signal that would esca
 
 1. Laundering. :meth:`ProcessLifecycleManager._replace_all_safety_process` skips the crash-loop record while
    either intentional-replacement flag is set. ``_safety_replacement_intentional_until_ready`` is cleared only
-   by :meth:`_clear_completed_intentional_safety_replacement`, which requires a *loaded* safety process. A
+   by :meth:`_observe_safety_pool_readiness`, which requires a *loaded* safety process. A
    child that dies while still ``PROCESS_STARTING`` never loads, so an intentional window opened by a
    whole-card pause never closes and every subsequent crash-driven rebuild is counted as part of the
    placement change. :attr:`ProcessLifecycleManager.safety_pool_failing` stays False for an unbounded
@@ -158,7 +158,7 @@ def _safety_child_reaches_readiness(lifecycle: ProcessLifecycleManager) -> None:
         state=HordeProcessState.WAITING_FOR_JOB,
         process_type=HordeProcessType.SAFETY,
     )
-    lifecycle._clear_completed_intentional_safety_replacement()
+    lifecycle._observe_safety_pool_readiness()
 
 
 def _hold_pop_gate(pm: HordeWorkerProcessManager, clock: _FakeClock, gate: str, held_seconds: float) -> None:

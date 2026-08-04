@@ -494,7 +494,7 @@ class TestWholeCardResidencyProtectsFromVramEviction:
 class TestInitialEstablishUsesWholeCardAwareShrink:
     """Initial whole-card establishment must use the same narrowed scale-down as convergence.
 
-    The convergence loop already passes ``whole_card_model`` so queued-model siblings behind the head do not
+    The convergence loop already passes ``protected_model`` so queued-model siblings behind the head do not
     pin the card above the residency target. The immediate establish path needs the same narrowing: it runs
     when the card is otherwise idle, so there is no later "live job drained" transition to rescue the head.
     """

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from loguru import logger
+
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadFailure,
@@ -18,11 +20,15 @@ _GB = 1024**3
 
 
 def _collector() -> tuple[Callable[..., None], list[str]]:
-    """Return a logging-function stand-in that records the lines it is given."""
+    """Return a logging-function stand-in that records the lines it is given.
+
+    Payloads the reporter cannot let a colorizer parse are passed as formatting arguments, so the stand-in
+    renders them the way the logger would; recording the bare template would hide the line's real content.
+    """
     lines: list[str] = []
 
-    def _record(message: str, *_args: object, **_kwargs: object) -> None:
-        lines.append(message)
+    def _record(message: str, *args: object, **kwargs: object) -> None:
+        lines.append(message.format(*args, **kwargs) if args or kwargs else message)
 
     return _record, lines
 
@@ -92,6 +98,39 @@ def test_print_downloads_renders_current_queue_and_failures() -> None:
     assert "Queued (1)" in blob
     assert "out of disk space" in blob
     assert "limit 5000 KB/s" in blob
+
+
+def test_print_downloads_survives_a_model_name_carrying_markup() -> None:
+    """A LoRA name containing HTML must not abort the downloads section under a colorizing logger.
+
+    Ad-hoc LoRA fetches name models with host-supplied titles, which can contain HTML. Colorized emission
+    parses its template for colour tags, so such a name must reach the logger as a formatting argument.
+    """
+    reporter = StatusReporter(0.0, 0.0)
+    emitted: list[str] = []
+    sink_id = logger.add(lambda m: emitted.append(m.record["message"]), level="INFO", colorize=True)
+    status = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        current=CurrentDownloadStatus(
+            model_name="<p>An Artist's LoRA</p>",
+            feature="lora",
+            target_dir="models/lora",
+            downloaded_bytes=_GB,
+            total_bytes=2 * _GB,
+        ),
+        pending=[DownloadItem(model_name="<b>Queued LoRA</b>", feature="lora", size_bytes=_GB)],
+        failures=[DownloadFailure(model_name="<i>Bad LoRA</i>", feature="lora", reason="404")],
+    )
+
+    try:
+        assert reporter._print_downloads(logger.opt(colors=True).info, status, None) is True
+    finally:
+        logger.remove(sink_id)
+
+    blob = "\n".join(emitted)
+    assert "<p>An Artist's LoRA</p>" in blob
+    assert "<b>Queued LoRA</b>" in blob
+    assert "<i>Bad LoRA</i>" in blob
 
 
 def test_print_downloads_renders_every_concurrent_transfer() -> None:

@@ -2511,7 +2511,7 @@ class ProcessLifecycleManager:
         target_count: int,
         *,
         device_index: int | None = None,
-        whole_card_model: str | None = None,
+        protected_model: str | None = None,
         pressure_shortfall_mb: float | None = None,
     ) -> int:
         """Grow or shrink the running inference processes toward ``target_count``.
@@ -2529,7 +2529,7 @@ class ProcessLifecycleManager:
                 lever a whole-card residency uses to reduce one card's live contexts on a multi-GPU host).
                 When None, the worker-wide pool, bounded by the launched-process ceiling (the single-GPU /
                 benchmark behaviour, unchanged).
-            whole_card_model: When set, this shrink is a whole-card residency collapsing to sole residency
+            protected_model: When set, this shrink is a whole-card residency collapsing to sole residency
                 for that model, so the usual "spare any process whose model is queued" protection is dropped:
                 whole-card residency means the heavy head owns the card and the queued siblings deliberately
                 wait (their models reload once the head drains, see
@@ -2574,8 +2574,8 @@ class ProcessLifecycleManager:
                 else:
                     logger.info(f"Scale-up deferred inference process {pid}")
         elif target < current:
-            if whole_card_model is not None:
-                disallowed = self._whole_card_protected_processes(whole_card_model, device_index)
+            if protected_model is not None:
+                disallowed = self._whole_card_protected_processes(protected_model, device_index)
             else:
                 disallowed = self.get_processes_with_model_for_queued_job()
                 if device_index is not None:
@@ -3081,7 +3081,7 @@ class ProcessLifecycleManager:
 
         The streak counts rebuilds since a safety process last reached readiness, so it measures a pool that
         cannot initialise at all rather than one that came up, served, and later died. It is reset by
-        :meth:`_clear_completed_intentional_safety_replacement` when readiness is observed. The backoff is
+        :meth:`_observe_safety_pool_readiness` when readiness is observed. The backoff is
         armed from the same streak so a pool failing repeatedly stops respawning at reap speed, while the
         first respawn after a lone crash stays immediate.
         """
@@ -3111,7 +3111,7 @@ class ProcessLifecycleManager:
         delay = SAFETY_RESPAWN_BACKOFF_BASE_SECONDS * (2 ** (self._safety_consecutive_start_failures - 2))
         return min(delay, SAFETY_RESPAWN_BACKOFF_MAX_SECONDS)
 
-    def _clear_completed_intentional_safety_replacement(self) -> None:
+    def _observe_safety_pool_readiness(self) -> None:
         """Observe safety-pool readiness and clear what an unready pool accumulates.
 
         Readiness is the one fact that ends both the intentional window's count suppression and the
@@ -4090,7 +4090,7 @@ class ProcessLifecycleManager:
             self._recently_recovered = False
 
         now = time.time()
-        self._clear_completed_intentional_safety_replacement()
+        self._observe_safety_pool_readiness()
         any_started_pending = self.drain_pending_gpu_starts() > 0
 
         # A live inference slot that has advanced past PROCESS_STARTING has proven it can initialise,

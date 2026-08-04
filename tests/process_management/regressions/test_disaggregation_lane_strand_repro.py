@@ -11,19 +11,25 @@ The specification here:
 * a borrowed service lane is returned once no post-processing job has been actively processed for a bounded
   idle window, even while jobs remain queued, so a stalled queue cannot hold a disaggregation lane hostage;
 * a reclaim-ladder lane pause that has outlived both responsible restore owners (a saturation episode and a PP
-  borrow receipt) is self-healed once the card has been HEALTHY, restoring disaggregation availability; and
+  borrow receipt) is self-healed once the card has been HEALTHY, restoring disaggregation availability;
+* the reclaim episode's other restore obligation, a live-context reduction, is self-healed on the same terms
+  when the card leaves saturation without ever returning HEALTHY, the one path on which the episode's own
+  unwind never runs; and
 * an enabled-but-unavailable disaggregation pipeline emits one edge-latched warning that re-arms on recovery.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 from loguru import logger
 
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommandKind
 from horde_worker_regen.process_management.workers import post_process_orchestrator as pp_orchestrator_module
 from tests.process_management.regressions.test_post_process_drain_context_reclaim_repro import (
@@ -161,6 +167,102 @@ async def test_backstop_waits_for_healthy_debounce(monkeypatch: pytest.MonkeyPat
     manager._healthy_since_by_device.pop(0, None)
     manager._reclaim_stranded_service_lane_pauses(0)
     assert manager._process_lifecycle.is_vae_lane_gpu_paused is True
+
+
+def _manager_with_a_stranded_context_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[HordeWorkerProcessManager, list[int]]:
+    """A live-shaped manager whose pool a reclaim reduction shrank, plus the list of regrowth targets asked for.
+
+    The reduction is booked exactly as the admission path books it (an episode restore obligation) and one idle
+    inference context is retired, so the card is left serving at emergency depth. Process spawning is not
+    available in-process, so the regrowth actuator's lifecycle call is stood in for by a recorder that mirrors
+    the real synchronous map update, keeping the pool-count assertions on observed state.
+    """
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    card_runtimes = manager._inference_scheduler._card_runtimes
+    card_runtimes[0] = replace(card_runtimes[0], target_process_count=2)
+    assert manager._process_map.num_loaded_inference_processes(device_index=0) == 2
+
+    manager._reclaim_ladder.record_context_reduction(0)
+    del manager._process_map[5]
+
+    requested_targets: list[int] = []
+
+    def _scale(target_count: int, *, device_index: int | None = None, **_kwargs: object) -> int:
+        requested_targets.append(target_count)
+        while manager._process_map.num_loaded_inference_processes(device_index=device_index) < target_count:
+            manager._process_map[5] = _live_process(5, HordeProcessType.INFERENCE, reserved_mb=1_362)
+        return manager._process_map.num_loaded_inference_processes(device_index=device_index)
+
+    manager._process_lifecycle.scale_inference_processes = _scale  # type: ignore[method-assign]
+    return manager, requested_targets
+
+
+async def test_stranded_context_reduction_regrows_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reduction on a card that leaves saturation without ever returning HEALTHY is regrown by the backstop."""
+    manager, requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
+
+    # The card never returns HEALTHY, so the reclaim episode's own LIFO unwind never runs and the obligation
+    # stays booked: without a backstop the pool is shrunk for the rest of the session.
+    assert 0 not in manager._healthy_since_by_device
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    manager._context_reduction_stranded_since_by_device[0] -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
+    manager._restore_stranded_context_reductions(0, saturated=False)
+
+    assert requested_targets == [2]
+    assert manager._process_map.num_loaded_inference_processes(device_index=0) == 2, (
+        "a live-context reduction whose card never returned HEALTHY left the inference pool at emergency depth "
+        "with no owner to grow it back"
+    )
+    assert manager._reclaim_ladder.has_context_reduction(0) is False, (
+        "the discharged obligation must not have a second restore run against it"
+    )
+
+
+async def test_stranded_context_reduction_waits_for_the_backstop_debounce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Below the debounce, and while the card is still saturated, the pool is left where the reclaim put it."""
+    manager, requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
+
+    # First observation only arms the clock.
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    assert requested_targets == []
+    assert manager._process_map.num_loaded_inference_processes(device_index=0) == 1
+
+    # A card the ladder is still reclaiming keeps the contexts it took, and re-saturating restarts the clock, so
+    # the elapsed time accrued while winding down cannot carry over into the next episode.
+    manager._context_reduction_stranded_since_by_device[0] -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
+    manager._restore_stranded_context_reductions(0, saturated=True)
+    assert requested_targets == []
+    assert 0 not in manager._context_reduction_stranded_since_by_device
+
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    assert requested_targets == []
+    assert manager._process_map.num_loaded_inference_processes(device_index=0) == 1
+
+
+async def test_stranded_context_reduction_stands_down_under_a_whole_card_residency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a whole-card residency owns the pool the backstop defers to it and keeps the obligation booked."""
+    manager, requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
+    manager._inference_scheduler._whole_card_ledger.any_held = Mock(return_value=True)  # type: ignore[method-assign]
+
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    manager._context_reduction_stranded_since_by_device[0] -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
+    manager._restore_stranded_context_reductions(0, saturated=False)
+
+    assert requested_targets == []
+    assert manager._reclaim_ladder.has_context_reduction(0) is True, (
+        "the residency's own restore owns the regrowth while it is held; the obligation must survive so the "
+        "backstop can retry once the residency releases"
+    )
+
+    # Residency released: the retained obligation is what lets the retry succeed.
+    manager._inference_scheduler._whole_card_ledger.any_held = Mock(return_value=False)  # type: ignore[method-assign]
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    assert manager._process_map.num_loaded_inference_processes(device_index=0) == 2
 
 
 def test_disaggregation_silence_breaker_edge_latches_and_rearms(monkeypatch: pytest.MonkeyPatch) -> None:

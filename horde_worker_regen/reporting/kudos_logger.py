@@ -24,10 +24,10 @@ class KudosLogger:
             user_info: The user information from the API.
             limited_console_messages: Whether to use limited console messages (success level).
         """
-        log_function = logger.opt(ansi=True).info
+        log_function = logger.opt(colors=True).info
 
         if limited_console_messages:
-            log_function = logger.opt(ansi=True).success
+            log_function = logger.opt(colors=True).success
 
         if kudos_generated_this_session > 0:
             log_function(
@@ -35,11 +35,14 @@ class KudosLogger:
             )
 
         if user_info is not None and user_info.kudos_details is not None:
+            # The username is a formatting argument: it is server-supplied, and a colorized emission parses
+            # only its template for colour tags, so a name containing markup cannot abort the line.
             log_function(
                 "<fg #7dcea0>"
                 f"Total Kudos Accumulated: {user_info.kudos_details.accumulated:,.2f} "
-                f"(all workers for {user_info.username})"
+                "(all workers for {})"
                 "</>",
+                user_info.username,
             )
             if user_info.kudos_details.accumulated is not None and user_info.kudos_details.accumulated < 0:
                 log_function(

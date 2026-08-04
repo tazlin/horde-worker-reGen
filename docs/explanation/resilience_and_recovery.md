@@ -875,6 +875,15 @@ diagnostics dump) and optionally mirrors each event to a size-rotated JSONL file
 **never raises**: a file IO error degrades to in-memory only, so auditing cannot
 itself wedge the worker. (Mirroring is disabled under `AI_HORDE_TESTING`.)
 
+That degrade is a **cooldown, not a latch**. A failed write pauses the mirror for
+a bounded interval and the next event after it lapses retries the file, so a
+transient fault (a full disk, a briefly locked file) costs the events inside the
+outage rather than every event for the rest of the run. The worker logs the pause
+once when it starts, and logs on recovery how many events were held in memory
+only, so the gap in the file reads as an outage instead of as a period in which
+the worker did nothing. Readers of the file (`horde-log`, the support bundle)
+skip a line torn by a mid-write crash and keep every whole record around it.
+
 ## The owned-PID registry
 
 [`OwnedProcessRegistry`][horde_worker_regen.process_management.lifecycle.owned_process_registry.OwnedProcessRegistry]

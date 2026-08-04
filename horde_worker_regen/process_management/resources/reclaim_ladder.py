@@ -533,6 +533,33 @@ class VerifiedReclaimLadder:
             return False
         return any(isinstance(obligation, ContextReduction) for obligation in episode.restore_obligations)
 
+    def discharge_context_reduction(self, device_index: int | None) -> bool:
+        """Drop an outstanding live-context reduction on ``device_index`` because the pool was already regrown.
+
+        The obligation records a debt; it is not the debt itself. When a caller outside the episode's own LIFO
+        unwind has regrown the pool the reduction shrank, leaving the record in place would have that caller
+        act again on every later observation and have a subsequent unwind regrow a pool that is no longer
+        shrunk. Discharging it keeps exactly one regrowth per reduction. A lane pause needs no equivalent
+        because the lifecycle's own pause state is what a second restore attempt reads.
+
+        Args:
+            device_index: The card whose reduction is discharged; ``None`` is the card-agnostic worker-wide
+                (single-GPU) scope.
+
+        Returns:
+            True when an outstanding reduction was removed.
+        """
+        episode = self._episodes.get(device_index)
+        if episode is None:
+            return False
+        remaining = [
+            obligation for obligation in episode.restore_obligations if not isinstance(obligation, ContextReduction)
+        ]
+        if len(remaining) == len(episode.restore_obligations):
+            return False
+        episode.restore_obligations[:] = remaining
+        return True
+
     def is_saturation_unresolved(self, device_index: int) -> bool:
         """Whether ``device_index``'s current SATURATED episode exhausted the ladder without relieving it."""
         episode = self._episodes.get(device_index)

@@ -20,7 +20,7 @@ progressively longer with no dispatch until the recovery supervisor broke the we
 lapsed, soft-resetting the pools, faulting the Flux job, and forcing process recoveries.
 
 The fix: ``_converge_whole_card_residency`` now tells the scale-down it is a whole-card collapse by passing
-``whole_card_model``, which narrows the teardown-exclusion set to spare only the head's holder (and other
+``protected_model``, which narrows the teardown-exclusion set to spare only the head's holder (and other
 cards), not every idle queued-model sibling. Whole-card residency means the heavy head owns the card's
 sampling and the queued siblings beyond the budget target deliberately wait; their jobs reload once the head
 drains. Busy processes are still never torn down.
@@ -161,7 +161,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
     """``scale_inference_processes`` toward the whole-card target, at the lifecycle seam (no scheduler/forecast).
 
     Two live processes, one holding the pre-staged whole-card head, one idle holding a model that is still
-    queued behind the head. The whole-card-aware shrink (``whole_card_model=...``) must reach the target of
+    queued behind the head. The whole-card-aware shrink (``protected_model=...``) must reach the target of
     one process by stopping that idle sibling; the *default* shrink must still protect it (the narrowing is
     convergence-only). Busy siblings are never the victim either way.
     """
@@ -201,7 +201,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
         await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL, width=1216, height=1216))
         await track_popped_job_async(job_tracker, make_job_pop_response(_RESIDENT_SDXL))
 
-        remaining = plm.scale_inference_processes(1, device_index=None, whole_card_model=_FLUX_MODEL)
+        remaining = plm.scale_inference_processes(1, device_index=None, protected_model=_FLUX_MODEL)
 
         assert remaining == 1, (
             "the whole-card head must reach sole residency; the idle SDXL sibling holding a queued model "
@@ -211,7 +211,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
     async def test_default_shrink_still_protects_queued_sibling_model(self) -> None:
         """Companion: the *default* (non-whole-card) shrink must still protect a queued-model sibling.
 
-        The convergence narrowing is scoped to ``whole_card_model``; the benchmark / RAM-pressure shrink must
+        The convergence narrowing is scoped to ``protected_model``; the benchmark / RAM-pressure shrink must
         keep its queued-model protection so it never tears down a process whose model a queued job needs. This
         pins that the narrowing did not leak into the default path.
         """
@@ -313,7 +313,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
         sdxl_job = await track_popped_job_async(job_tracker, make_job_pop_response(_RESIDENT_SDXL))
         await job_tracker.mark_inference_started(sdxl_job)
 
-        remaining = plm.scale_inference_processes(1, device_index=None, whole_card_model=_FLUX_MODEL)
+        remaining = plm.scale_inference_processes(1, device_index=None, protected_model=_FLUX_MODEL)
 
         assert remaining == 1
 
@@ -347,7 +347,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
         for model in (_FLUX_MODEL, _RESIDENT_SDXL, _OTHER_SDXL, _THIRD_SDXL):
             await track_popped_job_async(job_tracker, make_job_pop_response(model, width=1216, height=1216))
 
-        remaining = plm.scale_inference_processes(1, device_index=None, whole_card_model=_FLUX_MODEL)
+        remaining = plm.scale_inference_processes(1, device_index=None, protected_model=_FLUX_MODEL)
 
         assert remaining == 1
 

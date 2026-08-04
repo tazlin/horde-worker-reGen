@@ -719,8 +719,10 @@ class AlchemyCoordinator:
         self._form_time_popped[spec.form_id] = time.time()
         self._form_resolution[spec.form_id] = self._decode_image_resolution(spec.source_image_bytes)
         self._pending_forms.append(spec)
-        logger.opt(ansi=True).info(
-            f"<fg #34c0eb>Popped canned alchemy form {spec.form_id} ({spec.form})</>",
+        logger.opt(colors=True).info(
+            "<fg #34c0eb>Popped canned alchemy form {} ({})</>",
+            spec.form_id,
+            spec.form,
         )
 
     def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
@@ -833,8 +835,10 @@ class AlchemyCoordinator:
             self._form_time_popped[spec.form_id] = time.time()
             self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_bytes)
             self._pending_forms.append(spec)
-            logger.opt(ansi=True).info(
-                f"<fg #34c0eb>Popped alchemy form {spec.form_id} ({spec.form})</>",
+            logger.opt(colors=True).info(
+                "<fg #34c0eb>Popped alchemy form {} ({})</>",
+                spec.form_id,
+                spec.form,
             )
 
     # endregion
@@ -1066,9 +1070,11 @@ class AlchemyCoordinator:
             return
 
         time_taken = round(time.time() - submit.time_popped, 2)
-        logger.opt(ansi=True).success(
-            f"Submitted alchemy form {submit.form_id[:8]} (<u>{submit.result_message.form}</u>) "
+        logger.opt(colors=True).success(
+            "Submitted alchemy form {} (<u>{}</u>) "
             f"for {response.reward:,.2f} kudos. Form popped {time_taken} seconds ago.",
+            submit.form_id[:8],
+            submit.result_message.form,
         )
         submit_time = time.time()
         self._state.note_first_kudos_event(submit_time)
@@ -1094,9 +1100,10 @@ class AlchemyCoordinator:
             self.num_forms_submitted += 1
             submit.succeed(0)
             time_taken = round(time.time() - submit.time_popped, 2)
-            logger.opt(ansi=True).success(
-                f"Completed canned alchemy form {submit.form_id[:8]} (<u>{submit.result_message.form}</u>) "
-                f"in {time_taken} seconds.",
+            logger.opt(colors=True).success(
+                f"Completed canned alchemy form {{}} (<u>{{}}</u>) in {time_taken} seconds.",
+                submit.form_id[:8],
+                submit.result_message.form,
             )
             self._record_form_metrics(submit, faulted=False)
         else:

@@ -404,7 +404,7 @@ class TestWholeCardSiblingTeardown:
         # Flux needs the whole card: teardown all the way down to one inference process. The shrink is tagged
         # with the whole-card model so it spares that head's holder (and stops queued-model siblings).
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(
-            1, device_index=None, whole_card_model=_FLUX_MODEL
+            1, device_index=None, protected_model=_FLUX_MODEL
         )
         assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
 

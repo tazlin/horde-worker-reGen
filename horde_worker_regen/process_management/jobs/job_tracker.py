@@ -2173,12 +2173,13 @@ class JobTracker:
                 candidate_mb=tracked.measured_attempt_candidate_mb,
             )
             if newly_armed:
-                logger.opt(ansi=True).warning(
-                    f"<fg #f0beff>VRAM: a real measured load of {faulted_job.model} "
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>VRAM: a real measured load of {} "
                     f"({tracked.measured_attempt_candidate_mb:.0f} MB) failed with a resource fault on an empty "
                     "card; holding the model (not offering it) while other processes hold that VRAM, and "
                     "faulting this job for reissue. The hold frees automatically once that VRAM is released "
                     "(close other GPU apps), or you can remove the model from this worker's config.</>",
+                    faulted_job.model,
                 )
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):

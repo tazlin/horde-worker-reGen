@@ -423,14 +423,18 @@ class JobSubmitter:
 
         # If the job was not faulted, log the job submission as a success
         if new_submit.completed_job_info.state != GENERATION_STATE.faulted:
-            logger.opt(ansi=True).success(
-                f"Submitted generation {str(new_submit.job_id)[:8]} (model: "
-                f"<u>{new_submit.completed_job_info.sdk_api_job_info.model})</u> "
+            # The job id and model name are formatting arguments: they are server-supplied, and a colorized
+            # emission parses only its template for colour tags, so neither can be read as a directive.
+            logger.opt(colors=True).success(
+                "Submitted generation {} (model: "
+                "<u>{})</u> "
                 f"for {job_submit_response.reward:,.2f} "
                 f"kudos. Job popped {time_taken} seconds ago "
                 f"and took {new_submit.completed_job_info.time_to_generate:.2f} "
                 f"to generate. ({kudos_per_second * new_submit.batch_count:.2f} "
                 "kudos/second for the whole batch. 0.4 or greater is ideal)",
+                str(new_submit.job_id)[:8],
+                new_submit.completed_job_info.sdk_api_job_info.model,
             )
             # If slower than 0.4 kudos per second, log a warning
             if (kudos_per_second * new_submit.batch_count) < 0.4:

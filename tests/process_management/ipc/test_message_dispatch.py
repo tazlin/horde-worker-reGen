@@ -839,6 +839,64 @@ class TestHandleModelStateChange:
 
         process_manageron_model_load_state_change.assert_not_called()
 
+    def test_on_disk_model_name_carrying_markup_still_logs(self) -> None:
+        """An ON_DISK name containing HTML logs verbatim instead of aborting the line as a colour directive.
+
+        A download process reports auxiliary models here under names supplied by the model host, and a LoRA
+        title can contain HTML. Colourized emission parses its template for colour tags, so a name spliced
+        into that template raises and the line (plus everything the operator would learn from it) is lost.
+        """
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: make_mock_process_info(0)}))
+
+        with _capture_colorized() as records:
+            message_dispatcher._handle_model_state_change(
+                Mock(
+                    horde_model_name="<p>An Artist's LoRA</p>",
+                    horde_model_state=ModelLoadState.ON_DISK,
+                    process_id=0,
+                    time_elapsed=None,
+                    info="download status: complete",
+                ),
+            )
+
+        assert any("<p>An Artist's LoRA</p>" in message for message in records)
+
+    def test_loaded_in_ram_model_name_carrying_markup_still_logs(self) -> None:
+        """The same holds for the RAM-load line, which names the model on the same untrusted footing."""
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: make_mock_process_info(0)}))
+
+        with _capture_colorized() as records:
+            message_dispatcher._handle_model_state_change(
+                Mock(
+                    horde_model_name="<p>An Artist's LoRA</p>",
+                    horde_model_state=ModelLoadState.LOADED_IN_RAM,
+                    process_id=0,
+                    time_elapsed=2.5,
+                    info="loaded",
+                ),
+            )
+
+        assert any("<p>An Artist's LoRA</p>" in message for message in records)
+
+
+@contextmanager
+def _capture_colorized() -> Iterator[list[str]]:
+    """Capture messages emitted inside the block through a colourizing sink.
+
+    The colourized sink stands in for the operator's terminal: it is the configuration under which loguru
+    parses colour markup, so a test asserting untrusted text survives emission must run against one.
+    """
+    records: list[str] = []
+    handler_id = logger.add(
+        lambda m: records.append(m.record["message"]),
+        level="TRACE",
+        colorize=True,
+    )
+    try:
+        yield records
+    finally:
+        logger.remove(handler_id)
+
 
 @contextmanager
 def _capture_levels() -> Iterator[list[tuple[str, str]]]:

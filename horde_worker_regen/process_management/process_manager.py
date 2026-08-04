@@ -1503,6 +1503,10 @@ class HordeWorkerProcessManager:
         # currently HEALTHY. The stranded-lane self-heal backstop reads its duration: a reclaim-ladder lane
         # pause with no live claimant is only restored once the card has been debounced-HEALTHY this long.
         self._healthy_since_by_device: dict[int, float] = {}
+        # Monotonic time each card first held an unwound-nowhere live-context reduction while no longer
+        # SATURATED, or absent when there is none. The stranded-reduction backstop reads its duration: a pool a
+        # reclaim reduction shrank is only regrown from outside the episode once that has held this long.
+        self._context_reduction_stranded_since_by_device: dict[int, float] = {}
         # Silence-breaker for disaggregation routing: the monotonic instant disaggregation last became
         # continuously unavailable (roles not live) while enabled, and whether that outage has already been
         # warned. The edge-latched warning fires once per outage and re-arms when routing returns.
@@ -2769,9 +2773,10 @@ class HordeWorkerProcessManager:
                 "in a re-routable stage (it may have already completed or faulted).",
             )
             return
-        logger.opt(ansi=True).warning(
-            f"<fg #f0beff>Job {str(sdk_job.id_)[:8]} re-routed to the monolithic inference path after its "
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>Job {} re-routed to the monolithic inference path after its "
             "disaggregated stage could not clear device pressure within the defer window.</>",
+            str(sdk_job.id_)[:8],
         )
 
     def _disaggregation_class_eligible(self, sdk_job: ImageGenerateJobPopResponse) -> bool:
@@ -3421,6 +3426,11 @@ class HordeWorkerProcessManager:
             # holding the lane off can no longer be justified by pressure.
             self._reclaim_stranded_service_lane_pauses(device_index)
 
+            # The same defence for the other restore obligation an episode can hold: regrow an inference pool a
+            # reclaim reduction shrank when the card left saturation without ever returning HEALTHY, which is
+            # the one path on which the episode's own unwind never runs.
+            self._restore_stranded_context_reductions(device_index, saturated=saturated)
+
             # The reclaim episode as a coalesced decision: while a card is saturated the recorder emits one
             # opening record plus bounded heartbeats, and one resolving record when the card recovers, rather
             # than one per governed tick. NO_OP on a card that was never saturated is dropped by the recorder.
@@ -3507,6 +3517,46 @@ class HordeWorkerProcessManager:
                 "it, but no saturation episode still claims it and the card has been healthy.",
             )
             scheduler.restore_post_process_lane(device_index)
+
+    def _restore_stranded_context_reductions(self, device_index: int, *, saturated: bool) -> None:
+        """Regrow an inference pool a reclaim reduction shrank once its restore owner can no longer run.
+
+        A live-context reduction is booked as a reclaim-episode restore obligation whose single responsible
+        unwind is that episode's LIFO restore when the governor calls the card HEALTHY. A card that leaves
+        saturation but settles below the soft floor never reaches that unwind, so the pool stays at emergency
+        depth for the rest of the session and the worker serves at reduced concurrency long after the pressure
+        that bought the reduction is gone.
+
+        This closes that gap on the stranded-lane backstop's terms. It arms only while the card is no longer
+        SATURATED, since a card the ladder is still working keeps the contexts it reclaimed, and acts once that
+        has held for :attr:`_STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS`, so a card that dips and re-saturates never
+        regrows underneath the ladder. Regrowth goes through the same actuator the unwind uses, which stands
+        down while a whole-card residency owns the pool, and the obligation is discharged only when that
+        actuator reports it acted, so a stood-down card is retried on later ticks rather than left shrunk.
+
+        Args:
+            device_index: The card this governor tick is for.
+            saturated: Whether the ladder still counts the card as saturated this tick.
+        """
+        keys: tuple[int | None, ...] = (device_index, None)
+        outstanding = [key for key in keys if self._reclaim_ladder.has_context_reduction(key)]
+        if saturated or not outstanding:
+            self._context_reduction_stranded_since_by_device.pop(device_index, None)
+            return
+
+        stranded_since = self._context_reduction_stranded_since_by_device.setdefault(device_index, time.monotonic())
+        if (time.monotonic() - stranded_since) < self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS:
+            return
+
+        for key in outstanding:
+            if not self._inference_scheduler.restore_live_contexts(key):
+                continue
+            self._reclaim_ladder.discharge_context_reduction(key)
+            logger.warning(
+                f"Regrew the inference pool a reclaim reduction shrank on device {device_index}: the card left "
+                "saturation without returning healthy, so the reclaim episode's own restore never ran. The "
+                "worker served at reduced concurrency for as long as the pool stayed shrunk.",
+            )
 
     def latest_device_free_mb(self, device_index: int = 0) -> float | None:
         """Return the last NVML device-level free VRAM (MB) the governor sampled for a card (calibration)."""

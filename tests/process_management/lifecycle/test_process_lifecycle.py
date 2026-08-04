@@ -1293,7 +1293,7 @@ def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
         state=HordeProcessState.WAITING_FOR_JOB,
         process_type=HordeProcessType.SAFETY,
     )
-    plm._clear_completed_intentional_safety_replacement()
+    plm._observe_safety_pool_readiness()
     assert plm._safety_replacement_intentional_until_ready is False
     plm._process_map.clear()
 

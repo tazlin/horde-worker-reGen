@@ -13,10 +13,18 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 
 
-def _collector() -> tuple[Callable[[str], None], list[str]]:
-    """Return a logging stand-in and the lines it records."""
+def _collector() -> tuple[Callable[..., None], list[str]]:
+    """Return a logging stand-in and the lines it records.
+
+    Payloads the reporter cannot let a colorizer parse are passed as formatting arguments, so the stand-in
+    renders them the way the logger would; recording the bare template would hide the line's real content.
+    """
     lines: list[str] = []
-    return lines.append, lines
+
+    def _record(message: str, *args: object, **kwargs: object) -> None:
+        lines.append(message.format(*args, **kwargs) if args or kwargs else message)
+
+    return _record, lines
 
 
 def test_disabled_pool_names_normal_advertising_behavior() -> None:

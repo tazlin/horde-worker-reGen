@@ -79,6 +79,17 @@ conservative self-heal backstop in the governor tick reclaims any reclaim-ladder
 both owners (no live episode, no borrow receipt) once the card has been debounced-`HEALTHY`, so a lost claimant
 can never strand a lane off the GPU indefinitely.
 
+A live-context reduction is the episode's other restore obligation, and it strands differently. Its only
+responsible restore is that same LIFO unwind, which runs on `HEALTHY`; a card that leaves saturation but settles
+below the soft floor never reaches it, so the pool stays at emergency depth and the worker serves at reduced
+concurrency long after the pressure that bought the reduction. A second backstop in the governor tick closes
+that: while the card is no longer `SATURATED` and an episode still owes a reduction, it regrows the pool through
+the same actuator the unwind uses once that has held for the same debounce interval. It arms only off
+saturation, so a card the ladder is still working keeps the contexts it reclaimed and a card that dips and
+re-saturates restarts the clock. The actuator stands down while a whole-card residency owns the pool (that
+residency's own restore owns the regrowth), and the obligation is discharged only when the actuator reports it
+acted, so a stood-down card is retried rather than left shrunk.
+
 The VAE-lane pause carries one further eligibility rule the arbiter's idle-target guarantee cannot express.
 The arbiter only names a lane whose process is idle this instant, but an idle VAE lane may still have imminent
 work: the disaggregation orchestrator holds jobs at the decode stage whose sampling already finished and whose

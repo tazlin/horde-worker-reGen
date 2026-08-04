@@ -2026,13 +2026,16 @@ class JobPopper:
             )
             > 0
         )
-        logger.opt(ansi=True).info(
+        logger.opt(colors=True).info(
             "<fg #a200ff>"
-            f"Popped job {job_pop_response.id_} "
+            "Popped job {} "
             f"({get_single_job_magnitude(job_pop_response)} eMPS) "
-            f"(model: {job_pop_response.model}, batch: {job_pop_response.payload.n_iter}, "
+            "(model: {}, "
+            f"batch: {job_pop_response.payload.n_iter}, "
             f"loras: {has_loras}, post_processing: {has_post_processing})"
             "</>",
+            job_pop_response.id_,
+            job_pop_response.model,
         )
 
         job_pop_response = self._apply_sdk_workarounds(job_pop_response)

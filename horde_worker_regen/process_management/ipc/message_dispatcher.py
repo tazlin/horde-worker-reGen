@@ -982,8 +982,10 @@ class MessageDispatcher:
             message.process_state == HordeProcessState.UNLOADED_MODEL_FROM_RAM
             and self._process_map[message.process_id].last_process_state != HordeProcessState.UNLOADED_MODEL_FROM_RAM
         ):
-            logger.opt(ansi=True).info(
-                f"<fg #7b7d7d>Process {message.process_id} cleared RAM: {message.info}</>",
+            logger.opt(colors=True).info(
+                "<fg #7b7d7d>Process {} cleared RAM: {}</>",
+                message.process_id,
+                message.info,
             )
             self._process_map.on_model_ram_clear(process_id=message.process_id)
 
@@ -1155,12 +1157,18 @@ class MessageDispatcher:
                     if message.time_elapsed is not None:
                         loaded_message += f"Loading took {message.time_elapsed:.2f} seconds."
 
-                    logger.opt(ansi=True).info(f"<fg #7b7d7d>{loaded_message}</>")
+                    logger.opt(colors=True).info("<fg #7b7d7d>{}</>", loaded_message)
 
         else:
             # FIXME this message is wrong for download processes
-            logger.opt(ansi=True).info(
-                f"<fg #7b7d7d>Process {message.process_id} unloaded model {message.horde_model_name}</>",
+            # The name is passed as a formatting argument rather than interpolated into the template: a
+            # download process reports auxiliary models here under names that come from the model host (a
+            # LoRA title may contain HTML), and loguru parses only the template for colour tags, so a name
+            # like "<p>" cannot be read as a colour directive and abort the emission.
+            logger.opt(colors=True).info(
+                "<fg #7b7d7d>Process {} unloaded model {}</>",
+                message.process_id,
+                message.horde_model_name,
             )
 
     async def handle_synthetic_inference_result(self, message: HordeInferenceResultMessage) -> None:
@@ -1247,16 +1255,20 @@ class MessageDispatcher:
 
         if message.time_elapsed is not None:
             inference_duration_histogram.record(message.time_elapsed)
-            inference_finished_string = (
+            # The model name and the child's free-form info are formatting arguments, not template text, so
+            # colour-tag parsing never sees a value the parent did not author.
+            logger.opt(colors=True).info(
                 "\0<fg #da9dff>"
-                f"Inference finished for job {str(message.sdk_api_job_info.id_)[:8]} "
-                f"<u>({message.sdk_api_job_info.model})</u> on process {message.process_id}. "
-                f"It took {round(message.time_elapsed, 2)} seconds, finishing at {message.info} "
-                f"and reported {message.faults_count} faults."
-                "</>"
+                "Inference finished for job {} <u>({})</u> on process {}. "
+                "It took {} seconds, finishing at {} and reported {} faults."
+                "</>",
+                str(message.sdk_api_job_info.id_)[:8],
+                message.sdk_api_job_info.model,
+                message.process_id,
+                round(message.time_elapsed, 2),
+                message.info,
+                message.faults_count,
             )
-
-            logger.opt(ansi=True).info(inference_finished_string)
 
         else:
             logger.info(f"Inference finished for job {message.sdk_api_job_info.id_}")

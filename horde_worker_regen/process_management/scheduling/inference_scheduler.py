@@ -1291,11 +1291,13 @@ class InferenceScheduler:
         """
         exclusive = self._job_tracker.is_admitted_exclusive(job)
         fault_count = self._job_tracker.get_model_overbudget_fault_count(job.model)
-        logger.opt(ansi=True).warning(
-            f"<fg #f0beff>VRAM budget cannot fit head-of-queue model {job.model} even after reclaiming all idle "
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>VRAM budget cannot fit head-of-queue model {} even after reclaiming all idle "
             f"VRAM/RAM, but it physically fits measured device-free VRAM; admitting it "
             f"({'exclusive' if exclusive else 'shared'}, prior_overbudget_faults={fault_count}) rather than "
-            f"wedging the queue. {self._process_map.residency_snapshot()}</>",
+            "wedging the queue. {}</>",
+            job.model,
+            self._process_map.residency_snapshot(),
         )
 
     def _mark_overbudget_admit(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast | None) -> None:
@@ -1541,11 +1543,13 @@ class InferenceScheduler:
         weights = forecast.weights_mb
         total = forecast.total_vram_mb
         share = f"{(weights / total) * 100:.0f}%" if weights is not None and total else "unknown"
-        logger.opt(ansi=True).info(
-            f"<fg #7b7d7d>Declined a whole-card residency for {job.model}: its weights (~{weights or 0:.0f}MB, "
+        logger.opt(colors=True).info(
+            "<fg #7b7d7d>Declined a whole-card residency for {}: "
+            f"its weights (~{weights or 0:.0f}MB, "
             f"{share} of the {total or 0:.0f}MB card) do not dominate the device and the per-context overhead is "
             f"unmeasured (using the conservative first-context fallback), so a teardown demand cannot be trusted. "
             f"Serving it co-resident via model eviction instead of reserving the card.</>",
+            job.model,
         )
 
     def _residency_state(self, device_index: int | None) -> WholeCardResidency:
@@ -2219,7 +2223,7 @@ class InferenceScheduler:
             after = self._process_lifecycle.scale_inference_processes(
                 target,
                 device_index=device_index,
-                whole_card_model=job.model,
+                protected_model=job.model,
             )
 
         safety_paused = self._pause_safety_for_residency_if_idle(device_index)
@@ -2245,12 +2249,14 @@ class InferenceScheduler:
             safety_note = " and moving safety off-GPU" if safety_paused else ""
             total_mb = forecast.total_vram_mb
             card_phrase = f"the whole ~{total_mb / 1024:.0f}GB card" if total_mb else "nearly the whole card"
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>Whole-card residency: reserving the device for {job.model} "
+            logger.opt(colors=True).warning(
+                "<fg #f0beff>Whole-card residency: reserving the device for {} "
                 f"(inference processes {current} -> {after} of {self._max_inference_processes}, target "
                 f"{target}){safety_note}. Its weights + activations need {card_phrase}; co-resident "
                 f"siblings/safety would force the driver to stream activations to host RAM and run several "
-                f"times slower. {self._process_map.residency_snapshot()}</>",
+                "times slower. {}</>",
+                job.model,
+                self._process_map.residency_snapshot(),
             )
 
     def _should_prestage_whole_card_head(
@@ -2354,12 +2360,14 @@ class InferenceScheduler:
             refresh_established=announce,
         )
         if announce:
-            logger.opt(ansi=True).info(
-                f"<fg #f0beff>Pre-staging whole-card head {job.model} into a spare process's RAM while the "
+            logger.opt(colors=True).info(
+                "<fg #f0beff>Pre-staging whole-card head {} into a spare process's RAM while the "
                 f"in-flight job finishes; the device will be reserved for it (idle siblings stopped"
                 f"{' and safety moved off-GPU' if self._residency_should_pause_safety(device_index) else ''}) "
                 f"once it frees, so its weights are loaded before it samples instead of after. "
-                f"{self._process_map.residency_snapshot()}</>",
+                "{}</>",
+                job.model,
+                self._process_map.residency_snapshot(),
             )
 
     def _converge_whole_card_residency(self) -> None:
@@ -2369,7 +2377,7 @@ class InferenceScheduler:
         the device is claimed (see :meth:`_begin_whole_card_residency`); stopping idle siblings before the head
         is actually resident on a process could kill the very spare the pre-stage wants to use, so this waits
         until the head is resident or loading on a process. From then on the scale-down is told this is a
-        whole-card collapse (``whole_card_model``), so it spares only that head's holder and stops the *other*
+        whole-card collapse (``protected_model``), so it spares only that head's holder and stops the *other*
         idle siblings, including ones holding a model still queued behind the head, which the generic
         scale-down guard would otherwise protect and thereby pin the count above the target forever. Those
         queued jobs wait and reload once the head drains (see :meth:`_restore_siblings_after_whole_card`).
@@ -2388,7 +2396,7 @@ class InferenceScheduler:
                 self._process_lifecycle.scale_inference_processes(
                     target,
                     device_index=device_index,
-                    whole_card_model=model,
+                    protected_model=model,
                 )
             self._pause_safety_for_residency_if_idle(device_index)
             if forecast is not None:
@@ -2815,10 +2823,11 @@ class InferenceScheduler:
             post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
             vae_lane_note = " and restarting the VAE lane" if vae_lane_restored else ""
             component_lane_note = " and restarting the component lane" if component_lane_restored else ""
-            logger.opt(ansi=True).info(
-                f"<fg #7b7d7d>Whole-card residency for {model} complete; restoring inference processes "
+            logger.opt(colors=True).info(
+                "<fg #7b7d7d>Whole-card residency for {} complete; restoring inference processes "
                 f"({current} -> {after} of {ceiling})"
                 f"{safety_note}{post_process_note}{vae_lane_note}{component_lane_note}.</>",
+                model,
             )
 
     def _ready_different_model_head_on_device(
@@ -3194,9 +3203,11 @@ class InferenceScheduler:
             return
         self._dispatch_stall_last_reason = reason
         self._dispatch_stall_log_time = now
-        logger.opt(ansi=True).warning(
-            f"<fg #ff8c69>Inference dispatch stalled: head {str(head.id_)[:8]} ({head.model}) has been parked "
+        logger.opt(colors=True).warning(
+            "<fg #ff8c69>Inference dispatch stalled: head {} ({}) has been parked "
             f"{self._head_starved_seconds(head):.0f}s: {reason}.</>",
+            str(head.id_)[:8],
+            head.model,
         )
 
     def record_slot_duty(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
@@ -4955,9 +4966,10 @@ class InferenceScheduler:
         # the per-model notice once so the loop does not route a new model's weights through a host already
         # on the edge.
         if not self._ram_pressure_notified:
-            logger.opt(ansi=True).warning(
-                f"<fg #ff8c69>RAM danger floor reached: deferring preload of {job.model} "
+            logger.opt(colors=True).warning(
+                "<fg #ff8c69>RAM danger floor reached: deferring preload of {} "
                 f"({ram_pressure.reason()}). Shedding idle footprint and pausing pops.</>",
+                job.model,
             )
             self._ram_pressure_notified = True
         return True
@@ -5229,10 +5241,12 @@ class InferenceScheduler:
         key = (target.process_id, job.model, charge_key)
         if key != self._last_credited_admission_key:
             uncredited = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
-            logger.opt(ansi=True).info(
-                f"<fg #8fd6a0>RAM credit admitting preload of {job.model} onto process {target.process_id}: "
+            logger.opt(colors=True).info(
+                "<fg #8fd6a0>RAM credit admitting preload of {} "
+                f"onto process {target.process_id}: "
                 f"predicted ~{uncredited:.0f} MB, credit {verdict.reusable_credit_mb:.0f} MB "
                 f"(retained reusable {retained_mb:.0f} MB), effective charge ~{charge_key:.0f} MB.</>",
+                job.model,
             )
             self._last_credited_admission_key = key
         if job.model is not None:
@@ -5261,10 +5275,11 @@ class InferenceScheduler:
         key = (target.process_id, job.model, charge_key)
         if key != self._last_credited_admission_key:
             whole = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
-            logger.opt(ansi=True).info(
-                f"<fg #8fd6a0>RAM UNet-only charge admitting preload of {job.model} onto process "
+            logger.opt(colors=True).info(
+                "<fg #8fd6a0>RAM UNet-only charge admitting preload of {} onto process "
                 f"{target.process_id}: whole-checkpoint ~{whole:.0f} MB, component charge ~{charge_key:.0f} MB "
                 "(disaggregation-class sampler stages the UNet only).</>",
+                job.model,
             )
             self._last_credited_admission_key = key
         if job.model is not None:
@@ -5421,17 +5436,21 @@ class InferenceScheduler:
             if growth_mb <= record.effective_charge_mb + _REUSE_CREDIT_RECONCILE_SLACK_MB:
                 continue
             if record.kind == _REUSE_CREDIT_KIND_COMPONENT:
-                logger.opt(ansi=True).warning(
-                    f"<fg #f0beff>UNet-only component charge for {record.model} on process {process_id} "
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>UNet-only component charge for {} "
+                    f"on process {process_id} "
                     f"under-priced the stage: measured RSS grew ~{growth_mb:.0f} MB against a component charge of "
                     f"~{record.effective_charge_mb:.0f} MB; the reload shared fewer pages than the residual "
                     "implied.</>",
+                    record.model,
                 )
             else:
-                logger.opt(ansi=True).warning(
-                    f"<fg #f0beff>RAM reuse credit for {record.model} on process {process_id} was too generous: "
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>RAM reuse credit for {} "
+                    f"on process {process_id} was too generous: "
                     f"measured RSS grew ~{growth_mb:.0f} MB against an effective charge of "
                     f"~{record.effective_charge_mb:.0f} MB; the retained pages were less reusable than priced.</>",
+                    record.model,
                 )
 
     def _apply_ram_verdict(
@@ -5489,9 +5508,9 @@ class InferenceScheduler:
             return True
 
         if not self._ram_budget_defer_notified:
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>RAM budget deferring preload of {job.model}: "
-                f"{ram_verdict.reason()}. Reclaiming idle RAM.</>",
+            logger.opt(colors=True).warning(
+                f"<fg #f0beff>RAM budget deferring preload of {{}}: {ram_verdict.reason()}. Reclaiming idle RAM.</>",
+                job.model,
             )
             self._ram_budget_defer_notified = True
         reclaimed = self.unload_models(under_pressure=True)
@@ -5519,10 +5538,11 @@ class InferenceScheduler:
                 self._govern_head_ram_defer(job, made_reclaim_progress=reclaimed or cycled)
             return False
 
-        logger.opt(ansi=True).warning(
-            f"<fg #f0beff>RAM budget cannot fit head-of-queue model {job.model} even after "
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>RAM budget cannot fit head-of-queue model {} even after "
             "reclaiming all idle RAM, and no live job holds memory; admitting it best-effort "
             "rather than wedging the queue.</>",
+            job.model,
         )
         self._resolve_head_ram_defer(job, reason="admitted best-effort")
         return True
@@ -5589,10 +5609,11 @@ class InferenceScheduler:
         self._head_priority_barrier_job_id = job_id
         self._head_priority_barrier_since = time.time()
         self._head_priority_barrier_withhold_logged = False
-        logger.opt(ansi=True).warning(
-            f"<fg #f0beff>Head-of-queue model {job.model} has been RAM-deferred behind live work for over "
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>Head-of-queue model {} has been RAM-deferred behind live work for over "
             f"{_HEAD_RAM_DEFER_BARRIER_SECONDS:.0f}s with reclaim freeing nothing; withholding new dispatch to "
             "other slots so the running jobs drain and the head can load.</>",
+            job.model,
         )
         self._process_lifecycle.action_ledger.record(
             LedgerEventType.HEAD_PRIORITY_BARRIER_ENGAGED,
@@ -5625,10 +5646,11 @@ class InferenceScheduler:
         reissues the job promptly, the least-destructive terminal path: no model quarantine and no ceiling
         hold, because the block is transient host-RAM pressure behind live work, not an unroutable model.
         """
-        logger.opt(ansi=True).warning(
-            f"<fg #f0beff>Head-of-queue model {job.model} could not be admitted within "
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>Head-of-queue model {} could not be admitted within "
             f"{_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding the dispatch barrier; faulting it for "
             "reissue and releasing the barrier.</>",
+            job.model,
         )
         self._job_tracker.handle_job_fault_now(
             job,
@@ -5905,9 +5927,9 @@ class InferenceScheduler:
         # supervisor, and the arbiter emits a starvation diagnostic naming the arithmetic before then.
         # Completion is observed via the next cycle's frozen snapshot; the actuations are never awaited inline.
         if not self._vram_budget_defer_notified and not vram_verdict.fits:
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>VRAM arbiter deferring preload of {job.model}: {verdict.reason}. "
-                "Reclaiming idle VRAM.</>",
+            logger.opt(colors=True).warning(
+                f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.reason}. Reclaiming idle VRAM.</>",
+                job.model,
             )
             self._vram_budget_defer_notified = True
         self._preload_actuation = _PreloadActuation(
@@ -5982,11 +6004,12 @@ class InferenceScheduler:
             candidate_mb=candidate_mb,
         )
         if newly_armed:
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>VRAM: {arithmetic}. It is held (not offered) while other processes hold that "
+            logger.opt(colors=True).warning(
+                "<fg #f0beff>VRAM: {}. It is held (not offered) while other processes hold that "
                 "VRAM, and its jobs are faulted for reissue meanwhile. The hold frees automatically once that "
                 "VRAM is released (close other GPU apps), or you can remove the model from this worker's "
                 "config.</>",
+                arithmetic,
             )
         self._job_tracker.handle_job_fault_now(
             job,
@@ -6392,7 +6415,7 @@ class InferenceScheduler:
         after = self._process_lifecycle.scale_inference_processes(
             target,
             device_index=device_index,
-            whole_card_model=actuation.job.model,
+            protected_model=actuation.job.model,
         )
         self.unload_models_from_vram(
             actuation.available_process,
@@ -7081,11 +7104,12 @@ class InferenceScheduler:
             very_fast_disk_mode=bool(bridge_data.very_fast_disk_mode),
         ):
             if not self._preload_delay_notified:
-                logger.opt(ansi=True).info(
+                logger.opt(colors=True).info(
                     "<fg #7b7d7d>"
                     f"Already preloading {num_preloading_processes} models, waiting for one to finish before "
-                    f"preloading {job.model}"
+                    "preloading {}"
                     "</>",
+                    job.model,
                 )
                 self._preload_delay_notified = True
             return self._preload_outcome(
@@ -8321,18 +8345,19 @@ class InferenceScheduler:
         Side-effect-only diagnostics emitted just before an inference dispatch; it reads the job payload
         and writes log lines, mutating no scheduler state.
         """
+        # Every line here carries payload text the horde supplied (model, sampler, workflow, control type),
+        # so the text is passed as the ``message`` formatting argument rather than spliced into the colour
+        # template: loguru parses only the template for tags, so payload markup cannot abort the line.
         color_format_string = "<fg #f0beff>{message}</>"
 
-        logger.opt(ansi=True).info(
-            color_format_string.format(
-                message=f"  Model: {next_job.model}",
-            ),
+        logger.opt(colors=True).info(
+            color_format_string,
+            message=f"  Model: {next_job.model}",
         )
         if next_job.source_image is not None:
-            logger.opt(ansi=True).info(
-                color_format_string.format(
-                    message="  Using source image",
-                ),
+            logger.opt(colors=True).info(
+                color_format_string,
+                message="  Using source image",
             )
 
         extra_info = ""
@@ -8361,18 +8386,16 @@ class InferenceScheduler:
             extra_info += f"Workflow: {next_job.payload.workflow}"
 
         if extra_info:
-            logger.opt(ansi=True).info(
-                color_format_string.format(
-                    message=f"  {extra_info}",
-                ),
+            logger.opt(colors=True).info(
+                color_format_string,
+                message=f"  {extra_info}",
             )
 
-        logger.opt(ansi=True).info(
-            color_format_string.format(
-                message=f"  {next_job.payload.width}x{next_job.payload.height} for "
-                f"{next_job.payload.ddim_steps} steps "
-                f"with sampler {next_job.payload.sampler_name} for a batch of {next_job.payload.n_iter}",
-            ),
+        logger.opt(colors=True).info(
+            color_format_string,
+            message=f"  {next_job.payload.width}x{next_job.payload.height} for "
+            f"{next_job.payload.ddim_steps} steps "
+            f"with sampler {next_job.payload.sampler_name} for a batch of {next_job.payload.n_iter}",
         )
 
         logger.debug(f"All Batch IDs: {next_job.ids}")
@@ -8419,9 +8442,10 @@ class InferenceScheduler:
             job_id=str(next_job.id_) if next_job.id_ is not None else None,
             detail={"model": model, "disaggregated": True},
         )
-        logger.opt(ansi=True).info(
-            f"<fg #f0beff>Job {str(next_job.id_)[:8]} routed to the disaggregated pipeline; sampler pinned "
+        logger.opt(colors=True).info(
+            "<fg #f0beff>Job {} routed to the disaggregated pipeline; sampler pinned "
             f"to process {process_with_model.process_id}.</>",
+            str(next_job.id_)[:8],
         )
         return True
 
@@ -8723,9 +8747,11 @@ class InferenceScheduler:
             (str(next_job.id_), verdict.disposition.value),
         )
         if suppressed is not None:
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>Holding dispatch of {next_job.model} to reconcile residency: {verdict.reason}. "
+            logger.opt(colors=True).warning(
+                "<fg #f0beff>Holding dispatch of {} to reconcile residency: "
+                f"{verdict.reason}. "
                 "Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM.</>",
+                next_job.model,
             )
         return True
 
@@ -8942,9 +8968,10 @@ class InferenceScheduler:
             # so the running jobs drain and the head reaches its best-effort admit. The head keeps its queue
             # position and dispatches the moment the barrier releases.
             if not self._head_priority_barrier_withhold_logged:
-                logger.opt(ansi=True).info(
-                    f"<fg #7b7d7d><i>Holding dispatch of job {str(next_job.id_)[:8]} behind the head-priority "
+                logger.opt(colors=True).info(
+                    "<fg #7b7d7d><i>Holding dispatch of job {} behind the head-priority "
                     "barrier so running jobs drain for the starved head.</i></>",
+                    str(next_job.id_)[:8],
                 )
                 self._head_priority_barrier_withhold_logged = True
             return False
@@ -9060,11 +9087,9 @@ class InferenceScheduler:
         # Past every hold/fault gate: this job is dispatching now, so emit the start logging here rather than
         # before the reclaim decision (where a deferred or faulted job would mislead the log as "starting").
         color_format_string = "<fg #f0beff>{message}</>"
-        logger.opt(ansi=True).info(
-            color_format_string.format(
-                message=f"Starting inference for job {str(next_job.id_)[:8]} "
-                f"on process {process_with_model.process_id}",
-            ),
+        logger.opt(colors=True).info(
+            color_format_string,
+            message=f"Starting inference for job {str(next_job.id_)[:8]} on process {process_with_model.process_id}",
         )
         self._log_job_dispatch_details(next_job)
 
@@ -9616,9 +9641,11 @@ class InferenceScheduler:
             if not evictable:
                 continue
             if process_info.safe_send_message(HordeEvictComponentsControlMessage(identities=sorted(evictable))):
-                logger.opt(ansi=True).info(
+                logger.opt(colors=True).info(
                     f"<fg #ff8c69>RAM pressure: evicting {len(evictable)} idle unprotected staged component(s) "
-                    f"{sorted(evictable)} from process {process_info.process_id} before a whole-RAM unload.</>",
+                    "{} "
+                    f"from process {process_info.process_id} before a whole-RAM unload.</>",
+                    sorted(evictable),
                 )
                 acted = True
                 yielded_seat_models.update(evictable & seat_only_idle_models)
@@ -9646,9 +9673,10 @@ class InferenceScheduler:
 
         for model_name in sorted(newly_yielded_models):
             self._on_pool_pressure_eviction(model_name)
-        logger.opt(ansi=True).info(
+        logger.opt(colors=True).info(
             f"<fg #ff8c69>RAM pressure: {len(newly_yielded_models)} seated idle pool model(s) "
-            f"{sorted(newly_yielded_models)} yielded their staged components; the pool has been notified.</>",
+            "{} yielded their staged components; the pool has been notified.</>",
+            sorted(newly_yielded_models),
         )
 
     def unload_models(self, *, under_pressure: bool = False, for_head_of_queue: bool = False) -> bool:

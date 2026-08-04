@@ -163,10 +163,10 @@ class StatusReporter:
         """
         AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES", False)
 
-        logging_function = logger.opt(ansi=True).info
+        logging_function = logger.opt(colors=True).info
 
         if AIWORKER_LIMITED_CONSOLE_MESSAGES:
-            logging_function = logger.opt(ansi=True).success
+            logging_function = logger.opt(colors=True).success
 
         # Print header
         logging_function("<fg #dddddd>" + str("^" * 80) + "</>")
@@ -177,7 +177,7 @@ class StatusReporter:
         # Print process info
         logging_function("<b>Process info:</b>")
         for process_info_string in process_info_strings:
-            logging_function("  " + process_info_string)
+            logging_function("  {}", process_info_string)
 
         logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
 
@@ -257,7 +257,7 @@ class StatusReporter:
 
     @staticmethod
     def _print_model_pool(
-        logging_function: Callable[[str], None],
+        logging_function: Callable[..., None],
         *,
         enabled: bool,
         pool: ModelPoolSnapshot | None,
@@ -313,8 +313,11 @@ class StatusReporter:
         demand = _human_duration(pool.demand_age_seconds)
         logging_function(
             "<fg #7dcea0>  Model pool: "
-            f"seats {seat_summary} | last lane {pool.current_lane or '-'} | fixed {fixed_rate} | free {free_rate} | "
+            "seats {} | last lane {} | "
+            f"fixed {fixed_rate} | free {free_rate} | "
             f"bench {len(pool.bench)} | demand age {demand} | download admission {budget}</>",
+            seat_summary,
+            pool.current_lane or "-",
         )
 
     @staticmethod
@@ -370,9 +373,11 @@ class StatusReporter:
         jobs = []
         for x in jobs_pending_inference:
             shortened_id = str(x.id_.root)[:8] if x.id_ is not None else "None?"
-            jobs.append(f"<{shortened_id}: <u>{x.model}></u>")
+            # The job list is emitted as a formatting argument (model names are server-supplied and may
+            # contain markup), so per-entry colour tags here would print literally rather than render.
+            jobs.append(f"<{shortened_id}: {x.model}>")
 
-        logging_function(f"  Jobs: {', '.join(jobs)}")
+        logging_function("  Jobs: {}", ", ".join(jobs))
 
         logger.debug(f"Active models: {active_models}")
 
@@ -459,7 +464,7 @@ class StatusReporter:
             phase_bits.append(f"limit {download_status.rate_limit_kbps} KB/s")
         logging_function("  " + " | ".join(phase_bits))
         if download_status.error_message:
-            logging_function(f"  <fg #ff5555>error: {download_status.error_message}</>")
+            logging_function("  <fg #ff5555>error: {}</>", download_status.error_message)
 
         # Downloads run in parallel (several ad-hoc LoRA fetches to one host, or one per host), so rendering
         # only the primary names one transfer while others move unreported, and the one named is whichever
@@ -471,7 +476,10 @@ class StatusReporter:
             percent_text = f"{percent:.1f}%" if percent is not None else "?"
             speed = f"{_human_bytes(item.speed_bps)}/s" if item.speed_bps else "-"
             logging_function(
-                f"  Now: {item.model_name} [{item.feature}] -> {item.target_dir}",
+                "  Now: {} [{}] -> {}",
+                item.model_name,
+                item.feature,
+                item.target_dir,
             )
             logging_function(
                 f"       {_human_bytes(item.downloaded_bytes)}/{_human_bytes(item.total_bytes)} "
@@ -484,11 +492,14 @@ class StatusReporter:
                 for item in download_status.pending[:3]
             )
             more = f" (+{len(download_status.pending) - 3} more)" if len(download_status.pending) > 3 else ""
-            logging_function(f"  Queued ({len(download_status.pending)}): {preview}{more}")
+            logging_function(f"  Queued ({len(download_status.pending)}): " + "{}{}", preview, more)
 
         for failure in download_status.failures:
             logging_function(
-                f"  <fg #ff5555>Failed: {failure.model_name} [{failure.feature}]: {failure.reason}</>",
+                "  <fg #ff5555>Failed: {} [{}]: {}</>",
+                failure.model_name,
+                failure.feature,
+                failure.reason,
             )
 
     @staticmethod
@@ -536,7 +547,7 @@ class StatusReporter:
         jobs_in_progress: int,
     ) -> None:
         """Print worker information."""
-        logger.opt(ansi=True).info("<b>Worker Info:</b>")
+        logger.opt(colors=True).info("<b>Worker Info:</b>")
 
         max_power_dimension = int(math.sqrt(bridge_data.max_power * 8 * 64 * 64))
         logger.info(

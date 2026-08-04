@@ -257,7 +257,7 @@ class TestResidencyConvergesAfterDrain:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_with(
             1,
             device_index=None,
-            whole_card_model=_FLUX_MODEL,
+            protected_model=_FLUX_MODEL,
         )
         scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
 
@@ -324,7 +324,7 @@ class TestResidencyConvergesAfterDrain:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_with(
             1,
             device_index=None,
-            whole_card_model=_FLUX_MODEL,
+            protected_model=_FLUX_MODEL,
         )
 
 
