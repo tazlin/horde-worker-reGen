@@ -45,15 +45,31 @@ exit /b %errorlevel%
 
 REM ---------------------------------------------------------------------------
 :ensure_uv
-if exist "%~dp0bin\uv.exe" exit /b 0
-echo Downloading uv package manager...
-if not exist "%~dp0bin" md "%~dp0bin"
-
 REM This version MUST match [tool.uv] required-version in pyproject.toml. test_uv_version_consistency.py
 REM enforces this: uv checks its version at runtime against required-version, so the version we download
 REM here must satisfy it. Override with HORDE_WORKER_UV_VERSION to bump without editing this file.
 set "UV_VERSION=0.12.1"
 if defined HORDE_WORKER_UV_VERSION set "UV_VERSION=%HORDE_WORKER_UV_VERSION%"
+set "UV_ACTUAL="
+if not exist "%~dp0bin\uv.exe" goto :download_uv
+REM Probe from outside the project: an older uv may enforce the new pyproject.toml pin even for a version
+REM check, which would prevent bootstrap from discovering and repairing the mismatch.
+set "UV_PROBE_FILE=%HORDE_WORKER_DATA_DIR%\uv-version-probe-%RANDOM%.txt"
+pushd "%HORDE_WORKER_DATA_DIR%"
+"%~dp0bin\uv.exe" --version > "%UV_PROBE_FILE%" 2>nul
+popd
+for /f "usebackq tokens=1,2" %%A in ("%UV_PROBE_FILE%") do if /I "%%A"=="uv" set "UV_ACTUAL=%%B"
+del "%UV_PROBE_FILE%" >nul 2>&1
+if "%UV_ACTUAL%"=="%UV_VERSION%" exit /b 0
+if not defined UV_ACTUAL set "UV_ACTUAL=unknown"
+echo Updating uv package manager from %UV_ACTUAL% to %UV_VERSION%...
+goto :download_uv_payload
+
+:download_uv
+echo Downloading uv package manager...
+
+:download_uv_payload
+if not exist "%~dp0bin" md "%~dp0bin"
 set "UV_ZIP=uv-x86_64-pc-windows-msvc.zip"
 if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "UV_ZIP=uv-aarch64-pc-windows-msvc.zip"
 set "UV_URL=https://github.com/astral-sh/uv/releases/download/%UV_VERSION%/%UV_ZIP%"

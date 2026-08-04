@@ -31,14 +31,27 @@ fi
 # ladder stays env var > cache_home > peered default.
 
 ensure_uv() {
-    [ -x "$SCRIPT_DIR/bin/uv" ] && return 0
-    echo "Downloading uv package manager..."
-    mkdir -p "$SCRIPT_DIR/bin"
-    local version triple os arch
+    local version existing_output existing_version triple os arch
     # This version MUST match [tool.uv] required-version in pyproject.toml. test_uv_version_consistency.py
     # enforces this: uv checks its version at runtime against required-version, so the version we download
     # here must satisfy it. Override with HORDE_WORKER_UV_VERSION to bump without editing this file.
     version="${HORDE_WORKER_UV_VERSION:-0.12.1}"
+    existing_version=""
+    if [ -x "$SCRIPT_DIR/bin/uv" ]; then
+        # Probe from outside the project: an older uv may enforce the new pyproject.toml pin even for a
+        # version check, which would hide the version we need in order to repair it.
+        existing_output="$(cd "$HORDE_WORKER_DATA_DIR" && "$SCRIPT_DIR/bin/uv" --version 2>/dev/null)" || true
+        case "$existing_output" in
+            "uv "*) existing_version="${existing_output#uv }"; existing_version="${existing_version%% *}" ;;
+        esac
+        if [ "$existing_version" = "$version" ]; then
+            return 0
+        fi
+        echo "Updating uv package manager from ${existing_version:-unknown} to ${version}..."
+    else
+        echo "Downloading uv package manager..."
+    fi
+    mkdir -p "$SCRIPT_DIR/bin"
     os="$(uname -s)"; arch="$(uname -m)"
     case "$os" in
         Linux)  case "$arch" in

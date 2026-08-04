@@ -27,13 +27,18 @@ variants.
 
 Managed updates preserve the launcher scripts and private `bin/uv` executable so the process applying an
 update is never overwritten while it is running. If a release raises the exact uv version required by
-`pyproject.toml`, the bootstrap detects that change after the release bundle is overlaid. It copies the
-still-working private executable, self-updates the copy, verifies the reported version, and atomically
-publishes it as a versioned `bin/uv-<version>` sidecar before dependency preview or sync. The original
-executable remains available to start the stdlib-only bootstrap, including on Windows where it may still
-be locked by the parent process. Compatibility probes and the explicit `uv self update` run from a temporary
-directory outside the worker project, so the old uv does not reject the new `required-version` before it can
-update itself.
+`pyproject.toml`, the platform launcher first checks an existing private uv instead of assuming that its
+presence makes it compatible. A mismatch is explicitly replaced with the launcher's pinned version before
+the Python bootstrap starts. This also lets the one-line installer repair a preserved `bin/uv` from an older
+installation.
+
+During an already-running managed update, the Python bootstrap also detects a version change after the
+release bundle is overlaid. It copies the still-working private executable, self-updates the copy, verifies
+the reported version, and atomically publishes it as a versioned `bin/uv-<version>` sidecar before dependency
+preview or sync. The original executable remains available to host the stdlib-only bootstrap, including on
+Windows where it may still be locked by the parent process. Compatibility probes and the explicit
+`uv self update` run from a temporary directory outside the worker project, so the old uv does not reject the
+new `required-version` before it can update itself.
 
 This repair also runs at the beginning of every bootstrap invocation. An installation where the source
 update already succeeded but dependency sync stopped with `Required uv version ... does not match` therefore
@@ -41,8 +46,9 @@ self-heals on its next `update-runtime`, `update`, or worker launch; deleting th
 models again is unnecessary. The sidecar is kept in the managed `bin/` directory and reused on later runs.
 
 If the uv download itself is blocked by a proxy or firewall, restore network access and retry. As a manual
-fallback on Linux/macOS, run `./bin/uv self update <required-version>`; on Windows run
-`bin\uv.exe self update <required-version>`. The bootstrap error names the exact required version.
+fallback, run `bin/uv self update <required-version>` (or `bin\uv.exe ...` on Windows) from a working
+directory outside the worker project, using an absolute path to the binary. The bootstrap error names the
+exact required version.
 
 ## When the worker offers to update itself
 

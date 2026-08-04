@@ -81,3 +81,22 @@ def test_all_uv_versions_are_consistent() -> None:
     assert len(unique_versions) == 1, (
         f"uv versions are inconsistent across files: {versions}. All three must declare the same version."
     )
+
+
+def test_runtime_sh_replaces_an_existing_mismatched_uv() -> None:
+    """The POSIX bootstrap must version-check an existing private uv instead of trusting its presence."""
+    content = _RUNTIME_SH_PATH.read_text(encoding="utf-8")
+
+    assert '"$SCRIPT_DIR/bin/uv" --version' in content
+    assert 'if [ "$existing_version" = "$version" ]' in content
+    assert '[ -x "$SCRIPT_DIR/bin/uv" ] && return 0' not in content
+
+
+def test_runtime_cmd_replaces_an_existing_mismatched_uv() -> None:
+    """The Windows bootstrap must version-check an existing private uv instead of trusting its presence."""
+    content = _RUNTIME_CMD_PATH.read_text(encoding="utf-8")
+    pre_download_check = content.split("\n:ensure_uv\n", maxsplit=1)[1].split("\n:download_uv\n", maxsplit=1)[0]
+
+    assert '"%~dp0bin\\uv.exe" --version' in content
+    assert 'if "%UV_ACTUAL%"=="%UV_VERSION%" exit /b 0' in content
+    assert 'if exist "%~dp0bin\\uv.exe" exit /b 0' not in pre_download_check
