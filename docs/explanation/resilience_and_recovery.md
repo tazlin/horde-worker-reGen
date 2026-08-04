@@ -91,6 +91,50 @@ always OOMs on load, say) stops consuming respawn churn. A merely slow,
 replacing, or model-loading slot is **not** quarantined; only repeated fast
 crashes trip the breaker.
 
+### The safety pool's breakers
+
+The safety pool is rebuilt rather than quarantined (a worker without safety
+capacity cannot serve anything, so there is no useful "leave it out of the pool"
+state), which makes the bounds on that rebuilding the whole of its protection.
+Three of them apply, and they cover different shapes of the same failure:
+
+- **The sliding window** (`SAFETY_CRASH_LOOP_MAX`): more rebuilds than this
+  within `CRASH_LOOP_WINDOW_SECONDS` reports the pool as failing.
+- **The consecutive start-failure streak**
+  (`SAFETY_CRASH_LOOP_MAX_START_FAILURES`): this many rebuilds in a row without
+  one reaching readiness declares the pool unable to start, whatever their
+  spacing. It exists because a deterministic start failure pays a full cold start
+  per attempt, so its rebuilds can arrive spaced wider than the window can
+  accumulate and age their own evidence out; the pool would then respawn for as
+  long as the worker runs while every breaker reads clear. The streak resets the
+  moment a safety process reaches readiness, so a pool that comes up, serves, and
+  later dies is an ordinary crash the rebuild path is for. This is the safety-side
+  companion of `CRASH_LOOP_MAX_START_FAILURES` on inference slots, and either
+  signal makes the pool *unrecoverable* to the wedge assessment.
+- **The respawn backoff** (`SAFETY_RESPAWN_BACKOFF_BASE_SECONDS` doubling to
+  `SAFETY_RESPAWN_BACKOFF_MAX_SECONDS`): consecutive failed rebuilds wait longer
+  before the next start attempt. The first respawn after a lone crash is
+  immediate, since that is the ordinary recovery path; only a repeat failure
+  earns a wait, so a pool that cannot start stops consuming a spawn, a cold
+  start, and a reap several times a second while the escalation decides. Only the
+  respawn waits: a hung child is still ended and reaped promptly.
+
+Deliberate safety-pool churn is kept out of the record: a whole-card
+pause/restore cycle and a supervised soft-reset rebuild both mark the replacement
+*intentional*, and the suppression holds until the replacement reaches readiness,
+because the startup churn in between is part of the same placement change. A pool
+that cannot start never reaches readiness, so that window is additionally bounded
+by `SAFETY_INTENTIONAL_WINDOW_MAX_UNREADY_REBUILDS` attempts. Past the bound the
+window is no longer describing a placement change and its rebuilds are counted
+like any other, so a crash loop cannot hide inside an open intentional window and
+report the pool healthy indefinitely. Readiness clears all of it at once: the
+window, the streak, and the backoff.
+
+Reading these incidents, a child that died before it ever reported to the parent
+(`HordeProcessInfo.has_ever_reported`) failed in its own startup, before its
+message loop; one that had reported got past that and died later. The futility
+disclosure names which it was.
+
 ### Coercing the adaptive solver instead of reaping it
 
 The watchdog below is a **backstop**, not the first response to a runaway
@@ -355,8 +399,9 @@ manager-side **actions**:
   inference slot quarantined, the safety pool crash-looping with no healthy
   process, a **sustained** structural queue deadlock (pending inference work with
   every process idle, held long enough to rule out the transient all-idle gap
-  between jobs), or a recurring [orphaned-job](#stranded-in-progress-jobs) punt
-  storm. A busy, slow, replacing, or model-loading worker is never wedged, and a
+  between jobs), a recurring [orphaned-job](#stranded-in-progress-jobs) punt
+  storm, or job pops held at one gate past `POP_GATE_HELD_WEDGE_SECONDS` with
+  nothing completing behind it. A busy, slow, replacing, or model-loading worker is never wedged, and a
   queue deliberately held while a heavy model establishes whole-card residency is
   excused by a bounded grace. A pending job whose
   [auxiliary prefetch](model_downloads.md#job-driven-auxiliary-prefetch) is still
@@ -375,6 +420,23 @@ manager-side **actions**:
   no-progress window, the normal unrecoverable-pool checks resume.
   `run_recovery_supervisor()` runs each control-loop tick and applies the
   returned action.
+
+  Every signal above names a condition, and a condition nobody modelled holds the
+  intake path just as effectively, so the assessment also carries one
+  **failure-independent backstop**: pops held at the same gate for longer than
+  `POP_GATE_HELD_WEDGE_SECONDS` (15 minutes), with no pop attempt reaching the
+  horde in that span and no job completed since the hold began, is a wedge
+  whichever gate it is. Completed work is the proof it keys on precisely because
+  no gate-holding failure can produce one on its own, which is what lets the check
+  stand over gates added later. The two liveness clauses are also what keep
+  ordinary backpressure out: a worker whose local queue is full holds a gate
+  continuously and attempts no pops while doing so, and its completions excuse the
+  hold whatever its length. The threshold sits above every in-place remedy window
+  the worker gives a condition to clear itself (600 s at the widest), so the
+  watchdog that owns the condition always acts first and this only sees what it
+  left unresolved. A held-gate wedge escalates through the same ladder as any
+  other: an episode opens, the remedies run in order, and the give-up reaches the
+  terminal rung if nothing restores work flow.
 
   A pending post-processing drain can deliberately hold new inference sampling,
   so admission gets one bounded chance to reclaim ordinary idle memory and, only
@@ -672,7 +734,10 @@ close that class:
   when no attempt has reached the horde for 60 s with nothing deliberate to
   account for it, naming that gate; see
   [hung-process detection](process_lifecycle.md) for the sentinel and the
-  watchdogs that own each condition's remedy.
+  watchdogs that own each condition's remedy. Disclosure is not the only consumer
+  of that stamp: a gate that holds far past the sentinel's warning with no work
+  completing behind it is [a wedge in its own right](#layer-3-save-our-ship-sos-escalation),
+  so a condition no watchdog owns still reaches the escalation.
 
 ## Rejoining after horde-forced maintenance
 

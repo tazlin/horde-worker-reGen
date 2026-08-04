@@ -480,6 +480,11 @@ class MessageDispatcher:
             )
             return
 
+        # The message survived the map and launch-identifier checks, so this launch has provably reached its
+        # own message loop. Recording that separates a child that never opened its side of the IPC from one
+        # that initialised and later died.
+        self._process_map[message.process_id].has_ever_reported = True
+
         # Adopt the child's self-reported pid (the real interpreter's os.getpid()) as the authoritative
         # os_pid, overriding the parent's spawn-handle guess, so per-PID telemetry addresses the process
         # that actually holds the GPU context even when a launcher stub sits between them. An older child

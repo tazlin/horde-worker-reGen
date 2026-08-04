@@ -655,6 +655,7 @@ def make_test_recovery_coordinator(
     lifecycle.has_pending_safety_starts.return_value = False
     lifecycle.quarantined_inference_slots = frozenset()
     lifecycle.safety_pool_failing = False
+    lifecycle.safety_pool_start_failing = False
 
     dispatcher = Mock()
     dispatcher.get_deadlock_snapshot.return_value.indicates_structural_wedge.return_value = structural_wedge

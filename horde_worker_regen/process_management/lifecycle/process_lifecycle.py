@@ -148,6 +148,46 @@ per-slot breaker. This count is the equivalent signal for safety: a pool that ha
 this many times in the window is failing (e.g. a safety process that crashes on every start), which the
 recovery supervisor escalates rather than rebuilding the pool forever."""
 
+SAFETY_CRASH_LOOP_MAX_START_FAILURES: int = 3
+"""Consecutive safety-pool rebuilds without an intervening readiness before the pool is declared unrecoverable.
+
+The safety-pool equivalent of ``CRASH_LOOP_MAX_START_FAILURES``, and for the same reason: the sliding-window
+breaker above can only see rebuilds that coincide inside ``CRASH_LOOP_WINDOW_SECONDS``, so a deterministic
+start failure whose cold start costs more than that window's per-rebuild budget ages its own evidence out and
+respawns for as long as the worker runs. A streak of rebuilds where no safety process ever reached readiness
+is structural whatever its spacing. Matching the inference threshold keeps one number to reason about, and
+three is far enough above a single unlucky start (a transient device or disk fault the rebuild path exists
+for) to stay quiet on ordinary churn. The streak resets the moment a safety process reaches readiness."""
+
+SAFETY_INTENTIONAL_WINDOW_MAX_UNREADY_REBUILDS: int = 3
+"""Rebuilds an open intentional-replacement window may absorb before rebuilds are counted again.
+
+An intentional window (a whole-card pause/restore, a supervised pool rebuild) suppresses the crash-loop
+record so deliberate placement churn is not mistaken for a crash loop, and it stays open until a safety
+process reaches readiness. A pool that cannot start never reaches readiness, so without a bound the window
+never closes and every crash-driven rebuild after it is laundered: the pool reports healthy while respawning
+indefinitely. The bound is counted in rebuild attempts rather than wall time because the placement change it
+covers is a fixed, small number of rebuilds regardless of how long each cold start takes, whereas a time
+bound would have to be sized against the slowest legitimate start and would then be outrun by exactly the
+slow deterministic failure this exists to catch. Three covers the pause, the restore, and one retry of
+either; past that the window is no longer describing a placement change."""
+
+SAFETY_RESPAWN_BACKOFF_BASE_SECONDS: float = 2.0
+"""First non-zero delay before respawning a safety process that has failed to reach readiness.
+
+The delay doubles per consecutive failure up to ``SAFETY_RESPAWN_BACKOFF_MAX_SECONDS``. The first respawn
+after a lone crash is immediate: that is the ordinary recovery path and delaying it would leave the worker
+without safety capacity for no reason. Only a repeat failure earns a wait, so a pool that cannot start stops
+consuming a spawn, a full cold start, and a reap several times a second while the escalation above decides
+what to do about it."""
+
+SAFETY_RESPAWN_BACKOFF_MAX_SECONDS: float = 30.0
+"""Ceiling on the safety respawn backoff.
+
+Bounded well under the crash-loop window so a genuinely broken pool still accumulates rebuilds fast enough
+for both breakers to see it, and low enough that a pool whose external cause has cleared (a card a co-tenant
+released) comes back promptly rather than sitting out a long sleep."""
+
 INFERENCE_END_GRACE_SECONDS: float = 5.0
 """How long a single inference-slot end waits for the child to exit cleanly before killing it, when not
 shutting down. A busy child mid-sampling holds the GPU and cannot answer END_PROCESS until its current
@@ -416,6 +456,10 @@ class ProcessLifecycleManager:
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
     _safety_recovery_history: list[float]
+    _safety_consecutive_start_failures: int
+    _safety_intentional_window_rebuilds: int
+    _safety_next_start_allowed_at: float
+    _last_safety_child_ever_reported: bool | None
     _model_incident_history: dict[str, list[ModelIncident]]
     _quarantined_models: set[str]
     _recent_load_failure_by_process: dict[int, tuple[str, float]]
@@ -649,6 +693,15 @@ class ProcessLifecycleManager:
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
         self._safety_recovery_history = []
+        # Rebuilds of the safety pool since one last reached readiness, the rebuilds an open intentional
+        # window has absorbed so far, and the earliest time the next safety start may be attempted.
+        self._safety_consecutive_start_failures = 0
+        self._safety_intentional_window_rebuilds = 0
+        self._safety_next_start_allowed_at = 0.0
+        # Whether the safety child reaped most recently had ever reported to the parent; None before any
+        # safety child has been reaped. Carried for the futility diagnostic, since the process info is gone
+        # from the map by the time the rebuild completes.
+        self._last_safety_child_ever_reported = None
         self._model_incident_history = {}
         self._quarantined_models = set()
         self._recent_load_failure_by_process = {}
@@ -2941,6 +2994,7 @@ class ProcessLifecycleManager:
                 f"{process_info.last_process_state.name}; recovering",
             )
         if process_info.process_type == HordeProcessType.SAFETY:
+            self._last_safety_child_ever_reported = process_info.has_ever_reported
             self._initiate_safety_replacement()
             self._replace_all_safety_process()
         elif process_info.process_type == HordeProcessType.POST_PROCESS:
@@ -2960,7 +3014,11 @@ class ProcessLifecycleManager:
         return True
 
     def _replace_all_safety_process(self) -> None:
-        """Replace all of the safety processes."""
+        """Replace all of the safety processes.
+
+        The end and delete steps always proceed; only the respawn observes the consecutive-failure backoff, so
+        a pool that cannot start stops churning while a hung child is still torn down promptly.
+        """
         if self._automatic_replacement_is_parked() or not self._safety_processes_should_be_replaced:
             return
 
@@ -2983,10 +3041,13 @@ class ProcessLifecycleManager:
             and self._process_map.num_loaded_safety_processes() == 0
             and self._process_map.num_safety_processes() == 0
         ):
+            if time.time() < self._safety_next_start_allowed_at:
+                return
             self.start_safety_processes()
             self._safety_processes_ending = False
             self._safety_processes_should_be_replaced = False
-            if self._safety_replacement_intentional or self._safety_replacement_intentional_until_ready:
+            self._record_safety_start_failure()
+            if self._safety_replacement_is_suppressed():
                 # A deliberate whole-card pause/restore cycle, not a crash: keep it out of the recovery
                 # count and the crash-loop breaker so a burst of whole-card jobs is not mistaken for a
                 # safety crash loop (which would trip save-our-ship). Keep suppressing replacements until
@@ -2995,17 +3056,75 @@ class ProcessLifecycleManager:
                 self._safety_replacement_intentional = False
                 self._safety_replacement_intentional_until_ready = True
             else:
+                self._safety_replacement_intentional = False
+                self._safety_replacement_intentional_until_ready = False
                 self._num_process_recoveries += 1
                 self._record_safety_recovery()
 
+    def _safety_replacement_is_suppressed(self) -> bool:
+        """Whether this completed rebuild belongs to an intentional window that may still absorb it.
+
+        An intentional window is a placement change (a whole-card pause/restore, a supervised rebuild) whose
+        own churn is not a crash loop, so it is kept out of the recovery count. It is closed by a safety
+        process reaching readiness, which a pool that cannot start never does, so the suppression is
+        additionally bounded by ``SAFETY_INTENTIONAL_WINDOW_MAX_UNREADY_REBUILDS`` attempts. Past the bound
+        the window no longer describes a placement change and its rebuilds are counted like any other, so a
+        pool respawning inside an open window still reaches the crash-loop breaker.
+        """
+        if not (self._safety_replacement_intentional or self._safety_replacement_intentional_until_ready):
+            return False
+        self._safety_intentional_window_rebuilds += 1
+        return self._safety_intentional_window_rebuilds <= SAFETY_INTENTIONAL_WINDOW_MAX_UNREADY_REBUILDS
+
+    def _record_safety_start_failure(self) -> None:
+        """Count this rebuild against the consecutive-start-failure streak and arm the respawn backoff.
+
+        The streak counts rebuilds since a safety process last reached readiness, so it measures a pool that
+        cannot initialise at all rather than one that came up, served, and later died. It is reset by
+        :meth:`_clear_completed_intentional_safety_replacement` when readiness is observed. The backoff is
+        armed from the same streak so a pool failing repeatedly stops respawning at reap speed, while the
+        first respawn after a lone crash stays immediate.
+        """
+        self._safety_consecutive_start_failures += 1
+        self._safety_next_start_allowed_at = time.time() + self._safety_respawn_backoff_seconds()
+        if self._safety_consecutive_start_failures == SAFETY_CRASH_LOOP_MAX_START_FAILURES:
+            if self._last_safety_child_ever_reported is None:
+                ipc_evidence = "no safety child has been reaped, so the failure is not in a reaped child"
+            elif self._last_safety_child_ever_reported:
+                ipc_evidence = "the last child reported to the parent before dying (it got past its own startup)"
+            else:
+                ipc_evidence = "the last child never reported to the parent (it died before its message loop)"
+            logger.critical(
+                f"The safety pool has been rebuilt {self._safety_consecutive_start_failures} consecutive times "
+                f"without one reaching readiness; {ipc_evidence}. Treating the pool as unable to start: safety "
+                "sits on every job's path, so recovery escalates rather than respawning it indefinitely.",
+            )
+
+    def _safety_respawn_backoff_seconds(self) -> float:
+        """Return how long the next safety start waits, given the consecutive-failure streak.
+
+        Zero for the first failure (the ordinary recovery path, which must not be delayed), then doubling
+        from ``SAFETY_RESPAWN_BACKOFF_BASE_SECONDS`` up to ``SAFETY_RESPAWN_BACKOFF_MAX_SECONDS``.
+        """
+        if self._safety_consecutive_start_failures <= 1:
+            return 0.0
+        delay = SAFETY_RESPAWN_BACKOFF_BASE_SECONDS * (2 ** (self._safety_consecutive_start_failures - 2))
+        return min(delay, SAFETY_RESPAWN_BACKOFF_MAX_SECONDS)
+
     def _clear_completed_intentional_safety_replacement(self) -> None:
-        """End count suppression after an intentional safety replacement has reached readiness."""
-        if (
-            self._safety_replacement_intentional_until_ready
-            and not self._safety_processes_should_be_replaced
-            and self._process_map.num_loaded_safety_processes() > 0
-        ):
-            self._safety_replacement_intentional_until_ready = False
+        """Observe safety-pool readiness and clear what an unready pool accumulates.
+
+        Readiness is the one fact that ends both the intentional window's count suppression and the
+        consecutive-start-failure streak: the pool proved it can initialise, so whatever churn preceded it
+        was recovered rather than futile. It also clears the respawn backoff, so a pool that comes back is
+        not held off by the delay its previous failures armed.
+        """
+        if self._safety_processes_should_be_replaced or self._process_map.num_loaded_safety_processes() == 0:
+            return
+        self._safety_replacement_intentional_until_ready = False
+        self._safety_intentional_window_rebuilds = 0
+        self._safety_consecutive_start_failures = 0
+        self._safety_next_start_allowed_at = 0.0
 
     def _record_safety_recovery(self) -> None:
         """Record that the safety pool was just rebuilt, pruning the history to the crash-loop window."""
@@ -3026,6 +3145,17 @@ class ProcessLifecycleManager:
         now = time.time()
         recent = [t for t in self._safety_recovery_history if now - t <= CRASH_LOOP_WINDOW_SECONDS]
         return len(recent) > SAFETY_CRASH_LOOP_MAX
+
+    @property
+    def safety_pool_start_failing(self) -> bool:
+        """Whether consecutive safety rebuilds have failed to reach readiness (its rate-independent signal).
+
+        The companion to :attr:`safety_pool_failing`, which can only see rebuilds that coincide inside the
+        crash-loop window. A deterministic start failure costs a full cold start per attempt, so its rebuilds
+        can arrive spaced wider than that window and age out before they accumulate; the streak is evidence
+        the pool cannot initialise at all, whatever its spacing.
+        """
+        return self._safety_consecutive_start_failures >= SAFETY_CRASH_LOOP_MAX_START_FAILURES
 
     def _release_held_primitives(self, process_info: HordeProcessInfo) -> None:
         """Release every shared primitive a replaced inference child might still be holding.
@@ -3292,9 +3422,16 @@ class ProcessLifecycleManager:
         soft reset whose wedge was the *inference* pool double-counts as two recoveries (the healthy safety
         pool being collateral), and the soft reset could be re-triggered immediately by its own stale
         safety history.
+
+        The start-failure streak, the intentional-window count, and the respawn backoff are cleared with it,
+        for the same reason and with the same bound: a supervised rebuild is a fresh attempt, and if the pool
+        still cannot start its rebuilds re-accumulate from zero.
         """
         logger.error(f"Soft reset: rebuilding safety pool ({reason}).")
         self._safety_recovery_history.clear()
+        self._safety_consecutive_start_failures = 0
+        self._safety_intentional_window_rebuilds = 0
+        self._safety_next_start_allowed_at = 0.0
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         self._replace_all_safety_process()

@@ -126,6 +126,20 @@ class WorkerRecoveryCoordinator:
     while bounding what a permanently doomed pool can cost to one escalation cycle per interval instead of
     continuous process churn and job faulting."""
 
+    POP_GATE_HELD_WEDGE_SECONDS = 900.0
+    """How long job pops may be held at one gate with nothing completing before it counts as a wedge.
+
+    The failure-independent backstop. Every other wedge signal names a condition, and a condition nobody
+    modelled holds the intake path just as effectively; what no gate-holding failure can produce on its own is
+    a completed job, so the absence of one over a long continuous hold is evidence that stands whatever holds
+    the gate. Sized above every in-place remedy window the worker gives a condition to clear itself (the
+    deferred-start no-progress window and the recovery park's re-probe interval are the widest at 600s), so
+    the owning watchdog always acts first and this only sees what they left unresolved. It is far above
+    ordinary backpressure: a worker whose local queue is full holds a gate continuously while serving at full
+    rate, and completed work excuses that hold whatever its length. It is far below the horizon over which a
+    silently gated worker is worth anything to the horde, so the escalation opens in minutes rather than
+    hours."""
+
     HEAD_RECOVERY_BUDGET_FALLBACK_SECONDS = 150.0
     """Give-up deferral budget for head-of-queue model materialisation when no numeric preload timeout is set.
 
@@ -245,6 +259,12 @@ class WorkerRecoveryCoordinator:
         # give-up deferral so a stuck load still escalates. Cleared when materialisation stops or the episode
         # closes.
         self.head_recovery_in_flight_since: float | None = None
+        # The pop-gate hold currently being judged: the ``last_pop_gate_since`` stamp it is keyed on, and the
+        # completed-job count when that hold was first observed. None while no gate holds pops. Keying on the
+        # stamp means a new hold gets its own baseline without any explicit reset.
+        self.pop_gate_hold_baseline: tuple[float, int] | None = None
+        # Edge latch so one held-gate wedge is disclosed once per hold rather than on every assessment tick.
+        self.pop_gate_wedge_disclosed_since: float | None = None
 
     @property
     def bridge_data(self) -> reGenBridgeData:
@@ -314,10 +334,17 @@ class WorkerRecoveryCoordinator:
         return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
 
     def is_safety_pool_unrecoverable(self) -> bool:
-        """Return whether the safety pool is crash-looping and not currently ready."""
+        """Return whether the safety pool cannot be restored and is not currently ready.
+
+        Two independent signals qualify: the sliding-window crash-loop count, and the consecutive
+        start-failure streak. The streak is what covers a deterministic failure whose full cold start spaces
+        its rebuilds wider than the window can accumulate, so a pool that never initialises is classified
+        however slowly it fails rather than being respawned for the life of the worker.
+        """
         if self._safety_starts_backing_off():
             return False
-        return self._process_lifecycle.safety_pool_failing and not self.is_safety_pool_ready()
+        pool_broken = self._process_lifecycle.safety_pool_failing or self._process_lifecycle.safety_pool_start_failing
+        return pool_broken and not self.is_safety_pool_ready()
 
     def inference_slot_owns_job(self, job_id: GenerationID) -> bool:
         """Return whether some live inference slot owns the given job."""
@@ -596,6 +623,47 @@ class WorkerRecoveryCoordinator:
             return False
         return not self._process_map.has_inference_in_progress()
 
+    def pop_gate_wedge_active(self) -> bool:
+        """Return whether job pops have been gated far too long with no work completing behind the gate.
+
+        The pop coroutine returns early at any of a dozen preconditions, each owned by a different watchdog,
+        and a condition none of them models holds intake exactly as effectively. This keys on the hold itself
+        rather than on the condition, so it covers the gates nobody anticipated, and it takes its liveness
+        proof from completed jobs, which no gate-holding failure can produce on its own.
+
+        Three facts must hold together: the same gate has held pops for longer than
+        ``POP_GATE_HELD_WEDGE_SECONDS``, no pop attempt has reached the horde in that span, and no job has
+        completed since the hold was first observed. The last two are what keep ordinary backpressure out: a
+        worker whose queue is full holds a gate continuously and attempts no pops while doing so, and its
+        completions are the proof that the hold is capacity management rather than a wedge.
+        """
+        gate = self._state.last_pop_gate
+        if gate is None:
+            self.pop_gate_hold_baseline = None
+            self.pop_gate_wedge_disclosed_since = None
+            return False
+
+        held_since = self._state.last_pop_gate_since
+        if self.pop_gate_hold_baseline is None or self.pop_gate_hold_baseline[0] != held_since:
+            self.pop_gate_hold_baseline = (held_since, self._job_tracker.total_num_completed_jobs)
+
+        now = self._clock()
+        if (now - held_since) < self.POP_GATE_HELD_WEDGE_SECONDS:
+            return False
+        if self._job_tracker.total_num_completed_jobs > self.pop_gate_hold_baseline[1]:
+            return False
+        if (now - self._state.last_pop_attempt_completed_at) < self.POP_GATE_HELD_WEDGE_SECONDS:
+            return False
+
+        if self.pop_gate_wedge_disclosed_since != held_since:
+            self.pop_gate_wedge_disclosed_since = held_since
+            logger.critical(
+                f"Job pops have been held at gate '{gate}' for {now - held_since:.0f}s with no job completed "
+                "and no pop attempt reaching the horde in that time; the worker is serving nothing, so "
+                "recovery is escalating over the hold regardless of what is holding it.",
+            )
+        return True
+
     def assess_wedge(self) -> bool:
         """Return whether the worker structurally cannot make progress."""
         if self._state.shutting_down:
@@ -611,6 +679,7 @@ class WorkerRecoveryCoordinator:
             or self.is_safety_pool_unrecoverable()
             or self.structural_queue_wedge_active()
             or self.orphan_wedge_active()
+            or self.pop_gate_wedge_active()
         )
 
     def _capture_progress_baseline(self) -> None:

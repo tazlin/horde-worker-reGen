@@ -119,6 +119,14 @@ class HordeProcessInfo:
 
     last_received_timestamp: float
     """Last time we updated the process info. If we're regularly working, then this value should change frequently."""
+    has_ever_reported: bool
+    """Whether the parent has accepted at least one message from this child since it was launched.
+
+    ``last_received_timestamp`` is seeded at construction, so it cannot distinguish a child that has
+    reported from one that never opened its side of the IPC at all. This can: False on a dead child means
+    it died before its interpreter reached the message loop (a failed import, a driver that refuses to
+    initialise), which is a different fault from a child that initialised, reported, and then crashed.
+    Recovery diagnostics carry it so the two are separable after the fact."""
     loaded_horde_model_name: str | None
     """The name of the horde model that is (supposedly) currently loaded in this process."""
     loaded_horde_model_baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None
@@ -309,6 +317,7 @@ class HordeProcessInfo:
         self.last_process_state = last_process_state
         self.last_process_state_started_at = time.time()
         self.last_received_timestamp = time.time()
+        self.has_ever_reported = False
         self.loaded_horde_model_name = None
         self.loaded_horde_model_baseline = None
         self.last_control_flag = None
