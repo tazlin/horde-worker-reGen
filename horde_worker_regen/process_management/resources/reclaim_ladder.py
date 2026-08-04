@@ -420,6 +420,19 @@ class _Episode:
     pending: _PendingVerification | None = None
     unresolved: bool = False
     restore_obligations: list[RestoreObligation] = field(default_factory=list)
+    retention_logged: bool = False
+    """Whether this episode has already disclosed that a refused restore left it holding a debt."""
+
+    def reset_ladder_progress(self) -> None:
+        """Drop this episode's ladder, cursor, pending rung and outcome, keeping only what it still owes.
+
+        Leaves the episode in the same shape as one opened by a recorded obligation alone, so a card that
+        saturates again builds a fresh ladder against the topology of that moment.
+        """
+        self.ladder = None
+        self.next_index = 0
+        self.pending = None
+        self.unresolved = False
 
 
 class VerifiedReclaimLadder:
@@ -487,8 +500,16 @@ class VerifiedReclaimLadder:
                     episode = self._episodes.get(key)
                     if episode is None:
                         continue
-                    self._unwind_restore_obligations(episode, actuator)
-                    self._episodes.pop(key, None)
+                    if self._unwind_restore_obligations(episode, actuator):
+                        self._episodes.pop(key, None)
+                        continue
+                    # An obligation the actuator refused is still owed, so the episode survives as a debt
+                    # record and re-attempts on a later HEALTHY sample. Its ladder progress is dropped: the
+                    # saturation it was running is over, and a fresh one must build its rungs against the
+                    # topology of the moment it crosses the cliff, exactly as an episode opened by a recorded
+                    # obligation alone does.
+                    episode.reset_ladder_progress()
+                    self._log_retained_obligations(key, episode)
             return
 
         episode = self._episodes.get(device_index)
@@ -672,18 +693,55 @@ class VerifiedReclaimLadder:
         return _TEARDOWN_VERIFICATION_SAMPLES if kind in _TEARDOWN_RUNG_KINDS else _VERIFICATION_SAMPLES
 
     @staticmethod
-    def _unwind_restore_obligations(episode: _Episode, actuator: ReclaimLadderActuator) -> None:
+    def _unwind_restore_obligations(episode: _Episode, actuator: ReclaimLadderActuator) -> bool:
         """Undo everything this episode owes the card, in reverse order of the actions taken (LIFO unwind).
 
         The unwind mirrors the order the memory was taken back in: the last lane stopped (or context reduced)
         is the first restored, so a card that gave back memory action-by-action reclaims its capacity in the
         same order it released it. Each restore targets only what this engine did (the actuator routes it
         through its owner-guarded restore path), so an action another owner is responsible for is left
-        untouched. Called once, when the card returns HEALTHY.
+        untouched. Run when the card returns HEALTHY.
+
+        An actuator that reports it did not act has not discharged the debt: the context restore stands down
+        for as long as a whole-card residency owns the pool, and dropping the obligation on that answer would
+        leave the card shrunk with nobody left to regrow it. Such an obligation is retained in its original
+        order for a later attempt, so the debt outlives this pass.
+
+        Returns:
+            True when every obligation was discharged and the episode owes the card nothing.
         """
+        retained: list[RestoreObligation] = []
         for obligation in reversed(episode.restore_obligations):
-            unwind_restore_obligation(obligation, actuator)
-        episode.restore_obligations.clear()
+            if not unwind_restore_obligation(obligation, actuator):
+                retained.append(obligation)
+        retained.reverse()
+        episode.restore_obligations[:] = retained
+        if not retained:
+            episode.retention_logged = False
+        return not retained
+
+    @staticmethod
+    def _log_retained_obligations(device_index: int | None, episode: _Episode) -> None:
+        """Name the debt an unwind could not discharge, once per episode until it clears.
+
+        The unwind re-attempts on every HEALTHY sample, so the notice is edge-triggered: a card whose restore
+        owner stands down for minutes reports the retained debt once rather than on every governor tick.
+        """
+        if episode.retention_logged:
+            return
+        episode.retention_logged = True
+        kinds = ", ".join(
+            sorted(
+                {
+                    "live contexts" if isinstance(obligation, ContextReduction) else obligation.kind.value
+                    for obligation in episode.restore_obligations
+                },
+            ),
+        )
+        logger.debug(
+            f"Reclaim episode on device {device_index} still owes the card {kinds}: the restore actuator "
+            "declined to act, so the obligation is kept and retried once the card can take it back.",
+        )
 
     @staticmethod
     def execute_arbiter_commands(

@@ -84,7 +84,10 @@ Current allocator-derived checkpoint footprints and live reserve commitments ins
 `repriced_target`. That target may only tighten while the residency is held. If it falls below the live
 context count, the scheduler stops idle siblings and records one `ContextReduction` restore obligation with
 the verified reclaim ladder; a roomier later reading never grows contexts back underneath the heavy model.
-The residency release owns physical regrowth and discharges the ladder debt. A foreign application's VRAM
+The residency release owns physical regrowth and discharges the ladder debt. An obligation whose restore
+actuator reports it did not act (the context restore stands down for as long as a residency owns the pool) is
+kept and retried on a later healthy tick, so the debt outlives the episode that recorded it rather than
+leaving the card shrunk with no owner left to regrow it. A foreign application's VRAM
 growth after dispatch is not folded into this model price: the device-free governor observes that device-level
 condition and drives verified reclaim independently of queue or residency pricing.
 

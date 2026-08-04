@@ -426,3 +426,99 @@ class TestReclaimLadderVerifiedRestore:
         )
         # No restore call was appended: safety is not the ladder's to bring back.
         assert actuator.calls == [("safety", None)]
+
+
+class _StandDownActuator(_FakeActuator):
+    """An actuator whose context restore stands down while a whole-card residency owns the pool."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.residency_held = True
+
+    def restore_live_contexts(self, device_index: int | None) -> bool:
+        self.calls.append(("restore_contexts", device_index))
+        return not self.residency_held
+
+
+class TestRefusedRestoresStayOwed:
+    """An obligation the actuator declined to act on is still owed and is retried later."""
+
+    def test_declined_context_restore_survives_the_unwind(self) -> None:
+        """A stood-down restore keeps the debt, and a later tick regrows the pool once the actuator can act.
+
+        The context restore reports no-op for as long as a whole-card residency owns the pool. Discharging the
+        obligation on that answer would leave the card at emergency depth with no owner left to regrow it.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _StandDownActuator()
+
+        engine.record_context_reduction(0)
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("restore_contexts", 0)]
+        assert engine.has_context_reduction(0) is True
+
+        # The residency released, so the same obligation is retried and this time the actuator acts.
+        actuator.residency_held = False
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("restore_contexts", 0), ("restore_contexts", 0)]
+        assert engine.has_context_reduction(0) is False
+
+    def test_retained_debt_does_not_resume_a_spent_ladder(self) -> None:
+        """An episode kept alive by a refused restore builds a fresh ladder when the card saturates again."""
+        engine = VerifiedReclaimLadder()
+        actuator = _StandDownActuator()
+        ladder = _ladder(_unload_rung(2, promised=1000.0))
+        builds = 0
+
+        def _build() -> tuple[ReclaimRung, ...]:
+            nonlocal builds
+            builds += 1
+            return ladder
+
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=_build)
+        engine.record_context_reduction(0)
+        assert actuator.calls == [("unload", 2)]
+        assert builds == 1
+
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=_build
+        )
+        assert engine.has_context_reduction(0) is True
+
+        # The card crosses the cliff again: the retained debt must not have consumed the new episode's ladder.
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=_build)
+        assert builds == 2
+        assert actuator.calls == [("unload", 2), ("restore_contexts", 0), ("unload", 2)]
+
+    def test_declined_lane_restore_remains_the_episodes_own_to_retry(self) -> None:
+        """A lane whose restore was refused keeps its live claimant, so no backstop steals the restore."""
+        engine = VerifiedReclaimLadder()
+
+        class _LaneStandDownActuator(_FakeActuator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.can_restore = False
+
+            def restore_vae_lane(self, device_index: int | None) -> bool:
+                self.calls.append(("restore_vae", None))
+                return self.can_restore
+
+        actuator = _LaneStandDownActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_VAE_LANE))
+
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=lambda: ladder
+        )
+        assert engine.episode_holds_paused_lane(0) is True
+
+        actuator.can_restore = True
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=lambda: ladder
+        )
+        assert engine.episode_holds_paused_lane(0) is False
+        assert actuator.calls == [("vae", None), ("restore_vae", None), ("restore_vae", None)]
