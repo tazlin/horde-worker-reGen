@@ -283,6 +283,80 @@ async def test_whole_card_head_lifecycle_matrix_converges(case: WholeCardLifecyc
     assert holder.loaded_horde_model_name == _FLUX_MODEL
 
 
+async def test_unsized_forecast_leaves_the_live_process_count_alone() -> None:
+    """A residency whose forecast cannot size the card converges without cutting the pool.
+
+    An unsized forecast names no depth: the card's total VRAM was never reported, so the number of contexts
+    it holds is unknown. Collapsing to sole residency there would tear the pool down on the strength of a
+    figure nobody measured, on exactly the hosts where the measurement is missing.
+    """
+    case = WholeCardLifecycleCase(
+        mode="prestaged",
+        target=1,
+        total_processes=3,
+        holder_state=HordeProcessState.PRELOADED_MODEL,
+        holder_load_state=ModelLoadState.LOADED_IN_RAM,
+        sibling_models=(_RESIDENT_SDXL, _OTHER_SDXL),
+        queue_tail=(_RESIDENT_SDXL, _OTHER_SDXL),
+    )
+    harness = _make_flux_head_harness(case)
+    await _queue_flux_head_case(harness, case)
+
+    unsized = StreamForecast(
+        total_vram_mb=None,
+        free_now_mb=float(_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB),
+        free_if_alone_mb=float(_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB),
+        free_after_model_evict_mb=float(_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB),
+        weights_mb=_FLUX_WEIGHTS_MB,
+        reserve_mb=6500.0,
+        per_process_overhead_mb=float(_PER_PROCESS_OVERHEAD_MB),
+    )
+    assert unsized.max_resident_processes() is None
+
+    live_before = harness.process_map.num_loaded_inference_processes()
+    harness.scheduler._begin_whole_card_residency(harness.flux_job, unsized, announce=False)
+    harness.scheduler._converge_whole_card_residency()
+
+    assert harness.process_map.num_loaded_inference_processes() == live_before
+    assert live_before == case.total_processes
+
+
+async def test_unsized_forecast_establish_leaves_the_live_process_count_alone() -> None:
+    """A direct residency establishment with an unsized forecast likewise skips the scale-down.
+
+    The establish path sizes its own target from the forecast rather than reading the ledger, so the
+    absent-target contract must hold there independently of the converge path.
+    """
+    case = WholeCardLifecycleCase(
+        mode="prestaged",
+        target=1,
+        total_processes=3,
+        holder_state=HordeProcessState.PRELOADED_MODEL,
+        holder_load_state=ModelLoadState.LOADED_IN_RAM,
+        sibling_models=(_RESIDENT_SDXL, _OTHER_SDXL),
+        queue_tail=(_RESIDENT_SDXL, _OTHER_SDXL),
+    )
+    harness = _make_flux_head_harness(case)
+    await _queue_flux_head_case(harness, case)
+
+    unsized = StreamForecast(
+        total_vram_mb=None,
+        free_now_mb=float(_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB),
+        free_if_alone_mb=float(_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB),
+        free_after_model_evict_mb=float(_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB),
+        weights_mb=_FLUX_WEIGHTS_MB,
+        reserve_mb=6500.0,
+        per_process_overhead_mb=float(_PER_PROCESS_OVERHEAD_MB),
+    )
+    assert unsized.max_resident_processes() is None
+
+    live_before = harness.process_map.num_loaded_inference_processes()
+    harness.scheduler._establish_whole_card_residency(harness.flux_job, unsized, announce=False)
+
+    assert harness.process_map.num_loaded_inference_processes() == live_before
+    assert live_before == case.total_processes
+
+
 @pytest.mark.parametrize(
     "queue_models",
     [

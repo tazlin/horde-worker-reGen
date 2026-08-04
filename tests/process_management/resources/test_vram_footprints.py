@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    SAFETY_PROCESS_BASELINE,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
@@ -20,6 +21,27 @@ def _key(
     stage: FootprintStage = FootprintStage.SAMPLE,
 ) -> FootprintKey:
     return FootprintKey(model_baseline=baseline, resolution_bucket=bucket, platform=platform, stage=stage)
+
+
+def _resident_key(*, checkpoint: str = "checkpoint-a", platform: str = "linux") -> FootprintKey:
+    """A resident-weight key: per checkpoint, with no resolution band."""
+    return FootprintKey(
+        model_baseline="stable_diffusion_xl",
+        resolution_bucket=None,
+        platform=platform,
+        stage=FootprintStage.RESIDENT,
+        checkpoint=checkpoint,
+    )
+
+
+def _safety_key(*, platform: str = "linux") -> FootprintKey:
+    """The safety process's key: no baseline, no checkpoint, no resolution band."""
+    return FootprintKey(
+        model_baseline=SAFETY_PROCESS_BASELINE,
+        resolution_bucket=None,
+        platform=platform,
+        stage=FootprintStage.SAFETY,
+    )
 
 
 class TestResolutionBucketClassifier:
@@ -151,3 +173,75 @@ class TestFootprintKeyIdentity:
     def test_key_is_hashable(self) -> None:
         """A frozen key can be used directly in a set/dict."""
         assert len({_key(), _key()}) == 1
+
+    def test_omitting_the_checkpoint_matches_an_explicit_none(self) -> None:
+        """The baseline-keyed activation stages address one population whether or not the field is passed."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 8000.0)
+        store.observe_peak(
+            FootprintKey(
+                model_baseline="stable_diffusion_xl",
+                resolution_bucket=ResolutionBucket.LE_1024,
+                platform="linux",
+                stage=FootprintStage.SAMPLE,
+                checkpoint=None,
+            ),
+            9000.0,
+        )
+        assert len(store) == 1
+
+    def test_checkpoints_of_one_baseline_are_separate_populations(self) -> None:
+        """Two checkpoints sharing a baseline hold different weights, so they never share a watermark."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_resident_key(checkpoint="checkpoint-a"), 4900.0)
+        store.observe_peak(_resident_key(checkpoint="checkpoint-b"), 6800.0)
+
+        assert len(store) == 2
+        assert store.estimate_mb(_resident_key(checkpoint="checkpoint-a"), static_seed_mb=0.0) == pytest.approx(4900.0)
+
+
+class TestResidentAndSafetyStages:
+    """The resident-weight and safety stages carry the same raise-only contract on their own keys."""
+
+    def test_a_resident_key_never_collides_with_the_sampling_key(self) -> None:
+        """A checkpoint's resident weights and its baseline's sampling peak are separate populations.
+
+        Folding a sampling peak into the resident key would price a merely-loaded slot at the cost of a
+        running one, permanently and in the raise-only direction.
+        """
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 11000.0)
+
+        assert store.estimate_mb(_resident_key(), static_seed_mb=4900.0) == pytest.approx(4900.0)
+
+    def test_resident_watermark_raises_but_never_lowers_the_seed(self) -> None:
+        """A resident observation raises the seed it exceeds and leaves a higher seed alone."""
+        store = LearnedFootprintStore()
+        key = _resident_key()
+        store.observe_peak(key, 6200.0)
+        assert store.estimate_mb(key, static_seed_mb=4900.0) == pytest.approx(6200.0)
+
+        store.observe_peak(key, 5100.0)
+        assert store.estimate_mb(key, static_seed_mb=4900.0) == pytest.approx(6200.0)
+        assert store.estimate_mb(key, static_seed_mb=9000.0) == pytest.approx(9000.0)
+
+    def test_cold_resident_and_safety_keys_return_their_seeds(self) -> None:
+        """Before either stage is ever observed, a consumer gets the static seed back unchanged."""
+        store = LearnedFootprintStore()
+        assert store.estimate_mb(_resident_key(), static_seed_mb=4900.0) == pytest.approx(4900.0)
+        assert store.estimate_mb(_safety_key(), static_seed_mb=3044.0) == pytest.approx(3044.0)
+
+    def test_safety_watermark_raises_the_static_charge(self) -> None:
+        """A measured safety residency above the static charge becomes the priced figure."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_safety_key(), 3500.0)
+        assert store.estimate_mb(_safety_key(), static_seed_mb=3044.0) == pytest.approx(3500.0)
+
+    def test_the_safety_key_is_independent_of_every_model_key(self) -> None:
+        """The safety process belongs to no baseline, so its footprint stands alone in the store."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_safety_key(), 3500.0)
+
+        assert store.estimate_mb(_key(), static_seed_mb=6158.0) == pytest.approx(6158.0)
+        assert store.estimate_mb(_resident_key(), static_seed_mb=4900.0) == pytest.approx(4900.0)
+        assert len(store) == 1

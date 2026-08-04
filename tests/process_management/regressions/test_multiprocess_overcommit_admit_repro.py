@@ -14,10 +14,10 @@ Read the numbers: with four ~4056 MB process contexts resident, evicting every s
 only 3794 MB free, which does not even hold the 4900 MB of weights, let alone the activation reserve. The
 only thing that can make room is stopping a sibling *process* (a CUDA context is reclaimed only by the
 process exiting). The model also fits with the card to itself (alone=20018). So the physically-correct
-remedy is a partial sibling-process teardown: exactly what ``requires_sibling_teardown`` exists to signal.
+remedy is a partial sibling-process teardown: exactly what ``needs_process_count_reduction`` exists to signal.
 
 The blind spot:
-    ``requires_sibling_teardown`` (and ``needs_exclusive_residency``) are gated behind ``_weights_dominant``,
+    ``needs_exclusive_residency`` is gated behind ``_weights_dominant``,
     which is computed against a *fixed two-context* ceiling (``total_vram - 2 * per_process_overhead``: self
     plus one sibling). A moderate-weight SDXL job fits under that two-context ceiling, so it reads
     "not weight-dominant" and the teardown remedy is suppressed, even though there are *four* live contexts,
@@ -88,16 +88,15 @@ class TestMultiProcessOvercommitForecast:
     def test_overcommit_needs_process_count_reduction(self) -> None:
         """THE BUG: with model eviction insufficient and sole residency fitting, a teardown must be signalled.
 
-        The weight-dominant gates miss it: ``_weights_dominant`` (and so ``needs_exclusive_residency`` and
-        ``requires_sibling_teardown``) judge the moderate-weight SDXL "not card-filling" under the fixed
-        two-context ceiling, so no structural remedy fires from them and the head would be admitted into
-        an OOM. The topology-aware ``needs_process_count_reduction`` catches it: the live four contexts
-        squeeze the bounded weights off the card, but the model co-resides once the process count is reduced.
+        The weight-dominant gate misses it: ``_weights_dominant`` (and so ``needs_exclusive_residency``)
+        judges the moderate-weight SDXL "not card-filling" under the fixed two-context ceiling, so no
+        structural remedy fires from it and the head would be admitted into an OOM. The topology-aware
+        ``needs_process_count_reduction`` catches it: the live four contexts squeeze the bounded weights off
+        the card, but the model co-resides once the process count is reduced.
         """
         forecast = _sdxl_four_process_forecast()
-        # The weight-dominant gates stay False: this model does not need *sole* residency, only fewer procs.
+        # The weight-dominant gate stays False: this model does not need *sole* residency, only fewer procs.
         assert forecast.needs_exclusive_residency is False
-        assert forecast.requires_sibling_teardown is False
         # The new, topology-aware signal fires: stop a sibling process so the weights fit.
         assert forecast.needs_process_count_reduction is True
 

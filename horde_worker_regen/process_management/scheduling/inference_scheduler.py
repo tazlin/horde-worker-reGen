@@ -1199,7 +1199,6 @@ class InferenceScheduler:
             self._diagnostic_mb_bucket(forecast.marginal_process_overhead_mb),
             forecast.fits_coresident,
             forecast.needs_exclusive_residency,
-            forecast.requires_sibling_teardown,
             forecast.streams_unavoidably,
         )
         suppressed_count = self._scheduler_diagnostic_suppressed_count(f"stream_forecast:{job_id}", state_key)
@@ -1220,7 +1219,6 @@ class InferenceScheduler:
             f"idle_floor={marginal_floor})] -> "
             f"coresident={forecast.fits_coresident}, "
             f"needs_exclusive={forecast.needs_exclusive_residency}, "
-            f"needs_teardown={forecast.requires_sibling_teardown}, "
             f"streams_unavoidably={forecast.streams_unavoidably}"
             f"{self._suppressed_suffix(suppressed_count)}",
         )
@@ -2138,6 +2136,8 @@ class InferenceScheduler:
         if forecast.weights_mb is None or forecast.total_vram_mb is None:
             return True
         target = self._whole_card_ledger.target_process_count(forecast)
+        if target is None:
+            return True
         marginal = forecast._effective_marginal_overhead_mb  # noqa: SLF001 - same budget object owns the estimate.
         extra_contexts = max(0, target - 1) + 1  # surviving inference siblings plus the PP lane context.
         free_with_pp_lane_mb = max(
@@ -2215,11 +2215,13 @@ class InferenceScheduler:
 
         # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
         # than the forecast's lighter resident-weight estimate, for the activation-peak context over-commit the
-        # weight-based gates leave co-resident.
-        target = target_override if target_override is not None else (forecast.max_resident_processes() or 1)
+        # weight-based gates leave co-resident. A forecast that cannot size the card yields no target: the
+        # scale-down is skipped and the live count stands, the same absent-target contract the converge path
+        # and the ledger's target_process_count follow.
+        target = target_override if target_override is not None else forecast.max_resident_processes()
         current = self._process_map.num_loaded_inference_processes(device_index=device_index)
         after = current
-        if target < current:
+        if target is not None and target < current:
             after = self._process_lifecycle.scale_inference_processes(
                 target,
                 device_index=device_index,
@@ -2392,7 +2394,11 @@ class InferenceScheduler:
                 continue
             forecast = state.forecast
             target = self._whole_card_ledger.target_process_count(forecast)
-            if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
+            # A forecast that cannot size the card names no depth to converge on, so the pool is left where it
+            # is rather than collapsed to sole residency on a figure nobody measured. The rest of the
+            # convergence (moving the service lanes off the card) is unaffected by the missing depth.
+            live_count = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if target is not None and live_count > target:
                 self._process_lifecycle.scale_inference_processes(
                     target,
                     device_index=device_index,

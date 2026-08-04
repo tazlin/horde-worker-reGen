@@ -190,7 +190,7 @@ class TestResidencyReclaimsPostProcessLane:
         forecast = scheduler._forecast_streaming(make_job_pop_response(_FLUX_MODEL), "flux_1")
 
         assert forecast.needs_exclusive_residency is True
-        assert forecast.requires_sibling_teardown is False
+        assert forecast.needs_process_count_reduction is False
         assert scheduler._post_process_context_fits_with_residency(forecast, device_index=None) is True
 
     async def test_idle_pp_lane_modules_are_unloaded_for_the_head(self, monkeypatch: pytest.MonkeyPatch) -> None:

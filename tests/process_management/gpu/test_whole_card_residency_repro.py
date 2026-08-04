@@ -87,10 +87,10 @@ class TestStreamForecastClassification:
         assert forecast.fits_after_model_evict is True
         assert forecast.fits_alone is True
         assert forecast.needs_exclusive_residency is True
-        assert forecast.requires_sibling_teardown is False  # dropping sibling models is enough
+        assert forecast.needs_process_count_reduction is False  # dropping sibling models is enough
         assert forecast.streams_unavoidably is False
 
-    def test_flux_fp8_requires_sibling_teardown_when_contexts_overcommit(self) -> None:
+    def test_flux_fp8_needs_sole_residency_when_contexts_overcommit(self) -> None:
         """The blind spot: high instantaneous free yet contexts structurally over-commit the card.
 
         At admit the idle siblings' contexts have not allocated, so ``free_now`` reads ~15GB, but four
@@ -109,7 +109,8 @@ class TestStreamForecastClassification:
         assert forecast.fits_after_model_evict is False  # evicting models does not free the contexts
         assert forecast.fits_alone is True
         assert forecast.needs_exclusive_residency is True
-        assert forecast.requires_sibling_teardown is True
+        # Sole residency is the remedy here, so the partial process-count reduction is not also demanded.
+        assert forecast.needs_process_count_reduction is False
         assert forecast.streams_unavoidably is False
 
     def test_flux_fp16_streams_even_alone(self) -> None:
@@ -122,7 +123,7 @@ class TestStreamForecastClassification:
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - 4 * _PER_PROCESS_OVERHEAD_MB,
         )
         assert forecast.needs_exclusive_residency is False
-        assert forecast.requires_sibling_teardown is False
+        assert forecast.needs_process_count_reduction is False
         assert forecast.streams_unavoidably is True
 
     def test_unknown_or_cold_start_never_blocks(self) -> None:
@@ -136,7 +137,7 @@ class TestStreamForecastClassification:
         )
         assert unknown_weights.fits_coresident is True
         assert unknown_weights.needs_exclusive_residency is False
-        assert unknown_weights.requires_sibling_teardown is False
+        assert unknown_weights.needs_process_count_reduction is False
         cold = StreamForecast(
             weights_mb=11500,
             reserve_mb=2048,
@@ -173,7 +174,7 @@ class TestStreamForecastClassification:
             configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
             marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
         )
-        assert before.requires_sibling_teardown is True
+        assert before.needs_process_count_reduction is True
         # The reserve is the activation working set (peak ~14000 - weights 11500 = 2500 MB), not the flat
         # 2048 floor, so Flux needs sole residency: (16375 - 11500 - 2500) // 1288 == 1, down to one process.
         assert before.max_resident_processes() == 1
@@ -188,7 +189,7 @@ class TestStreamForecastClassification:
             configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
             marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
         )
-        assert after.requires_sibling_teardown is False
+        assert after.needs_process_count_reduction is False
         assert after.fits_coresident is True
 
     def test_reserve_covers_activation_working_set_not_flat_floor(self) -> None:
@@ -658,7 +659,7 @@ class TestWholeCardResidencyState:
 # Both faults trace to one term: forecast reserve = max(base_floor, predict_job_sampling_vram_mb - weights),
 # where the sampling-phase peak scales with width x height x batch. For a moderate-weight SDXL checkpoint
 # that reserve balloons with batch and resolution and can flip the model into needs_exclusive /
-# requires_teardown, so a model occupying a fraction of the card claims the whole device. For a high-res
+# needs_process_count_reduction, so a model occupying a fraction of the card claims the whole device. For a high-res
 # Flux fp8 job the same reserve can edge past free_if_alone and falsely mark it streams_unavoidably, so it
 # skips the clean whole-card branch and is admitted co-resident into a zero-free hang. Exclusivity is gated
 # on the persistent *weight* footprint (the weight-headroom gate) rather than the transient activation peak,
@@ -720,7 +721,7 @@ class TestSdxlStaysCoResident:
         """With siblings resident (low free) the forecast must keep SDXL co-resident, not claim the card.
 
         free_now is low because sibling SD/SDXL models are resident: the condition under which an
-        activation-inflated reserve could otherwise flip SDXL to needs_exclusive / requires_teardown.
+        activation-inflated reserve could otherwise flip SDXL to needs_exclusive / a process-count cut.
         """
         forecast = _live_forecast(
             _SDXL_MODEL,
@@ -731,7 +732,7 @@ class TestSdxlStaysCoResident:
             n_iter=n_iter,
         )
         assert forecast.needs_exclusive_residency is False
-        assert forecast.requires_sibling_teardown is False
+        assert forecast.needs_process_count_reduction is False
         assert forecast.streams_unavoidably is False
 
     def test_sdxl_fits_coresident_when_card_has_room(self) -> None:
@@ -959,7 +960,6 @@ class TestWholeCardTerminalAdmit:
         # The forecast at one live process is genuinely the unsatisfiable-teardown trap.
         forecast = scheduler._forecast_streaming(head_job, _FLUX_BASELINE)
         assert forecast.needs_exclusive_residency is True
-        assert forecast.requires_sibling_teardown is True
         assert forecast.max_resident_processes() == 1  # already at target; no sibling left to stop
 
         admitted = any(scheduler.preload_models() for _ in range(30))
@@ -1157,7 +1157,6 @@ class TestSdxlStartupResidencyRace:
         forecast = scheduler._forecast_streaming(head_job, _SDXL_BASELINE)
 
         assert forecast.needs_exclusive_residency is False
-        assert forecast.requires_sibling_teardown is False
         assert forecast.needs_process_count_reduction is False, (
             "a 4.9GB SDXL checkpoint with ~20GB free must co-reside, not demand a sibling-process teardown; "
             f"free_after_model_evict modeled as {forecast.free_after_model_evict_mb} MB is a phantom shortfall"

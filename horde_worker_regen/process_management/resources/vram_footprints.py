@@ -15,6 +15,11 @@ over-prices an isolated sampler (mixed operation is designed: a stage fault re-r
 monolithic). Monolithic peaks are observed from child memory reports; isolated-sampler peaks are observed
 from the disaggregation orchestrator at sample completion.
 
+Not every stage is an activation peak. :attr:`FootprintStage.RESIDENT` and :attr:`FootprintStage.SAFETY`
+record steady device charges (a loaded checkpoint's weights, the safety process's residency) observed while
+nothing is running, and they live in the same store under the same raise-only watermark contract: a consumer
+pricing "what does this already cost the card" reads them exactly as it reads a sampling peak.
+
 Thread-safety: the store is written and read from the parent's single-threaded control loop (the same
 loop that drains child memory reports), so no locking is required. It holds nothing across runs; every
 worker start begins with cold keys that fall back to the static seed until a peak is observed.
@@ -94,21 +99,54 @@ class FootprintStage(enum.StrEnum):
     """The text-encode (or VAE-encode) stage."""
     POST_PROCESS = "post_process"
     """The post-processing stage (upscale/face-fix)."""
+    RESIDENT = "resident"
+    """A loaded checkpoint's resident device footprint: the weights (plus whatever support components the
+    checkpoint force-loads) a slot holds while it is idle, with no activation on the card. Physically distinct
+    from the sampling stages for the same reason :attr:`SAMPLE_ISOLATED` is distinct from :attr:`SAMPLE`: a
+    sampling peak includes transient activation that is released between jobs, so folding one into the resident
+    key would permanently over-price what a merely-loaded slot costs and deny co-residency the card physically
+    holds. Keyed per checkpoint (see :attr:`FootprintKey.checkpoint`), since weights are a property of the
+    specific file rather than of the architecture."""
+    SAFETY = "safety"
+    """The safety process's device footprint (its resident classifier weights plus its CUDA context).
+
+    Not tied to any generation model or request, so its key carries :data:`SAFETY_PROCESS_BASELINE` and no
+    resolution band. What a consumer prices when deciding whether safety can sit on the card beside a job."""
+
+
+SAFETY_PROCESS_BASELINE = "safety_process"
+"""The :attr:`FootprintKey.model_baseline` token used for :attr:`FootprintStage.SAFETY` observations.
+
+The safety process holds classifier weights that belong to no generation baseline, so its footprint is
+recorded under this fixed token rather than against whatever model happens to be loaded elsewhere."""
 
 
 class FootprintKey(BaseModel):
     """The identity a learned footprint is recorded under.
 
-    Frozen so an instance is hashable and usable as a dict key. Two requests sharing all four fields are
+    Frozen so an instance is hashable and usable as a dict key. Two observations sharing every field are
     treated as the same footprint population.
+
+    Which fields carry information depends on the stage, because the quantities scale with different things:
+
+    - Activation stages (:attr:`FootprintStage.SAMPLE` and the disaggregated lane stages) are keyed by
+      baseline and resolution band, and leave ``checkpoint`` unset: the activation peak scales with the
+      architecture and the request size, so every checkpoint of a baseline shares one population and a
+      per-checkpoint split would only fragment it.
+    - :attr:`FootprintStage.RESIDENT` carries the checkpoint name and no resolution band: resident weights
+      are a property of the specific file (two SDXL checkpoints differ by gigabytes) and do not move with
+      the request size.
+    - :attr:`FootprintStage.SAFETY` carries neither, keyed under :data:`SAFETY_PROCESS_BASELINE`.
     """
 
     model_config = ConfigDict(frozen=True)
 
     model_baseline: str
     """The model's baseline category (e.g. ``stable_diffusion_xl``); peaks vary sharply by architecture."""
-    resolution_bucket: ResolutionBucket
-    """The resolution band (by maximum dimension); the activation peak scales with it."""
+    resolution_bucket: ResolutionBucket | None
+    """The resolution band (by maximum dimension); the activation peak scales with it.
+
+    None for a stage whose footprint does not scale with the request size (resident weights, safety)."""
     platform: str
     """The host platform token (``win32`` / ``linux`` from ``sys.platform``).
 
@@ -117,6 +155,10 @@ class FootprintKey(BaseModel):
     is not a valid prior for the other."""
     stage: FootprintStage
     """The pipeline stage the peak was observed for."""
+    checkpoint: str | None = None
+    """The specific checkpoint the footprint belongs to, or None when the stage is baseline-keyed.
+
+    Defaulted so a key that predates the distinction (every activation stage) is written unchanged."""
 
 
 class _FootprintObservation(BaseModel):
@@ -150,15 +192,16 @@ class LearnedFootprintStore:
         self._observations: dict[FootprintKey, _FootprintObservation] = {}
 
     def observe_peak(self, key: FootprintKey, peak_reserved_mb: float) -> None:
-        """Fold one observed device-memory peak into the running statistics for ``key``.
+        """Fold one observed device-memory figure into the running statistics for ``key``.
 
         Updates both an EWMA (alpha ``0.3``, smoothed central tendency for observability) and a
-        max-watermark (the estimate's undershoot-proof basis). A non-positive peak is ignored: a zero or
+        max-watermark (the estimate's undershoot-proof basis). A non-positive figure is ignored: a zero or
         negative reading carries no footprint information and would only pollute the average.
 
         Args:
             key (FootprintKey): The footprint identity to record under.
-            peak_reserved_mb (float): The peak reserved device memory (MB) observed for this key.
+            peak_reserved_mb (float): The device memory (MB) observed for this key: the reserved peak for an
+                activation stage, the steady reserved figure for a resident stage.
         """
         if peak_reserved_mb <= 0:
             return

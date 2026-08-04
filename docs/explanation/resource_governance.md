@@ -229,6 +229,15 @@ restoring siblings afterward) remain scheduler methods, but they read and write 
 the machine. A resident heavy head goes through the same machine-backed readiness gate as a newly-loaded
 head, so an already-resident whole-card model cannot co-sample while sibling models still occupy the card.
 
+The process target is a *measured* verdict, so it can be absent. When the forecast cannot size the card (no
+reported total VRAM, or no per-process overhead to reason about) the machine reports no target rather than
+one, and a caller leaves the live process count where it is: collapsing to sole residency there would tear
+the pool down on the strength of a figure nobody measured, on exactly the hosts where the measurement is
+missing. Readiness then turns on the residency's other legs (safety and the service lanes off the card, the
+live weight fit or the drain backstop) instead of waiting forever on a depth that was never named. A
+whole-card-intent baseline is the deliberate exception: it still sizes to one when its footprint cannot be
+sized at all, since its tier asserts it never shares the card well.
+
 The dispatch gate releases the head either on a live free-VRAM reading that genuinely holds the weights, or,
 once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized
 for a card every other context has left, safety included, so the scheduler passes in the charge of whatever

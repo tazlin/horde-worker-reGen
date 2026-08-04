@@ -57,8 +57,12 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
-from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.resources.resource_budget import (
+    CommittedReserveLedger,
+    platform_context_constant_mb,
+)
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    SAFETY_PROCESS_BASELINE,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
@@ -115,6 +119,31 @@ and the scheduler preloading the next model, and the detector deliberately holds
 preload (its anti-flap guard keeps it set while a process is starting). Requiring the deadlock to outlast
 any normal model-load / churn window before it drives save-our-ship restores the supervisor's
 definitive-signal assumption, so a head whose model is merely loading is not faulted as unrecoverable."""
+
+
+_RESIDENT_OBSERVATION_SETTLE_SECONDS = 15.0
+"""How long an inference slot's model residency must have been stable before its steady allocator
+reservation counts as a resident-footprint observation.
+
+A slot's reservation is still in motion around a model-load state change: the incoming weights stream in
+over seconds and the outgoing model's blocks are released asynchronously, so a reading taken across that
+window describes neither model. The child also samples its memory report on a fixed interval, so a reading
+that arrives just after a load can predate it. Three of those report intervals is long enough that the load
+has quiesced and any straddling reading has been superseded, while still leaving an ordinary idle slot
+observable well before it is given its next job."""
+
+_RESIDENT_OBSERVATION_IDLE_STATES = frozenset(
+    {
+        HordeProcessState.WAITING_FOR_JOB,
+        HordeProcessState.PRELOADED_MODEL,
+        HordeProcessState.INFERENCE_COMPLETE,
+    },
+)
+"""Inference-slot states in which a loaded model sits on the card with no activation against it.
+
+The resident footprint is the weights alone: a slot that is priming, sampling, or post-processing holds
+transient activation on top of them, which belongs to the sampling stages and would permanently over-price
+the resident watermark if folded into it."""
 
 
 def _no_aux_holds() -> set[GenerationID]:
@@ -310,6 +339,14 @@ class MessageDispatcher:
         stays set is a read that cannot return, which the corruption watchdog reads."""
         self._on_channel_corrupt: Callable[[str], None] | None = None
         self._channel_corruption_reported = False
+        self._last_model_load_change_at: dict[int, float] = {}
+        """Epoch time each process last had a child-confirmed model-load state change.
+
+        The settle anchor for resident-footprint observation. Kept here rather than on the process map
+        because this handler is where the child's model-state messages land: every load, unload, and load
+        failure the child reports passes through it, which is the transition that moves a slot's allocator
+        reservation. A slot with no entry has never confirmed a residency, so it is never observed.
+        """
 
     def take_safety_verdicts_known_lost(self) -> set[GenerationID]:
         """Return and clear the jobs whose safety verdict was dropped with their launch retired."""
@@ -390,10 +427,12 @@ class MessageDispatcher:
         self._on_inference_step = handler
 
     def set_footprint_store(self, store: LearnedFootprintStore) -> None:
-        """Register the learned-footprint store to observe measured peaks into (shadow-only).
+        """Register the learned-footprint store to observe measured device footprints into (shadow-only).
 
-        Once set, each memory report cleanly attributable to a running inference job records its peak
-        into the store. The store feeds no decision path; this is measurement for the future arbiter.
+        Once set, each memory report is offered to the store under whichever footprint it cleanly attributes
+        to: a running inference job's sampling peak, an idle slot's resident weights, or the safety process's
+        at-rest residency. Reports that attribute to none of those are left unrecorded. The store feeds no
+        decision path; this is measurement for the future arbiter.
         """
         self._footprint_store = store
 
@@ -866,6 +905,8 @@ class MessageDispatcher:
             held_components=message.held_components,
         )
         self._observe_footprint_peak(message)
+        self._observe_resident_footprint(message)
+        self._observe_safety_footprint(message)
 
     def _observe_footprint_peak(self, message: HordeProcessMemoryMessage) -> None:
         """Record a reported VRAM peak into the learned-footprint store, if cleanly attributable.
@@ -917,6 +958,108 @@ class MessageDispatcher:
             stage=FootprintStage.SAMPLE,
         )
         store.observe_peak(key, float(peak_mb))
+
+    def _model_residency_settled(self, process_id: int, *, sampled_at: float | None) -> bool:
+        """Whether ``process_id``'s model residency has been stable long enough to be measured.
+
+        Measured from the last model-load state change the child confirmed, against the time the reading was
+        sampled rather than the time it was handled, so a report queued behind a burst is judged by when the
+        allocator was actually read. A slot with no confirmed residency change reads unsettled: there is no
+        evidence its reservation has come to rest, and a guess in the permissive direction would fold a
+        mid-load reading into a raise-only watermark.
+        """
+        changed_at = self._last_model_load_change_at.get(process_id)
+        if changed_at is None:
+            return False
+        reference = time.time() if sampled_at is None else sampled_at
+        return (reference - changed_at) >= _RESIDENT_OBSERVATION_SETTLE_SECONDS
+
+    def _observe_resident_footprint(self, message: HordeProcessMemoryMessage) -> None:
+        """Record an idle inference slot's resident weight footprint into the learned-footprint store.
+
+        The resident figure is what a loaded checkpoint costs the card with nothing running against it, which
+        a consumer needs in order to price keeping (or displacing) a slot that already holds a model. It is
+        taken only from the unambiguous case: an inference slot in an idle state, holding a model whose
+        baseline is known, with no tracked job of its own in progress, whose residency has been stable for
+        :data:`_RESIDENT_OBSERVATION_SETTLE_SECONDS`. Anything else is a slot whose reservation still holds
+        activation or is still moving, and folding either into a raise-only watermark would over-price
+        residency permanently.
+
+        The charge is the process's own allocator reservation plus the platform's fixed CUDA-context
+        constant, which together are its full device footprint. Device-view readings (``vram_usage_mb``) are
+        deliberately not consulted: they report device-wide occupancy on one platform and a per-process view
+        on another, so they are never a per-process charge.
+        """
+        store = self._footprint_store
+        if store is None:
+            return
+
+        reserved_mb = message.process_reserved_mb
+        if reserved_mb is None or reserved_mb <= 0:
+            return
+
+        process_info = self._process_map.get(message.process_id)
+        if process_info is None or process_info.process_type is not HordeProcessType.INFERENCE:
+            return
+        if process_info.last_process_state not in _RESIDENT_OBSERVATION_IDLE_STATES:
+            return
+
+        model_name = process_info.loaded_horde_model_name
+        if model_name is None:
+            return
+
+        job = process_info.last_job_referenced
+        if job is not None and job in self._job_tracker.jobs_in_progress:
+            return
+
+        if not self._model_residency_settled(message.process_id, sampled_at=message.sampled_at):
+            return
+
+        baseline = self._model_metadata.get_baseline(model_name)
+        if baseline is None:
+            return
+
+        key = FootprintKey(
+            model_baseline=str(baseline),
+            resolution_bucket=None,
+            platform=sys.platform,
+            stage=FootprintStage.RESIDENT,
+            checkpoint=model_name,
+        )
+        store.observe_peak(key, platform_context_constant_mb() + float(reserved_mb))
+
+    def _observe_safety_footprint(self, message: HordeProcessMemoryMessage) -> None:
+        """Record the safety process's at-rest device footprint into the learned-footprint store.
+
+        A GPU-resident safety process reports its allocator fields like any other GPU child, so what it
+        actually costs the card is measurable rather than assumed. The steady reservation is folded, never
+        the peak: an evaluation's transient spike is reclaimable and is not what safety costs while it waits,
+        so pricing residency from it would keep safety off the card long after it would fit. For the same
+        reason a busy safety process is skipped, since its reservation still holds the evaluation it is
+        running. The context constant is added because the residency question is about the whole device
+        footprint, the context included, which is only freed by the process exiting.
+        """
+        store = self._footprint_store
+        if store is None:
+            return
+
+        reserved_mb = message.process_reserved_mb
+        if reserved_mb is None or reserved_mb <= 0:
+            return
+
+        process_info = self._process_map.get(message.process_id)
+        if process_info is None or process_info.process_type is not HordeProcessType.SAFETY:
+            return
+        if process_info.is_process_busy():
+            return
+
+        key = FootprintKey(
+            model_baseline=SAFETY_PROCESS_BASELINE,
+            resolution_bucket=None,
+            platform=sys.platform,
+            stage=FootprintStage.SAFETY,
+        )
+        store.observe_peak(key, platform_context_constant_mb() + float(reserved_mb))
 
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:
         """Handle a process state change message."""
@@ -1104,6 +1247,10 @@ class MessageDispatcher:
 
     def _handle_model_state_change(self, message: HordeModelStateChangeMessage) -> None:
         """Handle a model state change message."""
+        # Every reported transition (load, unload, failure) moves the slot's allocator reservation, so it
+        # restarts the settle window resident-footprint observation measures from.
+        self._last_model_load_change_at[message.process_id] = time.time()
+
         if message.horde_model_state == ModelLoadState.FAILED:
             # The model could not be loaded. Do not record it as resident anywhere: clear any LOADING entry
             # this process held for it (left by the PRELOADING_MODEL message moments earlier) so the model is

@@ -129,6 +129,19 @@ The arbiter keeps four concerns deliberately separate:
   reports; isolated-sampler peaks from the disaggregation orchestrator at sample completion. A cold key
   prices at the static seed unchanged, so a first-of-kind job and small-resolution buckets keep their
   smaller peaks and their concurrency.
+
+    Not every footprint is an activation peak. The same store also carries two at-rest stages under the same
+    raise-only contract: `RESIDENT` (a loaded checkpoint's weights, keyed per checkpoint rather than per
+    baseline, since two checkpoints of one architecture differ by gigabytes and weights do not move with the
+    request size) and `SAFETY` (the safety process's device residency). Both are observed from allocator
+    bookkeeping only, as the process's own reservation plus the platform's fixed CUDA-context constant;
+    device-view VRAM readings are never folded in, since they report device-wide occupancy on one platform
+    and a per-process view on the other. The gates are strict in both cases, because a raise-only watermark
+    keeps whatever it is given: a resident observation is taken only from an idle, model-loaded inference
+    slot with no tracked job of its own in progress whose residency has been stable for a short settle
+    window (a reservation is still in motion for seconds around a model load), and a safety observation only
+    from a safety process that is not mid-evaluation, folding its steady reservation rather than its peak,
+    because an evaluation's spike is reclaimable and is not what safety costs the card while it waits.
 - **Arbitration** evaluates the
   [ledger-driven admission identity][horde_worker_regen.process_management.resources.admission_identity]
   plus the concurrent-sampling headroom, then resolves an actuator escalation ladder. It never overcommit-admits

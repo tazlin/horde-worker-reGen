@@ -1233,10 +1233,11 @@ measured shortfall, so neither path marks the job exclusive or cycles service la
 machinery. The reduction actuator checks the target against the current live count again before any side
 effects, preserving idempotence when a command becomes stale after an earlier tick already shrank the pool.
 
-Both of those teardown paths (the streaming forecast's `needs_teardown` and the verdict-driven context
-reduction) are gated on the demand being **trustworthy** before the worker engages the disruptive whole-card
-machinery (reserve the device, move safety off-GPU, hold through a cooldown). A teardown is trusted when the
-model is genuinely **card-demanding**; its weights-plus-floor occupy a meaningful fraction of total VRAM, or
+Both of those teardown paths (the streaming forecast's `needs_process_count_reduction` and the
+verdict-driven context reduction) are gated on the demand being **trustworthy** before the worker engages
+the disruptive whole-card machinery (reserve the device, move safety off-GPU, hold through a cooldown). A
+teardown is trusted when the model is genuinely **card-demanding**; its weights-plus-floor occupy a
+meaningful fraction of total VRAM, or
 its baseline wants the whole card on intent **or** when the per-additional-context cost was actually
 *measured* (a probe delta or a clean idle floor), so the contention it rests on is real. When neither holds,
 a model whose weights are a small fraction of the card on a host that could not measure the marginal. The

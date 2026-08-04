@@ -213,11 +213,19 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         needs_teardown = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
         return enabled and needs_teardown and is_head_blocker
 
-    def target_process_count(self, forecast: StreamForecast | None) -> int:
-        """Return the live inference-process target for a held residency."""
+    def target_process_count(self, forecast: StreamForecast | None) -> int | None:
+        """Return the live inference-process target for a held residency, or None when it cannot be sized.
+
+        None means the forecast cannot say how many contexts the card holds (no weight estimate, no reported
+        total VRAM, or no per-process overhead to reason about), which is a different statement from "one".
+        Coercing it to sole residency tears the pool down to a single process on the strength of a figure
+        nobody measured, on exactly the hosts where the measurement is missing. A caller that cannot size the
+        card leaves the pool where it is instead; the residency's other gates (the live weight fit and the
+        drain backstop) still govern when the head loads.
+        """
         if forecast is None:
-            return 1
-        return forecast.max_resident_processes() or 1
+            return None
+        return forecast.max_resident_processes()
 
     def teardown_complete(
         self,
@@ -251,8 +259,14 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         configuration forbids moving it off-GPU). The caller supplies the figure because which contexts stay
         is a configuration and lifecycle fact, not residency state; zero (nothing stays) is the plain
         sole-residency guarantee.
+
+        A forecast that cannot size the card (:meth:`target_process_count` returns None) leaves the
+        process-count leg satisfied: no teardown depth was ever demanded of the pool, so waiting on one would
+        park the head forever. The remaining legs still gate, so the head is admitted on a measured fit or the
+        drain backstop rather than on the unsized count.
         """
-        if loaded_process_count > self.target_process_count(forecast):
+        target = self.target_process_count(forecast)
+        if target is not None and loaded_process_count > target:
             return False
         if safety_pause_required and not safety_paused:
             return False

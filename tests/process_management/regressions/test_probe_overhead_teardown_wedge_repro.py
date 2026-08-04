@@ -162,7 +162,7 @@ class TestProbeOverheadTeardownWedge:
     ) -> None:
         """The SDXL head must be servable by evicting a sibling *model*, not by stopping a sibling *process*.
 
-        ``high_memory_mode`` keeps every process resident, so ``requires_sibling_teardown`` /
+        ``high_memory_mode`` keeps every process resident, so ``needs_process_count_reduction`` /
         ``needs_exclusive_residency`` (both of which can only be satisfied by stopping an *idle* sibling
         process) are unsatisfiable and wedge the worker. With the device's true idle residency the model fits
         once a sibling model is evicted, a remedy ``high_memory_mode`` permits, so neither teardown flag
@@ -189,7 +189,7 @@ class TestProbeOverheadTeardownWedge:
         assert forecast.reserve_mb == pytest.approx(_SDXL_SAMPLING_PEAK_MB - _SDXL_WEIGHTS_MB)
         # The wedge geometry: an over-counted overhead would demand a sibling-process teardown no idle process
         # could provide. With the true residency it must not.
-        assert forecast.requires_sibling_teardown is False
+        assert forecast.needs_process_count_reduction is False
         assert forecast.needs_exclusive_residency is False
         # The correct remedy under the true residency: evict a sibling model (and in fact it co-resides).
         assert forecast.fits_after_model_evict is True

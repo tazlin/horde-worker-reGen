@@ -514,17 +514,6 @@ class StreamForecast:
         return not self.fits_coresident and self._persistent_weights_dominant
 
     @property
-    def requires_sibling_teardown(self) -> bool:
-        """The model cannot fit even after sibling models are evicted, fits alone, and is weight-dominant.
-
-        When True, dropping the siblings' resident models is not enough: their fixed per-process contexts
-        themselves over-commit the device, so the scheduler must *stop* idle sibling processes to reclaim
-        that VRAM (a context is only freed by the process exiting, never by emptying the allocator cache).
-        Gated on ``_weights_dominant`` so only a genuinely card-filling model triggers a process teardown.
-        """
-        return self.known and not self.fits_after_model_evict and self.fits_alone and self._weights_dominant
-
-    @property
     def needs_process_count_reduction(self) -> bool:
         """Return True when the model fits alone but not after sibling models are evicted.
 
@@ -535,10 +524,9 @@ class StreamForecast:
         This catches an over-commit the weight-dominant gate misses: four ~4 GB CUDA contexts on a 24 GB card
         leave under 4 GB free even with every sibling model evicted, below an SDXL checkpoint's ~4.9 GB of
         weights, so the model literally cannot load until a sibling *process* stops. ``_weights_dominant``
-        (and therefore
-        ``needs_exclusive_residency`` / ``requires_sibling_teardown``) miss it: their self-plus-one-sibling
-        ceiling judges the moderate weights "not card-filling", so no teardown is triggered and the head is
-        deferred until the old starvation backstop admitted it into an OOM.
+        (and therefore ``needs_exclusive_residency``) misses it: its self-plus-one-sibling ceiling judges the
+        moderate weights "not card-filling", so no teardown is triggered and the head is deferred until the
+        old starvation backstop admitted it into an OOM.
 
         Keyed on the *bounded weight* footprint (``_fits_weights``), not the activation-inclusive peak, so a
         transient activation spike whose weights still fit after model eviction is left co-resident rather than
@@ -655,12 +643,12 @@ class StreamForecast:
         alone = f"{self.free_if_alone_mb:.0f}" if self.free_if_alone_mb is not None else "?"
         if not self.fits_alone:
             verdict = "weights overflow the card alone: streams unavoidably"
-        elif self.requires_sibling_teardown:
-            verdict = "weight-dominant: needs idle sibling processes stopped (their contexts over-commit the card)"
         elif self.needs_exclusive_residency and self.wants_whole_card and self.fits_coresident:
             verdict = "whole-card baseline: sole residency on intent (evict sibling models)"
         elif self.needs_exclusive_residency:
             verdict = "weight-dominant: needs sole residency (evict sibling models)"
+        elif self.needs_process_count_reduction:
+            verdict = "needs idle sibling processes stopped (their live contexts over-commit the card)"
         else:
             verdict = "activation peak only (not weight-dominant): co-resident after evicting a sibling model"
         return (

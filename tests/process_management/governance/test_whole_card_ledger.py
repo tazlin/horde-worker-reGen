@@ -215,6 +215,56 @@ class TestWholeCardResidencyMachine:
         assert not machine.residency_demanded(forecast, enabled=False, is_head_blocker=True)
         assert not machine.residency_demanded(forecast, enabled=True, is_head_blocker=False)
 
+    def test_an_unsized_forecast_names_no_process_target(self) -> None:
+        """A forecast that cannot size the card reports None, which is not the same statement as one.
+
+        Sole residency is a measured verdict. Where the card was never sized (no reported total VRAM, or no
+        forecast at all), reporting 1 would hand the caller a teardown depth nobody measured.
+        """
+        machine = WholeCardResidencyMachine()
+        unsized = StreamForecast(
+            weights_mb=12_000.0,
+            reserve_mb=2_000.0,
+            free_now_mb=1_000.0,
+            free_if_alone_mb=14_000.0,
+            free_after_model_evict_mb=10_000.0,
+            total_vram_mb=None,
+            per_process_overhead_mb=1_000.0,
+        )
+        assert machine.target_process_count(unsized) is None
+        assert machine.target_process_count(None) is None
+
+    def test_an_unsized_target_leaves_the_process_count_leg_satisfied(self) -> None:
+        """With no depth to converge on, readiness turns on the other legs rather than parking forever."""
+        machine = WholeCardResidencyMachine()
+        unsized = StreamForecast(
+            weights_mb=12_000.0,
+            reserve_mb=2_000.0,
+            free_now_mb=1_000.0,
+            free_if_alone_mb=14_000.0,
+            free_after_model_evict_mb=10_000.0,
+            total_vram_mb=None,
+            per_process_overhead_mb=1_000.0,
+        )
+        # Four live processes and no target: the count cannot gate, but the live weight fit still can.
+        assert machine.teardown_complete(
+            unsized,
+            loaded_process_count=4,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+        # The other legs keep gating: safety has not left the card yet.
+        assert not machine.teardown_complete(
+            unsized,
+            loaded_process_count=4,
+            safety_pause_required=True,
+            safety_paused=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+
     def test_teardown_complete_requires_target_and_safety_then_live_fit_or_backstop(self) -> None:
         """The readiness query mirrors the scheduler's structural teardown gate."""
         machine = WholeCardResidencyMachine()
