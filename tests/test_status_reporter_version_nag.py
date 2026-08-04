@@ -9,6 +9,7 @@ from loguru import logger
 
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.update_check import NEWER_RELEASE_ENV_VAR
+from horde_worker_regen.utils import get_system_appropriate_updater
 
 
 def _stub_bridge_data() -> SimpleNamespace:
@@ -86,7 +87,7 @@ def test_newer_release_env_var_triggers_the_nag(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv(NEWER_RELEASE_ENV_VAR, "99.0.0")
     blob = "\n".join(_call_print_warnings())
     assert "newer AI Worker release (v99.0.0)" in blob
-    assert "update.cmd" in blob
+    assert get_system_appropriate_updater() in blob
 
 
 def test_required_version_takes_precedence_over_newer_release(monkeypatch: pytest.MonkeyPatch) -> None:
