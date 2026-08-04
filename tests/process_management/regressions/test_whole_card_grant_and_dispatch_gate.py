@@ -27,6 +27,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
@@ -51,6 +52,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     _ESTABLISH_WINDOW_LIMIT,
     _ESTABLISH_WINDOW_SECONDS,
     _GRACE_BUDGET_SECONDS,
+    _GRACE_BUDGET_WINDOW_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
@@ -628,9 +630,10 @@ class TestChurnGovernors:
     """Establishment rate, grace budget, and the unresolved-flag disclosure bound whole-card churn.
 
     Sole residency is expensive to enter and to leave (every sibling process the establishment stopped is
-    respawned on the way out, ~20s each), and each cycle also claims a window in which the recovery supervisor
+    respawned on the way out, ~20s each), and each cycle also opens a window in which the recovery supervisor
     ignores a held queue. Left ungoverned, a demand signal that oscillates rebuilds the pool continuously and
-    keeps the supervisor disarmed the whole time. These pin the two governors that bound it, plus the
+    keeps the supervisor disarmed the whole time. Both governors act at admission, deferring a new
+    establishment rather than withdrawing an excuse from one already under way. These pin them, plus the
     disclosure for a residency that is off because its flag never resolved.
     """
 
@@ -743,36 +746,127 @@ class TestChurnGovernors:
         )
         assert scheduler.is_whole_card_residency_active() is True
 
-    def test_repeated_establish_restore_cycles_exhaust_the_recovery_grace_budget(self) -> None:
-        """Churn cannot keep re-arming the wedge grace: past the rolling budget the claim is refused.
+    @staticmethod
+    def _spend_the_grace_budget(
+        scheduler: InferenceScheduler,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+    ) -> None:
+        """Cycle establish/restore on the single-GPU card until its rolling grace budget is spent.
 
-        Each cycle charges its establish and restore windows against the card's budget. In the field the cycles
-        are spread by the establishment rate limiter; the wall time between them is collapsed here because the
-        budget's window is what bounds the spend, not the spacing.
+        Each cycle charges its establish and restore windows against the card's budget. In the field the
+        cycles are spread by the establishment rate limiter; the wall time between them is collapsed here
+        because the budget's window is what bounds the spend, not the spacing.
+        """
+        cycle_cost = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
+        for _index in range(int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1):
+            scheduler._establish_whole_card_residency(job, forecast, announce=True)
+            scheduler._whole_card_ledger.state_for(None).cooldown_until = 0.0
+            scheduler._restore_siblings_after_whole_card()
+        assert scheduler._whole_card_ledger.grace_budget_exhausted(None, now=time.time()) is True, (
+            "precondition: repeated establish/restore cycles have spent the card's rolling grace budget"
+        )
+
+    @staticmethod
+    def _clear_the_establishment_rate_history(scheduler: InferenceScheduler) -> None:
+        """Age the card's recorded establishments out of the rate limiter's window, leaving charges intact.
+
+        The two governors are independent: this isolates the grace budget's own effect from the limiter's.
+        """
+        history = scheduler._whole_card_ledger.state_for(None).establishments
+        aged = [stamp - (_ESTABLISH_WINDOW_SECONDS + 1.0) for stamp in history]
+        history.clear()
+        history.extend(aged)
+        assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is False, (
+            "precondition: the establishment rate limiter is not what gates the next ask"
+        )
+
+    def test_an_in_flight_establishment_keeps_its_grace_for_the_whole_window(self) -> None:
+        """A granted window excuses the held queue for its full duration however much the card has spent.
+
+        The establishment is a teardown the scheduler commanded. Revoking its excuse part-way would have the
+        recovery supervisor classify that deliberate action as a structural queue wedge and soft-reset the
+        pools mid-teardown, which is the churn the budget is supposed to prevent, not cause.
         """
         scheduler, _available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
-        cycle_cost = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
-        cycles = int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1
-
-        for index in range(cycles):
-            scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
-            spent = index * cycle_cost + _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
-            assert scheduler.whole_card_residency_grace_active() is (spent <= _GRACE_BUDGET_SECONDS), (
-                "grace is granted while the card's rolling budget still covers the window it just opened"
-            )
-            scheduler._whole_card_ledger.state_for(None).cooldown_until = 0.0
-            scheduler._restore_siblings_after_whole_card()
+        self._spend_the_grace_budget(scheduler, flux_job, forecast)
 
         scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
-        assert scheduler._whole_card_ledger.grace_window_active(
-            now=time.time(),
-            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
-        ), "precondition: the fresh establishment is nominally inside its grace window"
+        state = scheduler._whole_card_ledger.state_for(None)
+        # Retire the preceding cycle's restore window so the establish window alone answers the question.
+        state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        # Walk the window by backdating the grant, which leaves the recorded charges (and so the spend) alone.
+        for elapsed in (0.0, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS / 2.0, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS - 5.0):
+            state.established_at = time.time() - elapsed
+            assert scheduler.whole_card_residency_grace_active() is True, (
+                "the granted establish window must hold for its whole duration even over budget"
+            )
+        state.established_at = time.time() - (_WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
         assert scheduler.whole_card_residency_grace_active() is False, (
-            "with the budget spent the recovery supervisor must be re-armed even inside a nominal grace window"
+            "the window's own duration is the liveness bound on a residency that never completes"
         )
+
+    def test_a_spent_grace_budget_defers_a_new_establishment(self) -> None:
+        """With the budget spent the card may not open another establish window, so the head is deferred.
+
+        Deferring keeps the head on the whole-card path so it re-asks, exactly as the establishment rate
+        limiter does; the card simply stops churning until the spend ages out of the rolling window.
+        """
+        scheduler, available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        self._spend_the_grace_budget(scheduler, flux_job, forecast)
+        self._clear_the_establishment_rate_history(scheduler)
+
+        with patch.object(inference_scheduler_module.logger, "warning") as warning:
+            for _ask in range(3):
+                outcome = scheduler._decide_whole_card_demand(
+                    flux_job,
+                    available_process,
+                    forecast,
+                    None,
+                    is_head_blocker=True,
+                    target_device_index=None,
+                )
+                assert outcome is _WholeCardDemandOutcome.DEFER
+        assert scheduler.is_whole_card_residency_active() is False, "the deferral must not have claimed the card"
+        assert warning.call_count == 1, "the refusal is disclosed on the transition, not once per scheduling cycle"
+
+    def test_the_grace_budget_replenishes_and_admission_resumes(self) -> None:
+        """As the charges age out of the rolling window the card may establish again."""
+        scheduler, available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        self._spend_the_grace_budget(scheduler, flux_job, forecast)
+        self._clear_the_establishment_rate_history(scheduler)
+
+        charges = scheduler._whole_card_ledger.state_for(None).grace_charges
+        aged = [(granted_at - (_GRACE_BUDGET_WINDOW_SECONDS + 1.0), seconds) for granted_at, seconds in charges]
+        charges.clear()
+        charges.extend(aged)
+        assert scheduler._whole_card_ledger.grace_budget_exhausted(None, now=time.time()) is False
+
+        scheduler._decide_whole_card_demand(
+            flux_job,
+            available_process,
+            forecast,
+            None,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        assert scheduler.is_whole_card_residency_active() is True
+
+    def test_a_restore_window_is_granted_even_with_the_budget_spent(self) -> None:
+        """The restore churn keeps its excuse unconditionally: the budget gates establishments only."""
+        scheduler, _available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        self._spend_the_grace_budget(scheduler, flux_job, forecast)
+
+        state = scheduler._whole_card_ledger.state_for(None)
+        assert state.restore_at != 0.0, "precondition: the last cycle ended in a restore"
+        state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS - 5.0)
+        assert scheduler.whole_card_residency_grace_active() is True
+        state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        assert scheduler.whole_card_residency_grace_active() is False
 
     def test_an_unresolved_residency_flag_is_disclosed_once(self) -> None:
         """A flag that never resolved reads as disabled, which is worth saying out loud exactly once.

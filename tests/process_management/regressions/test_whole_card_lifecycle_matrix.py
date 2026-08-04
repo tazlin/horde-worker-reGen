@@ -562,13 +562,19 @@ def test_residency_scenario_matrix_preserves_lifecycle_invariants(case: Residenc
             drain_backstop_elapsed=False,
         )
         dispatched += 1
-        exhausted = machine.grace_budget_exhausted(0, now=now)
+        state = machine.state_for(0)
+        window_open = (state.model is not None and (now - state.established_at) < 120.0) or (
+            state.restore_at != 0.0 and (now - state.restore_at) < 60.0
+        )
         grace_active = machine.grace_active(
             now=now,
             establish_grace_seconds=120.0,
             restore_grace_seconds=60.0,
         )
-        assert not (exhausted and grace_active)
+        assert grace_active is window_open, (
+            "the excuse tracks the granted window alone: the rolling grace budget gates a new establishment "
+            "at admission and never withdraws the window of one already under way"
+        )
         now += 15.0
 
     if machine.state_for(0).model is not None:

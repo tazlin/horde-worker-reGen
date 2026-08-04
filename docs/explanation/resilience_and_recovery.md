@@ -619,9 +619,12 @@ that one verdict.
 Each of those excuses is bounded by its own window, but a window alone is not enough for the whole-card one:
 an establish/restore cycle can re-arm a fresh window faster than the previous one expires, which would leave
 the supervisor disarmed for as long as the churn continued. So the whole-card grace is additionally charged
-against a per-card rolling budget. Once the budget is spent the claim is refused even inside a nominal
-window: the supervisor is re-armed and a held queue is judged on its merits, and the scheduler logs the
-refusal once so the operator can see that residency churn, not a genuine setup, is what held the queue. See
+against a per-card rolling budget, and the budget is spent at admission. While a card is over its allowance
+it may not open another establish window at all: the new establishment is deferred, the pool stops churning,
+and the scheduler logs the deferral once so the operator can see that residency churn, not a genuine setup,
+is what is holding the queue. A window already granted always runs to its own duration. Withdrawing it
+part-way would have the supervisor classify a teardown the scheduler itself commanded as a wedge and reset
+the pools mid-teardown, adding a rebuild to the very churn the budget exists to stop. See
 [Bounding residency churn](resource_governance.md#bounding-residency-churn). The wedge assessment and the give-up that acts on it must not diverge: a give-up applying
 a narrower set of excuses would fault exactly the backlog the scheduler is holding for capacity that is
 about to arrive.

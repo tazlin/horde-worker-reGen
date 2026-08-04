@@ -235,7 +235,7 @@ class TestEstablishRateLimit:
 
 
 class TestGraceBudget:
-    """Grace granted per card is capped over a rolling window so churn cannot disarm recovery forever."""
+    """Grace opened per card is capped over a rolling window, gating new establishments at admission."""
 
     def _cycle(self, ledger: WholeCardResidencyLedger, *, at: float) -> None:
         """Run one establish/restore cycle on card 0, charging both nominal grace windows."""
@@ -250,8 +250,8 @@ class TestGraceBudget:
         )
         ledger.record_restore(0, now=at + 1.0, restore_grace_seconds=_RESTORE_GRACE)
 
-    def test_budget_accrues_refuses_and_replenishes(self) -> None:
-        """Repeated cycles spend the allowance, refuse further claims, then replenish as they age out."""
+    def test_budget_accrues_gates_and_replenishes(self) -> None:
+        """Repeated cycles spend the allowance, gate further establishments, then replenish as they age out."""
         ledger = WholeCardResidencyLedger()
         cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
         for index in range(cycles):
@@ -261,13 +261,18 @@ class TestGraceBudget:
             )
         assert ledger.grace_budget_exhausted(0, now=_NOW + _GRACE_BUDGET_WINDOW_SECONDS + 100.0) is False
 
-    def test_an_exhausted_budget_refuses_grace_inside_a_nominal_window(self) -> None:
-        """The window still reads as open; the claim that disarms the supervisor does not."""
+    def test_an_exhausted_budget_leaves_a_granted_window_intact(self) -> None:
+        """A window already granted excuses the held queue for its full duration whatever the spend says.
+
+        The establishment the window covers is a teardown the scheduler commanded. Withdrawing its excuse
+        part-way would have the recovery supervisor read that deliberate action as a structural wedge, so the
+        budget is answered at admission instead and never revokes an in-flight window.
+        """
         ledger = WholeCardResidencyLedger()
         cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
         for index in range(cycles):
             self._cycle(ledger, at=_NOW + index * 10.0)
-        # Re-establish so a residency is held and nominally establishing at the moment of the claim.
+        # Re-establish so a residency is held and establishing at the moment of the read.
         last = _NOW + cycles * 10.0
         ledger.record_grant(
             0,
@@ -278,14 +283,39 @@ class TestGraceBudget:
             refresh_established=True,
             establish_grace_seconds=_ESTABLISH_GRACE,
         )
-        claim_at = last + 1.0
-        assert ledger.grace_window_active(
-            now=claim_at,
+        assert ledger.grace_budget_exhausted(0, now=last + 1.0) is True, (
+            "precondition: the card's rolling grace budget is spent"
+        )
+        for elapsed in (1.0, _ESTABLISH_GRACE / 2.0, _ESTABLISH_GRACE - 0.1):
+            assert ledger.grace_active(
+                now=last + elapsed,
+                establish_grace_seconds=_ESTABLISH_GRACE,
+                restore_grace_seconds=_RESTORE_GRACE,
+            ), "the granted establish window holds for its whole duration despite the spent budget"
+        assert not ledger.grace_active(
+            now=last + _ESTABLISH_GRACE + 0.1,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        ), "the window's own duration is the liveness bound on a residency that never completes"
+
+    def test_a_restore_window_is_granted_regardless_of_the_budget(self) -> None:
+        """The restore churn is always excused: the budget gates establishments, not teardown reversal."""
+        ledger = WholeCardResidencyLedger()
+        cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
+        for index in range(cycles):
+            self._cycle(ledger, at=_NOW + index * 10.0)
+        last = _NOW + cycles * 10.0
+        ledger.record_restore(0, now=last, restore_grace_seconds=_RESTORE_GRACE)
+        assert ledger.grace_budget_exhausted(0, now=last) is True, (
+            "precondition: the card's rolling grace budget is spent"
+        )
+        assert ledger.grace_active(
+            now=last + _RESTORE_GRACE - 0.1,
             establish_grace_seconds=_ESTABLISH_GRACE,
             restore_grace_seconds=_RESTORE_GRACE,
         )
         assert not ledger.grace_active(
-            now=claim_at,
+            now=last + _RESTORE_GRACE + 0.1,
             establish_grace_seconds=_ESTABLISH_GRACE,
             restore_grace_seconds=_RESTORE_GRACE,
         )

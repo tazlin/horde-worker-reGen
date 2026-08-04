@@ -305,13 +305,17 @@ call sites, bound that churn:
   said streams its weights. The window is deliberately far shorter than the pop-gate structural-wedge
   backstop, so a deferred head can never accrue toward a wedge verdict. The limiter gates *new*
   establishments only; a residency already held keeps being driven to convergence every cycle.
-- **Grace budget.** Each establish and each restore claims a window in which the recovery supervisor ignores
-  a held queue (see [Resilience and recovery](resilience_and_recovery.md)). Those claims are charged against
+- **Grace budget.** Each establish and each restore opens a window in which the recovery supervisor ignores
+  a held queue (see [Resilience and recovery](resilience_and_recovery.md)). Those windows are charged against
   a per-card rolling budget, because otherwise repeated cycling re-arms a fresh window faster than the
   previous one expires and the supervisor stays disarmed for as long as the churn continues, which is exactly
-  the state in which a real wedge goes unnoticed. Once the budget is spent, the grace claim is refused even
-  inside a nominal window, and the scheduler discloses the refusal once on the transition. The budget
-  replenishes as old grants age out of the window.
+  the state in which a real wedge goes unnoticed. The budget is answered at admission: while a card's spend
+  is over the allowance, a *new* establishment on that card is **deferred**, on the same reasoning as the
+  rate limit, and the scheduler discloses the deferral once on the transition. Refreshing or restoring a
+  residency the card already holds is not gated, and a window already granted is never withdrawn: the
+  teardown it covers is one the scheduler itself commanded, so cutting the excuse short would have the
+  supervisor read that deliberate action as the wedge. The liveness bound on a residency that never completes
+  is therefore the granted window's own duration. The budget replenishes as old grants age out of the window.
 
 Only one reconciler may change safety placement. Whole-card residency contributes a persistent off-GPU veto,
 the reclaim ladder contributes a one-shot request, and runtime placement contributes its hysteretic fit wish;

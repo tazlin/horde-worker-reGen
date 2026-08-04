@@ -7,8 +7,9 @@ answered from them alone: which cards hold a residency, which card holds a given
 residency is in, whether an establish/restore grace window is active, and whether the bounded drain
 backstop has elapsed. It also owns the churn governors that bound how fast residencies may be cycled: a
 minimum hold before a grant may be released early, a per-card establishment rate limit, and a rolling budget
-on how much recovery-supervisor grace the establish/restore cycle may consume. Each is stored and answered
-here, and actuated at the scheduler's call sites.
+on how much recovery-supervisor grace a card may open per window. The budget is an admission gate: it holds
+off a *new* establishment until the spend replenishes, and never withdraws a window already granted. Each is
+stored and answered here, and actuated at the scheduler's call sites.
 
 The scheduler keeps the transitions that touch live processes (establish, converge,
 restore); it reads and writes residency state exclusively through
@@ -67,13 +68,16 @@ Sized to the field's model-pool rotation period, so the budget is spent and repl
 that legitimately drives one establish/restore cycle per card."""
 
 _GRACE_BUDGET_SECONDS = 360.0
-"""Total grace seconds a card may be granted per :data:`_GRACE_BUDGET_WINDOW_SECONDS` before claims are refused.
+"""Total grace seconds a card may open per :data:`_GRACE_BUDGET_WINDOW_SECONDS` before establishments defer.
 
 One nominal rotation costs a card one establish grant (120s) plus one restore grant (60s), so this allows a
-full cycle plus one complete retry and refuses the third. Without a ceiling, back-to-back establish/restore
-churn re-arms the grace window faster than it expires and the recovery supervisor is disarmed indefinitely,
-which is precisely the state in which a real wedge goes unnoticed. Capping the spend at 30% of the window
-keeps the supervisor armed for the majority of any window no matter how hard the residency machinery churns."""
+full cycle plus one complete retry and holds the third off until the spend replenishes. Without a ceiling,
+back-to-back establish/restore churn re-arms the grace window faster than it expires and the recovery
+supervisor is disarmed indefinitely, which is precisely the state in which a real wedge goes unnoticed.
+Capping the spend at 30% of the window bounds how much of any window residency churn can cover, and it does
+so at admission rather than by withdrawing a window already granted: a granted window covers a teardown the
+scheduler itself commanded, so withdrawing it part-way would have the supervisor judge that deliberate action
+as a wedge. The bound on a residency that never completes is the granted window's own duration."""
 
 
 @dataclass
@@ -288,18 +292,21 @@ class WholeCardResidencyLedger:
         establishing = state.established_at != 0.0 and (now - state.established_at) < establish_grace_seconds
         return state.model, (WholeCardPhase.ESTABLISHING if establishing else WholeCardPhase.HOLDING)
 
-    def grace_window_active(
+    def grace_active(
         self,
         *,
         now: float,
         establish_grace_seconds: float,
         restore_grace_seconds: float,
     ) -> bool:
-        """Return whether any residency is nominally inside an establish or restore window.
+        """Return whether any residency sits inside a granted establish or restore window.
 
-        The window question alone, without the budget: a caller wanting the answer that actually disarms
-        the recovery supervisor wants :meth:`grace_active`. The two differ exactly when a card's rolling
-        grace budget is exhausted, which is the condition worth disclosing.
+        A granted window excuses a held queue for its whole duration and nothing shortens it. The teardown or
+        restore it covers is an action the scheduler itself commanded, so withdrawing the excuse part-way
+        would have the recovery supervisor classify that deliberate action as a structural wedge. The
+        liveness bound on a residency that never finishes loading (or a restore that never completes) is the
+        window's own duration, measured from the grant. How often a card may open a *new* window is governed
+        at admission by :meth:`grace_budget_exhausted`, not here.
         """
         return any(
             self._window_active(
@@ -311,35 +318,13 @@ class WholeCardResidencyLedger:
             for state in self._residencies.values()
         )
 
-    def grace_active(
-        self,
-        *,
-        now: float,
-        establish_grace_seconds: float,
-        restore_grace_seconds: float,
-    ) -> bool:
-        """Return whether any residency is establishing or restoring *within budget*, so a held queue is intentional.
-
-        Bounded three ways so a residency that genuinely never loads (or a restore that never completes)
-        still trips the recovery supervisor: by the establish window, by the restore window, and by the
-        card's rolling grace budget. The budget is what stops repeated establish/restore cycles from
-        re-arming a fresh window faster than the previous one expires, which would otherwise leave the
-        supervisor disarmed for as long as the churn continued.
-        """
-        for device_index, state in self._residencies.items():
-            if not self._window_active(
-                state,
-                now=now,
-                establish_grace_seconds=establish_grace_seconds,
-                restore_grace_seconds=restore_grace_seconds,
-            ):
-                continue
-            if not self.grace_budget_exhausted(device_index, now=now):
-                return True
-        return False
-
     def grace_budget_exhausted(self, device_index: int | None, *, now: float) -> bool:
         """Return whether this card has spent its rolling-window grace allowance.
+
+        The admission-side query on the whole-card path: a caller about to establish a *new* residency on
+        this card defers while this is True, so the card stops opening fresh grace windows until its spend
+        replenishes. It says nothing about a window already granted, which runs to its own duration
+        regardless; refreshes and restores of a residency the card already holds are not gated by it.
 
         Spend is the sum of the grace windows granted to the card inside
         :data:`_GRACE_BUDGET_WINDOW_SECONDS`; it replenishes as those grants age out of the window.

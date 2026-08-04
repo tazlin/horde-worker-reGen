@@ -972,8 +972,9 @@ class InferenceScheduler:
         # equally holds the queue, so this bounds a wedge grace that the whole-card establishment grace does
         # not cover. 0.0 when none is loading.
         self._heavy_head_admitted_at: float = 0.0
-        # Edge-trigger latch for the disclosure that a whole-card grace claim was refused on budget: the
-        # wedge assessment asks every control cycle, so the refusal is announced on the transition only.
+        # Edge-trigger latch for the disclosure that a new whole-card establishment was deferred because the
+        # card's rolling grace budget is spent: the head re-asks every scheduling cycle, so the refusal is
+        # announced on the transition into the deferral and again only after one has resolved.
         self._whole_card_grace_refused: bool = False
         # Edge-trigger latch for the disclosure that whole-card residency is off because its config flag
         # never resolved to a value (as distinct from resolving to False, which is an operator choice).
@@ -2740,31 +2741,17 @@ class InferenceScheduler:
 
         While true, the recovery supervisor must not treat the deliberately-deferred heavy head (waiting
         for idle siblings to stop, the safety process to cycle off-GPU, and ~11GB of weights to load) as a
-        structural queue wedge and soft-reset the pools mid-setup. Bounded by
-        ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` and by the card's rolling grace budget, so neither a residency
-        that genuinely never loads nor an establish/restore cycle that keeps re-arming the window can keep the
-        supervisor disarmed. Public: read by the process manager's wedge assessment.
+        structural queue wedge and soft-reset the pools mid-setup. A granted window holds for its own
+        duration (``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` or ``_WHOLE_CARD_RESTORE_GRACE_SECONDS``), which is
+        the liveness bound on a residency that never loads; how often a card may open a new window is
+        governed at admission, where an establishment is deferred while the card's rolling grace budget is
+        spent. Public: read by the process manager's wedge assessment.
         """
-        now = time.time()
-        granted = self._whole_card_ledger.grace_active(
-            now=now,
+        return self._whole_card_ledger.grace_active(
+            now=time.time(),
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
             restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
-        refused = not granted and self._whole_card_ledger.grace_window_active(
-            now=now,
-            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
-        )
-        if refused != self._whole_card_grace_refused:
-            self._whole_card_grace_refused = refused
-            if refused:
-                logger.warning(
-                    "Whole-card residency is inside a grace window but has spent its grace budget for the "
-                    "current window; the recovery supervisor will treat a held queue as a wedge from here. "
-                    "Repeated establish/restore cycles on this card are the cause.",
-                )
-        return granted
 
     def heavy_head_load_grace_active(self) -> bool:
         """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
@@ -5431,6 +5418,25 @@ class InferenceScheduler:
             # admitted well before a deferred head could age into a structural-wedge verdict. Declining
             # instead would send the head down the ordinary co-resident path the forecast has already said
             # streams its weights.
+            return _WholeCardDemandOutcome.DEFER
+        budget_spent = establishing_anew and self._whole_card_ledger.grace_budget_exhausted(
+            target_device_index,
+            now=time.time(),
+        )
+        if budget_spent != self._whole_card_grace_refused:
+            self._whole_card_grace_refused = budget_spent
+            if budget_spent:
+                logger.warning(
+                    "Deferring a new whole-card residency: this card has spent its rolling recovery-grace "
+                    "budget, so it may not open another establish window yet. Normal scheduling continues "
+                    "and the head is admitted once the budget replenishes.",
+                )
+        if budget_spent:
+            # Every establish/restore window this card opens is a window in which the recovery supervisor
+            # ignores a held queue, so the spend is capped per rolling window. Gate the *new* establishment
+            # rather than the window of one already granted: an in-flight teardown the scheduler commanded
+            # must keep its excuse for the window's full duration. Defer, for the same reason the rate
+            # limiter defers.
             return _WholeCardDemandOutcome.DEFER
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
