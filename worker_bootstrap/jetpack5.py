@@ -35,6 +35,7 @@ REQUIRED_WHEEL_SHA256: dict[str, str] = {
     REQUIRED_WHEEL_NAMES[1]: "0ddb4140f0827ec89349a61d47c0d6c5319c469686da501c6113b48c3faba3b1",
     REQUIRED_WHEEL_NAMES[2]: "00204769e28772eb12bb53a3cc33b61e8d1c7be640c44edfd23b587dff4f3566",
 }
+XFORMERS_WHEEL_SHA256 = "496de486460855325ba10afb81b560f30cddd8aa592077efa877f6d7bb884672"
 _XFORMERS_GLOB = "xformers-0.0.23+e1b36f7.d*-cp310-cp310-linux_aarch64.whl"
 _L4T_RELEASE = Path("/etc/nv_tegra_release")
 _L4T_MAJOR_RE = re.compile(r"^#\s*R(\d+)\b")
@@ -108,6 +109,7 @@ def resolve_wheels(
     directory: Path,
     *,
     required_hashes: dict[str, str] | None = None,
+    xformers_hash: str | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Resolve and verify the exact tested CUDA 11.4 wheel set."""
     hashes = REQUIRED_WHEEL_SHA256 if required_hashes is None else required_hashes
@@ -129,7 +131,20 @@ def resolve_wheels(
             f"Expected exactly one {_XFORMERS_GLOB} wheel in {directory}, found {len(xformers)}. "
             "Build it with build-xformers-jetson-jp5.sh on the Jetson, using one compiler worker."
         )
-    _verify_checksum(xformers[0], _xformers_checksum(xformers[0]))
+    expected_xformers = (
+        xformers_hash
+        or os.environ.get("HORDE_WORKER_JETPACK5_XFORMERS_SHA256", "").strip().lower()
+        or XFORMERS_WHEEL_SHA256
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", expected_xformers) is None:
+        raise JetPack5Error("HORDE_WORKER_JETPACK5_XFORMERS_SHA256 must be a 64-character lowercase SHA256.")
+    sidecar_xformers = _xformers_checksum(xformers[0])
+    if sidecar_xformers != expected_xformers:
+        raise JetPack5Error(
+            f"JetPack 5 wheel checksum mismatch for {xformers[0].name}: "
+            f"trusted {expected_xformers}, sidecar contains {sidecar_xformers}."
+        )
+    _verify_checksum(xformers[0], expected_xformers)
     return required[0], required[1], required[2], xformers[0]
 
 
@@ -311,6 +326,16 @@ def _install_runtime(uv: str, root: Path, legacy: Path) -> None:
         {
             "PYTHON_BIN": str(python310),
             "JETSON_WHEEL_DIR": str(wheels[0].parent),
+            "TORCH_WHEEL": str(wheels[0]),
+            "TORCH_WHEEL_SHA256": REQUIRED_WHEEL_SHA256[wheels[0].name],
+            "TORCHVISION_WHEEL": str(wheels[1]),
+            "TORCHVISION_WHEEL_SHA256": REQUIRED_WHEEL_SHA256[wheels[1].name],
+            "TORCHAUDIO_WHEEL": str(wheels[2]),
+            "TORCHAUDIO_WHEEL_SHA256": REQUIRED_WHEEL_SHA256[wheels[2].name],
+            "XFORMERS_WHEEL": str(wheels[3]),
+            "XFORMERS_WHEEL_SHA256": (
+                os.environ.get("HORDE_WORKER_JETPACK5_XFORMERS_SHA256", "").strip().lower() or XFORMERS_WHEEL_SHA256
+            ),
             "CMAKE_BUILD_PARALLEL_LEVEL": "1",
             "MAKEFLAGS": "-j1",
             "MAX_JOBS": "1",

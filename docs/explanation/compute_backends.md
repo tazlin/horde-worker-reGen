@@ -23,7 +23,10 @@ Place the tested wheel set in `$HOME/jetson`, or set
 
 The three NVIDIA wheel hashes are pinned. The xFormers wheel must be compiled
 on JetPack 5 for compute capability 7.2, and its build script writes the
-required checksum sidecar. The compatibility runtime includes
+required checksum sidecar. The tested xFormers build hash is pinned too. If
+you independently rebuild it, verify the printed digest and set
+`HORDE_WORKER_JETPACK5_XFORMERS_SHA256` to that trusted value. The
+compatibility runtime includes
 `build-xformers-jetson-jp5.sh`; it forces one build worker and CUDA 11.4. To
 force this profile on an L4T R35 host, set
 `HORDE_WORKER_BACKEND=jetpack5`. It refuses to run on another OS,

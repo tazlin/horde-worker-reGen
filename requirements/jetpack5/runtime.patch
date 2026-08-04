@@ -3,7 +3,7 @@ new file mode 100755
 index 00000000..1b115c8c
 --- /dev/null
 +++ b/build-xformers-jetson-jp5.sh
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,64 @@
 +#!/bin/sh
 +set -eu
 +
@@ -66,6 +66,8 @@ index 00000000..1b115c8c
 +	exit 1
 +fi
 +sha256sum "$1" >"$1.sha256"
++xformers_sha=$(sha256sum "$1" | awk '{print $1}')
++printf 'HORDE_WORKER_JETPACK5_XFORMERS_SHA256=%s\n' "$xformers_sha"
 diff --git a/horde_worker_regen/bridge_data/data_model.py b/horde_worker_regen/bridge_data/data_model.py
 index fc26e0ee..de584a62 100644
 --- a/horde_worker_regen/bridge_data/data_model.py
@@ -124,7 +126,7 @@ new file mode 100755
 index 00000000..4ea7aa9d
 --- /dev/null
 +++ b/install-jetson-jp5.sh
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,99 @@
 +#!/bin/sh
 +set -eu
 +
@@ -136,6 +138,13 @@ index 00000000..4ea7aa9d
 +python_bin=${PYTHON_BIN:-${HOME}/.pyenv/versions/3.10.20/bin/python}
 +wheel_dir=${JETSON_WHEEL_DIR:-${HOME}/jetson}
 +venv_dir=$script_dir/.venv
++torch_wheel=${TORCH_WHEEL:-$wheel_dir/torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl}
++torchvision_wheel=${TORCHVISION_WHEEL:-$wheel_dir/torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl}
++torchaudio_wheel=${TORCHAUDIO_WHEEL:-$wheel_dir/torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl}
++torch_sha=${TORCH_WHEEL_SHA256:-1079d7eaf5e6be486a534bc1546ce355e53fa63494eab9bb72611ca48d3f9cdf}
++torchvision_sha=${TORCHVISION_WHEEL_SHA256:-0ddb4140f0827ec89349a61d47c0d6c5319c469686da501c6113b48c3faba3b1}
++torchaudio_sha=${TORCHAUDIO_WHEEL_SHA256:-00204769e28772eb12bb53a3cc33b61e8d1c7be640c44edfd23b587dff4f3566}
++xformers_sha=${XFORMERS_WHEEL_SHA256:-496de486460855325ba10afb81b560f30cddd8aa592077efa877f6d7bb884672}
 +
 +if [ "${XFORMERS_WHEEL+x}" = x ]; then
 +	xformers_wheel=$XFORMERS_WHEEL
@@ -148,31 +157,49 @@ index 00000000..4ea7aa9d
 +	xformers_wheel=$1
 +fi
 +
++verify_wheel() {
++	wheel=$1
++	expected=$2
++	if [ ! -f "$wheel" ]; then
++		printf 'Required Jetson wheel not found: %s\n' "$wheel" >&2
++		exit 1
++	fi
++	case $expected in
++	'' | *[!0-9a-f]*)
++		printf 'Invalid SHA256 for Jetson wheel: %s\n' "$wheel" >&2
++		exit 1
++		;;
++	esac
++	if [ "${#expected}" -ne 64 ]; then
++		printf 'Invalid SHA256 length for Jetson wheel: %s\n' "$wheel" >&2
++		exit 1
++	fi
++	actual=$(sha256sum "$wheel" | awk '{print $1}')
++	if [ "$actual" != "$expected" ]; then
++		printf 'Jetson wheel checksum mismatch: %s\n' "$wheel" >&2
++		exit 1
++	fi
++}
++
 +export CMAKE_BUILD_PARALLEL_LEVEL=1
 +export MAKEFLAGS=-j1
 +export MAX_JOBS=1
 +export NINJAFLAGS=-j1
 +export OMP_NUM_THREADS=1
 +
-+for wheel in \
-+	"$wheel_dir/torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl" \
-+	"$wheel_dir/torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl" \
-+	"$wheel_dir/torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl" \
-+	"$xformers_wheel"; do
-+	if [ ! -f "$wheel" ]; then
-+		printf 'Required Jetson wheel not found: %s\n' "$wheel" >&2
-+		exit 1
-+	fi
-+done
++verify_wheel "$torch_wheel" "$torch_sha"
++verify_wheel "$torchvision_wheel" "$torchvision_sha"
++verify_wheel "$torchaudio_wheel" "$torchaudio_sha"
++verify_wheel "$xformers_wheel" "$xformers_sha"
 +
 +"$python_bin" -m venv "$venv_dir"
 +python=$venv_dir/bin/python
 +
 +"$python" -m pip install --upgrade pip "setuptools==80.9.0" wheel
 +"$python" -m pip install --no-deps \
-+	"$wheel_dir/torch-2.1.0a0+git7bcf7da-cp310-cp310-linux_aarch64.whl" \
-+	"$wheel_dir/torchvision-0.16.0+fbb4cc5-cp310-cp310-linux_aarch64.whl" \
-+	"$wheel_dir/torchaudio-2.1.0+6ea1133-cp310-cp310-linux_aarch64.whl"
++	"$torch_wheel" \
++	"$torchvision_wheel" \
++	"$torchaudio_wheel"
 +"$python" -m pip install -r "$script_dir/requirements.txt"
 +"$python" -m pip install -r "$script_dir/requirements.jetson-engine.txt"
 +"$python" -m pip install --no-deps horde-engine==2.15.3

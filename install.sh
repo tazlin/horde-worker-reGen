@@ -16,6 +16,8 @@
 #   HORDE_WORKER_JETPACK5_WHEELS
 #                            local directory containing the pinned NVIDIA aarch64 CUDA 11.4 wheels
 #                            required by the explicit JetPack 5 / L4T R35 compatibility profile
+#   HORDE_WORKER_JETPACK5_XFORMERS_SHA256
+#                            trusted hash for an independently rebuilt JetPack 5 xFormers wheel
 #   HORDE_WORKER_FEATURES    optional feature extras to install: comma/space list of post-processing,
 #                            controlnet, or 'none' (default: all on NVIDIA/CPU, none on other backends)
 #   HORDE_WORKER_VERSION     install a specific release tag (e.g. v1.2.3) instead of the latest release

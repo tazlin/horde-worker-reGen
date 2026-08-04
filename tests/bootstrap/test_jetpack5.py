@@ -53,7 +53,11 @@ def test_resolve_wheels_requires_the_tested_cuda114_set(tmp_path: Path) -> None:
         encoding="ascii",
     )
 
-    wheels = jetpack5.resolve_wheels(tmp_path, required_hashes=wheel_hashes)
+    wheels = jetpack5.resolve_wheels(
+        tmp_path,
+        required_hashes=wheel_hashes,
+        xformers_hash=hashlib.sha256(xformers.read_bytes()).hexdigest(),
+    )
 
     assert wheels[:3] == tuple(tmp_path / name for name in jetpack5.REQUIRED_WHEEL_NAMES)
     assert wheels[3] == xformers
@@ -72,6 +76,29 @@ def test_resolve_wheels_rejects_checksum_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(jetpack5.JetPack5Error, match="checksum mismatch"):
         jetpack5.resolve_wheels(tmp_path)
+
+
+def test_resolve_wheels_rejects_xformers_wheel_and_sidecar_substitution(tmp_path: Path) -> None:
+    """A replaced local xFormers wheel cannot authorize itself by replacing its sidecar too."""
+    wheel_hashes: dict[str, str] = {}
+    for name in jetpack5.REQUIRED_WHEEL_NAMES:
+        content = name.encode()
+        (tmp_path / name).write_bytes(content)
+        wheel_hashes[name] = hashlib.sha256(content).hexdigest()
+    xformers = tmp_path / "xformers-0.0.23+e1b36f7.d20260803-cp310-cp310-linux_aarch64.whl"
+    xformers.write_bytes(b"substituted build")
+    substituted = hashlib.sha256(xformers.read_bytes()).hexdigest()
+    xformers.with_suffix(f"{xformers.suffix}.sha256").write_text(
+        f"{substituted}  {xformers.name}\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(jetpack5.JetPack5Error, match="checksum mismatch"):
+        jetpack5.resolve_wheels(
+            tmp_path,
+            required_hashes=wheel_hashes,
+            xformers_hash="0" * 64,
+        )
 
 
 def test_source_archive_follows_recorded_install_origin(tmp_path: Path) -> None:
