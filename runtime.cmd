@@ -49,8 +49,10 @@ if exist "%~dp0bin\uv.exe" exit /b 0
 echo Downloading uv package manager...
 if not exist "%~dp0bin" md "%~dp0bin"
 
-REM Pinned for reproducibility; override with HORDE_WORKER_UV_VERSION to bump without editing this file.
-set "UV_VERSION=0.11.21"
+REM This version MUST match [tool.uv] required-version in pyproject.toml. test_uv_version_consistency.py
+REM enforces this: uv checks its version at runtime against required-version, so the version we download
+REM here must satisfy it. Override with HORDE_WORKER_UV_VERSION to bump without editing this file.
+set "UV_VERSION=0.12.1"
 if defined HORDE_WORKER_UV_VERSION set "UV_VERSION=%HORDE_WORKER_UV_VERSION%"
 set "UV_ZIP=uv-x86_64-pc-windows-msvc.zip"
 if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "UV_ZIP=uv-aarch64-pc-windows-msvc.zip"

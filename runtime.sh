@@ -35,7 +35,10 @@ ensure_uv() {
     echo "Downloading uv package manager..."
     mkdir -p "$SCRIPT_DIR/bin"
     local version triple os arch
-    version="${HORDE_WORKER_UV_VERSION:-0.11.21}"
+    # This version MUST match [tool.uv] required-version in pyproject.toml. test_uv_version_consistency.py
+    # enforces this: uv checks its version at runtime against required-version, so the version we download
+    # here must satisfy it. Override with HORDE_WORKER_UV_VERSION to bump without editing this file.
+    version="${HORDE_WORKER_UV_VERSION:-0.12.1}"
     os="$(uname -s)"; arch="$(uname -m)"
     case "$os" in
         Linux)  case "$arch" in
