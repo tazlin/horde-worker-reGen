@@ -13,6 +13,7 @@ import pytest
 
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     _FAULTHANDLER_MAX_BYTES,
+    _rearm_if_oversized,
     enable_child_faulthandler,
     neutralize_inherited_argv,
     read_last_startup_crash,
@@ -190,6 +191,88 @@ def test_enable_child_faulthandler_bounds_history(monkeypatch: pytest.MonkeyPatc
 
     assert fault_path.with_suffix(".faulthandler.1").exists()
     assert fault_path.stat().st_size < _FAULTHANDLER_MAX_BYTES
+
+
+def test_rolled_segment_carries_a_closing_marker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A rolled file ends with a marker naming its role, so its dumps stay attributable.
+
+    A roll can cut a process's dump history at an arbitrary point, leaving a segment whose armed banner
+    is in an earlier generation; the closing marker is what still identifies it.
+    """
+    monkeypatch.chdir(tmp_path)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    fault_path = log_dir / "bridge_inference_3.faulthandler"
+    fault_path.write_text("x" * (_FAULTHANDLER_MAX_BYTES + 1), encoding="utf-8")
+
+    try:
+        enable_child_faulthandler("inference_3")
+    finally:
+        faulthandler.disable()
+
+    rolled = fault_path.with_suffix(".faulthandler.1").read_text(encoding="utf-8")
+    assert "inference_3" in rolled
+    assert "segment closed" in rolled
+    assert fault_path.name in rolled, "the marker must point at where capture continued"
+
+
+def test_running_process_rearms_when_its_fault_file_passes_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A file that grows past the bound mid-run is rolled and re-armed without waiting for a relaunch.
+
+    Enforcing the bound only at startup lets a process that keeps faulting write its whole history under
+    one banner, so a later roll splits that stream at an arbitrary byte.
+    """
+    monkeypatch.chdir(tmp_path)
+    try:
+        enable_child_faulthandler("inference_4")
+        fault_path = tmp_path / "logs" / "bridge_inference_4.faulthandler"
+        with fault_path.open("a", encoding="utf-8") as handle:
+            handle.write("dump\n" * (_FAULTHANDLER_MAX_BYTES // 5))
+
+        assert _rearm_if_oversized("inference_4") is True
+        assert faulthandler.is_enabled()
+    finally:
+        faulthandler.disable()
+
+    assert "faulthandler armed" in fault_path.read_text(encoding="utf-8"), "the new segment has no banner"
+    assert fault_path.stat().st_size < _FAULTHANDLER_MAX_BYTES
+    rolled = fault_path.with_suffix(".faulthandler.1")
+    assert "segment closed" in rolled.read_text(encoding="utf-8")
+
+
+def test_every_segment_a_reader_sees_is_self_identifying(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Across repeated mid-run rolls, no segment is left as bare dumps with nothing naming its writer."""
+    monkeypatch.chdir(tmp_path)
+    fault_path = tmp_path / "logs" / "bridge_inference_5.faulthandler"
+    try:
+        enable_child_faulthandler("inference_5")
+        for _ in range(3):
+            with fault_path.open("a", encoding="utf-8") as handle:
+                handle.write("Current thread 0x0000 (most recent call first):\n" * 30000)
+            _rearm_if_oversized("inference_5")
+    finally:
+        faulthandler.disable()
+
+    segments = [fault_path, fault_path.with_suffix(".faulthandler.1")]
+    for segment in segments:
+        text = segment.read_text(encoding="utf-8")
+        assert "faulthandler armed" in text or "segment closed" in text, f"{segment.name} identifies nobody"
+        assert "inference_5" in text
+
+
+def test_rearm_leaves_a_small_file_alone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The size watch is a no-op below the bound, so a healthy file is not churned every interval."""
+    monkeypatch.chdir(tmp_path)
+    try:
+        enable_child_faulthandler("inference_6")
+        assert _rearm_if_oversized("inference_6") is False
+    finally:
+        faulthandler.disable()
+
+    assert not (tmp_path / "logs" / "bridge_inference_6.faulthandler.1").exists()
 
 
 def test_enable_child_faulthandler_keeps_a_small_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

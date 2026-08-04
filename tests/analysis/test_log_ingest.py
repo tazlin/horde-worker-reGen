@@ -51,6 +51,17 @@ class TestLineParsing:
         """Leading timestamp-less noise with no record to attach to does not crash or fabricate a record."""
         assert parse_lines(["junk with no head", "more junk"], Path("x.log")) == []
 
+    def test_truncation_note_flags_the_record_that_follows_it(self) -> None:
+        """A bundle truncation note is consumed and marks the next record as preceded by missing lines."""
+        (record,) = parse_lines(["[... truncated to the most recent 15 MB ...]", _GOOD], Path("bridge.log"))
+        assert record.follows_truncation is True
+        assert record.continuation == []
+
+    def test_truncation_note_is_not_folded_into_a_prior_record(self) -> None:
+        """The note is the bundler's own marker, so it never becomes part of a log record's text."""
+        (record,) = parse_lines([_GOOD, "[... truncated to the most recent 15 MB ...]"], Path("bridge.log"))
+        assert "truncated to the most recent" not in record.full_text
+
     def test_parse_ts_returns_none_for_non_timestamp(self) -> None:
         """A line without a leading timestamp yields None rather than raising."""
         assert parse_ts("no timestamp here") is None

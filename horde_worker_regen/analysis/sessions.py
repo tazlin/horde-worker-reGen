@@ -71,6 +71,15 @@ class WorkerSession:
     max_threads: int | None = None
     peak_process_recoveries: int = 0
     end_reason: SessionEndReason = SessionEndReason.STILL_RUNNING
+    start_is_lower_bound: bool = False
+    """Whether the launch boundary is missing from the capture, making ``start_ts`` an upper bound on it.
+
+    The session then began at or before ``start_ts``, and ``duration_seconds`` is a lower bound on the
+    real span. Reporting either as exact understates how long a run had been going, which is the figure a
+    wedge-age or duty judgement rests on.
+    """
+    start_truncated: bool = False
+    """Whether the missing launch boundary is attributable to a bundle truncation note in the capture."""
 
     @property
     def start_ts(self) -> datetime | None:
@@ -108,6 +117,10 @@ def segment_sessions(records: list[LogRecord]) -> list[WorkerSession]:
     bleed onto the prior session; falls back to the process-manager init banner for captures that have
     no logger-setup line (older logs, or a bundle that begins mid-run). A 30s burst-collapse keeps the
     several init lines of one launch from each opening a session.
+
+    A session opened without a boundary record (the capture starts mid-run, e.g. a size-trimmed log)
+    carries ``start_is_lower_bound``, so its start and duration are reported as bounds rather than as
+    facts the capture cannot support.
     """
     use_startup_boundary = any(_is_main_startup(record) for record in records)
     is_boundary = _is_main_startup if use_startup_boundary else _is_init_banner
@@ -132,7 +145,8 @@ def segment_sessions(records: list[LogRecord]) -> list[WorkerSession]:
                 last_boundary_ts = ts
         if current is None:
             # Records before the first banner (the file began mid-session): open an implicit session 0.
-            current = WorkerSession(index=0)
+            # Its launch line is not in the capture, so its start is only an upper bound on the real one.
+            current = WorkerSession(index=0, start_is_lower_bound=True, start_truncated=record.follows_truncation)
             sessions.append(current)
         current.records.append(record)
 

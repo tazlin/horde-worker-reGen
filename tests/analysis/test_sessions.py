@@ -6,6 +6,7 @@ from pathlib import Path
 
 from horde_worker_regen.analysis.log_ingest import parse_lines
 from horde_worker_regen.analysis.sessions import SessionEndReason, WorkerSession, segment_sessions
+from horde_worker_regen.analysis.triage_report import render_sessions, session_to_dict
 
 # Two launches in one appended log. Each opens with the main-process logger-setup line (the boundary),
 # prints a worker-info line (identity + version + recoveries), then ends differently: the first aborts
@@ -46,6 +47,48 @@ class TestSegmentation:
     def test_peak_recoveries_captured(self) -> None:
         """The peak process_recoveries count for the session is read from its status line."""
         assert _sessions()[0].peak_process_recoveries == 17
+
+
+class TestStartBounds:
+    """A session whose launch line is missing reports its start as a bound, not as a fact."""
+
+    _MID_RUN = (
+        "2026-06-24 18:30:00.000 | INFO  | a.b:c:1 - working\n"
+        "2026-06-24 19:30:00.000 | INFO  | a.b:c:1 - still working\n"
+    )
+
+    def test_start_of_a_bounded_session_is_flagged(self) -> None:
+        """A capture that begins mid-run yields a session marked as starting at or before its first line."""
+        session = segment_sessions(parse_lines(self._MID_RUN.splitlines(), Path("bridge.log")))[0]
+        assert session.start_is_lower_bound is True
+        assert session.start_truncated is False
+
+    def test_truncated_capture_names_truncation_as_the_cause(self) -> None:
+        """A bundle truncation note ahead of the first line attributes the missing start to the trim."""
+        log = "[... truncated to the most recent 15 MB ...]\n" + self._MID_RUN
+        session = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))[0]
+        assert session.start_is_lower_bound is True
+        assert session.start_truncated is True
+        assert session.start_ts is not None
+        assert session.start_ts.hour == 18, "the truncation note must not be parsed as a record"
+
+    def test_a_launch_boundary_gives_an_exact_start(self) -> None:
+        """A session opened on its own logger-setup line is not a bound."""
+        assert all(session.start_is_lower_bound is False for session in _sessions())
+
+    def test_rendering_discloses_the_bound(self) -> None:
+        """The rendered listing shows the span as a bound and says why."""
+        log = "[... truncated to the most recent 15 MB ...]\n" + self._MID_RUN
+        sessions = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))
+        text = render_sessions(sessions, root=Path("logs"))
+        assert "<=18:30:00" in text
+        assert ">=1h0m" in text
+        assert "started at or before 18:30:00 (log truncated)" in text
+
+    def test_dict_carries_the_bound(self) -> None:
+        """The JSON view exposes the same disclosure for downstream tooling."""
+        sessions = segment_sessions(parse_lines(self._MID_RUN.splitlines(), Path("bridge.log")))
+        assert session_to_dict(sessions[0])["start_is_lower_bound"] is True
 
 
 class TestEndReason:

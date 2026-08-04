@@ -274,6 +274,13 @@ scrubbed before it is written**. The horde `api_key` and CivitAI token always, a
 personal identifiers (home path, username, worker name) too. The command prints how many occurrences it
 redacted and reminds you to skim the result before sending; redaction is best-effort, not a guarantee.
 
+Anything too large for the per-file budget keeps its **most recent** end, logs and JSONL artifacts alike,
+so every artifact in one bundle covers the same window. A trimmed file says so on its first line: a
+`[... truncated to the most recent N MB ...]` note in a log, and the same wording as a JSON object under
+`_bundle_truncation` in a JSONL artifact, which is cut on a record boundary. When a trimmed log no longer
+contains a session's launch line, `sessions.txt` and `diagnose.txt` report that session as starting *at or
+before* its first surviving line, with the span and duration marked as lower bounds (`<=`/`>=`).
+
 ```bash
 # The usual: bundle the current logs into horde_support_<timestamp>.zip
 horde-log bundle
@@ -283,7 +290,7 @@ horde-log bundle
 |------|---------|
 | `--out FILE.zip` | Output path (default `horde_support_<timestamp>.zip`). |
 | `--last` / `--session N` | Diagnose only the most recent / a specific session (the logs are still included). |
-| `--full-logs` | Include rotation archives and do not tail-cap large logs (a much larger bundle). By default only the active logs are bundled; oversized plain logs are read from their tail and bundled already-trimmed, and the active `bridge.log` already spans many sessions. |
+| `--full-logs` | Include rotation archives and do not tail-cap large artifacts (a much larger bundle). By default only the active logs are bundled; oversized plain logs are read from their tail and bundled already-trimmed, and the active `bridge.log` already spans many sessions. |
 | `--no-cache-inventory` | Skip the on-disk model listing. |
 | `--probe-gpu` | Run the GPU probe for the system-info block (slower; the logs already record the GPUs). |
 | `--keep-identifiers` | Do not scrub home path / username / worker name (the keys are still redacted). |

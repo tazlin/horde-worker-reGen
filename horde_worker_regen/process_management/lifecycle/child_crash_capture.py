@@ -14,7 +14,9 @@ nowhere. A crash there is invisible.
 This module installs two cross-platform, loguru-independent backstops so that window is never silent:
 
 - :func:`enable_child_faulthandler` points :mod:`faulthandler` at a per-process file, capturing hard
-  faults (segfaults, fatal signals from torch / ComfyUI) that no ``try``/``except`` can catch.
+  faults (segfaults, fatal signals from torch / ComfyUI) that no ``try``/``except`` can catch. That file
+  is kept within a size bound while the process runs, and every segment it is rolled into carries its own
+  identification, so a dump can always be attributed to the worker and launch that wrote it.
 - :func:`write_startup_crash` appends a full, formatted traceback to a discoverable
   ``logs/bridge_{role}_startup.log`` using a plain file write, so a Python exception during preflight is
   recorded even when no loguru sink exists yet (and even if loguru itself is the thing that broke).
@@ -30,9 +32,12 @@ import faulthandler
 import os
 import re
 import sys
+import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import TextIO
 
 _LOG_DIR = Path("logs")
 
@@ -41,12 +46,16 @@ _LOG_DIR = Path("logs")
 # recovery path stays dependency-light.
 _EXCEPTION_LINE_RE = re.compile(r"^(?P<exc>[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit)): ?(?P<msg>.*)$")
 
-_FAULTHANDLER_FILES: list[object] = []
-"""Open faulthandler file handles, kept referenced for the process lifetime.
+_FAULTHANDLER_FILES: dict[str, TextIO] = {}
+"""The open faulthandler file handle per role, kept referenced for the process lifetime.
 
 ``faulthandler.enable(file=...)`` writes to the handle when a fatal signal fires, so the handle must
-outlive the call; letting it be garbage-collected would close the file and silence the backstop.
+outlive the call; letting it be garbage-collected would close the file and silence the backstop. Keying
+by role also gives the size watch the handle it has to close before it can roll the file.
 """
+
+_WATCHED_ROLES: set[str] = set()
+"""Roles whose fault file already has a size watch running in this process (one thread per role)."""
 
 _FAULTHANDLER_MAX_BYTES = 1_000_000
 """Size at which a role's fault file is rolled aside to a single ``.1`` companion before reopening.
@@ -56,6 +65,14 @@ launches accumulates dumps without bound. Each dump carries the interpreter's fu
 so the file grows by kilobytes per fault and can reach megabytes of history whose oldest entries predate
 anything else in a log bundle. One generation of history is enough to cover the launches a diagnosis
 spans, and rolling rather than truncating keeps the immediately preceding run readable."""
+
+_FAULTHANDLER_SIZE_CHECK_SECONDS = 60.0
+"""How often the size watch re-checks a role's fault file.
+
+The bound has to be enforced while a process runs, not only when one starts: a process that keeps faulting
+without dying writes its whole history under a single banner, and a roll that happens between arms then
+cuts that byte stream at an arbitrary point. A stat every minute costs nothing and keeps each rolled
+segment attributable."""
 
 
 def enable_child_faulthandler(role: str) -> None:
@@ -68,19 +85,41 @@ def enable_child_faulthandler(role: str) -> None:
 
     A dated banner naming the role and OS pid is written and flushed on entry. faulthandler's own output
     carries no timestamp, and the file accumulates across every launch of the role, so without the banner a
-    dump cannot be attributed to a launch or lined up against the timestamped logs. The file is also rolled
-    aside once it passes :data:`_FAULTHANDLER_MAX_BYTES` so that history stays bounded.
+    dump cannot be attributed to a launch or lined up against the timestamped logs. The file is rolled
+    aside once it passes :data:`_FAULTHANDLER_MAX_BYTES`, both here and from a background size watch, so
+    history stays bounded and every segment a reader opens is self-identifying: a rolled file ends with a
+    closing marker naming its role, and the file that succeeds it opens with a fresh armed banner.
 
     Args:
         role: Short identifier for the writing process (e.g. ``"main"``, ``"inference_0"``), used to
             name the per-process file so concurrent children never write to the same handle.
     """
+    if not _arm_faulthandler(role):
+        return
+    _start_fault_file_watch(role)
+
+
+def _fault_path(role: str) -> Path:
+    """The role's fault file path."""
+    return _LOG_DIR / f"bridge_{role}.faulthandler"
+
+
+def _arm_faulthandler(role: str) -> bool:
+    """Roll if oversized, open the role's fault file, write the armed banner, and point faulthandler at it.
+
+    Args:
+        role: Short identifier for the writing process.
+
+    Returns:
+        bool: Whether capture is armed on a freshly opened handle.
+    """
     try:
         _LOG_DIR.mkdir(exist_ok=True)
-        fault_path = _LOG_DIR / f"bridge_{role}.faulthandler"
-        _roll_oversized_fault_file(fault_path)
+        fault_path = _fault_path(role)
+        _close_open_handle(role)
+        _roll_oversized_fault_file(fault_path, role=role)
         fault_file = fault_path.open("a", encoding="utf-8")
-        _FAULTHANDLER_FILES.append(fault_file)
+        _FAULTHANDLER_FILES[role] = fault_file
         fault_file.write(
             f"\n=== {role} pid={os.getpid()} faulthandler armed {datetime.now().isoformat(timespec='seconds')}\n",
         )
@@ -89,23 +128,97 @@ def enable_child_faulthandler(role: str) -> None:
         fault_file.flush()
         faulthandler.enable(file=fault_file)  # type: ignore[arg-type]
     except Exception:  # noqa: BLE001 - crash capture must never block the worker from starting
+        return False
+    return True
+
+
+def _close_open_handle(role: str) -> None:
+    """Close the role's current fault handle, if this process holds one.
+
+    The handle has to be closed before the file can be rolled (an open file cannot be renamed on every
+    platform). Between the close and the reopen that follows it, faulthandler holds a descriptor number
+    with no file behind it, so a fault landing inside that window is not captured; the window is a few
+    file operations wide and is the price of keeping the active file at a stable name.
+    """
+    handle = _FAULTHANDLER_FILES.pop(role, None)
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except OSError:
         return
 
 
-def _roll_oversized_fault_file(fault_path: Path) -> None:
+def _roll_oversized_fault_file(fault_path: Path, *, role: str) -> None:
     """Move a fault file past its size bound aside to a single ``.1`` companion, replacing any previous one.
+
+    The rolled file is closed with a marker naming the role and the time of the roll. A roll can land in
+    the middle of a process's dump history, so without it a reader can open a segment that holds nothing
+    but dumps and cannot tell which worker wrote them.
 
     Args:
         fault_path: The role's fault file, which may not exist yet.
+        role: Short identifier for the writing process, named in the closing marker.
     """
     try:
         if not fault_path.exists() or fault_path.stat().st_size < _FAULTHANDLER_MAX_BYTES:
             return
-        fault_path.replace(fault_path.with_suffix(fault_path.suffix + ".1"))
+        rolled = fault_path.with_suffix(fault_path.suffix + ".1")
+        fault_path.replace(rolled)
+        with rolled.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n=== {role} faulthandler segment closed {datetime.now().isoformat(timespec='seconds')} "
+                f"by pid={os.getpid()}; capture continues in {fault_path.name}\n",
+            )
     except OSError:
         # A fault file that cannot be rolled is still usable for capture, so keep the larger file rather
         # than losing the backstop.
         return
+
+
+def _rearm_if_oversized(role: str) -> bool:
+    """Roll and re-arm the role's fault file when it has grown past the size bound.
+
+    Args:
+        role: Short identifier for the writing process.
+
+    Returns:
+        bool: Whether the file was rolled and capture re-armed on a new one.
+    """
+    try:
+        fault_path = _fault_path(role)
+        if not fault_path.exists() or fault_path.stat().st_size < _FAULTHANDLER_MAX_BYTES:
+            return False
+    except OSError:
+        return False
+    return _arm_faulthandler(role)
+
+
+def _start_fault_file_watch(role: str) -> None:
+    """Start the daemon thread that keeps the role's fault file within its size bound, once per role."""
+    if role in _WATCHED_ROLES:
+        return
+    _WATCHED_ROLES.add(role)
+    try:
+        thread = threading.Thread(
+            target=_watch_fault_file,
+            args=(role,),
+            name=f"faulthandler-bound-{role}",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:  # noqa: BLE001 - an unbounded fault file is better than a worker that will not start
+        _WATCHED_ROLES.discard(role)
+
+
+def _watch_fault_file(role: str) -> None:
+    """Re-check the role's fault file on an interval, rolling and re-arming when it passes the bound."""
+    while True:
+        time.sleep(_FAULTHANDLER_SIZE_CHECK_SECONDS)
+        try:
+            _rearm_if_oversized(role)
+        except Exception:  # noqa: BLE001 - the watch must never take the process down
+            return
 
 
 def neutralize_inherited_argv() -> None:

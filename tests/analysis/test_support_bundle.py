@@ -158,6 +158,89 @@ class TestContents:
         assert _CIVITAI not in compressed_stats_text
 
 
+class TestTruncationPolarity:
+    """Everything the bundle trims keeps its most recent end, on a record boundary."""
+
+    @staticmethod
+    def _jsonl(count: int) -> str:
+        """``count`` ledger-shaped JSONL records, each carrying its index and a padding field."""
+        return "".join(json.dumps({"index": i, "pad": "p" * 200}) + "\n" for i in range(count))
+
+    def test_ledger_keeps_the_most_recent_records(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An oversized action ledger is trimmed from the front, so the newest events survive."""
+        logs = _worker_dir(tmp_path)
+        ledger_dir = tmp_path / ".horde_worker_regen"
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        (ledger_dir / "action_ledger.jsonl").write_text(self._jsonl(200), encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 4096)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+        with zipfile.ZipFile(out) as zf:
+            ledger = zf.read("action_ledger.jsonl").decode("utf-8")
+
+        indices = [json.loads(line)["index"] for line in ledger.splitlines()[1:] if line]
+        assert indices, "the trimmed ledger kept no records at all"
+        assert indices[-1] == 199, "the newest ledger record was dropped"
+        assert indices[0] > 0, "the ledger was not actually trimmed by this test's cap"
+        assert indices == list(range(indices[0], 200)), "the kept records are not a contiguous recent run"
+
+    def test_ledger_truncation_is_marked_and_record_aligned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The trim is announced in the same words the logs use, and no line is cut mid-record."""
+        logs = _worker_dir(tmp_path)
+        ledger_dir = tmp_path / ".horde_worker_regen"
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        (ledger_dir / "action_ledger.jsonl").write_text(self._jsonl(200), encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 4096)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+        with zipfile.ZipFile(out) as zf:
+            ledger = zf.read("action_ledger.jsonl").decode("utf-8")
+
+        lines = [line for line in ledger.splitlines() if line]
+        note = json.loads(lines[0])
+        assert "truncated to the most recent" in note[support_bundle._TRUNCATION_NOTE_KEY]
+        for line in lines:
+            json.loads(line)  # every surviving line is a whole record, including the one at the cut
+
+    def test_stats_keep_the_most_recent_records(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An oversized stats file is trimmed with the same polarity as the ledger and the logs."""
+        logs = _worker_dir(tmp_path)
+        stats_dir = tmp_path / ".horde_worker_regen" / "stats"
+        stats_dir.mkdir(parents=True)
+        (stats_dir / "stats-v1.0.0-20260620-010203-000.jsonl").write_text(self._jsonl(200), encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 4096)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+        with zipfile.ZipFile(out) as zf:
+            stats = zf.read("stats/stats-v1.0.0-20260620-010203-000.jsonl").decode("utf-8")
+
+        lines = [line for line in stats.splitlines() if line]
+        assert support_bundle._TRUNCATION_NOTE_KEY in json.loads(lines[0])
+        assert json.loads(lines[-1])["index"] == 199
+
+    def test_full_logs_keeps_every_record(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``--full-logs`` lifts the cap for the JSONL artifacts too."""
+        logs = _worker_dir(tmp_path)
+        ledger_dir = tmp_path / ".horde_worker_regen"
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        (ledger_dir / "action_ledger.jsonl").write_text(self._jsonl(200), encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 4096)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml", full_logs=True)
+        with zipfile.ZipFile(out) as zf:
+            ledger = zf.read("action_ledger.jsonl").decode("utf-8")
+
+        assert [json.loads(line)["index"] for line in ledger.splitlines() if line] == list(range(200))
+
+
 class TestPerformance:
     """Support-bundle generation should not pay full-read cost for logs it tail-caps."""
 
@@ -177,3 +260,19 @@ class TestPerformance:
         assert text.startswith("[... truncated to the most recent")
         assert "new tail" in text
         assert "old prefix" not in text
+
+    def test_capped_plain_log_drops_the_line_cut_by_the_seek(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The partial line the byte-offset cut lands in is dropped, so the file starts on a whole line."""
+        path = tmp_path / "bridge_1.log"
+        path.write_text(("head " * 400) + "\nkept line\n", encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 64)
+
+        text = support_bundle._read_log_text(path, cap=True)
+
+        body = text.split("\n", 1)[1]
+        assert body.strip() == "kept line"
+        assert "head" not in body

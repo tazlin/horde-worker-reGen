@@ -44,6 +44,11 @@ _HEAD_RE = re.compile(
     r"(?P<message>.*)$",
 )
 
+# The support bundle heads a size-trimmed artifact with this note (see
+# :func:`horde_worker_regen.analysis.support_bundle._truncation_marker`). It carries no timestamp, so it
+# is not a log line; recognizing it is what lets a reader know the file starts later than the run did.
+TRUNCATION_NOTE_RE = re.compile(r"^\[\.\.\. truncated to the most recent .*\.\.\.\]\s*$")
+
 
 def _ts_from_prefix(ts: str) -> datetime | None:
     """Build a datetime from a fixed-width ``YYYY-MM-DD HH:MM:SS.ffffff`` prefix by integer slicing.
@@ -91,6 +96,8 @@ class LogRecord:
     """1-based physical line number within ``source_path`` (its uncompressed member), for evidence refs."""
     continuation: list[str] = field(default_factory=list)
     """Following lines with no timestamp prefix (e.g. a Python traceback) that belong to this record."""
+    follows_truncation: bool = False
+    """Whether a bundle truncation note precedes this record, so earlier lines of the file are missing."""
 
     @property
     def location(self) -> str:
@@ -160,9 +167,17 @@ def parse_lines(
     ``raw_lineno`` continuous with the lines already consumed. ``carry`` is the last record parsed from an
     earlier chunk of the same file: a leading continuation line (this chunk began mid-traceback) folds into
     it, reproducing exactly what a whole-file parse would have done across the chunk boundary.
+
+    A bundle truncation note is consumed rather than folded into a record: it is the bundler's own
+    marker, and the record that follows it is flagged so a reader can tell that the file's first
+    surviving line is later than the run it belongs to.
     """
     records: list[LogRecord] = []
+    follows_truncation = False
     for raw_lineno, line in enumerate(lines, start=start_lineno):
+        if TRUNCATION_NOTE_RE.match(line):
+            follows_truncation = True
+            continue
         head = _HEAD_RE.match(line)
         if head is None:
             # No record head: a traceback/continuation line, or torn output. Attach it to the record in
@@ -184,8 +199,10 @@ def parse_lines(
                 message=head.group("message"),
                 source_path=source_path,
                 raw_lineno=raw_lineno,
+                follows_truncation=follows_truncation,
             ),
         )
+        follows_truncation = False
     return records
 
 

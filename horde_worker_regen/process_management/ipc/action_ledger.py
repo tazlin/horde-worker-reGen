@@ -8,8 +8,11 @@ from scattered log lines.
 
 The ledger keeps a bounded in-memory ring (always on, cheap, queryable for the timeout diagnostics
 dump) and optionally mirrors each event to a size-rotated JSONL file so the record survives a restart
-for offline analysis. It never raises: a file IO error is logged once and degrades to in-memory only,
-so auditing can never itself wedge the worker.
+for offline analysis. It never raises: a file IO error pauses the mirror for a cooldown and degrades to
+in-memory only, so auditing can never itself wedge the worker. The pause is time-bounded rather than
+permanent, because the conditions that break the write (a full disk, a locked file, a transient network
+mount) usually clear well inside a worker's uptime, and a mirror that stays off until restart loses the
+whole remainder of the run: exactly the window an incident is diagnosed from.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import enum
 import json
 import os
+import time
 from collections import deque
 from pathlib import Path
 
@@ -81,6 +85,12 @@ class LedgerEvent(BaseModel):
 
 _DEFAULT_MAX_IN_MEMORY = 500
 _DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024
+_DEFAULT_FILE_RETRY_COOLDOWN_SECONDS = 60.0
+"""How long the file mirror stays paused after a failed write before the next event retries it.
+
+Long enough that a persistent fault costs one failed ``open()`` per minute rather than one per event,
+short enough that the mirror resumes within the same run once the fault clears.
+"""
 
 
 class ActionLedger:
@@ -92,6 +102,7 @@ class ActionLedger:
         path: Path | None = None,
         max_in_memory: int = _DEFAULT_MAX_IN_MEMORY,
         max_file_bytes: int = _DEFAULT_MAX_FILE_BYTES,
+        file_retry_cooldown_seconds: float = _DEFAULT_FILE_RETRY_COOLDOWN_SECONDS,
     ) -> None:
         """Initialize the ledger.
 
@@ -99,11 +110,20 @@ class ActionLedger:
             path: JSONL file to mirror events to, or None for in-memory only (e.g. under test).
             max_in_memory: How many recent events to keep queryable in memory.
             max_file_bytes: Rotate the JSONL file (to ``<name>.1``) once it exceeds this size.
+            file_retry_cooldown_seconds: How long the file mirror stays paused after a failed write.
         """
         self._events: deque[LedgerEvent] = deque(maxlen=max_in_memory)
         self._path = path
         self._max_file_bytes = max_file_bytes
+        self._file_retry_cooldown_seconds = file_retry_cooldown_seconds
         self._file_disabled = False
+        self._file_retry_at = 0.0
+        self._dropped_while_disabled = 0
+
+    @property
+    def dropped_file_writes(self) -> int:
+        """How many events the current mirror outage has kept off disk (0 while the mirror is healthy)."""
+        return self._dropped_while_disabled
 
     def record(
         self,
@@ -117,8 +137,6 @@ class ActionLedger:
         detail: dict[str, str | int | float | bool | None] | None = None,
     ) -> LedgerEvent:
         """Append a lifecycle event to the ring (and the file, if configured). Never raises."""
-        import time
-
         event = LedgerEvent(
             timestamp=time.time(),
             event_type=event_type,
@@ -142,17 +160,50 @@ class ActionLedger:
         return selected[-limit:]
 
     def _append_to_file(self, event: LedgerEvent) -> None:
-        if self._path is None or self._file_disabled:
+        if self._path is None:
+            return
+        if self._file_disabled and time.monotonic() < self._file_retry_at:
+            self._dropped_while_disabled += 1
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._rotate_if_needed()
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event.model_dump()) + "\n")
-        except Exception as e:
-            # Degrade to in-memory only rather than letting an audit IO error disrupt the worker.
-            logger.warning(f"Action ledger file at {self._path} is unwritable ({type(e).__name__}); in-memory only")
+        except Exception as e:  # noqa: BLE001 - an audit IO error must never disrupt the worker
+            self._pause_file_mirror(e)
+            return
+        if self._file_disabled:
+            self._resume_file_mirror()
+
+    def _pause_file_mirror(self, error: Exception) -> None:
+        """Degrade to in-memory only for the cooldown, announcing the outage once per outage.
+
+        Only the transition into an outage is announced: a fault that persists would otherwise emit a
+        line per retry for as long as it lasts, at the exact moment the log is most crowded.
+        """
+        self._file_retry_at = time.monotonic() + self._file_retry_cooldown_seconds
+        if not self._file_disabled:
             self._file_disabled = True
+            logger.warning(
+                f"Action ledger file at {self._path} is unwritable ({type(error).__name__}); mirroring paused "
+                f"for {self._file_retry_cooldown_seconds:.0f}s, events stay in memory",
+            )
+        self._dropped_while_disabled += 1
+
+    def _resume_file_mirror(self) -> None:
+        """Announce a recovered mirror and how many events the outage kept off disk, then clear the outage.
+
+        The count is the disclosure an offline reader needs: without it, the gap in the file reads as a
+        period in which the worker did nothing, rather than one in which nothing could be written.
+        """
+        logger.info(
+            f"Action ledger file at {self._path} is writable again; {self._dropped_while_disabled} event(s) "
+            "were recorded in memory only and are absent from the file",
+        )
+        self._file_disabled = False
+        self._file_retry_at = 0.0
+        self._dropped_while_disabled = 0
 
     def _rotate_if_needed(self) -> None:
         try:

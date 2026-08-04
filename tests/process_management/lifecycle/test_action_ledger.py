@@ -89,3 +89,54 @@ def test_file_error_degrades_to_memory(tmp_path: Path) -> None:
     ledger.record(LedgerEventType.PROCESS_REPLACED, process_id=0)  # must not raise
     assert ledger._file_disabled is True
     assert len(ledger.recent(limit=10)) == 2
+
+
+def test_file_mirror_resumes_after_a_transient_failure(tmp_path: Path) -> None:
+    """A write failure pauses the mirror for a cooldown; once it lapses, events reach the file again.
+
+    A permanent latch would cost the whole remainder of a run's audit trail for one transient fault.
+    """
+    path = tmp_path / "action_ledger.jsonl"
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+    ledger = ActionLedger(path=blocker / "nested" / "ledger.jsonl", file_retry_cooldown_seconds=0.0)
+
+    ledger.record(LedgerEventType.PROCESS_SPAWNED, process_id=0)
+    assert ledger._file_disabled is True
+    assert ledger.dropped_file_writes == 1
+
+    ledger._path = path
+    ledger.record(LedgerEventType.PROCESS_REPLACED, process_id=0, reason="recovered")
+
+    assert ledger._file_disabled is False
+    assert ledger.dropped_file_writes == 0
+    written = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    assert [event["reason"] for event in written] == ["recovered"]
+
+
+def test_events_dropped_during_an_outage_are_counted(tmp_path: Path) -> None:
+    """Every event the outage keeps off disk is counted, so the gap in the file can be disclosed."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+    ledger = ActionLedger(path=blocker / "nested" / "ledger.jsonl", file_retry_cooldown_seconds=3600.0)
+
+    for _ in range(4):
+        ledger.record(LedgerEventType.INFERENCE_DISPATCHED, process_id=0)
+
+    assert ledger.dropped_file_writes == 4
+    assert len(ledger.recent(limit=10)) == 4, "the in-memory ring keeps working through the outage"
+
+
+def test_cooldown_suppresses_retries_until_it_lapses(tmp_path: Path) -> None:
+    """While the cooldown holds, appends do not retry the failing write at all."""
+    path = tmp_path / "action_ledger.jsonl"
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+    ledger = ActionLedger(path=blocker / "nested" / "ledger.jsonl", file_retry_cooldown_seconds=3600.0)
+
+    ledger.record(LedgerEventType.PROCESS_SPAWNED, process_id=0)
+    ledger._path = path  # a healthy path, which the cooldown must not touch yet
+    ledger.record(LedgerEventType.PROCESS_REPLACED, process_id=0)
+
+    assert not path.exists()
+    assert ledger.dropped_file_writes == 2

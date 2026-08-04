@@ -38,8 +38,10 @@ from .system_info import (
 from .triage_report import finding_to_dict, render_findings, render_sessions
 
 _DEFAULT_CONFIG_PATH = Path("bridgeData.yaml")
-# Per-file cap: keep the tail (the most recent, most relevant lines) of any oversized log so one verbose
-# file (the console mirror is tens of MB) cannot balloon the bundle or make the interactive build crawl.
+# Per-file cap: keep the tail (the most recent, most relevant lines) of any oversized artifact so one
+# verbose file (the console mirror is tens of MB) cannot balloon the bundle or make the interactive build
+# crawl. Logs and the JSONL artifacts (ledger, stats) are capped with the same polarity, so a capped
+# bundle does not end up with its artifacts covering different windows of the timeline.
 # 15 MB keeps a full active bridge.log intact and trims only the largest mirrors. `--full-logs` lifts it.
 _MAX_FILE_BYTES = 15 * 1024 * 1024
 # A rotated archive: loguru's timestamped roll-over (``bridge.2026-06-22_00-55-59.log``) or its compressed
@@ -48,6 +50,9 @@ _MAX_FILE_BYTES = 15 * 1024 * 1024
 _ROTATION_TS_RE = re.compile(r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.log$")
 _APP_STATE_DIRNAME = ".horde_worker_regen"
 _STATS_DIRNAME = "stats"
+# The key the JSONL form of the truncation note is emitted under, so a reader that parses every line as
+# JSON sees an object it can recognize and skip rather than a bare bracketed line it must tolerate.
+_TRUNCATION_NOTE_KEY = "_bundle_truncation"
 
 
 @dataclass
@@ -102,21 +107,56 @@ def _member_name(file_path: Path, logs_root: Path) -> str:
     return f"logs/{name}"
 
 
+def _truncation_marker() -> str:
+    """The one-line note that heads any artifact trimmed to the per-file cap."""
+    megabytes = _MAX_FILE_BYTES // (1024 * 1024)
+    return f"[... truncated to the most recent {megabytes} MB ...]"
+
+
+def _drop_partial_first_line(text: str) -> str:
+    """Drop the leading partial line left by cutting a file at an arbitrary byte offset."""
+    newline = text.find("\n")
+    return text[newline + 1 :] if newline != -1 else ""
+
+
+def _tail_capped(text: str) -> str:
+    """Keep ``text``'s most recent whole lines within the cap, headed by the truncation note.
+
+    Every capped artifact keeps its end: an incident is read from what the worker was doing most
+    recently, so trimming from the front is what preserves the evidence. Cutting on a line boundary keeps
+    what survives parseable rather than leaving a torn leading line.
+    """
+    if len(text) <= _MAX_FILE_BYTES:
+        return text
+    return f"{_truncation_marker()}\n{_drop_partial_first_line(text[-_MAX_FILE_BYTES:])}"
+
+
+def _tail_capped_records(text: str, *, cap: bool) -> str:
+    """Keep the most recent whole JSONL records of ``text`` within the cap, headed by a note record.
+
+    Same polarity and record alignment as the log artifacts, so every artifact in one bundle covers the
+    same end of the timeline. The note is a JSON object carrying the log wording verbatim: it reads the
+    same to a human and still parses for a reader that loads every line as JSON.
+    """
+    if not cap or len(text) <= _MAX_FILE_BYTES:
+        return text
+    note = json.dumps({_TRUNCATION_NOTE_KEY: _truncation_marker()})
+    return f"{note}\n{_drop_partial_first_line(text[-_MAX_FILE_BYTES:])}"
+
+
 def _read_log_text(file_path: Path, *, cap: bool) -> str:
     """Read a log file (plain/.zip/.gz, NUL-stripped) as text, keeping only the tail past the size cap."""
     if cap and file_path.suffix.lower() == ".log":
         size = file_path.stat().st_size
         if size > _MAX_FILE_BYTES:
-            megabytes = _MAX_FILE_BYTES // (1024 * 1024)
             with file_path.open("rb") as handle:
                 handle.seek(-_MAX_FILE_BYTES, os.SEEK_END)
                 text = handle.read().decode("utf-8", errors="replace").replace("\x00", "")
-            return f"[... truncated to the most recent {megabytes} MB ...]\n{text}"
+            return f"{_truncation_marker()}\n{_drop_partial_first_line(text)}"
     lines = list(_read_physical_lines(file_path))
     text = "\n".join(lines)
-    if cap and len(text) > _MAX_FILE_BYTES:
-        megabytes = _MAX_FILE_BYTES // (1024 * 1024)
-        text = f"[... truncated to the most recent {megabytes} MB ...]\n" + text[-_MAX_FILE_BYTES:]
+    if cap:
+        text = _tail_capped(text)
     return text
 
 
@@ -255,7 +295,7 @@ def build_support_bundle(
         ledger_paths = ledger_ingest.find_ledger_paths(log_bundle.root)
         if ledger_paths:
             ledger_text = "\n".join(p.read_text(encoding="utf-8", errors="replace").rstrip("\n") for p in ledger_paths)
-            _write(zf, "action_ledger.jsonl", ledger_text)
+            _write(zf, "action_ledger.jsonl", _tail_capped_records(ledger_text, cap=not full_logs))
         used_stats_names: set[str] = set()
         for stats_path in _find_stats_files(log_bundle.root):
             name = _stats_member_name(stats_path)
@@ -266,7 +306,7 @@ def build_support_bundle(
                     index += 1
                 name = f"{stem}.{index}.{ext}"
             used_stats_names.add(name)
-            _write(zf, name, _read_stats_text(stats_path))
+            _write(zf, name, _tail_capped_records(_read_stats_text(stats_path), cap=not full_logs))
 
         # Every log file, redacted. Dedup member names so a rotation that exists both raw and zipped (both
         # reduce to the same `.log` name) does not collide in the archive.

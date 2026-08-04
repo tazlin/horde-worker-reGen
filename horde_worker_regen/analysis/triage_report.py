@@ -38,11 +38,32 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{hours}h{minutes}m"
 
 
+def _fmt_session_span(session: WorkerSession) -> tuple[str, str]:
+    """Format a session's span and duration, marked as bounds when its launch line is not in the capture."""
+    start = _fmt_ts(session.start_ts)
+    duration = _fmt_duration(session.duration_seconds)
+    if session.start_is_lower_bound:
+        return f"<={start} -> {_fmt_ts(session.end_ts)}", f">={duration}"
+    return f"{start} -> {_fmt_ts(session.end_ts)}", duration
+
+
+def _start_bound_note(session: WorkerSession) -> str:
+    """The line explaining why a session's start is a bound, or an empty string when it is exact."""
+    if not session.start_is_lower_bound:
+        return ""
+    cause = "log truncated" if session.start_truncated else "capture begins mid-run"
+    return (
+        f"    started at or before {_fmt_ts(session.start_ts)} ({cause}): the span and duration above are lower bounds"
+    )
+
+
 def session_to_dict(session: WorkerSession) -> dict[str, object]:
     """A JSON-serializable summary of one session."""
     return {
         "index": session.index,
         "start": session.start_ts.isoformat() if session.start_ts else None,
+        "start_is_lower_bound": session.start_is_lower_bound,
+        "start_truncated": session.start_truncated,
         "end": session.end_ts.isoformat() if session.end_ts else None,
         "duration_seconds": session.duration_seconds,
         "version": session.version,
@@ -62,8 +83,7 @@ def render_sessions(sessions: list[WorkerSession], *, root: Path) -> str:
 
     lines = [f"{len(sessions)} worker session(s) in {root}", ""]
     for session in sessions:
-        span = f"{_fmt_ts(session.start_ts)} -> {_fmt_ts(session.end_ts)}"
-        duration = _fmt_duration(session.duration_seconds)
+        span, duration = _fmt_session_span(session)
         version = session.version or "?"
         recoveries = session.peak_process_recoveries
         flag = "  <-- recovery storm" if recoveries >= 5 else ""
@@ -74,6 +94,9 @@ def render_sessions(sessions: list[WorkerSession], *, root: Path) -> str:
         models = session.num_models if session.num_models is not None else "?"
         threads = session.max_threads if session.max_threads is not None else "?"
         lines.append(f"    dreamer: {session.dreamer_name or '?'} | models: {models} | threads: {threads}")
+        note = _start_bound_note(session)
+        if note:
+            lines.append(note)
     return "\n".join(lines)
 
 
@@ -129,10 +152,11 @@ def finding_to_dict(finding: Finding) -> dict[str, object]:
 
 def render_findings(session: WorkerSession, findings: list[Finding]) -> str:
     """A per-session diagnosis block: each finding's verdict, evidence, and remediation."""
-    header = (
-        f"=== Session #{session.index}  {_fmt_ts(session.start_ts)} -> {_fmt_ts(session.end_ts)}  "
-        f"({_fmt_duration(session.duration_seconds)})  {session.end_reason} ==="
-    )
+    span, duration = _fmt_session_span(session)
+    header = f"=== Session #{session.index}  {span}  ({duration})  {session.end_reason} ==="
+    note = _start_bound_note(session)
+    if note:
+        header = f"{header}\n{note.strip()}"
     if not findings:
         return header + "\n  (no findings)"
     blocks = [header]
