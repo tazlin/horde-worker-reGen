@@ -365,6 +365,25 @@ card has proven durable headroom) so the readmit does not immediately re-trip th
 _SAFETY_BACKLOG_PRIORITY_DEPTH = 2
 """Safety backlog depth above which GPU safety restoration is prioritized over placement inertia."""
 
+_SAFETY_RESTORE_PP_BACKLOG_DEPTH = 2
+"""Post-processing backlog depth above which a paused safety process is kept off its card.
+
+Deferring restoration while post-processing runs protects the lane's transient device demand from a
+concurrent safety (re)load. The bound is a depth rather than mere presence because a worker serving
+post-processed requests is rarely without some post-processing work in flight, and an absolute veto would
+hand that steady trickle the power to keep safety off the card for the whole run. Matched to
+:data:`_SAFETY_BACKLOG_PRIORITY_DEPTH`: a queue of this size is one ordinary job's worth of tail work, while
+anything deeper is a lane genuinely under load."""
+
+_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS = 90.0
+"""How long a shallow post-processing backlog may defer safety restoration before it stops counting.
+
+Measured from when the post-processing backlog last became non-empty, so an emptying lane resets it and only
+continuously-occupied work ages. Long enough to cover the tail of a batch of jobs (the burst this gate exists
+for) and far longer than the :data:`_SAFETY_PLACEMENT_RESTORE_STREAK` band, so the fit hysteresis remains the
+term that decides restoration timing and this bound only stops an unbroken trickle from pinning safety to the
+CPU indefinitely."""
+
 _DISPATCH_STALL_MIN_SECONDS = 10.0
 """How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
 
@@ -872,6 +891,10 @@ class InferenceScheduler:
         # is the only code allowed to turn that request into a lifecycle pause or restore, so reclaim,
         # residency, and fit hysteresis cannot issue overlapping safety rebuilds.
         self._safety_reclaim_pause_requested = False
+        # When the post-processing backlog last became non-empty, or None while it is empty. Ages the
+        # restore-side post-processing bound so an unbroken trickle of shallow post-processing cannot keep a
+        # paused safety process off its card for the whole run.
+        self._safety_restore_pp_backlog_since: float | None = None
         # Lifetime counts of runtime safety-placement policy actuations, for the run-metrics readback: a
         # demotion moves safety off-GPU (its charge did not fit beside the sampler), a promotion restores it
         # once the chosen card's measured free proved durable room. These count only policy-initiated moves,
@@ -1825,6 +1848,41 @@ class InferenceScheduler:
         """Return whether the safety backlog is deep enough to prioritize GPU restoration."""
         return self._safety_backlog_depth() > _SAFETY_BACKLOG_PRIORITY_DEPTH
 
+    def _track_post_processing_backlog_age(self) -> int:
+        """Return the post-processing backlog depth, advancing the clock the restore bound reads.
+
+        The clock marks when the backlog last became non-empty and is cleared the moment it drains, so only
+        continuously-occupied post-processing work accrues age and an intermittent lane never does.
+        """
+        pp_backlog_depth = len(self._job_tracker.jobs_pending_post_processing) + len(
+            self._job_tracker.jobs_being_post_processed,
+        )
+        if pp_backlog_depth == 0:
+            self._safety_restore_pp_backlog_since = None
+        elif self._safety_restore_pp_backlog_since is None:
+            self._safety_restore_pp_backlog_since = time.time()
+        return pp_backlog_depth
+
+    def _post_processing_defers_safety_restore(self, pp_backlog_depth: int) -> bool:
+        """Whether post-processing work should keep a paused safety process off its card this cycle.
+
+        A safety (re)load competes for the card with the post-processing lane's transient demand, so live
+        post-processing defers restoration. The deferral is bounded on both depth and age rather than being
+        absolute: a backlog deeper than :data:`_SAFETY_RESTORE_PP_BACKLOG_DEPTH` is a lane under real load and
+        always defers, while a shallow backlog defers only until it has been continuously occupied for
+        :data:`_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS`. Without the age bound a worker with a steady
+        trickle of post-processed requests never presents an empty lane, and safety stays on the CPU for the
+        whole run no matter how much room the card has.
+        """
+        if pp_backlog_depth == 0:
+            return False
+        if pp_backlog_depth > _SAFETY_RESTORE_PP_BACKLOG_DEPTH:
+            return True
+        since = self._safety_restore_pp_backlog_since
+        if since is None:
+            return True
+        return (time.time() - since) < _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS
+
     def _held_residency_requests_safety_off_gpu(self) -> bool:
         """Return whether any live residency requires safety to remain off its card."""
         return any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies())
@@ -1834,8 +1892,8 @@ class InferenceScheduler:
 
         :data:`_SAFETY_GPU_LOAD_CHARGE_MB` is the static seed and any measured
         :attr:`FootprintStage.SAFETY` watermark raises it, the same raise-only overlay every other stage's
-        pricing uses. The learned figure is already safety's *whole device* footprint (its settled allocator
-        reservation plus the platform context constant, as the observation seam records it), directly
+        pricing uses. The learned figure is already safety's *whole device* footprint (its at-rest allocation
+        plus the platform context constant, as the observation seam records it), directly
         comparable with the seed, so no context term is added on top of it here.
 
         Every consumer of the safety charge routes through this accessor (the arbiter's ``SAFETY_LOAD``
@@ -2019,8 +2077,10 @@ class InferenceScheduler:
 
         Runtime fit hysteresis, whole-card residency, and the reclaim ladder contribute demand rather than
         cycling the process independently. This method is the sole caller of the lifecycle safety pause and
-        restore actuators. A live residency is a restore veto even when another request initiated the pause;
-        accepted post-processing work and the device-free governor similarly veto growth back onto the card.
+        restore actuators. A live residency is a restore veto even when another request initiated the pause,
+        and the device-free governor similarly vetoes growth back onto the card. Accepted post-processing work
+        defers restoration under a depth-and-age bound (see :meth:`_post_processing_defers_safety_restore`)
+        rather than absolutely, so a steady trickle cannot hold safety off the card for the whole run.
 
         The fit policy still uses modeled non-fit for demotion and measured device-free headroom for promotion.
         Whole-card and reclaim requests do not wait for fit hysteresis, but residency will not interrupt an
@@ -2044,10 +2104,12 @@ class InferenceScheduler:
             self._safety_placement_fit_streak = 0
             self._safety_placement_wants_off = False
             self._safety_reclaim_pause_requested = False
+            self._safety_restore_pp_backlog_since = None
             return
 
         safety_backlog_depth = self._safety_backlog_depth()
         safety_card = self._safety_gpu_card()
+        pp_backlog_depth = self._track_post_processing_backlog_age()
         if update_policy:
             if safety_backlog_depth > 0 and not self._process_lifecycle.is_safety_gpu_paused:
                 self._safety_placement_miss_streak = 0
@@ -2095,7 +2157,7 @@ class InferenceScheduler:
                 return
             if 0 < safety_backlog_depth <= _SAFETY_BACKLOG_PRIORITY_DEPTH:
                 return
-            if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+            if self._post_processing_defers_safety_restore(pp_backlog_depth):
                 return
             if self.is_vram_growth_held(safety_card) or not self._arbiter_admits_safety_gpu_load(safety_card):
                 return

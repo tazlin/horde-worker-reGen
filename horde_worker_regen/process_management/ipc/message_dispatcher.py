@@ -1002,17 +1002,19 @@ class MessageDispatcher:
         activation or is still moving, and folding either into a raise-only watermark would over-price
         residency permanently.
 
-        The charge is the process's own allocator reservation plus the platform's fixed CUDA-context
-        constant, which together are its full device footprint. Device-view readings (``vram_usage_mb``) are
-        deliberately not consulted: they report device-wide occupancy on one platform and a per-process view
-        on another, so they are never a per-process charge.
+        The charge is the process's live allocation (``process_allocated_mb``) plus the platform's fixed
+        CUDA-context constant. The allocator's reservation is deliberately not used: the caching allocator
+        retains blocks freed by earlier activation, so an idle slot's reservation is the high-water mark of
+        the work it last ran rather than the at-rest cost of its weights, and it is reclaimable on demand.
+        Device-view readings (``vram_usage_mb``) are likewise not consulted: they report device-wide
+        occupancy on one platform and a per-process view on another, so they are never a per-process charge.
         """
         store = self._footprint_store
         if store is None:
             return
 
-        reserved_mb = message.process_reserved_mb
-        if reserved_mb is None or reserved_mb <= 0:
+        allocated_mb = message.process_allocated_mb
+        if allocated_mb is None or allocated_mb <= 0:
             return
 
         process_info = self._process_map.get(message.process_id)
@@ -1043,25 +1045,27 @@ class MessageDispatcher:
             stage=FootprintStage.RESIDENT,
             checkpoint=model_name,
         )
-        store.observe_peak(key, platform_context_constant_mb() + float(reserved_mb))
+        store.observe_peak(key, platform_context_constant_mb() + float(allocated_mb))
 
     def _observe_safety_footprint(self, message: HordeProcessMemoryMessage) -> None:
         """Record the safety process's at-rest device footprint into the learned-footprint store.
 
         A GPU-resident safety process reports its allocator fields like any other GPU child, so what it
-        actually costs the card is measurable rather than assumed. The steady reservation is folded, never
-        the peak: an evaluation's transient spike is reclaimable and is not what safety costs while it waits,
-        so pricing residency from it would keep safety off the card long after it would fit. For the same
-        reason a busy safety process is skipped, since its reservation still holds the evaluation it is
-        running. The context constant is added because the residency question is about the whole device
-        footprint, the context included, which is only freed by the process exiting.
+        actually costs the card is measurable rather than assumed. The charge is the live allocation
+        (``process_allocated_mb``), never the peak and never the reservation: an evaluation's transient spike
+        is reclaimable and is not what safety costs while it waits, and the caching allocator holds that
+        spike's blocks in its reservation long after the evaluation ends, so pricing residency from either
+        would keep safety off the card long after it would fit. For the same reason a busy safety process is
+        skipped, since its allocation still holds the evaluation it is running. The context constant is added
+        because the residency question is about the whole device footprint, the context included, which is
+        only freed by the process exiting.
         """
         store = self._footprint_store
         if store is None:
             return
 
-        reserved_mb = message.process_reserved_mb
-        if reserved_mb is None or reserved_mb <= 0:
+        allocated_mb = message.process_allocated_mb
+        if allocated_mb is None or allocated_mb <= 0:
             return
 
         process_info = self._process_map.get(message.process_id)
@@ -1076,7 +1080,7 @@ class MessageDispatcher:
             platform=sys.platform,
             stage=FootprintStage.SAFETY,
         )
-        store.observe_peak(key, platform_context_constant_mb() + float(reserved_mb))
+        store.observe_peak(key, platform_context_constant_mb() + float(allocated_mb))
 
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:
         """Handle a process state change message."""

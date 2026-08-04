@@ -85,6 +85,7 @@ def _memory_message(
     *,
     peak_mb: int | None = None,
     reserved_mb: int | None = None,
+    allocated_mb: int | None = None,
     vram_usage_mb: int = 0,
     sampled_at: float | None = None,
 ) -> HordeProcessMemoryMessage:
@@ -96,6 +97,7 @@ def _memory_message(
         vram_usage_mb=vram_usage_mb,
         process_peak_reserved_mb=peak_mb,
         process_reserved_mb=reserved_mb,
+        process_allocated_mb=allocated_mb,
         sampled_at=sampled_at,
     )
 
@@ -212,7 +214,12 @@ def test_settled_idle_slot_records_its_resident_weights() -> None:
     loaded_at = time.time()
     _confirm_model_loaded(dispatcher, 1)
     dispatcher._handle_memory_report(
-        _memory_message(1, reserved_mb=4900, sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0),
+        _memory_message(
+            1,
+            allocated_mb=4900,
+            reserved_mb=5200,
+            sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0,
+        ),
     )
 
     observation = store.get_observation(_resident_key())
@@ -220,8 +227,13 @@ def test_settled_idle_slot_records_its_resident_weights() -> None:
     assert observation.watermark_mb == 4900.0 + platform_context_constant_mb()
 
 
-def test_a_slot_inside_the_settle_window_is_not_attributed() -> None:
-    """A reading taken just after a load describes a reservation still in motion, so it is discarded."""
+def test_resident_observation_ignores_the_allocator_cache() -> None:
+    """A slot whose reservation still caches a past job's freed blocks is priced by its live allocation.
+
+    The caching allocator keeps blocks it has freed, so an idle slot's reservation is the high-water mark of
+    the work it last ran. Folding that into the raise-only resident watermark would price residency at a
+    running job's cost forever.
+    """
     process_map = ProcessMap({1: make_mock_process_info(1, model_name=_MODEL)})
     store = LearnedFootprintStore()
     dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
@@ -229,14 +241,56 @@ def test_a_slot_inside_the_settle_window_is_not_attributed() -> None:
     loaded_at = time.time()
     _confirm_model_loaded(dispatcher, 1)
     dispatcher._handle_memory_report(
-        _memory_message(1, reserved_mb=4900, sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS - 1.0),
+        _memory_message(
+            1,
+            allocated_mb=4900,
+            reserved_mb=12000,
+            sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0,
+        ),
+    )
+
+    observation = store.get_observation(_resident_key())
+    assert observation is not None
+    assert observation.watermark_mb == 4900.0 + platform_context_constant_mb()
+
+
+def test_a_slot_reporting_no_live_allocation_is_not_attributed() -> None:
+    """A report carrying only a reservation gives no at-rest figure, so nothing is recorded."""
+    process_map = ProcessMap({1: make_mock_process_info(1, model_name=_MODEL)})
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
+
+    loaded_at = time.time()
+    _confirm_model_loaded(dispatcher, 1)
+    dispatcher._handle_memory_report(
+        _memory_message(
+            1,
+            reserved_mb=4900,
+            allocated_mb=None,
+            sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0,
+        ),
+    )
+
+    assert store.get_observation(_resident_key()) is None
+
+
+def test_a_slot_inside_the_settle_window_is_not_attributed() -> None:
+    """A reading taken just after a load describes an allocation still in motion, so it is discarded."""
+    process_map = ProcessMap({1: make_mock_process_info(1, model_name=_MODEL)})
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
+
+    loaded_at = time.time()
+    _confirm_model_loaded(dispatcher, 1)
+    dispatcher._handle_memory_report(
+        _memory_message(1, allocated_mb=4900, sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS - 1.0),
     )
 
     assert store.get_observation(_resident_key()) is None
 
 
 async def test_a_busy_slot_records_no_resident_footprint() -> None:
-    """A slot running its job holds activation on top of the weights, which is not a resident figure."""
+    """A slot running its job holds live activation on top of the weights, which is not a resident figure."""
     process_info = make_mock_process_info(1, model_name=_MODEL, state=HordeProcessState.INFERENCE_STARTING)
     job = make_job_pop_response(model=_MODEL, width=512, height=512)
     process_info.last_job_referenced = job
@@ -251,7 +305,7 @@ async def test_a_busy_slot_records_no_resident_footprint() -> None:
     dispatcher._handle_memory_report(
         _memory_message(
             1,
-            reserved_mb=12000,
+            allocated_mb=12000,
             sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0,
         ),
     )
@@ -275,7 +329,7 @@ async def test_an_idle_looking_slot_still_holding_a_tracked_job_is_not_attribute
     dispatcher._handle_memory_report(
         _memory_message(
             1,
-            reserved_mb=12000,
+            allocated_mb=12000,
             sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0,
         ),
     )
@@ -289,7 +343,7 @@ def test_a_slot_with_no_confirmed_residency_is_not_attributed() -> None:
     store = LearnedFootprintStore()
     dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
 
-    dispatcher._handle_memory_report(_memory_message(1, reserved_mb=4900, sampled_at=time.time()))
+    dispatcher._handle_memory_report(_memory_message(1, allocated_mb=4900, sampled_at=time.time()))
 
     assert len(store) == 0
 
@@ -312,30 +366,30 @@ def test_a_device_view_reading_is_never_folded_into_a_footprint() -> None:
     loaded_at = time.time()
     _confirm_model_loaded(dispatcher, 1)
     settled = loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0
-    dispatcher._handle_memory_report(_memory_message(1, reserved_mb=None, vram_usage_mb=15000, sampled_at=settled))
-    dispatcher._handle_memory_report(_memory_message(2, reserved_mb=None, vram_usage_mb=15000, sampled_at=settled))
+    dispatcher._handle_memory_report(_memory_message(1, allocated_mb=None, vram_usage_mb=15000, sampled_at=settled))
+    dispatcher._handle_memory_report(_memory_message(2, allocated_mb=None, vram_usage_mb=15000, sampled_at=settled))
 
     assert len(store) == 0
 
 
 def test_idle_safety_process_records_its_at_rest_residency() -> None:
-    """A GPU-resident safety process's steady reservation plus its context lands under the safety key."""
+    """A GPU-resident safety process's live allocation plus its context lands under the safety key."""
     process_info = make_mock_process_info(2, model_name=None, process_type=HordeProcessType.SAFETY)
     process_map = ProcessMap({2: process_info})
     store = LearnedFootprintStore()
     dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
 
-    dispatcher._handle_memory_report(_memory_message(2, reserved_mb=2800, peak_mb=6000))
+    dispatcher._handle_memory_report(_memory_message(2, allocated_mb=2800, reserved_mb=5100, peak_mb=6000))
 
     observation = store.get_observation(_safety_key())
     assert observation is not None
-    # The steady reservation, not the evaluation peak: the spike is reclaimable and is not what safety costs
-    # the card while it waits.
+    # Neither the evaluation peak nor the reservation that still caches it: both are reclaimable and are not
+    # what safety costs the card while it waits.
     assert observation.watermark_mb == 2800.0 + platform_context_constant_mb()
 
 
 def test_an_evaluating_safety_process_is_not_attributed() -> None:
-    """A safety process mid-evaluation still holds that evaluation, so its reservation is not at-rest."""
+    """A safety process mid-evaluation still holds that evaluation, so its allocation is not at-rest."""
     process_info = make_mock_process_info(
         2,
         model_name=None,
@@ -346,7 +400,7 @@ def test_an_evaluating_safety_process_is_not_attributed() -> None:
     store = LearnedFootprintStore()
     dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
 
-    dispatcher._handle_memory_report(_memory_message(2, reserved_mb=2800))
+    dispatcher._handle_memory_report(_memory_message(2, allocated_mb=2800))
 
     assert len(store) == 0
 
@@ -358,6 +412,6 @@ def test_a_cpu_only_safety_process_records_nothing() -> None:
     store = LearnedFootprintStore()
     dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
 
-    dispatcher._handle_memory_report(_memory_message(2, reserved_mb=None))
+    dispatcher._handle_memory_report(_memory_message(2, allocated_mb=None))
 
     assert len(store) == 0

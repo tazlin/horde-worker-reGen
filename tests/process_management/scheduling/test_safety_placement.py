@@ -12,12 +12,15 @@ process on and off the card. Placement is headroom-aware across cards, not a fix
 from __future__ import annotations
 
 import sys
+import time
 import uuid
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -33,6 +36,8 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     _SAFETY_GPU_LOAD_CHARGE_MB,
     _SAFETY_PLACEMENT_PAUSE_STREAK,
     _SAFETY_PLACEMENT_RESTORE_STREAK,
+    _SAFETY_RESTORE_PP_BACKLOG_DEPTH,
+    _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -337,6 +342,100 @@ class TestPlacementRequestOwnership:
 
         scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
         assert scheduler._safety_placement_miss_streak == 0
+
+
+class TestPostProcessingRestoreBound:
+    """Post-processing defers a safety restore on depth and age, never absolutely.
+
+    A worker serving post-processed requests is rarely without some post-processing work in flight, so an
+    absolute veto lets an arbitrarily shallow but unbroken trickle keep safety on the CPU for the whole run
+    however much room the card has.
+    """
+
+    def _restorable_scheduler(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
+        """A paused-off scheduler whose every restore gate but the post-processing one is satisfied."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
+        scheduler._safety_restore_headroom_fits = lambda device_index: True
+        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
+        scheduler._safety_placement_wants_off = True
+        return scheduler
+
+    async def _queue_post_processing(self, scheduler: object, depth: int) -> list[HordeJobInfo]:
+        """Place ``depth`` generated jobs in the pending post-processing stage; return them."""
+        queued: list[HordeJobInfo] = []
+        for _ in range(depth):
+            job_info = HordeJobInfo(
+                sdk_api_job_info=make_job_pop_response(post_processing=["RealESRGAN_x4plus"]),
+                job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+                state=GENERATION_STATE.ok,
+                censored=False,
+                time_popped=time.time(),
+            )
+            await scheduler._job_tracker.queue_for_post_processing(job_info)  # type: ignore[attr-defined]
+            queued.append(job_info)
+        return queued
+
+    async def test_a_persistent_shallow_backlog_stops_deferring_after_the_bound(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A one-deep backlog that never drains defers only until it has aged past the bound."""
+        scheduler = self._restorable_scheduler(monkeypatch)
+        await self._queue_post_processing(scheduler, 1)
+
+        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
+            scheduler._reconcile_runtime_safety_placement()
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+
+        # Age the unbroken backlog past the bound, leaving it just as deep and every other gate as it was.
+        scheduler._safety_restore_pp_backlog_since = time.time() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS + 1.0)
+        scheduler._reconcile_runtime_safety_placement()
+
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
+            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+        )
+
+    async def test_a_deep_backlog_defers_however_long_it_lasts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A lane under real load keeps the card, no matter how long it has been under load."""
+        scheduler = self._restorable_scheduler(monkeypatch)
+        await self._queue_post_processing(scheduler, _SAFETY_RESTORE_PP_BACKLOG_DEPTH + 1)
+
+        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
+            scheduler._reconcile_runtime_safety_placement()
+        scheduler._safety_restore_pp_backlog_since = time.time() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS * 10.0)
+        scheduler._reconcile_runtime_safety_placement()
+
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    async def test_a_young_shallow_backlog_defers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ordinary tail of post-processing after a batch of jobs still holds the restore off."""
+        scheduler = self._restorable_scheduler(monkeypatch)
+        await self._queue_post_processing(scheduler, 1)
+
+        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
+            scheduler._reconcile_runtime_safety_placement()
+
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    async def test_a_drained_backlog_resets_the_age(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An emptying lane restarts the clock, so intermittent work never accumulates toward the bound."""
+        scheduler = self._restorable_scheduler(monkeypatch)
+        queued = await self._queue_post_processing(scheduler, 1)
+        scheduler._reconcile_runtime_safety_placement()
+        aged = time.time() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS - 1.0)
+        scheduler._safety_restore_pp_backlog_since = aged
+
+        await scheduler._job_tracker.abandon_pending_post_processing(queued[0])
+        scheduler._reconcile_runtime_safety_placement()
+        assert scheduler._safety_restore_pp_backlog_since is None
+
+        await self._queue_post_processing(scheduler, 1)
+        scheduler._reconcile_runtime_safety_placement()
+
+        assert scheduler._safety_restore_pp_backlog_since is not None
+        assert scheduler._safety_restore_pp_backlog_since > aged
 
 
 class TestResidencyRestoreRespectsPlacementWish:
