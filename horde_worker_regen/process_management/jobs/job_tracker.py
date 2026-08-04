@@ -2004,9 +2004,28 @@ class JobTracker:
         Args:
             device_index: Card to query, or None for the worker-wide answer.
         """
+        return self._has_exclusive_job(
+            device_index,
+            stages=(JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS),
+        )
+
+    def has_exclusive_job_running(self, device_index: int | None = None) -> bool:
+        """Whether an exclusive over-budget job is actually running (``INFERENCE_IN_PROGRESS``) in the scope.
+
+        The narrower counterpart of :meth:`has_exclusive_job_in_progress`, for callers that must distinguish a
+        job whose over-budget footprint is on the card right now from one merely staged for an exclusive
+        admit. Scope matching is identical, including the conservative treatment of an unattributed admit.
+
+        Args:
+            device_index: Card to query, or None for the worker-wide answer.
+        """
+        return self._has_exclusive_job(device_index, stages=(JobStage.INFERENCE_IN_PROGRESS,))
+
+    def _has_exclusive_job(self, device_index: int | None, *, stages: tuple[JobStage, ...]) -> bool:
+        """Whether an exclusively-admitted job in one of ``stages`` matches the requested card scope."""
         return any(
             tracked.admitted_exclusive
-            and tracked.stage in (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS)
+            and tracked.stage in stages
             and (
                 device_index is None
                 or tracked.admitted_exclusive_device_index is None

@@ -225,6 +225,10 @@ Two scoping rules keep these last-resort remedies from taxing a healthy host:
   device and suppresses only that card's preload and dispatch consumers. A marker created before attribution
   remains worker-wide until a card is known, so missing routing evidence is conservative rather than permissive.
   If dispatch commits on a different card, that actual card replaces the plan before later consumers run.
+  Dispatch suppression additionally requires a live claim on the card: the exclusive job is sampling, or its
+  whole-card residency is held or being established. The marker itself lasts the life of the job (it also
+  carries fault attribution and the over-budget step grace), so a staged job whose establishment is deferred
+  by the residency rate limiter does not hold back unrelated work while it waits.
 - **RAM eviction sacrifices the cheapest cache.** When an idle RAM resident must be reclaimed, the
   victim is the smallest size-tier candidate (map order breaking ties), never a card-dominating
   checkpoint whose disk reload costs several times an ordinary model's, unless it is the only candidate.

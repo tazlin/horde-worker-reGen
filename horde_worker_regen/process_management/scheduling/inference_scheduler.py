@@ -796,6 +796,11 @@ class InferenceScheduler:
         self._dispatch_reconciliation_released_by_reclaim = 0
         self._dispatch_reconciliation_released_by_natural_free = 0
 
+        # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
+        # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
+        # the operator has already read.
+        self._exclusive_suppression_logged_at: dict[int | None, float] = {}
+
         # The bounded affinity line-skip window for the currently-tracked displaced head. Resident-model jobs
         # may pass a cold FIFO head only while it is inside this window (a wall-clock budget derived from the
         # job ttl plus a hard skip ceiling). The window advances only on committed dispatch (see
@@ -3144,6 +3149,16 @@ class InferenceScheduler:
                 f"its model is resident and idle on process {process.process_id}, but the concurrency cap is "
                 f"reached (in_progress={in_progress}, cap={cap})"
             )
+        # Below the cap the same admit still holds dispatch whenever it holds a live claim on the card (a
+        # running over-budget job, or a staged one whose whole-card residency is up). Attribute that slot to the
+        # admit here too, so the wait is named rather than falling through to the gate-less stall report.
+        if not self._job_tracker.is_admitted_exclusive(head) and self._exclusive_dispatch_suppression_active(
+            process.device_index,
+        ):
+            return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
+                f"its model is resident and idle on process {process.process_id}, but an exclusively-admitted "
+                f"over-budget job holds the card (in_progress={in_progress}, cap={cap})"
+            )
         if not self._concurrent_overlap_allowed(head, target_device_index=process.device_index):
             return SlotDutyBucket.OVERLAP_HEADWAY, (
                 f"its model is resident and idle on process {process.process_id}, but the overlap-headway gate "
@@ -3244,6 +3259,62 @@ class InferenceScheduler:
             if model is not None and model in queued_models:
                 blockers.append((proc.process_id, model))
         return blockers
+
+    _EXCLUSIVE_SUPPRESSION_LOG_INTERVAL_SECONDS = 30.0
+    """How often the exclusive-admit dispatch hold may name itself for one card scope.
+
+    The hold is re-evaluated on every dispatch selection, so an unthrottled line would repeat many times a
+    second for as long as the exclusive job owns the card while saying nothing new."""
+
+    def _exclusive_dispatch_suppression_active(self, device_index: int | None) -> bool:
+        """Whether an exclusive over-budget admit currently withholds co-dispatch in ``device_index``'s scope.
+
+        Suppression follows a live claim on the card, not the per-job ``admitted_exclusive`` flag: that flag is
+        sticky for the life of the job because it also carries fault attribution and the over-budget step
+        grace. Two claims qualify. An exclusive job actually sampling has its over-budget footprint on the card
+        right now, so co-dispatch stays suppressed for its whole run (on a single-GPU host that is worker-wide,
+        which is the intended conservatism). A staged exclusive job qualifies only while its whole-card
+        residency is held or being established, since that is when the card has actually been given to it. A
+        marked job with neither claim (its establishment deferred by the residency rate limiter, for instance)
+        holds nothing and must not stop unrelated work from dispatching.
+        """
+        if self._job_tracker.has_exclusive_job_running(device_index):
+            return True
+        if not self._job_tracker.has_exclusive_job_in_progress(device_index):
+            return False
+        return self._exclusive_residency_live(device_index)
+
+    def _exclusive_residency_live(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency is held or being established in ``device_index``'s scope.
+
+        A residency record with a model set covers both phases: the model is recorded at the grant, which is
+        when the teardown begins, and cleared only on restore. A card is asked about its own residency and
+        about the card-agnostic worker-wide record, mirroring how an unattributed exclusive admit is treated as
+        applying to every card.
+        """
+        if device_index is None:
+            return self._whole_card_ledger.any_held()
+        return any(
+            (state := self._whole_card_ledger.get(key)) is not None and state.model is not None
+            for key in (device_index, None)
+        )
+
+    def _note_exclusive_dispatch_suppression(
+        self,
+        job: ImageGenerateJobPopResponse,
+        device_index: int | None,
+    ) -> None:
+        """Disclose (throttled per card scope) that an exclusive admit is holding this job's dispatch back."""
+        now = time.time()
+        last = self._exclusive_suppression_logged_at.get(device_index, 0.0)
+        if (now - last) < self._EXCLUSIVE_SUPPRESSION_LOG_INTERVAL_SECONDS:
+            return
+        self._exclusive_suppression_logged_at[device_index] = now
+        scope = "worker-wide" if device_index is None else f"device {device_index}"
+        logger.debug(
+            f"Dispatch of job {str(job.id_)[:8]} ({job.model}) is held {scope}: an exclusively-admitted "
+            "over-budget job holds the card.",
+        )
 
     def _log_dispatch_stall_if_needed(
         self,
@@ -7866,9 +7937,10 @@ class InferenceScheduler:
             process_with_model = diversity_process
 
         dispatch_scope = process_with_model.device_index if self._multi_gpu_routing_active else None
-        if self._job_tracker.has_exclusive_job_in_progress(dispatch_scope) and not (
-            self._job_tracker.is_admitted_exclusive(next_job)
+        if not self._job_tracker.is_admitted_exclusive(next_job) and self._exclusive_dispatch_suppression_active(
+            dispatch_scope,
         ):
+            self._note_exclusive_dispatch_suppression(next_job, dispatch_scope)
             return None
 
         self._model_recently_missing = False
