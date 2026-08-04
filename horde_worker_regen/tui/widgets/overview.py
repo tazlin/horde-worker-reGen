@@ -77,6 +77,7 @@ from horde_worker_regen.tui.trends import (
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
 from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS
 from horde_worker_regen.update_check import UpdateInfo, current_version
+from horde_worker_regen.utils import get_system_appropriate_updater
 
 _TREND_HISTORY = 21600
 """How many one-second trend samples the Trends region retains (up to roughly six hours)."""
@@ -586,15 +587,14 @@ class OverviewView(Vertical):
     @staticmethod
     def _render_update_nag(info: UpdateInfo) -> Panel:
         """Render the update-available nag panel shown at the top of the overview."""
+        system_updater_name = get_system_appropriate_updater()
         line = Text.assemble(
             ("v", "grey70"),
             (current_version(), "bold"),
             (" -> ", "grey50"),
             (f"v{info.latest_version}", "bold yellow"),
             ("   Run ", "grey70"),
-            ("'update.cmd'", "bold cyan"),
-            (" / ", "grey50"),
-            ("'update.sh'", "bold cyan"),
+            (f"'{system_updater_name}'", "bold cyan"),
             (" to update, or re-run the installer.", "grey70"),
         )
         return Panel(line, title="Update available", title_align="left", border_style="yellow", padding=(0, 1))
@@ -981,9 +981,10 @@ class OverviewView(Vertical):
         grid.add_row("RAM", ram_text)
 
         intake_parts: list[tuple[str, str]] = []
-        intake_parts.append(
-            ("pop hold on" if ram.pop_hold_active else "pop hold off", "yellow" if ram.pop_hold_active else "grey62")
-        )
+        intake_parts.append((
+            "pop hold on" if ram.pop_hold_active else "pop hold off",
+            "yellow" if ram.pop_hold_active else "grey62",
+        ))
         if ram.pop_pause_active:
             pause = human_duration(ram.pop_pause_remaining_seconds)
             intake_parts.append((f"hard pause {pause}", "yellow"))
