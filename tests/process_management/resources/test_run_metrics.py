@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Tra
 from horde_worker_regen.process_management.resources.run_metrics import (
     DecisionKind,
     DecisionVerdict,
+    JobMetricsRecord,
     ResourceStateKind,
     WorkerRunMetrics,
 )
@@ -60,12 +61,18 @@ def _finalize_job(
     faulted: bool = False,
     n_iter: int = 1,
     kudos_reward: float | None = None,
+    payload_overrides: dict[str, object] | None = None,
 ) -> str:
     """Finalize a synthetic tracked job and return its job id string."""
     job = dummy_job_factory("Deliberate")
     assert job.id_ is not None
+    payload_updates: dict[str, object] = {}
     if n_iter != 1:
-        job = job.model_copy(update={"payload": job.payload.model_copy(update={"n_iter": n_iter})})
+        payload_updates["n_iter"] = n_iter
+    if payload_overrides:
+        payload_updates.update(payload_overrides)
+    if payload_updates:
+        job = job.model_copy(update={"payload": job.payload.model_copy(update=payload_updates)})
     tracked = TrackedJob(
         job_id=job.id_,
         sdk_api_job_info=job,
@@ -148,6 +155,50 @@ class TestJobCorrelation:
         metrics = WorkerRunMetrics()
         _finalize_job(metrics, faulted=True)
         assert metrics.snapshot().jobs[0].kudos_reward is None
+
+    def test_pricing_features_taken_from_the_pop_payload(self) -> None:
+        """The sampler, schedule, and cfg the horde priced are what the record carries.
+
+        These complete the request side of a payload-to-measured-seconds pair, so they must be the
+        popped values rather than defaults.
+        """
+        metrics = WorkerRunMetrics()
+        _finalize_job(
+            metrics,
+            payload_overrides={"sampler_name": "k_dpmpp_2m", "scheduler": "exponential", "cfg_scale": 4.5},
+        )
+
+        record = metrics.snapshot().jobs[0]
+        assert record.sampler_name == "k_dpmpp_2m"
+        assert record.scheduler == "exponential"
+        assert record.cfg_scale == 4.5
+
+    def test_scheduler_derived_from_karras_when_unstated(self) -> None:
+        """Without a named schedule, the legacy karras bool decides it, where false means normal."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, payload_overrides={"scheduler": None, "karras": True})
+        _finalize_job(metrics, payload_overrides={"scheduler": None, "karras": False})
+
+        records = metrics.snapshot().jobs
+        assert records[0].scheduler == "karras"
+        assert records[1].scheduler == "normal"
+
+    def test_alchemy_form_has_no_pricing_features(self) -> None:
+        """An alchemy form has no image pop payload, so its record leaves the three fields unknown."""
+        metrics = WorkerRunMetrics()
+        metrics.record_alchemy_form(form_id="f", form="caption", e2e_seconds=1.0, faulted=False)
+
+        record = metrics.snapshot().jobs[0]
+        assert record.sampler_name is None
+        assert record.scheduler is None
+        assert record.cfg_scale is None
+
+    def test_record_parses_without_the_pricing_features(self) -> None:
+        """A record written before these fields existed still parses, with the fields unknown."""
+        record = JobMetricsRecord.model_validate({"job_id": "old", "model_name": "Deliberate"})
+        assert record.sampler_name is None
+        assert record.scheduler is None
+        assert record.cfg_scale is None
 
     def test_alchemy_form_carries_its_reward(self) -> None:
         """An alchemy form's record carries the reward its own submit response paid."""

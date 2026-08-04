@@ -37,10 +37,16 @@ deletion; a foreign file, a leftover `.tmp`, or a nested folder is never touched
 | ---------------- | ------- | ------- |
 | `session_start`  | Once, when export begins | `worker_version`, `timestamp`, and a flat `config` snapshot of the throughput-relevant resolved bridge_data (max_power, max_threads, queue_size, residency and post-processing flags, disaggregation, model count, ...). The anchor for attributing a behavioural change to the configuration it ran under. |
 | `session_end`    | Once, on clean shutdown | Terminal `reason`, `duration_seconds`, `jobs_submitted`, `jobs_faulted`, `process_recoveries`. |
-| `job_completed`  | Per finished job or alchemy form | The full [`JobMetricsRecord`][horde_worker_regen.process_management.resources.run_metrics.JobMetricsRecord] (stage timings, queue-wait/e2e/sampling seconds, model, resolution, post-processing, VRAM high-water) and its resolved `baseline`. |
+| `job_completed`  | Per finished job or alchemy form | The full [`JobMetricsRecord`][horde_worker_regen.process_management.resources.run_metrics.JobMetricsRecord] (stage timings, queue-wait/e2e/sampling seconds, model, resolution, sampler/scheduler/cfg_scale, post-processing, VRAM high-water) and its resolved `baseline`. |
 | `stats_sample`   | At most once per second | A periodic [`StatsSample`][horde_worker_regen.process_management.ipc.supervisor_channel.StatsSample] (throughput, kudos/hr, VRAM/RAM, duty cycle). |
 | `decision`       | On an admission/dispatch/reclaim verdict (coalesced) | `decision_kind`, `subject`, `verdict`, `reason`, and a flat `inputs` map of the quantities the arbiter decided from. |
 | `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved), `state`, `device_index`, and flat `inputs`. |
+
+A `job_completed` record pairs the priced request with what it cost to serve: alongside resolution, steps
+and batch count it carries `sampler_name` (as the horde advertised it, uncanonicalized), `scheduler`
+(the schedule sampled on, `karras`/`normal` when the request only carried the legacy karras bool) and
+`cfg_scale`, against measured `sampling_seconds` and the horde's `kudos_reward`. Records written before
+these fields existed simply omit them.
 
 ### The `decision` record and its coalescing contract
 

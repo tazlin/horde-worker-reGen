@@ -144,6 +144,18 @@ class JobMetricsRecord(BaseModel):
     tis_count: int = 0
     control_type: str | None = None
     post_processing: list[str] = Field(default_factory=list)
+    sampler_name: str | None = None
+    """The sampler the horde asked for, kept as advertised rather than canonicalized to a backend name.
+
+    None on records built without a pop payload (alchemy forms, stage records)."""
+    scheduler: str | None = None
+    """The noise schedule the job was sampled on.
+
+    Taken from the payload's ``scheduler`` when the horde states one. When only the legacy ``karras`` bool
+    arrives, it decides: ``karras`` when set, ``normal`` when not. None on records built without a pop
+    payload."""
+    cfg_scale: float | None = None
+    """The classifier-free guidance scale the job requested, or None without a pop payload."""
     hires_fix: bool = False
     batch_count: int = 1
     megapixelsteps: float = 0.0
@@ -658,6 +670,13 @@ class WorkerRunMetrics:
         sampling_seconds = (
             phase_metrics.sampling.duration_seconds if phase_metrics is not None and phase_metrics.sampling else None
         )
+        # The horde may name the schedule outright; when it does not, the legacy karras bool decides it,
+        # where false means `normal`. Read through getattr rather than the attribute so an SDK predating
+        # the scheduler field cannot fault job finalization.
+        scheduler: str | None = getattr(payload, "scheduler", None)
+        if not scheduler:
+            scheduler = "karras" if payload.karras else "normal"
+
         batch_count = payload.n_iter if isinstance(payload.n_iter, int) and payload.n_iter > 0 else 1
         megapixelsteps = (
             (float(payload.width or 0) * float(payload.height or 0) / 1_000_000.0)
@@ -683,6 +702,9 @@ class WorkerRunMetrics:
             tis_count=len(payload.tis) if payload.tis else 0,
             control_type=control_type,
             post_processing=[str(post_proc_step) for post_proc_step in payload.post_processing],
+            sampler_name=str(payload.sampler_name) if payload.sampler_name is not None else None,
+            scheduler=scheduler,
+            cfg_scale=float(payload.cfg_scale) if payload.cfg_scale is not None else None,
             hires_fix=payload.hires_fix,
             batch_count=batch_count,
             megapixelsteps=megapixelsteps,
