@@ -225,13 +225,14 @@ class WorkerHost:
     def _apply_lifecycle(self, action: str) -> None:
         """Start, stop, or restart the worker process in response to a client request.
 
-        START is idempotent: with multiple attached sessions (each of which may auto-start), only the
-        first actually spawns; a START while the worker is alive is ignored so a second worker is never
-        spawned over the first.
+        START is forwarded unconditionally: the supervisor is the only party that can tell a healthy
+        worker (where the request is already satisfied) from one draining towards exit (where it becomes
+        the replacement that stop will spawn). Judging it here from liveness alone conflated the two and
+        discarded every START issued during a drain, so a client asking for the worker back got silence
+        and no worker.
         """
         if action == sp.LIFECYCLE_START:
-            if not self._supervisor.is_alive():
-                self._supervisor.start()
+            self._supervisor.start()
         elif action == sp.LIFECYCLE_STOP:
             self._supervisor.request_graceful_stop()
         elif action == sp.LIFECYCLE_RESTART:

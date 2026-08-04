@@ -223,6 +223,8 @@ class WorkerSupervisor:
         self._intentional_stop = False
         self._restart_after_stop = False
         """Whether the current cooperative stop should spawn a replacement once the old worker is reaped."""
+        self._start_already_running_logged = False
+        """Whether the current lifecycle episode has already explained a start that needed no action."""
         self._graceful_stop_deadline = 0.0
         """When > 0, a non-blocking graceful stop is in progress; ``tick`` terminates the worker if it
         has not exited by this monotonic-free wall-clock deadline (see :meth:`request_graceful_stop`)."""
@@ -271,16 +273,29 @@ class WorkerSupervisor:
         return self._process is not None and self._process.is_alive()
 
     def start(self) -> None:
-        """Launch the worker child process, or fold the request into a cooperative stop already draining.
+        """Ensure a worker is running or on its way, whatever lifecycle state the supervisor is in.
 
-        Spawning over a draining worker would put two workers on the same GPU, worker name, and model
-        cache, and the handle to the older one is overwritten in the act, so nothing is left to reap the
-        tree it owns. A start arriving in that window instead becomes the replacement the stop already
-        knows how to make (see :meth:`_complete_graceful_stop`), so exactly one worker comes back and it
-        comes back only once the outgoing one is confirmed dead.
+        The request carries one intent, and how it is met depends on what the worker is doing:
+
+        * Stopped, crashed, or never launched: spawn now.
+        * A cooperative stop draining: fold into that stop as its replacement (see
+          :meth:`_complete_graceful_stop`). Spawning over a draining worker would put two workers on the
+          same GPU, worker name, and model cache, and the handle to the older one is overwritten in the
+          act, so nothing is left to reap the tree it owns.
+        * Already running: nothing to do. The live worker keeps its handle, and its restart budget and
+          fatal-error record are left alone rather than being rewritten by a request that changed nothing.
+
+        Replacing a healthy worker is a different intent, expressed by :meth:`restart`.
+
+        Owners may therefore call this whenever they want a worker up, without first inspecting the
+        lifecycle themselves; a caller that guesses from the outside cannot see the drain, and dropping the
+        request there is what left an operator with no worker at all.
         """
         if self._is_cooperative_stop_draining():
             self._upgrade_draining_stop_to_restart()
+            return
+        if self.is_alive():
+            self._note_start_already_satisfied()
             return
         self._intentional_stop = False
         self._restart_after_stop = False
@@ -288,6 +303,19 @@ class WorkerSupervisor:
         self._restart_attempts = 0
         self.last_fatal_error = None
         self._spawn()
+
+    def _note_start_already_satisfied(self) -> None:
+        """Explain a start that needs no action, once per episode rather than once per request.
+
+        Attached clients reissue start on their own schedule (each session may auto-start, and a buffered
+        request is replayed on reconnect), so a line per call would be a log stream reporting a steady
+        state. :meth:`_set_status` re-arms this on the next lifecycle transition, so the next episode is
+        explained again.
+        """
+        if self._start_already_running_logged:
+            return
+        self._start_already_running_logged = True
+        logger.info("Start requested but the worker is already running; leaving the running worker as it is.")
 
     def _is_cooperative_stop_draining(self) -> bool:
         """Whether a stop or restart intent is recorded and the worker it targets is still alive."""
@@ -364,9 +392,14 @@ class WorkerSupervisor:
         self._last_loop_advance_wall = None
 
     def _set_status(self, status: SupervisorStatus) -> None:
-        """Update status and notify any observer on change."""
+        """Update status and notify any observer on change.
+
+        A change also ends the current "start needs no action" episode, which is what keeps that notice
+        edge-triggered: it is re-armed by the lifecycle moving, never by another request arriving.
+        """
         if status != self._status:
             self._status = status
+            self._start_already_running_logged = False
             if self.on_status_change is not None:
                 self.on_status_change(status)
 

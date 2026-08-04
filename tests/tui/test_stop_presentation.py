@@ -14,9 +14,11 @@ UNRESPONSIVE, and a stop that overruns its window is still force-killed and land
 
 from __future__ import annotations
 
+import io
 import time
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
@@ -27,6 +29,7 @@ from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui import worker_launcher
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
 from horde_worker_regen.tui.health import WorkerPhase, derive
+from horde_worker_regen.tui.worker_host import WorkerHost
 from horde_worker_regen.tui.worker_launcher import (
     SupervisorStatus,
     WorkerProcessMode,
@@ -35,6 +38,9 @@ from horde_worker_regen.tui.worker_launcher import (
 
 _STALE_LIVENESS_SECONDS = 60.0
 """Well past ``health.STALE_SNAPSHOT_SECONDS``: the silence a worker's teardown legitimately produces."""
+
+_ALREADY_RUNNING_NOTICE = "already running"
+"""The distinguishing fragment of the notice a start needing no action emits."""
 
 
 # region harness
@@ -155,6 +161,16 @@ def _owning_supervisor_mid_stop(ctx: _FakeCtx) -> tuple[WorkerSupervisor, float]
     supervisor.last_liveness_wall_time = now - _STALE_LIVENESS_SECONDS
     supervisor.request_graceful_stop()
     return supervisor, now
+
+
+def _capture_supervisor_logs() -> tuple[io.StringIO, int]:
+    """Attach a StringIO sink to the global loguru logger and return it with its sink id.
+
+    The supervisor logs through loguru, whose default sink binds to the real stderr fd and so dodges
+    pytest's capsys/capfd; an explicit sink on the same logger captures its output deterministically.
+    """
+    sink = io.StringIO()
+    return sink, logger.add(sink, level="DEBUG", format="{message}")
 
 
 def _attached_supervisor(monkeypatch: pytest.MonkeyPatch) -> AttachedWorkerSupervisor:
@@ -430,6 +446,157 @@ def test_start_after_a_completed_stop_spawns_a_fresh_worker() -> None:
 
     assert ctx.process_count == 2
     assert supervisor.status is SupervisorStatus.STARTING
+
+
+def test_start_on_a_running_worker_leaves_it_untouched() -> None:
+    """A start whose goal is already met changes nothing: no second worker, no reset lifecycle state.
+
+    The request is "have a worker running", and one is. Spawning again would strand the live worker's
+    handle, and clearing the restart budget or the fatal-error record would quietly rewrite recovery state
+    the running worker still owns. Bouncing a live worker is what ``restart`` is for.
+    """
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    process = ctx.last_process
+    assert process is not None
+    supervisor._set_status(SupervisorStatus.RUNNING)
+    supervisor._restart_attempts = 3
+
+    supervisor.start()
+
+    assert ctx.process_count == 1
+    assert supervisor._process is process, "the live worker's handle must not be replaced"
+    assert supervisor.status is SupervisorStatus.RUNNING
+    assert supervisor.restart_attempts == 3, "a satisfied start must not clear the restart budget"
+
+
+def test_repeated_starts_on_a_running_worker_explain_themselves_once_per_episode() -> None:
+    """The "already running" notice is edge-triggered: once per episode, re-armed by a state change.
+
+    A client that reissues start on a timer would otherwise turn the explanation into a log stream. The
+    trigger re-arms on the next lifecycle transition, so a later episode is still explained.
+    """
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    supervisor._set_status(SupervisorStatus.RUNNING)
+
+    sink, sink_id = _capture_supervisor_logs()
+    try:
+        for _ in range(5):
+            supervisor.start()
+        first_episode = sink.getvalue().count(_ALREADY_RUNNING_NOTICE)
+
+        # A lifecycle transition ends the episode; the next redundant start is explained afresh.
+        supervisor._set_status(SupervisorStatus.RESTARTING)
+        supervisor._set_status(SupervisorStatus.RUNNING)
+        supervisor.start()
+        second_episode = sink.getvalue().count(_ALREADY_RUNNING_NOTICE)
+    finally:
+        logger.remove(sink_id)
+
+    assert first_episode == 1, "the notice repeated per call instead of per episode"
+    assert second_episode == 2, "the notice never re-armed after the lifecycle state changed"
+    assert ctx.process_count == 1
+
+
+def test_restart_still_bounces_a_running_worker() -> None:
+    """A bounce is expressed by ``restart``, which must keep replacing a healthy worker."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    original = ctx.last_process
+    assert original is not None
+    supervisor._set_status(SupervisorStatus.RUNNING)
+
+    supervisor.restart()
+
+    assert ctx.process_count == 2
+    assert supervisor._process is not original
+    assert supervisor.status is SupervisorStatus.RESTARTING
+
+
+# endregion
+
+
+# region worker host lifecycle requests
+
+
+def _host_over(ctx: _FakeCtx) -> tuple[WorkerHost, WorkerSupervisor]:
+    """A host owning an unstarted supervisor; never bound, so lifecycle requests are applied directly."""
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    return WorkerHost(supervisor, host="127.0.0.1", port=0), supervisor
+
+
+def test_host_start_during_a_drain_brings_the_worker_back() -> None:
+    """A client pressing start while the worker drains gets a worker back, not a discarded request.
+
+    The host forwards the request and lets the supervisor resolve it, so the drain is upgraded to a
+    restart. Deciding at the host that a live process means "nothing to do" dropped the intent entirely:
+    the worker was on its way out, so the operator was left with no worker and no error.
+    """
+    ctx = _FakeCtx()
+    host, supervisor = _host_over(ctx)
+    supervisor.start()
+    process = ctx.last_process
+    assert process is not None
+    supervisor.request_graceful_stop()
+
+    host._apply_lifecycle(sp.LIFECYCLE_START)
+    host._apply_lifecycle(sp.LIFECYCLE_START)
+
+    assert ctx.process_count == 1, "no worker may spawn beside the one still draining"
+    assert supervisor.status is SupervisorStatus.RESTARTING
+
+    process.exit_cleanly()
+    supervisor.tick()
+
+    assert ctx.process_count == 2, "the start was swallowed: the worker never came back"
+    assert supervisor.is_alive()
+
+
+def test_host_start_while_running_keeps_the_one_worker() -> None:
+    """Repeated starts from attached clients against a healthy worker stay a no-op at the supervisor."""
+    ctx = _FakeCtx()
+    host, supervisor = _host_over(ctx)
+    supervisor.start()
+    process = ctx.last_process
+    assert process is not None
+    supervisor._set_status(SupervisorStatus.RUNNING)
+
+    host._apply_lifecycle(sp.LIFECYCLE_START)
+    host._apply_lifecycle(sp.LIFECYCLE_START)
+
+    assert ctx.process_count == 1
+    assert supervisor._process is process
+    assert supervisor.status is SupervisorStatus.RUNNING
+
+
+def test_host_start_on_a_stopped_worker_spawns_immediately() -> None:
+    """The ordinary case is unchanged: nothing is running, so the forwarded start launches the worker."""
+    ctx = _FakeCtx()
+    host, supervisor = _host_over(ctx)
+
+    host._apply_lifecycle(sp.LIFECYCLE_START)
+
+    assert ctx.process_count == 1
+    assert supervisor.is_alive()
+
+
+def test_host_stop_and_restart_requests_are_unaffected() -> None:
+    """The other lifecycle actions still map to the supervisor's cooperative stop and restart."""
+    ctx = _FakeCtx()
+    host, supervisor = _host_over(ctx)
+    supervisor.start()
+    assert ctx.last_process is not None
+
+    host._apply_lifecycle(sp.LIFECYCLE_STOP)
+    assert supervisor.status is SupervisorStatus.STOPPING
+
+    host._apply_lifecycle(sp.LIFECYCLE_RESTART)
+    assert supervisor.status is SupervisorStatus.RESTARTING
+    assert ctx.process_count == 1, "the replacement waits for the draining worker to exit"
 
 
 # endregion

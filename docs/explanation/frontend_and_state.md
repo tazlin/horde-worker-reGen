@@ -118,7 +118,14 @@ reporting `shutting_down` before it goes quiet. A repeat stop request re-sends
 the shutdown but keeps the original force-kill deadline, so pressing stop again
 cannot defer the backstop that ends a stop the worker is ignoring. A restart
 requested mid-stop upgrades that stop in place rather than starting a second
-teardown. Terminal and served modes use this same supervisor transition; socket
+teardown. Start carries one intent, "have a worker running", and the supervisor
+resolves it against its own state: it spawns when nothing is running, becomes the
+replacement the stop already plans when a drain is under way, and does nothing at
+all (beyond one explanatory log line) when the worker is already healthy. Callers
+therefore never have to inspect the lifecycle first, and the host forwards a
+client's start unconditionally instead of guessing from liveness; replacing a
+healthy worker is the separate `restart` intent. Terminal and served modes use
+this same supervisor transition; socket
 clients merely enqueue the intent on the host's single owner thread and present
 `STOPPING` locally until the host reports a status of its own.
 
