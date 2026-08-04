@@ -190,6 +190,12 @@ Two independent mechanisms guard against the worker getting stuck:
    remaining work runs on a service lane rather than an inference slot.
    These checks are purely informational: they emit diagnostics after a short
    grace period and do **not** kill or replace anything.
+   The diagnostics are held back until a condition has held continuously for
+   `_DEADLOCK_PRINT_SUSTAIN_SECONDS`, because the same condition is momentarily true during ordinary
+   gaps between jobs (pending work the dispatch arbiter is holding for a better-fitting candidate, for
+   instance). A sustained condition logs one compact summary line at `DEBUG`, with the full
+   job/process/model dump at `TRACE`. Detection state itself is unaffected: the flags and onset timestamps the
+   save-our-ship supervisor reads still track the instantaneous conditions.
 
 ## Worker-wide recovery
 

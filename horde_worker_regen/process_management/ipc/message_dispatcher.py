@@ -237,6 +237,24 @@ class MessageDispatcher:
     _queue_deadlock_model: str | None = None
     _queue_deadlock_process_id: int | None = None
     _last_deadlock_detail_log_time: float = 0.0
+    _deadlock_condition_since: float | None = None
+    """When the raw all-idle-with-work condition last became true, or None while it is false. Print gating
+    only; the detection latch and its timestamps are tracked separately."""
+    _queue_deadlock_condition_since: float | None = None
+    """When the raw queue-deadlock condition last became true, or None while it is false. Print gating only."""
+    _deadlock_summary_logged: bool = False
+    """Whether the current deadlock episode has had its diagnostics logged, so the "cleared" line is emitted
+    only for an episode an operator actually saw reported."""
+    _queue_deadlock_summary_logged: bool = False
+    """Whether the current queue-deadlock episode has had its diagnostics logged."""
+
+    _DEADLOCK_PRINT_SUSTAIN_SECONDS = 10.0
+    """How long a raw deadlock condition must hold continuously before any of its diagnostics are logged.
+    The condition (work outstanding while no process is busy) is momentarily true during ordinary scheduling
+    gaps between jobs, such as pending work the dispatch arbiter is deliberately holding back so a
+    better-fitting candidate can run first, so a sub-threshold blip describes a healthy worker and the
+    verbose dump that follows it is noise. Detection state, its timestamps and everything the recovery
+    supervisor reads are unaffected: this gates emission only."""
 
     _DEADLOCK_DETAIL_LOG_INTERVAL_SECONDS = 30.0
     """How often the verbose deadlock dump (process/model maps, per-stage counts) may be emitted while a
@@ -1777,15 +1795,42 @@ class MessageDispatcher:
         )
 
     def _print_deadlock_info(self) -> None:
-        """Dump the current job/process/model state for a deadlock post-mortem (verbose; throttled)."""
-        logger.debug(f"Jobs in queue: {len(self._job_tracker.jobs_pending_inference)}")
-        logger.debug(f"Jobs in progress: {len(self._job_tracker.jobs_in_progress)}")
-        logger.debug(f"Jobs pending safety check: {len(self._job_tracker.jobs_pending_safety_check)}")
-        logger.debug(f"Jobs being safety checked: {len(self._job_tracker.jobs_being_safety_checked)}")
-        logger.debug(f"Jobs completed: {len(self._job_tracker.jobs_pending_submit)}")
-        logger.debug(f"Jobs faulted: {self._job_tracker.num_jobs_faulted}")
-        logger.debug(f"horde_model_map: {self._horde_model_map}")
-        logger.debug(f"process_map: {self._process_map}")
+        """Dump the current job/process/model state for a deadlock post-mortem (verbose; throttled).
+
+        Emitted at TRACE: the whole-map dump is an investigation aid rather than an operator-facing signal,
+        and the compact summary line that precedes it carries what the operator-facing log needs.
+        """
+        logger.trace(f"Jobs in queue: {len(self._job_tracker.jobs_pending_inference)}")
+        logger.trace(f"Jobs in progress: {len(self._job_tracker.jobs_in_progress)}")
+        logger.trace(f"Jobs pending safety check: {len(self._job_tracker.jobs_pending_safety_check)}")
+        logger.trace(f"Jobs being safety checked: {len(self._job_tracker.jobs_being_safety_checked)}")
+        logger.trace(f"Jobs completed: {len(self._job_tracker.jobs_pending_submit)}")
+        logger.trace(f"Jobs faulted: {self._job_tracker.num_jobs_faulted}")
+        logger.trace(f"horde_model_map: {self._horde_model_map}")
+        logger.trace(f"process_map: {self._process_map}")
+
+    def _deadlock_state_summary(self) -> str:
+        """Compact one-line description of the outstanding work and slot states behind a deadlock condition."""
+        return (
+            f"pending={len(self._job_tracker.jobs_pending_inference)} "
+            f"in_progress={len(self._job_tracker.jobs_in_progress)} "
+            f"pending_safety={len(self._job_tracker.jobs_pending_safety_check)} "
+            f"pending_submit={len(self._job_tracker.jobs_pending_submit)} "
+            f"{self._process_map.residency_snapshot()}"
+        )
+
+    def _deadlock_print_due(self, condition_since: float | None) -> bool:
+        """Whether a raw deadlock condition has held long enough for its diagnostics to be worth logging.
+
+        Args:
+            condition_since: When the condition last became true, or None while it is false.
+
+        Returns:
+            True once the condition has held continuously for the sustain threshold.
+        """
+        if condition_since is None:
+            return False
+        return (time.time() - condition_since) >= self._DEADLOCK_PRINT_SUSTAIN_SECONDS
 
     def _should_log_deadlock_detail(self) -> bool:
         """Whether the recurring verbose deadlock dump may be emitted now (throttled per interval).
@@ -1800,14 +1845,24 @@ class MessageDispatcher:
         return False
 
     def detect_deadlock(self) -> None:
-        """Detect if there are jobs in the queue but no processes doing anything."""
+        """Detect if there are jobs in the queue but no processes doing anything.
+
+        The detection latches are set and cleared on the instantaneous conditions, since the recovery
+        supervisor applies its own patience to them. The diagnostics are held back until a condition has
+        held for ``_DEADLOCK_PRINT_SUSTAIN_SECONDS``, so an ordinary scheduling gap between jobs reports
+        nothing.
+        """
         if self._state.last_pop_recently():
-            if self._in_deadlock or self._in_queue_deadlock:
+            if self._deadlock_summary_logged or self._queue_deadlock_summary_logged:
                 logger.debug("Deadlock cleared after recent job pop.")
             self._in_deadlock = False
             self._in_queue_deadlock = False
             self._queue_deadlock_model = None
             self._queue_deadlock_process_id = None
+            self._deadlock_condition_since = None
+            self._queue_deadlock_condition_since = None
+            self._deadlock_summary_logged = False
+            self._queue_deadlock_summary_logged = False
             return
 
         # A pending job whose auxiliary prefetch is still in flight is holding no lane on purpose (its
@@ -1835,6 +1890,28 @@ class MessageDispatcher:
             and len(unheld_pending) > 0
             and not any(job in self._job_tracker.jobs_in_progress for job in unheld_pending)
         )
+
+        deadlock_condition = (
+            len(unheld_pending) > 0
+            or len(unheld_in_progress) > 0
+            or any(not _deadlock_exempt(job) for job in self._job_tracker.jobs_lookup)
+        ) and self._process_map.num_busy_processes() == 0
+
+        # The latches below are detection state the recovery supervisor reads and their timestamps mean
+        # "first detected"; these two clocks track the raw conditions instead, purely so a condition that
+        # has not lasted long enough to mean anything prints nothing.
+        if queue_deadlock_condition:
+            if self._queue_deadlock_condition_since is None:
+                self._queue_deadlock_condition_since = time.time()
+        else:
+            self._queue_deadlock_condition_since = None
+
+        if deadlock_condition:
+            if self._deadlock_condition_since is None:
+                self._deadlock_condition_since = time.time()
+        else:
+            self._deadlock_condition_since = None
+
         if (
             self._in_queue_deadlock
             and not queue_deadlock_condition
@@ -1844,10 +1921,12 @@ class MessageDispatcher:
             # re-spawning slot in PROCESS_STARTING) does not prematurely clear a real all-idle deadlock. But a
             # slot genuinely mid-inference disproves the all-idle premise outright, so a slow-to-spawn sibling
             # must not keep the flag latched over a healthy, advancing worker.
-            logger.debug("Queue deadlock cleared.")
+            if self._queue_deadlock_summary_logged:
+                logger.debug("Queue deadlock cleared.")
             self._in_queue_deadlock = False
             self._queue_deadlock_model = None
             self._queue_deadlock_process_id = None
+            self._queue_deadlock_summary_logged = False
 
         if not self._in_queue_deadlock and queue_deadlock_condition:
             currently_loaded_models = set()
@@ -1865,8 +1944,8 @@ class MessageDispatcher:
                     self._queue_deadlock_process_id = model_process_map[job.model]
                     break
             else:
-                logger.debug("Queue deadlock detected without a model causing it.")
-                self._print_deadlock_info()
+                # No diagnostics here: the condition is one tick old at this edge, so the sustain gate below
+                # decides whether it ever lasted long enough to be worth reporting.
                 self._in_queue_deadlock = True
                 self._last_queue_deadlock_detected_time = time.time()
                 self._queue_deadlock_model = unheld_pending[0].model
@@ -1890,22 +1969,32 @@ class MessageDispatcher:
 
             # Keep the flag set so the recovery supervisor can act on a sustained deadlock.
 
-        deadlock_condition = (
-            len(unheld_pending) > 0
-            or len(unheld_in_progress) > 0
-            or any(not _deadlock_exempt(job) for job in self._job_tracker.jobs_lookup)
-        ) and self._process_map.num_busy_processes() == 0
+        if (
+            self._in_queue_deadlock
+            and self._queue_deadlock_process_id is None
+            and not self._queue_deadlock_summary_logged
+            and self._deadlock_print_due(self._queue_deadlock_condition_since)
+        ):
+            # A None process id is how the latch above records "no loaded model explains the pending work".
+            self._queue_deadlock_summary_logged = True
+            logger.debug(f"Queue deadlock detected without a model causing it. {self._deadlock_state_summary()}")
+            self._print_deadlock_info()
 
         if (not self._in_deadlock) and deadlock_condition:
             self._last_deadlock_detected_time = time.time()
             self._in_deadlock = True
-            logger.debug("Deadlock detected")
-            self._print_deadlock_info()
-        elif self._in_deadlock and (self._last_deadlock_detected_time + 10) < time.time() and deadlock_condition:
-            # Recurring every tick while the deadlock persists; share the same throttle as the queue dump.
-            if self._should_log_deadlock_detail():
+        elif self._in_deadlock and not deadlock_condition:
+            if self._deadlock_summary_logged:
+                logger.debug("Deadlock cleared.")
+            self._in_deadlock = False
+            self._deadlock_summary_logged = False
+
+        if self._in_deadlock and self._deadlock_print_due(self._deadlock_condition_since):
+            if not self._deadlock_summary_logged:
+                self._deadlock_summary_logged = True
+                logger.debug(f"Deadlock detected. {self._deadlock_state_summary()}")
+                self._print_deadlock_info()
+            elif (self._last_deadlock_detected_time + 10) < time.time() and self._should_log_deadlock_detail():
+                # Recurring every tick while the deadlock persists; share the same throttle as the queue dump.
                 logger.debug("Deadlock still detected after 10 seconds.")
                 self._print_deadlock_info()
-        elif self._in_deadlock and not deadlock_condition:
-            logger.debug("Deadlock cleared.")
-            self._in_deadlock = False

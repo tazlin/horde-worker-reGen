@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import queue
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import Mock
+
+import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
-from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.ipc.message_dispatcher import (
+    _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
+    MessageDispatcher,
+)
 from horde_worker_regen.process_management.ipc.messages import HordeProcessMemoryMessage, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -57,6 +65,45 @@ def _make_message_dispatcher(
         on_unload_vram=Mock(),
         state=state,
     )
+
+
+@contextmanager
+def _capture_levels() -> Iterator[list[tuple[str, str]]]:
+    """Capture ``(level name, message)`` pairs for loguru records emitted inside the block."""
+    records: list[tuple[str, str]] = []
+    handler_id = logger.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="TRACE",
+    )
+    try:
+        yield records
+    finally:
+        logger.remove(handler_id)
+
+
+def _debug_messages(records: list[tuple[str, str]]) -> list[str]:
+    """Messages of the captured records emitted at DEBUG or above."""
+    return [message for level, message in records if level != "TRACE"]
+
+
+async def _make_deadlocked_dispatcher() -> tuple[MessageDispatcher, ProcessMap]:
+    """Build a dispatcher whose raw deadlock conditions are both true: one pending job and no busy slot."""
+    state = WorkerState(last_job_pop_time=time.time() - 60)
+    process_map = ProcessMap({})
+    job_tracker = JobTracker()
+    await track_popped_job_async(job_tracker, make_mock_job(model="stable_diffusion"))
+
+    return (
+        _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker),
+        process_map,
+    )
+
+
+def _age_deadlock_conditions(message_dispatcher: MessageDispatcher) -> None:
+    """Backdate the raw-condition clocks so the next tick sees the conditions as sustained."""
+    aged = time.time() - (MessageDispatcher._DEADLOCK_PRINT_SUSTAIN_SECONDS + 1)
+    message_dispatcher._deadlock_condition_since = aged
+    message_dispatcher._queue_deadlock_condition_since = aged
 
 
 class TestDetectDeadlock:
@@ -249,6 +296,115 @@ class TestDetectDeadlock:
         # Ten ticks of a continuous wedge must collapse to a single verbose dump, not ten (or twenty).
         assert dump_calls == 1
         assert message_dispatcher._in_queue_deadlock is True
+
+    async def test_sub_threshold_condition_prints_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A deadlock condition shorter than the sustain threshold must log nothing at DEBUG.
+
+        Every gap between jobs where pending work waits on a deliberate dispatch decision satisfies the raw
+        condition for a few seconds, so printing on its rising edge reports a healthy worker as wedged and
+        buries the log in verbose dumps.
+        """
+        message_dispatcher, _ = await _make_deadlocked_dispatcher()
+
+        with _capture_levels() as records:
+            for _ in range(5):
+                message_dispatcher.detect_deadlock()
+
+        assert _debug_messages(records) == []
+
+        # Load-bearing check: with the sustain threshold removed, the very same tick reports the condition,
+        # which is what the printer did before it was gated.
+        monkeypatch.setattr(MessageDispatcher, "_DEADLOCK_PRINT_SUSTAIN_SECONDS", 0.0)
+        with _capture_levels() as ungated_records:
+            message_dispatcher.detect_deadlock()
+
+        assert any(message.startswith("Deadlock detected.") for message in _debug_messages(ungated_records))
+
+    async def test_sustained_condition_prints_summary_once(self) -> None:
+        """Once the condition outlives the threshold, one compact summary is logged, not one per tick."""
+        message_dispatcher, _ = await _make_deadlocked_dispatcher()
+        message_dispatcher.detect_deadlock()
+        _age_deadlock_conditions(message_dispatcher)
+
+        with _capture_levels() as records:
+            for _ in range(5):
+                message_dispatcher.detect_deadlock()
+
+        summaries = [message for message in _debug_messages(records) if message.startswith("Deadlock detected.")]
+        assert len(summaries) == 1
+        assert "pending=1" in summaries[0]
+        assert "in_progress=0" in summaries[0]
+        assert "slots=" in summaries[0]
+
+        queue_summaries = [
+            message
+            for message in _debug_messages(records)
+            if message.startswith("Queue deadlock detected without a model causing it.")
+        ]
+        assert len(queue_summaries) == 1
+
+        # The verbose dump belongs to the investigation trail, not the operator-facing log.
+        assert not any(message.startswith("process_map:") for message in _debug_messages(records))
+        assert any(level == "TRACE" and message.startswith("process_map:") for level, message in records)
+
+    async def test_cleared_line_requires_a_printed_detected_line(self) -> None:
+        """The "cleared" lines are emitted only for an episode whose detection was actually reported."""
+        message_dispatcher, process_map = await _make_deadlocked_dispatcher()
+        message_dispatcher.detect_deadlock()
+
+        with _capture_levels() as records:
+            process_map[0] = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+            message_dispatcher.detect_deadlock()
+
+        assert message_dispatcher._in_deadlock is False
+        assert _debug_messages(records) == []
+
+        sustained_dispatcher, sustained_process_map = await _make_deadlocked_dispatcher()
+        sustained_dispatcher.detect_deadlock()
+        _age_deadlock_conditions(sustained_dispatcher)
+        sustained_dispatcher.detect_deadlock()
+
+        with _capture_levels() as sustained_records:
+            sustained_process_map[0] = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+            sustained_dispatcher.detect_deadlock()
+
+        assert sustained_dispatcher._in_deadlock is False
+        assert "Deadlock cleared." in _debug_messages(sustained_records)
+        assert "Queue deadlock cleared." in _debug_messages(sustained_records)
+
+    async def test_detection_state_matches_for_sub_threshold_and_sustained(self) -> None:
+        """Print gating must not move any detection state the recovery supervisor reads."""
+        blip_dispatcher, _ = await _make_deadlocked_dispatcher()
+        blip_dispatcher.detect_deadlock()
+        blip_snapshot = blip_dispatcher.get_deadlock_snapshot()
+
+        sustained_dispatcher, _ = await _make_deadlocked_dispatcher()
+        sustained_dispatcher.detect_deadlock()
+        _age_deadlock_conditions(sustained_dispatcher)
+        first_detected_at = sustained_dispatcher._last_deadlock_detected_time
+        first_queue_detected_at = sustained_dispatcher._last_queue_deadlock_detected_time
+        sustained_dispatcher.detect_deadlock()
+        sustained_snapshot = sustained_dispatcher.get_deadlock_snapshot()
+
+        assert blip_snapshot.in_deadlock is True
+        assert blip_snapshot.in_queue_deadlock is True
+        assert sustained_snapshot.in_deadlock is True
+        assert sustained_snapshot.in_queue_deadlock is True
+        assert sustained_snapshot.queue_deadlock_model == blip_snapshot.queue_deadlock_model
+        assert sustained_snapshot.queue_deadlock_process_id == blip_snapshot.queue_deadlock_process_id
+
+        # Printing the summary must not restart the onset clocks the wedge classifier measures against.
+        assert sustained_snapshot.deadlock_started_at == first_detected_at
+        assert sustained_snapshot.queue_deadlock_started_at == first_queue_detected_at
+
+        for snapshot in (blip_snapshot, sustained_snapshot):
+            assert snapshot.indicates_structural_wedge(now=snapshot.queue_deadlock_started_at + 1) is False
+            assert (
+                snapshot.indicates_structural_wedge(
+                    now=snapshot.queue_deadlock_started_at + _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
+                )
+                is True
+            )
 
     async def test_memory_report_does_not_clear_deadlock_signal(self) -> None:
         """Passive child messages should not mask an active deadlock episode."""
