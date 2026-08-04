@@ -1,18 +1,19 @@
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
     -   id: check-yaml
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.16
+    rev: v0.16.1
     hooks:
-    -    id: ruff
+    -   id: ruff-check
+    -   id: ruff-format
 -   repo: https://github.com/facebook/pyrefly-pre-commit
-    rev: 1.1.0.dev2  # Version of the pre-commit hook itself; language: system means the venv's pyrefly is used
+    rev: 1.2.0
     hooks:
       - id: pyrefly-check
         name: Pyrefly (type checking)
-        pass_filenames: false
-        language: system  # Use the pyrefly from the active venv, keeping it in sync with pyproject.toml
+        entry: uv run --no-sync pyrefly check
+        language: system

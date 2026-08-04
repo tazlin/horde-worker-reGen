@@ -15,7 +15,7 @@ jobs:
   bundle:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Guard against a tag/version mismatch
         # The release version lives in exactly one place: __version__ in horde_worker_regen/__init__.py
@@ -150,7 +150,7 @@ jobs:
       # ships an (unsigned) installer instead of failing the job. Once secrets exist, both steps run.
       SIGN_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download the staged bundle
         uses: actions/download-artifact@v4

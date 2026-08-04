@@ -1,64 +1,64 @@
+import re
+import tomllib
 from pathlib import Path
 
-import pytest
 import yaml
 
-PRECOMMIT_FILE_PATH = Path(__file__).parent.parent / ".pre-commit-config.yaml"
+REPOSITORY_ROOT = Path(__file__).parent.parent
+PRECOMMIT_FILE_PATH = REPOSITORY_ROOT / ".pre-commit-config.yaml"
+PYPROJECT_FILE_PATH = REPOSITORY_ROOT / "pyproject.toml"
+WORKFLOW_DIRECTORY = REPOSITORY_ROOT / ".github" / "workflows"
 
 
-@pytest.mark.skip(reason="This test is meant to be run manually to check for version mismatches.")
-def test_pre_commit_dep_versions(
-    horde_dependency_versions: dict[str, str],
-    tracked_dependencies: list[str],
-) -> None:
-    """Check that the versions of horde deps. in .pre-commit-config.yaml match the versions in pyproject.toml.
+def _exact_dev_pin(package: str) -> str:
+    """Return an exact development dependency pin from the project metadata."""
+    with PYPROJECT_FILE_PATH.open("rb") as file_handle:
+        dependencies = tomllib.load(file_handle)["dependency-groups"]["dev"]
 
-    See the `tracked_dependencies` fixture for the dependencies tracked.
+    prefix = f"{package}=="
+    matches = [dependency.removeprefix(prefix) for dependency in dependencies if dependency.startswith(prefix)]
+    assert len(matches) == 1, f"Expected one exact {package} pin, found {matches}"
+    return matches[0]
 
-    Args:
-        horde_dependency_versions (list[tuple[str, str]]): The versions of the dependencies in pyproject.toml.
-        tracked_dependencies (list[str]): The dependencies to track.
 
-    """
-    # Load the pre-commit config
-    with open(PRECOMMIT_FILE_PATH) as f:
-        precommit_config = yaml.safe_load(f)
+def _hook_repositories() -> dict[str, dict[str, object]]:
+    """Return pre-commit repository definitions keyed by repository URL."""
+    with PRECOMMIT_FILE_PATH.open(encoding="utf-8") as file_handle:
+        configuration = yaml.safe_load(file_handle)
+    return {repository["repo"]: repository for repository in configuration["repos"]}
 
-    # Initialize a dictionary to hold the versions of the dependencies
-    versions = dict.fromkeys(tracked_dependencies)
 
-    # Extract versions from the pre-commit config
-    for repo in precommit_config["repos"]:
-        if "mypy" in repo["repo"]:
-            for dep in repo["hooks"][0]["additional_dependencies"]:
-                # Find which tracked dependency this dep string refers to
-                matched_dep = next((name for name in versions if name in dep), None)
-                if matched_dep is None:
-                    continue
+def test_python_quality_hook_versions_match_project_pins() -> None:
+    """Ruff and Pyrefly hooks use the exact versions installed for project development."""
+    repositories = _hook_repositories()
+    ruff = repositories["https://github.com/astral-sh/ruff-pre-commit"]
+    pyrefly = repositories["https://github.com/facebook/pyrefly-pre-commit"]
 
-                try:
-                    if "==" in dep:
-                        dep_version = dep.split("==")[1]
-                    elif "~=" in dep:
-                        dep_version = dep.split("~=")[1]
-                    elif ">=" in dep:
-                        dep_version = dep.split(">=")[1]
-                    else:
-                        raise ValueError(f"Unsupported version pin: {dep}")
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to split dependency: {dep}. Are you missing an exact version pin?",
-                    ) from e
-                versions[matched_dep] = dep_version
+    assert ruff["rev"] == f"v{_exact_dev_pin('ruff')}"
+    assert pyrefly["rev"] == _exact_dev_pin("pyrefly")
+    assert {hook["id"] for hook in ruff["hooks"]} == {"ruff-check", "ruff-format"}
+    assert pyrefly["hooks"] == [
+        {
+            "id": "pyrefly-check",
+            "name": "Pyrefly (type checking)",
+            "entry": "uv run --no-sync pyrefly check",
+            "language": "system",
+        },
+    ]
 
-    # Ensure all versions were found
-    assert all(version is not None for version in versions.values()), (
-        f"Some dependencies are missing their versions.\n{versions}"
-    )
 
-    # Check if the versions match
-    matches = sum(1 for dep, version in horde_dependency_versions.items() if versions.get(dep) == version)
+def test_ci_quality_action_versions_are_uniform() -> None:
+    """Every workflow uses one reviewed release for each shared quality action."""
+    expected_versions = {
+        "actions/checkout": "v7",
+        "astral-sh/setup-uv": "v9",
+        "hadolint/hadolint-action": "v3.4.0",
+    }
+    discovered_versions = {action: set() for action in expected_versions}
 
-    assert matches == len(
-        horde_dependency_versions,
-    ), f"Not all dependency versions match.\n`.pre-commit-config.yaml: {versions}"
+    for workflow_path in WORKFLOW_DIRECTORY.glob("*.yml"):
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for action in expected_versions:
+            discovered_versions[action].update(re.findall(rf"uses:\s*{re.escape(action)}@([^\s]+)", workflow))
+
+    assert discovered_versions == {action: {version} for action, version in expected_versions.items()}

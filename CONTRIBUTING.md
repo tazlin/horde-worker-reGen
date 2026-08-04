@@ -6,12 +6,15 @@
     * A modern Python package manager and virtual environment tool
     * Run `uv sync --extra <extra>` to install dependencies and `uv run <command>` to run commands in the virtual environment.
         * See `pyproject.toml` for the dependencies and extras used in this project - you need to specify your GPU specific torch.
+    * The required uv version is pinned in `pyproject.toml`; CI's setup action reads that same pin.
 * [prek](https://github.com/j178/prek)
     * Pre-commit compatible hooks for code quality and formatting
     * Run `prek run --all-files` or see `.pre-commit-config.yaml` for more info.
+    * The hooks run Ruff's linter and formatter plus Pyrefly. Ruff and Pyrefly hook revisions match the exact versions in the `dev` dependency group. The Pyrefly hook enters the project environment through `uv run --no-sync`, so an unrelated global installation cannot change results or trigger an unsafe environment sync.
 * [ruff](https://github.com/astral-sh/ruff)
     * Linting rules from a wide variety of selectable rule sets
     * `ruff format` is used for formatting, and `ruff check` is used for linting.
+    * The vendored `docs/haidra-assets` submodule is excluded; format it only in its owning repository.
     * See `pyproject.toml` for the rules used.
     * See all rules (but not necessarily used in the project) availible in rust [here](https://beta.ruff.rs/docs/rules/).
 * [Pyrefly](https://pyrefly.org/)

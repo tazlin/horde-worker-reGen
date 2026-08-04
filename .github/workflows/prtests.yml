@@ -23,11 +23,11 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v9
         with:
           python-version: "3.12"
       - name: Install dependencies (including pyrefly)
@@ -38,13 +38,13 @@ jobs:
   dockerfile-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Lint CUDA Dockerfile
-        uses: hadolint/hadolint-action@master
+        uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: "Dockerfiles/Dockerfile.cuda"
       - name: Lint RoCM Dockerfile
-        uses: hadolint/hadolint-action@master
+        uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: "Dockerfiles/Dockerfile.rocm"
 
@@ -55,11 +55,11 @@ jobs:
         python: ["3.12"]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v9
         with:
           python-version: ${{ matrix.python }}
       # The image-utilities capability venv is provisioned with `uv sync --locked` against its own project,

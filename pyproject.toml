@@ -122,9 +122,9 @@ horde-stats = "horde_worker_regen.stats_operations:main"
 dev = [
     "pytest==9.0.3",
     "pytest-asyncio>=0.24.0",
-    "ruff==0.15.16",
-    "prek==0.4.5",
-    "pyrefly==1.0.0",
+    "ruff==0.16.1",
+    "prek==0.4.12",
+    "pyrefly==1.2.0",
     "build>=0.10.0",
     "coverage>=7.2.7",
     "semver",
@@ -162,6 +162,7 @@ docs = [
 # -- uv configuration --
 
 [tool.uv]
+required-version = "0.12.1"
 python-preference = "managed"
 conflicts = [
     [
@@ -253,7 +254,7 @@ lint.ignore = [
   "D413",
   "COM812" # warning: The following rule may cause conflicts when used with the formatter: `COM812`.
   ]
-extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
+extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py", "docs/haidra-assets"]
 
 [tool.ruff.lint.per-file-ignores]
 "download_models.py" = ["E402"]
