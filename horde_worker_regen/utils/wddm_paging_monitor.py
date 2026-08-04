@@ -96,7 +96,7 @@ def _make_pdh_reader() -> Callable[[], GpuProcessMemorySample | None] | None:
         import ctypes
         from ctypes import wintypes
 
-        pdh = ctypes.windll.pdh
+        pdh = ctypes.windll.pdh  # type: ignore
 
         class _PdhFmtCounterValueLarge(ctypes.Structure):
             _fields_ = (
