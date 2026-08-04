@@ -105,7 +105,12 @@ from horde_worker_regen.tui.widgets.simple import (
 )
 from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import GettingStartedScreen, is_setup_incomplete
-from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
+from horde_worker_regen.tui.worker_launcher import (
+    SupervisorStallStats,
+    SupervisorStatus,
+    WorkerProcessMode,
+    WorkerSupervisor,
+)
 from horde_worker_regen.utils import get_system_appropriate_updater
 
 if TYPE_CHECKING:
@@ -1237,6 +1242,9 @@ class HordeWorkerTUI(App[None]):
         parts = [f"[black on {self._badge_colour(report.severity)}] {phase_text} [/]"]
         if self._supervisor.restart_attempts:
             parts.append(f"[yellow]restarts {self._supervisor.restart_attempts}[/]")
+        stall_markup = self._supervisor_stall_markup(self._supervisor.stall_stats)
+        if stall_markup is not None:
+            parts.append(stall_markup)
         parts.append(self._health_summary_markup(report))
         if snapshot is not None:
             parts.append(self._pipeline_markup(snapshot))
@@ -1313,6 +1321,22 @@ class HordeWorkerTUI(App[None]):
         if used_fraction is None:
             return None
         return f"[grey62]ram[/] {format_percent(used_fraction * 100)}"
+
+    @staticmethod
+    def _supervisor_stall_markup(stall: SupervisorStallStats) -> str | None:
+        """The supervisor's own liveness segment, or None while it has had nothing to forgive.
+
+        Every other segment describes the worker; this one describes the process watching it. A supervisor
+        starved by its host re-graces the worker's wedge baseline to avoid blaming it for time it could not
+        observe, and while that is happening the worker's wedge backstop is effectively held off, so the
+        condition has to be visible rather than inferred from an alarm that never arrives. Shown only once
+        a gap has been forgiven, since the healthy case is the absence of the segment.
+        """
+        if not stall.resets_in_window and not stall.budget_spent:
+            return None
+        colour = "red" if stall.budget_spent else "yellow"
+        gap = f" gap {stall.largest_tick_gap_seconds:.0f}s" if stall.largest_tick_gap_seconds else ""
+        return f"[{colour}]stalls {stall.resets_in_window}/{stall.max_forgiven_resets}{gap}[/]"
 
     @staticmethod
     def _badge_colour(severity: HealthStatus) -> str:

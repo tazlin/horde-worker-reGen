@@ -129,6 +129,30 @@ this same supervisor transition; socket
 clients merely enqueue the intent on the host's single owner thread and present
 `STOPPING` locally until the host reports a status of its own.
 
+### The wedge backstop and its budgeted forgiveness
+
+An exit-only supervisor never relaunches a worker that does not exit, so the
+supervisor also watches the *value* of the worker's reported loop stamp. While the
+worker is alive and no cooperative stop is under way, a stamp that has not advanced
+for `WEDGE_LIVENESS_TIMEOUT_SECONDS` (180 s) means the control loop is frozen: the
+tree is force-killed and the ordinary crash path relaunches it.
+
+That measurement only holds while the supervisor is itself ticking. A gap of more
+than 30 s between two ticks is time it could not observe (the host slept, it was
+descheduled under load, a debugger paused it), so it moves the wedge baseline
+forward instead of charging the gap to the worker. Forgiveness is bounded by a
+rolling hour: at most three re-graces, or five minutes of already-forgiven time,
+whichever comes first. Only what the window already holds is weighed, so an
+overnight sleep is one forgiven event however long it was, while a host that
+starves the supervisor repeatedly stops being excused. Past the bound the gap
+accrues normally and detection proceeds, which is the point: unbounded forgiveness
+is the detector's off switch, since a supervisor starved faster than the detection
+window can never accrue one. Charging a gap is not a restart on its own; a worker
+that resumed alongside its supervisor advances its stamp on the next drain and is
+untouched. Every re-grace is logged at INFO with a running counter, the spent
+budget is logged once on its edge, and the counters are published on the
+supervisor's `stall_stats` so a starved supervisor is visible as its own condition.
+
 In served mode (`tui/web.py`, the default for non-technical users) a single
 `WorkerHost` owns one worker independently of any browser session, so closing a
 browser tab detaches the client but **leaves the worker running**. Network

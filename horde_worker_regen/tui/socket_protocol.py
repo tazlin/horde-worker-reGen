@@ -120,8 +120,19 @@ def status_message(
     mode: str,
     worker_running: bool,
     last_liveness_wall_time: float | None = None,
+    stall_resets_in_window: int = 0,
+    stall_max_forgiven_resets: int = 0,
+    stall_budget_spent: bool = False,
+    largest_tick_gap_seconds: float = 0.0,
 ) -> dict[str, Any]:
-    """Wrap the host's supervisor status for the wire."""
+    """Wrap the host's supervisor status for the wire.
+
+    The stall fields describe the host supervisor's *own* liveness (see
+    [`SupervisorStallStats`][horde_worker_regen.tui.worker_launcher.SupervisorStallStats]): a client can
+    otherwise only see the worker, so a host being starved by its machine, and re-gracing the worker to
+    stay out of the way, would look identical to a quiet, healthy session. They default to the quiet
+    values so a frame from a host that predates them parses as "nothing to report".
+    """
     return {
         "type": MSG_STATUS,
         "status": status,
@@ -129,6 +140,10 @@ def status_message(
         "mode": mode,
         "worker_running": worker_running,
         "last_liveness_wall_time": last_liveness_wall_time,
+        "stall_resets_in_window": stall_resets_in_window,
+        "stall_max_forgiven_resets": stall_max_forgiven_resets,
+        "stall_budget_spent": stall_budget_spent,
+        "largest_tick_gap_seconds": largest_tick_gap_seconds,
     }
 
 

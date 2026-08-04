@@ -981,10 +981,12 @@ class OverviewView(Vertical):
         grid.add_row("RAM", ram_text)
 
         intake_parts: list[tuple[str, str]] = []
-        intake_parts.append((
-            "pop hold on" if ram.pop_hold_active else "pop hold off",
-            "yellow" if ram.pop_hold_active else "grey62",
-        ))
+        intake_parts.append(
+            (
+                "pop hold on" if ram.pop_hold_active else "pop hold off",
+                "yellow" if ram.pop_hold_active else "grey62",
+            )
+        )
         if ram.pop_pause_active:
             pause = human_duration(ram.pop_pause_remaining_seconds)
             intake_parts.append((f"hard pause {pause}", "yellow"))

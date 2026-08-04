@@ -20,6 +20,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from typing import TextIO
@@ -101,7 +102,43 @@ was frozen (the host slept/resumed, the process was descheduled under load, a de
 worker. Time the supervisor could not observe must not count toward the wedge window, so on such a gap the
 wedge baseline is reset. Kept well above the sub-second tick cadence (so normal jitter never trips it) and
 well below :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` (so a real supervisor stall is always re-graced before it
-could be mistaken for a worker wedge)."""
+could be mistaken for a worker wedge). Re-gracing is bounded; see
+:data:`_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS`."""
+
+_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS = 3600.0
+"""The rolling window over which forgiven supervisor stalls are counted.
+
+An hour is long enough that the events it holds are a genuine pattern rather than one bad minute, and short
+enough that a host which stalls once and then behaves is fully re-armed by the next hour. Both bounds below
+are measured over this window."""
+
+_SUPERVISOR_STALL_MAX_FORGIVEN_RESETS = 3
+"""How many tick-gap re-graces the window may already hold before further gaps stop being forgiven.
+
+Forgiveness is what keeps the supervisor's own outages from being charged to the worker, but unbounded
+forgiveness is indistinguishable from a disabled detector: a host that starves the supervisor every minute
+re-graces the baseline before the :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` window can ever accrue, so a
+genuinely wedged worker is never detected at all. Three is chosen against both scenarios that matter: a
+laptop that sleeps overnight produces exactly *one* gap, which is always forgiven (the window is empty, and
+the bounds below look only at what the window already holds), while a host descheduling the supervisor
+repeatedly produces many, and the fourth stops being excused.
+
+Past the bound the baseline is left alone, so staleness accrues and detection proceeds normally. A worker
+that resumed along with its supervisor advances its stamp on the very next drain and is unaffected; only a
+worker that is also not advancing is killed. Restarting a healthy-but-silent worker after repeated genuine
+host stalls is the accepted cost: that restart is recoverable by design, an undetected multi-hour wedge is
+not."""
+
+_SUPERVISOR_STALL_FORGIVENESS_BUDGET_SECONDS = 300.0
+"""How much already-forgiven stall time the window may hold before further gaps stop being forgiven.
+
+The second bound catches the shape the reset-count bound does not: a few very long stalls rather than many
+short ones. Five minutes is a small multiple of :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS`, so the supervisor
+never excuses substantially more unobserved time than the detection window it is protecting.
+
+Only time already forgiven is counted; the gap being judged is not charged before the decision. That is
+what keeps a single long host sleep (hours in one gap) forgiven on its own, while making the hours it
+recorded spend the window for any *further* stall inside the same hour."""
 
 GRACEFUL_STOP_TIMEOUT_SECONDS = 150.0
 """How long :meth:`WorkerSupervisor.stop` waits for the worker to drain and exit before terminating it.
@@ -112,6 +149,51 @@ re-orphaned their subprocesses). That window is the worker's hard-capped drain g
 (``shutdown_manager.MAX_SHUTDOWN_GRACE_SECONDS``) plus the fault-report tail it spends reissuing still
 -outstanding jobs (``_FAULT_REPORT_GRACE_SECONDS``) before it self-exits; this value carries headroom
 over their sum."""
+
+
+@dataclass(frozen=True)
+class SupervisorStallStats:
+    """How much of the supervisor's own unavailability has been excused, so that liveness is observable.
+
+    The wedge detector is only as good as the supervisor's ability to observe the worker, and every
+    forgiven tick gap is a stretch it could not. Publishing the counters makes a supervisor that is being
+    starved (and therefore repeatedly re-gracing the worker) visible as a condition in its own right,
+    rather than something to be inferred from the absence of detections.
+    """
+
+    forgiven_resets: int
+    """Tick gaps re-graced since this supervisor was constructed."""
+    forgiven_seconds: float
+    """Total unobserved wall-clock time those re-graces excused."""
+    refused_resets: int
+    """Tick gaps that were *not* re-graced because the rolling window's budget was already spent."""
+    resets_in_window: int
+    """Re-graces currently inside :data:`_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS`."""
+    forgiven_seconds_in_window: float
+    """Excused wall-clock time currently inside that same window."""
+    largest_tick_gap_seconds: float
+    """The longest gap ever observed between two consecutive :meth:`WorkerSupervisor.tick` calls."""
+    budget_spent: bool
+    """Whether a further gap right now would be charged to the worker rather than forgiven."""
+    max_forgiven_resets: int = _SUPERVISOR_STALL_MAX_FORGIVEN_RESETS
+    """The window's re-grace allowance, carried alongside the count so a display needs no other import."""
+
+    @classmethod
+    def quiet(cls) -> SupervisorStallStats:
+        """Stats for a supervisor that has never had a gap to forgive.
+
+        Also what a client reports before the host has told it otherwise: nothing observed is the same
+        display as nothing forgiven, and both are the absence of the condition these counters exist to show.
+        """
+        return cls(
+            forgiven_resets=0,
+            forgiven_seconds=0.0,
+            refused_resets=0,
+            resets_in_window=0,
+            forgiven_seconds_in_window=0.0,
+            largest_tick_gap_seconds=0.0,
+            budget_spent=False,
+        )
 
 
 def _stream_has_real_fd(stream: TextIO | None) -> bool:
@@ -246,6 +328,15 @@ class WorkerSupervisor:
         self._last_tick_wall: float | None = None
         """Parent wall-clock time of the previous :meth:`tick`, used to spot a supervisor-side stall (see
         :data:`_SUPERVISOR_STALL_RESET_SECONDS`)."""
+        self._stall_forgiveness_events: list[tuple[float, float]] = []
+        """``(when, gap_seconds)`` for each re-graced tick gap, pruned to the rolling forgiveness window."""
+        self._stall_forgiven_resets = 0
+        self._stall_forgiven_seconds = 0.0
+        self._stall_refused_resets = 0
+        self._largest_tick_gap_seconds = 0.0
+        self._stall_budget_spent_logged = False
+        """Whether the current spent-budget episode has been reported; re-armed by the next forgiveness so
+        the notice is edge-triggered rather than repeated for every gap the window keeps refusing."""
         self.last_fatal_error: WorkerFatalConfigError | None = None
         """The reason the worker reported a fatal, non-retryable config problem (e.g. a taken worker name)
         before exiting, or None. Set from the worker's frame, retained through the resulting CRASHED state
@@ -503,18 +594,94 @@ class WorkerSupervisor:
         Time the supervisor could not observe the worker must not accrue against the wedge window, so on
         such a gap the wedge baseline is moved forward. Recorded before draining so a real worker frame this
         same tick can still advance the baseline normally afterwards.
+
+        The re-grace is budgeted (see :meth:`_claim_stall_forgiveness`). Unbounded, it is the detector's
+        off switch: a host that starves the supervisor faster than
+        :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` keeps moving the baseline forward, so staleness can never
+        accrue and a wedged worker is never recovered. Once the budget is spent the gap is charged to the
+        worker like any other elapsed time.
         """
         now = time.time()
         previous = self._last_tick_wall
         self._last_tick_wall = now
         if previous is None:
             return
-        if (now - previous) > _SUPERVISOR_STALL_RESET_SECONDS and self._last_loop_advance_wall is not None:
-            logger.debug(
-                f"Supervisor tick gap of {now - previous:.0f}s (it was likely descheduled or the host "
-                "slept); resetting the worker wedge baseline rather than charging the gap to the worker.",
-            )
-            self._last_loop_advance_wall = now
+        gap = now - previous
+        self._largest_tick_gap_seconds = max(self._largest_tick_gap_seconds, gap)
+        if gap <= _SUPERVISOR_STALL_RESET_SECONDS or self._last_loop_advance_wall is None:
+            return
+        if not self._claim_stall_forgiveness(now=now, gap=gap):
+            return
+        self._last_loop_advance_wall = now
+
+    def _claim_stall_forgiveness(self, *, now: float, gap: float) -> bool:
+        """Charge one tick gap against the rolling forgiveness budget; report whether it is forgiven.
+
+        Only what the window *already* holds is weighed, so the first gap in a quiet window is always
+        forgiven however long it was (an overnight host sleep is one event, not a budget overrun), while
+        the record it leaves behind is what makes a repeated pattern stop being excused.
+
+        Args:
+            now: Parent wall-clock time of the tick that observed the gap.
+            gap: Seconds since the previous tick.
+
+        Returns:
+            True when the wedge baseline may be moved forward; False when the gap must be charged to the
+            worker so staleness accrues and detection proceeds.
+        """
+        window_start = now - _SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS
+        self._stall_forgiveness_events = [
+            event for event in self._stall_forgiveness_events if event[0] >= window_start
+        ]
+        forgiven_in_window = sum(seconds for _when, seconds in self._stall_forgiveness_events)
+        budget_spent = (
+            len(self._stall_forgiveness_events) >= _SUPERVISOR_STALL_MAX_FORGIVEN_RESETS
+            or forgiven_in_window >= _SUPERVISOR_STALL_FORGIVENESS_BUDGET_SECONDS
+        )
+        if budget_spent:
+            self._stall_refused_resets += 1
+            if not self._stall_budget_spent_logged:
+                self._stall_budget_spent_logged = True
+                logger.warning(
+                    f"Supervisor tick gap of {gap:.0f}s, but its stall-forgiveness budget is spent "
+                    f"({len(self._stall_forgiveness_events)} re-graces / {forgiven_in_window:.0f}s in the "
+                    f"last {_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS / 60:.0f} minutes). Charging this "
+                    "gap to the worker so wedge detection can proceed; a worker that is still advancing is "
+                    "unaffected, a silent one will be restarted.",
+                )
+            return False
+        self._stall_forgiveness_events.append((now, gap))
+        self._stall_forgiven_resets += 1
+        self._stall_forgiven_seconds += gap
+        self._stall_budget_spent_logged = False
+        logger.info(
+            f"Supervisor tick gap of {gap:.0f}s (it was likely descheduled or the host slept); resetting "
+            f"the worker wedge baseline rather than charging the gap to the worker. Re-grace "
+            f"{len(self._stall_forgiveness_events)}/{_SUPERVISOR_STALL_MAX_FORGIVEN_RESETS} in the last "
+            f"{_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS / 60:.0f} minutes "
+            f"({self._stall_forgiven_resets} total, {self._stall_forgiven_seconds:.0f}s forgiven).",
+        )
+        return True
+
+    @property
+    def stall_stats(self) -> SupervisorStallStats:
+        """Counters describing the supervisor's own tick gaps and how many of them were forgiven."""
+        window_start = time.time() - _SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS
+        in_window = [event for event in self._stall_forgiveness_events if event[0] >= window_start]
+        forgiven_in_window = sum(seconds for _when, seconds in in_window)
+        return SupervisorStallStats(
+            forgiven_resets=self._stall_forgiven_resets,
+            forgiven_seconds=self._stall_forgiven_seconds,
+            refused_resets=self._stall_refused_resets,
+            resets_in_window=len(in_window),
+            forgiven_seconds_in_window=forgiven_in_window,
+            largest_tick_gap_seconds=self._largest_tick_gap_seconds,
+            budget_spent=(
+                len(in_window) >= _SUPERVISOR_STALL_MAX_FORGIVEN_RESETS
+                or forgiven_in_window >= _SUPERVISOR_STALL_FORGIVENESS_BUDGET_SECONDS
+            ),
+            max_forgiven_resets=_SUPERVISOR_STALL_MAX_FORGIVEN_RESETS,
+        )
 
     def _recover_if_wedged(self, process: BaseProcess) -> None:
         """Force-kill and relaunch a worker whose control loop has stopped advancing (the wedge backstop).

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError, WorkerStateSnapshot
 from horde_worker_regen.tui.attach import SupervisorLike
-from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode
+from horde_worker_regen.tui.worker_launcher import SupervisorStallStats, SupervisorStatus, WorkerProcessMode
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,11 @@ class FakeSupervisor:
     def restart_attempts(self) -> int:
         """How many restarts have been attempted (always zero for the fake)."""
         return self._restart_attempts
+
+    @property
+    def stall_stats(self) -> SupervisorStallStats:
+        """The supervisor's own stall counters; the fake never stalls, so they stay quiet."""
+        return SupervisorStallStats.quiet()
 
     def is_alive(self) -> bool:
         """Whether the (fake) worker is currently running."""

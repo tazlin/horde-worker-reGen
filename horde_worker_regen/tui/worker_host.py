@@ -242,13 +242,22 @@ class WorkerHost:
             self._stop.set()
 
     def _status_message(self) -> dict[str, object]:
-        """Build the current host/supervisor status frame."""
+        """Build the current host/supervisor status frame.
+
+        Carries the host supervisor's own stall counters as well as the worker's lifecycle: a client that
+        sees only the worker cannot tell a healthy host from one being starved into re-gracing it.
+        """
+        stall = self._supervisor.stall_stats
         return sp.status_message(
             status=self._supervisor.status.value,
             restart_attempts=self._supervisor.restart_attempts,
             mode=self._supervisor.mode.value,
             worker_running=self._supervisor.is_alive(),
             last_liveness_wall_time=self._supervisor.last_liveness_wall_time,
+            stall_resets_in_window=stall.resets_in_window,
+            stall_max_forgiven_resets=stall.max_forgiven_resets,
+            stall_budget_spent=stall.budget_spent,
+            largest_tick_gap_seconds=stall.largest_tick_gap_seconds,
         )
 
     def _broadcast(self) -> None:

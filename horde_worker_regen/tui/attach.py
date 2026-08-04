@@ -15,6 +15,7 @@ client but leaves the worker running on the host, which is the whole point of se
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import socket
 import threading
 from typing import Protocol
@@ -28,7 +29,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.tui import socket_protocol as sp
-from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode
+from horde_worker_regen.tui.worker_launcher import SupervisorStallStats, SupervisorStatus, WorkerProcessMode
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
 _RECONNECT_BACKOFF_SECONDS = 1.0
@@ -45,6 +46,24 @@ _TERMINAL_STATUSES = frozenset({SupervisorStatus.STOPPED, SupervisorStatus.CRASH
 
 Any snapshot still arriving under one of these describes a worker that is already gone, so it is refused
 rather than applied."""
+
+
+def _parse_stall_stats(message: dict[str, object]) -> SupervisorStallStats:
+    """Read the host supervisor's stall counters out of a status frame, tolerating a host without them.
+
+    A host predating these fields reports a quiet supervisor rather than a missing one: the display this
+    feeds is an alarm, and inventing an alarm from an absent field would be worse than showing none.
+    """
+    resets = message.get("stall_resets_in_window", 0)
+    maximum = message.get("stall_max_forgiven_resets", 0)
+    largest_gap = message.get("largest_tick_gap_seconds", 0.0)
+    return dataclasses.replace(
+        SupervisorStallStats.quiet(),
+        resets_in_window=resets if isinstance(resets, int) else 0,
+        max_forgiven_resets=maximum if isinstance(maximum, int) else 0,
+        budget_spent=bool(message.get("stall_budget_spent", False)),
+        largest_tick_gap_seconds=float(largest_gap) if isinstance(largest_gap, int | float) else 0.0,
+    )
 
 
 class SupervisorLike(Protocol):
@@ -68,6 +87,10 @@ class SupervisorLike(Protocol):
     @property
     def restart_attempts(self) -> int:
         """How many consecutive worker restarts have been attempted."""
+
+    @property
+    def stall_stats(self) -> SupervisorStallStats:
+        """How much of the supervisor's own unavailability it has excused (its liveness, not the worker's)."""
 
     def is_alive(self) -> bool:
         """Whether the worker process is currently running."""
@@ -165,6 +188,7 @@ class AttachedWorkerSupervisor:
         self.last_fatal_error: WorkerFatalConfigError | None = None
         self._status = SupervisorStatus.STOPPED
         self._restart_attempts = 0
+        self._stall_stats = SupervisorStallStats.quiet()
         self._worker_running = False
         self._stop_requested = False
         """Whether this session has asked the host to stop the worker and is still awaiting its verdict.
@@ -198,6 +222,15 @@ class AttachedWorkerSupervisor:
     def restart_attempts(self) -> int:
         """The host's current restart-attempt count."""
         return self._restart_attempts
+
+    @property
+    def stall_stats(self) -> SupervisorStallStats:
+        """The host supervisor's stall counters as last reported (quiet until a status frame carries them).
+
+        Only the fields the host puts on the wire are populated; the session-lifetime totals stay at their
+        quiet values because they belong to the host process, not to this client.
+        """
+        return self._stall_stats
 
     @property
     def connected(self) -> bool:
@@ -454,7 +487,7 @@ class AttachedWorkerSupervisor:
         return self._status not in _TERMINAL_STATUSES
 
     def _apply_status(self, message: dict[str, object]) -> None:
-        """Apply a status frame's fields (status / restart count / running / mode)."""
+        """Apply a status frame's fields (status / restart count / running / mode / host stall counters)."""
         status_value = message.get("status")
         if isinstance(status_value, str):
             with contextlib.suppress(ValueError):
@@ -474,6 +507,7 @@ class AttachedWorkerSupervisor:
         restart_attempts = message.get("restart_attempts", 0)
         self._restart_attempts = restart_attempts if isinstance(restart_attempts, int) else 0
         self._worker_running = bool(message.get("worker_running", False))
+        self._stall_stats = _parse_stall_stats(message)
         mode_value = message.get("mode")
         if isinstance(mode_value, str):
             with contextlib.suppress(ValueError):

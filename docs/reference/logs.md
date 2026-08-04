@@ -82,6 +82,28 @@ become more precise without invalidating older logs, so the detector accepts bot
 format and the former free-after-commitments format. Repeated warnings for one job, with no later PP completion,
 surface as `post_processing_deferral_starvation` in the dashboard's Diagnostics tab.
 
+## Supervisor stall forgiveness
+
+Two lines in `bridge_tui.log` / `bridge_host.log` describe the *supervisor's* own liveness rather than the
+worker's. The supervisor only observes the worker when it ticks, so a gap of more than 30 seconds between
+two ticks is time it could not see and must not charge to the worker; it moves the wedge baseline forward
+instead. That forgiveness is bounded (three re-graces, or five minutes of already-forgiven time, per
+rolling hour), because an unbounded one silently disables the wedge backstop.
+
+- `INFO` `Supervisor tick gap of Ns (it was likely descheduled or the host slept); resetting the worker
+  wedge baseline …` -- one gap was forgiven. The line carries a running counter (`Re-grace 2/3 in the last
+  60 minutes`, plus session totals), so a repeating pattern reads as one condition rather than as unrelated
+  events. A single line after a laptop resume is expected and needs no action; a rising counter means the
+  host is starving the dashboard/host process.
+- `WARNING` `Supervisor tick gap of Ns, but its stall-forgiveness budget is spent …` -- further gaps are
+  now charged to the worker so wedge detection can proceed. Emitted once when the budget runs out, not per
+  gap, so its absence on later gaps does not mean the condition cleared. A worker that is still advancing
+  is unaffected by this; a silent one will be force-killed and relaunched.
+
+The same counters are on the dashboard status bar as a `stalls n/3` segment (yellow while forgiving, red
+once the budget is spent), which appears only when there is something to report. See
+[Frontend and durable state](../explanation/frontend_and_state.md) for the mechanism.
+
 ## Sharing logs
 
 Do **not** post `.log` files in public channels. Send them to a maintainer directly: we cannot
