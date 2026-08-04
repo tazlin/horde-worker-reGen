@@ -23,7 +23,7 @@ from __future__ import annotations
 import dataclasses
 import multiprocessing
 import time
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -46,9 +46,17 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     _CORESIDENT_SIBLING_MODEL_FLOOR_MB,
     StreamForecast,
 )
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    _ESTABLISH_WINDOW_LIMIT,
+    _ESTABLISH_WINDOW_SECONDS,
+    _GRACE_BUDGET_SECONDS,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
+    _WholeCardDemandOutcome,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -614,6 +622,178 @@ class TestReservedHeadNeverWaitsIndefinitely:
             horde_model_map.update_entry(
                 horde_model_name=model_name, load_state=ModelLoadState.LOADED_IN_RAM, process_id=process.process_id
             )
+
+
+class TestChurnGovernors:
+    """Establishment rate, grace budget, and the unresolved-flag disclosure bound whole-card churn.
+
+    Sole residency is expensive to enter and to leave (every sibling process the establishment stopped is
+    respawned on the way out, ~20s each), and each cycle also claims a window in which the recovery supervisor
+    ignores a held queue. Left ungoverned, a demand signal that oscillates rebuilds the pool continuously and
+    keeps the supervisor disarmed the whole time. These pin the two governors that bound it, plus the
+    disclosure for a residency that is off because its flag never resolved.
+    """
+
+    @staticmethod
+    def _scheduler_and_head() -> tuple[InferenceScheduler, object, StreamForecast]:
+        """A tight-card scheduler with a card-filling head whose forecast genuinely demands the card."""
+        process_map, horde_model_map = _prestaged_head_topology(head_model=_FLUX_MODEL)
+        job_tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            horde_model_map=horde_model_map,
+            bridge_data=_bridge_data(),
+            max_concurrent=1,
+            max_inference=4,
+        )
+        lifecycle = Mock()
+        lifecycle.is_safety_gpu_paused = False
+        lifecycle.post_process_lane_enabled = Mock(return_value=False)
+        lifecycle.component_lane_enabled = Mock(return_value=False)
+        lifecycle.vae_lane_enabled = Mock(return_value=False)
+        scheduler._process_lifecycle = lifecycle
+        forecast = _forecast_16gb(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
+            wants_whole_card=True,
+        )
+        return scheduler, process_map[1], forecast
+
+    def test_a_rate_limited_establishment_is_deferred_then_granted(self) -> None:
+        """Past the per-card establishment allowance the head is deferred, not declined, and is later granted.
+
+        Deferring keeps the head on the whole-card path so it re-asks; declining would send it down the ordinary
+        co-resident path the forecast has already said streams its weights. The wait is bounded by the limiter's
+        window, which is short enough that a deferred head cannot age into a structural-wedge verdict.
+        """
+        scheduler, available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        now = time.time()
+        for index in range(_ESTABLISH_WINDOW_LIMIT):
+            scheduler._whole_card_ledger.record_grant(
+                None,
+                model=_FLUX_MODEL,
+                forecast=forecast,
+                cooldown_until=now,
+                now=now - index,
+                refresh_established=True,
+            )
+            scheduler._whole_card_ledger.record_restore(None, now=now - index)
+
+        outcome = scheduler._decide_whole_card_demand(
+            flux_job,
+            available_process,
+            forecast,
+            None,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        assert outcome is _WholeCardDemandOutcome.DEFER
+        assert scheduler.is_whole_card_residency_active() is False, "the deferral must not have claimed the card"
+
+        # Age the recorded establishments out of the limiter's window: the same ask now claims the card.
+        history = scheduler._whole_card_ledger.state_for(None).establishments
+        aged = [stamp - (_ESTABLISH_WINDOW_SECONDS + 1.0) for stamp in history]
+        history.clear()
+        history.extend(aged)
+
+        scheduler._decide_whole_card_demand(
+            flux_job,
+            available_process,
+            forecast,
+            None,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        assert scheduler.is_whole_card_residency_active() is True
+
+    def test_a_held_residency_is_never_rate_limited_out_of_its_own_convergence(self) -> None:
+        """The limiter gates new establishments only; a residency already held keeps converging every cycle."""
+        scheduler, available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        scheduler._decide_whole_card_demand(
+            flux_job,
+            available_process,
+            forecast,
+            None,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        assert scheduler.is_whole_card_residency_active() is True
+        # Spend the allowance outright; the held residency must still be driven to convergence.
+        history = scheduler._whole_card_ledger.state_for(None).establishments
+        history.extend([time.time()] * _ESTABLISH_WINDOW_LIMIT)
+        assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is True, (
+            "precondition: a *new* establishment on this card would now be rate limited"
+        )
+        scheduler._whole_card_ledger.state_for(None).cooldown_until = 0.0
+        scheduler._decide_whole_card_demand(
+            flux_job,
+            available_process,
+            forecast,
+            None,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        assert scheduler._whole_card_ledger.state_for(None).cooldown_until > time.time(), (
+            "the limiter's early return sits above the residency grant, so a refreshed cooldown proves the held "
+            "residency's own convergence was driven rather than bounced off the whole-card path"
+        )
+        assert scheduler.is_whole_card_residency_active() is True
+
+    def test_repeated_establish_restore_cycles_exhaust_the_recovery_grace_budget(self) -> None:
+        """Churn cannot keep re-arming the wedge grace: past the rolling budget the claim is refused.
+
+        Each cycle charges its establish and restore windows against the card's budget. In the field the cycles
+        are spread by the establishment rate limiter; the wall time between them is collapsed here because the
+        budget's window is what bounds the spend, not the spacing.
+        """
+        scheduler, _available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        cycle_cost = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
+        cycles = int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1
+
+        for index in range(cycles):
+            scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
+            spent = index * cycle_cost + _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+            assert scheduler.whole_card_residency_grace_active() is (spent <= _GRACE_BUDGET_SECONDS), (
+                "grace is granted while the card's rolling budget still covers the window it just opened"
+            )
+            scheduler._whole_card_ledger.state_for(None).cooldown_until = 0.0
+            scheduler._restore_siblings_after_whole_card()
+
+        scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
+        assert scheduler._whole_card_ledger.grace_window_active(
+            now=time.time(),
+            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+        ), "precondition: the fresh establishment is nominally inside its grace window"
+        assert scheduler.whole_card_residency_grace_active() is False, (
+            "with the budget spent the recovery supervisor must be re-armed even inside a nominal grace window"
+        )
+
+    def test_an_unresolved_residency_flag_is_disclosed_once(self) -> None:
+        """A flag that never resolved reads as disabled, which is worth saying out loud exactly once.
+
+        Whole-card residency being off is otherwise invisible: heavy models simply load co-resident and stream,
+        which is very hard to attribute afterwards. False is an operator's choice and says nothing.
+        """
+        scheduler, _available_process, _forecast = self._scheduler_and_head()
+        scheduler._runtime_config.bridge_data.whole_card_exclusive_residency = None
+        with patch.object(inference_scheduler_module.logger, "warning") as warning:
+            assert scheduler._whole_card_residency_enabled() is False
+            assert scheduler._whole_card_residency_enabled() is False
+        assert warning.call_count == 1
+
+    def test_an_explicitly_disabled_residency_flag_is_not_disclosed(self) -> None:
+        """False is a decision, not a gap, so it must not produce the unresolved-flag warning."""
+        scheduler, _available_process, _forecast = self._scheduler_and_head()
+        scheduler._runtime_config.bridge_data.whole_card_exclusive_residency = False
+        with patch.object(inference_scheduler_module.logger, "warning") as warning:
+            assert scheduler._whole_card_residency_enabled() is False
+        assert warning.call_count == 0
 
 
 class TestMakingRoomNeverStrandsInflight:

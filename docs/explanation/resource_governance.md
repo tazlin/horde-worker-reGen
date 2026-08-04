@@ -242,14 +242,54 @@ The dispatch gate releases the head either on a live free-VRAM reading that genu
 once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized
 for a card every other context has left, safety included, so the scheduler passes in the charge of whatever
 the residency is leaving on the card: where the operator has not permitted the residency to move safety
-off-GPU, the resident safety context is priced back out of the alone figure. Without that the backstop admits
+off-GPU, the resident safety process's whole device footprint (the one safety price: its seed raised by any
+measured `SAFETY` watermark) is priced back out of the alone figure. Without that the backstop admits
 the head against room only a departure the configuration forbids would free, and the weights load into a card
 short by roughly the safety footprint and stream. Which contexts stay is a configuration and lifecycle fact,
 not residency state, so the machine takes the charge as an input and remains a pure state machine.
 
+The drain backstop runs from the moment the teardown's structural legs *first all pass*, not from the moment
+the residency was granted. A slow establishment (siblings still exiting, safety still cycling off-GPU) would
+otherwise spend the backstop before there was any sole-residency guarantee for it to admit the head against,
+and the head would load into a card that had not yet cleared. The machine latches that moment when it answers
+the readiness question, since that is where the structural legs are computed, and clears the latch on every
+fresh grant so a re-established residency starts its own backstop rather than inheriting a spent one.
+
+### Bounding residency churn
+
+Entering and leaving sole residency are both expensive: the establishment stops sibling inference processes
+and may move safety off-GPU, and the restore respawns each of those siblings (a ~20s spawn apiece, plus the
+preload that follows). A demand signal that oscillates can therefore rebuild the pool continuously without
+ever serving more work. Three governors, all held in the residency machine and actuated at the scheduler's
+call sites, bound that churn:
+
+- **Minimum hold.** A ready queue head for a *different* model may cut a drained residency's cooldown short,
+  but not before the grant has held long enough to amortize the teardown and the regrowth the release itself
+  will pay for. Without the floor, a queue alternating heavy and light heads turns into a continuous pool
+  rebuild. The floor is shorter than the establish grace window, so it can never keep a residency alive past
+  the point the recovery supervisor is watching.
+- **Establishment rate limit.** Establishments are counted per card over a short rolling window. Past the
+  allowance the head is **deferred**, never declined: deferring keeps it on the whole-card path so it re-asks
+  the next cycle, whereas declining would send it down the ordinary co-resident path the forecast has already
+  said streams its weights. The window is deliberately far shorter than the pop-gate structural-wedge
+  backstop, so a deferred head can never accrue toward a wedge verdict. The limiter gates *new*
+  establishments only; a residency already held keeps being driven to convergence every cycle.
+- **Grace budget.** Each establish and each restore claims a window in which the recovery supervisor ignores
+  a held queue (see [Resilience and recovery](resilience_and_recovery.md)). Those claims are charged against
+  a per-card rolling budget, because otherwise repeated cycling re-arms a fresh window faster than the
+  previous one expires and the supervisor stays disarmed for as long as the churn continues, which is exactly
+  the state in which a real wedge goes unnoticed. Once the budget is spent, the grace claim is refused even
+  inside a nominal window, and the scheduler discloses the refusal once on the transition. The budget
+  replenishes as old grants age out of the window.
+
 Only one owner may put safety back on its card. The residency-end restore and the residency-drain
 reconciler both stand down while the runtime safety-placement policy holds safety off, so a residency that
 ends under that wish does not promote safety only for the policy to demote it again.
+
+Whole-card residency is off unless its config flag resolves to true. A flag that never resolved at all is
+disclosed once at the scheduler, because a worker that quietly forgoes the residency simply loads heavy
+models co-resident and streams them, which is very hard to attribute after the fact; an explicit `false` is
+an operator decision and says nothing.
 The pure sizing rule for how many live contexts a rejected peak can co-reside with is
 [`max_coresident_for_peak`][horde_worker_regen.process_management.scheduling.governance.whole_card.max_coresident_for_peak].
 

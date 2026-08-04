@@ -9,13 +9,25 @@ from horde_worker_regen.process_management.scheduling.governance import (
     WholeCardResidencyMachine,
     max_coresident_for_peak,
 )
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    _ESTABLISH_WINDOW_LIMIT,
+    _ESTABLISH_WINDOW_SECONDS,
+    _GRACE_BUDGET_SECONDS,
+    _GRACE_BUDGET_WINDOW_SECONDS,
+    _MIN_HOLD_SECONDS,
+)
 
 _NOW = 1_000_000.0
 _ESTABLISH_GRACE = 90.0
 _RESTORE_GRACE = 30.0
 
 
-def _granted_ledger(device_index: int | None = None, *, model: str = "heavy-model") -> WholeCardResidencyLedger:
+def _granted_ledger(
+    device_index: int | None = None,
+    *,
+    model: str = "heavy-model",
+    establish_grace_seconds: float = 0.0,
+) -> WholeCardResidencyLedger:
     """Build a ledger with one residency granted at ``_NOW``."""
     ledger = WholeCardResidencyLedger()
     ledger.record_grant(
@@ -25,6 +37,7 @@ def _granted_ledger(device_index: int | None = None, *, model: str = "heavy-mode
         cooldown_until=_NOW + 300.0,
         now=_NOW,
         refresh_established=True,
+        establish_grace_seconds=establish_grace_seconds,
     )
     return ledger
 
@@ -130,12 +143,158 @@ class TestGraceWindows:
             restore_grace_seconds=_RESTORE_GRACE,
         )
 
-    def test_drain_backstop_elapses_from_establishment(self) -> None:
-        """The bounded drain backstop is measured from the establishment stamp."""
+    def test_drain_backstop_elapses_from_structural_completion(self) -> None:
+        """The bounded drain backstop runs from the structural-completion latch, not the establishment."""
         ledger = _granted_ledger(0)
-        assert not ledger.drain_backstop_elapsed(0, now=_NOW + 5.0, settle_seconds=20.0)
-        assert ledger.drain_backstop_elapsed(0, now=_NOW + 25.0, settle_seconds=20.0)
-        assert not ledger.drain_backstop_elapsed(1, now=_NOW + 25.0, settle_seconds=20.0)
+        # Established but not yet structurally complete: the backstop is not running at all.
+        assert not ledger.drain_backstop_elapsed(0, now=_NOW + 500.0, settle_seconds=20.0)
+        ledger.state_for(0).structural_complete_at = _NOW + 500.0
+        assert not ledger.drain_backstop_elapsed(0, now=_NOW + 505.0, settle_seconds=20.0)
+        assert ledger.drain_backstop_elapsed(0, now=_NOW + 525.0, settle_seconds=20.0)
+        assert not ledger.drain_backstop_elapsed(1, now=_NOW + 525.0, settle_seconds=20.0)
+
+
+class TestMinHold:
+    """A fresh grant is immune to early release for the time it takes to amortize the actuation paid."""
+
+    def test_min_hold_denies_then_allows(self) -> None:
+        """The floor is active from the grant and lapses once it elapses."""
+        ledger = _granted_ledger(0)
+        assert ledger.min_hold_active(0, now=_NOW + 1.0) is True
+        assert ledger.min_hold_active(0, now=_NOW + _MIN_HOLD_SECONDS - 0.1) is True
+        assert ledger.min_hold_active(0, now=_NOW + _MIN_HOLD_SECONDS) is False
+
+    def test_min_hold_is_inert_without_a_held_residency(self) -> None:
+        """A card with no residency (never granted, or already restored) holds nothing."""
+        ledger = WholeCardResidencyLedger()
+        assert ledger.min_hold_active(0, now=_NOW) is False
+        granted = _granted_ledger(0)
+        granted.record_restore(0, now=_NOW + 1.0)
+        assert granted.min_hold_active(0, now=_NOW + 2.0) is False
+
+    def test_a_refreshed_grant_opens_a_new_floor(self) -> None:
+        """Re-establishing restarts the floor; a non-refreshing re-grant leaves it where it was."""
+        ledger = _granted_ledger(0)
+        ledger.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=_NOW + 300.0,
+            now=_NOW + 10.0,
+            refresh_established=False,
+        )
+        assert ledger.state_for(0).min_hold_until == _NOW + _MIN_HOLD_SECONDS
+        ledger.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=_NOW + 300.0,
+            now=_NOW + 20.0,
+            refresh_established=True,
+        )
+        assert ledger.state_for(0).min_hold_until == _NOW + 20.0 + _MIN_HOLD_SECONDS
+
+
+class TestEstablishRateLimit:
+    """Establishments per card are counted over a rolling window so churn cannot run unbounded."""
+
+    def _establish(self, ledger: WholeCardResidencyLedger, *, at: float) -> None:
+        """Record one fresh establishment on card 0 at ``at``."""
+        ledger.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=at + 300.0,
+            now=at,
+            refresh_established=True,
+        )
+
+    def test_unknown_card_is_never_rate_limited(self) -> None:
+        """A card that has never established has no history to exceed."""
+        ledger = WholeCardResidencyLedger()
+        assert ledger.establish_rate_exceeded(0, now=_NOW) is False
+
+    def test_limit_reached_within_the_window_then_replenished(self) -> None:
+        """The allowance is spent inside the window and returns as the oldest establishment ages out."""
+        ledger = WholeCardResidencyLedger()
+        for index in range(_ESTABLISH_WINDOW_LIMIT):
+            self._establish(ledger, at=_NOW + index)
+            if index < _ESTABLISH_WINDOW_LIMIT - 1:
+                assert ledger.establish_rate_exceeded(0, now=_NOW + index) is False
+        assert ledger.establish_rate_exceeded(0, now=_NOW + _ESTABLISH_WINDOW_LIMIT) is True
+        # The deferral a caller pays can never outlast the window itself.
+        assert ledger.establish_rate_exceeded(0, now=_NOW + _ESTABLISH_WINDOW_SECONDS + 1.0) is False
+
+    def test_the_limit_is_per_card(self) -> None:
+        """One card exhausting its allowance leaves another card's untouched."""
+        ledger = WholeCardResidencyLedger()
+        for index in range(_ESTABLISH_WINDOW_LIMIT):
+            self._establish(ledger, at=_NOW + index)
+        assert ledger.establish_rate_exceeded(0, now=_NOW) is True
+        assert ledger.establish_rate_exceeded(1, now=_NOW) is False
+
+
+class TestGraceBudget:
+    """Grace granted per card is capped over a rolling window so churn cannot disarm recovery forever."""
+
+    def _cycle(self, ledger: WholeCardResidencyLedger, *, at: float) -> None:
+        """Run one establish/restore cycle on card 0, charging both nominal grace windows."""
+        ledger.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=at + 300.0,
+            now=at,
+            refresh_established=True,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+        )
+        ledger.record_restore(0, now=at + 1.0, restore_grace_seconds=_RESTORE_GRACE)
+
+    def test_budget_accrues_refuses_and_replenishes(self) -> None:
+        """Repeated cycles spend the allowance, refuse further claims, then replenish as they age out."""
+        ledger = WholeCardResidencyLedger()
+        cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
+        for index in range(cycles):
+            self._cycle(ledger, at=_NOW + index * 10.0)
+            assert ledger.grace_budget_exhausted(0, now=_NOW + index * 10.0 + 2.0) is (
+                (index + 1) * (_ESTABLISH_GRACE + _RESTORE_GRACE) > _GRACE_BUDGET_SECONDS
+            )
+        assert ledger.grace_budget_exhausted(0, now=_NOW + _GRACE_BUDGET_WINDOW_SECONDS + 100.0) is False
+
+    def test_an_exhausted_budget_refuses_grace_inside_a_nominal_window(self) -> None:
+        """The window still reads as open; the claim that disarms the supervisor does not."""
+        ledger = WholeCardResidencyLedger()
+        cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
+        for index in range(cycles):
+            self._cycle(ledger, at=_NOW + index * 10.0)
+        # Re-establish so a residency is held and nominally establishing at the moment of the claim.
+        last = _NOW + cycles * 10.0
+        ledger.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=last + 300.0,
+            now=last,
+            refresh_established=True,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+        )
+        claim_at = last + 1.0
+        assert ledger.grace_window_active(
+            now=claim_at,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        )
+        assert not ledger.grace_active(
+            now=claim_at,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        )
+
+    def test_a_single_cycle_is_well_inside_the_budget(self) -> None:
+        """The ordinary one-establish-per-rotation shape is never refused."""
+        ledger = WholeCardResidencyLedger()
+        self._cycle(ledger, at=_NOW)
+        assert ledger.grace_budget_exhausted(0, now=_NOW + 5.0) is False
 
 
 class TestMaxCoresidentForPeak:
@@ -355,3 +514,120 @@ class TestWholeCardResidencyMachine:
             weights_fit_live=True,
             drain_backstop_elapsed=False,
         )
+
+
+class TestStructuralCompletionLatch:
+    """The readiness query records when the teardown's structural legs first all passed."""
+
+    @staticmethod
+    def _machine() -> WholeCardResidencyMachine:
+        """A machine holding one residency on card 0, granted at ``_NOW``."""
+        machine = WholeCardResidencyMachine()
+        machine.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=_NOW + 300.0,
+            now=_NOW,
+            refresh_established=True,
+        )
+        return machine
+
+    @staticmethod
+    def _forecast() -> StreamForecast:
+        """A card-filling forecast whose teardown target is sole residency."""
+        return StreamForecast(
+            weights_mb=13_000.0,
+            reserve_mb=1_500.0,
+            free_now_mb=1_000.0,
+            free_if_alone_mb=14_500.0,
+            free_after_model_evict_mb=10_000.0,
+            total_vram_mb=16_000.0,
+            per_process_overhead_mb=1_000.0,
+            marginal_process_overhead_mb=600.0,
+        )
+
+    def test_a_slow_teardown_does_not_start_the_backstop(self) -> None:
+        """While siblings are still resident the latch stays unset, so the backstop is not running."""
+        machine = self._machine()
+        forecast = self._forecast()
+        assert not machine.teardown_complete(
+            forecast,
+            loaded_process_count=3,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=False,
+            drain_backstop_elapsed=False,
+            device_index=0,
+            now=_NOW + 200.0,
+        )
+        assert machine.state_for(0).structural_complete_at == 0.0
+        assert not machine.drain_backstop_elapsed(0, now=_NOW + 200.0, settle_seconds=20.0)
+
+    def test_the_latch_stamps_once_and_then_holds(self) -> None:
+        """The first structurally-complete ask stamps the clock; later asks leave it alone."""
+        machine = self._machine()
+        forecast = self._forecast()
+        machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=False,
+            drain_backstop_elapsed=False,
+            device_index=0,
+            now=_NOW + 200.0,
+        )
+        assert machine.state_for(0).structural_complete_at == _NOW + 200.0
+        machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=False,
+            drain_backstop_elapsed=False,
+            device_index=0,
+            now=_NOW + 210.0,
+        )
+        assert machine.state_for(0).structural_complete_at == _NOW + 200.0
+        assert not machine.drain_backstop_elapsed(0, now=_NOW + 215.0, settle_seconds=20.0)
+        assert machine.drain_backstop_elapsed(0, now=_NOW + 220.0, settle_seconds=20.0)
+
+    def test_a_re_established_grant_does_not_inherit_an_elapsed_backstop(self) -> None:
+        """A retry tears the card down again, so its backstop starts from the new teardown."""
+        machine = self._machine()
+        forecast = self._forecast()
+        machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=False,
+            drain_backstop_elapsed=False,
+            device_index=0,
+            now=_NOW,
+        )
+        assert machine.drain_backstop_elapsed(0, now=_NOW + 100.0, settle_seconds=20.0)
+        machine.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=_NOW + 400.0,
+            now=_NOW + 100.0,
+            refresh_established=True,
+        )
+        assert not machine.drain_backstop_elapsed(0, now=_NOW + 100.0, settle_seconds=20.0)
+
+    def test_omitting_the_clock_records_nothing(self) -> None:
+        """A caller that only wants the answer (the ledger's pure query form) latches nothing."""
+        machine = self._machine()
+        assert machine.teardown_complete(
+            self._forecast(),
+            loaded_process_count=1,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+            device_index=0,
+        )
+        assert machine.state_for(0).structural_complete_at == 0.0

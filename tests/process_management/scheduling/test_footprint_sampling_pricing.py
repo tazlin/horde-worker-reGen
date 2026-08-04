@@ -400,3 +400,81 @@ class TestDisaggregatedObservation:
         )
 
         assert len(pm._learned_footprint_store) == 0
+
+
+def _make_monolithic_manager() -> HordeWorkerProcessManager:
+    """A testable manager with disaggregation off, so a job's forecast prices the whole resident set."""
+    ref = _reference()
+    pm = make_testable_process_manager(
+        enable_pipeline_disaggregation=False,
+        post_processing_lane_enabled=False,
+        stable_diffusion_reference=ref,  # type: ignore[arg-type]
+    )
+    pm._model_metadata.set_reference(ref)  # type: ignore[arg-type]
+    return pm
+
+
+def _resident_key(checkpoint: str) -> FootprintKey:
+    """The per-checkpoint RESIDENT key (no resolution band: weights do not move with request size)."""
+    return FootprintKey(
+        model_baseline=str(_BASELINE),
+        resolution_bucket=None,
+        platform=sys.platform,
+        stage=FootprintStage.RESIDENT,
+        checkpoint=checkpoint,
+    )
+
+
+class TestResidentFootprintPricing:
+    """The scheduler's resident-footprint seam reads the per-checkpoint RESIDENT watermark, context netted out.
+
+    The store records a whole *device* charge (the slot's settled reservation plus its CUDA context), while
+    the streaming forecast charges contexts separately from model bytes, so the seam must return the figure
+    in context-exclusive terms or the context is paid for twice.
+    """
+
+    def test_cold_key_prices_nothing(self) -> None:
+        """Nothing observed yields None, which leaves the forecast on its static seeds."""
+        scheduler = _make_manager()._inference_scheduler
+        assert scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE) is None
+
+    def test_watermark_is_returned_net_of_the_context_constant(self) -> None:
+        """The measured device charge is offered back with the context term removed."""
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        pm._learned_footprint_store.observe_peak(_resident_key(_MODEL), 12000.0)
+        assert scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE) == pytest.approx(
+            12000.0 - scheduler.resolved_context_constant_mb(),
+        )
+
+    def test_another_checkpoint_is_unaffected(self) -> None:
+        """Resident weights are a property of the file, so one checkpoint's measurement never prices another."""
+        pm = _make_manager()
+        pm._learned_footprint_store.observe_peak(_resident_key("some other checkpoint"), 12000.0)
+        assert pm._inference_scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE) is None
+
+    def test_unkeyable_model_prices_nothing(self) -> None:
+        """A model or baseline that cannot be keyed leaves the forecast on its static seeds."""
+        scheduler = _make_manager()._inference_scheduler
+        assert scheduler._learned_resident_footprint_mb(None, _BASELINE) is None
+        assert scheduler._learned_resident_footprint_mb(_MODEL, None) is None
+
+    def test_forecast_footprint_rises_with_the_measurement(self) -> None:
+        """End to end: the measured resident figure reaches the streaming forecast's footprint term.
+
+        Read off the monolithic path, where a slot holds the whole resident set the observation records.
+        """
+        pm = _make_monolithic_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        cold = scheduler._forecast_streaming(job, _BASELINE)
+        assert cold.footprint_mb is not None
+
+        pm._learned_footprint_store.observe_peak(
+            _resident_key(_MODEL),
+            cold.footprint_mb + scheduler.resolved_context_constant_mb() + 4000.0,
+        )
+        learned = scheduler._forecast_streaming(job, _BASELINE)
+        assert learned.footprint_mb == pytest.approx(cold.footprint_mb + 4000.0)
+        # The core-weight term is untouched: the measurement carries no weights-versus-support attribution.
+        assert learned.weights_mb == cold.weights_mb

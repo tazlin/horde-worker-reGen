@@ -797,6 +797,8 @@ def forecast_weight_streaming(
     configured_reserve_floor_mb: float,
     reserve_vram_gb: float | None = None,
     num_extra_resident_contexts: int = 0,
+    safety_context_charge_mb: float = 0.0,
+    learned_resident_footprint_mb: float | None = None,
     committed_reserve_mb: float = 0.0,
     marginal_process_overhead_mb: float | None = None,
     wants_whole_card: bool = False,
@@ -826,10 +828,29 @@ def forecast_weight_streaming(
     first-context overhead (the surviving process still pays the one-time cost).
 
     ``num_extra_resident_contexts`` is the count of *non-inference* processes that also hold a CUDA context
-    on the card (the safety process when ``safety_on_gpu`` is set). Their contexts are real device-wide
-    commitments that a stopping of idle *inference* siblings cannot reclaim, so they are subtracted (at the
-    marginal cost, the runtime being already paid) from the achievable-free figure; sole residency for a heavy
-    model therefore implies moving them off the GPU too.
+    on the card (the post-processing and VAE lanes). Their contexts are real device-wide commitments that a
+    stopping of idle *inference* siblings cannot reclaim, so they are subtracted (at the marginal cost, the
+    runtime being already paid) from the achievable-free figure; sole residency for a heavy model therefore
+    implies moving them off the GPU too.
+
+    ``safety_context_charge_mb`` is the safety process's whole device footprint when it is on the card, and
+    zero when it is not. Safety is charged as this explicit figure rather than counted among
+    ``num_extra_resident_contexts`` because a marginal context charge prices only an empty CUDA context,
+    while safety additionally holds resident classifier weights: the caller supplies the one safety price
+    the rest of the scheduler admits and places against, so the forecast cannot disagree with them about
+    what safety costs. It is charged in the same place and for the same reason as an extra context (against
+    the siblings-present achievable-free figure, never against ``free_if_alone``, which is the ceiling
+    reached by moving safety off the card), and it must NOT also appear in the extra-context count.
+
+    ``learned_resident_footprint_mb`` is a measured at-rest device charge for this specific checkpoint, in
+    the same context-exclusive terms as the static seeds (the caller nets out the context constant). It
+    raises ``footprint_mb`` and only ``footprint_mb``: the observation is the whole resident set the slot
+    holds at rest, which is exactly what :func:`predict_job_footprint_mb` estimates, whereas ``weights_mb``
+    is deliberately the *core* diffusion weights alone (the support components time-share the card via
+    per-phase swaps, which is why the load-feasibility judgments key on it). Attributing a combined
+    measurement to the core term would assert a split the measurement does not carry and could flip a model
+    whose weights genuinely fit the drained card into reading as streaming-unavoidable. None (or a figure at
+    or below the static estimate) leaves the forecast byte-identical to the static arithmetic.
 
     ``wants_whole_card`` flags a baseline the caller has classified as a sole-residency model on intent (the
     ``EXTRA_LARGE`` tier: Cascade/Flux/Qwen/Z-Image), so a conservative weight seed that happens to fit
@@ -856,6 +877,13 @@ def forecast_weight_streaming(
     else:
         weights_mb = predict_job_weight_mb(job, baseline)
         footprint_mb = predict_job_footprint_mb(job, baseline)
+        # A measured at-rest footprint for this checkpoint raises the per-baseline seed (raise-only, so a
+        # cold or under-seed figure changes nothing). The disaggregated branch above is deliberately left
+        # out: its sampler process holds the UNet alone, so a whole-slot resident measurement would re-add
+        # the support weights it never carries and collapse the two co-resident samplers the sampler-only
+        # charge exists to keep.
+        if learned_resident_footprint_mb is not None and footprint_mb is not None:
+            footprint_mb = max(footprint_mb, learned_resident_footprint_mb)
     # The weight-fit floor is ComfyUI's *own* streaming threshold (``minimum_inference_memory``), NOT the
     # operator's configured ``vram_reserve_mb``. That configured figure is a sampling / co-residency safety
     # margin (how much headroom to keep free while a model samples beside siblings), not a statement about
@@ -920,15 +948,17 @@ def forecast_weight_streaming(
         free_after_model_evict_mb = None
     else:
         # free_if_alone is the absolute ceiling: the model's own process is the only context on the card,
-        # which for whole-card residency means safety is moved off-GPU too. So the extra (safety) context is
-        # NOT charged here; a model only "streams unavoidably" when it overflows even that ceiling. A caller
+        # which for whole-card residency means safety is moved off-GPU too. So neither the extra contexts nor
+        # the safety charge apply here; a model only "streams unavoidably" when it overflows even that ceiling.
+        # A caller
         # whose configuration keeps a context on the card prices it back out via
         # :meth:`StreamForecast.fits_alone_beside` rather than reading this figure as reachable.
         free_if_alone_mb = max(0.0, float(total_vram_mb) - overhead)
         # free_after_model_evict is the current reality with every process's context materialised, including
-        # the safety-on-GPU context, since stopping idle *inference* siblings cannot reclaim it. The loading
+        # the safety-on-GPU process, since stopping idle *inference* siblings cannot reclaim it. The loading
         # process's context costs the full first-context overhead (it pays the shared one-time runtime cost);
-        # every other inference and safety context costs only the marginal.
+        # every other inference and service-lane context costs only the marginal, while safety is charged its
+        # own whole-process figure below (it is not one of the extra contexts, so nothing is counted twice).
         additional_contexts = (process_count - 1) + extra_contexts
         # Under disaggregation the image lane VAE-decodes the previous job while this one samples, so its
         # decode spike is a real, concurrent device commitment idle inference siblings cannot reclaim. Charge
@@ -937,7 +967,11 @@ def forecast_weight_streaming(
         lane_spike_mb = max(0.0, disaggregation_sibling_charge_mb) if disaggregated else 0.0
         free_after_model_evict_mb = max(
             0.0,
-            float(total_vram_mb) - overhead - marginal * additional_contexts - lane_spike_mb,
+            float(total_vram_mb)
+            - overhead
+            - marginal * additional_contexts
+            - max(0.0, safety_context_charge_mb)
+            - lane_spike_mb,
         )
     return StreamForecast(
         weights_mb=weights_mb,

@@ -1014,6 +1014,108 @@ class TestMarginalProcessOverhead:
         assert seeded.free_if_alone_mb == pytest.approx(24074.0 - 4266.0)
 
 
+class TestLearnedResidentFootprint:
+    """A measured per-checkpoint resident footprint raises the forecast's static per-baseline seed.
+
+    The static seeds are per-baseline, so every checkpoint of an architecture is priced alike; a heavy
+    checkpoint that measurably costs far more than its baseline's seed is granted sibling room that does not
+    exist. The measured at-rest figure raises the seed (raise-only, so nothing measured leaves the arithmetic
+    exactly as the seeds compute it) and re-keys the sibling-room judgment on what the file actually costs.
+    """
+
+    _TOTAL_MB = 24576.0
+    _OVERHEAD_MB = 1288.0
+    _CORE_WEIGHTS_MB = 4900.0
+    _SEED_FOOTPRINT_MB = 6900.0
+    _MEASURED_FOOTPRINT_MB = 18000.0
+
+    def _forecast(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        learned_resident_footprint_mb: float | None,
+    ) -> resource_budget.StreamForecast:
+        """A 24GB card holding one SDXL-class checkpoint, priced with or without a measured resident figure."""
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda j, b: self._CORE_WEIGHTS_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_footprint_mb", lambda j, b: self._SEED_FOOTPRINT_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda j, b: 9000.0)
+        monkeypatch.setattr(resource_budget, "effective_inference_reserve_mb", lambda *a, **k: 1000.0)
+        return resource_budget.forecast_weight_streaming(
+            make_mock_job(width=1024, height=1024),
+            "stable_diffusion_xl",
+            free_now_mb=20000.0,
+            total_vram_mb=self._TOTAL_MB,
+            per_process_overhead_mb=self._OVERHEAD_MB,
+            num_inference_processes=1,
+            configured_reserve_floor_mb=0.0,
+            learned_resident_footprint_mb=learned_resident_footprint_mb,
+        )
+
+    def test_seeded_card_has_room_for_a_sibling_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Baseline: at the per-baseline seed the 24GB card reads as holding another full model."""
+        forecast = self._forecast(monkeypatch, learned_resident_footprint_mb=None)
+        assert forecast._has_room_for_coresident_model is True
+
+    def test_measured_footprint_removes_the_sibling_room(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A checkpoint measured at 18GB leaves no room for a sibling model the seed said would fit."""
+        forecast = self._forecast(monkeypatch, learned_resident_footprint_mb=self._MEASURED_FOOTPRINT_MB)
+        assert forecast._has_room_for_coresident_model is False
+        assert forecast.footprint_mb == self._MEASURED_FOOTPRINT_MB
+
+    def test_measured_footprint_leaves_the_core_weights_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The raise lands on the footprint only: the core-weight term drives load feasibility and must not move.
+
+        ``weights_mb`` is deliberately the core diffusion weights without the support components (which
+        time-share the card via per-phase swaps), and the at-rest measurement carries no attribution of that
+        split. Folding a combined figure into it would make a model whose weights fit the drained card read
+        as streaming-unavoidable.
+        """
+        forecast = self._forecast(monkeypatch, learned_resident_footprint_mb=self._MEASURED_FOOTPRINT_MB)
+        assert forecast.weights_mb == self._CORE_WEIGHTS_MB
+        assert forecast.streams_unavoidably is False
+        assert forecast.fits_alone is True
+
+    def test_measurement_below_the_seed_changes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Raise-only: a measurement lighter than the seed leaves the conservative seed standing."""
+        light = self._forecast(monkeypatch, learned_resident_footprint_mb=self._SEED_FOOTPRINT_MB - 2000.0)
+        assert light.footprint_mb == self._SEED_FOOTPRINT_MB
+
+    def test_cold_store_is_identical_to_the_static_arithmetic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The regression keystone: with nothing measured, every forecast field is the static figure."""
+        cold = self._forecast(monkeypatch, learned_resident_footprint_mb=None)
+        seeded = self._forecast(monkeypatch, learned_resident_footprint_mb=self._SEED_FOOTPRINT_MB)
+        assert cold == seeded
+
+    def test_disaggregated_forecast_ignores_the_whole_slot_measurement(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A disaggregated sampler holds the UNet alone, so a whole-slot resident figure must not price it.
+
+        Applying it would re-add the support weights the sampler process never carries and collapse the two
+        co-resident samplers the sampler-only charge exists to keep.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_sampler_only_vram_mb", lambda j, b: 6600.0)
+        monkeypatch.setattr(resource_budget, "effective_inference_reserve_mb", lambda *a, **k: 1000.0)
+        common = {
+            "free_now_mb": 20000.0,
+            "total_vram_mb": self._TOTAL_MB,
+            "per_process_overhead_mb": self._OVERHEAD_MB,
+            "num_inference_processes": 1,
+            "configured_reserve_floor_mb": 0.0,
+            "disaggregated": True,
+        }
+        job = make_mock_job(width=1024, height=1024)
+        without = resource_budget.forecast_weight_streaming(job, "stable_diffusion_xl", **common)
+        with_measurement = resource_budget.forecast_weight_streaming(
+            job,
+            "stable_diffusion_xl",
+            learned_resident_footprint_mb=self._MEASURED_FOOTPRINT_MB,
+            **common,
+        )
+        assert with_measurement == without
+
+
 class TestWholeCardIntent:
     """A baseline declared whole-card (the EXTRA_LARGE tier) claims sole residency even when its weight seed fits.
 

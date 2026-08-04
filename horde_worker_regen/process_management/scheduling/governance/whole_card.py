@@ -5,7 +5,12 @@ A heavy model can claim a whole card to itself by stopping that card's idle sibl
 moving safety off-GPU. This module owns the per-card residency records and every question that can be
 answered from them alone: which cards hold a residency, which card holds a given model, what phase a
 residency is in, whether an establish/restore grace window is active, and whether the bounded drain
-backstop has elapsed. The scheduler keeps the transitions that touch live processes (establish, converge,
+backstop has elapsed. It also owns the churn governors that bound how fast residencies may be cycled: a
+minimum hold before a grant may be released early, a per-card establishment rate limit, and a rolling budget
+on how much recovery-supervisor grace the establish/restore cycle may consume. Each is stored and answered
+here, and actuated at the scheduler's call sites.
+
+The scheduler keeps the transitions that touch live processes (establish, converge,
 restore); it reads and writes residency state exclusively through
 [`WholeCardResidencyLedger`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyLedger].
 
@@ -16,7 +21,8 @@ pure sizing rule for how many live inference contexts a rejected peak can co-res
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
 
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
@@ -28,6 +34,46 @@ __all__ = [
     "WholeCardResidencyMachine",
     "max_coresident_for_peak",
 ]
+
+_MIN_HOLD_SECONDS = 90.0
+"""How long a fresh whole-card residency is immune to early release by a ready different-model head.
+
+Releasing a residency is not free: every sibling inference process the establishment stopped has to be
+respawned (~20s each, plus the preload that follows) and the safety process cycled back on-GPU, and the
+next heavy head then pays the whole teardown again. A residency released seconds after it was granted
+therefore buys one lighter job at the price of two full pool rebuilds, and a queue that alternates heavy
+and light heads can repeat that indefinitely. This floor amortizes the actuation already paid over at
+least a few jobs' worth of holding; it is deliberately shorter than the establish grace window so it can
+never be the thing that keeps a residency alive past the point the recovery supervisor is watching."""
+
+_ESTABLISH_WINDOW_SECONDS = 240.0
+"""Rolling window over which a card's whole-card establishments are counted by the rate limiter.
+
+Kept well under the pop-gate structural-wedge backstop (900s) so a head deferred by the limiter can never
+accrue toward it: the longest a deferral can last is one window, after which the oldest establishment
+falls out and the head is admitted."""
+
+_ESTABLISH_WINDOW_LIMIT = 2
+"""Establishments per card per :data:`_ESTABLISH_WINDOW_SECONDS` before a further one is deferred.
+
+Two lets a genuine retry follow a first establishment immediately (an establishment that failed to converge
+and was restored still gets a second attempt without waiting), while a third inside the same window is the
+signature of a pricing oscillation rather than of demand, and is made to wait out the window."""
+
+_GRACE_BUDGET_WINDOW_SECONDS = 1200.0
+"""Rolling window over which the grace granted to a card's residencies is accumulated.
+
+Sized to the field's model-pool rotation period, so the budget is spent and replenished on the same cadence
+that legitimately drives one establish/restore cycle per card."""
+
+_GRACE_BUDGET_SECONDS = 360.0
+"""Total grace seconds a card may be granted per :data:`_GRACE_BUDGET_WINDOW_SECONDS` before claims are refused.
+
+One nominal rotation costs a card one establish grant (120s) plus one restore grant (60s), so this allows a
+full cycle plus one complete retry and refuses the third. Without a ceiling, back-to-back establish/restore
+churn re-arms the grace window faster than it expires and the recovery supervisor is disarmed indefinitely,
+which is precisely the state in which a real wedge goes unnoticed. Capping the spend at 30% of the window
+keeps the supervisor armed for the majority of any window no matter how hard the residency machinery churns."""
 
 
 @dataclass
@@ -54,6 +100,27 @@ class WholeCardResidency:
     restore_at: float = 0.0
     """When this residency was last restored (siblings respawned, safety cycled back on-GPU); 0.0 when none.
     The restore churn also briefly makes the queue unservable, so the wedge grace must cover it too."""
+    min_hold_until: float = 0.0
+    """Wall-clock time before which this residency may not be released early for a different-model head.
+
+    Distinct from ``cooldown_until``, which is an operator-configured hold that a ready different-model head
+    may preempt: this floor is not preemptable, because the point of it is to amortize the teardown and
+    regrowth the establishment has already paid for. 0.0 when no residency is held."""
+    structural_complete_at: float = 0.0
+    """When this residency's teardown first satisfied every structural leg (process count, safety, lanes).
+
+    The drain backstop measures from here rather than from ``established_at`` so a slow teardown cannot burn
+    the backstop before there is anything to back off from: until the structure is complete there is no
+    sole-residency guarantee for the backstop to admit the head against. 0.0 while incomplete."""
+    grace_charges: deque[tuple[float, float]] = field(default_factory=deque)
+    """``(granted_at, seconds)`` for each grace window this card has been granted, newest last.
+
+    Pruned to :data:`_GRACE_BUDGET_WINDOW_SECONDS` whenever the budget is consulted, so the sum over the
+    deque is the grace spent in the current rolling window."""
+    establishments: deque[float] = field(default_factory=deque)
+    """When each of this card's whole-card residencies was established, newest last.
+
+    Pruned to :data:`_ESTABLISH_WINDOW_SECONDS` whenever the rate limiter is consulted."""
 
 
 class WholeCardPhase(StrEnum):
@@ -124,20 +191,70 @@ class WholeCardResidencyLedger:
         cooldown_until: float,
         now: float,
         refresh_established: bool,
+        establish_grace_seconds: float = 0.0,
     ) -> WholeCardResidency:
         """Record a residency grant (an establishment or a RAM pre-stage) for ``device_index``.
 
         Sets the model, forecast, and cooldown; stamps ``established_at`` when ``refresh_established`` is
         set or the residency is fresh, so the recovery supervisor's grace window is measured from when the
-        intentional hold began. Returns the updated state.
+        intentional hold began. A stamped establishment also opens a fresh min-hold floor, clears any
+        structural-completion latch from the previous grant (a re-established residency tears down again, so
+        it must not inherit an elapsed drain backstop), records the establishment for the rate limiter, and
+        charges ``establish_grace_seconds`` against the card's rolling grace budget. Passing zero seconds
+        records no charge, which is what a caller that is not claiming a grace window should do.
+
+        Returns the updated state.
         """
         state = self.state_for(device_index)
         if refresh_established or state.established_at == 0.0:
             state.established_at = now
+            state.min_hold_until = now + _MIN_HOLD_SECONDS
+            state.structural_complete_at = 0.0
+            state.establishments.append(now)
+            if establish_grace_seconds > 0.0:
+                state.grace_charges.append((now, establish_grace_seconds))
         state.model = model
         state.forecast = forecast
         state.cooldown_until = cooldown_until
         return state
+
+    def record_restore(self, device_index: int | None, *, now: float, restore_grace_seconds: float = 0.0) -> None:
+        """Clear a drained residency on ``device_index`` and open its restore window.
+
+        The restore's own churn (respawning the stopped siblings, cycling safety back on-GPU) briefly makes
+        the queue unservable, so the stamp is what the wedge grace reads; the grant's holds (min-hold,
+        structural completion) are released with it and ``restore_grace_seconds`` is charged against the
+        card's rolling grace budget.
+        """
+        state = self.state_for(device_index)
+        state.model = None
+        state.forecast = None
+        state.established_at = 0.0
+        state.min_hold_until = 0.0
+        state.structural_complete_at = 0.0
+        state.restore_at = now
+        if restore_grace_seconds > 0.0:
+            state.grace_charges.append((now, restore_grace_seconds))
+
+    def min_hold_active(self, device_index: int | None, *, now: float) -> bool:
+        """Return whether this card's residency is still inside its non-preemptable minimum hold."""
+        state = self._residencies.get(device_index)
+        if state is None or state.model is None:
+            return False
+        return now < state.min_hold_until
+
+    def establish_rate_exceeded(self, device_index: int | None, *, now: float) -> bool:
+        """Return whether this card has already established as often as the rolling window allows.
+
+        A caller that sees True should defer the new establishment and re-ask, never deny it outright: the
+        window is short enough (:data:`_ESTABLISH_WINDOW_SECONDS`) that the deferral always resolves well
+        inside the structural-wedge backstop the deferred head would otherwise accrue toward.
+        """
+        state = self._residencies.get(device_index)
+        if state is None:
+            return False
+        _prune_before(state.establishments, cutoff=now - _ESTABLISH_WINDOW_SECONDS)
+        return len(state.establishments) >= _ESTABLISH_WINDOW_LIMIT
 
     def phase(
         self,
@@ -157,6 +274,29 @@ class WholeCardResidencyLedger:
         establishing = state.established_at != 0.0 and (now - state.established_at) < establish_grace_seconds
         return state.model, (WholeCardPhase.ESTABLISHING if establishing else WholeCardPhase.HOLDING)
 
+    def grace_window_active(
+        self,
+        *,
+        now: float,
+        establish_grace_seconds: float,
+        restore_grace_seconds: float,
+    ) -> bool:
+        """Return whether any residency is nominally inside an establish or restore window.
+
+        The window question alone, without the budget: a caller wanting the answer that actually disarms
+        the recovery supervisor wants :meth:`grace_active`. The two differ exactly when a card's rolling
+        grace budget is exhausted, which is the condition worth disclosing.
+        """
+        return any(
+            self._window_active(
+                state,
+                now=now,
+                establish_grace_seconds=establish_grace_seconds,
+                restore_grace_seconds=restore_grace_seconds,
+            )
+            for state in self._residencies.values()
+        )
+
     def grace_active(
         self,
         *,
@@ -164,33 +304,69 @@ class WholeCardResidencyLedger:
         establish_grace_seconds: float,
         restore_grace_seconds: float,
     ) -> bool:
-        """Return whether any residency is establishing or restoring, so a held queue is intentional.
+        """Return whether any residency is establishing or restoring *within budget*, so a held queue is intentional.
 
-        Bounded by the two grace windows so a residency that genuinely never loads (or a restore that
-        never completes) still trips the recovery supervisor.
+        Bounded three ways so a residency that genuinely never loads (or a restore that never completes)
+        still trips the recovery supervisor: by the establish window, by the restore window, and by the
+        card's rolling grace budget. The budget is what stops repeated establish/restore cycles from
+        re-arming a fresh window faster than the previous one expires, which would otherwise leave the
+        supervisor disarmed for as long as the churn continued.
         """
-        for state in self._residencies.values():
-            establishing = (
-                state.model is not None
-                and state.established_at != 0.0
-                and (now - state.established_at) < establish_grace_seconds
-            )
-            restoring = state.restore_at != 0.0 and (now - state.restore_at) < restore_grace_seconds
-            if establishing or restoring:
+        for device_index, state in self._residencies.items():
+            if not self._window_active(
+                state,
+                now=now,
+                establish_grace_seconds=establish_grace_seconds,
+                restore_grace_seconds=restore_grace_seconds,
+            ):
+                continue
+            if not self.grace_budget_exhausted(device_index, now=now):
                 return True
         return False
 
+    def grace_budget_exhausted(self, device_index: int | None, *, now: float) -> bool:
+        """Return whether this card has spent its rolling-window grace allowance.
+
+        Spend is the sum of the grace windows granted to the card inside
+        :data:`_GRACE_BUDGET_WINDOW_SECONDS`; it replenishes as those grants age out of the window.
+        """
+        state = self._residencies.get(device_index)
+        if state is None:
+            return False
+        _prune_charges_before(state.grace_charges, cutoff=now - _GRACE_BUDGET_WINDOW_SECONDS)
+        return sum(seconds for _granted_at, seconds in state.grace_charges) > _GRACE_BUDGET_SECONDS
+
+    @staticmethod
+    def _window_active(
+        state: WholeCardResidency,
+        *,
+        now: float,
+        establish_grace_seconds: float,
+        restore_grace_seconds: float,
+    ) -> bool:
+        """Return whether one card's residency sits inside a nominal establish or restore window."""
+        establishing = (
+            state.model is not None
+            and state.established_at != 0.0
+            and (now - state.established_at) < establish_grace_seconds
+        )
+        restoring = state.restore_at != 0.0 and (now - state.restore_at) < restore_grace_seconds
+        return establishing or restoring
+
     def drain_backstop_elapsed(self, device_index: int | None, *, now: float, settle_seconds: float) -> bool:
-        """Return whether the bounded drain-settle window has elapsed since this residency was established.
+        """Return whether the bounded drain-settle window has elapsed since the teardown became structural.
 
         The deterministic backstop for the dispatch gate: once a structurally-complete teardown has held
         for ``settle_seconds`` without the live free-VRAM reading confirming the drain, the head is
-        admitted on the structural guarantee rather than parking forever.
+        admitted on the structural guarantee rather than parking forever. Measured from
+        ``structural_complete_at``, so the clock only runs once there is a sole-residency guarantee to admit
+        the head against: a slow establishment (siblings still exiting, safety still cycling) does not burn
+        the backstop before the drain it backstops has anything to drain.
         """
         state = self._residencies.get(device_index)
-        if state is None or state.established_at == 0.0:
+        if state is None or state.structural_complete_at == 0.0:
             return False
-        return (now - state.established_at) >= settle_seconds
+        return (now - state.structural_complete_at) >= settle_seconds
 
 
 class WholeCardResidencyMachine(WholeCardResidencyLedger):
@@ -241,6 +417,8 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         weights_fit_live: bool,
         drain_backstop_elapsed: bool,
         resident_context_charge_mb: float = 0.0,
+        device_index: int | None = None,
+        now: float | None = None,
     ) -> bool:
         """Return whether a held residency has cleared enough room for the head to sample.
 
@@ -264,19 +442,40 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         process-count leg satisfied: no teardown depth was ever demanded of the pool, so waiting on one would
         park the head forever. The remaining legs still gate, so the head is admitted on a measured fit or the
         drain backstop rather than on the unsized count.
+
+        Passing ``now`` (with the ``device_index`` the other arguments were gathered for) latches the moment
+        the structural legs first all pass onto the residency, which is what the drain backstop measures
+        from. The latch lives here because the structural legs are computed here and nowhere else; callers
+        that only want the question answered omit ``now`` and record nothing.
         """
         target = self.target_process_count(forecast)
-        if target is not None and loaded_process_count > target:
-            return False
-        if safety_pause_required and not safety_paused:
-            return False
-        if post_process_pause_required and not post_process_cleared:
-            return False
-        if component_lane_pause_required and not component_lane_cleared:
+        structurally_complete = not (
+            (target is not None and loaded_process_count > target)
+            or (safety_pause_required and not safety_paused)
+            or (post_process_pause_required and not post_process_cleared)
+            or (component_lane_pause_required and not component_lane_cleared)
+        )
+        if now is not None and structurally_complete:
+            state = self._residencies.get(device_index)
+            if state is not None and state.model is not None and state.structural_complete_at == 0.0:
+                state.structural_complete_at = now
+        if not structurally_complete:
             return False
         if weights_fit_live:
             return True
         return forecast.fits_alone_beside(resident_context_charge_mb) and drain_backstop_elapsed
+
+
+def _prune_before(stamps: deque[float], *, cutoff: float) -> None:
+    """Drop timestamps older than ``cutoff`` from the front of an oldest-first deque."""
+    while stamps and stamps[0] < cutoff:
+        stamps.popleft()
+
+
+def _prune_charges_before(charges: deque[tuple[float, float]], *, cutoff: float) -> None:
+    """Drop ``(granted_at, seconds)`` charges granted before ``cutoff`` from an oldest-first deque."""
+    while charges and charges[0][0] < cutoff:
+        charges.popleft()
 
 
 def max_coresident_for_peak(

@@ -107,6 +107,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
 )
 from horde_worker_regen.process_management.resources.vram_attribution import _REPORT_STALENESS_SECONDS
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    SAFETY_PROCESS_BASELINE,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
@@ -342,9 +343,11 @@ never actually relieve."""
 _SAFETY_GPU_LOAD_CHARGE_MB = 3044.0
 """The device VRAM (MB) charged when the safety process is loaded onto the GPU, for the arbiter's SAFETY_LOAD
 gate. A documented conservative seed for the idle CLIP model plus its CUDA context. DeepDanbooru, BLIP, the
-aesthetic head, and evaluation activations are explicitly reclaimable and are not fixed safety residency. The
-worker holds no learned CLIP footprint, so this static figure prices restore rather than a per-run watermark;
-erring high keeps safety off-GPU one more cycle rather than restoring it onto a card it would over-commit."""
+aesthetic head, and evaluation activations are explicitly reclaimable and are not fixed safety residency.
+Erring high keeps safety off-GPU one more cycle rather than restoring it onto a card it would over-commit.
+This is the *seed* for the learned safety figure: :meth:`InferenceScheduler._safety_footprint_mb` is the one
+price every consumer reads, and it raises this constant by any measured :attr:`FootprintStage.SAFETY`
+watermark."""
 
 _SAFETY_PLACEMENT_PAUSE_STREAK = 2
 """Consecutive control cycles the safety charge must fail to fit beside the largest learned solo sampling peak
@@ -937,6 +940,12 @@ class InferenceScheduler:
         # equally holds the queue, so this bounds a wedge grace that the whole-card establishment grace does
         # not cover. 0.0 when none is loading.
         self._heavy_head_admitted_at: float = 0.0
+        # Edge-trigger latch for the disclosure that a whole-card grace claim was refused on budget: the
+        # wedge assessment asks every control cycle, so the refusal is announced on the transition only.
+        self._whole_card_grace_refused: bool = False
+        # Edge-trigger latch for the disclosure that whole-card residency is off because its config flag
+        # never resolved to a value (as distinct from resolving to False, which is an operator choice).
+        self._whole_card_flag_unresolved_disclosed: bool = False
         # When an idle inference slot was last deliberately cycled to reclaim allocator-retained RAM
         # (_replace_stale_ram_unload_process). The respawn + the next head's preload leave the queue
         # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
@@ -1498,8 +1507,21 @@ class InferenceScheduler:
         return platform_context_constant_mb(self._marginal_process_overhead_mb())
 
     def _whole_card_residency_enabled(self) -> bool:
-        """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config)."""
+        """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config).
+
+        The identity test against True is deliberate: a config surface that has not resolved the flag hands
+        back None, and a None here would otherwise silently read as "operator turned it off". That case is
+        disclosed once, because a worker that quietly forgoes whole-card residency streams heavy models
+        instead of failing visibly, which is very hard to attribute after the fact.
+        """
         enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
+        if enabled is None and not self._whole_card_flag_unresolved_disclosed:
+            self._whole_card_flag_unresolved_disclosed = True
+            logger.warning(
+                "Whole-card exclusive residency is disabled because its config flag never resolved to a "
+                "value. Heavy models will load co-resident with sibling contexts and may stream their "
+                "weights. Set `whole_card_exclusive_residency` explicitly to choose the behaviour.",
+            )
         return enabled is True
 
     def _whole_card_warranted(self, forecast: StreamForecast) -> bool:
@@ -1685,21 +1707,26 @@ class InferenceScheduler:
         # against a ceiling that is no longer running. Processes are staged up front (or once a model is on
         # disk), so by the time a job is scheduled the live count already reflects the real contention.
         num_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
-        # The safety process holds its own CUDA context on the card when safety_on_gpu is set; that VRAM is
-        # not reclaimable by stopping idle inference siblings, so the forecast must count it against the
-        # achievable-free figures (sole residency for a heavy model then implies moving safety off-GPU too).
-        # Count the safety context only when safety is *actually* on the GPU right now: once a whole-card
-        # job has paused it off-GPU, its context is freed, so continuing to charge it would keep the
-        # structural floor (free_after_model_evict) below the model's demand forever and the whole-card
-        # branch would defer the model every tick without ever loading it. The safety process is pinned to a
-        # single card, so on a per-card forecast it is charged only against the card it actually sits on.
+        # The safety process holds a CUDA context *and* resident classifier weights on the card when
+        # safety_on_gpu is set; that VRAM is not reclaimable by stopping idle inference siblings, so the
+        # forecast must charge it against the achievable-free figures (sole residency for a heavy model then
+        # implies moving safety off-GPU too). It is priced at :meth:`_safety_footprint_mb`, the same figure
+        # admission, placement, and reclaim charge, rather than as one more marginal context: the marginal
+        # prices an empty context and would under-count safety's weights. Charge it only when safety is
+        # *actually* on the GPU right now: once a whole-card job has paused it off-GPU its footprint is
+        # freed, so continuing to charge it would keep the structural floor (free_after_model_evict) below
+        # the model's demand forever and the whole-card branch would defer the model every tick without ever
+        # loading it. The safety process is pinned to a single card, so on a per-card forecast it is charged
+        # only against the card it actually sits on.
         safety_on_gpu = self._runtime_config.bridge_data.safety_on_gpu and (
             not self._process_lifecycle.is_safety_gpu_paused
         )
         num_safety_contexts = self._process_map.num_safety_processes(device_index=device_index) if safety_on_gpu else 0
+        safety_context_charge_mb = num_safety_contexts * self._safety_footprint_mb()
         # The dedicated post-processing lane holds a CUDA context (and its resident post-processing models)
-        # on the card it is pinned to; like the safety context, that is a real device-wide commitment idle
-        # inference siblings cannot reclaim, so it is charged as an extra resident context here. Charge it only
+        # on the card it is pinned to; like safety, that is a real device-wide commitment idle
+        # inference siblings cannot reclaim, so it is charged as an extra resident context here (at the
+        # marginal per-context cost, the lane holding no learned at-rest figure of its own). Charge it only
         # while the lane is actually on the card: once a whole-card job has stopped the lane off-GPU its context
         # is freed, so continuing to charge it would keep the structural floor below the model's demand and
         # defer the head forever (the same reasoning as the paused safety context above).
@@ -1727,7 +1754,9 @@ class InferenceScheduler:
             per_process_overhead_mb=self._per_process_overhead_mb(),
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
-            num_extra_resident_contexts=num_safety_contexts + num_post_process_contexts,
+            num_extra_resident_contexts=num_post_process_contexts,
+            safety_context_charge_mb=safety_context_charge_mb,
+            learned_resident_footprint_mb=self._learned_resident_footprint_mb(job.model, baseline),
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
             marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
             wants_whole_card=wants_whole_card,
@@ -1775,10 +1804,37 @@ class InferenceScheduler:
             return False
         return self._process_lifecycle.pause_safety_on_gpu()
 
+    def _safety_footprint_mb(self) -> float:
+        """The device VRAM (MB) the safety process costs while it sits on the GPU: the single safety price.
+
+        :data:`_SAFETY_GPU_LOAD_CHARGE_MB` is the static seed and any measured
+        :attr:`FootprintStage.SAFETY` watermark raises it, the same raise-only overlay every other stage's
+        pricing uses. The learned figure is already safety's *whole device* footprint (its settled allocator
+        reservation plus the platform context constant, as the observation seam records it), directly
+        comparable with the seed, so no context term is added on top of it here.
+
+        Every consumer of the safety charge routes through this accessor (the arbiter's ``SAFETY_LOAD``
+        request, both runtime-placement predicates, the streaming forecast's safety term, the residency
+        charge-back, and the reclaim rung's promise), so admission, placement, forecasting, and reclaim can
+        never disagree about what safety costs the card.
+        """
+        store = self._footprint_store
+        if store is None:
+            return _SAFETY_GPU_LOAD_CHARGE_MB
+        return store.estimate_mb(
+            FootprintKey(
+                model_baseline=SAFETY_PROCESS_BASELINE,
+                resolution_bucket=None,
+                platform=sys.platform,
+                stage=FootprintStage.SAFETY,
+            ),
+            static_seed_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+        )
+
     def _arbiter_admits_safety_gpu_load(self, device_index: int | None) -> bool:
         """Whether the safety process may (re)load onto the GPU now, the VRAM arbiter deciding the memory question.
 
-        Charges :data:`_SAFETY_GPU_LOAD_CHARGE_MB` against the card's measured admission floor as a
+        Charges :meth:`_safety_footprint_mb` against the card's measured admission floor as a
         :attr:`VramRequestKind.SAFETY_LOAD`: a FITS verdict admits, a DEFER or DENY keeps safety off-GPU this
         cycle so the load re-asks. An unwired or cold arbiter admits, matching the
         every-gate-admits-on-missing-telemetry contract. No actuations run here (reclaim is single-owner, driven
@@ -1793,7 +1849,7 @@ class InferenceScheduler:
                 job_label="safety_load",
                 baseline=None,
                 device_index=device_index,
-                candidate_delta_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+                candidate_delta_mb=self._safety_footprint_mb(),
             ),
         )
         return verdict.admits
@@ -1895,7 +1951,7 @@ class InferenceScheduler:
             return False
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         buffer_mb = admission_noise_buffer_mb(total_vram_mb)
-        return (measured_free_mb - _SAFETY_GPU_LOAD_CHARGE_MB - buffer_mb) >= 0.0
+        return (measured_free_mb - self._safety_footprint_mb() - buffer_mb) >= 0.0
 
     def _runtime_safety_placement_enabled(self) -> bool:
         """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
@@ -1946,8 +2002,8 @@ class InferenceScheduler:
     ) -> bool:
         """Whether the safety charge fits on the card beside the largest active sampling peak, as arithmetic.
 
-        Structural fit over (device total, largest learned sampling peak, proportional noise buffer, the static
-        safety charge): ``total - peak - noise - safety_charge >= 0``. No constant is tuned to a card size; the
+        Structural fit over (device total, largest learned sampling peak, proportional noise buffer, the safety
+        charge): ``total - peak - noise - safety_charge >= 0``. No constant is tuned to a card size; the
         noise buffer scales with the device total. With ``require_margin`` an extra proportional buffer must
         also clear, so the restore side of the hysteresis demands durable headroom rather than a bare fit. When
         the device total is unknown or nothing is sampling, the charge trivially fits (the policy never forces
@@ -1961,7 +2017,7 @@ class InferenceScheduler:
             return True
         noise_mb = admission_noise_buffer_mb(total_vram_mb)
         margin_mb = admission_noise_buffer_mb(total_vram_mb) if require_margin else 0.0
-        return (total_vram_mb - peak_mb - noise_mb - _SAFETY_GPU_LOAD_CHARGE_MB - margin_mb) >= 0.0
+        return (total_vram_mb - peak_mb - noise_mb - self._safety_footprint_mb() - margin_mb) >= 0.0
 
     def _reconcile_runtime_safety_placement(self) -> None:
         """Keep safety off the GPU while its charge cannot fit, and re-promote it once a card proves room.
@@ -2043,7 +2099,7 @@ class InferenceScheduler:
                     self._safety_placement_demotions += 1
                     logger.info(
                         f"Runtime safety placement: moving safety off-GPU. Its "
-                        f"~{_SAFETY_GPU_LOAD_CHARGE_MB / 1024:.1f}GB context does not fit beside the largest "
+                        f"~{self._safety_footprint_mb() / 1024:.1f}GB context does not fit beside the largest "
                         f"active sampling peak (~{(peak_mb or 0.0) / 1024:.1f}GB) on a "
                         f"~{(total_mb or 0.0) / 1024:.0f}GB card after "
                         f"{self._safety_placement_miss_streak} consecutive cycles.",
@@ -2065,7 +2121,7 @@ class InferenceScheduler:
             logger.info(
                 f"Runtime safety placement: restoring safety to card {safety_card} after "
                 f"{self._safety_placement_fit_streak} consecutive cycles of measured device-free headroom for "
-                f"its ~{_SAFETY_GPU_LOAD_CHARGE_MB / 1024:.1f}GB context.",
+                f"its ~{self._safety_footprint_mb() / 1024:.1f}GB context.",
             )
 
     def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
@@ -2211,6 +2267,7 @@ class InferenceScheduler:
             cooldown_until=time.time() + self._whole_card_cooldown_seconds(),
             now=time.time(),
             refresh_established=announce,
+            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
 
         # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
@@ -2360,6 +2417,7 @@ class InferenceScheduler:
             cooldown_until=time.time() + self._whole_card_cooldown_seconds(),
             now=time.time(),
             refresh_established=announce,
+            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
         if announce:
             logger.opt(colors=True).info(
@@ -2546,6 +2604,8 @@ class InferenceScheduler:
             weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
             drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
             resident_context_charge_mb=self._resident_safety_charge_mb(device_index),
+            device_index=device_index,
+            now=time.time(),
         )
 
     def _resident_safety_charge_mb(self, device_index: int | None) -> float:
@@ -2554,7 +2614,7 @@ class InferenceScheduler:
         A whole-card residency only reaches sole residency where it actually moves safety off the card. Where
         the configuration keeps safety on-GPU (:meth:`_residency_should_pause_safety` is False) and safety is
         still holding its context, the residency's structural sole-residency figure over-states the room the
-        head will find by :data:`_SAFETY_GPU_LOAD_CHARGE_MB`, so that charge is what a caller leaning on the
+        head will find by :meth:`_safety_footprint_mb`, so that charge is what a caller leaning on the
         figure must price back out. Zero once safety is off-GPU, or where this residency is going to move it.
         """
         if not self._runtime_config.bridge_data.safety_on_gpu:
@@ -2563,7 +2623,7 @@ class InferenceScheduler:
             return 0.0
         if self._process_lifecycle.is_safety_gpu_paused:
             return 0.0
-        return _SAFETY_GPU_LOAD_CHARGE_MB
+        return self._safety_footprint_mb()
 
     def _whole_card_weights_fit_live(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether the residency model's weights fit the *live* measured free VRAM (read only at sole residency).
@@ -2587,9 +2647,10 @@ class InferenceScheduler:
 
         The deterministic backstop for the dispatch gate: once a structurally-complete teardown has held for
         ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` without the live reading confirming the drain, the head is admitted
-        on the structural ``fits_alone`` guarantee rather than parking forever. Measured from ``established_at``
-        (the teardown completes shortly after establishment, and this is gated behind the structural-complete
-        check at the call site), so a stuck or unavailable free-VRAM measurement can never wedge the head.
+        on the structural ``fits_alone`` guarantee rather than parking forever. Measured from the moment the
+        teardown's structural legs first all passed, so a slow establishment does not spend the backstop before
+        the sole-residency guarantee it admits the head against exists; once that guarantee holds, a stuck or
+        unavailable free-VRAM measurement can never wedge the head.
         """
         return self._whole_card_ledger.drain_backstop_elapsed(
             device_index,
@@ -2612,14 +2673,30 @@ class InferenceScheduler:
         While true, the recovery supervisor must not treat the deliberately-deferred heavy head (waiting
         for idle siblings to stop, the safety process to cycle off-GPU, and ~11GB of weights to load) as a
         structural queue wedge and soft-reset the pools mid-setup. Bounded by
-        ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` so a residency that genuinely never loads still trips the
-        supervisor. Public: read by the process manager's wedge assessment.
+        ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` and by the card's rolling grace budget, so neither a residency
+        that genuinely never loads nor an establish/restore cycle that keeps re-arming the window can keep the
+        supervisor disarmed. Public: read by the process manager's wedge assessment.
         """
-        return self._whole_card_ledger.grace_active(
-            now=time.time(),
+        now = time.time()
+        granted = self._whole_card_ledger.grace_active(
+            now=now,
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
             restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
+        refused = not granted and self._whole_card_ledger.grace_window_active(
+            now=now,
+            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+        )
+        if refused != self._whole_card_grace_refused:
+            self._whole_card_grace_refused = refused
+            if refused:
+                logger.warning(
+                    "Whole-card residency is inside a grace window but has spent its grace budget for the "
+                    "current window; the recovery supervisor will treat a held queue as a wedge from here. "
+                    "Repeated establish/restore cycles on this card are the cause.",
+                )
+        return granted
 
     def heavy_head_load_grace_active(self) -> bool:
         """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
@@ -2773,18 +2850,23 @@ class InferenceScheduler:
                 # back-to-back heavy jobs).
                 state.cooldown_until = now + self._whole_card_cooldown_seconds()
                 continue
-            if time.time() < state.cooldown_until and not self._ready_different_model_head_on_device(
+            # A ready head for a different model may cut the cooldown short, but not before the residency has
+            # held long enough to amortize the teardown and the regrowth the release itself will pay for;
+            # otherwise a queue alternating heavy and light heads rebuilds the pool on every job.
+            preempt_cooldown = self._ready_different_model_head_on_device(
                 residency_model=model,
                 device_index=device_index,
-            ):
+            ) and not self._whole_card_ledger.min_hold_active(device_index, now=now)
+            if time.time() < state.cooldown_until and not preempt_cooldown:
                 # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
                 continue
-            state.model = None
-            state.established_at = 0.0
-            state.forecast = None
             # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
             # unservable; mark its start so the wedge grace covers it (see _WHOLE_CARD_RESTORE_GRACE_SECONDS).
-            state.restore_at = time.time()
+            self._whole_card_ledger.record_restore(
+                device_index,
+                now=time.time(),
+                restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+            )
             # The runtime safety-placement policy is the other owner of safety's on/off-GPU state; while it
             # holds safety off, promoting it here only for that policy to demote it again costs two full safety
             # process rebuilds per residency. The residency-drain reconciler
@@ -3968,6 +4050,45 @@ class InferenceScheduler:
             stage=stage,
         )
 
+    def _learned_resident_footprint_mb(
+        self,
+        model_name: str | None,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+    ) -> float | None:
+        """The measured at-rest device footprint (MB) of this checkpoint, or None when nothing was measured.
+
+        Reads the per-checkpoint :attr:`FootprintStage.RESIDENT` watermark: what a slot holding this specific
+        file actually costs the card with no activation on it. Keyed on the checkpoint rather than the
+        baseline because resident weights are a property of the file (two checkpoints of one baseline differ
+        by gigabytes), which is what lets the streaming forecast price a heavy checkpoint by its own
+        measurement instead of its architecture's seed.
+
+        The store records the whole *device* charge, the process's CUDA context included, whereas the
+        forecast charges contexts separately from model bytes (the loading process's first-context overhead
+        plus a marginal per sibling). The context constant is therefore netted back out here so the returned
+        figure is in the same context-exclusive terms as the static weight seeds it will raise, and the
+        context is not paid for twice.
+
+        Returns None for a cold key, an unkeyable model, or a store-less scheduler, which leaves the
+        forecast's arithmetic exactly as the static seeds compute it.
+        """
+        store = self._footprint_store
+        if store is None or model_name is None or baseline is None:
+            return None
+        watermark_mb = store.estimate_mb(
+            FootprintKey(
+                model_baseline=str(baseline),
+                resolution_bucket=None,
+                platform=sys.platform,
+                stage=FootprintStage.RESIDENT,
+                checkpoint=model_name,
+            ),
+            static_seed_mb=0.0,
+        )
+        if watermark_mb <= 0.0:
+            return None
+        return max(0.0, watermark_mb - self.resolved_context_constant_mb())
+
     def _learned_sampling_peak_mb(
         self,
         job: ImageGenerateJobPopResponse,
@@ -5125,6 +5246,19 @@ class InferenceScheduler:
             # reserving the device on an over-counted-context phantom.
             self._log_whole_card_declined(job, forecast)
             return _WholeCardDemandOutcome.FALL_THROUGH
+
+        held = self._whole_card_ledger.get(target_device_index)
+        establishing_anew = held is None or held.model is None
+        if establishing_anew and self._whole_card_ledger.establish_rate_exceeded(
+            target_device_index,
+            now=time.time(),
+        ):
+            # This card has already been torn down and rebuilt as often as the rolling window allows. Defer
+            # rather than decline: the head re-asks every cycle and the window is short enough that it is
+            # admitted well before a deferred head could age into a structural-wedge verdict. Declining
+            # instead would send the head down the ordinary co-resident path the forecast has already said
+            # streams its weights.
+            return _WholeCardDemandOutcome.DEFER
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
         self._job_tracker.mark_admitted_exclusive(job)
@@ -6648,7 +6782,7 @@ class InferenceScheduler:
         return LaneReclaimCandidate(
             kind=ReclaimRungKind.SAFETY_OFF_GPU,
             tenant_label="safety",
-            promised_mb=reserved_mb if reserved_mb > 0 else _SAFETY_GPU_LOAD_CHARGE_MB,
+            promised_mb=reserved_mb if reserved_mb > 0 else self._safety_footprint_mb(),
         )
 
     def _reserved_mb_for_type(self, process_type: HordeProcessType, device_index: int | None) -> float:

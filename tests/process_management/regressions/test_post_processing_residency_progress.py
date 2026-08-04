@@ -14,6 +14,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.scheduling.governance.whole_card import _MIN_HOLD_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -38,8 +39,13 @@ from tests.process_management.workers import test_post_process_orchestration as 
 def _scheduler_with_active_residency(
     *,
     job_tracker: JobTracker,
+    established_seconds_ago: float = _MIN_HOLD_SECONDS + 1.0,
 ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse]:
-    """Build a held residency with an idle holder and an idle process for another model."""
+    """Build a held residency with an idle holder and an idle process for another model.
+
+    The residency is aged past its minimum hold by default, so the contracts under test are the cooldown's
+    and the lane's rather than the churn floor's; a caller wanting a fresh grant passes a smaller age.
+    """
     holder = make_mock_process_info(
         1,
         model_name=_FLUX_MODEL,
@@ -88,7 +94,7 @@ def _scheduler_with_active_residency(
             wants_whole_card=True,
         ),
         cooldown_until=time.time() + 45,
-        now=time.time(),
+        now=time.time() - established_seconds_ago,
         refresh_established=True,
     )
     return scheduler, holder_job
@@ -106,6 +112,27 @@ async def test_drained_residency_yields_to_ready_different_model_head() -> None:
     assert scheduler.is_whole_card_residency_active() is False
     assert await scheduler.start_inference() is True
     assert next_job in tracker.jobs_in_progress
+
+
+async def test_a_fresh_residency_is_not_released_early_for_a_ready_different_model_head() -> None:
+    """The preemption that shortens a cooldown must not undo a teardown the worker only just paid for.
+
+    Releasing respawns every sibling the establishment stopped and cycles safety back on-GPU, and the next
+    heavy head pays the teardown again, so a residency preempted seconds after it was granted turns an
+    alternating heavy/light queue into a continuous pool rebuild. The minimum hold denies the preemption
+    until the actuation has been amortized, and then allows it.
+    """
+    tracker = JobTracker()
+    scheduler, _holder_job = _scheduler_with_active_residency(job_tracker=tracker, established_seconds_ago=1.0)
+    next_job = make_job_pop_response(_SDXL_A)
+    await track_popped_job_async(tracker, next_job)
+
+    scheduler._restore_siblings_after_whole_card()
+    assert scheduler.is_whole_card_residency_active() is True, "a fresh grant must survive the ready head"
+
+    scheduler._whole_card_ledger.state_for(None).min_hold_until = time.time() - 1.0
+    scheduler._restore_siblings_after_whole_card()
+    assert scheduler.is_whole_card_residency_active() is False, "past the floor the ready head preempts again"
 
 
 async def test_residency_release_keeps_safety_off_until_pending_post_processing_drains() -> None:

@@ -116,6 +116,11 @@ def _residency_scheduler(
         now=time.time() - (_WHOLE_CARD_DRAIN_SETTLE_SECONDS + 5.0),
         refresh_established=True,
     )
+    # The backstop runs from structural completion, so age that stamp rather than the establishment: the
+    # scenario under test is a teardown that finished long ago and whose drain the live reading never confirmed.
+    scheduler._whole_card_ledger.state_for(None).structural_complete_at = time.time() - (
+        _WHOLE_CARD_DRAIN_SETTLE_SECONDS + 5.0
+    )
     return scheduler
 
 

@@ -613,7 +613,15 @@ stalled stage manufacture its own proof of recovery and close the very episode t
 The same rule governs the wedge verdict itself. A structural queue deadlock is excused while the scheduler
 is deliberately holding the queue (a whole-card model establishing residency, a heavy head loading, a RAM
 reclaim cycle, backing-off process starts) or while inference is actually running, and every consumer reads
-that one verdict. The wedge assessment and the give-up that acts on it must not diverge: a give-up applying
+that one verdict.
+
+Each of those excuses is bounded by its own window, but a window alone is not enough for the whole-card one:
+an establish/restore cycle can re-arm a fresh window faster than the previous one expires, which would leave
+the supervisor disarmed for as long as the churn continued. So the whole-card grace is additionally charged
+against a per-card rolling budget. Once the budget is spent the claim is refused even inside a nominal
+window: the supervisor is re-armed and a held queue is judged on its merits, and the scheduler logs the
+refusal once so the operator can see that residency churn, not a genuine setup, is what held the queue. See
+[Bounding residency churn](resource_governance.md#bounding-residency-churn). The wedge assessment and the give-up that acts on it must not diverge: a give-up applying
 a narrower set of excuses would fault exactly the backlog the scheduler is holding for capacity that is
 about to arrive.
 

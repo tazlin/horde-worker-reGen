@@ -142,6 +142,30 @@ The arbiter keeps four concerns deliberately separate:
     window (a reservation is still in motion for seconds around a model load), and a safety observation only
     from a safety process that is not mid-evaluation, folding its steady reservation rather than its peak,
     because an evaluation's spike is reclaimable and is not what safety costs the card while it waits.
+
+    Both at-rest stages are priced through a single seam each. **Safety** has one price worker-wide,
+    `InferenceScheduler._safety_footprint_mb`: the documented `_SAFETY_GPU_LOAD_CHARGE_MB` seed raised by any
+    `SAFETY` watermark. The arbiter's `SAFETY_LOAD` charge, both runtime-placement predicates, the streaming
+    forecast, the whole-card residency charge-back, and the safety-off reclaim rung all read it, so admission,
+    placement, forecasting, and reclaim cannot come to disagree about what the same process costs. The
+    streaming forecast charges that whole-process figure rather than counting safety as one more context at
+    the per-additional-context marginal: the marginal prices an empty CUDA context, while safety additionally
+    holds resident classifier weights, so a marginal-priced safety term understated the card by gigabytes. The
+    service lanes, which hold contexts and no learned at-rest figure of their own, keep marginal pricing.
+
+    **Resident** footprints feed the streaming forecast's per-checkpoint weight term. The per-baseline seed
+    prices every checkpoint of an architecture alike, so a heavy file is granted sibling room it does not have;
+    a measured at-rest figure raises the seed and re-keys the sibling-room and card-dominance judgments on what
+    the file actually costs. Two conversions happen at that seam. The store records a whole *device* charge, so
+    the context constant is netted back out before the figure reaches a forecast that charges contexts
+    separately. And the raise lands on the forecast's full-footprint term only, never on the core-weight term:
+    the core weights are deliberately the smaller quantity (support components time-share the card via
+    per-phase swaps, which is why load feasibility keys on them), and an at-rest measurement carries no
+    attribution of that split. The disaggregated branch ignores resident measurements entirely, for the same
+    reason `SAMPLE_ISOLATED` is distinct from `SAMPLE`: its sampler process holds the UNet alone. On a roomy
+    card this pricing is expected to stop the heaviest checkpoints from co-residing and to have them claim the
+    card instead, which is the honest verdict for a file measured near the card's size; the residency churn
+    limiter, not a buffer on the estimate, is what bounds the cost of that flip.
 - **Arbitration** evaluates the
   [ledger-driven admission identity][horde_worker_regen.process_management.resources.admission_identity]
   plus the concurrent-sampling headroom, then resolves an actuator escalation ladder. It never overcommit-admits

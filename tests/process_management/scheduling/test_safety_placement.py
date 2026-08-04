@@ -1,7 +1,7 @@
 """The runtime safety-placement policy: keep safety off-GPU when its charge cannot fit beside sampling.
 
 The policy generalises the whole-card safety-off lever to the ordinary case. Demotion prices a modeled worst
-case (device total, largest learned sampling peak, proportional noise buffer, the static safety charge);
+case (device total, largest learned sampling peak, proportional noise buffer, the safety charge);
 re-promotion instead reads the chosen card's measured device-free between allocation peaks, so it stays
 satisfiable under sustained load rather than waiting for a sampling-free window that never comes. It only ever
 degrades the operator's placement (GPU to CPU) and back, never beyond the operator's grant, and its
@@ -11,18 +11,34 @@ process on and off the card. Placement is headroom-aware across cards, not a fix
 
 from __future__ import annotations
 
+import sys
 import uuid
 from unittest.mock import Mock
 
 import pytest
 
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.vram_arbiter import VramRequest
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    SAFETY_PROCESS_BASELINE,
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+)
 from horde_worker_regen.process_management.scheduling import inference_scheduler as sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _SAFETY_GPU_LOAD_CHARGE_MB,
     _SAFETY_PLACEMENT_PAUSE_STREAK,
     _SAFETY_PLACEMENT_RESTORE_STREAK,
 )
-from tests.process_management.conftest import make_mock_bridge_data, make_test_card_runtimes
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    make_test_card_runtimes,
+)
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
@@ -70,7 +86,8 @@ class TestSafetyFitArithmetic:
         scheduler = _placement_scheduler(monkeypatch)
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=16000.0)
         scheduler._largest_active_sampling_peak_mb = Mock(return_value=11500.0)
-        # 16000 - 11500 - 800 (5% noise) - 3044 (safety) = 656 >= 0 bare; a second 800 margin makes it negative.
+        # 16000 - 11500 - 800 (5% noise) - 3044 (the safety seed) = 656 >= 0 bare; a second 800 margin makes
+        # it negative.
         assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
         assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=True) is False
 
@@ -86,6 +103,112 @@ class TestSafetyFitArithmetic:
         scheduler = _placement_scheduler(monkeypatch)
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=None)
         assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
+
+
+def _observe_safety_footprint(scheduler: object, device_footprint_mb: float) -> None:
+    """Fold one measured safety device footprint into the scheduler's learned-footprint store."""
+    store = LearnedFootprintStore()
+    store.observe_peak(
+        FootprintKey(
+            model_baseline=SAFETY_PROCESS_BASELINE,
+            resolution_bucket=None,
+            platform=sys.platform,
+            stage=FootprintStage.SAFETY,
+        ),
+        device_footprint_mb,
+    )
+    scheduler.set_footprint_store(store)  # type: ignore[attr-defined]
+
+
+class TestLearnedSafetyPrice:
+    """The safety charge is the static seed raised by any measured SAFETY watermark, and nothing else."""
+
+    def test_cold_store_prices_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With nothing measured (and with no store at all) the price is exactly the documented seed."""
+        scheduler = _placement_scheduler(monkeypatch)
+        assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB
+        scheduler.set_footprint_store(LearnedFootprintStore())
+        assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB
+
+    def test_measured_footprint_above_the_seed_raises_the_price(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A safety process measured heavier than the seed is priced at what it actually costs."""
+        scheduler = _placement_scheduler(monkeypatch)
+        _observe_safety_footprint(scheduler, _SAFETY_GPU_LOAD_CHARGE_MB + 1500.0)
+        assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB + 1500.0
+
+    def test_measured_footprint_below_the_seed_never_lowers_the_price(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The overlay is raise-only: a lighter measurement leaves the conservative seed standing."""
+        scheduler = _placement_scheduler(monkeypatch)
+        _observe_safety_footprint(scheduler, _SAFETY_GPU_LOAD_CHARGE_MB - 1500.0)
+        assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB
+
+    def test_learned_price_evicts_safety_from_a_card_the_seed_fit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A measured footprint the seed under-stated turns a modeled fit into a modeled non-fit."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=16000.0)
+        scheduler._largest_active_sampling_peak_mb = Mock(return_value=11500.0)
+        assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
+
+        # The bare fit had 656 MB of slack at the seed; a measurement 1 GB above it consumes that slack.
+        _observe_safety_footprint(scheduler, _SAFETY_GPU_LOAD_CHARGE_MB + 1024.0)
+        assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is False
+
+
+class TestOneSafetyPrice:
+    """Admission, placement, and the streaming forecast charge the identical figure for a given store state."""
+
+    @pytest.mark.parametrize("learned_footprint_mb", [None, _SAFETY_GPU_LOAD_CHARGE_MB + 2000.0])
+    def test_forecast_and_arbiter_charge_the_same_figure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        learned_footprint_mb: float | None,
+    ) -> None:
+        """The forecast's safety term and the arbiter's SAFETY_LOAD delta agree, seeded and learned alike.
+
+        Two prices for one process is how admission and placement come to disagree about whether safety can
+        sit on the card, so the pin reads both surfaces rather than the accessor they share: the forecast
+        term is recovered as the achievable-free difference between safety on-GPU and safety paused, and the
+        arbiter term is the delta the SAFETY_LOAD request actually carries.
+        """
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0,
+                    model_name=None,
+                    state=HordeProcessState.WAITING_FOR_JOB,
+                    process_type=HordeProcessType.SAFETY,
+                ),
+            },
+        )
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._process_map = process_map
+        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24000.0)
+        if learned_footprint_mb is not None:
+            _observe_safety_footprint(scheduler, learned_footprint_mb)
+
+        expected_mb = learned_footprint_mb if learned_footprint_mb is not None else _SAFETY_GPU_LOAD_CHARGE_MB
+
+        job = make_job_pop_response("Deliberate")
+        scheduler._process_lifecycle.is_safety_gpu_paused = False
+        on_gpu = scheduler._forecast_streaming(job, "stable_diffusion_1")
+        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        paused = scheduler._forecast_streaming(job, "stable_diffusion_1")
+        assert on_gpu.free_after_model_evict_mb is not None
+        assert paused.free_after_model_evict_mb is not None
+        forecast_charge_mb = paused.free_after_model_evict_mb - on_gpu.free_after_model_evict_mb
+
+        requests: list[VramRequest] = []
+        arbiter = Mock()
+        arbiter.has_cycle = True
+        arbiter.evaluate = Mock(side_effect=lambda request: (requests.append(request), Mock(admits=True))[1])
+        scheduler._vram_arbiter = arbiter
+        scheduler._arbiter_admits_safety_gpu_load(None)
+
+        assert forecast_charge_mb == expected_mb
+        assert [request.candidate_delta_mb for request in requests] == [expected_mb]
 
 
 class TestPlacementHysteresis:

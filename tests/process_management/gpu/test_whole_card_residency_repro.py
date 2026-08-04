@@ -31,7 +31,10 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     forecast_weight_streaming,
     predict_job_weight_mb,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _SAFETY_GPU_LOAD_CHARGE_MB,
+    InferenceScheduler,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -212,11 +215,14 @@ class TestStreamForecastClassification:
         )
         assert forecast.reserve_mb > float(_VRAM_RESERVE_MB)
 
-    def test_safety_on_gpu_context_lowers_current_achievable_free(self) -> None:
-        """A safety-on-GPU context is charged against the *current* achievable free (free_after_model_evict).
+    def test_safety_on_gpu_charge_lowers_current_achievable_free(self) -> None:
+        """A safety-on-GPU process is charged against the *current* achievable free (free_after_model_evict).
 
         Stopping idle inference siblings cannot reclaim it, so it must lower that figure. It does NOT lower
         free_if_alone (the ceiling), since claiming the whole card for a heavy model moves safety off-GPU too.
+        Safety is priced by its own whole-process charge (weights plus context), not by a bare context
+        marginal, so the figure the forecast subtracts is the one the arbiter and the placement policy
+        charge for the same process.
         """
         job = make_job_pop_response(_FLUX_MODEL)
         kwargs = {
@@ -225,19 +231,23 @@ class TestStreamForecastClassification:
             "per_process_overhead_mb": _PER_PROCESS_OVERHEAD_MB,
             "num_inference_processes": 2,
             "configured_reserve_floor_mb": float(_VRAM_RESERVE_MB),
-            # Unmeasured-marginal host: extra contexts (here the safety context) are charged the full
-            # first-context overhead, so the safety context lowers achievable-free by exactly that. Pinned
-            # because an unmeasured marginal now seeds a smaller constant.
             "marginal_process_overhead_mb": _PER_PROCESS_OVERHEAD_MB,
         }
-        without_safety = forecast_weight_streaming(job, "flux_1", num_extra_resident_contexts=0, **kwargs)
-        with_safety = forecast_weight_streaming(job, "flux_1", num_extra_resident_contexts=1, **kwargs)
+        without_safety = forecast_weight_streaming(job, "flux_1", safety_context_charge_mb=0.0, **kwargs)
+        with_safety = forecast_weight_streaming(
+            job,
+            "flux_1",
+            safety_context_charge_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+            **kwargs,
+        )
         # The ceiling (sole residency, safety off) is unchanged...
         assert with_safety.free_if_alone_mb == without_safety.free_if_alone_mb
-        # ...but the current floor drops by the safety context.
+        # ...but the current floor drops by safety's whole-process charge.
+        assert with_safety.free_after_model_evict_mb is not None
+        assert without_safety.free_after_model_evict_mb is not None
         assert (
             with_safety.free_after_model_evict_mb
-            == without_safety.free_after_model_evict_mb - _PER_PROCESS_OVERHEAD_MB
+            == without_safety.free_after_model_evict_mb - _SAFETY_GPU_LOAD_CHARGE_MB
         )
 
 
@@ -473,17 +483,15 @@ class TestWholeCardSiblingTeardown:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
         assert scheduler._sibling_teardown_for_model is None
 
-    def test_forecast_stops_charging_safety_context_once_paused(self) -> None:
-        """Once safety is paused off-GPU, the forecast must stop charging its context.
+    def test_forecast_stops_charging_safety_once_paused(self) -> None:
+        """Once safety is paused off-GPU, the forecast must stop charging it.
 
-        If the forecast keeps subtracting the (now-freed) context while safety is paused, the structural
-        floor (free_after_model_evict) stays below Flux's demand, so the whole-card branch defers Flux every
-        tick forever and it never loads. The forecast must read the live pause state, not just the
+        If the forecast keeps subtracting the (now-freed) safety footprint while safety is paused, the
+        structural floor (free_after_model_evict) stays below Flux's demand, so the whole-card branch defers
+        Flux every tick forever and it never loads. The forecast must read the live pause state, not just the
         safety_on_gpu config.
         """
         scheduler, process_map, _job_tracker = _build_context_overcommit_scheduler(num_processes=1)
-        # The safety context is charged at the per-additional-context marginal; pin it to the per-process
-        # overhead (the unmeasured-marginal host this scenario models) so pausing safety frees exactly that.
         scheduler.set_measured_marginal_overhead_mb(_PER_PROCESS_OVERHEAD_MB)
         process_map[0] = make_mock_process_info(
             0,
@@ -498,9 +506,9 @@ class TestWholeCardSiblingTeardown:
         scheduler._process_lifecycle.is_safety_gpu_paused = True
         paused = scheduler._forecast_streaming(job, "flux_1")
 
-        # Pausing safety frees one context, so the structural floor rises by one per-process overhead.
+        # Pausing safety frees its whole device footprint, so the structural floor rises by that charge.
         assert on_gpu.free_after_model_evict_mb is not None
-        assert paused.free_after_model_evict_mb == on_gpu.free_after_model_evict_mb + _PER_PROCESS_OVERHEAD_MB
+        assert paused.free_after_model_evict_mb == on_gpu.free_after_model_evict_mb + _SAFETY_GPU_LOAD_CHARGE_MB
 
     def test_grace_suppresses_structural_wedge_during_establishment(self) -> None:
         """While a whole-card residency establishes, the intentionally-held queue is not a structural wedge.
@@ -667,9 +675,8 @@ class TestWholeCardResidencyState:
 
 _SDXL_BASELINE = "stable_diffusion_xl"
 _FLUX_BASELINE = "flux_schnell"
-# A representative 16GB topology: 4 inference processes plus the safety GPU context.
+# A representative 16GB topology: 4 inference processes plus the GPU-resident safety process.
 _LIVE_NUM_PROCESSES = 4
-_LIVE_SAFETY_CONTEXTS = 1
 _SDXL_MODEL = "CyberRealistic Pony"
 
 
@@ -697,7 +704,9 @@ def _live_forecast(
         per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
         num_inference_processes=_LIVE_NUM_PROCESSES,
         configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
-        num_extra_resident_contexts=_LIVE_SAFETY_CONTEXTS,
+        # Production-faithful: the live scheduler prices the GPU-resident safety process by its whole
+        # device footprint, the same figure admission and placement charge, not by a bare context marginal.
+        safety_context_charge_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
         # Production-faithful: the real scheduler sets this from the model's size tier, so an EXTRA_LARGE
         # baseline (Flux) takes the whole-card-intent branch as it does live. Without it Flux would be judged
         # purely on weight-dominance, which a roomy-context card no longer treats as needing the whole card.
