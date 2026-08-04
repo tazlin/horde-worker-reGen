@@ -108,13 +108,15 @@ class TestContextTeardownActuationExecutesWithFlagOff:
     """The arbiter's REDUCE_LIVE_CONTEXTS command runs its teardown even when whole-card residency is off.
 
     The predicate reaching the arbiter is only half the fix: the actuation the arbiter emits must also execute.
-    The command routes through :meth:`InferenceScheduler.reduce_live_contexts`, which establishes the residency
-    for the head and evicts the idle siblings' VRAM. Neither step gates on ``whole_card_exclusive_residency``, so
-    the idle contexts are torn down for the starved head on a card where the flag is off.
+    The command routes through :meth:`InferenceScheduler.reduce_live_contexts`, which stops the card's idle
+    inference contexts down to the head's target and evicts the idle siblings' VRAM. Neither step gates on
+    ``whole_card_exclusive_residency``, so the idle contexts are torn down for the starved head on a card where
+    the flag is off. That the reduction takes none of the whole-card residency's policy commitments is pinned
+    separately, in ``test_ladder_context_reduction_side_effects_repro``.
     """
 
     async def test_reduce_contexts_command_drives_the_teardown(self) -> None:
-        """With the flag off, the command establishes the head's residency and unloads the idle sibling VRAM."""
+        """With the flag off, the command scales the pool to the head's target and unloads the sibling VRAM."""
         head = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         idle_sibling = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         job_tracker = JobTracker()
@@ -129,7 +131,8 @@ class TestContextTeardownActuationExecutesWithFlagOff:
             ),
             max_inference=2,
         )
-        scheduler._establish_whole_card_residency = Mock()  # type: ignore[method-assign]
+        scale_down = Mock(return_value=1)
+        scheduler._process_lifecycle.scale_inference_processes = scale_down  # type: ignore[method-assign]
         scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
         scheduler._preload_actuation = _PreloadActuation(
             job=job,
@@ -141,8 +144,6 @@ class TestContextTeardownActuationExecutesWithFlagOff:
         commands = (ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None),)
         scheduler._execute_preload_actuations(commands, device_index=None, for_head_of_queue=True)
 
-        scheduler._establish_whole_card_residency.assert_called_once()
+        scale_down.assert_called_once()
+        assert scale_down.call_args.args[0] == 1, "the pool is stopped down to the head's sized target"
         scheduler.unload_models_from_vram.assert_called_once()
-        # The head is marked exclusive so the residency established for the emergency teardown is held through
-        # the head's dispatch rather than being immediately restored while the flag is off.
-        assert scheduler._job_tracker.is_admitted_exclusive(job) is True

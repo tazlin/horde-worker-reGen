@@ -262,14 +262,15 @@ evidence rather than a long clock. Two timings apply, deliberately different:
   at device level before the head is admitted, so the escalation never force-admits; it only makes room the
   re-ask can then fit. Because the trigger is short, a re-ask arrives every scheduler cycle; that is safe
   because the teardown scales to a fixed target and retires its victims from the process map synchronously, so
-  a repeated command sees the count already at target and tears nothing more down (`_establish_whole_card_residency`
-  only scales while the live count exceeds the target, and re-stamps the residency once). Both the preload and
+  a repeated command sees the count already at target and tears nothing more down (the actuation only scales
+  while the live count exceeds the target, and books one restore obligation however many times the head asks).
+  Both the preload and
   `MONOLITHIC_DISPATCH` paths may use this escape only when the candidate peak computes a maximum
   resident-process target below the current live pool. Merely finding an idle sibling does not qualify: a
   target at or above the live count proves pruning that context cannot address the deficit, so the request
   stays out of whole-card residency. The actuator repeats that check against the current live count before it
-  acquires exclusivity or pauses service lanes, because a correctly-issued command can become stale after an
-  earlier scheduler tick has already retired its victims.
+  stops anything, because a correctly-issued command can become stale after an earlier scheduler tick has
+  already retired its victims.
 * **The genuinely-foreign starvation diagnostic keeps its 60s threshold (`_STARVATION_DIAGNOSTIC_SECONDS`).** A
   head whose shortfall is real foreign load with no first-party context reclaim has no surgical remedy the
   arbiter can apply, so its long-wait warning stays at 60s (see below); shortening it would only spam the log.
@@ -285,9 +286,19 @@ of course (the pre-staging and forecast-driven teardown described under whole-ca
 gate the starvation escalation. A weight-dominant head starved behind its own idle sibling contexts must reach
 the verified teardown even with the flag off, because the alternative is the catastrophic save-our-ship pool
 reset resolving a situation the arbiter could relieve surgically. The scheduler therefore reports
-`idle_contexts_teardownable` on this seam independent of the flag, and the actuation (establish the head's
-residency, then evict the idle siblings' VRAM) runs through machinery that does not itself consult the flag, so
-the contexts are torn down and the head admits regardless of the steady-state preference.
+`idle_contexts_teardownable` on this seam independent of the flag, and the actuation (stop the idle contexts
+down to the head's target, then evict the idle siblings' VRAM) runs through machinery that does not itself
+consult the flag, so the contexts are torn down and the head admits regardless of the steady-state preference.
+
+**The reduction is an actuation, not a residency grant.** `REDUCE_LIVE_CONTEXTS` removes inference contexts
+and does nothing else. Reserving the worker for the head, stamping a residency lease and its cooldown, moving
+safety off the GPU, pausing the service lanes, and opening the establish grace window that tells the recovery
+supervisor a held queue is intentional are commitments of a *whole-card residency*. They belong to the grant
+that asks for one, which may itself request a reduction through this same surface; taking them on the rung
+would impose the whole policy on an operator who declined it, since emergency reclaim is not gated on a
+steady-state preference. The pool the reduction shrank is booked with the verified reclaim ladder as a restore
+obligation and regrown when that card recovers, so a reduction is not a permanent capacity loss (see
+[The verified LIFO reclaim ladder](performance_and_backpressure.md#the-verified-lifo-reclaim-ladder)).
 
 A head deferred past the 60s diagnostic threshold with reclaim genuinely exhausted and no such teardown target
 (no first-party context reclaim remains) emits a warning with the full arithmetic and increments
@@ -571,8 +582,11 @@ hysteresis-gated: safety moves off after a short run of consecutive non-fitting 
 after a longer run of cycles that fit *with an added proportional margin*, so a card oscillating around the fit
 boundary does not flap the safety process on and off the GPU every cycle. This generalises the whole-card
 safety-off lever (which stops safety only while a genuinely-heavy model holds the whole card) to the ordinary
-tight-card case; the two share the single pause/restore machinery, and the placement latch withholds the
-residency-drain safety restore so the two controllers never fight over the safety process's placement.
+tight-card case; the two share the single pause/restore machinery, and the placement latch withholds *both*
+residency-side restores (the drain reconciler and the residency-end restore) so the two controllers never
+fight over the safety process's placement. A residency that ends while the latch holds safety off leaves it
+off; the placement policy's own re-promotion is the single path back on-GPU, which is what keeps one ending
+residency from costing two full safety process rebuilds.
 
 **Lane yield parity.** The disaggregated pipeline's component (text-encode) lane, like its VAE lane and the
 post-processing lane, holds a permanent CUDA context plus resident weights that a sibling teardown cannot

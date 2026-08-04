@@ -153,6 +153,80 @@ class TestPlacementHysteresis:
         scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
 
 
+class TestResidencyRestoreRespectsPlacementWish:
+    """Both owners of safety's placement must agree before safety goes back on the card.
+
+    The residency-drain reconciler (:meth:`InferenceScheduler._restore_deferred_safety_gpu_load`) already
+    stands down while the placement latch holds safety off. The residency-end restore
+    (:meth:`InferenceScheduler._restore_siblings_after_whole_card`) is the other path that puts safety back on
+    the GPU, and it must observe the same wish: with a heavy job still pending, a restore the placement policy
+    immediately re-demotes costs two full safety process rebuilds per residency.
+    """
+
+    def _drained_residency_scheduler(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
+        """A scheduler holding a fully-drained whole-card residency on the safety card, ready to restore."""
+        bridge_data = make_mock_bridge_data(
+            safety_on_gpu=True,
+            whole_card_residency_safety_off_gpu=True,
+            whole_card_residency_cooldown_seconds=0,
+        )
+        monkeypatch.setattr(sched_mod, "is_cpu_only_install", lambda: False)
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({}), bridge_data=bridge_data)
+        lifecycle = Mock()
+        lifecycle.is_safety_gpu_paused = True
+        lifecycle.pause_safety_on_gpu = Mock(return_value=True)
+        lifecycle.restore_safety_on_gpu = Mock(return_value=True)
+        lifecycle.post_process_lane_enabled = Mock(return_value=False)
+        lifecycle.component_lane_enabled = Mock(return_value=False)
+        lifecycle.vae_lane_enabled = Mock(return_value=False)
+        scheduler._process_lifecycle = lifecycle
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=0.0,
+            now=0.0,
+            refresh_established=True,
+        )
+        return scheduler
+
+    def test_residency_end_does_not_restore_safety_the_placement_policy_wants_off(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A drained residency leaves safety off the card while the placement latch still holds it off."""
+        scheduler = self._drained_residency_scheduler(monkeypatch)
+        # Drive the latch on through the policy itself: the modeled charge does not fit beside the peak the
+        # card is committed to, for the full run of cycles the hysteresis demands.
+        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
+        scheduler._safety_restore_headroom_fits = lambda device_index: False
+        for _ in range(_SAFETY_PLACEMENT_PAUSE_STREAK):
+            scheduler._reconcile_runtime_safety_placement()
+        assert scheduler._safety_placement_wants_off is True, (
+            "precondition: the placement policy holds safety off the card"
+        )
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._residency_state(None).model is None, (
+            "precondition: the drained residency is released, so this is the restore path under test"
+        )
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    def test_residency_end_restores_safety_when_the_placement_policy_has_no_wish(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no off-GPU wish outstanding, the drained residency puts safety back on its card."""
+        scheduler = self._drained_residency_scheduler(monkeypatch)
+        assert scheduler._safety_placement_wants_off is False
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._residency_state(None).model is None
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+
+
 class TestDemoteThenMeasuredRepromote:
     """Demotion latches the policy off, and a later run of measured-headroom cycles re-promotes safety."""
 

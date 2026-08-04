@@ -458,6 +458,19 @@ class StreamForecast:
         """
         return self._fits_weights(self.free_if_alone_mb)
 
+    def fits_alone_beside(self, resident_context_mb: float) -> bool:
+        """True when sole residency fits the weights with ``resident_context_mb`` still held on the card.
+
+        ``fits_alone`` describes the absolute ceiling: every other context, including the safety process's,
+        has left the card. A caller that knows a context is staying (a residency whose configuration forbids
+        moving safety off-GPU) prices that context out of the ceiling here, so the structural guarantee it
+        leans on describes the card it will actually load into rather than one it cannot reach. A zero charge
+        is exactly :attr:`fits_alone`, and an unsized card admits as everywhere else.
+        """
+        if self.free_if_alone_mb is None:
+            return self._fits_weights(None)
+        return self._fits_weights(max(0.0, self.free_if_alone_mb - max(0.0, resident_context_mb)))
+
     @property
     def fits_weights_now(self) -> bool:
         """True when the persistent weights + bounded floor fit the *measured* free VRAM right now.
@@ -920,7 +933,9 @@ def forecast_weight_streaming(
     else:
         # free_if_alone is the absolute ceiling: the model's own process is the only context on the card,
         # which for whole-card residency means safety is moved off-GPU too. So the extra (safety) context is
-        # NOT charged here; a model only "streams unavoidably" when it overflows even that ceiling.
+        # NOT charged here; a model only "streams unavoidably" when it overflows even that ceiling. A caller
+        # whose configuration keeps a context on the card prices it back out via
+        # :meth:`StreamForecast.fits_alone_beside` rather than reading this figure as reachable.
         free_if_alone_mb = max(0.0, float(total_vram_mb) - overhead)
         # free_after_model_evict is the current reality with every process's context materialised, including
         # the safety-on-GPU context, since stopping idle *inference* siblings cannot reclaim it. The loading

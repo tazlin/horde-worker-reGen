@@ -69,12 +69,14 @@ restores. The tick's verdict is retained for the rest of the cycle: per-job gate
 RAM-floor defer) read it instead of re-measuring, so a whole cycle acts on one reading.
 
 The single-GPU shed record tracks the *live* shortfall below plan (planned minus loaded), not a running
-total of reductions. This matters because the inference-process count is also moved by a second, unrelated
-mechanism: whole-card residency collapses the pool to the residency holder and grows it back when the
-residency drains. When that restore regrows the pool, it reconciles the RAM shed record against the live
-count, dropping it once the pool is back at plan. Without that reconciliation the record would linger as a
-stale claim that the pool is still short, and while the host stayed under its floor the governor would
-re-shed the pool the residency just regrew, cycle after cycle, without ever returning to steady state.
+total of reductions. This matters because the inference-process count is also moved by two other, unrelated
+mechanisms: whole-card residency collapses the pool to the residency holder and grows it back when the
+residency drains, and the VRAM arbiter's live-context reduction stops idle contexts under admission pressure
+and has the verified reclaim ladder grow them back when the card recovers. When either restore regrows the
+pool, it reconciles the RAM shed record against the live count, dropping it once the pool is back at plan.
+Without that reconciliation the record would linger as a stale claim that the pool is still short, and while
+the host stayed under its floor the governor would re-shed the pool the restore just regrew, cycle after
+cycle, without ever returning to steady state.
 
 ## Idle service-lane RAM containment
 
@@ -226,6 +228,19 @@ The transitions that touch live processes (establishing a residency, converging 
 restoring siblings afterward) remain scheduler methods, but they read and write state exclusively through
 the machine. A resident heavy head goes through the same machine-backed readiness gate as a newly-loaded
 head, so an already-resident whole-card model cannot co-sample while sibling models still occupy the card.
+
+The dispatch gate releases the head either on a live free-VRAM reading that genuinely holds the weights, or,
+once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized
+for a card every other context has left, safety included, so the scheduler passes in the charge of whatever
+the residency is leaving on the card: where the operator has not permitted the residency to move safety
+off-GPU, the resident safety context is priced back out of the alone figure. Without that the backstop admits
+the head against room only a departure the configuration forbids would free, and the weights load into a card
+short by roughly the safety footprint and stream. Which contexts stay is a configuration and lifecycle fact,
+not residency state, so the machine takes the charge as an input and remains a pure state machine.
+
+Only one owner may put safety back on its card. The residency-end restore and the residency-drain
+reconciler both stand down while the runtime safety-placement policy holds safety off, so a residency that
+ends under that wish does not promote safety only for the policy to demote it again.
 The pure sizing rule for how many live contexts a rejected peak can co-reside with is
 [`max_coresident_for_peak`][horde_worker_regen.process_management.scheduling.governance.whole_card.max_coresident_for_peak].
 

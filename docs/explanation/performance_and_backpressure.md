@@ -737,15 +737,26 @@ almost none of its promised context one sample later, then the full figure a sam
 rungs are therefore given one extra verification sample before a shortfall is declared, so the engine does not
 falsely grade a pause that is still tearing down as short and escalate past a rung that is in fact working.
 
-It also **restores what it paused**. A paused lane, unlike safety, has no independent mechanism to bring it
+It also **restores what it took**. A paused lane, unlike safety, has no independent mechanism to bring it
 back (the runtime safety-placement policy re-promotes safety on its own; a lane stays down until something
 restarts it). Each lane pause is therefore tagged with an **owner** so the whole-card residency and the reclaim
 ladder can never clear each other's hold: the residency's completion loop restores only residency-owned pauses,
-and the ladder restores only ladder-owned pauses. When a card's saturation episode ends and it returns fully
-**HEALTHY** (the pauses are held through the intermediate PRESSURE band, since restarting a lane's CUDA context
-while the card is still tight would risk re-crossing the cliff), the ladder **unwinds** its own pauses in
-reverse rung order (LIFO): the last lane stopped is the first restarted. Safety is excluded from the unwind on
+and the ladder restores only ladder-owned pauses. When a card's episode ends and it returns fully **HEALTHY**
+(the actions are held through the intermediate PRESSURE band, since restarting a CUDA context while the card
+is still tight would risk re-crossing the cliff), the ladder **unwinds** its own **restore obligations** in
+reverse order (LIFO): the last thing taken is the first given back. Safety is excluded from the unwind on
 purpose, because the placement policy already owns its restore.
+
+The **live-context reduction** the per-cycle admission path takes (the arbiter's `REDUCE_LIVE_CONTEXTS`
+actuation, which stops idle inference processes so the VRAM a live process retains for its context returns to
+the card) is booked as a restore obligation on the same list. It is the one reclaim action that shrinks the
+worker's serving capacity, and it has no external restore trigger either: without the obligation a card would
+keep whatever depth one episode of pressure left it at for the rest of the session. So the same
+debounced-HEALTHY unwind grows the pool back toward its configured size, interleaved in LIFO order with the
+lane restores. The regrowth stands down while that card holds a whole-card residency, because the residency's
+own completion loop owns the pool then and growing it underneath a held residency would re-add the very
+contexts the residency cleared. A head that re-asks every scheduler cycle books one obligation, not one per
+ask, so the pool is grown back once.
 
 That ownership closes a liveness gap. Pending post-processing work behind an off-GPU lane suppresses its
 patience clock only for a **residency-owned** pause, which has a bounded, self-restoring hold. A **ladder-owned**

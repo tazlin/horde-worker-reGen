@@ -763,6 +763,11 @@ class InferenceScheduler:
         # measurement. None until wired (and in standalone unit tests), where those seams fall back to their
         # measured floors.
         self._vram_arbiter: VramArbiter | None = None
+        # The worker's single verified reclaim ladder, injected by the manager. The scheduler books a live-
+        # context reduction with it as a restore obligation, so the engine that already owns the LIFO unwind of
+        # ladder-issued pauses also owns growing the inference pool back when the card recovers. None until
+        # wired (and in standalone unit tests), where a reduction is simply not booked.
+        self._reclaim_ladder: VerifiedReclaimLadder | None = None
         # The truthful per-card device-free reading source, injected by the manager (parent NVML). The
         # manager-driven cycle passes its explicit reading map to build_vram_arbiter_snapshot; this provider is
         # the fallback for a self-primed snapshot (a scheduler consult before or outside a manager tick), so the
@@ -2500,10 +2505,14 @@ class InferenceScheduler:
         ``free_now_mb`` was captured before the teardown freed the siblings' VRAM, so reading it would park the
         head forever once it drains): the *live* free-VRAM reading dispatches the head the moment it confirms the
         drain (safe to read here, at sole residency, where it only rises as the stopped contexts release), and a
-        bounded ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` backstop admits it on the structural ``fits_alone`` guarantee
-        if the measurement is unavailable or lags, so the head never parks indefinitely. A model that still
-        cannot fit co-resident even at sole residency loads best-effort the same way and samples slowly under the
-        over-budget step grace rather than wedging the queue until the recovery supervisor soft-resets.
+        bounded ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` backstop admits it on the structural sole-residency
+        guarantee if the measurement is unavailable or lags, so the head never parks indefinitely. That
+        guarantee is sized for a card every other context has left, so the safety context this residency is
+        leaving in place (:meth:`_resident_safety_charge_mb`) is priced back out of it: otherwise the backstop
+        admits the head against room only a departure the configuration forbids would free, and the weights
+        load into a card short by roughly the safety footprint. A model that still cannot fit co-resident even
+        at sole residency loads best-effort the same way and samples slowly under the over-budget step grace
+        rather than wedging the queue until the recovery supervisor soft-resets.
 
         ``device_index`` scopes the live-context count and the safety check to one card on a multi-GPU host;
         None is the single-GPU / worker-wide case.
@@ -2522,7 +2531,25 @@ class InferenceScheduler:
             component_lane_cleared=self._process_map.num_component_processes(device_index=device_index) == 0,
             weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
             drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
+            resident_context_charge_mb=self._resident_safety_charge_mb(device_index),
         )
+
+    def _resident_safety_charge_mb(self, device_index: int | None) -> float:
+        """The device charge of a safety context this card's residency is leaving where it is.
+
+        A whole-card residency only reaches sole residency where it actually moves safety off the card. Where
+        the configuration keeps safety on-GPU (:meth:`_residency_should_pause_safety` is False) and safety is
+        still holding its context, the residency's structural sole-residency figure over-states the room the
+        head will find by :data:`_SAFETY_GPU_LOAD_CHARGE_MB`, so that charge is what a caller leaning on the
+        figure must price back out. Zero once safety is off-GPU, or where this residency is going to move it.
+        """
+        if not self._runtime_config.bridge_data.safety_on_gpu:
+            return 0.0
+        if self._residency_should_pause_safety(device_index):
+            return 0.0
+        if self._process_lifecycle.is_safety_gpu_paused:
+            return 0.0
+        return _SAFETY_GPU_LOAD_CHARGE_MB
 
     def _whole_card_weights_fit_live(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether the residency model's weights fit the *live* measured free VRAM (read only at sole residency).
@@ -2744,9 +2771,14 @@ class InferenceScheduler:
             # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
             # unservable; mark its start so the wedge grace covers it (see _WHOLE_CARD_RESTORE_GRACE_SECONDS).
             state.restore_at = time.time()
+            # The runtime safety-placement policy is the other owner of safety's on/off-GPU state; while it
+            # holds safety off, promoting it here only for that policy to demote it again costs two full safety
+            # process rebuilds per residency. The residency-drain reconciler
+            # (:meth:`_restore_deferred_safety_gpu_load`) stands down for the same wish.
             safety_restored = (
                 self._process_lifecycle.restore_safety_on_gpu()
                 if self._residency_should_pause_safety(device_index)
+                and not self._safety_placement_wants_off
                 and self._arbiter_admits_safety_gpu_load(device_index)
                 and not post_processing_has_work
                 else False
@@ -3863,6 +3895,15 @@ class InferenceScheduler:
     def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
         """Inject the single VRAM arbiter: the preload-admission authority and the observational overlay elsewhere."""
         self._vram_arbiter = arbiter
+
+    def set_reclaim_ladder(self, reclaim_ladder: VerifiedReclaimLadder) -> None:
+        """Inject the worker's single verified reclaim ladder, the owner of every reclaim restore obligation.
+
+        A live-context reduction the admission path takes is booked with the engine here, so it is unwound
+        (the pool regrown) on the same debounced-HEALTHY signal, in the same LIFO order, as the lane pauses the
+        engine issues itself. Without the injection a reduction is not booked and nothing grows the pool back.
+        """
+        self._reclaim_ladder = reclaim_ladder
 
     def set_device_free_mb_provider(self, provider: Callable[[int], float | None]) -> None:
         """Inject the truthful per-card device-free reading source (the parent's NVML view).
@@ -6247,8 +6288,8 @@ class InferenceScheduler:
         establishes exclusive residency as a steady-state preference, but the starvation escalation is an
         emergency liveness path (a head starved past the arbiter's threshold whose own idle contexts hold the
         deficit) that must be reachable regardless. The actuation runs through :meth:`reduce_live_contexts` ->
-        :meth:`_establish_whole_card_residency` -> ``scale_inference_processes``, none of which gate on the flag,
-        so tearing the idle contexts down proceeds when the flag is off.
+        ``scale_inference_processes``, neither of which gates on the flag, so tearing the idle contexts down
+        proceeds when the flag is off.
         """
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
         for process_info in self._process_map.values():
@@ -6322,12 +6363,21 @@ class InferenceScheduler:
     def reduce_live_contexts(self, device_index: int | None) -> bool:
         """Reduce the live inference-context count for the current head (:class:`VramActuator`).
 
-        Establishes whole-card residency for the head at the depth the rejected peak sized, then evicts the
-        idle residents on the other processes so their contexts' retained VRAM returns to the card. A no-op
-        when no head-preload context is recorded, the target could not be sized, or the command is stale and
-        the live pool is already at or below its target. The last guard is deliberately before exclusivity and
-        residency side effects: a command that cannot remove a context must not reserve the card, pause service
-        lanes, or open a whole-card grace window that masks a genuine structural wedge.
+        Stops the card's idle inference contexts down to the depth the rejected peak sized and evicts the idle
+        residents on the other processes, so the VRAM a live process retains for its context returns to the
+        card. That is the whole of it: this is a reclaim actuation, not a policy grant. Reserving the worker
+        for the head, stamping a residency lease and its cooldown, moving safety off the GPU, pausing the
+        service lanes and opening the establish grace window are commitments of a *whole-card residency*, and
+        they belong to the grant that asks for one (:meth:`_establish_whole_card_residency`), which may itself
+        request a reduction through this same surface. Taking them here would impose them on an operator who
+        declined that policy, since emergency reclaim is not gated on a steady-state preference.
+
+        The reduction is booked with the reclaim ladder as a restore obligation, so the pool it shrank is
+        grown back when the card recovers (:meth:`restore_live_contexts`) rather than leaving the worker at
+        emergency depth for the rest of the session.
+
+        A no-op when no head-preload context is recorded, the target could not be sized, or the command is
+        stale and the live pool is already at or below its target.
         """
         actuation = self._preload_actuation
         if actuation is None:
@@ -6336,20 +6386,49 @@ class InferenceScheduler:
         live_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
         if target is None or target >= live_processes:
             return False
-        first_time = not self._job_tracker.is_admitted_exclusive(actuation.job)
-        self._job_tracker.mark_admitted_exclusive(actuation.job)
-        self._establish_whole_card_residency(
-            actuation.job,
-            actuation.forecast,
-            announce=first_time,
-            target_override=target,
+        # The head's own holder is the process the reduction is making room for, so it is named here to spare
+        # it and to drop the "spare any process whose model is queued" protection, which would otherwise let a
+        # sibling holding a model queued *behind* the head pin the count above the target and free nothing.
+        after = self._process_lifecycle.scale_inference_processes(
+            target,
             device_index=device_index,
+            whole_card_model=actuation.job.model,
         )
         self.unload_models_from_vram(
             actuation.available_process,
             under_pressure=True,
             for_head_of_queue=True,
             device_index=device_index,
+        )
+        if self._reclaim_ladder is not None:
+            self._reclaim_ladder.record_context_reduction(device_index)
+        logger.info(
+            f"Reclaiming live inference contexts for {actuation.job.model} "
+            f"(inference processes {live_processes} -> {after} of {self._max_inference_processes}, target "
+            f"{target}); the pool is grown back once the card recovers.",
+        )
+        return True
+
+    def restore_live_contexts(self, device_index: int | None) -> bool:
+        """Regrow a card's inference pool after a reclaim reduction (reclaim-ladder actuator).
+
+        The unwind of :meth:`reduce_live_contexts`, driven by the reclaim ladder once the governor calls the
+        card HEALTHY. Stands down while that card holds a whole-card residency: the residency's own restore
+        (:meth:`_restore_siblings_after_whole_card`) owns the regrowth then, and growing the pool underneath a
+        held residency would re-add the very contexts it cleared. Reports no-op when the pool is already at
+        its configured size.
+        """
+        if self._whole_card_ledger.any_held():
+            return False
+        ceiling = self._residency_restore_ceiling(device_index)
+        current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        if current >= ceiling:
+            return False
+        after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
+        self._reconcile_worker_shed_to_pool()
+        logger.info(
+            f"Card recovered; restoring the inference contexts reclaimed under pressure "
+            f"({current} -> {after} of {ceiling}).",
         )
         return True
 

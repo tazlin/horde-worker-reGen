@@ -5,16 +5,16 @@ The starvation context teardown is an emergency-liveness path that must run even
 contexts tears them down to admit. Two properties of that path were previously never exercised with the flag
 off, because whole-card residency (and therefore its restore) was unreachable in that configuration:
 
-* The worker must get its lanes back. The exclusive hold the teardown takes releases when the head's job leaves
-  the in-progress stages, and the torn-down sibling processes regrow once the residency drains. If either the
-  hold release or the regrowth gated on the flag, every large-model job would permanently degrade the worker to
-  a single lane. Neither does: the release is stage-based in the job tracker and the regrowth runs through
-  ``_restore_siblings_after_whole_card`` unconditionally.
+* The worker must get its lanes back. The reduction is a plain reclaim actuation that books a restore
+  obligation with the verified reclaim ladder, and the ladder regrows the pool when it unwinds that obligation
+  on the card's debounced HEALTHY signal. If the regrowth gated on the flag, every large-model job would
+  permanently degrade the worker to a single lane. It does not: the obligation and its unwind live in the
+  reclaim engine, which knows nothing of the residency preference.
 * Re-asks must be safe. Past the escalation threshold the head re-asks every scheduler cycle, so a second
   ``REDUCE_LIVE_CONTEXTS`` can arrive while the first teardown's processes have already retired. The scale-down
-  targets a fixed process count and retires victims from the map immediately, and the residency establish only
-  scales when the count still exceeds the target, so repeated commands converge on the target rather than
-  tearing down additional processes.
+  targets a fixed process count and retires victims from the map immediately, and the actuation only scales
+  when the count still exceeds the target, so repeated commands converge on the target rather than tearing down
+  additional processes, and book one restore obligation rather than one per ask.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, ActuatorCommandKind
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler, _PreloadActuation
 from tests.process_management.conftest import (
@@ -81,9 +82,9 @@ async def _flag_off_scheduler_with_tracked_head() -> tuple[
 ]:
     """A flag-off scheduler with two idle lanes, a tracked pending head, and a map-mutating scale stub.
 
-    The teardown actuation's residency establish and the sibling unload run for real; only the lifecycle
-    scale-down (replaced by the recorder) and the VRAM unload send (mocked) are stood in, so the assertions
-    observe real lane-count and residency-hold state, not call wiring.
+    The teardown actuation and the sibling unload run for real against a real reclaim-ladder engine; only the
+    lifecycle scale-down (replaced by the recorder) and the VRAM unload send (mocked) are stood in, so the
+    assertions observe real lane-count and restore-obligation state, not call wiring.
     """
     process_map = ProcessMap(
         {
@@ -105,6 +106,7 @@ async def _flag_off_scheduler_with_tracked_head() -> tuple[
     scheduler._process_lifecycle.restore_safety_on_gpu = lambda: False  # type: ignore[method-assign]
     scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
     scheduler._pause_post_process_for_residency_if_idle = Mock(return_value=False)  # type: ignore[method-assign]
+    scheduler.set_reclaim_ladder(VerifiedReclaimLadder())
 
     forecast = Mock()
     forecast.max_resident_processes = Mock(return_value=1)
@@ -125,53 +127,68 @@ def _issue_reduce_contexts(scheduler: InferenceScheduler) -> None:
     scheduler._execute_preload_actuations(commands, device_index=None, for_head_of_queue=True)
 
 
+def _tick_ladder_healthy(scheduler: InferenceScheduler) -> None:
+    """Drive one governor sample on which the card reads HEALTHY, the signal that unwinds the obligation."""
+    ladder = scheduler._reclaim_ladder
+    assert ladder is not None
+    ladder.on_tick(
+        0,
+        saturated=False,
+        healthy=True,
+        device_free_mb=24000.0,
+        actuator=scheduler,
+        ladder_builder=lambda: (),
+    )
+
+
 class TestFlagOffStarvationTeardownRecovery:
     """The full emergency cycle recovers the worker's lanes even with steady-state residency disabled."""
 
-    async def test_teardown_then_completion_restores_lane_count(self) -> None:
-        """Head tears its siblings down, holds exclusive through dispatch, then the drain regrows the pool."""
+    async def test_teardown_then_recovery_restores_lane_count(self) -> None:
+        """Head tears its siblings down as a plain reclaim, and the recovered card regrows the pool."""
         scheduler, process_map, _recorder, job = await _flag_off_scheduler_with_tracked_head()
 
         _issue_reduce_contexts(scheduler)
         assert process_map.num_loaded_inference_processes() == 1
-        assert scheduler._job_tracker.has_exclusive_job_in_progress() is True
-        assert scheduler._residency_state(None).model == _HEAD_MODEL
+        # The reduction is an actuation, not a policy grant: it reserves nothing and leases nothing. What it
+        # does leave behind is the reclaim ladder's obligation to give the pool back.
+        assert scheduler._job_tracker.has_exclusive_job_in_progress() is False
+        assert scheduler._residency_state(None).model is None
+        assert scheduler._reclaim_ladder is not None
+        assert scheduler._reclaim_ladder.has_context_reduction(None) is True
 
-        # The head dispatches and its job runs, then finishes: it leaves the in-progress stages for a
-        # post-inference stage, which is what releases the exclusive hold (a stage transition, not the flag).
+        # The head dispatches and its job runs, then finishes, leaving the in-progress stages.
         await scheduler._job_tracker.mark_inference_started(job)
         tracked = scheduler._job_tracker._tracked_for(job)
         assert tracked is not None
         assert scheduler._job_tracker._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK) is True
-        assert scheduler._job_tracker.has_exclusive_job_in_progress() is False
 
-        # The residency's cooldown lapses with no heavy job left in flight, so the restore pass releases the
-        # residency and grows the pool back to its pre-emergency ceiling.
-        scheduler._residency_state(None).cooldown_until = 0.0
-        scheduler._restore_siblings_after_whole_card()
+        # The card returns HEALTHY, so the ladder unwinds its obligations and grows the pool back to its
+        # pre-emergency ceiling.
+        _tick_ladder_healthy(scheduler)
 
         assert process_map.num_loaded_inference_processes() == _MAX_INFERENCE
-        assert scheduler._residency_state(None).model is None
+        assert scheduler._reclaim_ladder.has_context_reduction(None) is False
 
 
 class TestReAskTeardownIsIdempotent:
     """A REDUCE_LIVE_CONTEXTS re-issued after the first teardown retired its victims tears nothing more down."""
 
     async def test_second_command_does_not_reduce_below_the_target(self) -> None:
-        """Two commands in succession converge on the target lane count and re-establish nothing."""
+        """Two commands in succession converge on the target lane count and book one restore obligation."""
         scheduler, process_map, recorder, _job = await _flag_off_scheduler_with_tracked_head()
 
         _issue_reduce_contexts(scheduler)
         assert process_map.num_loaded_inference_processes() == 1
         removed_after_first = recorder.removed_total
-        established_at_after_first = scheduler._residency_state(None).established_at
         assert removed_after_first == 1
-        assert established_at_after_first != 0.0
 
         # The head re-asks the next cycle while the first teardown has already retired its victim: the count is
-        # already at the target, so the establish does not scale again and the residency is not re-stamped.
+        # already at the target, so the actuation does not scale again.
         _issue_reduce_contexts(scheduler)
         assert process_map.num_loaded_inference_processes() == 1
         assert recorder.removed_total == removed_after_first
-        assert scheduler._residency_state(None).established_at == established_at_after_first
-        assert scheduler._residency_state(None).model == _HEAD_MODEL
+
+        # One reduction is owed back, not one per ask: the recovery grows the pool to the ceiling once.
+        _tick_ladder_healthy(scheduler)
+        assert process_map.num_loaded_inference_processes() == _MAX_INFERENCE

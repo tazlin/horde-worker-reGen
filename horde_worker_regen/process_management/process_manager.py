@@ -1650,6 +1650,10 @@ class HordeWorkerProcessManager:
         # concurrent-sampling gate sizes real capacity per card.
         self._inference_scheduler.set_admission_baseline_provider(self.latest_baseline_estimate_mb)
         self._inference_scheduler.set_vram_arbiter(self._vram_arbiter)
+        # The single ladder engine records the restore obligation for every context reduction the scheduler
+        # actuates, so the pool regrows on debounced HEALTHY through the same LIFO unwind as lane pauses.
+        # Without this wiring a reduction would shrink the pool and nothing would ever grow it back.
+        self._inference_scheduler.set_reclaim_ladder(self._reclaim_ladder)
         # The measured-truth identity's primary input for any snapshot the scheduler self-primes outside the
         # manager-driven cycle; the per-tick cycle passes the same readings map explicitly.
         self._inference_scheduler.set_device_free_mb_provider(self._last_device_free_mb_by_device.get)

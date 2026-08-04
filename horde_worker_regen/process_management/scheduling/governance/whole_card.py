@@ -232,6 +232,7 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         component_lane_cleared: bool = True,
         weights_fit_live: bool,
         drain_backstop_elapsed: bool,
+        resident_context_charge_mb: float = 0.0,
     ) -> bool:
         """Return whether a held residency has cleared enough room for the head to sample.
 
@@ -242,6 +243,14 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         ``component_lane_cleared`` are structural checks (the lane is gone), distinct from the pause merely
         having been requested; admitting the head while a lane's context is still resident is exactly what
         leaves too little room and streams the weights.
+
+        Once the structural checks hold, a live free-VRAM reading that holds the weights releases the head
+        immediately; otherwise the bounded drain backstop releases it on the forecast's sole-residency
+        guarantee. That guarantee describes a card every other context has left, so ``resident_context_charge_mb``
+        prices back in whatever the residency is leaving on the card (the safety context, where the
+        configuration forbids moving it off-GPU). The caller supplies the figure because which contexts stay
+        is a configuration and lifecycle fact, not residency state; zero (nothing stays) is the plain
+        sole-residency guarantee.
         """
         if loaded_process_count > self.target_process_count(forecast):
             return False
@@ -253,7 +262,7 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
             return False
         if weights_fit_live:
             return True
-        return forecast.fits_alone and drain_backstop_elapsed
+        return forecast.fits_alone_beside(resident_context_charge_mb) and drain_backstop_elapsed
 
 
 def max_coresident_for_peak(

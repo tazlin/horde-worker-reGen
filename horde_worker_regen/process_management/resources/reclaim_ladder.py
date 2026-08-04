@@ -154,6 +154,25 @@ class LaneReclaimCandidate:
 
 
 @dataclass(frozen=True)
+class ContextReduction:
+    """A live-inference-context reduction the ladder owes a regrowth for once the card recovers.
+
+    Reducing a card's live inference-process count returns the retained per-context VRAM the driver never
+    gives back while a process lives, and it is the one reclaim action that shrinks the worker's serving
+    capacity. Like a lane pause it has no external restore trigger, so the ladder records it as a restore
+    obligation and unwinds it with the rest when the card returns HEALTHY; without that the card keeps
+    whatever depth an episode of pressure left it at for the remainder of the session.
+    """
+
+    device_index: int | None
+    """The card the reduction acted on; ``None`` is the card-agnostic worker-wide (single-GPU) scope."""
+
+
+RestoreObligation = ReclaimRung | ContextReduction
+"""One recorded action an episode must unwind when its card recovers, in LIFO order."""
+
+
+@dataclass(frozen=True)
 class LadderCandidates:
     """The raw, already-idle-filtered inputs the pure ladder builder orders into rungs.
 
@@ -295,6 +314,10 @@ class ReclaimLadderActuator(Protocol):
         """Restart the component/text-encode lane the ladder paused, once the card has recovered."""
         ...
 
+    def restore_live_contexts(self, device_index: int | None) -> bool:
+        """Regrow the card's inference-process pool toward its configured size, once the card has recovered."""
+        ...
+
     def record_calibration_event(self, rung: ReclaimRung, *, promised_mb: float, realized_mb: float) -> None:
         """Record that ``rung`` freed ``realized_mb`` against a promised ``promised_mb`` (a shortfall)."""
         ...
@@ -351,6 +374,25 @@ def restore_reclaim_rung(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> 
     return False
 
 
+def unwind_restore_obligation(obligation: RestoreObligation, actuator: ReclaimLadderActuator) -> bool:
+    """Dispatch one recorded restore obligation onto the actuator, returning whether it acted.
+
+    The single mapping from an obligation to the actuator call that undoes it, so a lane pause and a live-
+    context reduction are unwound through one surface in one LIFO order. Each call routes through the
+    actuator's own guarded restore path, so an action another owner is responsible for is left untouched.
+
+    Args:
+        obligation: The lane-pause rung or context reduction to unwind.
+        actuator: The surface that owns the process actions.
+
+    Returns:
+        True when the actuator reported that it acted.
+    """
+    if isinstance(obligation, ContextReduction):
+        return actuator.restore_live_contexts(obligation.device_index)
+    return restore_reclaim_rung(obligation, actuator)
+
+
 @dataclass
 class _PendingVerification:
     """A rung awaiting verification: its promise, the device-free baseline at issue, and samples waited."""
@@ -362,19 +404,22 @@ class _PendingVerification:
 
 @dataclass
 class _Episode:
-    """One contiguous SATURATED stretch on a card: its frozen ladder, cursor, pending rung, and outcome.
+    """One card's live reclaim record: its frozen ladder, cursor, pending rung, outcome, and what it owes back.
 
-    ``paused_lanes`` records, in issue order, every lane-pause rung this episode actually actuated, so the
-    engine can restore exactly those lanes (and only those, in LIFO order) when the episode ends. A lane whose
-    pause was a no-op (already paused by another owner) is never recorded, so the engine never tries to restore
-    a lane it did not stop.
+    ``restore_obligations`` records, in the order they were taken, every action this episode actually performed
+    that the engine must undo when the card recovers: a lane pause it issued, and a live-context reduction the
+    per-cycle admission path requested. An action that was a no-op (a lane already paused by another owner) is
+    never recorded, so the engine never tries to restore something it did not do.
+
+    ``ladder`` is built lazily on the first SATURATED tick, so the rungs stay frozen against the topology at
+    the moment the card crossed the cliff even when the episode was opened earlier by a recorded obligation.
     """
 
-    ladder: tuple[ReclaimRung, ...]
+    ladder: tuple[ReclaimRung, ...] | None = None
     next_index: int = 0
     pending: _PendingVerification | None = None
     unresolved: bool = False
-    paused_lanes: list[ReclaimRung] = field(default_factory=list)
+    restore_obligations: list[RestoreObligation] = field(default_factory=list)
 
 
 class VerifiedReclaimLadder:
@@ -393,7 +438,7 @@ class VerifiedReclaimLadder:
         self.rungs_issued = 0
         self.verified_frees_mb = 0.0
         self.verification_shortfalls = 0
-        self._episodes: dict[int, _Episode] = {}
+        self._episodes: dict[int | None, _Episode] = {}
 
     def on_tick(
         self,
@@ -413,13 +458,17 @@ class VerifiedReclaimLadder:
         episode unresolved.
 
         When the card is not SATURATED the episode is winding down, but the engine holds it (issuing no further
-        rungs) until the card returns fully HEALTHY, then unwinds: it restores every lane it paused, in reverse
-        rung order (LIFO), and clears the episode. Holding through the intermediate PRESSURE band (below the
-        soft floor but above the hard floor) matters because a lane pause frees a real CUDA context: restarting
-        it the instant saturation lifts would re-add that context while the card is still tight and risk
-        re-crossing the cliff, so the restore waits for the governor's debounced HEALTHY signal. Safety, if the
-        ladder cycled it off, is not restored here: the runtime safety-placement policy re-promotes it once the
-        card demonstrably fits it.
+        rungs) until the card returns fully HEALTHY, then unwinds: it undoes every restore obligation it took
+        (each lane it paused, each live-context reduction it made) in reverse order (LIFO), and clears the
+        episode. Holding through the intermediate PRESSURE band (below the soft floor but above the hard floor)
+        matters because those actions free real CUDA contexts: undoing them the instant saturation lifts would
+        re-add the contexts while the card is still tight and risk re-crossing the cliff, so the restore waits
+        for the governor's debounced HEALTHY signal. Safety, if the ladder cycled it off, is not restored here:
+        the runtime safety-placement policy re-promotes it once the card demonstrably fits it.
+
+        Obligations recorded against the card-agnostic worker-wide scope (the ``None`` key, used by the
+        per-cycle admission path on a single-GPU host) are unwound alongside the sampled card's own, since that
+        scope is only ever produced where there is exactly one governed card.
 
         Args:
             device_index: The card this tick is for.
@@ -433,21 +482,56 @@ class VerifiedReclaimLadder:
                 episode so the ladder is frozen against the topology at the moment the card crossed the cliff.
         """
         if not saturated:
-            episode = self._episodes.get(device_index)
-            if episode is not None and healthy:
-                self._restore_paused_lanes(episode, actuator)
-                self._episodes.pop(device_index, None)
+            if healthy:
+                for key in (device_index, None):
+                    episode = self._episodes.get(key)
+                    if episode is None:
+                        continue
+                    self._unwind_restore_obligations(episode, actuator)
+                    self._episodes.pop(key, None)
             return
 
         episode = self._episodes.get(device_index)
         if episode is None:
-            episode = _Episode(ladder=tuple(ladder_builder()))
+            episode = _Episode()
             self._episodes[device_index] = episode
+        if episode.ladder is None:
+            episode.ladder = tuple(ladder_builder())
 
         if episode.pending is not None and not self._verify(episode, device_free_mb, actuator):
             return
 
         self._issue_next(episode, device_free_mb, actuator)
+
+    def record_context_reduction(self, device_index: int | None) -> None:
+        """Record that a card's live inference-context count was reduced under admission pressure.
+
+        The per-cycle admission path reduces the live context count directly (it is the one relief that
+        returns the per-context VRAM a live process retains), which shrinks the card's serving capacity until
+        something grows it back. Booking it here puts the regrowth on the same footing as a ladder-issued lane
+        pause: the engine owes the card its pool back and unwinds the obligation with the rest, LIFO, once the
+        governor calls the card HEALTHY. Recording is idempotent per card: a head that re-asks every cycle
+        books one obligation, not one per ask, so the unwind regrows the pool once.
+
+        Args:
+            device_index: The card whose contexts were reduced; ``None`` is the card-agnostic worker-wide
+                (single-GPU) scope.
+        """
+        episode = self._episodes.get(device_index)
+        if episode is None:
+            episode = _Episode()
+            self._episodes[device_index] = episode
+        reduction = ContextReduction(device_index=device_index)
+        if reduction in episode.restore_obligations:
+            return
+        episode.restore_obligations.append(reduction)
+
+    def has_context_reduction(self, device_index: int | None) -> bool:
+        """Whether an outstanding live-context reduction on ``device_index`` still owes the card its pool back."""
+        episode = self._episodes.get(device_index)
+        if episode is None:
+            return False
+        return any(isinstance(obligation, ContextReduction) for obligation in episode.restore_obligations)
 
     def is_saturation_unresolved(self, device_index: int) -> bool:
         """Whether ``device_index``'s current SATURATED episode exhausted the ladder without relieving it."""
@@ -464,7 +548,12 @@ class VerifiedReclaimLadder:
         held, is an orphan the backstop may reclaim.
         """
         episode = self._episodes.get(device_index)
-        return episode is not None and bool(episode.paused_lanes)
+        if episode is None:
+            return False
+        return any(
+            isinstance(obligation, ReclaimRung) and obligation.kind in LANE_PAUSE_RUNG_KINDS
+            for obligation in episode.restore_obligations
+        )
 
     def _verify(
         self,
@@ -536,15 +625,16 @@ class VerifiedReclaimLadder:
         engine advances to the next rung in the same tick rather than opening a verification window on a no-op.
         The first rung that acts opens a fresh verification window and stops the tick.
         """
-        while episode.next_index < len(episode.ladder):
-            rung = episode.ladder[episode.next_index]
+        ladder = episode.ladder or ()
+        while episode.next_index < len(ladder):
+            rung = ladder[episode.next_index]
             episode.next_index += 1
             if execute_reclaim_rung(rung, actuator):
                 self.rungs_issued += 1
                 if rung.kind in LANE_PAUSE_RUNG_KINDS:
                     # Only a lane pause that actually acted is the engine's to restore later; record it so the
                     # episode-end unwind restarts exactly the lanes this engine stopped.
-                    episode.paused_lanes.append(rung)
+                    episode.restore_obligations.append(rung)
                 episode.pending = _PendingVerification(rung=rung, baseline_free_mb=device_free_mb)
                 return
         episode.unresolved = True
@@ -555,17 +645,18 @@ class VerifiedReclaimLadder:
         return _TEARDOWN_VERIFICATION_SAMPLES if kind in _TEARDOWN_RUNG_KINDS else _VERIFICATION_SAMPLES
 
     @staticmethod
-    def _restore_paused_lanes(episode: _Episode, actuator: ReclaimLadderActuator) -> None:
-        """Restart every lane this episode paused, in reverse rung order (LIFO unwind).
+    def _unwind_restore_obligations(episode: _Episode, actuator: ReclaimLadderActuator) -> None:
+        """Undo everything this episode owes the card, in reverse order of the actions taken (LIFO unwind).
 
-        The unwind mirrors the pause order: the last lane stopped is the first restored, so a card that gave
-        back memory pause-by-pause reclaims its lanes in the same order it released them. Each restore targets
-        only the ladder-owned pause (the actuator routes it through the owner-guarded restore path), so a lane
-        another owner paused is left untouched. Called once, when the card returns HEALTHY.
+        The unwind mirrors the order the memory was taken back in: the last lane stopped (or context reduced)
+        is the first restored, so a card that gave back memory action-by-action reclaims its capacity in the
+        same order it released it. Each restore targets only what this engine did (the actuator routes it
+        through its owner-guarded restore path), so an action another owner is responsible for is left
+        untouched. Called once, when the card returns HEALTHY.
         """
-        for rung in reversed(episode.paused_lanes):
-            restore_reclaim_rung(rung, actuator)
-        episode.paused_lanes.clear()
+        for obligation in reversed(episode.restore_obligations):
+            unwind_restore_obligation(obligation, actuator)
+        episode.restore_obligations.clear()
 
     @staticmethod
     def execute_arbiter_commands(

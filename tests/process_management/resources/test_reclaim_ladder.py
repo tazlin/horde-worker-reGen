@@ -58,6 +58,10 @@ class _FakeActuator:
         self.calls.append(("restore_component", None))
         return True
 
+    def restore_live_contexts(self, device_index: int | None) -> bool:
+        self.calls.append(("restore_contexts", device_index))
+        return True
+
     def record_calibration_event(self, rung: ReclaimRung, *, promised_mb: float, realized_mb: float) -> None:
         self.calibration_events.append((rung.kind, promised_mb, realized_mb))
 
@@ -326,6 +330,56 @@ class TestReclaimLadderVerifiedRestore:
             ("restore_vae", None),
             ("restore_pp", None),
         ]
+
+    def test_context_reduction_is_regrown_only_when_healthy(self) -> None:
+        """A booked live-context reduction is held through PRESSURE and regrown once the card is HEALTHY."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+
+        engine.record_context_reduction(0)
+        # A head that re-asks every cycle books the obligation once, so the pool is grown back once.
+        engine.record_context_reduction(0)
+        assert engine.has_context_reduction(0) is True
+        assert actuator.calls == []
+
+        engine.on_tick(
+            0, saturated=False, healthy=False, device_free_mb=500.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == []
+
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("restore_contexts", 0)]
+        assert engine.has_context_reduction(0) is False
+
+    def test_worker_wide_reduction_is_regrown_by_the_governed_card(self) -> None:
+        """A reduction booked against the card-agnostic scope unwinds on the one governed card's recovery."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+
+        engine.record_context_reduction(None)
+
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("restore_contexts", None)]
+        assert engine.has_context_reduction(None) is False
+
+    def test_reduction_booked_mid_episode_unwinds_after_the_lane_it_followed(self) -> None:
+        """Obligations unwind in one LIFO order regardless of which path recorded them."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
+
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        assert actuator.calls == [("pp", None)]
+        engine.record_context_reduction(0)
+
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("pp", None), ("restore_contexts", 0), ("restore_pp", None)]
 
     def test_only_lanes_that_actually_paused_are_restored(self) -> None:
         """A lane pause that was a no-op (already paused by another owner) is not restored by the engine."""
