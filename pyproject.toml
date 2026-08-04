@@ -164,7 +164,9 @@ docs = [
 [tool.uv]
 # IMPORTANT: When updating required-version, also update the hardcoded version in both runtime.sh and
 # runtime.cmd (search for HORDE_WORKER_UV_VERSION and UV_VERSION). test_uv_version_consistency.py enforces
-# this: the runtime scripts download uv, so they must fetch the version that pyproject.toml requires.
+# this: fresh installs should immediately download the version that pyproject.toml requires. Managed
+# in-place updates preserve those shims and bin/uv, so worker_bootstrap.uvbin also derives this pin from
+# the newly overlaid project and repairs a verified versioned sidecar before any project-aware uv command.
 required-version = "0.12.1"
 python-preference = "managed"
 conflicts = [

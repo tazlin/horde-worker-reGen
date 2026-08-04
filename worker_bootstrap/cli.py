@@ -733,6 +733,13 @@ def _maybe_offer_update(root: Path) -> None:
 def _cmd_launch(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Start the worker in the requested mode, syncing first if the venv is missing or stale."""
     _maybe_offer_update(root)
+    # A launch-time overlay can raise [tool.uv] required-version after ``main`` selected the old private
+    # binary. Re-resolve here so this same launch repairs and uses a compatible version before syncing.
+    try:
+        uv = uvbin.ensure_compatible_uv(root, uv)
+    except uvbin.UvCompatibilityError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     rc = _ensure_synced(uv, root, cli_flag=args.backend, options=_sync_options(args))
     if rc != 0:
         return rc
@@ -818,6 +825,16 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     updater.sync_arp_version(root, info.latest)
 
     # The overlay may have moved uv.lock; reconcile the venv now so the next launch starts on the new deps.
+    # It may also have raised [tool.uv] required-version while the preserved bin/uv is still the version
+    # that launched this bootstrap. Repair a versioned sidecar before issuing any project-aware uv command.
+    try:
+        uv = uvbin.ensure_compatible_uv(root, uv)
+    except uvbin.UvCompatibilityError as error:
+        print(
+            f"{result.message} The private uv update did not complete: {error} The next launch will retry it.",
+            file=sys.stderr,
+        )
+        return 1
     # Hold the success line until the reconcile lands so a failed sync is not reported as a clean update
     # (the overlay invalidated the sync stamp, so the next launch retries the sync regardless).
     rc = _sync(uv, root, cli_flag=None, options=_sync_options(args))
@@ -1021,5 +1038,9 @@ def main(argv: list[str] | None = None) -> int:
         argv = ["run", *argv]
     args = _build_parser().parse_args(argv)
     root = paths.install_root()
-    uv = uvbin.uv_executable(root)
+    try:
+        uv = uvbin.ensure_compatible_uv(root)
+    except uvbin.UvCompatibilityError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     return _HANDLERS[args.command](args, root, uv)

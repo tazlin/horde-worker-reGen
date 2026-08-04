@@ -389,6 +389,57 @@ def test_update_applies_then_resyncs(env: tuple[Path, list], monkeypatch: pytest
     assert calls == [("sync", "cu126")]  # reconcile after the overlay
 
 
+def test_update_repairs_uv_again_after_overlay(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A release may raise required-version, so update must re-resolve uv after applying its bundle."""
+    _, calls = env
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root, **kw: _available_info())
+    monkeypatch.setattr(
+        cli.updater,
+        "perform_update",
+        lambda root, info: cli.updater.UpdateResult(True, "Updated to v2.0.0.", "1.0.0", "2.0.0"),
+    )
+    repairs: list[str | None] = []
+
+    def fake_repair(root: Path, executable: str | None = None) -> str:
+        repairs.append(executable)
+        return "OLD_UV" if executable is None else "REPAIRED_UV"
+
+    synced_with: list[str] = []
+    monkeypatch.setattr(cli.uvbin, "ensure_compatible_uv", fake_repair)
+    monkeypatch.setattr(
+        cli.runner,
+        "uv_sync",
+        lambda uv, extra, **kw: synced_with.append(uv) or calls.append(("sync", extra)) or 0,
+    )
+
+    assert cli.main(["update", "--yes"]) == 0
+    assert repairs == [None, "OLD_UV"]
+    assert synced_with == ["REPAIRED_UV"]
+
+
+def test_already_updated_install_repairs_uv_before_sync(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user whose bundle already landed self-heals on the next update-runtime or launch invocation."""
+    repaired: list[bool] = []
+    synced_with: list[str] = []
+    monkeypatch.setattr(
+        cli.uvbin,
+        "ensure_compatible_uv",
+        lambda root, executable=None: repaired.append(True) or "REPAIRED_UV",
+    )
+    monkeypatch.setattr(
+        cli.runner,
+        "uv_sync",
+        lambda uv, extra, **kw: synced_with.append(uv) or 0,
+    )
+
+    assert cli.main(["sync"]) == 0
+    assert repaired == [True]
+    assert synced_with == ["REPAIRED_UV"]
+
+
 def test_launch_auto_update_reconciles_deps_when_lock_changes(
     env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
 ) -> None:

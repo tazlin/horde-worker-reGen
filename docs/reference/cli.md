@@ -17,6 +17,11 @@ Windows, `.sh` on Linux/macOS, and the `-rocm` variants on AMD Linux.
 
 `horde-worker` and `horde-bridge` pass any extra arguments through to the underlying program.
 
+All managed launcher paths enter the stdlib-only bootstrap before touching the project environment. The
+bootstrap validates the private uv against `[tool.uv] required-version` and repairs a verified versioned
+sidecar when an in-place release update preserved an older `bin/uv`; this happens before dependency sync or
+application launch. See [Update the worker](../how-to/update-the-worker.md#when-an-update-requires-a-newer-uv).
+
 ## Console entry points
 
 Installed as console scripts (defined in `pyproject.toml`):

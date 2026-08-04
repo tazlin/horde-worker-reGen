@@ -23,6 +23,25 @@ status report. Set `HORDE_WORKER_NO_UPDATE_CHECK=1` to disable the check.
 Script names above assume Windows and NVIDIA. For Linux use the `.sh` scripts; for AMD use the `-rocm`
 variants.
 
+### When an update requires a newer uv
+
+Managed updates preserve the launcher scripts and private `bin/uv` executable so the process applying an
+update is never overwritten while it is running. If a release raises the exact uv version required by
+`pyproject.toml`, the bootstrap detects that change after the release bundle is overlaid. It copies the
+still-working private executable, self-updates the copy, verifies the reported version, and atomically
+publishes it as a versioned `bin/uv-<version>` sidecar before dependency preview or sync. The original
+executable remains available to start the stdlib-only bootstrap, including on Windows where it may still
+be locked by the parent process.
+
+This repair also runs at the beginning of every bootstrap invocation. An installation where the source
+update already succeeded but dependency sync stopped with `Required uv version ... does not match` therefore
+self-heals on its next `update-runtime`, `update`, or worker launch; deleting the environment or downloading
+models again is unnecessary. The sidecar is kept in the managed `bin/` directory and reused on later runs.
+
+If the uv download itself is blocked by a proxy or firewall, restore network access and retry. As a manual
+fallback on Linux/macOS, run `./bin/uv self update <required-version>`; on Windows run
+`bin\uv.exe self update <required-version>`. The bootstrap error names the exact required version.
+
 ## When the worker offers to update itself
 
 A worker installed by the one-line installer or the `.exe` checks for a newer release on launch and, by
