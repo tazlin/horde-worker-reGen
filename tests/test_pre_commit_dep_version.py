@@ -48,17 +48,17 @@ def test_python_quality_hook_versions_match_project_pins() -> None:
 
 
 def test_ci_quality_action_versions_are_uniform() -> None:
-    """Every workflow uses one reviewed release for each shared quality action."""
-    expected_versions = {
+    """Every workflow uses one reviewed ref for each shared quality action."""
+    expected_refs = {
         "actions/checkout": "v7",
-        "astral-sh/setup-uv": "v9",
+        "astral-sh/setup-uv": "c771a70e6277c0a99b617c7a806ffedaca235ff9",
         "hadolint/hadolint-action": "v3.4.0",
     }
-    discovered_versions = {action: set() for action in expected_versions}
+    discovered_refs = {action: set() for action in expected_refs}
 
     for workflow_path in WORKFLOW_DIRECTORY.glob("*.yml"):
         workflow = workflow_path.read_text(encoding="utf-8")
-        for action in expected_versions:
-            discovered_versions[action].update(re.findall(rf"uses:\s*{re.escape(action)}@([^\s]+)", workflow))
+        for action in expected_refs:
+            discovered_refs[action].update(re.findall(rf"uses:\s*{re.escape(action)}@([^\s]+)", workflow))
 
-    assert discovered_versions == {action: {version} for action, version in expected_versions.items()}
+    assert discovered_refs == {action: {ref} for action, ref in expected_refs.items()}

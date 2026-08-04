@@ -11,8 +11,12 @@ what comes out the far end.
 from __future__ import annotations
 
 import uuid
+from typing import cast
+from unittest.mock import Mock
 
 import pytest
+from horde_model_reference import ModelReferenceManager
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_sdk.generation_parameters.image.object_models import BasicImageGenerationParameters
 from hordelib.pipeline.payload import ImageGenPayload
@@ -68,18 +72,26 @@ def _job_pop_response_with_solver_knobs() -> ImageGenerateJobPopResponse:
 
 
 @pytest.fixture
-def converted_payload() -> ImageGenPayload:
+def model_reference_manager() -> ModelReferenceManager:
+    """Return the one reference lookup the SDK conversion needs, without disk or network state."""
+    manager = Mock(spec=ModelReferenceManager)
+    model_record = Mock()
+    model_record.baseline = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+    manager.query.return_value.where.return_value.first.return_value = model_record
+    return cast(ModelReferenceManager, manager)
+
+
+@pytest.fixture
+def converted_payload(model_reference_manager: ModelReferenceManager) -> ImageGenPayload:
     """The backend payload a pop response carrying every knob converts into."""
     from horde_sdk.worker.dispatch.ai_horde.image.convert import (
         convert_image_job_pop_response_to_parameters,
     )
     from hordelib.pipeline.sdk_adapter import to_image_gen_payload
 
-    from horde_worker_regen.reference_helper import ensure_offline_reference_manager
-
     conversion_result = convert_image_job_pop_response_to_parameters(
         api_response=_job_pop_response_with_solver_knobs(),
-        model_reference_manager=ensure_offline_reference_manager(),
+        model_reference_manager=model_reference_manager,
     )
     payload, faults = to_image_gen_payload(conversion_result.generation_parameters)
     assert faults == [], f"conversion recorded faults for a plain txt2img job: {faults}"
@@ -114,14 +126,14 @@ def test_the_knobs_reach_the_options_the_backend_builds_its_sampler_with(
     assert options["order"] == SOLVER_KNOB_PAYLOAD["sampler_order"]
 
 
-def test_a_job_that_asks_for_none_of_them_carries_none_of_them() -> None:
+def test_a_job_that_asks_for_none_of_them_carries_none_of_them(
+    model_reference_manager: ModelReferenceManager,
+) -> None:
     """The invariant the whole wave rests on: an ordinary job is unchanged by any of this."""
     from horde_sdk.worker.dispatch.ai_horde.image.convert import (
         convert_image_job_pop_response_to_parameters,
     )
     from hordelib.pipeline.sdk_adapter import to_image_gen_payload
-
-    from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
     job_id = str(uuid.uuid4())
     plain_job = ImageGenerateJobPopResponse(
@@ -144,7 +156,7 @@ def test_a_job_that_asks_for_none_of_them_carries_none_of_them() -> None:
 
     conversion_result = convert_image_job_pop_response_to_parameters(
         api_response=plain_job,
-        model_reference_manager=ensure_offline_reference_manager(),
+        model_reference_manager=model_reference_manager,
     )
     payload, _faults = to_image_gen_payload(conversion_result.generation_parameters)
 

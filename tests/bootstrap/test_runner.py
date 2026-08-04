@@ -122,6 +122,7 @@ def test_build_child_env_shared_cache_mode_omits_uv_cache_dir(
 ) -> None:
     """Shared cache mode leaves UV_CACHE_DIR unset so uv uses its own (system) default cache."""
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("UV_PYTHON_INSTALL_DIR", raising=False)
     monkeypatch.setenv("HORDE_WORKER_UV_CACHE_MODE", "shared")
     env = runner.build_child_env(tmp_path)
     assert "UV_CACHE_DIR" not in env

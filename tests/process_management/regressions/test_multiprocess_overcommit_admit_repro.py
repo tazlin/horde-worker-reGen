@@ -148,6 +148,9 @@ class TestSchedulerActuatesProcessReduction:
         # Modest activation working set so the model reads activation-light (not weight-dominant), exercising
         # the needs_process_count_reduction path rather than needs_exclusive_residency.
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 10000.0 + 600)
+        # Pin ComfyUI's weight-fit floor: its platform-specific default differs between Linux and Windows,
+        # and this regression is about scheduler actuation rather than backend reserve policy.
+        monkeypatch.setattr(resource_budget, "effective_inference_reserve_mb", lambda *args, **kwargs: 1519.0)
 
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=4)
         # This reproduces the unmeasured-marginal (WDDM) host: pin the per-context marginal to the
