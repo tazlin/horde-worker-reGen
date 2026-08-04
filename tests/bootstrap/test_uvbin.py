@@ -64,8 +64,10 @@ def test_stale_bundled_uv_is_repaired_through_verified_copy(
     bundled.write_bytes(b"old-private-uv")
     updated_copies: set[Path] = set()
     commands: list[list[str]] = []
+    command_directories: list[Path] = []
 
-    def fake_reported_version(executable: str, **kw: object) -> str | None:
+    def fake_reported_version(executable: str, *, cwd: Path) -> str | None:
+        command_directories.append(cwd)
         path = Path(executable)
         if path in updated_copies:
             return "0.12.1"
@@ -78,6 +80,10 @@ def test_stale_bundled_uv_is_repaired_through_verified_copy(
 
     def fake_run(command: list[str], **kw: object) -> _Completed:
         commands.append(command)
+        command_directory = Path(str(kw["cwd"]))
+        command_directories.append(command_directory)
+        assert command_directory.exists()
+        assert not command_directory.is_relative_to(tmp_path)
         candidate = Path(command[0])
         assert candidate != bundled
         assert candidate.read_bytes() == b"old-private-uv"
@@ -91,6 +97,8 @@ def test_stale_bundled_uv_is_repaired_through_verified_copy(
     repaired = Path(uvbin.ensure_compatible_uv(tmp_path))
 
     assert commands
+    assert command_directories
+    assert all(not directory.is_relative_to(tmp_path) for directory in command_directories)
     assert repaired.name == ("uv-0.12.1.exe" if os.name == "nt" else "uv-0.12.1")
     assert repaired.read_bytes() == b"old-private-uv"
     assert bundled.read_bytes() == b"old-private-uv"

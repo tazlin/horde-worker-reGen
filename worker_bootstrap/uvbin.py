@@ -107,57 +107,69 @@ def ensure_compatible_uv(root: Path | None = None, executable: str | None = None
 
     bin_dir = paths.bin_dir(install_root)
     versioned = _versioned_uv_path(install_root, required)
-    if versioned.exists() and _reported_version(str(versioned), cwd=bin_dir) == required:
-        return str(versioned)
-    if _reported_version(selected, cwd=bin_dir) == required:
-        return selected
+    # uv checks [tool.uv] required-version for commands such as `self update`. Run every compatibility
+    # probe and repair from a temporary directory outside the install, otherwise the stale executable
+    # rejects the new pin before it gets a chance to update itself.
+    with tempfile.TemporaryDirectory(prefix="horde-worker-uv-command-") as command_directory_name:
+        command_directory = Path(command_directory_name)
+        if versioned.exists() and _reported_version(str(versioned), cwd=command_directory) == required:
+            return str(versioned)
+        if _reported_version(selected, cwd=command_directory) == required:
+            return selected
 
-    bundled = _bundled_uv_path(install_root)
-    selected_unresolved = Path(selected).resolve(strict=False)
-    bundled_unresolved = bundled.resolve(strict=False)
-    if not bundled.exists():
-        if selected_unresolved != bundled_unresolved:
+        bundled = _bundled_uv_path(install_root)
+        selected_unresolved = Path(selected).resolve(strict=False)
+        bundled_unresolved = bundled.resolve(strict=False)
+        if not bundled.exists():
+            if selected_unresolved != bundled_unresolved:
+                raise UvCompatibilityError(
+                    f"uv {required} is required, but the PATH-provided uv is incompatible. "
+                    f"Update it with `uv self update {required}`."
+                )
             raise UvCompatibilityError(
-                f"uv {required} is required, but the PATH-provided uv is incompatible. "
-                f"Update it with `uv self update {required}`."
+                f"uv {required} is required, but the worker's private uv binary is missing. "
+                "Re-run the worker installer."
             )
-        raise UvCompatibilityError(
-            f"uv {required} is required, but the worker's private uv binary is missing. Re-run the worker installer."
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        suffix = ".exe" if os.name == "nt" else ""
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".uv-{required}-repair-",
+            suffix=suffix,
+            dir=bin_dir,
         )
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    suffix = ".exe" if os.name == "nt" else ""
-    file_descriptor, temporary_name = tempfile.mkstemp(prefix=f".uv-{required}-repair-", suffix=suffix, dir=bin_dir)
-    os.close(file_descriptor)
-    temporary = Path(temporary_name)
-    try:
-        shutil.copy2(bundled, temporary)
-        print(f"Updating the worker's private uv to {required} ...", flush=True)
+        os.close(file_descriptor)
+        temporary = Path(temporary_name)
         try:
-            result = subprocess.run(  # noqa: S603 - temporary is our private copy of the bundled executable
-                [str(temporary), "self", "update", required],
-                cwd=str(bin_dir),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=_SELF_UPDATE_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise UvCompatibilityError(f"Could not update the worker's private uv to {required}: {error}") from error
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            suffix_text = f" ({detail})" if detail else ""
-            raise UvCompatibilityError(
-                f"Could not update the worker's private uv to {required}{suffix_text}. "
-                f"Run `./bin/uv self update {required}` and retry."
-            )
-        actual = _reported_version(str(temporary), cwd=bin_dir)
-        if actual != required:
-            raise UvCompatibilityError(
-                f"The repaired uv reported {actual or 'an unreadable version'}; expected {required}."
-            )
-        os.replace(temporary, versioned)
-    finally:
-        temporary.unlink(missing_ok=True)
+            shutil.copy2(bundled, temporary)
+            print(f"Updating the worker's private uv to {required} ...", flush=True)
+            try:
+                result = subprocess.run(  # noqa: S603 - temporary is our private copy of the bundled executable
+                    [str(temporary), "self", "update", required],
+                    cwd=str(command_directory),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_SELF_UPDATE_TIMEOUT_SECONDS,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise UvCompatibilityError(
+                    f"Could not update the worker's private uv to {required}: {error}"
+                ) from error
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                suffix_text = f" ({detail})" if detail else ""
+                raise UvCompatibilityError(
+                    f"Could not update the worker's private uv to {required}{suffix_text}. "
+                    f"Run `./bin/uv self update {required}` and retry."
+                )
+            actual = _reported_version(str(temporary), cwd=command_directory)
+            if actual != required:
+                raise UvCompatibilityError(
+                    f"The repaired uv reported {actual or 'an unreadable version'}; expected {required}."
+                )
+            os.replace(temporary, versioned)
+        finally:
+            temporary.unlink(missing_ok=True)
     print(f"The worker's private uv is now {required}.")
     return str(versioned)
 

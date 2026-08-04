@@ -31,7 +31,9 @@ update is never overwritten while it is running. If a release raises the exact u
 still-working private executable, self-updates the copy, verifies the reported version, and atomically
 publishes it as a versioned `bin/uv-<version>` sidecar before dependency preview or sync. The original
 executable remains available to start the stdlib-only bootstrap, including on Windows where it may still
-be locked by the parent process.
+be locked by the parent process. Compatibility probes and the explicit `uv self update` run from a temporary
+directory outside the worker project, so the old uv does not reject the new `required-version` before it can
+update itself.
 
 This repair also runs at the beginning of every bootstrap invocation. An installation where the source
 update already succeeded but dependency sync stopped with `Required uv version ... does not match` therefore
