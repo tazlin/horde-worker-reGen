@@ -1346,6 +1346,10 @@ class SupervisorChannel:
         self._lock = threading.Lock()
         self._closed = False
         self._latest: WorkerStateSnapshot | None = None
+        self._latest_unsent = False
+        """Whether :attr:`_latest` still has to go out. Distinct from :attr:`_pending`, which is also set
+        by :meth:`close` to wake the sender, so it alone cannot tell a frame waiting to be sent from one
+        already on the wire."""
         self._pending = threading.Event()
         self._stop = threading.Event()
         self._loop_alive_wall_time = time.time()
@@ -1369,6 +1373,7 @@ class SupervisorChannel:
         if self._closed:
             return False
         self._latest = snapshot
+        self._latest_unsent = True
         self._pending.set()
         return True
 
@@ -1377,6 +1382,12 @@ class SupervisorChannel:
 
         Either send may block on a slow consumer; that is fine, because this runs on a daemon thread and
         never touches the worker's control loop.
+
+        A snapshot handed over just before :meth:`close` is flushed on the way out rather than discarded
+        with the loop: the frame arriving in that window is the worker's last one, carrying the
+        ``shutting_down`` state the supervisor needs to tell a deliberate exit from a worker gone silent.
+        The flush is one bounded attempt and shares the ordinary best-effort send, so a pipe that has
+        already died costs nothing.
         """
         while not self._stop.is_set():
             got_pending = self._pending.wait(timeout=self._LIVENESS_INTERVAL)
@@ -1389,12 +1400,26 @@ class SupervisorChannel:
 
             if not got_pending:
                 continue
-            self._pending.clear()
-            snapshot = self._latest
-            if snapshot is None:
-                continue
-            if not self._send_frame(snapshot):
+            if not self._send_pending_snapshot():
                 return
+
+        self._send_pending_snapshot()
+
+    def _send_pending_snapshot(self) -> bool:
+        """Send the freshest snapshot the sender has accepted, if any. False once the transport is dead.
+
+        The unsent flag is cleared before the frame is read: a producer racing this method then leaves the
+        flag set for a frame that just went out, costing one redundant resend, whereas the reverse order
+        would mark a frame sent that never was and drop it.
+        """
+        self._pending.clear()
+        if not self._latest_unsent:
+            return True
+        self._latest_unsent = False
+        snapshot = self._latest
+        if snapshot is None:
+            return True
+        return self._send_frame(snapshot)
 
     def _send_frame(self, frame: WorkerStateSnapshot | WorkerLivenessFrame) -> bool:
         """Send one frame under the connection lock. Returns False once the channel is closed/dead."""

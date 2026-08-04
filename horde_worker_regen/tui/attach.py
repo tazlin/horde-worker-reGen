@@ -40,6 +40,12 @@ A locally-recorded stop intent stays in force while the host reports one of thes
 reporting the pre-stop lifecycle until its own supervisor picks the request up. Any other reported status
 means the host has acted, so the local intent is spent."""
 
+_TERMINAL_STATUSES = frozenset({SupervisorStatus.STOPPED, SupervisorStatus.CRASHED})
+"""Host statuses that end the life of the worker incarnation whose frames are in flight.
+
+Any snapshot still arriving under one of these describes a worker that is already gone, so it is refused
+rather than applied."""
+
 
 class SupervisorLike(Protocol):
     """The supervisor surface the TUI depends on, satisfied by both the owning and attach supervisors."""
@@ -429,9 +435,23 @@ class AttachedWorkerSupervisor:
         """Update local state from a host frame (snapshot or status; hello is ignored)."""
         message_type = message.get("type")
         if message_type == sp.MSG_SNAPSHOT:
-            self.latest_snapshot = sp.parse_snapshot(message)
+            if self._accepts_worker_frames():
+                self.latest_snapshot = sp.parse_snapshot(message)
         elif message_type == sp.MSG_STATUS:
             self._apply_status(message)
+
+    def _accepts_worker_frames(self) -> bool:
+        """Whether a streamed frame still describes the worker incarnation this session is presenting.
+
+        One host broadcast writes its status frame and then its retained snapshot, so a snapshot of a
+        worker that has just died lands immediately behind the status reporting the death, and behind the
+        frames a locally-issued stop dropped. Acceptance is decided by the lifecycle this session is in
+        rather than by the order the two frames happen to arrive in, which is what keeps a spent frame
+        from being re-adopted and then aged into the unresponsive alarm by the next running lifecycle.
+        """
+        if self._stop_requested:
+            return False
+        return self._status not in _TERMINAL_STATUSES
 
     def _apply_status(self, message: dict[str, object]) -> None:
         """Apply a status frame's fields (status / restart count / running / mode)."""

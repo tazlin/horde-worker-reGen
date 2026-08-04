@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import multiprocessing
 import pickle
+import threading
 import time
 from types import SimpleNamespace
+
+import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -375,6 +378,118 @@ def test_closed_channel_emits_no_liveness_frame() -> None:
     assert channel.closed is True
     channel.close()
     child.close()
+
+
+class _GatedConnection:
+    """A connection stand-in whose first send parks until released, so close() can be raced into it.
+
+    Lets a test hold the sender thread inside a send while a snapshot is handed over and the channel is
+    closed, which is the ordering where an accepted frame would otherwise never reach the transport.
+    ``fail_after_gate`` makes every later send raise, modelling a pipe that died during the teardown.
+    """
+
+    def __init__(self, *, fail_after_gate: bool = False) -> None:
+        self.sent: list[object] = []
+        self.entered_send = threading.Event()
+        self.release = threading.Event()
+        self._fail_after_gate = fail_after_gate
+        self._gate_passed = False
+
+    def send(self, obj: object) -> None:
+        """Record the frame, parking the first caller until the test releases it."""
+        if not self.entered_send.is_set():
+            self.entered_send.set()
+            self.release.wait(5.0)
+            self._gate_passed = True
+        elif self._fail_after_gate:
+            raise OSError("pipe is gone")
+        self.sent.append(obj)
+
+    def poll(self, timeout: float | None = None) -> bool:
+        """No commands ever arrive on this stand-in."""
+        return False
+
+    def recv(self) -> object:
+        """Never called; the stand-in carries no inbound traffic."""
+        raise EOFError
+
+    def close(self) -> None:
+        """No resources to release."""
+
+
+def _channel_on_gated_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: _GatedConnection,
+) -> SupervisorChannel:
+    """Start a channel over ``connection`` with a fast liveness cadence, parked inside its first send."""
+    monkeypatch.setattr(SupervisorChannel, "_LIVENESS_INTERVAL", 0.01)
+    channel = SupervisorChannel(connection)  # pyrefly: ignore
+    assert connection.entered_send.wait(5.0), "the sender thread never reached its first send"
+    return channel
+
+
+def test_close_flushes_a_snapshot_handed_over_just_before_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A snapshot the sender already accepted must still reach the supervisor when the channel stops.
+
+    The worker's final frame is the one carrying ``shutting_down``, and it is handed over at exactly the
+    moment the channel is being torn down. Exiting the send loop on the stop flag alone would discard it,
+    leaving the supervisor with no record that the worker went quiet on purpose.
+    """
+    connection = _GatedConnection()
+    channel = _channel_on_gated_connection(monkeypatch, connection)
+
+    channel.send_snapshot(_make_snapshot())
+    channel.close()
+    connection.release.set()
+    channel._sender.join(5.0)
+
+    assert not channel._sender.is_alive()
+    assert any(isinstance(frame, WorkerStateSnapshot) for frame in connection.sent)
+
+
+def test_close_with_nothing_pending_exits_promptly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flush is bounded by what was already accepted; with no frame waiting the loop just ends."""
+    connection = _GatedConnection()
+    channel = _channel_on_gated_connection(monkeypatch, connection)
+
+    channel.close()
+    connection.release.set()
+    channel._sender.join(5.0)
+
+    assert not channel._sender.is_alive()
+    assert not any(isinstance(frame, WorkerStateSnapshot) for frame in connection.sent)
+
+
+def test_close_does_not_resend_a_snapshot_already_on_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flush covers frames still waiting, not the last one sent; closing repeats nothing."""
+    connection = _GatedConnection()
+    channel = _channel_on_gated_connection(monkeypatch, connection)
+    connection.release.set()
+
+    channel.send_snapshot(_make_snapshot())
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not any(isinstance(f, WorkerStateSnapshot) for f in connection.sent):
+        time.sleep(0.01)
+
+    channel.close()
+    channel._sender.join(5.0)
+
+    assert len([f for f in connection.sent if isinstance(f, WorkerStateSnapshot)]) == 1
+
+
+def test_a_failing_final_flush_neither_hangs_nor_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead pipe at teardown is the ordinary case; the final attempt is best-effort like every other send."""
+    connection = _GatedConnection(fail_after_gate=True)
+    channel = _channel_on_gated_connection(monkeypatch, connection)
+
+    channel.send_snapshot(_make_snapshot())
+    channel.close()
+    connection.release.set()
+    channel._sender.join(5.0)
+
+    assert not channel._sender.is_alive()
+    assert not any(isinstance(frame, WorkerStateSnapshot) for frame in connection.sent)
+    assert channel.closed is True
 
 
 def test_scheduling_governance_survives_json_roundtrip() -> None:

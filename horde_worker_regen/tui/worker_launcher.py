@@ -271,13 +271,43 @@ class WorkerSupervisor:
         return self._process is not None and self._process.is_alive()
 
     def start(self) -> None:
-        """Launch the worker child process."""
+        """Launch the worker child process, or fold the request into a cooperative stop already draining.
+
+        Spawning over a draining worker would put two workers on the same GPU, worker name, and model
+        cache, and the handle to the older one is overwritten in the act, so nothing is left to reap the
+        tree it owns. A start arriving in that window instead becomes the replacement the stop already
+        knows how to make (see :meth:`_complete_graceful_stop`), so exactly one worker comes back and it
+        comes back only once the outgoing one is confirmed dead.
+        """
+        if self._is_cooperative_stop_draining():
+            self._upgrade_draining_stop_to_restart()
+            return
         self._intentional_stop = False
         self._restart_after_stop = False
         self._graceful_stop_deadline = 0.0
         self._restart_attempts = 0
         self.last_fatal_error = None
         self._spawn()
+
+    def _is_cooperative_stop_draining(self) -> bool:
+        """Whether a stop or restart intent is recorded and the worker it targets is still alive."""
+        return self._intentional_stop and self._process is not None and self._process.is_alive()
+
+    def _upgrade_draining_stop_to_restart(self) -> None:
+        """Turn an in-flight cooperative stop into a restart without disturbing its drain.
+
+        The force-kill deadline keeps its original value for the same reason a repeated stop does not
+        re-arm it: the backstop that ends a stop the worker is ignoring must not be deferred by further
+        operator input. Only the replacement is added, so the pinned presentation moves to RESTARTING and
+        the successor spawns when the drain finishes.
+        """
+        if not self._restart_after_stop:
+            self._restart_after_stop = True
+            logger.info(
+                "Start requested while the worker is still draining; it will be relaunched once the "
+                "running worker exits rather than started alongside it.",
+            )
+        self._set_status(SupervisorStatus.RESTARTING)
 
     def _spawn(self, *, status: SupervisorStatus = SupervisorStatus.STARTING) -> None:
         """Create a fresh pipe and worker process (the pipe transport seam).

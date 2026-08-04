@@ -342,6 +342,96 @@ def test_restart_requested_while_stopping_upgrades_the_stop_in_place(monkeypatch
     assert supervisor.status is SupervisorStatus.RESTARTING
 
 
+def test_start_requested_while_stopping_upgrades_the_stop_instead_of_double_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start pressed during a drain must not put a second worker beside the one still exiting.
+
+    The draining worker still owns the GPU, the worker name, and its own subprocess tree, and the handle
+    to it would be overwritten by an immediate spawn, leaving it orphaned. The start therefore becomes the
+    replacement the stop already knows how to make: one worker, spawned once the old one is confirmed dead.
+    """
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(worker_launcher, "time", clock)
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    process = ctx.last_process
+    assert process is not None
+
+    supervisor.request_graceful_stop(timeout=150.0)
+    first_deadline = supervisor._graceful_stop_deadline
+
+    clock.advance(10.0)
+    supervisor.start()
+
+    assert ctx.process_count == 1, "no worker may spawn while the old one still drains"
+    assert supervisor.status is SupervisorStatus.RESTARTING
+    assert supervisor._graceful_stop_deadline == first_deadline, "the force-kill backstop keeps its window"
+    assert supervisor.is_alive(), "the draining worker is still the one being tracked"
+
+    process.exit_cleanly()
+    supervisor.tick()
+
+    assert ctx.process_count == 2
+    assert supervisor.status is SupervisorStatus.RESTARTING
+
+
+def test_repeated_starts_during_a_drain_still_produce_exactly_one_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator pressing start repeatedly through a long drain gets one successor, not a queue of them."""
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(worker_launcher, "time", clock)
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    process = ctx.last_process
+    assert process is not None
+
+    supervisor.request_graceful_stop(timeout=150.0)
+    for _ in range(5):
+        clock.advance(1.0)
+        supervisor.start()
+        supervisor.tick()
+
+    assert ctx.process_count == 1
+
+    process.exit_cleanly()
+    supervisor.tick()
+    supervisor.tick()
+
+    assert ctx.process_count == 2
+
+
+def test_start_on_an_idle_supervisor_still_spawns_immediately() -> None:
+    """The plain start path is untouched: nothing is draining, so the worker launches at once."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+
+    supervisor.start()
+
+    assert ctx.process_count == 1
+    assert supervisor.status is SupervisorStatus.STARTING
+    assert supervisor.is_alive()
+
+
+def test_start_after_a_completed_stop_spawns_a_fresh_worker() -> None:
+    """Once the stop has finished there is nothing to upgrade, so a start is an ordinary launch."""
+    ctx = _FakeCtx()
+    supervisor, _ = _owning_supervisor_mid_stop(ctx)
+    process = ctx.last_process
+    assert process is not None
+    process.exit_cleanly()
+    supervisor.tick()
+    assert supervisor.status is SupervisorStatus.STOPPED
+
+    supervisor.start()
+
+    assert ctx.process_count == 2
+    assert supervisor.status is SupervisorStatus.STARTING
+
+
 # endregion
 
 
@@ -412,6 +502,71 @@ def test_attached_host_reporting_stopped_presents_as_stopped(monkeypatch: pytest
 
     assert client.latest_snapshot is None
     assert _dashboard_phase(client, now=now) is WorkerPhase.STOPPED
+
+
+def test_snapshot_arriving_behind_a_terminal_status_does_not_resurrect_the_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frame acceptance follows the lifecycle, not the order the host happens to send its two frames in.
+
+    One host broadcast writes the status frame and then the retained snapshot, so the snapshot of a worker
+    that has just died lands immediately behind the status that reported its death. Re-populating from it
+    would hand the session a frame belonging to a dead incarnation, which the next running lifecycle would
+    then age into the unresponsive alarm.
+    """
+    client = _attached_supervisor(monkeypatch)
+    now = time.time()
+    stale = _running_worker_snapshot()
+
+    client._apply({"type": sp.MSG_STATUS, "status": SupervisorStatus.STOPPED.value, "worker_running": False})
+    client._apply({"type": sp.MSG_SNAPSHOT, "snapshot": stale.model_dump(mode="json")})
+
+    assert client.latest_snapshot is None
+    assert _dashboard_phase(client, now=now) is WorkerPhase.STOPPED
+
+    # The worker is started again; the dead incarnation's frame must not be what this session presents.
+    client._apply({"type": sp.MSG_STATUS, "status": SupervisorStatus.STARTING.value, "worker_running": True})
+
+    assert client.latest_snapshot is None
+    assert _dashboard_phase(client, now=now + _STALE_LIVENESS_SECONDS) is WorkerPhase.INITIALIZING
+
+
+def test_snapshot_arriving_behind_a_crashed_status_does_not_resurrect_the_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash is terminal for the reporting incarnation too, so its trailing frame is equally spent."""
+    client = _attached_supervisor(monkeypatch)
+
+    client._apply({"type": sp.MSG_STATUS, "status": SupervisorStatus.CRASHED.value, "worker_running": False})
+    client._apply({"type": sp.MSG_SNAPSHOT, "snapshot": _running_worker_snapshot().model_dump(mode="json")})
+
+    assert client.latest_snapshot is None
+    assert _dashboard_phase(client, now=time.time()) is WorkerPhase.CRASHED
+
+
+def test_host_snapshot_is_refused_while_this_sessions_stop_intent_stands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The frames dropped on a local stop must stay dropped while the host is still catching up."""
+    client = _attached_supervisor(monkeypatch)
+    now = time.time()
+
+    client.request_graceful_stop()
+    client._apply({"type": sp.MSG_SNAPSHOT, "snapshot": _running_worker_snapshot().model_dump(mode="json")})
+
+    assert client.latest_snapshot is None
+    assert _dashboard_phase(client, now=now) is WorkerPhase.SHUTTING_DOWN
+
+
+def test_running_host_snapshots_are_still_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate stays narrow: a live worker's frames are what the dashboard renders from."""
+    client = _attached_supervisor(monkeypatch)
+
+    client._apply({"type": sp.MSG_STATUS, "status": SupervisorStatus.RUNNING.value, "worker_running": True})
+    client._apply({"type": sp.MSG_SNAPSHOT, "snapshot": _running_worker_snapshot().model_dump(mode="json")})
+
+    assert client.latest_snapshot is not None
+    assert client.latest_snapshot.config.dreamer_name == "Test"
 
 
 # endregion
