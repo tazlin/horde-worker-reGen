@@ -328,6 +328,17 @@ def _build_context_overcommit_scheduler(
         proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
         proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB  # device reads ~15GB free: one context's worth used
         procs[pid] = proc
+    # The real worker with safety_on_gpu=True always has a safety process; its CUDA context is charged
+    # against free_after_model_evict (stopping idle inference siblings cannot reclaim it), so the forecast's
+    # structural floor reflects the genuine device commitment rather than reading deceptively high.
+    procs[0] = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    procs[0].total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+    procs[0].vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
     process_map = ProcessMap(procs)
 
     job_tracker = JobTracker()
