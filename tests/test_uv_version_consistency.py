@@ -79,6 +79,5 @@ def test_all_uv_versions_are_consistent() -> None:
 
     unique_versions = set(versions.values())
     assert len(unique_versions) == 1, (
-        f"uv versions are inconsistent across files: {versions}. "
-        f"All three must declare the same version."
+        f"uv versions are inconsistent across files: {versions}. All three must declare the same version."
     )
