@@ -1716,6 +1716,9 @@ class HordeWorkerProcessManager:
         )
         self._disaggregation_orchestrator.set_vram_arbiter(self._vram_arbiter)
         self._message_dispatcher.set_stage_result_handler(self._disaggregation_orchestrator.handle_stage_result)
+        # Between stages a disaggregated job leaves every inference slot idle by design, so the deadlock
+        # detector must not read that as a wedge.
+        self._message_dispatcher.set_disagg_hold_provider(self._disaggregation_orchestrator.held_job_ids)
         # Crash-path inference failures resolve in the tracker without touching the orchestrator; releasing the
         # job's held pipeline state there keeps the retry single-flight (no parallel held-state re-dispatch)
         # and purges the registration on a terminal fault (no zombie sampling of a job the tracker dropped).

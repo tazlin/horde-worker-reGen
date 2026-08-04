@@ -472,6 +472,16 @@ class DisaggregationOrchestrator:
         """Whether a job is currently in the disaggregated pipeline."""
         return self._key(job_info) in self._jobs
 
+    def held_job_ids(self) -> set[str]:
+        """Return the ids of every job currently inside the disaggregated pipeline.
+
+        Read by the deadlock detector: between stages such a job holds no inference slot (its sampler returns
+        to waiting-for-job the moment it emits the latent, while a service lane decodes), so the worker is
+        legitimately all-idle with the job still outstanding. The set is bounded by this orchestrator's own
+        stage patience, which faults or reroutes a job whose stage never returns, dropping it from the map.
+        """
+        return set(self._jobs)
+
     def _release_pin(self, state: _DisaggJobState) -> None:
         """Release a job's pinned sampler reservation (idempotent), returning the slot to the pool."""
         if state.pinned_sampler is not None:

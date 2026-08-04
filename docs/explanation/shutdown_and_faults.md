@@ -185,6 +185,9 @@ Two independent mechanisms guard against the worker getting stuck:
    [`MessageDispatcher`][horde_worker_regen.process_management.ipc.message_dispatcher.MessageDispatcher]'s
    `detect_deadlock` inspects job/process state and logs when all inference processes are idle while
    jobs are still pending inference, or when jobs are tracked but no process is busy.
+   Jobs that are idle by design are excluded from both conditions: one waiting on its auxiliary
+   (LoRA/TI) prefetch, and one the disaggregation orchestrator holds between pipeline stages, whose
+   remaining work runs on a service lane rather than an inference slot.
    These checks are purely informational: they emit diagnostics after a short
    grace period and do **not** kill or replace anything.
 

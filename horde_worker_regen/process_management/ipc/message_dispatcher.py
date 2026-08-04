@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from multiprocessing import Queue
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
-from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
+from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry, ImageGenerateJobPopResponse
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import GenerationID
 from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
@@ -151,6 +151,11 @@ def _no_aux_holds() -> set[GenerationID]:
     return set()
 
 
+def _no_disagg_holds() -> set[str]:
+    """Default disaggregation-hold provider: report no jobs in the disaggregated pipeline."""
+    return set()
+
+
 @dataclass(frozen=True)
 class DeadlockSnapshot:
     """Represents the currently observed scheduler deadlock state."""
@@ -197,6 +202,7 @@ class MessageDispatcher:
     _reserve_ledger: CommittedReserveLedger
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
     _aux_hold_provider: Callable[[], set[GenerationID]]
+    _disagg_hold_provider: Callable[[], set[str]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
     _on_annotation_result: Callable[[HordeAnnotationResultMessage], None] | None = None
     """Invoked when the image-utilities lane reports a ControlNet annotation result (map bytes or a fault)."""
@@ -309,6 +315,7 @@ class MessageDispatcher:
         self._on_unload_vram = on_unload_vram
         self._state = state
         self._aux_hold_provider = aux_hold_provider if aux_hold_provider is not None else _no_aux_holds
+        self._disagg_hold_provider = _no_disagg_holds
         self._safety_verdicts_known_lost: set[GenerationID] = set()
         """Jobs whose safety verdict was dropped because its producing launch was retired.
 
@@ -386,6 +393,16 @@ class MessageDispatcher:
         registered orchestrator dispatches by concrete type and advances the job's DAG.
         """
         self._on_stage_result = handler
+
+    def set_disagg_hold_provider(self, provider: Callable[[], set[str]]) -> None:
+        """Register the source of job ids currently held inside the disaggregated pipeline.
+
+        Registered by the parent once its disaggregation orchestrator exists. Deadlock detection excludes
+        these jobs from both deadlock conditions: a job whose sampling finished and whose remaining lane work
+        (conditioning, VAE encode/decode, post-processing) runs on a service lane leaves every inference slot
+        idle by design, so "work outstanding plus every process idle" is the pipeline advancing, not a wedge.
+        """
+        self._disagg_hold_provider = provider
 
     def set_metrics_handlers(
         self,
@@ -1794,8 +1811,20 @@ class MessageDispatcher:
         # jobs from every deadlock term: "pending plus every process idle" is that gate working as designed,
         # not a wedge. The hold is bounded by the coordinator's per-job deadline, so a genuinely stalled
         # prefetch stops shielding the queue once its deadline lapses.
+        # A job inside the disaggregated pipeline holds no inference slot between its stages: once its sampler
+        # emits the latent it returns to waiting-for-job while the service lanes decode, so every inference
+        # process is legitimately idle with the job still outstanding. Exclude those jobs from every deadlock
+        # term for the same reason aux-held jobs are excluded. The exclusion is bounded by the orchestrator's
+        # own stage patience: a job whose stage never returns is faulted (or rerouted monolithic) and leaves
+        # the pipeline, so it stops shielding the queue.
         aux_held = self._aux_hold_provider()
-        unheld_pending = tuple(job for job in self._job_tracker.jobs_pending_inference if job.id_ not in aux_held)
+        disagg_held = self._disagg_hold_provider()
+
+        def _deadlock_exempt(job: ImageGenerateJobPopResponse) -> bool:
+            return job.id_ in aux_held or str(job.id_) in disagg_held
+
+        unheld_pending = tuple(job for job in self._job_tracker.jobs_pending_inference if not _deadlock_exempt(job))
+        unheld_in_progress = tuple(job for job in self._job_tracker.jobs_in_progress if not _deadlock_exempt(job))
 
         queue_deadlock_condition = (
             self._process_map.all_waiting_for_job()
@@ -1859,8 +1888,8 @@ class MessageDispatcher:
 
         deadlock_condition = (
             len(unheld_pending) > 0
-            or len(self._job_tracker.jobs_in_progress) > 0
-            or any(job.id_ not in aux_held for job in self._job_tracker.jobs_lookup)
+            or len(unheld_in_progress) > 0
+            or any(not _deadlock_exempt(job) for job in self._job_tracker.jobs_lookup)
         ) and self._process_map.num_busy_processes() == 0
 
         if (not self._in_deadlock) and deadlock_condition:
