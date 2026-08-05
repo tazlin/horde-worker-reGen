@@ -63,6 +63,8 @@ from horde_worker_regen.process_management.scheduling.governance.snapshots impor
     InferenceSlotSnapshot,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    GraceBudgetStatus,
+    WholeCardGrantKind,
     WholeCardPhase,
     WholeCardResidency,
     WholeCardResidencyLedger,
@@ -79,6 +81,7 @@ __all__ = [
     "EvictIdleModels",
     "GovernanceAction",
     "GovernanceHost",
+    "GraceBudgetStatus",
     "HostMemorySnapshot",
     "InferenceSlotSnapshot",
     "MarkProcessDraining",
@@ -96,6 +99,7 @@ __all__ = [
     "SetPopHold",
     "StopTrackingShedCard",
     "StopTrackingWorkerShed",
+    "WholeCardGrantKind",
     "WholeCardPhase",
     "WholeCardResidency",
     "WholeCardResidencyLedger",

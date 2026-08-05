@@ -13,13 +13,20 @@ empty. Its value rests on two invariants pinned here:
 
 from __future__ import annotations
 
+import dataclasses
 import time
+from unittest.mock import patch
+
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import AffinitySkipState
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -293,6 +300,88 @@ class TestSchedulerClassifierBuckets:
 
         assert bucket is SlotDutyBucket.UNEXPLAINED
         assert "no matching gate" in text
+
+
+class TestStallReasonStability:
+    """The stall reason names the block and nothing that merely advances with the clock.
+
+    Two consumers compare the reason across cycles: the parked-head line throttles on it being unchanged, and
+    recovery judges whether a rung moved the head's blocker by whether it changed. A reason carrying a
+    per-cycle counter would defeat both, logging every cycle of a sustained stall and making every rung look
+    effective. The counters still reach the operator, on the formatted line.
+    """
+
+    @staticmethod
+    async def _scheduler_with_bypassed_head() -> tuple[InferenceScheduler, ImageGenerateJobPopResponse]:
+        """A parked cold head that resident-model jobs have been skipping past for some time."""
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({1: make_mock_process_info(1, model_name=None)}),
+            horde_model_map=HordeModelMap(root={}),
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(max_threads=2),
+            max_concurrent=2,
+            max_inference=2,
+        )
+        scheduler._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head.id_),
+            first_skip_time=time.time() - 300.0,
+            skip_count=1,
+        )
+        scheduler._head_starvation_job_id = str(head.id_)
+        scheduler._head_starvation_since = time.time() - 300.0
+        return scheduler, head
+
+    async def test_advancing_bypass_counters_leave_the_reason_unchanged(self) -> None:
+        """Skips accumulating against an unchanged gate do not rewrite what the gate is."""
+        scheduler, head = await self._scheduler_with_bypassed_head()
+
+        first = scheduler._diagnose_dispatch_stall(head, {})
+        state = scheduler._affinity_skip_state
+        scheduler._affinity_skip_state = dataclasses.replace(
+            state,
+            first_skip_time=state.first_skip_time - 120.0,
+            skip_count=state.skip_count + 1,
+        )
+
+        assert scheduler._diagnose_dispatch_stall(head, {}) == first
+
+    async def test_a_sustained_block_logs_once_per_interval_and_still_shows_the_counters(self) -> None:
+        """The line is throttled across cycles, and the quantities it drops from the reason appear in it."""
+        scheduler, head = await self._scheduler_with_bypassed_head()
+
+        with patch.object(inference_scheduler_module.logger, "opt") as opt:
+            scheduler._log_dispatch_stall_if_needed({})
+            state = scheduler._affinity_skip_state
+            scheduler._affinity_skip_state = dataclasses.replace(
+                state,
+                first_skip_time=state.first_skip_time - 120.0,
+            )
+            scheduler._log_dispatch_stall_if_needed({})
+
+        assert opt.return_value.warning.call_count == 1, (
+            "a block that has not changed is stated once per interval, however its counters move"
+        )
+        emitted = str(opt.return_value.warning.call_args)
+        assert "affinity line-skips" in emitted, "the line still tells the operator the head is being fed past"
+
+    async def test_a_changed_block_speaks_immediately(self) -> None:
+        """A different gate is new information, so it is not held back by the previous gate's interval."""
+        scheduler, head = await self._scheduler_with_bypassed_head()
+
+        with patch.object(inference_scheduler_module.logger, "opt") as opt:
+            scheduler._log_dispatch_stall_if_needed({})
+            scheduler._record_preload_admission(
+                AdmissionDecision.DEFER_BUDGET,
+                job=head,
+                reason="the card cannot hold these weights beside the live contexts",
+            )
+            scheduler._log_dispatch_stall_if_needed({})
+
+        assert opt.return_value.warning.call_count == 2
+        assert "cannot hold these weights" in str(opt.return_value.warning.call_args)
 
 
 class TestRecordSlotDutyIntegration:

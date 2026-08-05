@@ -12,9 +12,11 @@ from horde_worker_regen.process_management.scheduling.governance import (
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _ESTABLISH_WINDOW_SECONDS,
+    _GOVERNOR_DEFER_DWELL_SECONDS,
     _GRACE_BUDGET_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
     _MIN_HOLD_SECONDS,
+    WholeCardGrantKind,
 )
 
 _NOW = 1_000_000.0
@@ -36,7 +38,6 @@ def _granted_ledger(
         forecast=None,
         cooldown_until=_NOW + 300.0,
         now=_NOW,
-        refresh_established=True,
         establish_grace_seconds=establish_grace_seconds,
     )
     return ledger
@@ -68,18 +69,23 @@ class TestLedgerQueries:
         assert len(held) == 1
         assert held[0][0] is None
 
-    def test_grant_preserves_established_at_unless_refreshed(self) -> None:
-        """A re-grant without refresh keeps the original establishment stamp (the grace anchor)."""
+    def test_a_reuse_re_ask_keeps_the_establishment_stamp_and_refreshes_the_cooldown(self) -> None:
+        """Re-asking for the model the card already holds keeps the grace anchor and extends the hold.
+
+        The stamp anchors the recovery supervisor's grace window over one physical teardown. A later job for
+        the same held model rides that residency without touching the card, so re-opening the window would
+        hand the supervisor a fresh excuse for a queue nothing is currently tearing down.
+        """
         ledger = _granted_ledger(0)
-        ledger.record_grant(
+        kind = ledger.record_grant(
             0,
             model="heavy-model",
             forecast=None,
             cooldown_until=_NOW + 600.0,
             now=_NOW + 50.0,
-            refresh_established=False,
         )
         state = ledger.state_for(0)
+        assert kind is WholeCardGrantKind.REUSE
         assert state.established_at == _NOW
         assert state.cooldown_until == _NOW + 600.0
 
@@ -172,8 +178,13 @@ class TestMinHold:
         granted.record_restore(0, now=_NOW + 1.0)
         assert granted.min_hold_active(0, now=_NOW + 2.0) is False
 
-    def test_a_refreshed_grant_opens_a_new_floor(self) -> None:
-        """Re-establishing restarts the floor; a non-refreshing re-grant leaves it where it was."""
+    def test_only_a_physical_establishment_opens_a_new_floor(self) -> None:
+        """Re-establishing after a restore restarts the floor; a reuse re-ask leaves it where it was.
+
+        The floor exists to amortize actuation the card has actually paid for. A second job riding the held
+        residency pays none, so extending the floor on its behalf would keep a different-model head locked
+        out for as long as same-model work keeps arriving.
+        """
         ledger = _granted_ledger(0)
         ledger.record_grant(
             0,
@@ -181,17 +192,17 @@ class TestMinHold:
             forecast=None,
             cooldown_until=_NOW + 300.0,
             now=_NOW + 10.0,
-            refresh_established=False,
         )
         assert ledger.state_for(0).min_hold_until == _NOW + _MIN_HOLD_SECONDS
-        ledger.record_grant(
+        ledger.record_restore(0, now=_NOW + 15.0)
+        kind = ledger.record_grant(
             0,
             model="heavy-model",
             forecast=None,
             cooldown_until=_NOW + 300.0,
             now=_NOW + 20.0,
-            refresh_established=True,
         )
+        assert kind is WholeCardGrantKind.ESTABLISH
         assert ledger.state_for(0).min_hold_until == _NOW + 20.0 + _MIN_HOLD_SECONDS
 
 
@@ -199,15 +210,15 @@ class TestEstablishRateLimit:
     """Establishments per card are counted over a rolling window so churn cannot run unbounded."""
 
     def _establish(self, ledger: WholeCardResidencyLedger, *, at: float) -> None:
-        """Record one fresh establishment on card 0 at ``at``."""
+        """Record one physical establish/restore cycle on card 0 at ``at``."""
         ledger.record_grant(
             0,
             model="heavy-model",
             forecast=None,
             cooldown_until=at + 300.0,
             now=at,
-            refresh_established=True,
         )
+        ledger.record_restore(0, now=at)
 
     def test_unknown_card_is_never_rate_limited(self) -> None:
         """A card that has never established has no history to exceed."""
@@ -245,7 +256,6 @@ class TestGraceBudget:
             forecast=None,
             cooldown_until=at + 300.0,
             now=at,
-            refresh_established=True,
             establish_grace_seconds=_ESTABLISH_GRACE,
         )
         ledger.record_restore(0, now=at + 1.0, restore_grace_seconds=_RESTORE_GRACE)
@@ -280,7 +290,6 @@ class TestGraceBudget:
             forecast=None,
             cooldown_until=last + 300.0,
             now=last,
-            refresh_established=True,
             establish_grace_seconds=_ESTABLISH_GRACE,
         )
         assert ledger.grace_budget_exhausted(0, now=last + 1.0) is True, (
@@ -325,6 +334,152 @@ class TestGraceBudget:
         ledger = WholeCardResidencyLedger()
         self._cycle(ledger, at=_NOW)
         assert ledger.grace_budget_exhausted(0, now=_NOW + 5.0) is False
+
+
+class TestGraceIsChargedPerPhysicalEpisode:
+    """Grace and the establishment count are spent by teardown churn, never by reuse of a held residency.
+
+    The cooldown exists so a burst of heavy jobs rides one residency instead of each churning a teardown and
+    restore. That burst costs the card exactly one grace window, so charging it per job spends an allowance
+    sized for physical churn on jobs that caused none, and the card then refuses the next genuine
+    establishment while nothing has actually been torn down.
+    """
+
+    @staticmethod
+    def _ask(ledger: WholeCardResidencyLedger, *, at: float, model: str = "heavy-model") -> WholeCardGrantKind:
+        """Record one head's whole-card ask, exactly as the scheduler records it every cycle."""
+        return ledger.record_grant(
+            0,
+            model=model,
+            forecast=None,
+            cooldown_until=at + 300.0,
+            now=at,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+        )
+
+    def test_a_burst_reusing_one_residency_costs_one_window(self) -> None:
+        """A fresh grant plus repeated same-model asks charge once and record one establishment."""
+        ledger = WholeCardResidencyLedger()
+        assert self._ask(ledger, at=_NOW) is WholeCardGrantKind.ESTABLISH
+        for index in range(1, 12):
+            assert self._ask(ledger, at=_NOW + index * 20.0) is WholeCardGrantKind.REUSE
+
+        state = ledger.state_for(0)
+        assert sum(seconds for _granted_at, seconds in state.grace_charges) == _ESTABLISH_GRACE
+        assert len(state.establishments) == 1
+        assert ledger.grace_budget_exhausted(0, now=_NOW + 240.0) is False
+        assert ledger.establish_rate_exceeded(0, now=_NOW + 240.0) is False
+
+    def test_a_restore_and_re_establish_costs_a_second_window(self) -> None:
+        """Physically giving the card back and taking it again is a new episode, so it charges again."""
+        ledger = WholeCardResidencyLedger()
+        self._ask(ledger, at=_NOW)
+        self._ask(ledger, at=_NOW + 10.0)
+        ledger.record_restore(0, now=_NOW + 20.0, restore_grace_seconds=_RESTORE_GRACE)
+        assert self._ask(ledger, at=_NOW + 30.0) is WholeCardGrantKind.ESTABLISH
+
+        state = ledger.state_for(0)
+        expected = _ESTABLISH_GRACE * 2 + _RESTORE_GRACE
+        assert sum(seconds for _granted_at, seconds in state.grace_charges) == expected
+        assert len(state.establishments) == 2
+
+    def test_sustained_teardown_churn_still_exhausts_both_governors(self) -> None:
+        """Repeated establish/restore cycles remain governed: the brake is on churn, not on demand."""
+        ledger = WholeCardResidencyLedger()
+        cycle_cost = _ESTABLISH_GRACE + _RESTORE_GRACE
+        cycles = int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1
+        for index in range(cycles):
+            at = _NOW + index * 5.0
+            self._ask(ledger, at=at)
+            ledger.record_restore(0, now=at + 1.0, restore_grace_seconds=_RESTORE_GRACE)
+
+        now = _NOW + cycles * 5.0
+        assert ledger.grace_budget_exhausted(0, now=now) is True
+        assert ledger.establish_rate_exceeded(0, now=now) is True
+
+    def test_a_different_model_taking_the_card_is_a_new_episode(self) -> None:
+        """Swapping the resident model is a physical rotation, so it charges and counts."""
+        ledger = WholeCardResidencyLedger()
+        self._ask(ledger, at=_NOW)
+        assert self._ask(ledger, at=_NOW + 30.0, model="other-heavy-model") is WholeCardGrantKind.ESTABLISH
+        assert len(ledger.state_for(0).establishments) == 2
+
+
+class TestGraceBudgetStatus:
+    """The budget can say what it has spent and when the next allowance returns."""
+
+    def test_status_reports_spend_remaining_and_the_next_replenishment(self) -> None:
+        """The status quotes the rolling spend, what is left of the allowance, and the wait for more."""
+        ledger = WholeCardResidencyLedger()
+        state = ledger.state_for(0)
+        state.grace_charges.append((_NOW, _GRACE_BUDGET_SECONDS))
+        state.grace_charges.append((_NOW + 100.0, 60.0))
+
+        status = ledger.grace_budget_status(0, now=_NOW + 200.0)
+        assert status.allowance_seconds == _GRACE_BUDGET_SECONDS
+        assert status.spent_seconds == _GRACE_BUDGET_SECONDS + 60.0
+        assert status.remaining_seconds == 0.0
+        # Only the first charge need age out for the spend to fall back inside the allowance.
+        assert status.replenish_in_seconds == (_NOW + _GRACE_BUDGET_WINDOW_SECONDS) - (_NOW + 200.0)
+
+    def test_an_unspent_card_needs_no_replenishment(self) -> None:
+        """With nothing charged the whole allowance is available and no wait is quoted."""
+        status = WholeCardResidencyLedger().grace_budget_status(0, now=_NOW)
+        assert status.spent_seconds == 0.0
+        assert status.remaining_seconds == _GRACE_BUDGET_SECONDS
+        assert status.replenish_in_seconds == 0.0
+
+
+class TestGovernorDeferDwell:
+    """A head held off the card by a churn governor waits a bounded dwell, then stops preferring the card."""
+
+    def test_the_dwell_runs_from_the_first_deferral_and_then_reports_exhausted(self) -> None:
+        """Consecutive deferrals of one head accumulate until the dwell is spent."""
+        ledger = WholeCardResidencyLedger()
+        elapsed, exhausted = ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
+        assert (elapsed, exhausted) == (0.0, False)
+        elapsed, exhausted = ledger.note_governor_defer(0, model="heavy-model", now=_NOW + 10.0)
+        assert (elapsed, exhausted) == (10.0, False)
+        _elapsed, exhausted = ledger.note_governor_defer(
+            0,
+            model="heavy-model",
+            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS,
+        )
+        assert exhausted is True
+
+    def test_a_new_head_does_not_inherit_the_previous_dwell(self) -> None:
+        """The dwell is one head's wait, so a different model starts its own."""
+        ledger = WholeCardResidencyLedger()
+        ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
+        elapsed, exhausted = ledger.note_governor_defer(
+            0,
+            model="other-heavy-model",
+            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS + 1.0,
+        )
+        assert (elapsed, exhausted) == (0.0, False)
+
+    def test_clearing_the_deferral_restarts_the_next_dwell(self) -> None:
+        """Once the governors let a head through, the next deferral is timed from scratch."""
+        ledger = WholeCardResidencyLedger()
+        ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
+        ledger.clear_governor_defer(0)
+        elapsed, exhausted = ledger.note_governor_defer(
+            0,
+            model="heavy-model",
+            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS + 1.0,
+        )
+        assert (elapsed, exhausted) == (0.0, False)
+
+    def test_the_dwell_is_per_card(self) -> None:
+        """One card's held head says nothing about another card's."""
+        ledger = WholeCardResidencyLedger()
+        ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
+        elapsed, _exhausted = ledger.note_governor_defer(
+            1,
+            model="heavy-model",
+            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS,
+        )
+        assert elapsed == 0.0
 
 
 class TestMaxCoresidentForPeak:
@@ -551,7 +706,6 @@ class TestStructuralCompletionLatch:
             forecast=None,
             cooldown_until=_NOW + 300.0,
             now=_NOW,
-            refresh_established=True,
         )
         return machine
 
@@ -626,15 +780,42 @@ class TestStructuralCompletionLatch:
             now=_NOW,
         )
         assert machine.drain_backstop_elapsed(0, now=_NOW + 100.0, settle_seconds=20.0)
+        machine.record_restore(0, now=_NOW + 90.0)
         machine.record_grant(
             0,
             model="heavy-model",
             forecast=None,
             cooldown_until=_NOW + 400.0,
             now=_NOW + 100.0,
-            refresh_established=True,
         )
         assert not machine.drain_backstop_elapsed(0, now=_NOW + 100.0, settle_seconds=20.0)
+
+    def test_a_reuse_re_ask_keeps_a_converged_residencys_backstop(self) -> None:
+        """A later job for the model the card already holds does not restart the drain clock.
+
+        The card is already converged and drained for that model; restarting the backstop on every re-ask
+        would re-park a head behind a teardown that finished long ago.
+        """
+        machine = self._machine()
+        forecast = self._forecast()
+        machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_clear_of_card=True,
+            weights_fit_live=False,
+            drain_backstop_elapsed=False,
+            device_index=0,
+            now=_NOW,
+        )
+        machine.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=_NOW + 400.0,
+            now=_NOW + 100.0,
+        )
+        assert machine.state_for(0).structural_complete_at == _NOW
+        assert machine.drain_backstop_elapsed(0, now=_NOW + 100.0, settle_seconds=20.0)
 
     def test_omitting_the_clock_records_nothing(self) -> None:
         """A caller that only wants the answer (the ledger's pure query form) latches nothing."""

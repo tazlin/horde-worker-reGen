@@ -131,8 +131,13 @@ async def test_head_dispatches_onto_the_resident_lane_once_the_pin_releases() ->
     assert result.process_with_model is process_map[0]  # dispatched onto the resident lane, not a fresh slot
 
 
-async def test_classifier_names_the_pinned_residency_wait_with_owner_and_peaks() -> None:
-    """The dispatch-stall classifier attributes the held head to the pin, its owning job, and the in-flight peaks."""
+async def test_classifier_names_the_pinned_residency_wait_with_owner_and_sampling_count() -> None:
+    """The classifier attributes the held head to the pin, its owning job, and that sampling is in flight.
+
+    The stall text is compared across cycles by the log throttle and by recovery's judgement of whether a
+    remedy moved the head's blocker, so it carries the count (which changes only when work starts or stops)
+    and not the sampling megabytes, which drift on every measurement while the block is the same.
+    """
     scheduler, head, _process_map = await _scheduler_with_pinned_resident_head(with_free_slot=False)
     scheduler.set_disaggregation_hooks(
         is_disaggregatable=lambda _job: False,
@@ -147,7 +152,8 @@ async def test_classifier_names_the_pinned_residency_wait_with_owner_and_peaks()
     assert bucket is SlotDutyBucket.DISAGG_PIN_WAIT
     assert "process 0" in text
     assert "abcd1234"[:8] in text  # names the disaggregated job holding the pin
-    assert "8000" in text  # surfaces the in-flight sampling peak keeping the card busy
+    assert "1 sampling(s) in flight" in text  # the card is busy sampling, which is what the head waits out
+    assert "8000" not in text  # a per-measurement figure would make the stall read as a new block every cycle
 
 
 async def test_classifier_names_degraded_isolation_pending() -> None:

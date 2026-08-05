@@ -29,6 +29,8 @@ from enum import StrEnum, auto
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 
 __all__ = [
+    "GraceBudgetStatus",
+    "WholeCardGrantKind",
     "WholeCardPhase",
     "WholeCardResidency",
     "WholeCardResidencyLedger",
@@ -78,6 +80,31 @@ Capping the spend at 30% of the window bounds how much of any window residency c
 so at admission rather than by withdrawing a window already granted: a granted window covers a teardown the
 scheduler itself commanded, so withdrawing it part-way would have the supervisor judge that deliberate action
 as a wedge. The bound on a residency that never completes is the granted window's own duration."""
+
+_GOVERNOR_DEFER_DWELL_SECONDS = _ESTABLISH_WINDOW_SECONDS
+"""How long a head may be held off the card by a churn governor before it stops asking for the card.
+
+Both governors brake the *rate* at which a card may be rotated; neither is a finding that the head cannot be
+served. Left unbounded they become an absolute park: a card measurably able to hold the model sits idle while
+the queue stands still, which costs far more than the churn the brake was protecting against. Sized at one
+establishment window, the longest a rate deferral can itself last, so a governor that is going to release on
+its own is given the chance to before the preference is abandoned. Past it the head falls through to ordinary
+measured admission and runs co-resident where the device reading allows: slower than sole residency, and
+strictly better than not running."""
+
+
+@dataclass(frozen=True)
+class GraceBudgetStatus:
+    """One card's rolling grace spend against its allowance, and the wait for the next replenishment."""
+
+    allowance_seconds: float
+    """Total grace the card may have open across the rolling window."""
+    spent_seconds: float
+    """Grace granted inside the rolling window, which is what the allowance is measured against."""
+    remaining_seconds: float
+    """Allowance still available, floored at zero once the spend has passed it."""
+    replenish_in_seconds: float
+    """Wait until enough charges age out for the spend to fall back inside the allowance; 0.0 when it already is."""
 
 
 @dataclass
@@ -133,6 +160,21 @@ class WholeCardResidency:
     """When each of this card's whole-card residencies was established, newest last.
 
     Pruned to :data:`_ESTABLISH_WINDOW_SECONDS` whenever the rate limiter is consulted."""
+    governor_deferred_model: str | None = None
+    """The head model a churn governor is currently holding off this card; None when none is held."""
+    governor_deferred_since: float = 0.0
+    """When the current governor deferral of ``governor_deferred_model`` began; 0.0 when none is in force."""
+
+
+class WholeCardGrantKind(StrEnum):
+    """What a residency grant cost the card it was recorded against."""
+
+    ESTABLISH = auto()
+    """The card took the model on physically (it held nothing, or held something else), so the grant opened a
+    grace window, counted toward the establishment rate, and reset the holds that a teardown resets."""
+    REUSE = auto()
+    """A further job asked for the model the card already holds, which costs no teardown and so charges
+    nothing: it extends the cooldown and leaves every clock the physical episode started where it was."""
 
 
 class WholeCardPhase(StrEnum):
@@ -202,38 +244,47 @@ class WholeCardResidencyLedger:
         forecast: StreamForecast | None,
         cooldown_until: float,
         now: float,
-        refresh_established: bool,
         establish_grace_seconds: float = 0.0,
-    ) -> WholeCardResidency:
+    ) -> WholeCardGrantKind:
         """Record a residency grant (an establishment or a RAM pre-stage) for ``device_index``.
 
-        Sets the model and cooldown; captures the grant forecast only when the residency is fresh, keeping it
-        immutable through repeated asks for the same held model. Stamps ``established_at`` when
-        ``refresh_established`` is set or the residency is fresh, so the recovery supervisor's grace window is
-        measured from when the intentional hold began. A stamped establishment also opens a fresh min-hold
-        floor and clears any structural-completion latch from the previous grant. A re-established residency
-        tears down again, so it must not inherit an elapsed drain backstop. The stamp also records the
-        establishment for the rate limiter and
-        charges ``establish_grace_seconds`` against the card's rolling grace budget. Passing zero seconds
-        records no charge, which is what a caller that is not claiming a grace window should do.
+        Sets the model and cooldown, and returns which kind of grant this was. Everything else the grant
+        touches is scoped to a *physical* grace window: the card taking the model on when it held nothing or
+        held something else. That is what costs a teardown, opens the window the recovery supervisor honours,
+        and resets the clocks a teardown resets, so it stamps ``established_at``, opens a fresh min-hold
+        floor, clears the previous grant's structural-completion latch (a re-established residency tears down
+        again, so it must not inherit an elapsed drain backstop), records the establishment for the rate
+        limiter, and charges ``establish_grace_seconds`` against the card's rolling grace budget. Passing zero
+        seconds records no charge, which is what a caller not claiming a grace window should do.
 
-        Returns the updated state.
+        A further job asking for the model the card already holds is a reuse: it rides the residency the
+        cooldown is deliberately keeping alive and physically costs nothing, so it only extends the cooldown.
+        Charging it, counting it, or re-opening its establish window would spend an allowance sized for
+        teardown churn on jobs that caused none, hand the supervisor a fresh excuse for a queue nothing is
+        tearing down, and restart the drain backstop of a residency that has already converged. The grant
+        forecast is likewise captured only for a physical grant, keeping it immutable across repeated asks.
         """
         state = self.state_for(device_index)
-        fresh_grant = state.model is None or state.model != model
-        if refresh_established or state.established_at == 0.0:
+        kind = (
+            WholeCardGrantKind.REUSE
+            if state.model is not None and state.model == model and state.established_at != 0.0
+            else WholeCardGrantKind.ESTABLISH
+        )
+        if kind is WholeCardGrantKind.ESTABLISH:
             state.established_at = now
             state.min_hold_until = now + _MIN_HOLD_SECONDS
             state.structural_complete_at = 0.0
             state.establishments.append(now)
             if establish_grace_seconds > 0.0:
                 state.grace_charges.append((now, establish_grace_seconds))
-        if fresh_grant or state.forecast is None:
+            state.forecast = forecast
+            state.repriced_target = forecast.max_resident_processes() if forecast is not None else None
+        elif state.forecast is None:
             state.forecast = forecast
             state.repriced_target = forecast.max_resident_processes() if forecast is not None else None
         state.model = model
         state.cooldown_until = cooldown_until
-        return state
+        return kind
 
     def record_restore(self, device_index: int | None, *, now: float, restore_grace_seconds: float = 0.0) -> None:
         """Clear a drained residency on ``device_index`` and open its restore window.
@@ -334,6 +385,68 @@ class WholeCardResidencyLedger:
             return False
         _prune_charges_before(state.grace_charges, cutoff=now - _GRACE_BUDGET_WINDOW_SECONDS)
         return sum(seconds for _granted_at, seconds in state.grace_charges) > _GRACE_BUDGET_SECONDS
+
+    def grace_budget_status(self, device_index: int | None, *, now: float) -> GraceBudgetStatus:
+        """Return this card's rolling grace spend, remaining allowance, and wait for the next replenishment.
+
+        The disclosure companion to :meth:`grace_budget_exhausted`: a refusal that quotes the arithmetic can be
+        acted on, where a bare "deferred" cannot. The replenishment wait is derived from the charges
+        themselves, being how long until enough of them age out of the rolling window for the spend to sit back
+        inside the allowance.
+        """
+        state = self._residencies.get(device_index)
+        if state is None:
+            return GraceBudgetStatus(
+                allowance_seconds=_GRACE_BUDGET_SECONDS,
+                spent_seconds=0.0,
+                remaining_seconds=_GRACE_BUDGET_SECONDS,
+                replenish_in_seconds=0.0,
+            )
+        _prune_charges_before(state.grace_charges, cutoff=now - _GRACE_BUDGET_WINDOW_SECONDS)
+        spent = sum(seconds for _granted_at, seconds in state.grace_charges)
+        replenish_in = 0.0
+        if spent > _GRACE_BUDGET_SECONDS:
+            outstanding = spent
+            for granted_at, seconds in state.grace_charges:
+                outstanding -= seconds
+                if outstanding <= _GRACE_BUDGET_SECONDS:
+                    replenish_in = max(0.0, (granted_at + _GRACE_BUDGET_WINDOW_SECONDS) - now)
+                    break
+        return GraceBudgetStatus(
+            allowance_seconds=_GRACE_BUDGET_SECONDS,
+            spent_seconds=spent,
+            remaining_seconds=max(0.0, _GRACE_BUDGET_SECONDS - spent),
+            replenish_in_seconds=replenish_in,
+        )
+
+    @property
+    def governor_defer_dwell_seconds(self) -> float:
+        """How long a head may be held off a card by a churn governor before it stops asking for the card."""
+        return _GOVERNOR_DEFER_DWELL_SECONDS
+
+    def note_governor_defer(self, device_index: int | None, *, model: str | None, now: float) -> tuple[float, bool]:
+        """Record that a churn governor is holding ``model`` off this card, and report the wait so far.
+
+        Returns ``(elapsed_seconds, dwell_exhausted)``. The wait is anchored at the first of a run of
+        deferrals for this model on this card and restarts whenever the deferred model changes, so one head's
+        wait is never inherited by the next. ``dwell_exhausted`` is the caller's cue to stop preferring the
+        whole card for this head and let ordinary measured admission decide instead; see
+        :data:`_GOVERNOR_DEFER_DWELL_SECONDS` for why the preference is bounded at all.
+        """
+        state = self.state_for(device_index)
+        if state.governor_deferred_model != model or state.governor_deferred_since == 0.0:
+            state.governor_deferred_model = model
+            state.governor_deferred_since = now
+        elapsed = max(0.0, now - state.governor_deferred_since)
+        return elapsed, elapsed >= _GOVERNOR_DEFER_DWELL_SECONDS
+
+    def clear_governor_defer(self, device_index: int | None) -> None:
+        """Forget any governor deferral recorded for this card, so the next one is timed from its own start."""
+        state = self._residencies.get(device_index)
+        if state is None:
+            return
+        state.governor_deferred_model = None
+        state.governor_deferred_since = 0.0
 
     @staticmethod
     def _window_active(

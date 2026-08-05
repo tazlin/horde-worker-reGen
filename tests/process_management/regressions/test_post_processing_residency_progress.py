@@ -95,7 +95,6 @@ def _scheduler_with_active_residency(
         ),
         cooldown_until=time.time() + 45,
         now=time.time() - established_seconds_ago,
-        refresh_established=True,
     )
     return scheduler, holder_job
 

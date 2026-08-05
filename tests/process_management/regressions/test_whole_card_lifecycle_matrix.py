@@ -525,7 +525,6 @@ def test_residency_scenario_matrix_preserves_lifecycle_invariants(case: Residenc
                 forecast=forecast,
                 cooldown_until=now + 90.0,
                 now=now,
-                refresh_established=True,
                 establish_grace_seconds=120.0,
             )
 
@@ -609,7 +608,6 @@ def test_db0_twenty_minute_rotation_sim_drains_every_admitted_head() -> None:
             forecast=forecast,
             cooldown_until=float(now + 90),
             now=float(now),
-            refresh_established=True,
             establish_grace_seconds=120.0,
         )
         assert machine.teardown_complete(

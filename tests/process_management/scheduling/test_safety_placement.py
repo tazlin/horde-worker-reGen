@@ -322,7 +322,6 @@ class TestPlacementRequestOwnership:
             forecast=None,
             cooldown_until=100.0,
             now=0.0,
-            refresh_established=True,
         )
 
         scheduler._reconcile_runtime_safety_placement()
@@ -471,7 +470,6 @@ class TestResidencyRestoreRespectsPlacementWish:
             forecast=None,
             cooldown_until=0.0,
             now=0.0,
-            refresh_established=True,
         )
         return scheduler
 

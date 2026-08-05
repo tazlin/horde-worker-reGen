@@ -77,7 +77,6 @@ def _grant_residency(scheduler: InferenceScheduler, model: str) -> None:
         forecast=None,
         cooldown_until=time.time() + 60.0,
         now=time.time(),
-        refresh_established=True,
     )
 
 
