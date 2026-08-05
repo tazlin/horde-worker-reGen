@@ -37,6 +37,9 @@ A heterogeneous box (say a 24 GB card alongside a 12 GB card) can give each card
 standing up separate workers. Each card sets only the fields that should differ from the global config;
 everything else inherits.
 
+Per-card overrides work the same whether the worker reads `bridgeData.yaml`, JSON, or environment variables;
+the YAML parser's private state is not carried into the resolved per-card runtime configs.
+
 The easiest path is the **Config → Per-GPU** tab: each driven, detected, or selected card gets a
 collapsible section (two laid out side by side on a wide terminal, so comparing a pair of cards is easy).
 Inside, every overridable knob has an *Override* toggle that is off (the disabled control shows the

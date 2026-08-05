@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,6 +12,7 @@ from horde_worker_regen.bridge_data.gpu_config import (
     resolve_all_effective_gpu_configs,
     resolve_effective_gpu_config,
 )
+from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, ConfigFormat
 
 _API_KEY = "0" * 22
 
@@ -72,6 +75,22 @@ class TestResolveInheritance:
         assert resolved.nsfw is False
         assert resolved.allow_lora is True  # inherited
         assert base.max_threads == 4  # global object is not mutated by resolving a card
+
+    def test_yaml_loaded_base_with_override_does_not_copy_loader(self, tmp_path: Path) -> None:
+        """Resolving a YAML-loaded config must not deepcopy ruamel's unpicklable open-stream state."""
+        config_path = tmp_path / "bridgeData.yaml"
+        config_path.write_text(
+            f'api_key: "{_API_KEY}"\nmodels_to_load: [modelA]\ngpu_overrides:\n  0:\n    queue_size: 4\n',
+            encoding="utf-8",
+        )
+        base = BridgeDataLoader.load(config_path, file_format=ConfigFormat.yaml)
+
+        resolved = resolve_all_effective_gpu_configs(base, [0])[0]
+
+        assert resolved is not base
+        assert resolved.queue_size == 4
+        assert resolved._yaml_loader is None
+        assert base._yaml_loader is not None
 
 
 class TestBridgeDataTimeoutDefaults:

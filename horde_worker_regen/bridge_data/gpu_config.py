@@ -12,10 +12,12 @@ The resolved per-card config is itself a :class:`~horde_worker_regen.bridge_data
 not a bespoke view type: every scheduler/popper consumer already takes a ``reGenBridgeData``, so a per-card
 one is drop-in, and there is no second (and third) place to add a field whenever a new one becomes
 per-card-relevant. :func:`resolve_effective_gpu_config` applies the override as a delta
-(``model_copy(update=...)`` of the global config with only the operator-set fields) and then re-applies the
-same cross-field normalisation the constructor runs (extra-slow clamps, performance-mode timeout scaling,
-the ``queue_size`` cap, the controlnet/img2img dependency chain, and meta-instruction extraction when a
-model list is replaced), reusing the standalone helpers in
+(``model_copy(update=...)`` of the global config with only the operator-set fields). The copy is deliberately
+shallow because configs are read-only after resolution and a YAML-loaded config owns an uncopyable private
+ruamel loader; the resolved runtime-only copy drops that loader. The resolver then re-applies the same
+cross-field normalisation the constructor runs (extra-slow clamps, performance-mode timeout scaling, the
+``queue_size`` cap, the controlnet/img2img dependency chain, and meta-instruction extraction when a model
+list is replaced), reusing the standalone helpers in
 :mod:`horde_worker_regen.bridge_data.data_model` rather than re-deriving the rules here. A card with no
 override inherits the global config unchanged (the single-GPU case is bit-for-bit identical), so the
 returned config must be treated as read-only by consumers.
@@ -68,7 +70,13 @@ def resolve_effective_gpu_config(
     delta = override.model_dump(exclude_unset=True)
     if not delta:
         return base
-    resolved = base.model_copy(update=delta, deep=True)
+    # Config consumers treat the result as read-only, and every normalisation below assigns fields rather
+    # than mutating inherited containers. A deep Pydantic copy is actively unsafe here: YAML-loaded configs
+    # retain ruamel's loader as private state, including its closed TextIOWrapper, which deepcopy cannot
+    # pickle. Keep the base's public values by reference and discard the runtime-irrelevant loader on the
+    # per-card copy; the base retains it for save().
+    resolved = base.model_copy(update=delta)
+    resolved._yaml_loader = None
     _renormalize_overridden_config(resolved, changed_fields=set(delta))
     return resolved
 
