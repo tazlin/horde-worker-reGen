@@ -254,6 +254,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.overbudget_exclusive_mode = True
     bd.whole_card_residency_safety_off_gpu = True
     bd.whole_card_residency_cooldown_seconds = 0
+    bd.whole_card_residency_max_hold_seconds = 180
     bd.large_model_switch_min_seconds = 0
     bd.large_model_reentry_cooldown_seconds = -1
     bd.unservable_model_fault_threshold = 3

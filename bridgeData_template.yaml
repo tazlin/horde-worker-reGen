@@ -718,6 +718,14 @@ whole_card_residency_safety_off_gpu: true
 # churn. 0 restores immediately (most responsive, most churn). Only used with enable_vram_budget.
 whole_card_residency_cooldown_seconds: 45
 
+# Longest one whole-card residency may own the card, measured from when it was established. While a
+# residency is held the worker advertises only the resident model, so the horde stops sending work that
+# would push those weights back to system RAM or off the card; this ceiling is what guarantees a
+# multi-model worker returns to its full pool. Past it the residency stops being retained and lets go once
+# its own accepted work has drained. A residency whose model runs out of demand releases sooner than this
+# on its own. 0 disables both the ceiling and the single-model offer. Only used with enable_vram_budget.
+whole_card_residency_max_hold_seconds: 180
+
 # Minimum seconds between accepting jobs for *different* very-large models (Flux/Cascade/Qwen/Z-Image and
 # the named VRAM-heavy checkpoints). A queue that alternates distinct very-large models forces a fresh
 # whole-card teardown and a multi-GB checkpoint reload on every switch. Above 0, once a very-large model is

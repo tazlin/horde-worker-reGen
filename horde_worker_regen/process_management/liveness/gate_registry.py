@@ -599,6 +599,34 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         backstop=_POP_GATE_WEDGE_BACKSTOP,
         observable_at="the large_model_switch and large_model_reentry governor spells, and the last_pop_gate stamp",
     ),
+    GateEntry(
+        key="whole_card_pop_claim",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.scheduling.governance.whole_card",
+        engaged_by=(
+            "a whole-card residency claims the offer for its resident model, and that model is not offerable "
+            "this cycle (a quarantine or a serviceability exclusion already took it out), so narrowing the "
+            "offer to it leaves nothing to advertise"
+        ),
+        released_by=(
+            "the residency's claim ending, whether by the maximum hold elapsing, the empty-pop evidence "
+            "finding the resident model has no demand left, or the residency itself releasing; the claim is "
+            "derived from the residency and the clock on every ask, so it cannot outlive either. The exclusion "
+            "that emptied the offer has its own release beneath it"
+        ),
+        bound_seconds=None,
+        bound_source=(
+            "the operator's whole_card_residency_max_hold_seconds, measured from the residency's "
+            "establishment; whole_card._POP_CLAIM_EMPTY_POP_RUN over "
+            "whole_card._POP_CLAIM_EMPTY_POP_WINDOW_SECONDS ends an unwanted claim sooner"
+        ),
+        backstop=_POP_GATE_WEDGE_BACKSTOP,
+        observable_at=(
+            "the edge-triggered whole-card pop claim engage/release lines, which name the model, the cap and "
+            "the release reason; InferenceScheduler.whole_card_pop_claim, and the last_pop_gate stamp"
+        ),
+    ),
     # endregion
     # region whole-card churn governors
     GateEntry(

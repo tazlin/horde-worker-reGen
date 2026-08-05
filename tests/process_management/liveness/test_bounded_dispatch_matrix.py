@@ -65,6 +65,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import Measure
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _GRACE_BUDGET_SECONDS,
+    offer_under_pop_claim,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
@@ -209,6 +210,27 @@ class _MidSequenceEvent(Enum):
     """An idle sibling's resident model is evicted by an actor other than this scheduler."""
 
 
+class _ClaimScenario(Enum):
+    """What a row asserts about the residency's claim over the worker's pop offer.
+
+    A residency governs the card; the claim is the same commitment applied to intake, so that foreign work
+    stops arriving to push the resident weights back out. Each value names one end of that arrangement: the
+    burst it exists to serve, and the three ways it gives the pool back.
+    """
+
+    NONE = "none"
+    """The row says nothing about intake; the claim is exercised only as far as the other properties reach."""
+    SERVES_THE_BURST = "serves_the_burst"
+    """Work for the resident model keeps arriving and is served, while foreign work is not asked for."""
+    CAP_RETURNS_THE_POOL = "cap_returns_the_pool"
+    """The maximum hold elapses over a still-wanted residency, returning the full offer and draining the
+    foreign work the claim had been holding back."""
+    EMPTY_POPS_RELEASE = "empty_pops_release"
+    """The resident model's demand dries up, so the claim releases on that evidence well inside its cap."""
+    FOREIGN_QUEUED_FIRST = "foreign_queued_first"
+    """Foreign jobs accepted before the residency existed wait for the claim to end, then drain."""
+
+
 class _Expected(Enum):
     """What the row asserts about the head."""
 
@@ -247,6 +269,8 @@ class _DispatchWorld:
         max_threads: int,
         queue_depth: int,
         whole_card_enabled: bool = True,
+        cooldown_seconds: int = 0,
+        max_hold_seconds: int = 180,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -256,6 +280,10 @@ class _DispatchWorld:
             max_threads: The concurrent-sampling cap (the ``max_threads`` config axis).
             queue_depth: The configured queue size, so an at-depth row can express a full queue.
             whole_card_enabled: Whether preventative whole-card exclusive residency is on.
+            cooldown_seconds: How long a drained residency is retained for a follow-on heavy job. Raised by
+                the rows that need the residency to still be standing when they make their assertion.
+            max_hold_seconds: The operator ceiling on one residency episode, which is also what bounds its
+                claim over the offer.
         """
         self.card = card
         self.tick = 0
@@ -296,9 +324,18 @@ class _DispatchWorld:
             vram_reserve_mb=0,
             ram_reserve_mb=8192.0,
             vram_per_process_overhead_mb=_FIRST_CONTEXT_MB,
-            whole_card_residency_cooldown_seconds=0,
+            whole_card_residency_cooldown_seconds=cooldown_seconds,
+            whole_card_residency_max_hold_seconds=max_hold_seconds,
             image_models_to_load=[model.name for model in _MODEL_CLASSES],
         )
+        self.offers: dict[int, frozenset[str]] = {}
+        """What the worker would have advertised at the end of each tick, through the real claim seam."""
+        self.claim_ticks: list[int] = []
+        """The ticks a whole-card residency was claiming the offer, so a row can order events against it."""
+        self.claim_expires_at = 0.0
+        """When the standing claim's maximum hold runs out, as the claim itself reported it."""
+        self.claim_released_at = 0.0
+        """The world's clock when the claim first stopped standing; 0.0 while one has never ended."""
         self._lane_ceiling = lane_count
         self._lifecycle = _make_mock_lifecycle(self)
         self._scheduler = InferenceScheduler(
@@ -366,6 +403,35 @@ class _DispatchWorld:
     async def pop(self, job: ImageGenerateJobPopResponse) -> None:
         """Record a popped job, exactly as the pop path hands one to the tracker."""
         await track_popped_job_async(self._job_tracker, job, time_popped=self.now)
+
+    # -- intake -------------------------------------------------------------------------------------------
+
+    def advertised_models(self) -> frozenset[str]:
+        """The models the worker would ask the horde for right now.
+
+        Only the residency's claim over the offer is modelled here (through the same pure stage the popper
+        runs, over the same scheduler accessor it reads), because that is the only offer shaping these rows
+        vary. The other narrowings are the pop suite's subject.
+        """
+        return offer_under_pop_claim(
+            frozenset(model.name for model in _MODEL_CLASSES),
+            claim=self._scheduler.whole_card_pop_claim(),
+        )
+
+    async def offer_job(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Take a job only when its model is one the worker is currently asking for.
+
+        Stands in for the horde answering a pop with a job: work the worker did not advertise never arrives,
+        so a job for an unadvertised model is refused and the queue never sees it.
+        """
+        if job.model not in self.advertised_models():
+            return False
+        await self.pop(job)
+        return True
+
+    def report_empty_pop(self) -> None:
+        """Report that a pop taken under the standing claim came back with no work."""
+        self._scheduler.note_whole_card_pop_outcome(served=False)
 
     # -- child-side effects -------------------------------------------------------------------------------
 
@@ -647,6 +713,13 @@ class _DispatchWorld:
         self._scheduler.preload_models()
         self._begin_started_preloads()
         await self._dispatch_until_full()
+        self.offers[self.tick] = self.advertised_models()
+        claim = self._scheduler.whole_card_pop_claim()
+        if claim is not None:
+            self.claim_ticks.append(self.tick)
+            self.claim_expires_at = claim.expires_at
+        elif self.claim_ticks and self.claim_released_at == 0.0:
+            self.claim_released_at = self.now
 
     async def run(self, ticks: int) -> None:
         """Advance ``ticks`` scheduling ticks."""
@@ -771,6 +844,9 @@ class _Row:
         run_ticks: How many ticks to drive in total (at least the bound, plus drain ticks for the
             obligation-closure assertions).
         drain_all: Whether every queued job (not only the head) must drain within ``run_ticks``.
+        claim: What the row asserts about the residency's claim over the pop offer.
+        cooldown_seconds: How long a drained residency is retained for a follow-on heavy job.
+        max_hold_seconds: The ceiling on one residency episode, which also bounds its claim.
     """
 
     label: str
@@ -787,6 +863,9 @@ class _Row:
     run_ticks: int = 14
     drain_all: bool = True
     whole_card_enabled: bool = True
+    claim: _ClaimScenario = _ClaimScenario.NONE
+    cooldown_seconds: int = 0
+    max_hold_seconds: int = 180
 
 
 _PRUNED_COMBINATIONS: tuple[tuple[str, str], ...] = (
@@ -825,6 +904,13 @@ _PRUNED_COMBINATIONS: tuple[tuple[str, str], ...] = (
         "EXTERNAL_RECLAIM x rows whose card is not under pressure",
         "an eviction that frees room nothing was waiting for varies nothing; the event is applied only where "
         "the head's admission actually turns on the freed VRAM.",
+    ),
+    (
+        "pop-claim scenarios x every card, model, governor and event value",
+        "the claim is a property of a held residency and of the clock, not of the card it is held on: the "
+        "16 GB flux cell is the one where a residency is genuinely warranted, so the four claim scenarios are "
+        "driven there and the cross-product with hardware that would either never establish a residency or "
+        "never need one is dropped.",
     ),
     (
         "24 GB card x SD15 head x every governor and event value",
@@ -1106,6 +1192,59 @@ def _rows() -> tuple[_Row, ...]:
             whole_card_enabled=False,
             tick_bound=8,
         ),
+        # -- The residency's claim over intake. --------------------------------------------------------------
+        # Each row raises the cooldown so the residency is still standing where its assertion is made: with
+        # the cooldown at zero every residency releases the instant its work drains, which would leave the
+        # claim's own ends untested.
+        _Row(
+            "flux_16gb_claim_serves_the_burst",
+            _CARD_16GB,
+            _FLUX,
+            _Residency.ABSENT,
+            _QueueShape.SAME_MODEL_BURST,
+            tick_bound=8,
+            run_ticks=16,
+            claim=_ClaimScenario.SERVES_THE_BURST,
+            cooldown_seconds=600,
+        ),
+        _Row(
+            "flux_16gb_claim_cap_returns_the_pool",
+            _CARD_16GB,
+            _FLUX,
+            _Residency.ABSENT,
+            _QueueShape.HEAD_PLUS_SKIPPERS,
+            tick_bound=8,
+            run_ticks=16,
+            claim=_ClaimScenario.CAP_RETURNS_THE_POOL,
+            # The cooldown alone would retain this residency for the whole run, so the pool coming back is
+            # attributable to the cap and to nothing else.
+            cooldown_seconds=600,
+            max_hold_seconds=120,
+        ),
+        _Row(
+            "flux_16gb_claim_empty_pops_release",
+            _CARD_16GB,
+            _FLUX,
+            _Residency.ABSENT,
+            _QueueShape.SINGLE_HEAD,
+            tick_bound=8,
+            run_ticks=24,
+            claim=_ClaimScenario.EMPTY_POPS_RELEASE,
+            # Both clocks are set past the run's own reach so the early release is the only thing that can
+            # end the claim inside it; the run is long enough that the cap still terminates the row.
+            cooldown_seconds=600,
+            max_hold_seconds=600,
+        ),
+        _Row(
+            "flux_16gb_claim_foreign_jobs_queued_first",
+            _CARD_16GB,
+            _FLUX,
+            _Residency.ABSENT,
+            _QueueShape.HEAD_PLUS_SKIPPERS,
+            tick_bound=8,
+            run_ticks=16,
+            claim=_ClaimScenario.FOREIGN_QUEUED_FIRST,
+        ),
     )
 
 
@@ -1167,6 +1306,8 @@ async def _build_world(row: _Row) -> tuple[_DispatchWorld, list[ImageGenerateJob
         max_threads=row.max_threads,
         queue_depth=_QUEUE_LENGTHS[row.queue],
         whole_card_enabled=row.whole_card_enabled,
+        cooldown_seconds=row.cooldown_seconds,
+        max_hold_seconds=row.max_hold_seconds,
     )
 
     if row.residency is _Residency.RESIDENT_IDLE_TARGET:
@@ -1372,6 +1513,119 @@ async def test_rate_governed_head_claims_the_card_once_the_brake_lifts(row: _Row
     )
 
 
+_CLAIM_ROWS = tuple(row for row in _ROWS if row.claim is not _ClaimScenario.NONE)
+
+_CLAIM_INTAKE_JOBS = 3
+"""How many further jobs the horde offers a row that models continuing demand.
+
+Enough that the burst outlives the establishment and the first dispatch, and few enough that the queue the
+worker accepts still drains inside the row's ticks."""
+
+
+async def _drive_claim_row(world: _DispatchWorld, row: _Row) -> list[ImageGenerateJobPopResponse]:
+    """Run a claim row, offering the horde's answers through whatever the worker is currently asking for.
+
+    Returns the resident-model jobs the worker accepted mid-run, which is what a row asserting the burst is
+    served reads its outcome from. A foreign job is offered on the same ticks and is expected to be refused
+    for as long as the claim stands: work the worker never advertised is work the horde never sends it.
+    """
+    accepted: list[ImageGenerateJobPopResponse] = []
+    offered_resident = 0
+    for _ in range(row.run_ticks):
+        await world.step()
+        if row.claim is _ClaimScenario.EMPTY_POPS_RELEASE:
+            world.report_empty_pop()
+            continue
+        if row.claim is not _ClaimScenario.SERVES_THE_BURST or offered_resident >= _CLAIM_INTAKE_JOBS:
+            continue
+        offered_resident += 1
+        resident_job = make_job_pop_response(row.head_model.name, width=512, height=512, ddim_steps=8)
+        if await world.offer_job(resident_job):
+            accepted.append(resident_job)
+        foreign_job = make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=8)
+        foreign_taken = await world.offer_job(foreign_job)
+        if world.claim_ticks and world.claim_ticks[-1] == world.tick:
+            assert foreign_taken is False, (
+                f"{row.label}: a foreign job arrived while the residency claimed the offer, which is the "
+                f"intake the claim exists to stop. {world.state_dump()}"
+            )
+    return accepted
+
+
+@pytest.mark.parametrize("row", _CLAIM_ROWS, ids=[row.label for row in _CLAIM_ROWS])
+async def test_the_residency_claims_intake_and_gives_it_back(row: _Row) -> None:
+    """A held residency asks the horde for its own model alone, and every way that claim ends returns the pool.
+
+    The claim is what makes a residency a burst-serving window rather than a card the worker keeps evicting
+    itself from: while it stands, no foreign job is asked for, so nothing arrives to push the resident weights
+    back to host RAM. Each row drives one of its ends and asserts the pool comes back, because a claim with no
+    reachable end is a worker that has advertised itself down to one model permanently.
+    """
+    world, jobs = await _build_world(row)
+
+    accepted = await _drive_claim_row(world, row)
+
+    assert world.claim_ticks, (
+        f"{row.label}: the residency never claimed the offer, so the row proves nothing about intake. "
+        f"{world.state_dump()}"
+    )
+    for tick in world.claim_ticks:
+        assert world.offers[tick] == frozenset({row.head_model.name}), (
+            f"{row.label}: at tick {tick} the claim stood but the worker was still advertising "
+            f"{sorted(world.offers[tick])}. {world.state_dump()}"
+        )
+
+    if row.claim is _ClaimScenario.SERVES_THE_BURST:
+        assert accepted, f"{row.label}: the claim must keep taking work for the model it holds the card for"
+        for job in jobs + accepted:
+            assert world.dispatch_tick(job) is not None, (
+                f"{row.label}: a job for the resident model was not served inside the window the residency "
+                f"was held for. {world.state_dump()}"
+            )
+
+    if row.claim is _ClaimScenario.CAP_RETURNS_THE_POOL:
+        assert row.cooldown_seconds > row.run_ticks * _TICK_SECONDS, (
+            f"{row.label}: precondition, the cooldown outlasts the run, so the pool returning is attributable "
+            "to the maximum hold and to nothing else"
+        )
+        assert world.claim_released_at > 0.0, (
+            f"{row.label}: the maximum hold elapsed and the claim still stands. {world.state_dump()}"
+        )
+        assert world.claim_released_at >= world.claim_expires_at, (
+            f"{row.label}: the claim ended before its cap, so this row is not measuring the cap"
+        )
+
+    if row.claim is _ClaimScenario.EMPTY_POPS_RELEASE:
+        assert world.claim_released_at > 0.0, (
+            f"{row.label}: a resident model the horde has no work for held the offer for the whole run. "
+            f"{world.state_dump()}"
+        )
+        assert world.claim_released_at < world.claim_expires_at, (
+            f"{row.label}: the claim was only ended by its cap; the empty answers must release it sooner, or a "
+            "worker nobody is sending work to sits on its own claim"
+        )
+
+    if row.claim is _ClaimScenario.FOREIGN_QUEUED_FIRST:
+        last_claimed_tick = world.claim_ticks[-1]
+        for job in jobs:
+            if job.model == row.head_model.name:
+                continue
+            dispatched_at = world.dispatch_tick(job)
+            assert dispatched_at is not None, (
+                f"{row.label}: a foreign job queued before the residency existed never drained after the "
+                f"claim ended. {world.state_dump()}"
+            )
+            assert dispatched_at > last_claimed_tick, (
+                f"{row.label}: a foreign job was pulled onto the card at tick {dispatched_at}, while the "
+                f"residency still claimed it. {world.state_dump()}"
+            )
+
+    # However the claim ended, the worker is asking for its whole pool again.
+    assert world.offers[world.tick] == frozenset(model.name for model in _MODEL_CLASSES), (
+        f"{row.label}: the full model pool never came back to the offer. {world.state_dump()}"
+    )
+
+
 def test_the_matrix_states_its_own_coverage() -> None:
     """The table's axes are fully enumerated: every driven row is unique and every omission is explained."""
     labels = [row.label for row in _ROWS]
@@ -1392,3 +1646,4 @@ def test_the_matrix_states_its_own_coverage() -> None:
     assert driven_governors == set(_GovernorState)
     assert driven_events == set(_MidSequenceEvent)
     assert {row.max_threads for row in _ROWS} == {1, 2}
+    assert {row.claim for row in _ROWS} == set(_ClaimScenario)

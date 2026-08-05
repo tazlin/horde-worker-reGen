@@ -1212,6 +1212,20 @@ CONFIG_FIELDS: list[ConfigField] = [
         risk_level="dangerous",
     ),
     ConfigField(
+        "whole_card_residency_max_hold_seconds",
+        "Whole-card maximum hold",
+        FieldKind.INT,
+        "Exclusive residency",
+        "Longest one whole-card residency may own the card. While it is held the worker offers only the "
+        "resident model, so foreign jobs stop arriving to push its weights back off the card; past this "
+        "ceiling the residency lets go and the full model pool returns. 0 disables both.",
+        minimum=0,
+        maximum=1800,
+        unit="s",
+        explicit_default=180,
+        risk_level="dangerous",
+    ),
+    ConfigField(
         "overbudget_step_timeout",
         "Overbudget step timeout",
         FieldKind.INT,

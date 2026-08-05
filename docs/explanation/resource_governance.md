@@ -322,6 +322,48 @@ call sites, bound that churn:
   deliberate action as the wedge. The liveness bound on a residency that never completes is therefore the
   granted window's own duration. The budget replenishes as old grants age out of the window.
 
+### The residency claims intake
+
+The three governors above bound how fast a residency may be *cycled*. They say nothing about the traffic that
+drives the cycling, and the pop offer is where that traffic is decided: while a heavy model holds the card, a
+worker that keeps advertising its whole pool keeps being sent foreign jobs, and each one forces the resident
+weights to yield the VRAM they were given, at best a demotion to host RAM and a bus read-back per bounce and
+at worst a full re-read from disk. The scheduler then spends establish/restore cycles and grace budget on
+contention that intake manufactured upstream.
+
+So a held residency claims the offer. For as long as it stands, the advertised model set is exactly the
+resident model and every other model leaves the offer, which turns the residency into a deliberate
+burst-serving window with a clean entry and a clean exit. The claim shapes what the worker *asks* for and
+never what it will serve: work already accepted keeps its queue position and drains after the claim ends. For
+the same reason, a foreign job cannot line-skip onto the residency card while the claim stands, since pulling
+another model forward there is the very eviction the residency was taken out to prevent; only the resident
+model may still bypass, so a burst for it keeps flowing.
+
+A claim that could stand indefinitely would be a worker that has advertised itself down to one model, so it
+has three ends, and the first to arrive wins:
+
+- **The maximum hold.** `whole_card_residency_max_hold_seconds` caps one residency episode, measured from its
+  establishment and covering the claim, the minimum hold and the cooldown alike. Past it the residency stops
+  being *retained*: the cooldown neither refreshes nor holds, and the residency lets go as soon as its own
+  accepted work has drained. This is what guarantees a multi-model worker returns to its full pool even while
+  the resident model is in continuous demand, and it is deliberately the one operator-facing lever here. It
+  ends retention only; work in flight finishes, and a granted establish or restore grace window still runs its
+  own duration, since that window covers a teardown the scheduler itself commanded.
+- **The empty-pop evidence.** The claim narrows the offer to one model, so the only evidence it can generate
+  is whether that model has work. A run of consecutive pops that come back with nothing, spanning a short
+  window as well as a count, is the finding that the burst is over, and the claim releases early rather than
+  idling out the cap. Both rails are fixed constants: they describe how much evidence is needed to believe a
+  reading, which is not an operator preference. The hysteresis is what stops one unlucky pop ending a
+  productive burst.
+- **The residency itself.** The claim is derived from the residency and the clock on every ask rather than
+  latched, so a residency that drains and restores for any other reason takes its claim with it.
+
+The claim engages only where it cannot do harm. A residency is per-card, so on a host driving more than one
+card the claim is skipped entirely: holding the whole worker's intake to one card's model would starve the
+others. Setting the maximum hold to zero disables the claim along with the cap that bounds it. The short
+post-release withholding of very large models from the offer is unchanged and sits beneath all of this, so a
+released residency does not immediately re-establish.
+
 A governor brakes how fast the card may be rotated; it is never a finding that the head cannot be served. A
 head either governor holds off the card keeps re-asking for a bounded dwell, and once the dwell is spent the
 whole-card preference is dropped for that head: ordinary measured admission decides, and a card that can

@@ -1834,6 +1834,8 @@ class HordeWorkerProcessManager:
             card_runtimes=self._card_runtimes,
             model_metadata=self._model_metadata,
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
+            whole_card_pop_claim=self._inference_scheduler.whole_card_pop_claim,
+            whole_card_pop_outcome=self._inference_scheduler.note_whole_card_pop_outcome,
             admission_baseline_provider=self.latest_baseline_estimate_mb,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
             post_processing_lane_paused_provider=lambda: self._process_lifecycle.is_post_process_gpu_paused,

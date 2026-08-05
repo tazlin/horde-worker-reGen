@@ -1223,6 +1223,23 @@ class reGenBridgeData(CombinedHordeBridgeData):
     with no whole-card job pending or in progress does the worker restore full concurrency. 0 restores
     immediately (maximum responsiveness, maximum churn). Only used when `enable_vram_budget` is true."""
 
+    whole_card_residency_max_hold_seconds: int = Field(default=180, ge=0, le=1800)
+    """Longest a single whole-card residency may own the card, including its claim over the pop offer.
+
+    While a residency is held the worker advertises only the resident model, so the horde stops sending work
+    that would force the resident weights back out to host RAM or off the card entirely. That claim has to
+    end: a multi-model worker must return to its full pool, and a card whose model is in demand could
+    otherwise hold the offer for as long as that demand lasts. This is the ceiling on one residency episode,
+    measured from its establishment and covering the claim, the minimum hold and the cooldown alike; past it
+    the residency stops being retained and lets go as soon as its own accepted work has drained. The
+    residency's other exits still apply beneath it: a burst that dries up releases early on the empty-pop
+    evidence, and a drained residency still releases at its cooldown.
+
+    Kept a few minutes so a residency covers a genuine burst (a multi-gigabyte load plus several heavy jobs)
+    while a job queued for another model just before the residency began still drains inside its deadline. 0
+    disables both the cap and the pop claim, leaving residency duration governed by the cooldown alone. Only
+    used when `enable_vram_budget` is true."""
+
     large_model_switch_min_seconds: int = Field(default=0, ge=0, le=600)
     """Minimum seconds between accepting jobs for *different* very-large models (the switch throttle).
 

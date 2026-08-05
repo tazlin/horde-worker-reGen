@@ -55,6 +55,8 @@ class PopGate(enum.StrEnum):
     """Model selection produced no model this worker can currently serve."""
     LARGE_MODEL_LIMITS = "large_model_limits"
     """The large-model switch throttle and re-entry cooldown emptied the offer for this cycle."""
+    WHOLE_CARD_POP_CLAIM = "whole_card_pop_claim"
+    """A whole-card residency claims the offer and its model is not currently offerable, so nothing is left."""
 
 
 class PopPauseOwner(enum.StrEnum):

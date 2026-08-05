@@ -11,6 +11,11 @@ on how much recovery-supervisor grace a card may open per window. The budget is 
 off a *new* establishment until the spend replenishes, and never withdraws a window already granted. Each is
 stored and answered here, and actuated at the scheduler's call sites.
 
+A held residency also claims the worker's intake: while the claim stands the offer is exactly the resident
+model, so the horde stops sending work that would force the resident weights back out of the card. The claim
+is a residency fact, so its state and its two end conditions (the operator-configured maximum hold, and the
+run of empty pops that says the resident model's demand has dried up) are answered here too.
+
 The scheduler keeps the transitions that touch live processes (establish, converge,
 restore); it reads and writes residency state exclusively through
 [`WholeCardResidencyLedger`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyLedger].
@@ -33,10 +38,12 @@ __all__ = [
     "WholeCardGovernor",
     "WholeCardGrantKind",
     "WholeCardPhase",
+    "WholeCardPopClaim",
     "WholeCardResidency",
     "WholeCardResidencyLedger",
     "WholeCardResidencyMachine",
     "max_coresident_for_peak",
+    "offer_under_pop_claim",
 ]
 
 _MIN_HOLD_SECONDS = 90.0
@@ -94,6 +101,27 @@ measured admission and runs co-resident where the device reading allows: slower 
 strictly better than not running."""
 
 
+_POP_CLAIM_EMPTY_POP_RUN = 3
+"""Consecutive pops that must come back with no work for the resident model before the claim releases.
+
+One empty pop is the horde's ordinary answer between jobs, not evidence that a burst is over, and ending a
+residency on it would pay a full teardown and regrowth for a lull of a few seconds. Three is the shortest run
+that cannot be produced by that ordinary spacing, and it is reached within seconds at any pop cadence, so the
+hysteresis costs the worker almost nothing when the demand really has gone."""
+
+_POP_CLAIM_EMPTY_POP_WINDOW_SECONDS = 30.0
+"""How long the run of empty pops must have spanned before it counts as the demand having dried up.
+
+The count alone is cadence-dependent: a worker popping every second reaches three empties in a gap far too
+short to conclude anything from. Requiring the run to also cover a span makes the evidence a statement about
+the horde's queue rather than about this worker's pop rate. Deliberately short next to the maximum hold, so
+an idle residency is given back long before the cap has to end it.
+
+Both rails are fixed rather than operator-configured: they describe how much evidence is needed to believe a
+reading, which is not a preference, and the operator-facing lever over how long a residency may own the
+intake is the maximum hold."""
+
+
 class WholeCardGovernor(StrEnum):
     """The churn governors that may bar a card from taking on a *new* whole-card residency.
 
@@ -121,6 +149,27 @@ class GraceBudgetStatus:
     """Allowance still available, floored at zero once the spend has passed it."""
     replenish_in_seconds: float
     """Wait until enough charges age out for the spend to fall back inside the allowance; 0.0 when it already is."""
+
+
+@dataclass(frozen=True)
+class WholeCardPopClaim:
+    """One card's standing claim over the worker's pop offer, held for the duration of its residency.
+
+    While a claim stands the advertised model set is exactly :attr:`model`. Every other model leaves the
+    offer, because a foreign job accepted now forces the resident weights to page back to host RAM or be
+    re-read from disk, and the scheduler then spends an establish/restore cycle on contention that intake
+    manufactured. The claim is a promise about what the worker asks for, never about what it will serve:
+    work already accepted keeps its queue position and drains after the claim ends.
+    """
+
+    model: str
+    """The resident model, and so the only model the worker advertises while this claim stands."""
+    device_index: int | None
+    """The card whose residency holds the claim (``None`` on a single-GPU host)."""
+    held_since: float
+    """When the residency behind the claim was established, which is where the maximum hold is measured from."""
+    expires_at: float
+    """When the maximum hold elapses, after which the pool returns whatever the residency itself is doing."""
 
 
 @dataclass
@@ -187,6 +236,16 @@ class WholeCardResidency:
     """The head model a churn governor is currently holding off this card; None when none is held."""
     governor_deferred_since: float = 0.0
     """When the current governor deferral of ``governor_deferred_model`` began; 0.0 when none is in force."""
+    pop_claim_empty_pops: int = 0
+    """Consecutive pops that came back with no work while this residency claimed the offer; 0 when the last
+    one was served or none has been reported."""
+    pop_claim_empty_pop_since: float = 0.0
+    """When the current run of empty pops began, so the run is judged over a span as well as a count."""
+    pop_claim_released_at: float = 0.0
+    """When the empty-pop evidence ended this residency's claim over the offer; 0.0 while it still stands.
+
+    Distinct from the maximum hold, which is a clock on the grant: this is a finding that the resident model
+    has no demand left, so continuing to hold the pool to it would starve the worker on its own claim."""
 
 
 class WholeCardGrantKind(StrEnum):
@@ -293,10 +352,16 @@ class WholeCardResidencyLedger:
             if state.model is not None and state.model == model and state.established_at != 0.0
             else WholeCardGrantKind.ESTABLISH
         )
+        # A grant of either kind is a job asking for this model, which is the direct contradiction of the
+        # empty-pop evidence: the run restarts from the demand that just arrived. An establishment additionally
+        # restarts the maximum hold, since the clock measures one physical residency episode.
+        state.pop_claim_empty_pops = 0
+        state.pop_claim_empty_pop_since = 0.0
         if kind is WholeCardGrantKind.ESTABLISH:
             state.established_at = now
             state.min_hold_until = now + _MIN_HOLD_SECONDS
             state.structural_complete_at = 0.0
+            state.pop_claim_released_at = 0.0
             state.establishments.append(now)
             if establish_grace_seconds > 0.0:
                 state.grace_charges.append((now, establish_grace_seconds))
@@ -329,6 +394,9 @@ class WholeCardResidencyLedger:
         state.min_hold_until = 0.0
         state.structural_complete_at = 0.0
         state.prestage_process_id = None
+        state.pop_claim_empty_pops = 0
+        state.pop_claim_empty_pop_since = 0.0
+        state.pop_claim_released_at = 0.0
         state.restore_at = now
         if restore_grace_seconds > 0.0:
             state.grace_charges.append((now, restore_grace_seconds))
@@ -356,6 +424,96 @@ class WholeCardResidencyLedger:
         if state is None or state.model is None:
             return False
         return now < state.min_hold_until
+
+    def pop_claim(
+        self,
+        device_index: int | None,
+        *,
+        now: float,
+        max_hold_seconds: float,
+    ) -> WholeCardPopClaim | None:
+        """Return this card's standing claim over the pop offer, or None when it holds none.
+
+        A claim stands from the establishment until the first of its two ends: ``max_hold_seconds`` elapsing
+        from the grant, or the empty-pop evidence finding that the resident model has no demand left. A
+        non-positive ``max_hold_seconds`` means the caller is not running the claim at all (the operator
+        disabled it, or the host drives more than one card), and no claim is ever reported.
+
+        Deliberately live rather than latched: the claim is derived from the residency and the clock on every
+        ask, so releasing the residency releases the claim with it and nothing can outlive the thing it was
+        taken for.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.model is None or max_hold_seconds <= 0.0:
+            return None
+        if state.pop_claim_released_at != 0.0 or state.established_at == 0.0:
+            return None
+        expires_at = state.established_at + max_hold_seconds
+        if now >= expires_at:
+            return None
+        return WholeCardPopClaim(
+            model=state.model,
+            device_index=device_index,
+            held_since=state.established_at,
+            expires_at=expires_at,
+        )
+
+    def note_pop_outcome(self, device_index: int | None, *, served: bool, now: float) -> bool:
+        """Record what one pop taken under this card's claim came back with, and report an early release.
+
+        A pop that returned work is proof the resident model still has demand, so it restarts the run. A pop
+        that returned nothing extends it, and once the run has both reached :data:`_POP_CLAIM_EMPTY_POP_RUN`
+        and covered :data:`_POP_CLAIM_EMPTY_POP_WINDOW_SECONDS` the claim is released: a residency whose model
+        nobody is asking for would otherwise hold the whole pool to itself until the maximum hold expired,
+        which is the worker starving on its own claim.
+
+        Returns:
+            True on the pop that released the claim, so the caller can disclose the edge once.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.model is None:
+            return False
+        if served:
+            state.pop_claim_empty_pops = 0
+            state.pop_claim_empty_pop_since = 0.0
+            return False
+        if state.pop_claim_empty_pops == 0:
+            state.pop_claim_empty_pop_since = now
+        state.pop_claim_empty_pops += 1
+        if state.pop_claim_released_at != 0.0:
+            return False
+        if state.pop_claim_empty_pops < _POP_CLAIM_EMPTY_POP_RUN:
+            return False
+        if (now - state.pop_claim_empty_pop_since) < _POP_CLAIM_EMPTY_POP_WINDOW_SECONDS:
+            return False
+        state.pop_claim_released_at = now
+        return True
+
+    def pop_claim_retention_ended(
+        self,
+        device_index: int | None,
+        *,
+        now: float,
+        max_hold_seconds: float,
+    ) -> bool:
+        """Return whether this residency's claim has ended, so the residency is no longer retained.
+
+        The two ends of a claim are also the two statements that the residency has had its window: the
+        maximum hold caps how long one grant may own the card and the intake, and the empty-pop release says
+        the demand it was holding for is gone. Past either, the release path stops refreshing the cooldown and
+        stops honouring a standing one, so the residency lets go as soon as its own work has drained.
+
+        It ends retention, never an action in flight: a granted establish or restore window runs its full
+        duration, and work already dispatched is left to finish.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.model is None or max_hold_seconds <= 0.0:
+            return False
+        if state.pop_claim_released_at != 0.0:
+            return True
+        if state.established_at == 0.0:
+            return False
+        return now >= (state.established_at + max_hold_seconds)
 
     def establish_rate_exceeded(self, device_index: int | None, *, now: float) -> bool:
         """Return whether this card has already established as often as the rolling window allows.
@@ -655,6 +813,22 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         if weights_fit_live:
             return True
         return forecast.fits_alone_beside(resident_context_charge_mb) and drain_backstop_elapsed
+
+
+def offer_under_pop_claim(models: frozenset[str], *, claim: WholeCardPopClaim | None) -> frozenset[str]:
+    """Return the model set a worker may advertise while ``claim`` stands.
+
+    With no claim the offer passes through untouched. Under a claim it is exactly the resident model, and
+    nothing else: the point of the claim is that a foreign job accepted now costs the residency the card.
+
+    The result is empty when the claimed model is not in ``models`` at all, which is a real state and not an
+    error: an earlier offer stage (a quarantine, a serviceability exclusion) has already found the resident
+    model unofferable this cycle. Advertising the rest of the pool instead would hand the card exactly the
+    foreign work the claim exists to keep off it, so the caller withholds the pop and says so.
+    """
+    if claim is None:
+        return models
+    return models & {claim.model}
 
 
 def _prune_before(stamps: deque[float], *, cutoff: float) -> None:

@@ -54,8 +54,11 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     _GRACE_BUDGET_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
     _MIN_HOLD_SECONDS,
+    _POP_CLAIM_EMPTY_POP_RUN,
     WholeCardGrantKind,
+    WholeCardPopClaim,
     WholeCardResidencyLedger,
+    offer_under_pop_claim,
 )
 from tests.process_management.conftest import (
     make_mock_job,
@@ -703,6 +706,155 @@ class TestKeepSingleInference:
         process_info.last_job_referenced = make_mock_job(model="stable_diffusion")
         keep_after, _reason_after = process_map.keep_single_inference(stable_diffusion_model_reference=reference)
         assert keep_after is False, "fifty engaged reads must leave no residue behind the fifty-first"
+
+
+class TestWholeCardPopClaim:
+    """``pop_gate.whole_card_pop_claim``: the residency's claim over what the worker asks the horde for.
+
+    The claim is the strongest narrowing the offer has: while it stands the worker advertises one model and
+    nothing else. That is what makes its release path load-bearing. A claim that could stand on its own
+    account would be a worker holding its whole intake to a model nobody is asking for, which is the
+    self-inflicted wedge shape in its purest form.
+    """
+
+    _MAX_HOLD = 180.0
+    """A representative operator maximum hold, so the bound is asserted against a stated figure."""
+
+    def test_the_declaration_exists(self) -> None:
+        """The gate under attack is the one the registry describes."""
+        _assert_registered_hold(GateSurface.POP_GATE, "whole_card_pop_claim")
+
+    def _held_ledger(self) -> WholeCardResidencyLedger:
+        """Return a ledger holding one established residency for ``heavy`` at the epoch."""
+        ledger = WholeCardResidencyLedger()
+        ledger.record_grant(_CARD, model="heavy", forecast=None, cooldown_until=_EPOCH + 600.0, now=_EPOCH)
+        return ledger
+
+    def test_releasing_the_residency_returns_the_whole_pool_to_the_offer(self) -> None:
+        """Engage-has-reachable-release: the claim is derived from the residency, so it cannot outlive it."""
+        ledger = self._held_ledger()
+        offered = frozenset({"heavy", "light", "other"})
+
+        claim = ledger.pop_claim(_CARD, now=_EPOCH + 1.0, max_hold_seconds=self._MAX_HOLD)
+        assert claim is not None and claim.model == "heavy", "a held residency claims the offer for its model"
+        assert offer_under_pop_claim(offered, claim=claim) == frozenset({"heavy"}), (
+            "under the claim the worker asks for the resident model and nothing else"
+        )
+
+        ledger.record_restore(_CARD, now=_EPOCH + 2.0)
+
+        assert ledger.pop_claim(_CARD, now=_EPOCH + 2.0, max_hold_seconds=self._MAX_HOLD) is None
+        assert offer_under_pop_claim(offered, claim=None) == offered, (
+            "a released residency must hand the full model pool back to the offer"
+        )
+
+    def test_a_resident_model_with_no_demand_cannot_hold_the_pool(self) -> None:
+        """No self-inflicted permanent monopoly: the claim's own empty answers are what end it.
+
+        The claim narrows the offer to one model, so the only evidence it can generate is whether that model
+        has work. If a run of empty answers did not release it, a worker would advertise a model nobody wants
+        until the cap expired, having silenced every other model it could have served.
+        """
+        ledger = self._held_ledger()
+        now = _EPOCH
+        released = False
+        for _pop in range(20):
+            now += 10.0
+            released = ledger.note_pop_outcome(_CARD, served=False, now=now)
+            if released:
+                break
+        assert released is True, "a run of empty pops must end a claim the horde has no work for"
+        assert now < _EPOCH + self._MAX_HOLD, (
+            "the empty-pop release must come well inside the maximum hold; a claim that can only end on the "
+            "cap is a cap, not an early release"
+        )
+        assert ledger.pop_claim(_CARD, now=now, max_hold_seconds=self._MAX_HOLD) is None, (
+            "the released claim must stop narrowing the offer immediately"
+        )
+        assert ledger.pop_claim_retention_ended(_CARD, now=now, max_hold_seconds=self._MAX_HOLD) is True, (
+            "the same evidence must stop the residency being retained, or the card is held for a claim that "
+            "has already been given up"
+        )
+
+    def test_work_arriving_for_the_resident_model_restarts_the_evidence(self) -> None:
+        """The hysteresis is over a *run*: a served pop is proof the burst is still live."""
+        ledger = self._held_ledger()
+        now = _EPOCH
+        for _pop in range(_POP_CLAIM_EMPTY_POP_RUN - 1):
+            now += 20.0
+            assert ledger.note_pop_outcome(_CARD, served=False, now=now) is False
+
+        now += 20.0
+        ledger.note_pop_outcome(_CARD, served=True, now=now)
+
+        now += 20.0
+        assert ledger.note_pop_outcome(_CARD, served=False, now=now) is False, (
+            "one empty pop after a served one must not end a burst the horde is still feeding"
+        )
+        assert ledger.pop_claim(_CARD, now=now, max_hold_seconds=self._MAX_HOLD) is not None
+
+    def test_the_maximum_hold_ends_the_claim_on_its_own_clock(self) -> None:
+        """Bounded resolution: under an explicit clock the cap ends the claim with nothing able to extend it.
+
+        Driven against a stream of the resident model's own work, which is the state that would otherwise
+        hold the offer forever: every one of those jobs is a reuse that refreshes the cooldown, and the cap
+        is the only thing standing between that and a worker that never advertises anything else again.
+        """
+        ledger = self._held_ledger()
+        for ask in range(1, int(self._MAX_HOLD) + 60):
+            ledger.record_grant(
+                _CARD,
+                model="heavy",
+                forecast=None,
+                cooldown_until=_EPOCH + ask + 600.0,
+                now=_EPOCH + ask,
+            )
+
+        inside = _EPOCH + self._MAX_HOLD - 1.0
+        assert ledger.pop_claim(_CARD, now=inside, max_hold_seconds=self._MAX_HOLD) is not None
+        assert ledger.pop_claim_retention_ended(_CARD, now=inside, max_hold_seconds=self._MAX_HOLD) is False
+
+        expired = _EPOCH + self._MAX_HOLD
+        assert ledger.pop_claim(_CARD, now=expired, max_hold_seconds=self._MAX_HOLD) is None, (
+            "past the maximum hold the pool returns however busy the resident model is"
+        )
+        assert ledger.pop_claim_retention_ended(_CARD, now=expired, max_hold_seconds=self._MAX_HOLD) is True, (
+            "the cap must beat the cooldown, or a burst of the model's own work retains the residency past it"
+        )
+
+    def test_the_claim_narrows_a_real_pop_offer_and_stops_narrowing_when_it_ends(self) -> None:
+        """The offer stage the popper actually runs is the one the claim acts through."""
+        popper = _make_popper()
+        offered = {"heavy", "light", "other"}
+        claim = WholeCardPopClaim(
+            model="heavy",
+            device_index=_CARD,
+            held_since=_EPOCH,
+            expires_at=_EPOCH + self._MAX_HOLD,
+        )
+
+        assert popper._apply_whole_card_pop_claim(set(offered), claim) == {"heavy"}
+        assert popper._apply_whole_card_pop_claim(set(offered), None) == offered
+
+    def test_a_claim_for_an_unofferable_model_names_its_gate(self) -> None:
+        """The one state in which the claim holds pops rather than narrowing them is the registered gate.
+
+        An earlier stage having withheld the claimed model leaves nothing the worker should ask for, and the
+        registry entry is what says how that state ends. Asserted through the same offer stage so the empty
+        result is a real outcome of production code rather than a constructed one.
+        """
+        popper = _make_popper()
+        claim = WholeCardPopClaim(
+            model="heavy",
+            device_index=_CARD,
+            held_since=_EPOCH,
+            expires_at=_EPOCH + self._MAX_HOLD,
+        )
+
+        assert popper._apply_whole_card_pop_claim({"light", "other"}, claim) == set()
+        assert PopGate.WHOLE_CARD_POP_CLAIM.value == "whole_card_pop_claim", (
+            "the gate the popper stamps must be the key the registry declares"
+        )
 
 
 class TestGatesWithNoTestSeamYet:

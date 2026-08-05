@@ -149,6 +149,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     StopTrackingShedCard,
     StopTrackingWorkerShed,
     WholeCardGovernor,
+    WholeCardPopClaim,
     WholeCardResidency,
     WholeCardResidencyMachine,
     WorkerProcessShedState,
@@ -1040,6 +1041,15 @@ class InferenceScheduler:
         # Edge-trigger latch for the disclosure that whole-card residency is off because its config flag
         # never resolved to a value (as distinct from resolving to False, which is an operator choice).
         self._whole_card_flag_unresolved_disclosed: bool = False
+        # The whole-card pop claim as it was last disclosed, so the engage/release lines are edge-triggered:
+        # a claim standing over many ticks says so once. None when the last disclosure was a release.
+        self._pop_claim_disclosed: WholeCardPopClaim | None = None
+        # Whether the empty-pop evidence ended the standing claim, so the release line names that reason
+        # rather than the cap. Consumed by the disclosure that reports the release.
+        self._pop_claim_empty_release_pending: bool = False
+        # Edge-trigger latch for the disclosure that a residency on this multi-card host does not claim the
+        # worker-wide offer, so its absence reads as deliberate rather than as the feature failing.
+        self._pop_claim_multi_gpu_disclosed: bool = False
         # When an idle inference slot was last deliberately cycled to reclaim allocator-retained RAM
         # (_replace_stale_ram_unload_process). The respawn + the next head's preload leave the queue
         # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
@@ -2907,6 +2917,115 @@ class InferenceScheduler:
         """
         return self._whole_card_ledger.any_held()
 
+    def whole_card_pop_claim(self) -> WholeCardPopClaim | None:
+        """Return the standing whole-card claim over the pop offer, or None when the pool is unclaimed.
+
+        The typed answer to the only question intake asks about a residency: is one claiming the offer, and
+        for which model. While a claim stands the worker advertises exactly that model, so the horde stops
+        sending work whose arrival would force the resident weights back to host RAM or off the card. The
+        claim's end conditions live with the residency (``WholeCardResidencyLedger.pop_claim``); intake only
+        reads it.
+
+        Two conditions keep the claim off hosts it would harm. It is skipped entirely while more than one
+        card serves work, because a residency is per-card and holding the whole worker's intake to one card's
+        model would starve the others; and it is skipped when the operator has set the maximum hold to zero,
+        which disables the claim along with the cap that bounds it.
+        """
+        if self._multi_gpu_routing_active:
+            self._disclose_pop_claim_skipped_on_multi_gpu()
+            return None
+        max_hold_seconds = self._whole_card_max_hold_seconds()
+        if max_hold_seconds <= 0.0:
+            return None
+        now = self._clock()
+        for device_index, _state in self._held_residencies():
+            claim = self._whole_card_ledger.pop_claim(
+                device_index,
+                now=now,
+                max_hold_seconds=max_hold_seconds,
+            )
+            if claim is not None:
+                return claim
+        return None
+
+    def note_whole_card_pop_outcome(self, *, served: bool) -> None:
+        """Record what a pop taken under the standing claim came back with (the empty-pop evidence).
+
+        Called by the popper once per concluded attempt made under a claim, never for an attempt that failed
+        to reach the horde: a request that errored says nothing about whether the resident model has demand.
+        A run of empty answers releases the claim early, which is what stops a resident model nobody wants
+        from holding the whole pool until the maximum hold expires.
+        """
+        claim = self.whole_card_pop_claim()
+        if claim is None:
+            return
+        released = self._whole_card_ledger.note_pop_outcome(
+            claim.device_index,
+            served=served,
+            now=self._clock(),
+        )
+        if released:
+            self._pop_claim_empty_release_pending = True
+
+    def _disclose_pop_claim_skipped_on_multi_gpu(self) -> None:
+        """State once that a residency on this host does not claim the offer, and why.
+
+        The offer is worker-wide while a residency is per-card, so on a multi-card host narrowing intake to
+        one card's resident model would leave the other cards with nothing to serve. Silence would read as
+        the feature being broken rather than deliberately inapplicable, so the first residency to be held
+        here says so.
+        """
+        if self._pop_claim_multi_gpu_disclosed or not self._whole_card_ledger.any_held():
+            return
+        self._pop_claim_multi_gpu_disclosed = True
+        logger.info(
+            "Whole-card residency is held on a multi-card host, so it does not claim the pop offer: the offer "
+            "is worker-wide and narrowing it to one card's model would starve the others.",
+        )
+
+    def _whole_card_max_hold_seconds(self) -> float:
+        """Longest one whole-card residency may own the card and the offer, from operator configuration.
+
+        Coerced defensively because a partially-mocked configuration would otherwise put a non-numeric value
+        into a comparison on the pop path; a value that is not a number reads as the feature being off.
+        """
+        configured = self._runtime_config.bridge_data.whole_card_residency_max_hold_seconds
+        if isinstance(configured, bool) or not isinstance(configured, (int, float)):
+            return 0.0
+        return float(configured)
+
+    def _disclose_pop_claim_edge(self) -> None:
+        """Emit the one-line engage/release disclosure when the pop claim's state actually changes.
+
+        Edge-triggered against the claim last surfaced, so a claim held across many ticks is stated once and
+        a released one is stated once. The release names which of the claim's ends fired, since the remedies
+        differ: a cap expiry says the burst outlasted its window, an empty-pop release says the demand went
+        away, and neither reads the same as the residency simply finishing its work.
+        """
+        claim = self.whole_card_pop_claim()
+        previous = self._pop_claim_disclosed
+        if claim is not None:
+            if previous is not None and previous.model == claim.model:
+                return
+            self._pop_claim_disclosed = claim
+            self._pop_claim_empty_release_pending = False
+            logger.info(
+                f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
+                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.",
+            )
+            return
+        if previous is None:
+            return
+        self._pop_claim_disclosed = None
+        if self._pop_claim_empty_release_pending:
+            reason = "the horde had no further work for it"
+        elif self._clock() >= previous.expires_at:
+            reason = "the maximum hold elapsed"
+        else:
+            reason = "the residency released"
+        self._pop_claim_empty_release_pending = False
+        logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
+
     def whole_card_residency_grace_active(self) -> bool:
         """Whether a whole-card residency is establishing, so the held queue is intentional (not a wedge).
 
@@ -3060,6 +3179,11 @@ class InferenceScheduler:
         ceiling and, if the residency was on the safety card, the safety process is restored to the GPU.
         Restores every drained card's residency independently; a no-op when none is outstanding.
 
+        The operator's maximum hold sits above both retention rules: past it (or once the empty-pop evidence
+        has ended the residency's claim over the offer) the cooldown neither refreshes nor holds, so one
+        residency episode cannot own the card indefinitely on the strength of demand it is itself the only
+        source of.
+
         The restore's wedge-grace window is granted for the churn the restore actually creates: siblings still
         respawning, or a service lane restarted. A release that finds the pool already at its ceiling and no
         lane to restart changed nothing, so it takes no window; leaving one standing would tell the recovery
@@ -3067,14 +3191,25 @@ class InferenceScheduler:
         the card's rolling allowance for teardown churn that never happened.
         """
         now = self._clock()
+        max_hold_seconds = 0.0 if self._multi_gpu_routing_active else self._whole_card_max_hold_seconds()
         active_models = {j.model for j in self._job_tracker.jobs_in_progress}
         active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
         for device_index, state in self._held_residencies():
             model = state.model
+            # Past the maximum hold (or once the empty-pop evidence has ended the claim) the residency stops
+            # being retained: it neither refreshes its cooldown nor honours a standing one, so it lets go as
+            # soon as its own accepted work has drained and the full model pool returns. Retention is all it
+            # ends; work in flight finishes and a granted grace window still runs its own duration.
+            retention_ended = self._whole_card_ledger.pop_claim_retention_ended(
+                device_index,
+                now=now,
+                max_hold_seconds=max_hold_seconds,
+            )
             if model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index):
                 # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
                 # back-to-back heavy jobs).
-                state.cooldown_until = now + self._whole_card_cooldown_seconds()
+                if not retention_ended:
+                    state.cooldown_until = now + self._whole_card_cooldown_seconds()
                 continue
             # A ready head for a different model may cut the cooldown short, but not before the residency has
             # held long enough to amortize the teardown and the regrowth the release itself will pay for;
@@ -3083,7 +3218,7 @@ class InferenceScheduler:
                 residency_model=model,
                 device_index=device_index,
             ) and not self._whole_card_ledger.min_hold_active(device_index, now=now)
-            if self._clock() < state.cooldown_until and not preempt_cooldown:
+            if self._clock() < state.cooldown_until and not preempt_cooldown and not retention_ended:
                 # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
                 continue
             # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
@@ -3138,6 +3273,7 @@ class InferenceScheduler:
                 f"{post_process_note}{vae_lane_note}{component_lane_note}.</>",
                 model,
             )
+        self._disclose_pop_claim_edge()
 
     def _ready_different_model_head_on_device(
         self,
@@ -8399,9 +8535,16 @@ class InferenceScheduler:
             if within_affinity_budget and self._head_aged_past_anti_starvation(next_job):
                 within_affinity_budget = False
                 self._note_anti_starvation_override(next_job)
+            # While a whole-card residency claims the card, a foreign job must not be pulled forward onto it:
+            # materialising another model there is precisely the weight eviction the residency was taken out
+            # to prevent, and the job it would serve is one the queue can serve after the release. Only the
+            # claimed model may still bypass, so a burst for it keeps flowing.
+            pop_claim = self.whole_card_pop_claim()
             if pinned_resident is not None or within_affinity_budget:
                 for candidate_job in next_n_jobs:
                     if candidate_job.model is None or candidate_job.model == next_job.model:
+                        continue
+                    if pop_claim is not None and candidate_job.model != pop_claim.model:
                         continue
                     # A degraded retry must run isolated (see the diversity path), so it is never a bypass target.
                     if self._job_tracker.is_degraded_dispatch_pending(candidate_job):

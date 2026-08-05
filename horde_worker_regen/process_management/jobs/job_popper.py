@@ -66,6 +66,10 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable_for,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    WholeCardPopClaim,
+    offer_under_pop_claim,
+)
 from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_affinity import (
     ResidencyBiasDecision,
@@ -446,6 +450,8 @@ class JobPopper:
         card_runtimes: dict[int, CardRuntime] | None = None,
         model_metadata: ModelMetadata | None = None,
         whole_card_residency_active: Callable[[], bool] | None = None,
+        whole_card_pop_claim: Callable[[], WholeCardPopClaim | None] | None = None,
+        whole_card_pop_outcome: Callable[..., None] | None = None,
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
@@ -474,6 +480,12 @@ class JobPopper:
         `whole_card_residency_active` is queried by the large-model re-entry cooldown to know whether a
         whole-card residency lease is still held; it defaults to "never held" so a worker wired without it
         (and the tests) behaves as if no lease is ever active.
+
+        `whole_card_pop_claim` returns the residency's standing claim over the offer, which narrows this
+        cycle's advertised models to the resident one; `whole_card_pop_outcome` reports back whether the
+        attempt made under that claim was answered with work, which is the evidence that ends a claim whose
+        model the horde has nothing for. Both default to inert, so a worker wired without them advertises
+        exactly as it always has.
 
         `admission_baseline_provider` supplies the shared device baseline for model serviceability offer
         shaping. A missing provider or uncaptured baseline reads as zero and only defers the exclusion until
@@ -539,6 +551,8 @@ class JobPopper:
         self._whole_card_residency_active = (
             whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
         )
+        self._whole_card_pop_claim = whole_card_pop_claim if whole_card_pop_claim is not None else (lambda: None)
+        self._whole_card_pop_outcome = whole_card_pop_outcome
         self._post_processing_lane_commitments_provider = (
             post_processing_lane_commitments_provider
             if post_processing_lane_commitments_provider is not None
@@ -940,6 +954,33 @@ class JobPopper:
         self._residency_bias_offered_count = len(decision.advertised_models)
         self._log_residency_bias_edge(decision)
         return set(decision.advertised_models)
+
+    def _apply_whole_card_pop_claim(self, models: set[str], claim: WholeCardPopClaim | None) -> set[str]:
+        """Narrow the offer to the model a whole-card residency claims the card for.
+
+        The strongest of the offer stages and deliberately unfloored: every other model leaves the offer for
+        the duration of the claim. A residency is a commitment the rest of the worker has already paid for
+        (idle sibling contexts stopped, safety cycled off the card, multiple gigabytes of weights loaded), and
+        every foreign job accepted while it stands forces those weights to page back to host RAM or be re-read
+        from disk. The other narrowings floor themselves because they are preferences; this one is the offer
+        matching what the worker has actually committed to serving.
+
+        Returning an empty set is a real outcome rather than a fault: the claimed model was already withheld
+        by an earlier stage, so there is nothing this worker should be asking for this cycle. The caller
+        withholds the pop and names the gate.
+        """
+        return set(offer_under_pop_claim(frozenset(models), claim=claim))
+
+    def _note_whole_card_pop_outcome(self, claim: WholeCardPopClaim | None, *, served: bool) -> None:
+        """Report back what an attempt made under the residency's claim came back with.
+
+        Only an attempt that reached the horde and was answered carries evidence: a request that errored or
+        timed out says nothing about whether the claimed model has demand, so those paths report nothing and
+        the run of empty answers keeps whatever length it had.
+        """
+        if claim is None or self._whole_card_pop_outcome is None:
+            return
+        self._whole_card_pop_outcome(served=served)
 
     def _log_residency_bias_edge(self, decision: ResidencyBiasDecision) -> None:
         """Emit the edge-triggered engage/release log line and ledger event for offer narrowing.
@@ -1852,6 +1893,17 @@ class JobPopper:
             models, pop_max_power = self._apply_idle_fill_ladder(models, pop_max_power, bridge_data)
             pop_allow_lora = False
 
+        # Whole-card pop claim: while a residency holds the card, ask for its model and nothing else, so the
+        # horde stops sending work whose arrival would evict the weights the residency exists to keep resident.
+        # Applied last, and to the idle-fill path too: a card held by a residency is not free to be filled with
+        # whatever is quickest, and a residency with no work of its own releases on its own evidence instead.
+        pop_claim = self._whole_card_pop_claim()
+        if pop_claim is not None:
+            models = self._apply_whole_card_pop_claim(models, pop_claim)
+            if len(models) == 0:
+                self._note_pop_gate(PopGate.WHOLE_CARD_POP_CLAIM)
+                return
+
         # The effective allow_lora is now settled for this pop; surface it (and, when withheld, why) so a
         # LoRA-download-backoff incident is verifiable from the logs. Edge-triggered, so steady state is quiet.
         self._log_lora_advertising(bridge_data, pop_allow_lora=pop_allow_lora, idle_fill=idle_fill_wanted)
@@ -1988,6 +2040,7 @@ class JobPopper:
         info_string += f"(Skipped reasons: {skipped_reasons})"
 
         if job_pop_response.id_ is None:
+            self._note_whole_card_pop_outcome(pop_claim, served=False)
             self._state.last_pop_no_jobs_available = True
             self._state.last_pop_skipped_reasons = skipped_reasons
             if idle_fill_wanted:
@@ -2006,6 +2059,7 @@ class JobPopper:
             self._report_pool_pop_outcome(pool_lane, popped_model=None)
             return
 
+        self._note_whole_card_pop_outcome(pop_claim, served=True)
         if self._state.last_pop_maintenance_mode:
             logger.info("Clearing horde maintenance latch: a new job was popped successfully.")
             self._state.server_maintenance_cleared_by_job_pop = True

@@ -1323,6 +1323,26 @@ a large model. The timing state lives in a pure, worker-wide
 both limiters are off by default (zero / inherited-zero durations) and independent of
 `whole_card_exclusive_residency`.
 
+### The whole-card pop claim
+
+The limiters above shape which very-large models the worker will *take on*. Once one of them is actually
+holding the card, the offer stops being a preference at all: while a whole-card residency stands, the
+advertised model set is exactly the resident model, and every other model leaves the offer. The worker has
+already paid for that residency (idle sibling contexts stopped, safety cycled off the card, several gigabytes
+of weights loaded), and each foreign job accepted while it stands forces those weights to page back to host
+RAM or be re-read from disk, so continuing to advertise the rest of the pool is the worker manufacturing its
+own contention.
+
+Unlike the other narrowings, this one is unfloored: if an earlier offer stage has already withheld the
+resident model (a quarantine, a serviceability exclusion), there is nothing this worker should be asking for
+this cycle, so the pop is withheld and the `whole_card_pop_claim` gate is named. Advertising the rest of the
+pool instead would hand the card exactly the work the claim exists to keep off it.
+
+The claim is bounded by `whole_card_residency_max_hold_seconds` and released early when a run of pops comes
+back with no work for the resident model, and it is skipped entirely on a host driving more than one card.
+Those ends, and why each is shaped the way it is, are in
+[Resource governance](resource_governance.md).
+
 ### Governor observability
 
 These limiters, whole-card residency, and the other conditions that hold back or reshape pops (post-inference
