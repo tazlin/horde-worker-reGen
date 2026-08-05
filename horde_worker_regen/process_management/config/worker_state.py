@@ -15,6 +15,48 @@ from collections import deque
 from horde_worker_regen.process_management.models.aux_download_backoff import AuxDownloadBackoff
 
 
+class PopGate(enum.StrEnum):
+    """Every named condition that can end a job-pop cycle before it reaches the horde.
+
+    The pop coroutine returns early at a dozen preconditions, and the name it stamps onto
+    :attr:`WorkerState.last_pop_gate` is what the liveness sentinel, the recovery coordinator's pop-gate
+    wedge, and the operator surfaces read. Enumerating the names here (rather than spelling them at each
+    return) makes the set of holds a closed, inspectable surface: a new hold has to take a member, so it
+    cannot reach production without a declared release path in the gate registry.
+    """
+
+    INTAKE_PAUSED = "intake_paused"
+    """A worker-wide intake hold is in force (shutdown, operator or self pause, download-only, recovery park)."""
+    RAM_PRESSURE = "ram_pressure"
+    """The pre-floor host-RAM hold is set: system RAM is near its danger floor or a process is draining."""
+    TORCH_UNUSABLE = "torch_unusable"
+    """The installed torch build cannot serve image work on this host (no kernels for the GPU, or CPU-only)."""
+    CONSECUTIVE_FAILURE_PAUSE = "consecutive_failure_pause"
+    """The consecutive-failure backoff is holding intake after a run of failed jobs."""
+    QUEUE_FULL = "queue_full"
+    """The local queue already holds its configured depth of accepted work."""
+    SAFETY_BACKLOG = "safety_backlog"
+    """The post-inference safety stage is backed up past its self-tuned cap."""
+    SUBMIT_BACKLOG = "submit_backlog"
+    """The submit stage is backed up, so accepted work would age past its ttl waiting to be delivered."""
+    WARMUP_FIRST_JOB = "warmup_first_job"
+    """No job has completed this session, so the queue is held at one job until the first one proves out."""
+    NO_SAFETY_PROCESS = "no_safety_process"
+    """No safety process is available to clear a generated result."""
+    NO_INFERENCE_PROCESS = "no_inference_process"
+    """No inference process is available to take work."""
+    NO_MODELS_CONFIGURED = "no_models_configured"
+    """The configuration names no image models to load, so no offer can be composed."""
+    MEGAPIXELSTEP_WAIT = "megapixelstep_wait"
+    """The megapixelstep governor is letting large in-flight work drain before more is accepted."""
+    POP_FREQUENCY_GATE = "pop_frequency_gate"
+    """The inter-pop cadence has not elapsed since the previous attempt."""
+    NO_ELIGIBLE_MODELS = "no_eligible_models"
+    """Model selection produced no model this worker can currently serve."""
+    LARGE_MODEL_LIMITS = "large_model_limits"
+    """The large-model switch throttle and re-entry cooldown emptied the offer for this cycle."""
+
+
 class PopPauseOwner(enum.StrEnum):
     """Which backstop armed the worker's self-throttle pop pause, so its cause and lapse can be attributed.
 

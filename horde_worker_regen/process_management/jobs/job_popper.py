@@ -19,7 +19,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 from loguru import logger
 
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopGate, WorkerState
 from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_card_indices_for
 from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
     AdvertisedCapabilities,
@@ -1210,16 +1210,19 @@ class JobPopper:
 
         return False
 
-    def _note_pop_gate(self, gate: str | None) -> None:
+    def _note_pop_gate(self, gate: PopGate | None) -> None:
         """Record which gate ended this pop cycle, or None when the cycle reached the API.
 
         The since-stamp moves only when the gate name changes, so it measures how long the current gate has
         held rather than when it was last observed. Kept to one comparison and at most two writes: this runs
-        on every tick of the sub-second pop loop.
+        on every tick of the sub-second pop loop. The stamp is stored as a plain string so every reader of
+        :attr:`WorkerState.last_pop_gate` (the sentinel, the recovery coordinator, the wire snapshots) keeps
+        comparing names rather than enum identity.
         """
-        if self._state.last_pop_gate == gate:
+        name = str(gate) if gate is not None else None
+        if self._state.last_pop_gate == name:
             return
-        self._state.last_pop_gate = gate
+        self._state.last_pop_gate = name
         self._state.last_pop_gate_since = time.time()
 
     def _is_queue_full(self, bridge_data: reGenBridgeData, *, extra_allowance: int = 0) -> bool:
@@ -1618,7 +1621,7 @@ class JobPopper:
             # terminal-recovery park). Keep it centralized on WorkerState so a new flow cannot accidentally
             # accept work under a worker-wide hold.
             self._state.last_pop_no_jobs_available = False
-            self._note_pop_gate("intake_paused")
+            self._note_pop_gate(PopGate.INTAKE_PAUSED)
             return
 
         if self._state.ram_pressure_pop_hold:
@@ -1630,7 +1633,7 @@ class JobPopper:
             self._state.last_pop_skipped_reasons["ram_pressure"] = (
                 self._state.last_pop_skipped_reasons.get("ram_pressure", 0) + 1
             )
-            self._note_pop_gate("ram_pressure")
+            self._note_pop_gate(PopGate.RAM_PRESSURE)
             return
 
         self._state.last_pop_skipped_reasons.pop("ram_pressure", None)
@@ -1639,7 +1642,7 @@ class JobPopper:
             # The installed PyTorch has no kernels for this GPU: every job would fail at the first kernel
             # launch, so never pop. Sticky for the session (a build/hardware mismatch); fixed by reinstalling.
             self._state.last_pop_no_jobs_available = False
-            self._note_pop_gate("torch_unusable")
+            self._note_pop_gate(PopGate.TORCH_UNUSABLE)
             return
 
         if self._state.torch_build_cpu_only:
@@ -1647,7 +1650,7 @@ class JobPopper:
             # popper never pops. Alchemy runs on its own loop and is unaffected. This is the runtime
             # equivalent of a 'cpu' install sentinel; sticky for the session (a build fact).
             self._state.last_pop_no_jobs_available = False
-            self._note_pop_gate("torch_unusable")
+            self._note_pop_gate(PopGate.TORCH_UNUSABLE)
             return
 
         cur_time = time.time()
@@ -1658,14 +1661,14 @@ class JobPopper:
             urgent = True
 
         if self._handle_consecutive_failures(bridge_data, cur_time):
-            self._note_pop_gate("consecutive_failure_pause")
+            self._note_pop_gate(PopGate.CONSECUTIVE_FAILURE_PAUSE)
             return
 
         # Admit one extra job past the configured depth when an idle-fill is wanted: that job is expected to
         # leave the queue immediately for the idle sibling, so bounding the relaxation to a single slot keeps
         # intake from running away if it cannot be placed this cycle.
         if self._is_queue_full(bridge_data, extra_allowance=1 if idle_fill_wanted else 0):
-            self._note_pop_gate("queue_full")
+            self._note_pop_gate(PopGate.QUEUE_FULL)
             return
 
         # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
@@ -1676,11 +1679,12 @@ class JobPopper:
             self._state.last_pop_no_jobs_available = False
             # The hold can come from either post-inference stage; attribute the skipped reason (and any
             # prose) to the latch actually engaged, or an alert reader chases the wrong stage.
-            backlog_reason = "safety_backlog" if self._safety_backpressure_engaged else "submit_backlog"
+            backlog_gate = PopGate.SAFETY_BACKLOG if self._safety_backpressure_engaged else PopGate.SUBMIT_BACKLOG
+            backlog_reason = str(backlog_gate)
             self._state.last_pop_skipped_reasons[backlog_reason] = (
                 self._state.last_pop_skipped_reasons.get(backlog_reason, 0) + 1
             )
-            self._note_pop_gate(backlog_reason)
+            self._note_pop_gate(backlog_gate)
             # Surface safety backpressure in prose, throttled so the sub-second pop loop never spams it: a
             # bundle should show pops were stopped *because the safety stage is backed up*, not merely that
             # pops stopped. Names the depth, the self-tuned cap, and the oldest waiting safety job so a
@@ -1713,20 +1717,20 @@ class JobPopper:
         # Warm-up rule: until the first job of the session has completed, don't queue
         # ahead (if we're doomed to fail with 1 job, we're doomed to fail with 2).
         if len(self._job_tracker.jobs_pending_inference) != 0 and self._job_tracker.total_num_completed_jobs == 0:
-            self._note_pop_gate("warmup_first_job")
+            self._note_pop_gate(PopGate.WARMUP_FIRST_JOB)
             return
 
         if self._process_map.get_first_available_safety_process() is None:
-            self._note_pop_gate("no_safety_process")
+            self._note_pop_gate(PopGate.NO_SAFETY_PROCESS)
             return
 
         if self._process_map.get_first_available_inference_process() is None:
-            self._note_pop_gate("no_inference_process")
+            self._note_pop_gate(PopGate.NO_INFERENCE_PROCESS)
             return
 
         if len(bridge_data.image_models_to_load) == 0:
             logger.error("No models are configured to be loaded, please check your config (models_to_load).")
-            self._note_pop_gate("no_models_configured")
+            self._note_pop_gate(PopGate.NO_MODELS_CONFIGURED)
             await asyncio.sleep(3)
             return
 
@@ -1736,11 +1740,11 @@ class JobPopper:
         if not idle_fill_wanted and self._pop_throttler.should_wait_for_megapixelsteps(
             bridge_data,
         ):
-            self._note_pop_gate("megapixelstep_wait")
+            self._note_pop_gate(PopGate.MEGAPIXELSTEP_WAIT)
             return
 
         if not urgent and self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
-            self._note_pop_gate("pop_frequency_gate")
+            self._note_pop_gate(PopGate.POP_FREQUENCY_GATE)
             return
 
         self._state.last_job_pop_time = time.time()
@@ -1778,7 +1782,7 @@ class JobPopper:
             serviceability_logged=self._serviceability_exclusion_logged,
         )
         if models is None:
-            self._note_pop_gate("no_eligible_models")
+            self._note_pop_gate(PopGate.NO_ELIGIBLE_MODELS)
             return
 
         # Stop advertising a model the lifecycle manager has taken out of rotation, so the horde stops sending
@@ -1790,7 +1794,7 @@ class JobPopper:
         # reloads. A no-op unless the operator configures a switch interval or re-entry cooldown.
         models = self._apply_large_model_pop_limits(models, bridge_data)
         if len(models) == 0:
-            self._note_pop_gate("large_model_limits")
+            self._note_pop_gate(PopGate.LARGE_MODEL_LIMITS)
             return
 
         # Stop promising what the card cannot host: while every governed card is under VRAM pressure, the
