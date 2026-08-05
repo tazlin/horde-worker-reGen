@@ -489,7 +489,15 @@ The escalation, in order:
    with a context on the card never prices as zero and remains available as a remedy. The lane pauses the
    remedy does take are stamped with the reclaim ladder's owner (it acts through
    that actuator), so the ladder's stranded-pause backstop consults the coordinator's own receipt before
-   treating one as an orphan; the coordinator's unwind remains the responsible restore.
+   treating one as an orphan; the coordinator's unwind remains the responsible restore. The ladder also
+   judges its own relevance: every rung on it frees card memory, which addresses the head only when a
+   shortfall is what holds it. When the scheduler publishes the constraint blocking the head, each issued
+   rung is judged once, after its full settling window, on whether the named constraint or the
+   inference-start count moved. Two consecutive rungs that moved neither set the ladder aside for the rest
+   of the episode: it stops being issued and, critically, its settling windows stop counting as "a remedy
+   remains" toward deferring the give-up. Without that judgement a ladder answering a constraint it has no
+   purchase on cycles children on its own cadence indefinitely, each cycle both churning resident state and
+   renewing the excuse that holds the give-up backstop off.
 2. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools
    in place (kill and respawn every child, un-quarantine slots), preserving the
    configured concurrency (`max_threads`). The rebuild alone clears a transient
@@ -617,6 +625,10 @@ counts unconditionally: it proves every downstream stage cleared. An inference *
 so it counts only while no downstream stage is holding accepted work. A post-processing or safety backlog
 keeps admitting fresh starts while nothing leaves the stage, so crediting those starts would let the
 stalled stage manufacture its own proof of recovery and close the very episode that should be climbing.
+The queue-deadlock clock applies the same rule to "capacity is on its way": only an *inference* slot
+booting is worth restarting it for, because only an inference slot can take the pending work. Safety and
+service-lane children are cycled by recovery remedies on their own cadence, and crediting their boots as
+progress would let a looping remedy hold the wedge clock at zero for as long as it keeps running.
 
 The same rule governs the wedge verdict itself. A structural queue deadlock is excused while the scheduler
 is deliberately holding the queue (a whole-card model establishing residency, a heavy head loading, a RAM
@@ -626,12 +638,15 @@ that one verdict.
 Each of those excuses is bounded by its own window, but a window alone is not enough for the whole-card one:
 an establish/restore cycle can re-arm a fresh window faster than the previous one expires, which would leave
 the supervisor disarmed for as long as the churn continued. So the whole-card grace is additionally charged
-against a per-card rolling budget, and the budget is spent at admission. While a card is over its allowance
-it may not open another establish window at all: the new establishment is deferred, the pool stops churning,
-and the scheduler logs the deferral once so the operator can see that residency churn, not a genuine setup,
-is what is holding the queue. A window already granted always runs to its own duration. Withdrawing it
-part-way would have the supervisor classify a teardown the scheduler itself commanded as a wedge and reset
-the pools mid-teardown, adding a rebuild to the very churn the budget exists to stop. See
+against a per-card rolling budget, spent at admission and charged only for physical teardown events, never
+for jobs reusing a residency the card already holds. While a card is over its allowance it may not open
+another establish window: the new establishment is deferred for a bounded dwell and the refusal is
+re-disclosed periodically with the current spend and replenish wait, so the operator can see that residency
+churn, not a genuine setup, is what is holding the queue. Past the dwell the head stops asking for the card
+and ordinary measured admission serves it co-resident if the device holds its weights, so the budget brakes
+rotation without ever parking a servable head. A window already granted always runs to its own duration.
+Withdrawing it part-way would have the supervisor classify a teardown the scheduler itself commanded as a
+wedge and reset the pools mid-teardown, adding a rebuild to the very churn the budget exists to stop. See
 [Bounding residency churn](resource_governance.md#bounding-residency-churn). The wedge assessment and the give-up that acts on it must not diverge: a give-up applying
 a narrower set of excuses would fault exactly the backlog the scheduler is holding for capacity that is
 about to arrive.
@@ -753,7 +768,13 @@ close that class:
   when no attempt has reached the horde for 60 s with nothing deliberate to
   account for it, naming that gate; see
   [hung-process detection](process_lifecycle.md) for the sentinel and the
-  watchdogs that own each condition's remedy. Disclosure is not the only consumer
+  watchdogs that own each condition's remedy. The full-queue gate gets one extra
+  test, because a full local queue is the ordinary shape of a busy worker and
+  would otherwise fully excuse the silence: full is only healthy while it drains.
+  When the queue has been full with nothing dispatched and nothing completed for
+  the whole span, the sentinel escalates to a distinct error naming the frozen
+  span, the waiting head, and the constraint the scheduler says is blocking it.
+  Disclosure is not the only consumer
   of that stamp: a gate that holds far past the sentinel's warning with no work
   completing behind it is [a wedge in its own right](#layer-3-save-our-ship-sos-escalation),
   so a condition no watchdog owns still reaches the escalation.

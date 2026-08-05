@@ -300,22 +300,35 @@ call sites, bound that churn:
   rebuild. The floor is shorter than the establish grace window, so it can never keep a residency alive past
   the point the recovery supervisor is watching.
 - **Establishment rate limit.** Establishments are counted per card over a short rolling window. Past the
-  allowance the head is **deferred**, never declined: deferring keeps it on the whole-card path so it re-asks
-  the next cycle, whereas declining would send it down the ordinary co-resident path the forecast has already
-  said streams its weights. The window is deliberately far shorter than the pop-gate structural-wedge
+  allowance the head is **deferred** rather than immediately declined, keeping it on the whole-card path so
+  it re-asks the next cycle. The window is deliberately far shorter than the pop-gate structural-wedge
   backstop, so a deferred head can never accrue toward a wedge verdict. The limiter gates *new*
   establishments only; a residency already held keeps being driven to convergence every cycle.
 - **Grace budget.** Each establish and each restore opens a window in which the recovery supervisor ignores
   a held queue (see [Resilience and recovery](resilience_and_recovery.md)). Those windows are charged against
   a per-card rolling budget, because otherwise repeated cycling re-arms a fresh window faster than the
   previous one expires and the supervisor stays disarmed for as long as the churn continues, which is exactly
-  the state in which a real wedge goes unnoticed. The budget is answered at admission: while a card's spend
-  is over the allowance, a *new* establishment on that card is **deferred**, on the same reasoning as the
-  rate limit, and the scheduler discloses the deferral once on the transition. Refreshing or restoring a
-  residency the card already holds is not gated, and a window already granted is never withdrawn: the
-  teardown it covers is one the scheduler itself commanded, so cutting the excuse short would have the
-  supervisor read that deliberate action as the wedge. The liveness bound on a residency that never completes
-  is therefore the granted window's own duration. The budget replenishes as old grants age out of the window.
+  the state in which a real wedge goes unnoticed. The charge follows the *physical* event: a card taking a
+  model on when it held nothing or held something else pays one establish charge, and its restore pays one
+  restore charge. A further job asking for the model the card already holds is a reuse riding the residency
+  the cooldown keeps alive; it costs no teardown, so it is neither charged nor counted by the rate limiter.
+  An allowance sized for teardown churn spent on jobs that caused none would otherwise let the card's most
+  efficient pattern, a burst of heavy jobs sharing one residency, talk the governors into refusing the next
+  legitimate establishment. The budget is answered at admission: while a card's spend is over the allowance,
+  a *new* establishment on that card is deferred, and the refusal is re-disclosed periodically with the
+  current spend and the replenish wait for as long as it persists. Refreshing or restoring a residency the
+  card already holds is not gated, and a window already granted is never withdrawn: the teardown it covers
+  is one the scheduler itself commanded, so cutting the excuse short would have the supervisor read that
+  deliberate action as the wedge. The liveness bound on a residency that never completes is therefore the
+  granted window's own duration. The budget replenishes as old grants age out of the window.
+
+A governor brakes how fast the card may be rotated; it is never a finding that the head cannot be served. A
+head either governor holds off the card keeps re-asking for a bounded dwell, and once the dwell is spent the
+whole-card preference is dropped for that head: ordinary measured admission decides, and a card that can
+demonstrably hold the weights serves the head co-resident (slower than sole residency) instead of leaving it
+parked behind a brake with no fallback. The dispatch-time residency check honours the same governors, so a
+head coerced onto the co-resident path cannot win the card back at dispatch time and re-spend the exhausted
+allowance. The dwell state lives in the residency ledger and is shared by both paths.
 
 Only one reconciler may change safety placement. Whole-card residency contributes a persistent off-GPU veto,
 the reclaim ladder contributes a one-shot request, and runtime placement contributes its hysteretic fit wish;
