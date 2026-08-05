@@ -348,3 +348,59 @@ class TestJobStages:
         head = job_tracker.jobs_pending_submit[0]
         assert head is safety_checked
         assert head.censored is False
+
+
+class TestDispatchConditionStamps:
+    """The worker conditions stamped on a job at dispatch, exported per job by the run metrics."""
+
+    async def test_dispatch_records_the_contention_around_the_job(self, job_tracker: JobTracker) -> None:
+        """Queue depth counts the other jobs competing for inference, never the job being dispatched."""
+        first = await track_popped_job_async(job_tracker, make_mock_job())
+        second = await track_popped_job_async(job_tracker, make_mock_job())
+        third = await track_popped_job_async(job_tracker, make_mock_job())
+        assert first.id_ is not None
+
+        await job_tracker.mark_inference_started(first)
+
+        tracked = job_tracker.get_tracked_job(first.id_)
+        assert tracked is not None
+        assert tracked.queue_depth_at_dispatch == 2
+        assert tracked.post_processing_depth_at_dispatch == 0
+        assert second is not third  # both remain queued behind the dispatched head
+
+    async def test_dispatch_records_residency_and_process_age(self, job_tracker: JobTracker) -> None:
+        """Whole-card residency and the serving process's age are carried from the dispatch site."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job.id_ is not None
+
+        await job_tracker.mark_inference_started(job, whole_card=True, process_age_seconds=12.5)
+
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.served_whole_card is True
+        assert tracked.serving_process_age_seconds == 12.5
+
+    async def test_undispatched_job_carries_no_dispatch_stamps(self, job_tracker: JobTracker) -> None:
+        """A job still waiting has nothing to report, so its stamps stay unknown rather than zero."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job.id_ is not None
+
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.queue_depth_at_dispatch is None
+        assert tracked.post_processing_depth_at_dispatch is None
+        assert tracked.served_whole_card is None
+        assert tracked.serving_process_age_seconds is None
+
+    async def test_auxiliary_readiness_is_stamped_and_withdrawn(self, job_tracker: JobTracker) -> None:
+        """The readiness stamp tracks the prepared flag, so a withdrawn preparation leaves no stale time."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job.id_ is not None
+
+        assert job_tracker.mark_job_aux_prepared_if_ready(job.id_)
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.aux_models_prepared_at is not None
+
+        assert job_tracker.invalidate_job_aux_preparation(job)
+        assert tracked.aux_models_prepared_at is None

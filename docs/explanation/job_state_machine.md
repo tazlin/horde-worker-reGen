@@ -57,6 +57,14 @@ the `TrackedJob` map, so existing call sites keep working without being able to 
 *not* a `JobStage`, only a timestamp key. `DETACHED` is the only stage a job must never rest in across
 loop iterations (see [The DETACHED stage](#the-detached-stage)).
 
+Terminality is what stops a stale or duplicate result from resurrecting a job whose outcome is settled, and
+the transition table enforces it for every caller. One path may ask for an exception:
+`readopt_post_inference_result` re-opens the safety tail for a job that was written off when a worker-owned
+stage stopped waiting on a lane, if that lane later delivers the finished work. It applies only while the
+job is *resting* at `PENDING_SUBMIT`; the `submit_in_flight` latch, set the moment the submitter takes a
+job, closes the door for good. See the [image utilities lane](image_utilities_lane.md) for the case that
+motivates it.
+
 ## The stage dual-presence rule
 
 The one intentional exception to "one stage at a time": a job in `INFERENCE_IN_PROGRESS` is **also**
@@ -73,7 +81,8 @@ violation.
 These are the only legal moves; any other is rejected by the transition method. The diagram is the
 `_ALLOWED_TRANSITIONS` table rendered directly. The happy path runs left to right along the top
 (`PENDING_INFERENCE → INFERENCE_IN_PROGRESS → PENDING_SAFETY_CHECK → SAFETY_CHECKING →
-PENDING_SUBMIT`); the remaining edges are faults, retries, and `DETACHED` hand-offs.
+PENDING_SUBMIT`); the remaining edges are faults, retries, and `DETACHED` hand-offs, plus the one opt-in
+edge out of `PENDING_SUBMIT` described above, which the table withholds from callers by default.
 
 ```mermaid
 stateDiagram-v2
@@ -93,6 +102,7 @@ stateDiagram-v2
     PENDING_INFERENCE --> PENDING_SAFETY_CHECK : late-registered result
     PENDING_SAFETY_CHECK --> PENDING_SUBMIT : faulted, skip safety
     SAFETY_CHECKING --> PENDING_SAFETY_CHECK : requeued (safety process lost)
+    PENDING_SUBMIT --> PENDING_SAFETY_CHECK : written-off work delivered late (opt-in only)
 
     %% transient DETACHED hand-offs
     PENDING_INFERENCE --> DETACHED

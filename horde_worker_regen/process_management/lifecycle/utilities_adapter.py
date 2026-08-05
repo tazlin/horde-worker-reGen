@@ -18,6 +18,8 @@ alive (an unresponsive-but-not-dead hang) is not silently tolerated: after a gra
 stops the subprocess outright, which makes :meth:`UtilitiesProcessHandle.is_alive` report False so the
 lifecycle's existing crash reaper recovers it. There is no bespoke silence watchdog for this lane; the
 choice to convert an unresponsive service into a dead one lets the one existing recovery path handle both.
+A background strip the parent dispatched and still waits on suspends that verdict for as long as the strip
+is inside its budget, so a lane serving a long pass is never mistaken for a hung one and killed for it.
 
 The capability service launcher exposes its subprocess pid, so this lane surfaces an OS pid the same way a
 spawned child does: :meth:`UtilitiesProcessHandle.pid` reports it, and every emitted state / heartbeat /
@@ -29,6 +31,7 @@ terminate/kill, both of which stop the subprocess.
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 import urllib.error
@@ -224,6 +227,8 @@ class UtilitiesProcessAdapter:
         memory_interval_seconds: float = 5.0,
         annotate_timeout_seconds: float = 120.0,
         health_failure_grace_seconds: float = 15.0,
+        health_probe_timeout_seconds: float = 5.0,
+        strip_execution_budget_seconds: float = 180.0,
     ) -> None:
         """Initialise the adapter.
 
@@ -239,6 +244,13 @@ class UtilitiesProcessAdapter:
             annotate_timeout_seconds: Per-request timeout for an annotation HTTP call.
             health_failure_grace_seconds: How long the service may fail health while its subprocess is \
                 alive before the adapter stops it (converting an unresponsive service into a recoverable death).
+            health_probe_timeout_seconds: Per-request timeout for one health probe, where the installed \
+                client supports it. Short by design: the probe answers the "is the service still there" \
+                question, and a service too busy to answer it promptly is judged by the grace window rather \
+                than by holding the cadence thread.
+            strip_execution_budget_seconds: How long a dispatched background strip may run before the lane \
+                is treated as unhealthy on its account. Mirrors the parent's strip execution budget, so the \
+                lane is never stopped for being busy with work the worker dispatched and still waits on.
         """
         self._process_id = process_id
         self._process_message_queue = process_message_queue
@@ -250,6 +262,8 @@ class UtilitiesProcessAdapter:
         self._memory_interval_seconds = memory_interval_seconds
         self._annotate_timeout_seconds = annotate_timeout_seconds
         self._health_failure_grace_seconds = health_failure_grace_seconds
+        self._health_probe_timeout_seconds = health_probe_timeout_seconds
+        self._strip_execution_budget_seconds = strip_execution_budget_seconds
 
         self._handle = UtilitiesProcessHandle(server, self.stop)
         self._stop = threading.Event()
@@ -261,6 +275,8 @@ class UtilitiesProcessAdapter:
         self._last_memory_report_at = 0.0
         self._first_health_failure_at: float | None = None
         self._servable_control_types: frozenset[str] = frozenset()
+        self._strip_started_at: float | None = None
+        self._health_accepts_timeout: bool | None = None
 
     @property
     def handle(self) -> ChildProcessHandle:
@@ -405,6 +421,7 @@ class UtilitiesProcessAdapter:
         self._set_annotating(True)
         self._send_state(HordeProcessState.ALCHEMY_STARTING, "Background strip")
         started_at = time.monotonic()
+        self._set_strip_started_at(started_at)
         stripped: list[bytes] = []
         state = GENERATION_STATE.ok
         fault_reason: str | None = None
@@ -435,6 +452,7 @@ class UtilitiesProcessAdapter:
             HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
         )
         self._send_state(completed_state, "Background strip complete")
+        self._set_strip_started_at(None)
         self._set_annotating(False)
 
     def _handle_alchemy(self, message: HordeAlchemyControlMessage) -> None:
@@ -637,15 +655,62 @@ class UtilitiesProcessAdapter:
                     self._refresh_servable_control_types()
 
     def _poll_health(self) -> bool:
-        """Return whether the service answers its health endpoint (never raises)."""
+        """Return whether the service answers its health endpoint promptly (never raises).
+
+        The probe carries its own short timeout where the installed client accepts one, so an unanswered
+        probe costs the cadence one interval rather than the client-wide request timeout, which is sized for
+        real work and is minutes long. A client without the keyword is called as before; the grace window is
+        what bounds the verdict in that case.
+        """
         try:
+            if self._health_probe_accepts_timeout():
+                return self._server.client.health(timeout=self._health_probe_timeout_seconds)  # type: ignore[call-arg]
             return self._server.client.health()
         except Exception:
             return False
 
+    def _health_probe_accepts_timeout(self) -> bool:
+        """Return whether the installed client's ``health`` takes a per-call ``timeout`` (probed once).
+
+        The keyword arrived in a later release of the client than this worker's floor pin allows, so the
+        capability is discovered rather than assumed; an introspection failure is read as "not supported",
+        which only costs the probe its short timeout.
+        """
+        if self._health_accepts_timeout is None:
+            try:
+                self._health_accepts_timeout = "timeout" in inspect.signature(self._server.client.health).parameters
+            except (TypeError, ValueError):
+                self._health_accepts_timeout = False
+        return self._health_accepts_timeout
+
+    def _set_strip_started_at(self, started_at: float | None) -> None:
+        """Record when the in-flight background strip began (None once it finishes)."""
+        with self._state_lock:
+            self._strip_started_at = started_at
+
+    def _strip_within_budget(self) -> bool:
+        """Return whether a dispatched background strip is still inside the budget the parent gives it."""
+        with self._state_lock:
+            started_at = self._strip_started_at
+        return started_at is not None and (time.monotonic() - started_at) < self._strip_execution_budget_seconds
+
     def _note_health_failure(self) -> None:
-        """Track a health failure while the subprocess is alive, stopping it once past the grace window."""
+        """Track a health failure while the subprocess is alive, stopping it once past the grace window.
+
+        A strip the parent dispatched and is still waiting on holds the stop off entirely: the lane is busy
+        with work the worker asked for and has not given up on, and stopping it there destroys that work and
+        faults the job for being served. A client release whose health endpoint answers while a strip runs
+        makes the failed probe meaningful on its own, but the hold is what keeps the older, blocking
+        behaviour from being read as a hang.
+        """
         now = time.monotonic()
+        if self._strip_within_budget():
+            logger.debug(
+                "Image utilities service is not answering health while a dispatched background strip is "
+                "still within its budget; leaving the lane alone until the strip finishes or overruns",
+            )
+            self._first_health_failure_at = None
+            return
         if self._first_health_failure_at is None:
             self._first_health_failure_at = now
         elapsed = now - self._first_health_failure_at

@@ -3879,6 +3879,13 @@ class ProcessLifecycleManager:
                     self._job_tracker.note_post_processing_overcommit_fault()
                 self._initiate_post_process_replacement()
                 self._replace_all_post_process_process()
+            if process_info.process_type == HordeProcessType.UTILITIES:
+                # The utilities lane reaches this the same way any other lane does (it can be stuck starting
+                # or silent while idle), and it has the same end -> delete -> start machine behind the
+                # ``_initiate_*`` flag, so it is driven here exactly as the crash reaper drives it. Without
+                # this branch the timeout was recorded and announced while nothing was replaced.
+                self._initiate_utilities_replacement()
+                self._replace_all_utilities_process()
             if process_info.process_type == HordeProcessType.INFERENCE:
                 self._replace_inference_process(
                     process_info,

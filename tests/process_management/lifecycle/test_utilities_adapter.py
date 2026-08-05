@@ -604,6 +604,51 @@ def test_annotation_without_control_type_faults_without_calling_the_service(
         parent_conn.close()
 
 
+def test_service_is_not_stopped_while_a_dispatched_strip_is_within_budget(
+    http_service: tuple[_ServiceState, str],
+) -> None:
+    """A lane busy with a strip the worker dispatched and still waits on is never killed for being busy."""
+    state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, fake_server = _build_adapter(base_url, q, child_conn, health_failure_grace_seconds=0.2)
+
+    adapter.start()
+    try:
+        assert _wait_for(lambda: HordeProcessState.WAITING_FOR_JOB in _states(list(q.queue)))
+        # The lane is mid-strip and health stops answering, which is exactly what a client whose health
+        # endpoint blocks behind the work looks like from here.
+        adapter._set_strip_started_at(time.monotonic())
+        state.health_ok = False
+        assert not _wait_for(lambda: fake_server.stop_called, timeout=1.0)
+
+        # Once the strip is done, an unanswered health probe means something real again.
+        adapter._set_strip_started_at(None)
+        assert _wait_for(lambda: fake_server.stop_called, timeout=3.0)
+    finally:
+        adapter.stop()
+        parent_conn.close()
+
+
+def test_health_probe_falls_back_when_the_client_has_no_timeout_keyword(
+    http_service: tuple[_ServiceState, str],
+) -> None:
+    """The short per-call probe timeout is used only where the installed client accepts it."""
+    _state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, _fake_server = _build_adapter(base_url, q, child_conn)
+
+    try:
+        supports_timeout = adapter._health_probe_accepts_timeout()
+        assert isinstance(supports_timeout, bool)
+        # Whichever call shape the installed client offers, the probe itself must work and cache its verdict.
+        assert adapter._poll_health() is True
+        assert adapter._health_probe_accepts_timeout() is supports_timeout
+    finally:
+        parent_conn.close()
+
+
 def test_unresponsive_but_alive_service_is_recycled(http_service: tuple[_ServiceState, str]) -> None:
     """A service that fails health while its subprocess is alive is stopped so the lane can be recovered."""
     state, base_url = http_service

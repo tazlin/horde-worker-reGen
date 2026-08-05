@@ -1531,6 +1531,30 @@ def test_stuck_starting_safety_arms_replacement() -> None:
     assert plm.safety_processes_should_be_replaced is True
 
 
+def test_stuck_utilities_lane_arms_its_replacement() -> None:
+    """A utilities lane meeting a timeout condition must actually be replaced, not just announced.
+
+    The watchdog iterates every process in the map, so the lane reaches the timeout conditions like any
+    other child. Without a branch of its own the timeout was logged and recorded while the wedged lane was
+    left in place.
+    """
+    utilities = make_mock_process_info(
+        3,
+        model_name=None,
+        state=HordeProcessState.PROCESS_STARTING,
+        process_type=HordeProcessType.UTILITIES,
+    )
+    utilities.last_received_timestamp = time.time() - 1000
+    utilities.last_heartbeat_timestamp = time.time() - 1000
+    plm = _make_plm(process_map=ProcessMap({3: utilities}))
+
+    assert plm.utilities_processes_should_be_replaced is False
+    replaced = plm._check_and_replace_process(utilities, 0.0, HordeProcessState.PROCESS_STARTING, "stuck")
+
+    assert replaced is True
+    assert plm.utilities_processes_should_be_replaced is True
+
+
 def test_operation_timeout_uses_state_duration_not_recent_liveness() -> None:
     """Operation replacement is bounded by time in state, not by heartbeat silence.
 

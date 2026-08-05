@@ -182,11 +182,27 @@ inference -> post-processing lane (upscale/face-fix) -> utilities strip (last) -
 the post-processing-lane hop when no pure-torch transform was requested.
 
 Background removal has **no in-graph fallback**, so its liveness contract differs from pre-annotation: a
-strip that faults, ages out, or whose lane dies mid-pass is a **no-image fault** (the horde reissues the
-job), never a silent submit of un-stripped images. This matches the post-processing lane, which likewise
-faults without images a job whose requested post-processing could not run. As with the strip pass being
-dispatched one per idle lane per tick, no job is ever left parked indefinitely: the bounded age-out is the
-backstop, and a dead lane is caught immediately by the orphan reconcile.
+strip that faults or exhausts its budgets is a **no-image fault** (the horde reissues the job), never a
+silent submit of un-stripped images. This matches the post-processing lane, which likewise faults without
+images a job whose requested post-processing could not run. No job is left parked indefinitely, but the
+write-off is deliberately hard to reach, because a reissue asks the horde to buy the work twice:
+
+- **Execution budget** (180s): how long one strip may run, timed from the moment it is dispatched to a lane.
+  A job's wait for its turn is never counted against its own pass.
+- **Queue-wait budget**: a strip still waiting for a lane is allowed 180s for each strip ahead of it plus its
+  own, since the lane serves them one at a time and each may legitimately take a full execution budget. The
+  clock restarts when a strip is handed back to the queue.
+- **Lane replacement**: a lane going away does not spoil the job. Its images are still held, so the strip is
+  re-queued for the replacement lane; only after a bounded number of lanes (two) is it written off. This is
+  what the orphan reconcile does instead of faulting on sight.
+- **Late results**: a strip that finishes after its job was written off is still adopted, as long as the
+  job's delivery to the horde has not begun. Finished images serve the requester and earn the job's kudos,
+  where the write-off only asks for the work to be done again. Once the submit is in flight the outcome is
+  settled and the late result is discarded with the reason logged.
+
+The lane-side watchdog respects the same accounting: the adapter never stops a lane that is busy with a
+strip the worker dispatched and still considers inside its budget, so a slow pass cannot be mistaken for a
+hang and killed for it.
 
 ### Pop gating
 

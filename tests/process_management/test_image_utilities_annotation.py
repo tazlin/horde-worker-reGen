@@ -509,10 +509,14 @@ class TestStripDispatchHappyPath:
 
 
 class TestStripLaneDeath:
-    """A strip whose lane dies mid-pass is a no-image fault (reissue), matching the post-processing lane."""
+    """A strip outliving its lanes ends as a no-image fault (reissue), matching the post-processing lane."""
 
-    async def test_lane_death_faults_strip_job_without_images(self) -> None:
-        """The job moves to submit as a fault carrying no images; nothing is silently submitted un-stripped."""
+    async def test_repeated_lane_death_faults_strip_job_without_images(self) -> None:
+        """Once the job has spent every lane it is allowed, it moves to submit as a fault carrying no images.
+
+        The images are re-offered to a replacement lane first, so the fault lands only when the pass has
+        genuinely run out of ways to happen; nothing is ever silently submitted un-stripped.
+        """
         pm = make_testable_process_manager(enable_image_utilities=True)
         util = _add_utilities_process(pm)
         job = await _park_strip_job(pm)
@@ -520,8 +524,13 @@ class TestStripLaneDeath:
         await pm._advance_pending_strips()
         assert pm._job_tracker.get_stage(job.id_) == JobStage.PENDING_STRIP
 
-        util.mp_process.is_alive.return_value = False
-        await pm._advance_pending_strips()
+        # Each pass kills the lane the strip is on and stands a replacement up in its place.
+        for _lane_death in range(pm._MAX_STRIP_DISPATCH_ATTEMPTS):
+            util.mp_process.is_alive.return_value = False
+            await pm._advance_pending_strips()
+            del pm._process_map[_UTILITIES_PROCESS_ID]
+            util = _add_utilities_process(pm)
+            await pm._advance_pending_strips()
 
         tracked = pm._job_tracker.get_tracked_job(job.id_)
         assert tracked is not None
@@ -549,6 +558,170 @@ class TestStripAgeOut:
         assert tracked.stage == JobStage.PENDING_SUBMIT
         assert tracked.job_info is not None
         assert tracked.job_info.state == GENERATION_STATE.faulted
+
+
+class TestStripBudgets:
+    """A strip is judged on the time it actually had: its own run, or its wait behind the serial lane."""
+
+    async def test_dispatched_strip_is_budgeted_from_dispatch_not_stage_entry(self) -> None:
+        """A strip dispatched moments ago survives a long stay in the stage: the wait is not its run time."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        _add_utilities_process(pm)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+        await pm._advance_pending_strips()
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.strip_dispatched_at is not None
+        tracked.current_stage_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS * 4)
+        tracked.strip_dispatched_at = time.time() - 5.0
+
+        await pm._age_out_pending_strips()
+
+        assert tracked.stage == JobStage.PENDING_STRIP
+
+    async def test_dispatched_strip_ages_out_on_its_own_elapsed_run(self) -> None:
+        """Once the dispatched strip itself overruns the budget, the job is faulted without images."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        _add_utilities_process(pm)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+        await pm._advance_pending_strips()
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        tracked.strip_dispatched_at = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+
+        await pm._age_out_pending_strips()
+
+        assert tracked.stage == JobStage.PENDING_SUBMIT
+        assert tracked.job_info is not None
+        assert tracked.job_info.state == GENERATION_STATE.faulted
+
+    async def test_queued_strip_earns_a_budget_for_each_strip_ahead_of_it(self) -> None:
+        """A job waiting behind another strip is allowed that strip's budget on top of its own."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        _add_utilities_process(pm)
+        first = await _park_strip_job(pm)
+        second = await _park_strip_job(pm)
+        assert first.id_ is not None
+        assert second.id_ is not None
+        await pm._advance_pending_strips()
+
+        head = pm._job_tracker.get_tracked_job(first.id_)
+        waiter = pm._job_tracker.get_tracked_job(second.id_)
+        assert head is not None
+        assert waiter is not None
+        assert head.strip_dispatched_at is not None
+        assert waiter.strip_dispatched_at is None, "the single serial lane takes one strip at a time"
+
+        # Waiting longer than one strip's budget, but less than the two it is owed behind the running one.
+        waiter.current_stage_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS * 1.5)
+        await pm._age_out_pending_strips()
+        assert waiter.stage == JobStage.PENDING_STRIP
+
+        waiter.current_stage_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS * 2.5)
+        await pm._age_out_pending_strips()
+        assert waiter.stage == JobStage.PENDING_SUBMIT
+
+
+class TestStripLaneReplacement:
+    """A strip whose lane goes away is re-run on the replacement, up to a bounded number of attempts."""
+
+    async def test_lane_death_requeues_the_strip_for_the_replacement_lane(self) -> None:
+        """The job keeps its images and its place in the strip stage, re-armed for dispatch."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+        await pm._advance_pending_strips()
+
+        util.mp_process.is_alive.return_value = False
+        await pm._advance_pending_strips()
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.stage == JobStage.PENDING_STRIP
+        assert tracked.strip_process_id is None
+        assert tracked.strip_requeued_at is not None
+        assert tracked.job_info is not None
+        assert tracked.job_info.images_bytes == [b"raw-image"]
+
+        # The replacement lane picks the re-queued strip straight up.
+        del pm._process_map[_UTILITIES_PROCESS_ID]
+        replacement = _add_utilities_process(pm)
+        await pm._advance_pending_strips()
+
+        assert tracked.strip_process_id == replacement.process_id
+        sent = _sent(replacement).call_args.args[0]
+        assert isinstance(sent, HordeStartStripControlMessage)
+        assert sent.job_id == job.id_
+
+
+class TestLateStripResult:
+    """Finished strip work is used wherever it still can be, rather than thrown away behind a write-off."""
+
+    async def test_late_success_reopens_a_written_off_job(self) -> None:
+        """A strip that completes after the age-out carries the job on to safety with its stripped images."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        _add_utilities_process(pm)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+        await pm._advance_pending_strips()
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        tracked.strip_dispatched_at = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+        await pm._age_out_pending_strips()
+        assert tracked.stage == JobStage.PENDING_SUBMIT
+
+        await pm._on_strip_result(
+            HordeStripResultMessage(
+                process_id=_UTILITIES_PROCESS_ID,
+                process_launch_identifier=0,
+                info="ok",
+                job_id=job.id_,
+                images_bytes=[b"stripped-late"],
+                state=GENERATION_STATE.ok,
+            ),
+        )
+
+        assert tracked.stage == JobStage.PENDING_SAFETY_CHECK
+        assert tracked.job_info is not None
+        assert tracked.job_info.state == GENERATION_STATE.ok
+        assert tracked.job_info.images_bytes == [b"stripped-late"]
+        assert await pm._job_tracker.get_faults_for_job(job.id_) == []
+
+    async def test_late_success_is_discarded_once_the_submit_is_under_way(self) -> None:
+        """A job whose outcome is already being reported keeps that outcome; the images cannot be used."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        _add_utilities_process(pm)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+        await pm._advance_pending_strips()
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        tracked.strip_dispatched_at = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+        await pm._age_out_pending_strips()
+        assert tracked.job_info is not None
+        pm._job_tracker.note_submit_in_flight(tracked.job_info)
+
+        await pm._on_strip_result(
+            HordeStripResultMessage(
+                process_id=_UTILITIES_PROCESS_ID,
+                process_launch_identifier=0,
+                info="ok",
+                job_id=job.id_,
+                images_bytes=[b"stripped-too-late"],
+                state=GENERATION_STATE.ok,
+            ),
+        )
+
+        assert tracked.stage == JobStage.PENDING_SUBMIT
+        assert tracked.job_info.state == GENERATION_STATE.faulted
+        assert tracked.job_info.job_image_results is None
 
 
 class TestStripLaneDisabled:

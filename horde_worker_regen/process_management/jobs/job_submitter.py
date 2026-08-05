@@ -479,6 +479,10 @@ class JobSubmitter:
 
         completed_job_info = self._job_tracker.jobs_pending_submit[0]
         job_info = completed_job_info.sdk_api_job_info
+        # Taking the job closes it to any further worker-side result: from here its outcome is being
+        # reported, so a late result from a stage the worker wrote off must be discarded rather than
+        # re-opening a job whose delivery is already under way.
+        self._job_tracker.note_submit_in_flight(completed_job_info)
 
         if completed_job_info.state is None:
             logger.error(f"Job {job_info.ids} has no state, assuming faulted")

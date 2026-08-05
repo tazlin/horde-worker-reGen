@@ -201,7 +201,11 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
     ),
     JobStage.PENDING_SUBMIT: frozenset(),
 }
-"""Legal stage transitions. ``PENDING_SUBMIT`` is terminal; jobs leave it only by removal."""
+"""Legal stage transitions. ``PENDING_SUBMIT`` is terminal; jobs leave it only by removal.
+
+Terminality is what keeps a stale or duplicate result from resurrecting a job whose outcome is settled, so
+the one path that may re-open a job (:meth:`JobTracker.readopt_post_inference_result`, adopting finished
+work the worker had written off) asks for that permission explicitly rather than being granted it here."""
 
 _QUEUED_STAGES: tuple[JobStage, ...] = (
     JobStage.PENDING_INFERENCE,
@@ -216,6 +220,12 @@ _QUEUED_STAGES: tuple[JobStage, ...] = (
     JobStage.PENDING_SUBMIT,
 )
 """Stages counted by ``num_jobs_total`` (everything except ``DETACHED``)."""
+
+_POST_INFERENCE_FAULT_REF_PREFIX = "faulted after inference: "
+"""Prefix of the metadata note :meth:`JobTracker.fault_post_inference_job` records.
+
+Matched by :meth:`JobTracker.readopt_post_inference_result` to withdraw the note when the work that was
+written off arrives after all, so a job delivered with its images does not also carry a fault report."""
 
 
 class JobFaultOrigin(enum.StrEnum):
@@ -354,8 +364,26 @@ class TrackedJob:
     """The image-utilities process id that owns this job's in-flight background strip, or None.
 
     None while the job waits in ``PENDING_STRIP`` for a free lane; set when the strip is dispatched, so the
-    orphan reconcile can fault the job the instant that specific lane process is gone (died or was replaced)
-    rather than waiting for the age-out backstop. Cleared implicitly when the job leaves the stage."""
+    orphan reconcile can act the instant that specific lane process is gone (died or was replaced) rather
+    than waiting for the age-out backstop. Cleared implicitly when the job leaves the stage."""
+    strip_dispatched_at: float | None = None
+    """Epoch time this job's background strip was handed to a lane, or None while it is still queued.
+
+    The strip execution budget is measured from here, never from stage entry: the lane is single-serial, so a
+    job can sit legitimately queued behind other strips for far longer than any one strip may take. Cleared
+    when the job is re-queued for another lane, so the replacement gets the full budget rather than inheriting
+    the dead lane's elapsed time."""
+    strip_requeued_at: float | None = None
+    """Epoch time this job's strip was last returned to the queue after its lane went away, or None.
+
+    The queue-wait budget is measured from the later of stage entry and this stamp, so a job handed back for
+    dispatch to a replacement lane is judged on how long it has waited for that lane rather than on the time
+    already spent on the dead one."""
+    strip_dispatch_attempts: int = 0
+    """How many times this job's background strip has been dispatched to a lane.
+
+    Bounds re-dispatch after a lane replacement so a job whose images reliably kill the lane cannot cycle
+    through replacements indefinitely; past the cap it is faulted like any other unservable strip."""
     post_process_process_id: int | None = None
     """The post-processing process id that owns the current post-processing attempt, if any."""
     post_process_launch_identifier: int | None = None
@@ -377,6 +405,33 @@ class TrackedJob:
     to resolve one of the files, so the prefetch is re-armed instead of the job being re-dispatched into
     the same failure.
     """
+    aux_models_prepared_at: float | None = None
+    """Epoch time :attr:`aux_models_prepared` last became true, or None while the job is still gated.
+
+    With :attr:`time_popped` this measures the wall time a job spent blocked on its auxiliary files being
+    placed on disk, which is the part of its queue wait attributable to LoRA/TI fetching rather than to
+    scheduling. A job whose files were already cached stamps this as soon as the prefetch pipeline
+    evaluates it, so its wait reads as ~0 rather than as unknown."""
+    queue_depth_at_dispatch: int | None = None
+    """How many other jobs were queued for or running inference when this job was last dispatched.
+
+    Counts tracked jobs in ``PENDING_INFERENCE`` and ``INFERENCE_IN_PROGRESS`` other than this one, taken at
+    the dispatch that moved this job into inference. None for a job that never reached dispatch."""
+    post_processing_depth_at_dispatch: int | None = None
+    """How many other jobs were queued for or running post-processing when this job was last dispatched.
+
+    Counts tracked jobs in ``PENDING_POST_PROCESSING`` and ``POST_PROCESSING`` other than this one. A job
+    that requests post-processing behind a busy lane pays a tail its own generation did not cause."""
+    served_whole_card: bool | None = None
+    """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
+
+    Such a job runs with the card to itself and carries the amortized cost of establishing that residency,
+    so it is not comparable to a co-resident job of the same shape. None until the job is dispatched."""
+    serving_process_age_seconds: float | None = None
+    """How long the inference process serving this job had been alive at dispatch, in seconds.
+
+    A freshly spawned process has cold component/RAM caches, so its first jobs pay loads a long-lived
+    process would not. None when the dispatch site did not attribute a process."""
     chain_context: ChainExecutionContext | None = None
     """The chain-stage state for this job's unit of work, or None for jobs registered outside the pop path.
 
@@ -396,6 +451,12 @@ class TrackedJob:
 
     Read by the submit path to decide whether the fault counts toward the consecutive-failure pop pause: a
     scheduling-recovery give-up is excluded, a generation/submit fault is not."""
+    submit_in_flight: bool = False
+    """Whether the submitter has taken this job and its delivery to the horde has begun.
+
+    The point of no return for any late result that would otherwise re-open a finished job: once set, the
+    job's outcome is being reported and only the submit path may change it. Latched, never cleared, because
+    the submitter drives every taken job to finalization (delivered or punted)."""
 
 
 @dataclass(frozen=True)
@@ -748,15 +809,26 @@ class JobTracker:
     def _tracked_for(self, job: ImageGenerateJobPopResponse) -> TrackedJob | None:
         return self._tracked_by_id(job.id_)
 
-    def _set_stage(self, tracked: TrackedJob, new_stage: JobStage) -> bool:
+    def _set_stage(self, tracked: TrackedJob, new_stage: JobStage, *, reopening_from_submit: bool = False) -> bool:
         """Move a job to a new stage, validating the transition.
+
+        Args:
+            tracked: The job to move.
+            new_stage: The stage to move it into.
+            reopening_from_submit: Permit the one transition the table deliberately withholds, a job at rest
+                in ``PENDING_SUBMIT`` returning to the safety tail. Only :meth:`readopt_post_inference_result`
+                passes this, and only for a job whose delivery has not begun; every other caller must keep
+                ``PENDING_SUBMIT`` terminal so a stale result cannot resurrect a settled job.
 
         Returns:
             True if the transition was applied, False if it was illegal (and logged).
         """
         if tracked.stage == new_stage:
             return True
-        if new_stage not in _ALLOWED_TRANSITIONS[tracked.stage]:
+        allowed = _ALLOWED_TRANSITIONS[tracked.stage]
+        if reopening_from_submit and tracked.stage == JobStage.PENDING_SUBMIT:
+            allowed = frozenset({JobStage.PENDING_SAFETY_CHECK})
+        if new_stage not in allowed:
             logger.error(
                 f"Illegal job stage transition for job {tracked.job_id}: "
                 f"{tracked.stage.name} -> {new_stage.name}. Transition refused.",
@@ -820,7 +892,13 @@ class JobTracker:
             self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING)
             return
 
-        if new_stage == JobStage.PENDING_SAFETY_CHECK and old_stage == JobStage.PENDING_STRIP:
+        if new_stage == JobStage.PENDING_SAFETY_CHECK and old_stage in (
+            JobStage.PENDING_STRIP,
+            # A strip result adopted after the job had already been written off comes back from
+            # PENDING_SUBMIT with the post-processing node still executing, so it closes the same node the
+            # in-stage result would have.
+            JobStage.PENDING_SUBMIT,
+        ):
             self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING_COMPLETE)
             return
 
@@ -1114,6 +1192,9 @@ class JobTracker:
             return False
         tracked.job_info = job_info
         tracked.strip_process_id = None
+        tracked.strip_dispatched_at = None
+        tracked.strip_requeued_at = None
+        tracked.strip_dispatch_attempts = 0
         if from_post_processing:
             self._total_num_post_processing_progress += 1
         else:
@@ -1125,10 +1206,35 @@ class JobTracker:
         return True
 
     def mark_strip_dispatched(self, job_id: GenerationID, *, process_id: int) -> None:
-        """Record that a parked strip job's pass was dispatched to image-utilities process ``process_id``."""
+        """Record that a parked strip job's pass was dispatched to image-utilities process ``process_id``.
+
+        Stamps the dispatch time, which is what the strip execution budget is measured against, and counts
+        the attempt so repeated re-dispatch after lane replacements is bounded.
+        """
         tracked = self._tracked_by_id(job_id)
         if tracked is not None and tracked.stage == JobStage.PENDING_STRIP:
             tracked.strip_process_id = process_id
+            tracked.strip_dispatched_at = time.time()
+            tracked.strip_requeued_at = None
+            tracked.strip_dispatch_attempts += 1
+
+    def requeue_strip_for_dispatch(self, job_id: GenerationID) -> bool:
+        """Hand a dispatched strip back to the queue so a replacement lane can run it.
+
+        The lane a strip was dispatched to going away says nothing about the job: the images are still held
+        and the pass is still runnable, so the job is re-armed for dispatch instead of being written off.
+        Stamps the re-queue time, which restarts the queue-wait budget for the new lane.
+
+        Returns:
+            True if the job was re-armed, False if it is not a dispatched strip job.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_STRIP or tracked.strip_process_id is None:
+            return False
+        tracked.strip_process_id = None
+        tracked.strip_dispatched_at = None
+        tracked.strip_requeued_at = time.time()
+        return True
 
     @property
     def job_pop_timestamps(self) -> dict[ImageGenerateJobPopResponse, float]:
@@ -1268,11 +1374,39 @@ class JobTracker:
         self._job_faults.setdefault(job_pop_response.id_, [])
         return job_info
 
+    def _stamp_dispatch_conditions(
+        self,
+        tracked: TrackedJob,
+        *,
+        whole_card: bool,
+        process_age_seconds: float | None,
+    ) -> None:
+        """Record the worker conditions this job is dispatched into, for per-job cost attribution.
+
+        Read at finalize time by the run-metrics aggregator, which exports them alongside the job's
+        measured seconds so an analysis can control for what else the worker was doing. Written on every
+        dispatch, so a re-dispatched job describes the attempt that actually ran.
+        """
+        tracked.queue_depth_at_dispatch = sum(
+            1
+            for other in self._jobs.values()
+            if other is not tracked and other.stage in (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS)
+        )
+        tracked.post_processing_depth_at_dispatch = sum(
+            1
+            for other in self._jobs.values()
+            if other is not tracked and other.stage in (JobStage.PENDING_POST_PROCESSING, JobStage.POST_PROCESSING)
+        )
+        tracked.served_whole_card = whole_card
+        tracked.serving_process_age_seconds = process_age_seconds
+
     async def mark_inference_started(
         self,
         job: ImageGenerateJobPopResponse,
         *,
         device_index: int | None = None,
+        whole_card: bool = False,
+        process_age_seconds: float | None = None,
     ) -> None:
         """Mark a job as started for inference, recording the card it was dispatched to.
 
@@ -1280,6 +1414,10 @@ class JobTracker:
             job: The job entering inference.
             device_index: The card it was dispatched to (multi-GPU), or None on a single-GPU host. Stored so
                 its over-budget fault streak (and the success that clears it) is keyed to that card.
+            whole_card: Whether a whole-card exclusive residency for this job's model was held on that card
+                at dispatch.
+            process_age_seconds: How long the serving inference process had been alive at dispatch, or None
+                when the dispatch site attributes no process.
         """
         tracked = self._tracked_for(job)
         if tracked is None:
@@ -1300,10 +1438,16 @@ class JobTracker:
                 new_tracked.last_dispatched_device_index = device_index
                 if new_tracked.admitted_exclusive and device_index is not None:
                     new_tracked.admitted_exclusive_device_index = device_index
+                self._stamp_dispatch_conditions(
+                    new_tracked,
+                    whole_card=whole_card,
+                    process_age_seconds=process_age_seconds,
+                )
             return
         if tracked.stage != JobStage.INFERENCE_IN_PROGRESS:
             self._total_num_inference_starts += 1
         tracked.last_dispatched_device_index = device_index
+        self._stamp_dispatch_conditions(tracked, whole_card=whole_card, process_age_seconds=process_age_seconds)
         if tracked.admitted_exclusive and device_index is not None:
             tracked.admitted_exclusive_device_index = device_index
         # The job took its dispatch opportunity, so a recovery-granted retry is no longer awaiting one: a
@@ -1605,7 +1749,7 @@ class JobTracker:
             GenMetadataEntry(
                 type=METADATA_TYPE.information,
                 value=METADATA_VALUE.see_ref,
-                ref=f"faulted after inference: {reason}"[:255],
+                ref=f"{_POST_INFERENCE_FAULT_REF_PREFIX}{reason}"[:255],
             ),
         )
         if not self._set_stage(tracked, JobStage.PENDING_SUBMIT):
@@ -1616,6 +1760,52 @@ class JobTracker:
             return
         if previous_stage in (JobStage.PENDING_POST_PROCESSING, JobStage.POST_PROCESSING):
             self._total_num_post_processing_progress += 1
+
+    def note_submit_in_flight(self, job_info: HordeJobInfo) -> None:
+        """Latch that the submitter has taken this job, closing it to any further worker-side result.
+
+        Called by the submit path the moment it commits to delivering a job's outcome, so a result that
+        arrives from a stage the worker had already written off can tell the difference between a job still
+        sitting at rest and one whose fate is being reported.
+        """
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is not None:
+            tracked.submit_in_flight = True
+
+    async def readopt_post_inference_result(
+        self,
+        job_info: HordeJobInfo,
+        *,
+        job_image_results: list[HordeImageResult],
+    ) -> bool:
+        """Take back a post-inference fault when the work it wrote off completes after all.
+
+        A worker-owned stage that stops waiting on a lane reports a no-image fault so the horde reissues the
+        job, but the lane can still finish the pass afterwards. Finished images are worth more than a reissue
+        request, so as long as the job is only resting at ``PENDING_SUBMIT`` (its delivery not yet begun) the
+        result is adopted, the fault note it accrued is withdrawn, and the job re-enters the safety tail it
+        would have taken. A job whose submit is already in flight, or that the tracker no longer holds, is
+        past the point where its outcome can change.
+
+        Returns:
+            True if the job was re-opened with the adopted images, False if it is past the point of no return.
+        """
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None or tracked.submit_in_flight or tracked.stage != JobStage.PENDING_SUBMIT:
+            return False
+        if not self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK, reopening_from_submit=True):
+            return False
+        faults = self._job_faults.get(tracked.job_id)
+        if faults:
+            self._job_faults[tracked.job_id] = [
+                entry
+                for entry in faults
+                if entry.ref is None or not entry.ref.startswith(_POST_INFERENCE_FAULT_REF_PREFIX)
+            ]
+        job_info.job_image_results = job_image_results
+        job_info.state = GENERATION_STATE.ok
+        tracked.job_info = job_info
+        return True
 
     async def begin_safety_check(self, job_info: HordeJobInfo) -> None:
         """Begin the safety check process for a job."""
@@ -1823,6 +2013,7 @@ class JobTracker:
         if not self.are_all_job_loras_cached(job) or not self.are_all_job_tis_cached(job):
             return False
         tracked.aux_models_prepared = True
+        tracked.aux_models_prepared_at = time.time()
         return True
 
     def invalidate_job_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
@@ -1843,6 +2034,7 @@ class JobTracker:
         if tracked is None or not tracked.aux_models_prepared:
             return False
         tracked.aux_models_prepared = False
+        tracked.aux_models_prepared_at = None
         return True
 
     async def get_time_popped(self, job: ImageGenerateJobPopResponse) -> float | None:

@@ -182,6 +182,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     ResourceStateKind,
     RunMetricsSnapshot,
     WorkerRunMetrics,
+    scenario_provenance_from_env,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommandKind, VramArbiter
 from horde_worker_regen.process_management.resources.vram_attribution import (
@@ -1461,6 +1462,7 @@ class HordeWorkerProcessManager:
             self._run_metrics.set_stats_export(True, worker_version=horde_worker_regen.__version__)
             self._run_metrics.record_session_start(config=self._stats_config_snapshot())
         self._session_end_recorded = False
+        self._session_end_reason: str | None = None
 
         # Measure real GPU core uptime (the duty cycle) for the whole worker session, not just the
         # benchmark. A coarse 1s poll is plenty for the rolling-window trend and threshold logs and
@@ -4546,39 +4548,58 @@ class HordeWorkerProcessManager:
             )
 
     def _first_available_utilities_process(self, *, exclude: set[int]) -> HordeProcessInfo | None:
-        """Return an idle image-utilities lane process not already used this tick, or None."""
+        """Return a live, idle image-utilities lane process not already used this tick, or None.
+
+        Liveness is checked as well as readiness: a lane that has died still carries its last reported state,
+        so readiness alone would hand work to a process that is on its way out of the map, which for a
+        re-queued strip means feeding it straight back to the lane it was just rescued from.
+        """
         for info in self._process_map.values():
             if info.process_type != HordeProcessType.UTILITIES:
                 continue
             if info.process_id in exclude:
                 continue
-            if info.can_accept_job():
+            if info.can_accept_job() and info.is_process_alive():
                 return info
         return None
 
     _PENDING_STRIP_TIMEOUT_SECONDS = 180.0
-    """How long a job may sit in ``PENDING_STRIP`` before its background strip is faulted without images.
+    """How long one dispatched background strip may run before its job is faulted without images.
 
-    Bounds how long a generation job waits on its background-removal pass when the lane answers health yet
-    drops a specific strip. A dead or unresponsive lane is caught sooner by the orphan reconcile. On expiry
-    the job is a no-image fault (reissued), because background removal has no in-graph fallback: this matches
-    the post-processing lane, which also faults a job whose requested post-processing could not run."""
+    Measured from the moment the strip is handed to a lane, never from stage entry: the lane runs strips one
+    at a time, so a job's wait for its turn is unrelated to how long its own pass may take. A job still
+    queued is judged instead against a wait budget of this many seconds per strip ahead of it plus its own
+    (see :meth:`_age_out_pending_strips`), which is the longest the queue in front of it can legitimately
+    take. A dead or unresponsive lane is caught sooner by the orphan reconcile. On expiry the job is a
+    no-image fault (reissued), because background removal has no in-graph fallback: this matches the
+    post-processing lane, which also faults a job whose requested post-processing could not run."""
+
+    _MAX_STRIP_DISPATCH_ATTEMPTS = 2
+    """How many lanes a single job's background strip may be handed to before it is written off.
+
+    A strip whose lane goes away is re-queued for the replacement rather than faulted, since the images are
+    still held and the pass is still runnable. This bounds that: a job whose images take the lane down with
+    them cannot walk through replacement after replacement."""
 
     async def _on_strip_result(self, message: HordeStripResultMessage) -> None:
         """Adopt a background-strip result: on success move the job to safety, on a fault reissue it.
 
         Background removal is the job's advertised post-processing, so a failed strip is a no-image fault
         (the horde reissues the job) rather than a silent submit of un-stripped images, exactly as the
-        post-processing lane treats a failed pass.
+        post-processing lane treats a failed pass. A result for a job that has already left the stage is
+        routed to :meth:`_adopt_late_strip_result`, which decides whether the finished work can still be used.
         """
         tracked = self._job_tracker.get_tracked_job(message.job_id)
-        if tracked is None or tracked.stage != JobStage.PENDING_STRIP or tracked.job_info is None:
-            # The job already left PENDING_STRIP (an orphan reconcile faulted it when its lane died, or this
-            # is a duplicate/late result); nothing to do.
+        if tracked is None or tracked.job_info is None:
+            # The job is no longer tracked at all (finalized, or a duplicate result); nothing to do.
+            return
+        if tracked.stage != JobStage.PENDING_STRIP:
+            await self._adopt_late_strip_result(tracked, message)
             return
         subject = f"job:{str(message.job_id)[:8]}"
         job_info = tracked.job_info
         tracked.strip_process_id = None
+        tracked.strip_dispatched_at = None
         if message.state == GENERATION_STATE.ok and message.images_bytes:
             job_info.job_image_results = [HordeImageResult(image_bytes=image) for image in message.images_bytes]
             job_info.state = GENERATION_STATE.ok
@@ -4601,6 +4622,56 @@ class HordeWorkerProcessManager:
             inputs={"fault_reason": reason},
         )
 
+    async def _adopt_late_strip_result(self, tracked: TrackedJob, message: HordeStripResultMessage) -> None:
+        """Use a background-strip result that arrived after its job left the strip stage, where that is still possible.
+
+        The worker writes a strip off when it stops waiting on the lane, but the lane can still finish the
+        pass afterwards. Finished images serve the requester and earn the job's kudos, where the write-off
+        only asks the horde to have the work done again, so a successful late result is adopted for any job
+        whose delivery has not yet begun. Anything past that point (its submit in flight, or the job already
+        finalized) is unusable and is discarded with the reason recorded.
+        """
+        subject = f"job:{str(message.job_id)[:8]}"
+        if tracked.job_info is None:
+            return
+        if message.state != GENERATION_STATE.ok or not message.images_bytes:
+            logger.debug(
+                f"Discarding a faulted background strip for {subject}: the job left the strip stage at "
+                f"{tracked.stage.name} before the result arrived.",
+            )
+            return
+
+        adopted = await self._job_tracker.readopt_post_inference_result(
+            tracked.job_info,
+            job_image_results=[HordeImageResult(image_bytes=image) for image in message.images_bytes],
+        )
+        if not adopted:
+            logger.warning(
+                f"Discarding a completed background strip for {subject}: the job is at {tracked.stage.name} "
+                f"and its outcome is already being reported to the horde, so the images cannot be used.",
+            )
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                subject=subject,
+                verdict=DecisionVerdict.DENY,
+                reason="late_strip_result_unusable",
+                inputs={"stage": tracked.stage.name},
+            )
+            return
+
+        tracked.strip_process_id = None
+        tracked.strip_dispatched_at = None
+        logger.info(
+            f"Adopted a background strip for {subject} that finished after the job had been written off; "
+            f"the job continues to safety with its stripped images instead of being reissued.",
+        )
+        self._run_metrics.record_decision(
+            decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+            subject=subject,
+            verdict=DecisionVerdict.ADMIT,
+            reason="late_strip_result_adopted",
+        )
+
     async def _advance_pending_strips(self) -> None:
         """Reconcile, age out, and dispatch the image-utilities background-strip stage for generation jobs.
 
@@ -4616,7 +4687,13 @@ class HordeWorkerProcessManager:
         self._dispatch_pending_strips()
 
     async def _reconcile_orphaned_strip_jobs(self) -> None:
-        """Fault (no images) any strip job whose owning image-utilities lane process is gone."""
+        """Re-queue (or, past the attempt cap, fault) any strip job whose owning lane process is gone.
+
+        The lane going away does not spoil the job: its images are still held by the tracker and the pass is
+        still runnable, so the strip is handed back to the queue for the replacement lane. Only a job that
+        has already burned its dispatch attempts is written off, which keeps a lane that dies on one job's
+        images from being replaced forever on its behalf.
+        """
         live_ids = {
             info.process_id
             for info in self._process_map.values()
@@ -4625,18 +4702,46 @@ class HordeWorkerProcessManager:
         for tracked in self._job_tracker.jobs_pending_strip:
             if tracked.strip_process_id is None or tracked.strip_process_id in live_ids:
                 continue
-            await self._fault_strip_job(tracked, cause="lane_gone", detail="its image-utilities lane is gone")
+            if tracked.strip_dispatch_attempts >= self._MAX_STRIP_DISPATCH_ATTEMPTS or not (
+                tracked.job_info is not None and tracked.job_info.images_bytes
+            ):
+                await self._fault_strip_job(tracked, cause="lane_gone", detail="its image-utilities lane is gone")
+                continue
+            if self._job_tracker.requeue_strip_for_dispatch(tracked.job_id):
+                logger.info(
+                    f"Re-queueing the background strip for job {str(tracked.job_id)[:8]}: its image-utilities "
+                    f"lane is gone, so the pass is handed to the replacement lane rather than written off.",
+                )
+                self._run_metrics.record_decision(
+                    decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                    subject=f"job:{str(tracked.job_id)[:8]}",
+                    verdict=DecisionVerdict.DEFER,
+                    reason="strip_requeued_lane_gone",
+                    inputs={"attempts": tracked.strip_dispatch_attempts},
+                )
 
     async def _age_out_pending_strips(self) -> None:
-        """Fault (no images) any job that has sat in ``PENDING_STRIP`` past the bounded timeout."""
+        """Fault (no images) any strip job that has outlived the budget its position earns it.
+
+        A dispatched strip is judged on how long it has been running on its lane; a strip still queued is
+        judged on how long it has been waiting for one, against a budget that grows with the number of
+        strips ahead of it, because the lane serves them one at a time and each may take a full execution
+        budget. Nothing about a job's wait for its turn is therefore counted against its own pass.
+        """
         now = time.time()
-        for tracked in self._job_tracker.jobs_pending_strip:
-            age = now - tracked.current_stage_since if tracked.current_stage_since else 0.0
-            if age < self._PENDING_STRIP_TIMEOUT_SECONDS:
+        for jobs_ahead, tracked in enumerate(self._job_tracker.jobs_pending_strip):
+            if tracked.strip_dispatched_at is not None:
+                age = now - tracked.strip_dispatched_at
+                budget = self._PENDING_STRIP_TIMEOUT_SECONDS
+                detail = f"its background strip ran {age:.0f}s on the lane without a result"
+            else:
+                waiting_since = max(tracked.current_stage_since or now, tracked.strip_requeued_at or 0.0)
+                age = now - waiting_since
+                budget = self._PENDING_STRIP_TIMEOUT_SECONDS * (jobs_ahead + 1)
+                detail = f"its background strip waited {age:.0f}s for a lane behind {jobs_ahead} other strip(s)"
+            if age < budget:
                 continue
-            await self._fault_strip_job(
-                tracked, cause="age_out", detail=f"background strip timed out after {age:.0f}s"
-            )
+            await self._fault_strip_job(tracked, cause="age_out", detail=detail)
 
     async def _fault_strip_job(self, tracked: TrackedJob, *, cause: str, detail: str) -> None:
         """Report a no-image fault for a strip job that cannot complete, so the horde reissues it."""
@@ -5340,10 +5445,16 @@ class HordeWorkerProcessManager:
         A curated, one-level-deep view of the bridge_data fields that shape throughput and resource
         behaviour. It is the anchor a later analysis uses to attribute an observed change to the
         configuration it ran under; kept flat and scalar so any downstream reader consumes it directly.
+
+        A harness- or benchmark-driven session additionally carries the identity of the workload it ran
+        (``scenario_id``/``scenario_revision``, from the environment), which is what lets records gathered
+        on different machines be paired by workload rather than only by configuration. Those keys are
+        absent for a production run, which has no scenario.
         """
         bridge = self.bridge_data
         image_models = bridge.image_models_to_load
         return {
+            **scenario_provenance_from_env(),
             "max_power": bridge.max_power,
             "max_threads": bridge.max_threads,
             "queue_size": bridge.queue_size,
@@ -7426,15 +7537,21 @@ class HordeWorkerProcessManager:
 
             # return_exceptions=True so one failing loop does not cancel its siblings mid-flight:
             # _handle_exception has already initiated a graceful shutdown, and we want the other
-            # loops (notably the submitter) to keep draining in-flight work until the control loop has
-            # completed the drain and final child reap. Its done callback then cancels any blocked remainder.
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # loops (notably the submitter) to keep draining in-flight work until done.
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if not self._state.shut_down:
-                self._shutdown()
-            for result in results:
-                if isinstance(result, BaseException) and not isinstance(result, CancelledError):
-                    logger.error(f"main loop task raised during shutdown: {result}")
+                if not self._state.shut_down:
+                    self._shutdown()
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(result, CancelledError):
+                        logger.error(f"main loop task raised during shutdown: {result}")
+            finally:
+                # Every loop that can finalize a job (the submitter, and the control loop's post-inference
+                # drain) has returned, so no further job_completed record can be written and the terminal
+                # totals now account for the whole stream. In a finally so a cancelled loop still leaves
+                # the stream terminated.
+                self._record_session_end_once(self._session_end_reason or "graceful_shutdown")
 
     def _cancel_main_loop_siblings(self, tasks: list[asyncio.Task[None]]) -> None:
         """Cancel background loops after the control loop has completed final child teardown.
@@ -7499,32 +7616,41 @@ class HordeWorkerProcessManager:
         """
         self._shutdown_manager.cancel_timed_shutdown()
 
+    def _note_session_end_reason(self, reason: str) -> None:
+        """Remember why this session is ending, for the ``session_end`` marker written after the drain.
+
+        The first reason wins: it names what began the teardown, which is what a reader of the stream
+        wants, rather than whatever later stage happened to complete it.
+        """
+        if self._session_end_reason is None:
+            self._session_end_reason = reason
+
     def _record_session_end_once(self, reason: str) -> None:
-        """Emit the session_end marker at most once, with terminal totals. Best-effort; never raises."""
+        """Emit the session_end marker at most once, with terminal totals. Best-effort; never raises.
+
+        Called once every loop that can still finalize a job has returned, so the marker is the last
+        line of the stats stream and its counters cover every ``job_completed`` record above it.
+        """
         if self._session_end_recorded:
             return
         self._session_end_recorded = True
         try:
-            snapshot = self.get_run_metrics_snapshot()
-            submitted = sum(1 for job in snapshot.jobs if not job.faulted)
-            faulted = sum(1 for job in snapshot.jobs if job.faulted)
             self._run_metrics.record_session_end(
                 reason=reason,
-                jobs_submitted=submitted,
-                jobs_faulted=faulted,
-                process_recoveries=snapshot.num_process_recoveries,
+                process_recoveries=self.get_run_metrics_snapshot().num_process_recoveries,
             )
         except Exception as end_error:  # noqa: BLE001 - session_end is best-effort; never block shutdown
             logger.debug(f"session_end record skipped: {type(end_error).__name__}: {end_error}")
 
     def _shutdown(self) -> None:
         # Flush the latest self-calibration before exit so the next run starts warm.
-        self._record_session_end_once("graceful_shutdown")
+        self._note_session_end_reason("graceful_shutdown")
         self._performance_model.save()
         self._shutdown_manager.shutdown()
 
     def _abort(self) -> None:
         """Exit as soon as possible, aborting all processes and jobs immediately."""
+        self._note_session_end_reason("aborted")
         self._shutdown_manager.abort()
 
     def _restart_after_message_channel_corruption(self, reason: str) -> None:
