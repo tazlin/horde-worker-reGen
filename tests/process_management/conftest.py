@@ -504,6 +504,11 @@ def make_testable_process_manager(
     )
     if device_free_mb is not None:
         process_manager._last_device_free_mb_by_device[0] = device_free_mb
+    # Pin the RAM admission gates to an ample host, mirroring the device-free seeding above: an unpinned
+    # scheduler reads the suite machine's real free RAM through psutil, so a scenario admitting a heavy
+    # model would pass on a large dev box and defer on a small CI runner regardless of the scenario's own
+    # constructed state. Tests exercising RAM pressure install their own provider over this one.
+    process_manager._inference_scheduler.set_available_ram_mb_provider(lambda: 65536.0)
     return process_manager
 
 

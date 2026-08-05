@@ -64,6 +64,7 @@ from horde_worker_regen.process_management.scheduling.governance.snapshots impor
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     GraceBudgetStatus,
+    WholeCardGovernor,
     WholeCardGrantKind,
     WholeCardPhase,
     WholeCardResidency,
@@ -99,6 +100,7 @@ __all__ = [
     "SetPopHold",
     "StopTrackingShedCard",
     "StopTrackingWorkerShed",
+    "WholeCardGovernor",
     "WholeCardGrantKind",
     "WholeCardPhase",
     "WholeCardResidency",

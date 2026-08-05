@@ -148,6 +148,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     SetPopHold,
     StopTrackingShedCard,
     StopTrackingWorkerShed,
+    WholeCardGovernor,
     WholeCardResidency,
     WholeCardResidencyMachine,
     WorkerProcessShedState,
@@ -594,7 +595,7 @@ class _WholeCardDemandOutcome(enum.Enum):
 class _WholeCardGovernorHold:
     """A churn governor's refusal to open a new whole-card residency on one card, with its arithmetic."""
 
-    governor: str
+    governor: WholeCardGovernor
     """Which governor refused, used to key the throttled disclosure so a changed objection always speaks."""
     reason: str
     """Operator-facing sentence naming the refusal; also the recorded defer reason.
@@ -722,6 +723,7 @@ class InferenceScheduler:
         pool_protected_models_provider: Callable[[], frozenset[str]] | None = None,
         on_pool_pressure_eviction: Callable[[str], None] | None = None,
         decision_sink: DecisionSink | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
 
@@ -769,7 +771,16 @@ class InferenceScheduler:
             decision_sink (DecisionSink | None): Optional callback the manager injects to record
                 dispatch-residency admission decisions (holds and their release) to the stats export.
                 ``None`` in unit tests and until wired; emission is a no-op then.
+            clock (Callable[[], float] | None): The wall-clock source for every scheduling and governance
+                window the scheduler owns: residency grace and cooldown, the churn governors' rolling windows
+                and their deferral dwell, head starvation and the dispatch barriers, and the reclaim rate
+                limits. It is injectable so a harness can drive those windows on its own timeline instead of
+                having to spend the real seconds they are sized in. Timestamps shared with other components (a
+                process's spawn time, IPC report ages, action-ledger entries) stay on the real clock, since
+                they are compared against stamps this scheduler does not write. ``None`` reads the real clock
+                through a fresh lookup on every call, so a test that patches ``time.time`` still governs it.
         """
+        self._clock: Callable[[], float] = clock if clock is not None else lambda: time.time()
         self._state = state
         self._process_map = process_map
         self._horde_model_map = horde_model_map
@@ -833,6 +844,10 @@ class InferenceScheduler:
         # measurement. None until wired (and in standalone unit tests), where those seams fall back to their
         # measured floors.
         self._vram_arbiter: VramArbiter | None = None
+        # Whether the arbiter above is one this scheduler made for itself rather than the manager's. Nothing
+        # else freezes a private arbiter's cycle, so the scheduler must re-freeze it from live state on each
+        # consult; an injected one is driven by the control loop and must be left on the cycle it froze.
+        self._owns_private_vram_arbiter = False
         # The worker's single verified reclaim ladder, injected by the manager. The scheduler books a live-
         # context reduction with it as a restore obligation, so the engine that already owns the LIFO unwind of
         # ladder-issued pauses also owns growing the inference pool back when the card recovers. None until
@@ -844,6 +859,7 @@ class InferenceScheduler:
         # measured-truth identity keeps its primary input there too. None (unwired) leaves the reading absent,
         # and admission defers with the missing-reading diagnostic.
         self._device_free_mb_provider: Callable[[int], float | None] | None = None
+        self._available_ram_mb_provider: Callable[[], float] | None = None
         # The head-preload context the current deferred verdict's actuations act on, set immediately before the
         # adapter runs a verdict's commands and cleared once they have. None outside that window.
         self._preload_actuation: _PreloadActuation | None = None
@@ -1243,7 +1259,7 @@ class InferenceScheduler:
         The first observation logs, a semantic state change logs immediately, and an unchanged observation
         logs periodically. ``None`` means "do not emit this time".
         """
-        now = time.time()
+        now = self._clock()
         previous = self._scheduler_diagnostic_log_state.get(name)
         if previous is None:
             self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
@@ -1409,7 +1425,7 @@ class InferenceScheduler:
         other preload. An unsized or missing forecast keeps the conservative isolation.
         """
         if not self._job_tracker.is_admitted_over_budget(job):
-            self._heavy_head_admitted_at = time.time()
+            self._heavy_head_admitted_at = self._clock()
         self._job_tracker.mark_admitted_over_budget(job)
         if self._runtime_config.bridge_data.overbudget_exclusive_mode and (
             forecast is None or forecast.admit_requires_isolation
@@ -1917,7 +1933,7 @@ class InferenceScheduler:
         if pp_backlog_depth == 0:
             self._safety_restore_pp_backlog_since = None
         elif self._safety_restore_pp_backlog_since is None:
-            self._safety_restore_pp_backlog_since = time.time()
+            self._safety_restore_pp_backlog_since = self._clock()
         return pp_backlog_depth
 
     def _post_processing_defers_safety_restore(self, pp_backlog_depth: int) -> bool:
@@ -1938,7 +1954,7 @@ class InferenceScheduler:
         since = self._safety_restore_pp_backlog_since
         if since is None:
             return True
-        return (time.time() - since) < _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS
+        return (self._clock() - since) < _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS
 
     def _held_residency_requests_safety_off_gpu(self) -> bool:
         """Return whether any live residency requires safety to remain off its card."""
@@ -2369,6 +2385,7 @@ class InferenceScheduler:
         announce: bool,
         target_override: int | None = None,
         device_index: int | None = None,
+        target_process: HordeProcessInfo | None = None,
     ) -> None:
         """Claim the device for a whole-card model: stop idle siblings and move safety off-GPU.
 
@@ -2382,13 +2399,18 @@ class InferenceScheduler:
 
         ``device_index`` scopes the residency to one card on a multi-GPU host (only that card's processes are
         reduced, and safety is paused only if it sits on that card); None is the single-GPU / worker-wide case.
+
+        ``target_process`` is the slot the caller is about to load or dispatch this head on. It is spared from
+        the scale-down: ``protected_model`` spares only lanes already carrying the model, and a head that is
+        not staged anywhere yet has none, so its own empty idle target would otherwise be a legal victim of
+        the teardown its residency ordered.
         """
         self._whole_card_ledger.record_grant(
             device_index,
             model=job.model,
             forecast=forecast,
-            cooldown_until=time.time() + self._whole_card_cooldown_seconds(),
-            now=time.time(),
+            cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
+            now=self._clock(),
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
         if target_override is not None:
@@ -2403,10 +2425,11 @@ class InferenceScheduler:
         current = self._process_map.num_loaded_inference_processes(device_index=device_index)
         after = current
         if target is not None and target < current:
-            after = self._process_lifecycle.scale_inference_processes(
+            after = self._scale_sparing(
                 target,
                 device_index=device_index,
                 protected_model=job.model,
+                spared_process_id=target_process.process_id if target_process is not None else None,
             )
 
         safety_pause_requested = self._residency_should_pause_safety(device_index) and not self._has_safety_backlog()
@@ -2441,6 +2464,33 @@ class InferenceScheduler:
                 job.model,
                 self._process_map.residency_snapshot(),
             )
+
+    def _scale_sparing(
+        self,
+        target: int,
+        *,
+        device_index: int | None,
+        protected_model: str | None,
+        spared_process_id: int | None,
+    ) -> int:
+        """Scale the inference pool, naming a spared slot only when this caller holds one.
+
+        The spare is an optional extra on top of the model-name protection: a residency that has no slot of
+        its own committed yet (its head is resident somewhere, or the caller is a convergence with nothing
+        pre-staged) asks for exactly the shrink it always did.
+        """
+        if spared_process_id is None:
+            return self._process_lifecycle.scale_inference_processes(
+                target,
+                device_index=device_index,
+                protected_model=protected_model,
+            )
+        return self._process_lifecycle.scale_inference_processes(
+            target,
+            device_index=device_index,
+            protected_model=protected_model,
+            spared_process_id=spared_process_id,
+        )
 
     def _should_prestage_whole_card_head(
         self,
@@ -2522,6 +2572,7 @@ class InferenceScheduler:
         *,
         announce: bool,
         device_index: int | None = None,
+        target_process: HordeProcessInfo | None = None,
     ) -> None:
         """Record a whole-card residency for a head being pre-staged into RAM, without claiming the card yet.
 
@@ -2533,15 +2584,22 @@ class InferenceScheduler:
 
         ``device_index`` scopes the pre-staged residency to one card on a multi-GPU host; None is the
         single-GPU / worker-wide case.
+
+        ``target_process`` is the spare the pre-stage loads into. It is remembered on the residency so the
+        convergence that follows spares it: that shrink spares the holder by model name, which a slot still
+        mid-load does not carry, so the pre-stage's own target would otherwise be a legal victim of the
+        collapse it is loading for.
         """
         self._whole_card_ledger.record_grant(
             device_index,
             model=job.model,
             forecast=forecast,
-            cooldown_until=time.time() + self._whole_card_cooldown_seconds(),
-            now=time.time(),
+            cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
+            now=self._clock(),
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
+        if target_process is not None:
+            self._whole_card_ledger.state_for(device_index).prestage_process_id = target_process.process_id
         if announce:
             logger.opt(colors=True).info(
                 "<fg #f0beff>Pre-staging whole-card head {} into a spare process's RAM while the "
@@ -2580,10 +2638,11 @@ class InferenceScheduler:
             # convergence (moving the service lanes off the card) is unaffected by the missing depth.
             live_count = self._process_map.num_loaded_inference_processes(device_index=device_index)
             if target is not None and live_count > target:
-                self._process_lifecycle.scale_inference_processes(
+                self._scale_sparing(
                     target,
                     device_index=device_index,
                     protected_model=model,
+                    spared_process_id=state.prestage_process_id,
                 )
             if forecast is not None:
                 self._pause_post_process_for_residency_if_idle(device_index, model_name=model, forecast=forecast)
@@ -2668,12 +2727,12 @@ class InferenceScheduler:
         # through the ledger, so a head that already sat out its dwell dispatches co-resident immediately.
         held = self._whole_card_ledger.get(target_device_index)
         if held is None or held.model is None or held.model != job.model:
-            governor_hold = self._whole_card_governor_hold(target_device_index, now=time.time())
+            governor_hold = self._whole_card_governor_hold(target_device_index, now=self._clock())
             if governor_hold is not None:
                 elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
                     target_device_index,
                     model=job.model,
-                    now=time.time(),
+                    now=self._clock(),
                 )
                 self._disclose_whole_card_governor_hold(
                     job,
@@ -2693,6 +2752,7 @@ class InferenceScheduler:
             forecast,
             announce=first_time,
             device_index=target_device_index,
+            target_process=process_with_model,
         )
         self.unload_models_from_vram(
             process_with_model,
@@ -2749,11 +2809,15 @@ class InferenceScheduler:
             post_process_cleared=self._process_map.num_post_process_processes(device_index=device_index) == 0,
             component_lane_pause_required=self._residency_should_pause_component_lane(device_index),
             component_lane_cleared=self._process_map.num_component_processes(device_index=device_index) == 0,
-            weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
+            weights_fit_live=self._whole_card_weights_fit_live(
+                forecast,
+                device_index=device_index,
+                model=state.model,
+            ),
             drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
             resident_context_charge_mb=self._resident_safety_charge_mb(device_index),
             device_index=device_index,
-            now=time.time(),
+            now=self._clock(),
         )
 
     def _resident_safety_charge_mb(self, device_index: int | None) -> float:
@@ -2773,7 +2837,13 @@ class InferenceScheduler:
             return 0.0
         return self._safety_footprint_mb()
 
-    def _whole_card_weights_fit_live(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
+    def _whole_card_weights_fit_live(
+        self,
+        forecast: StreamForecast,
+        *,
+        device_index: int | None = None,
+        model: str | None = None,
+    ) -> bool:
         """Whether the residency model's weights fit the *live* measured free VRAM (read only at sole residency).
 
         Keyed on the live device reading rather than the forecast's stored ``free_now_mb`` (captured at
@@ -2782,13 +2852,35 @@ class InferenceScheduler:
         stopped siblings' contexts release, so it never reads deceptively high the way an instantaneous
         reading does during startup (idle contexts not yet allocated reading as free). Unknown weight or
         measurement returns False so the bounded structural backstop, not a guess, drives the fallback.
+
+        Weights already committed to VRAM are the answered case: a free-VRAM reading taken while the residency
+        model itself is resident already excludes those weights, so comparing the model's full weight figure
+        against it asks the card for room it is spending on this very model. That comparison can never pass
+        while the model is resident, which parks every dispatch of a resident head on the drain-settle backstop
+        even though the fit it is waiting to confirm is already a physical fact. Residency of the model is
+        therefore the fit.
         """
+        if model is not None and self._whole_card_model_weights_resident(model, device_index=device_index):
+            return True
         if forecast.weights_mb is None:
             return False
         free_now = self._measured_free_vram_mb(device_index=device_index)
         if free_now is None:
             return False
         return (free_now - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001
+
+    def _whole_card_model_weights_resident(self, model: str, *, device_index: int | None) -> bool:
+        """Whether ``model``'s weights already occupy VRAM on an inference process of this card.
+
+        ``device_index`` scopes the question to one card on a multi-GPU host; None accepts any inference
+        process (the single-GPU / worker-wide case).
+        """
+        return any(
+            process_info.process_type is HordeProcessType.INFERENCE
+            and (device_index is None or process_info.device_index == device_index)
+            and self._candidate_weights_resident_on_process(model, process_info.process_id)
+            for process_info in self._process_map.values()
+        )
 
     def _whole_card_drain_backstop_elapsed(self, device_index: int | None) -> bool:
         """Whether the bounded drain-settle window has elapsed since this residency was established.
@@ -2802,7 +2894,7 @@ class InferenceScheduler:
         """
         return self._whole_card_ledger.drain_backstop_elapsed(
             device_index,
-            now=time.time(),
+            now=self._clock(),
             settle_seconds=_WHOLE_CARD_DRAIN_SETTLE_SECONDS,
         )
 
@@ -2827,7 +2919,7 @@ class InferenceScheduler:
         spent. Public: read by the process manager's wedge assessment.
         """
         return self._whole_card_ledger.grace_active(
-            now=time.time(),
+            now=self._clock(),
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
             restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
@@ -2843,7 +2935,7 @@ class InferenceScheduler:
         """
         if self._heavy_head_admitted_at == 0.0:
             return False
-        return (time.time() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
+        return (self._clock() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
 
     def ram_reclaim_cycle_grace_active(self) -> bool:
         """Whether a deliberate RAM-reclaim process cycle is still inside its bounded respawn/preload window.
@@ -2858,7 +2950,7 @@ class InferenceScheduler:
         """
         if self._ram_reclaim_cycle_at == 0.0:
             return False
-        return (time.time() - self._ram_reclaim_cycle_at) < _RAM_RECLAIM_CYCLE_GRACE_SECONDS
+        return (self._clock() - self._ram_reclaim_cycle_at) < _RAM_RECLAIM_CYCLE_GRACE_SECONDS
 
     def card_residency(self, device_index: int | None) -> tuple[str | None, str]:
         """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
@@ -2871,7 +2963,7 @@ class InferenceScheduler:
         """
         model, phase = self._whole_card_ledger.phase(
             device_index,
-            now=time.time(),
+            now=self._clock(),
             establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
         if model is None:
@@ -2902,7 +2994,7 @@ class InferenceScheduler:
         model = representative.model if representative is not None else None
         active = model is not None
         forecast = representative.forecast if representative is not None else None
-        now = time.time()
+        now = self._clock()
 
         phase = ""
         cooldown_remaining: float | None = None
@@ -2967,8 +3059,14 @@ class InferenceScheduler:
         the safety process. Once neither condition holds, that card's sibling processes are grown back to its
         ceiling and, if the residency was on the safety card, the safety process is restored to the GPU.
         Restores every drained card's residency independently; a no-op when none is outstanding.
+
+        The restore's wedge-grace window is granted for the churn the restore actually creates: siblings still
+        respawning, or a service lane restarted. A release that finds the pool already at its ceiling and no
+        lane to restart changed nothing, so it takes no window; leaving one standing would tell the recovery
+        supervisor to ignore a genuine wedge for its whole duration after every such release, and would charge
+        the card's rolling allowance for teardown churn that never happened.
         """
-        now = time.time()
+        now = self._clock()
         active_models = {j.model for j in self._job_tracker.jobs_in_progress}
         active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
         for device_index, state in self._held_residencies():
@@ -2985,14 +3083,17 @@ class InferenceScheduler:
                 residency_model=model,
                 device_index=device_index,
             ) and not self._whole_card_ledger.min_hold_active(device_index, now=now)
-            if time.time() < state.cooldown_until and not preempt_cooldown:
+            if self._clock() < state.cooldown_until and not preempt_cooldown:
                 # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
                 continue
             # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
             # unservable; mark its start so the wedge grace covers it (see _WHOLE_CARD_RESTORE_GRACE_SECONDS).
+            # The window is granted here, before the churn is ordered, so no reader can see the release without
+            # its excuse; it is withdrawn below if the release turns out to have had no churn to cover.
+            granted_at = self._clock()
             self._whole_card_ledger.record_restore(
                 device_index,
-                now=time.time(),
+                now=granted_at,
                 restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
             )
             if self._reclaim_ladder is not None:
@@ -3013,17 +3114,21 @@ class InferenceScheduler:
                 if self._residency_should_pause_component_lane(device_index)
                 else False
             )
+            lanes_restarting = post_process_restored or vae_lane_restored or component_lane_restored
             ceiling = self._residency_restore_ceiling(device_index)
             current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if (
-                current >= ceiling
-                and not post_process_restored
-                and not vae_lane_restored
-                and not component_lane_restored
-            ):
+            if current >= ceiling and not lanes_restarting:
+                # The pool is already at its ceiling and no lane was restarted: this release changed nothing.
+                self._whole_card_ledger.close_restore_window(device_index, granted_at=granted_at)
                 continue
             after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
             self._reconcile_worker_shed_to_pool()
+            regrown_to_ceiling = isinstance(after, int) and after >= ceiling
+            if not lanes_restarting and regrown_to_ceiling:
+                # Every sibling was back before this call returned, so there is no respawn still in flight for
+                # the window to cover. A pool that has not reached its ceiling keeps it: the spawns it is
+                # waiting on are exactly the churn the wedge grace exists to excuse.
+                self._whole_card_ledger.close_restore_window(device_index, granted_at=granted_at)
             post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
             vae_lane_note = " and restarting the VAE lane" if vae_lane_restored else ""
             component_lane_note = " and restarting the component lane" if component_lane_restored else ""
@@ -3095,14 +3200,14 @@ class InferenceScheduler:
             return
         if head_id != self._head_starvation_job_id:
             self._head_starvation_job_id = head_id
-            self._head_starvation_since = time.time()
+            self._head_starvation_since = self._clock()
 
     def _head_starved_seconds(self, job: ImageGenerateJobPopResponse) -> float:
         """Seconds this job has been the idle-device head, or 0.0 when it is not the tracked head."""
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None or job_id != self._head_starvation_job_id or self._head_starvation_since == 0.0:
             return 0.0
-        return time.time() - self._head_starvation_since
+        return self._clock() - self._head_starvation_since
 
     def _undispatched_head(self) -> ImageGenerateJobPopResponse | None:
         """Return the first queued job no process is running yet (the head of queue), or None when there is none."""
@@ -3154,7 +3259,7 @@ class InferenceScheduler:
         starved_long_enough = (
             threshold is not None
             and self._head_starvation_since > 0.0
-            and (time.time() - self._head_starvation_since) >= threshold
+            and (self._clock() - self._head_starvation_since) >= threshold
         )
         has_free_sibling = self._process_map.get_first_available_inference_process() is not None
         if starved_long_enough and has_free_sibling:
@@ -3437,7 +3542,7 @@ class InferenceScheduler:
         device_index: int | None,
     ) -> None:
         """Disclose (throttled per card scope) that an exclusive admit is holding this job's dispatch back."""
-        now = time.time()
+        now = self._clock()
         last = self._exclusive_suppression_logged_at.get(device_index, 0.0)
         if (now - last) < self._EXCLUSIVE_SUPPRESSION_LOG_INTERVAL_SECONDS:
             return
@@ -3612,7 +3717,9 @@ class InferenceScheduler:
         return self._process_map.get_free_vram_mb(device_index=device_index)
 
     def _measured_available_ram_mb(self) -> float:
-        """The measured system-wide available RAM (MB), read live in the parent process."""
+        """The measured system-wide available RAM (MB): the injected provider, else a live parent read."""
+        if self._available_ram_mb_provider is not None:
+            return self._available_ram_mb_provider()
         return psutil.virtual_memory().available / (1024 * 1024)
 
     def _measured_total_ram_mb(self) -> float:
@@ -3854,7 +3961,7 @@ class InferenceScheduler:
                     )
                     governor_state.draining_process_ids.discard(process_id)
                     self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
-                    self._ram_reclaim_cycle_at = time.time()
+                    self._ram_reclaim_cycle_at = self._clock()
                     self._record_churn("process_cycle")
                 case RestoreCardProcess(device_index=device_index, target_count=target_count, planned_count=planned):
                     current = self._process_map.num_loaded_inference_processes(device_index=device_index)
@@ -4261,6 +4368,7 @@ class InferenceScheduler:
     def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
         """Inject the single VRAM arbiter: the preload-admission authority and the observational overlay elsewhere."""
         self._vram_arbiter = arbiter
+        self._owns_private_vram_arbiter = False
 
     def set_reclaim_ladder(self, reclaim_ladder: VerifiedReclaimLadder) -> None:
         """Inject the worker's single verified reclaim ladder, the owner of every reclaim restore obligation.
@@ -4279,6 +4387,16 @@ class InferenceScheduler:
         the measured-truth admission identity keeps its primary input on every snapshot the scheduler builds.
         """
         self._device_free_mb_provider = provider
+
+    def set_available_ram_mb_provider(self, provider: Callable[[], float]) -> None:
+        """Inject the available-system-RAM reading source, replacing the live psutil read.
+
+        The RAM admission gates price a preload against the host the worker actually runs on, so production
+        never overrides this. A harness constructing scheduling scenarios must, because otherwise every RAM
+        gate silently prices against whatever machine happens to run the suite, and a scenario that admits a
+        heavy model passes or fails with the runner's free RAM instead of the scenario's own state.
+        """
+        self._available_ram_mb_provider = provider
 
     def set_footprint_store(self, store: LearnedFootprintStore) -> None:
         """Inject the shared learned-footprint store the message dispatcher also observes into.
@@ -5237,7 +5355,7 @@ class InferenceScheduler:
             HordeProcessState.UNLOADED_MODEL_FROM_RAM,
         }
 
-        now = time.time()
+        now = self._clock()
 
         for model_name, model_info in list(self._horde_model_map.root.items()):
             process_info = self._process_map.get(model_info.process_id)
@@ -5338,7 +5456,7 @@ class InferenceScheduler:
         # onto it, a window in which the queue is unservable by the worker's own deliberate action, not
         # a wedge. ram_reclaim_cycle_grace_active() reads this so the recovery supervisor does not
         # soft-reset the pools and fault the servable backlog mid-reclaim.
-        self._ram_reclaim_cycle_at = time.time()
+        self._ram_reclaim_cycle_at = self._clock()
         self._record_churn("process_cycle")
         return True
 
@@ -5473,13 +5591,13 @@ class InferenceScheduler:
         """
         if self._whole_card_ledger.establish_rate_exceeded(device_index, now=now):
             return _WholeCardGovernorHold(
-                governor="establish_rate",
+                governor=WholeCardGovernor.ESTABLISH_RATE,
                 reason="this card has already cycled whole-card residency as often as the rolling window allows",
             )
         if self._whole_card_ledger.grace_budget_exhausted(device_index, now=now):
             status = self._whole_card_ledger.grace_budget_status(device_index, now=now)
             return _WholeCardGovernorHold(
-                governor="grace_budget",
+                governor=WholeCardGovernor.GRACE_BUDGET,
                 reason=(
                     "this card has spent its rolling recovery-supervisor grace allowance, so it may not open "
                     "another establish window yet"
@@ -5584,7 +5702,7 @@ class InferenceScheduler:
         held = self._whole_card_ledger.get(target_device_index)
         establishing_anew = held is None or held.model is None
         governor_hold = (
-            self._whole_card_governor_hold(target_device_index, now=time.time()) if establishing_anew else None
+            self._whole_card_governor_hold(target_device_index, now=self._clock()) if establishing_anew else None
         )
         if governor_hold is not None:
             # A governor brakes how fast this card may be rotated; it never says the head cannot be served.
@@ -5594,7 +5712,7 @@ class InferenceScheduler:
             elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
                 target_device_index,
                 model=job.model,
-                now=time.time(),
+                now=self._clock(),
             )
             self._disclose_whole_card_governor_hold(
                 job,
@@ -5629,6 +5747,7 @@ class InferenceScheduler:
                 forecast,
                 announce=first_time,
                 device_index=target_device_index,
+                target_process=available_process,
             )
             return _WholeCardDemandOutcome.PRESTAGE
 
@@ -5640,6 +5759,7 @@ class InferenceScheduler:
             forecast,
             announce=first_time,
             device_index=target_device_index,
+            target_process=available_process,
         )
         # Evict the idle resident models on the *other* processes (sparing the slot that will load this
         # model, and never a live in-progress model) so their VRAM returns to the driver. A live sibling is
@@ -5743,7 +5863,7 @@ class InferenceScheduler:
                 model=job.model,
                 rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
                 effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
-                admitted_at=time.time(),
+                admitted_at=self._clock(),
             )
 
     def _note_component_admission(
@@ -5776,7 +5896,7 @@ class InferenceScheduler:
                 model=job.model,
                 rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
                 effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
-                admitted_at=time.time(),
+                admitted_at=self._clock(),
                 kind=_REUSE_CREDIT_KIND_COMPONENT,
             )
 
@@ -5907,7 +6027,7 @@ class InferenceScheduler:
         record kinds; the threshold is identical. Records for vanished or re-tasked slots are dropped so the map
         does not accumulate.
         """
-        now = time.time()
+        now = self._clock()
         for process_id, record in list(self._pending_reuse_credits.items()):
             process_info = self._process_map.get(process_id)
             if process_info is None:
@@ -6049,7 +6169,7 @@ class InferenceScheduler:
         is suppressed while a deliberate RAM-reclaim process cycle is still inside its bounded grace, so an
         actively-resolving defer is never mistaken for starvation.
         """
-        now = time.time()
+        now = self._clock()
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
@@ -6096,7 +6216,7 @@ class InferenceScheduler:
         if job_id is None or self._head_priority_barrier_job_id == job_id:
             return
         self._head_priority_barrier_job_id = job_id
-        self._head_priority_barrier_since = time.time()
+        self._head_priority_barrier_since = self._clock()
         self._head_priority_barrier_withhold_logged = False
         logger.opt(colors=True).warning(
             "<fg #f0beff>Head-of-queue model {} has been RAM-deferred behind live work for over "
@@ -6211,7 +6331,7 @@ class InferenceScheduler:
             # persists. A fresh episode is possible only after the condition clears (the release path runs).
             return False
 
-        now = time.time()
+        now = self._clock()
         if self._safety_recovery_hold_since == 0.0:
             self._safety_recovery_hold_since = now
             self._engage_safety_recovery_hold(target_device_index)
@@ -6539,7 +6659,15 @@ class InferenceScheduler:
         if arbiter is None:
             arbiter = VramArbiter()
             self._vram_arbiter = arbiter
-        if not arbiter.has_cycle:
+            self._owns_private_vram_arbiter = True
+        if self._owns_private_vram_arbiter:
+            # Nothing else advances a private arbiter's cycle, so priming it only while it has none would
+            # freeze the very first measurement for the rest of the session: every later admission would be
+            # priced against a card state that has since been reclaimed, and a head the reclaim made room for
+            # would be declined forever on a reading that no longer describes the device. Re-prime each time
+            # so "the current measurement" stays true past the first request.
+            arbiter.begin_cycle(self.build_vram_arbiter_snapshot())
+        elif not arbiter.has_cycle:
             arbiter.begin_cycle(self.build_vram_arbiter_snapshot())
         return arbiter
 
@@ -6760,6 +6888,14 @@ class InferenceScheduler:
         is the remedy. The depth keys on the honest streaming floor, not the operator's configured margin, so
         only a genuinely card-filling peak pushes the co-resident count below the live pool; a demand resting
         on untrusted (unmeasured-fallback) overhead figures is not warranted.
+
+        The warrant is measured, never an operator preference. ``whole_card_exclusive_residency`` governs
+        whether the worker takes an exclusive *residency* (a lease with a cooldown, safety and the service
+        lanes moved off the card); a context reduction is none of those, and both the actuator that performs it
+        (:meth:`reduce_live_contexts`) and the reachability predicate behind it
+        (:meth:`_has_teardownable_idle_context`) are deliberately independent of the flag. Gating the demand on
+        it would leave a head that is servable only once an idle context is torn down with no ordinary route to
+        that reclaim, deferring it against a card whose own idle contexts hold the deficit.
         """
         max_resident: int | None = None
         if vram_verdict.predicted_mb is not None:
@@ -6775,8 +6911,7 @@ class InferenceScheduler:
                 device_index=target_device_index,
             )
         context_reduction_demanded = (
-            self._whole_card_residency_enabled()
-            and is_head_blocker
+            is_head_blocker
             and max_resident is not None
             and self._process_map.num_loaded_inference_processes(device_index=target_device_index) > max_resident
         )
@@ -6962,7 +7097,7 @@ class InferenceScheduler:
         # A head re-asks every cycle, so without a floor on the rate one rejected peak can buy a reduction per
         # cycle: each costs a cold start, and the pool it shrinks is regrown between them.
         last_reduction = self._context_reduction_at.get(device_index)
-        if last_reduction is not None and (time.time() - last_reduction) < _CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS:
+        if last_reduction is not None and (self._clock() - last_reduction) < _CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS:
             return False
         # The head's own holder is the process the reduction is making room for, so it is named here to spare
         # it and to drop the "spare any process whose model is queued" protection, which would otherwise let a
@@ -6982,7 +7117,7 @@ class InferenceScheduler:
             self._reclaim_ladder.record_context_reduction(device_index)
         # Stamped only once the reduction has actually been taken, so a bail-out added above can never charge
         # the rate limit for a reduction that did not happen.
-        self._context_reduction_at[device_index] = time.time()
+        self._context_reduction_at[device_index] = self._clock()
         self._record_churn("context_reduction")
         logger.info(
             f"Reclaiming live inference contexts for {actuation.job.model} "
@@ -7773,6 +7908,21 @@ class InferenceScheduler:
                 reason=self._last_budget_defer_reason or "VRAM/RAM budget gate",
             )
 
+        # Admission is not read-only: a whole-card residency establish scales the inference pool down to the
+        # depth the head needs, and this preload's chosen target is by construction an idle, empty lane, which
+        # is exactly what that scale-down selects as a victim. A lane the pool no longer has cannot be sent a
+        # load command, so re-select onto a surviving one rather than addressing a retired slot. Deferring
+        # instead would be worse than the crash it replaces: the head would lose its preload every cycle for
+        # as long as the residency keeps choosing its own target.
+        if self._process_map.get(available_process.process_id) is not available_process:
+            available_process = self._select_preload_process(job, sorted(preload_disallowed))
+            if available_process is None:
+                return self._preload_outcome(
+                    AdmissionDecision.NO_TARGET,
+                    job=job,
+                    reason="the preload target was retired during admission and no other slot is free",
+                )
+
         if self._send_preload(job, available_process):
             return self._preload_outcome(
                 AdmissionDecision.ADMIT, job=job, process=available_process, reason="preload sent"
@@ -8020,7 +8170,7 @@ class InferenceScheduler:
         tracked = self._job_tracker.get_tracked_job(job_id)
         if tracked is None or tracked.time_popped is None:
             return False
-        age_since_pop = time.time() - tracked.time_popped
+        age_since_pop = self._clock() - tracked.time_popped
         return age_since_pop > _DISPATCH_ANTI_STARVATION_TTL_FRACTION * ttl
 
     def _note_anti_starvation_override(self, head_job: ImageGenerateJobPopResponse) -> None:
@@ -8032,7 +8182,7 @@ class InferenceScheduler:
             return
         self._anti_starvation_logged_head_id = job_id
         tracked = self._job_tracker.get_tracked_job(head_job.id_)
-        age_since_pop = time.time() - tracked.time_popped if tracked is not None and tracked.time_popped else 0.0
+        age_since_pop = self._clock() - tracked.time_popped if tracked is not None and tracked.time_popped else 0.0
         logger.info(
             f"Anti-starvation override: head job {job_id[:8]} (model {head_job.model}) has waited "
             f"{age_since_pop:.0f}s since pop, past the anti-starvation fraction of its ttl; resident-model bypass "
@@ -8121,7 +8271,7 @@ class InferenceScheduler:
             self._model_recently_missing = True
 
             logger.debug(f"Last missing time: {self._model_recently_missing_time}")
-            self._model_recently_missing_time = time.time()
+            self._model_recently_missing_time = self._clock()
 
             if not await self._job_tracker.release_in_progress(job):
                 logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
@@ -8238,7 +8388,7 @@ class InferenceScheduler:
             within_affinity_budget = affinity_skip_allowed(
                 self._affinity_skip_state,
                 head_job_id,
-                time.time(),
+                self._clock(),
                 affinity_budget,
                 _AFFINITY_MAX_SKIPS,
             )
@@ -9258,7 +9408,7 @@ class InferenceScheduler:
             return
         self._dispatch_reconciliation_conflicts += 1
         if job_id not in self._dispatch_hold_since:
-            self._dispatch_hold_since[job_id] = time.time()
+            self._dispatch_hold_since[job_id] = self._clock()
             self._dispatch_reconciliation_holds += 1
         if reclaim_requested:
             self._dispatch_hold_reclaim_requested.add(job_id)
@@ -9277,7 +9427,7 @@ class InferenceScheduler:
         if held_since is None:
             self._dispatch_hold_reclaim_requested.discard(job_id)
             return
-        self._dispatch_reconciliation_hold_seconds += max(0.0, time.time() - held_since)
+        self._dispatch_reconciliation_hold_seconds += max(0.0, self._clock() - held_since)
         if job_id in self._dispatch_hold_reclaim_requested:
             self._dispatch_reconciliation_released_by_reclaim += 1
             self._dispatch_hold_reclaim_requested.discard(job_id)
@@ -9609,7 +9759,7 @@ class InferenceScheduler:
         """Return the wall-clock seconds since the tracked displaced head's first affinity skip (0 if none)."""
         if self._affinity_skip_state.skip_count == 0:
             return 0.0
-        return time.time() - self._affinity_skip_state.first_skip_time
+        return self._clock() - self._affinity_skip_state.first_skip_time
 
     def latest_safety_placement_demotions(self) -> int:
         """Return how many times the runtime safety-placement policy moved safety off-GPU this run."""
@@ -9721,7 +9871,7 @@ class InferenceScheduler:
                 self._affinity_skip_state = record_affinity_skip(
                     self._affinity_skip_state,
                     displaced_head_id,
-                    time.time(),
+                    self._clock(),
                 )
         elif line_skip is None:
             self._affinity_skip_state = AffinitySkipState()
@@ -9867,7 +10017,7 @@ class InferenceScheduler:
         not mere residency, refreshes the stamp, so a loaded-but-idle model's grace still
         expires. Entries well past the grace window are pruned to bound the dict.
         """
-        now = time.time()
+        now = self._clock()
         for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress):
             if job.model is not None:
                 self._model_last_in_demand[job.model] = now
@@ -9879,7 +10029,7 @@ class InferenceScheduler:
     def _is_recently_demanded(self, model_name: str) -> bool:
         """Whether the model had a pending/in-progress job within the residency grace window."""
         last = self._model_last_in_demand.get(model_name)
-        return last is not None and (time.time() - last) <= _RESIDENCY_GRACE_SECONDS
+        return last is not None and (self._clock() - last) <= _RESIDENCY_GRACE_SECONDS
 
     def _residency_protects_from_unload(
         self,
@@ -10464,11 +10614,11 @@ class InferenceScheduler:
                 self._job_tracker.jobs_in_progress,
             )
             if keep_single_inference and pending_and_active > 1:
-                if (time.time() - self._batch_wait_log_time > 10) and bridge_data.max_threads > 1:
+                if (self._clock() - self._batch_wait_log_time > 10) and bridge_data.max_threads > 1:
                     logger.opt(ansi=True).info(
                         f"<fg #7b7d7d><i>Blocking further inference due to {single_inf_reason}.</i></>",
                     )
-                    self._batch_wait_log_time = time.time()
+                    self._batch_wait_log_time = self._clock()
 
             else:
                 # Fill every free inference slot this cycle rather than one per ~0.5s control-loop

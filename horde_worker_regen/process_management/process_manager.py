@@ -65,7 +65,7 @@ from horde_worker_regen.process_management._internal.util import throttled_log_l
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_identity import lookup_worker_by_name
-from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopGate, PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
@@ -361,6 +361,15 @@ class SystemResources:
                 kind=accelerator.kind,
             )
 
+        # Both figures are worker-wide, because the model that consumes them (``ContextOverheadModel``) holds
+        # one measurement for the whole worker rather than one per card. The probe measures a context on the
+        # active device only and reports that same measurement against every accelerator, so on a multi-card
+        # host these maxima select between copies of one figure, not between cards. That is sound only because
+        # the figures are now each context's *own* cost (a before/after delta, see ``accelerator_probe``): the
+        # cards differ by tens of MB. It was not sound while the first-context figure was a device-wide used
+        # reading, where the busiest card's other tenants set a worker-wide overhead that a small card cannot
+        # afford. Making the term genuinely per-card needs per-device measurement in the probe and a per-card
+        # overhead model behind the scheduler; until then the collapse is deliberate and named here.
         per_process_overhead_mb = max((a.runtime_overhead_mb for a in accelerators), default=0)
         marginal_process_overhead_mb = max((a.marginal_overhead_mb for a in accelerators), default=0)
 
@@ -925,7 +934,7 @@ POP_LIVENESS_ERROR_SECONDS = 300.0
 At this point the worker has served nothing for minutes with no governor and no pause to account for it, so
 the condition is escalated from a notice to an error."""
 
-POP_LIVENESS_QUEUE_FULL_GATE = "queue_full"
+POP_LIVENESS_QUEUE_FULL_GATE = PopGate.QUEUE_FULL
 """The pop gate the popper records when the local queue is already at its configured depth."""
 
 POP_LIVENESS_FROZEN_QUEUE_SECONDS = 120.0

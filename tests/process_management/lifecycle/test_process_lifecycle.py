@@ -2180,3 +2180,30 @@ class TestNoJobsEvidenceDoesNotDisableTheReaper:
         plm.replace_hung_processes()
 
         assert plm._replace_inference_process.call_count == 2
+
+
+def test_scale_down_spares_the_slot_the_caller_named() -> None:
+    """A slot named as the caller's own is excluded from victim selection, so a sibling is taken instead.
+
+    ``protected_model`` spares lanes already carrying the model. A whole-card head that is staged nowhere
+    carries it on no lane, so the empty idle slot chosen to load it into is otherwise a legal victim of the
+    teardown its own residency ordered, and the load is then addressed to a slot the pool no longer has.
+    """
+    target = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+    sibling = make_mock_process_info(1, model_name="other", state=HordeProcessState.WAITING_FOR_JOB)
+    plm = _make_plm(process_map=ProcessMap({0: target, 1: sibling}))
+
+    plm.scale_inference_processes(1, protected_model="flux_model", spared_process_id=0)
+
+    assert list(plm._process_map.keys()) == [0]
+
+
+def test_scale_down_without_a_named_slot_is_unchanged() -> None:
+    """With nothing named, victim selection keeps its prior behaviour and takes the first eligible slot."""
+    first = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+    second = make_mock_process_info(1, model_name="other", state=HordeProcessState.WAITING_FOR_JOB)
+    plm = _make_plm(process_map=ProcessMap({0: first, 1: second}))
+
+    plm.scale_inference_processes(1, protected_model="flux_model")
+
+    assert list(plm._process_map.keys()) == [1]

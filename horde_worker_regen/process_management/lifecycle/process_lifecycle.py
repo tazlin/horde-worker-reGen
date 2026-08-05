@@ -2516,6 +2516,7 @@ class ProcessLifecycleManager:
         device_index: int | None = None,
         protected_model: str | None = None,
         pressure_shortfall_mb: float | None = None,
+        spared_process_id: int | None = None,
     ) -> int:
         """Grow or shrink the running inference processes toward ``target_count``.
 
@@ -2544,6 +2545,11 @@ class ProcessLifecycleManager:
             pressure_shortfall_mb: When set, choose the smallest idle victim that can plausibly clear this
                 RAM shortfall before falling back to the usual first eligible victim. This keeps a small RAM
                 dip from tearing down a much larger model-holding process when a smaller idle context suffices.
+            spared_process_id: A slot the caller has already committed to and this shrink may not take,
+                excluded from victim selection alongside every busy process. ``protected_model`` cannot cover
+                it: a head that is not staged anywhere yet has no lane carrying its model, so the empty idle
+                slot chosen to load it into is a legal victim of the very scale-down its own residency ordered.
+                Leave None when the caller holds no slot.
 
         Returns:
             The number of inference processes after scaling (scoped to ``device_index`` when given).
@@ -2585,6 +2591,8 @@ class ProcessLifecycleManager:
                     # Confine the shrink to this card: every inference process on another card is off-limits, so
                     # only an idle process on the target card can be the victim.
                     disallowed = disallowed + self._other_card_inference_processes(device_index)
+            if spared_process_id is not None and spared_process_id not in disallowed:
+                disallowed = [*disallowed, spared_process_id]
             for _ in range(current - target):
                 victim = self._select_inference_process_to_scale_down(
                     disallowed_processes=disallowed,

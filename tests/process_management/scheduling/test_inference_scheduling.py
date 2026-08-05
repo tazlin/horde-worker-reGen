@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from collections.abc import Callable
 from unittest.mock import Mock
 
@@ -23,10 +24,12 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     _AFFINITY_MAX_SKIPS,
@@ -37,6 +40,8 @@ from horde_worker_regen.process_management.scheduling.governance import Admissio
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
+    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
 )
 from tests.process_management.conftest import (
@@ -68,6 +73,8 @@ def _make_inference_scheduler(
     pool_protected_models_provider: Callable[[], frozenset[str]] | None = None,
     on_pool_pressure_eviction: Callable[[str], None] | None = None,
     device_free_mb: float | None = 24000.0,
+    available_ram_mb: float | None = 65536.0,
+    clock: Callable[[], float] | None = None,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with mostly-mocked dependencies.
 
@@ -75,6 +82,11 @@ def _make_inference_scheduler(
     identity's primary input: the default is an ample card so admission-neutral tests never defer on a
     missing reading. Tests exercising VRAM pressure pass a small figure (or install a crafted arbiter
     cycle), and tests exercising the missing-reading contract pass None.
+
+    ``available_ram_mb`` pins the RAM admission gates the same way: the default is an ample host so a
+    scenario's outcome depends on its own constructed state, never on the free RAM of whatever machine runs
+    the suite (an unpinned read admits a heavy model on a large dev box and defers it on a small CI runner).
+    Tests exercising RAM pressure pass a small figure; None restores the live psutil read.
     """
     if state is None:
         state = WorkerState()
@@ -108,9 +120,12 @@ def _make_inference_scheduler(
         pool_protected_models_provider=pool_protected_models_provider,
         on_pool_pressure_eviction=on_pool_pressure_eviction,
         card_runtimes=card_runtimes,
+        clock=clock,
     )
     if device_free_mb is not None:
         scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
+    if available_ram_mb is not None:
+        scheduler.set_available_ram_mb_provider(lambda: available_ram_mb)
     return scheduler
 
 
@@ -1825,3 +1840,280 @@ class TestAuxPreparationGate:
         assert cold_sibling in job_tracker.jobs_in_progress
         assert lora_head not in job_tracker.jobs_in_progress
         assert job_tracker.get_stage(lora_head.id_) == JobStage.PENDING_INFERENCE
+
+
+class TestPreloadTargetRetiredDuringAdmission:
+    """Admission may retire the very lane the preload was aimed at, and the pass must still land the load.
+
+    A whole-card residency establish runs inside preload admission and scales the inference pool down to the
+    depth the head needs. The lane chosen as the preload's target is idle and holds no model, which is exactly
+    what that scale-down picks as a victim, so a head whose model is not yet staged anywhere can have its own
+    target retired underneath it before the load command is sent.
+    """
+
+    def _scheduler_with_two_idle_lanes(self) -> tuple[InferenceScheduler, ProcessMap]:
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB),
+                1: make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB),
+            },
+        )
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            bridge_data=make_mock_bridge_data(
+                enable_vram_budget=True,
+                vram_reserve_mb=0,
+                ram_reserve_mb=4096.0,
+                image_models_to_load=["stable_diffusion"],
+            ),
+        )
+        assert scheduler._budget_active() is True, "precondition: admission runs, so it can retire the target"
+        return scheduler, process_map
+
+    async def test_preload_lands_on_a_surviving_lane(self) -> None:
+        """The load is sent to a lane the pool still has, rather than addressing the retired slot."""
+        scheduler, process_map = self._scheduler_with_two_idle_lanes()
+        await track_popped_job_async(scheduler._job_tracker, make_job_pop_response("stable_diffusion"))
+
+        def admit(job: ImageGenerateJobPopResponse, process_info: HordeProcessInfo, *, is_head_blocker: bool) -> bool:
+            del job, is_head_blocker
+            assert process_info.process_id == 0, "precondition: the pass aims at the first idle lane"
+            process_map.retire_process(process_map[0], "inference scale-down")
+            return True
+
+        scheduler._admit_preload_under_budget = admit  # type: ignore[method-assign]
+
+        assert scheduler.preload_models() is True
+        assert 0 not in process_map, "the retired lane must not have come back"
+        assert process_map[1].loaded_horde_model_name == "stable_diffusion"
+
+    async def test_no_surviving_lane_defers_without_sending(self) -> None:
+        """With every other slot gone the preload is declined for this cycle, not sent into the void."""
+        scheduler, process_map = self._scheduler_with_two_idle_lanes()
+        await track_popped_job_async(scheduler._job_tracker, make_job_pop_response("stable_diffusion"))
+
+        def admit(job: ImageGenerateJobPopResponse, process_info: HordeProcessInfo, *, is_head_blocker: bool) -> bool:
+            del job, process_info, is_head_blocker
+            for process_id in (0, 1):
+                process_map.retire_process(process_map[process_id], "inference scale-down")
+            return True
+
+        scheduler._admit_preload_under_budget = admit  # type: ignore[method-assign]
+
+        assert scheduler.preload_models() is False
+        assert len(process_map) == 0
+
+
+class TestPrivateArbiterCycleFreshness:
+    """A scheduler with no manager driving it must still price against the card as it currently is.
+
+    The manager freezes the shared arbiter's cycle once per control-loop iteration. A scheduler that was never
+    given one makes its own, and nothing else advances that arbiter's cycle: frozen at the first consult, every
+    later admission would be priced against a card state that reclaim has since changed, and a head the reclaim
+    made room for would be declined forever on a reading that no longer describes the device.
+    """
+
+    def _scheduler_reading(self, free_mb: list[float]) -> InferenceScheduler:
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.total_vram_mb = 16384
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: process_info}))
+        scheduler.set_device_free_mb_provider(lambda _device_index: free_mb[0])
+        return scheduler
+
+    def test_private_arbiter_reprices_against_the_current_reading(self) -> None:
+        """Consecutive consults see the card's current free VRAM, not the first consult's."""
+        free_mb = [4000.0]
+        scheduler = self._scheduler_reading(free_mb)
+
+        first = scheduler._ensure_preload_arbiter().device_state(None)
+        assert first is not None
+        assert first.device_free_mb == 4000.0
+
+        free_mb[0] = 12000.0
+        second = scheduler._ensure_preload_arbiter().device_state(None)
+        assert second is not None
+        assert second.device_free_mb == 12000.0
+
+    def test_injected_arbiter_keeps_the_cycle_the_control_loop_froze(self) -> None:
+        """An injected arbiter is driven by the control loop, so a consult must not re-freeze its cycle."""
+        free_mb = [4000.0]
+        scheduler = self._scheduler_reading(free_mb)
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(scheduler.build_vram_arbiter_snapshot())
+        scheduler.set_vram_arbiter(arbiter)
+
+        free_mb[0] = 12000.0
+        state = scheduler._ensure_preload_arbiter().device_state(None)
+        assert state is not None
+        assert state.device_free_mb == 4000.0
+
+
+class TestContextReductionIsNotAResidencyPreference:
+    """Reducing the live context count is a measured reclaim, so the residency preference does not gate it.
+
+    ``whole_card_exclusive_residency`` governs whether the worker takes an exclusive residency: a lease with a
+    cooldown, safety and the service lanes moved off the card. Tearing an idle sibling context down is none of
+    those. Gating the remedy on the preference leaves a head that is servable only once a context is torn down
+    with no ordinary route to that reclaim, deferred against a card whose own idle contexts hold the deficit.
+    """
+
+    def _demand_with_residency(self, *, enabled: bool) -> tuple[int | None, bool]:
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.total_vram_mb = 16384
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: process_info,
+                    1: make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB),
+                },
+            ),
+            bridge_data=make_mock_bridge_data(
+                enable_vram_budget=True,
+                whole_card_exclusive_residency=enabled,
+            ),
+        )
+        scheduler._max_coresident_for_peak_mb = Mock(return_value=1)  # type: ignore[method-assign]
+        scheduler._whole_card_warranted = Mock(return_value=True)  # type: ignore[method-assign]
+        return scheduler._context_reduction_demand(
+            Mock(fits=False, predicted_mb=14000.0, reserve_mb=1024.0),
+            Mock(is_card_demanding=True),
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+
+    def test_remedy_is_offered_with_the_residency_preference_off(self) -> None:
+        """The same card state yields the same reduction demand whichever way the preference is set."""
+        assert self._demand_with_residency(enabled=True) == (1, True)
+        assert self._demand_with_residency(enabled=False) == (1, True)
+
+
+class TestResidentWholeCardHeadFitsLive:
+    """Weights already committed to VRAM are the answered case for the whole-card live-fit check.
+
+    A free-VRAM reading taken while the residency model is itself resident already excludes that model's
+    weights, so comparing its full weight figure against the reading asks the card for room it is spending on
+    this very model. Left that way the check can never pass for a resident head, and every dispatch of one
+    waits out the drain-settle backstop instead.
+    """
+
+    def _scheduler_holding(self, model: str, *, free_mb: float) -> InferenceScheduler:
+        process_info = make_mock_process_info(0, model_name=model, state=HordeProcessState.PRELOADED_MODEL)
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(model, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=0)
+        return _make_inference_scheduler(
+            process_map=ProcessMap({0: process_info}),
+            horde_model_map=horde_model_map,
+            bridge_data=make_mock_bridge_data(enable_vram_budget=True, image_models_to_load=[model]),
+            device_free_mb=free_mb,
+        )
+
+    def test_resident_model_fits_without_room_for_a_second_copy(self) -> None:
+        """The resident head's fit is read off residency, not off room for its weights all over again."""
+        model = "flux_model"
+        scheduler = self._scheduler_holding(model, free_mb=2000.0)
+        forecast = Mock(weights_mb=11500.0, _effective_base_reserve=1500.0)
+
+        assert scheduler._whole_card_weights_fit_live(forecast, model=model) is True
+
+    def test_absent_model_still_needs_measured_room(self) -> None:
+        """A model nothing holds is unchanged: the live reading must actually cover its weights."""
+        scheduler = self._scheduler_holding("flux_model", free_mb=2000.0)
+        forecast = Mock(weights_mb=11500.0, _effective_base_reserve=1500.0)
+
+        assert scheduler._whole_card_weights_fit_live(forecast, model="some_other_model") is False
+
+
+class TestSchedulerClockIsInjectable:
+    """Every window the scheduler owns is measured on its injected clock, not on real elapsed seconds.
+
+    The governance windows are sized in tens of seconds (a residency's establish grace, a restore's wedge
+    grace, a churn governor's deferral dwell). A caller that must observe what happens on the far side of one
+    can move the injected clock instead of spending the seconds; without the injection those bounds are only
+    reachable by waiting them out.
+    """
+
+    def _scheduler_on(self, now: list[float]) -> InferenceScheduler:
+        return _make_inference_scheduler(
+            process_map=ProcessMap({0: make_mock_process_info(0, model_name=None)}),
+            clock=lambda: now[0],
+        )
+
+    def test_a_residency_window_closes_on_the_injected_clock(self) -> None:
+        """A restore window opened at the injected time is inside its grace, and outside it once time moves."""
+        now = [1_000.0]
+        scheduler = self._scheduler_on(now)
+        scheduler._whole_card_ledger.record_restore(
+            None,
+            now=now[0],
+            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+        )
+
+        assert scheduler.whole_card_residency_grace_active() is True
+
+        now[0] += _WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0
+        assert scheduler.whole_card_residency_grace_active() is False
+
+    def test_the_default_clock_is_the_real_one(self) -> None:
+        """With nothing injected the scheduler reads the real clock, resolved per call."""
+        scheduler = _make_inference_scheduler()
+
+        assert abs(scheduler._clock() - time.time()) < 1.0
+
+
+class TestRestoreGraceIsGrantedForChurn:
+    """The restore's wedge-grace window covers churn, so a release that changed nothing is granted none.
+
+    The window tells the recovery supervisor to excuse a held queue while the scheduler's own teardown or
+    regrowth is in flight. A release that finds the pool already whole and no lane to restart has nothing in
+    flight, so a window left standing would blind the supervisor to a genuine wedge for its whole duration and
+    would spend the card's rolling allowance on churn that never happened.
+    """
+
+    def _drained_residency(self, *, live_lanes: int, regrown_to: int) -> InferenceScheduler:
+        process_map = ProcessMap(
+            {
+                lane_id: make_mock_process_info(lane_id, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+                for lane_id in range(live_lanes)
+            },
+        )
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            max_inference=2,
+            bridge_data=make_mock_bridge_data(
+                enable_vram_budget=True,
+                whole_card_exclusive_residency=True,
+                whole_card_residency_safety_off_gpu=False,
+                safety_on_gpu=False,
+                whole_card_residency_cooldown_seconds=0,
+            ),
+        )
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=regrown_to)
+        # A bare Mock reports every lane restore as having happened, which would read as churn this release
+        # never created; each is pinned to its inert answer so the row turns on the pool alone.
+        scheduler._process_lifecycle.restore_post_process_off_gpu = Mock(return_value=False)
+        scheduler._process_lifecycle.restore_vae_lane_off_gpu = Mock(return_value=False)
+        scheduler._process_lifecycle.restore_component_off_gpu = Mock(return_value=False)
+        state = scheduler._whole_card_ledger.state_for(None)
+        state.model = "flux_model"
+        state.established_at = scheduler._clock() - (_WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
+        state.cooldown_until = 0.0
+        return scheduler
+
+    def test_a_release_that_regrows_nothing_takes_no_window(self) -> None:
+        """The pool is already at its ceiling and no lane restarted, so the release opens no grace."""
+        scheduler = self._drained_residency(live_lanes=2, regrown_to=2)
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.state_for(None).model is None, "the residency must be released"
+        assert scheduler.whole_card_residency_grace_active() is False
+        assert scheduler._whole_card_ledger.state_for(None).grace_charges == deque()
+
+    def test_a_release_still_waiting_on_respawns_keeps_its_window(self) -> None:
+        """The pool has not reached its ceiling when the call returns, so the respawns keep the grace open."""
+        scheduler = self._drained_residency(live_lanes=1, regrown_to=1)
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler.whole_card_residency_grace_active() is True
+        assert scheduler._whole_card_ledger.state_for(None).restore_at != 0.0

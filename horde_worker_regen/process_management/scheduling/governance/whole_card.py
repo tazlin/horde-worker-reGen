@@ -30,6 +30,7 @@ from horde_worker_regen.process_management.resources.resource_budget import Stre
 
 __all__ = [
     "GraceBudgetStatus",
+    "WholeCardGovernor",
     "WholeCardGrantKind",
     "WholeCardPhase",
     "WholeCardResidency",
@@ -91,6 +92,21 @@ establishment window, the longest a rate deferral can itself last, so a governor
 its own is given the chance to before the preference is abandoned. Past it the head falls through to ordinary
 measured admission and runs co-resident where the device reading allows: slower than sole residency, and
 strictly better than not running."""
+
+
+class WholeCardGovernor(StrEnum):
+    """The churn governors that may bar a card from taking on a *new* whole-card residency.
+
+    Both brake the rate at which a card is rotated; neither is a finding that the head cannot be served, so
+    each has a bounded dwell past which the head falls through to ordinary measured admission. Enumerating
+    them keeps the set of churn brakes closed: a further one has to take a member, so it cannot ship without
+    a declared release path in the gate registry.
+    """
+
+    ESTABLISH_RATE = "establish_rate"
+    """The rolling per-card establishment rate limit is at its ceiling."""
+    GRACE_BUDGET = "grace_budget"
+    """The card has spent its rolling recovery-supervisor grace allowance."""
 
 
 @dataclass(frozen=True)
@@ -160,6 +176,13 @@ class WholeCardResidency:
     """When each of this card's whole-card residencies was established, newest last.
 
     Pruned to :data:`_ESTABLISH_WINDOW_SECONDS` whenever the rate limiter is consulted."""
+    prestage_process_id: int | None = None
+    """The slot a pre-staged head's weights are being loaded into, before any lane carries its model name.
+
+    A convergence shrink spares the residency holder by model name, which a slot mid-load does not yet have,
+    so the pre-stage's own target would be a legal victim of the collapse it is loading for. None once the
+    residency was established outright (its target is spared at the establish itself) or once no pre-stage is
+    outstanding."""
     governor_deferred_model: str | None = None
     """The head model a churn governor is currently holding off this card; None when none is held."""
     governor_deferred_since: float = 0.0
@@ -293,6 +316,10 @@ class WholeCardResidencyLedger:
         the queue unservable, so the stamp is what the wedge grace reads; the grant's holds (min-hold,
         structural completion) are released with it and ``restore_grace_seconds`` is charged against the
         card's rolling grace budget.
+
+        The window is granted for churn, so a caller that finds it had none to do withdraws the grant with
+        :meth:`close_restore_window`. That is a narrower grant, not a shortened one: a window this card is
+        genuinely inside still runs its full duration and nothing cuts it short.
         """
         state = self.state_for(device_index)
         state.model = None
@@ -301,9 +328,27 @@ class WholeCardResidencyLedger:
         state.established_at = 0.0
         state.min_hold_until = 0.0
         state.structural_complete_at = 0.0
+        state.prestage_process_id = None
         state.restore_at = now
         if restore_grace_seconds > 0.0:
             state.grace_charges.append((now, restore_grace_seconds))
+
+    def close_restore_window(self, device_index: int | None, *, granted_at: float) -> None:
+        """Withdraw a restore window granted at ``granted_at`` whose restore had no churn to cover.
+
+        A restore that respawns nothing and restarts no lane leaves the card exactly as it found it, so the
+        wedge grace has no deliberate action to excuse. Left standing, the window would tell the recovery
+        supervisor to ignore a genuine wedge for the rest of its duration after every such release, and the
+        allowance it charged would price teardown churn that never happened. Both are undone here: the stamp
+        is cleared and the charge this grant added is dropped. A no-op once any other grant has been recorded
+        against the card, so only the caller's own window is ever withdrawn.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.restore_at != granted_at:
+            return
+        state.restore_at = 0.0
+        if state.grace_charges and state.grace_charges[-1][0] == granted_at:
+            state.grace_charges.pop()
 
     def min_hold_active(self, device_index: int | None, *, now: float) -> bool:
         """Return whether this card's residency is still inside its non-preemptable minimum hold."""
@@ -358,6 +403,11 @@ class WholeCardResidencyLedger:
         liveness bound on a residency that never finishes loading (or a restore that never completes) is the
         window's own duration, measured from the grant. How often a card may open a *new* window is governed
         at admission by :meth:`grace_budget_exhausted`, not here.
+
+        The grant condition is churn: a restore window covers siblings actually being respawned or a service
+        lane actually being restarted, and a release that changed nothing is granted none (see
+        :meth:`close_restore_window`). Narrowing what earns a window is distinct from cutting one short, which
+        nothing does.
         """
         return any(
             self._window_active(
@@ -608,14 +658,21 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
 
 
 def _prune_before(stamps: deque[float], *, cutoff: float) -> None:
-    """Drop timestamps older than ``cutoff`` from the front of an oldest-first deque."""
-    while stamps and stamps[0] < cutoff:
+    """Drop timestamps at or before ``cutoff`` from the front of an oldest-first deque.
+
+    Inclusive at the boundary so a stamp exactly one window old is already out: the disclosed replenish
+    wait (``granted_at + window - now``) is then exact rather than short by an instant.
+    """
+    while stamps and stamps[0] <= cutoff:
         stamps.popleft()
 
 
 def _prune_charges_before(charges: deque[tuple[float, float]], *, cutoff: float) -> None:
-    """Drop ``(granted_at, seconds)`` charges granted before ``cutoff`` from an oldest-first deque."""
-    while charges and charges[0][0] < cutoff:
+    """Drop ``(granted_at, seconds)`` charges granted at or before ``cutoff`` from an oldest-first deque.
+
+    Inclusive at the boundary for the same reason as :func:`_prune_before`.
+    """
+    while charges and charges[0][0] <= cutoff:
         charges.popleft()
 
 

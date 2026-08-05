@@ -758,12 +758,18 @@ class TestChurnGovernors:
     ) -> None:
         """Cycle establish/restore on the single-GPU card until its rolling grace budget is spent.
 
-        Each cycle charges its establish and restore windows against the card's budget. In the field the
-        cycles are spread by the establishment rate limiter; the wall time between them is collapsed here
-        because the budget's window is what bounds the spend, not the spacing.
+        Cycles run until the ledger itself reports the budget exhausted, so the helper does not assume how
+        much each cycle charges: a restore that had no churn to cover charges nothing, and only genuine
+        grants spend the allowance. The wall time between cycles is collapsed because the budget's window is
+        what bounds the spend, not the spacing.
         """
         cycle_cost = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
-        for _index in range(int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1):
+        max_cycles = int(_GRACE_BUDGET_SECONDS // _WHOLE_CARD_ESTABLISH_GRACE_SECONDS) + int(
+            _GRACE_BUDGET_SECONDS // cycle_cost
+        )
+        for _index in range(max_cycles):
+            if scheduler._whole_card_ledger.grace_budget_exhausted(None, now=time.time()):
+                break
             scheduler._establish_whole_card_residency(job, forecast, announce=True)
             scheduler._whole_card_ledger.state_for(None).cooldown_until = 0.0
             scheduler._restore_siblings_after_whole_card()
@@ -860,13 +866,23 @@ class TestChurnGovernors:
         assert scheduler.is_whole_card_residency_active() is True
 
     def test_a_restore_window_is_granted_even_with_the_budget_spent(self) -> None:
-        """The restore churn keeps its excuse unconditionally: the budget gates establishments only."""
+        """A granted restore window keeps its excuse unconditionally: the budget gates establishments only.
+
+        The grant itself is conditional on the restore having churn to cover, which is pinned elsewhere;
+        here the window is granted directly so what is under test is that a spent budget never mutes a
+        window already open.
+        """
         scheduler, _available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         self._spend_the_grace_budget(scheduler, flux_job, forecast)
 
+        scheduler._whole_card_ledger.record_restore(
+            None,
+            now=time.time(),
+            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+        )
         state = scheduler._whole_card_ledger.state_for(None)
-        assert state.restore_at != 0.0, "precondition: the last cycle ended in a restore"
+        assert state.restore_at != 0.0, "precondition: a restore window is open"
         state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS - 5.0)
         assert scheduler.whole_card_residency_grace_active() is True
         state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
