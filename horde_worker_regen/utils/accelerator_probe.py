@@ -17,8 +17,12 @@ correspond to two distinct terms of the device's VRAM decomposition (device base
 marginal overhead / model weights / activation peaks; see ``scheduling/context_overhead_model``):
 
 - the *first/sole* process's context cost: the one-time, device-wide CUDA runtime allocation plus one
-  context (and any fixed device baseline the reading happens to include). This is paid once per device and
-  sizes ``free_if_alone``; it is never the cost of an additional context; and
+  context. This is paid once per device and sizes ``free_if_alone``; it is never the cost of an additional
+  context. Like the marginal below it is a before/after delta, so whatever the device already held when the
+  probe started (a desktop compositor, another tenant's process) cancels instead of being charged to the
+  worker: a device-wide *used* reading taken after the context materialises includes every other tenant on
+  the card, and that figure applied as a per-process overhead prices a small card out of models it serves;
+  and
 - the *marginal* cost of each additional sibling context: measured directly by bringing up a second
   context-holding process and reading the device-wide used *delta*. Because the one-time runtime and the
   device baseline are already counted in the first figure, the delta isolates term (2) alone, so the
@@ -81,6 +85,24 @@ import sys
 import threading
 
 try:
+    def _nvml_used_mb():
+        # NVML queries the driver without creating a CUDA context, and reports true device-wide usage on
+        # every platform (including Windows WDDM, where the torch reading below is only this process's view).
+        # Both properties are load-bearing for the before/after pair: a "before" reading taken through torch
+        # would initialise CUDA and so already contain the context being measured, and a pair read on
+        # different bases would not subtract.
+        try:
+            from hordelib.utils.nvml import get_device_memory_mb
+
+            _memory = get_device_memory_mb(0)
+            return None if _memory is None else int(_memory.used_mb)
+        except BaseException:
+            return None
+
+    # Read the device's pre-existing baseline FIRST, before anything can touch the GPU: enumeration and every
+    # torch memory helper initialise CUDA as a side effect.
+    _baseline_mb = _nvml_used_mb()
+
     from hordelib.utils.torch_memory import enumerate_accelerators
     # Device-wide free (mem_get_info), NOT comfy's per-process view (torch_memory.get_torch_free_vram_mb):
     # only the device-wide figure sees a *sibling* process's context, which is the whole point of the
@@ -106,14 +128,23 @@ try:
         _block = torch.ones((512, 512), device=_dev)
         float((_block @ _block).sum().item())
 
-    # First/sole context: materialise this process's context and read device-wide used (the one-time runtime
-    # cost plus one context (plus any fixed device baseline, e.g. a desktop compositor), the figure that
-    # survives at sole residency, which the forecast subtracts from total VRAM for free_if_alone.
+    # First/sole context: materialise this process's context, then read used again. The pair is reported raw
+    # and the parent takes the delta (see _first_context_overhead_mb): the subtraction is plain arithmetic that
+    # must stay directly testable, while this child only ever runs on real hardware. The NVML pair is used when
+    # both readings landed, so the two figures share a basis; otherwise the baseline is dropped and the torch
+    # reading stands alone (baseline-inclusive, over-counting in the safe direction, as before).
     try:
         _materialize_context()
         _overhead_mb = _device_used_mb()
+        _context_nvml_mb = _nvml_used_mb()
     except BaseException:
         _overhead_mb = 0
+        _context_nvml_mb = None
+    if _baseline_mb is None or _context_nvml_mb is None:
+        _context_used_mb = _overhead_mb
+        _baseline_mb = None
+    else:
+        _context_used_mb = _context_nvml_mb
 
     # Marginal cost of an *additional* sibling context: bring up a second process that materialises its own
     # context, then measure the device-wide used delta. The one-time runtime (and any device baseline) is
@@ -163,7 +194,8 @@ try:
             "name": str(a.name),
             "total_vram_mb": int(a.total_vram_mb),
             "kind": str(a.kind),
-            "runtime_overhead_mb": _overhead_mb,
+            "context_device_used_mb": _context_used_mb,
+            "device_baseline_mb": _baseline_mb,
             "marginal_overhead_mb": _marginal_mb,
         }}
         for a in _accelerators
@@ -188,8 +220,17 @@ class ProbedAccelerator(BaseModel):
     serialisations that predate this field."""
     runtime_overhead_mb: int = 0
     """Approx. VRAM (MB) the *first/sole* fresh torch process consumes on the idle device: the one-time
-    CUDA-runtime/kernel allocation plus one context. Sizes free-if-alone. Defaults to 0 for probes/
-    serialisations that predate this field."""
+    CUDA-runtime/kernel allocation plus one context. Sizes free-if-alone. Derived by the parent as the
+    before/after delta over :attr:`device_baseline_mb`, so VRAM other tenants already held is not charged to
+    the worker. Defaults to 0 for probes/serialisations that predate this field."""
+    context_device_used_mb: int = 0
+    """Device-wide VRAM used (MB) measured after the probe materialised its context: the raw reading behind
+    :attr:`runtime_overhead_mb`, before the baseline is netted out. Carried so the derivation is inspectable
+    and the raw figures stay available for diagnostics."""
+    device_baseline_mb: int | None = None
+    """Device-wide VRAM used (MB) on this card *before* the probe created any context, read through NVML so
+    the reading itself allocates nothing. None when unmeasurable (a non-NVIDIA backend, no driver), where the
+    first-context overhead degrades to the baseline-inclusive raw reading."""
     marginal_overhead_mb: int = 0
     """Approx. VRAM (MB) each *additional* sibling process's context costs once the first has paid the shared
     one-time runtime cost, measured by bringing up a second context and taking the device-wide used delta.
@@ -197,6 +238,29 @@ class ProbedAccelerator(BaseModel):
     0 when it could not be measured (single-context backends, probe failure), where the worker seeds a
     conservative per-additional-context constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``)
     rather than re-charging the first-context ``runtime_overhead_mb`` against every context."""
+
+
+def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_mb: int | None) -> int:
+    """Return the first/sole context's own VRAM cost (MB): the reading net of the device's prior baseline.
+
+    The raw reading is device-wide, so it contains every tenant already on the card (a desktop compositor,
+    another application, a second worker) as well as the context just created. Charged whole as a per-process
+    overhead it is not a measurement of the worker at all, and the error scales with how busy the *host*
+    is rather than with anything the worker does: a desktop machine's several-GB baseline, applied to a small
+    card, removes more of that card's budget than the models it is being asked to serve. Subtracting the
+    pre-context baseline leaves the context's own cost, which is what the term means.
+
+    Clamped at 0: the baseline and the post-context reading are separate samples, so an unrelated tenant
+    releasing memory in between can invert them, and a negative overhead would credit the worker VRAM it never
+    freed. An unmeasurable baseline (None) leaves the raw reading, which over-counts in the safe direction.
+
+    Args:
+        context_device_used_mb (int): Device-wide VRAM used (MB) after the probe materialised its context.
+        device_baseline_mb (int | None): Device-wide VRAM used (MB) before it did, or None when unmeasurable.
+    """
+    if device_baseline_mb is None:
+        return max(0, context_device_used_mb)
+    return max(0, context_device_used_mb - device_baseline_mb)
 
 
 def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelerator]:
@@ -228,7 +292,25 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
             continue
         try:
             raw_entries = json.loads(line[len(_RESULT_PREFIX) :])
-            return [ProbedAccelerator.model_validate(entry) for entry in raw_entries]
+            accelerators = [ProbedAccelerator.model_validate(entry) for entry in raw_entries]
+            # The child reports the raw before/after pair; the first-context overhead is derived here. An entry
+            # carrying no post-context reading (a serialisation that predates the pair) keeps whatever
+            # ``runtime_overhead_mb`` it already had rather than being zeroed.
+            return [
+                (
+                    accelerator
+                    if accelerator.context_device_used_mb <= 0
+                    else accelerator.model_copy(
+                        update={
+                            "runtime_overhead_mb": _first_context_overhead_mb(
+                                context_device_used_mb=accelerator.context_device_used_mb,
+                                device_baseline_mb=accelerator.device_baseline_mb,
+                            ),
+                        },
+                    )
+                )
+                for accelerator in accelerators
+            ]
         except (ValueError, TypeError) as parse_error:
             logger.debug(f"Could not parse accelerator probe output: {parse_error}")
             return []

@@ -172,7 +172,9 @@ class TestAuxPreparationRegression:
             tracker,
             model_map,
             max_threads=2,
-            device_free_mb=11_000.0,
+            # Room for one priced SDXL sampling peak but not two, so the head's later admission is decided by
+            # the backfill's live reservation rather than by an inflated per-baseline constant.
+            device_free_mb=10_000.0,
         )
 
         # The gated head is invisible to dispatch, so the resident backfill sibling is fed on the first pass.
@@ -254,7 +256,9 @@ async def test_backfill_retries_after_measured_vram_recovers() -> None:
     model_map.update_entry(_HEAD_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=0)
     model_map.update_entry(_BACKFILL_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
     scheduler = _scheduler(ProcessMap({0: head_process, 1: backfill_process}), tracker, model_map)
-    free_mb = {"value": 8_500.0}
+    # Below the backfill's priced SDXL sampling peak plus the admission noise buffer, so the hold is a
+    # genuine refusal on the reading rather than one manufactured by an inflated per-baseline constant.
+    free_mb = {"value": 7_500.0}
     scheduler.set_device_free_mb_provider(lambda _device_index: free_mb["value"])
 
     # The gated head holds nothing; the backfill is the dispatch head but its sampling peak does not fit the

@@ -14,6 +14,8 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     admission_noise_buffer_mb,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _CEILING_ATTEMPT_OVERSHOOT_CAP_MB,
+    _CEILING_ATTEMPT_OVERSHOOT_FRACTION,
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     _STARVATION_DIAGNOSTIC_SECONDS,
     ActuatorCommandKind,
@@ -1092,13 +1094,18 @@ class TestMeasuredAttemptEscapeHatch:
         assert verdict.measured_attempt is False
         assert arbiter.measured_attempts == 0
 
-    def test_beyond_ceiling_still_denies(self) -> None:
-        """A candidate above the achievable ceiling is structurally impossible: it DENIES, never attempts."""
+    def test_beyond_the_ceiling_allowance_still_denies(self) -> None:
+        """Past the ceiling by more than prediction error can explain, the candidate DENIES with no attempt.
+
+        A candidate over the achievable ceiling is structurally impossible on this card. It is granted one
+        real load only when it clears the ceiling by a small, prediction-error-sized margin (see
+        :class:`TestCeilingMeasuredAttempt`); a wider gap keeps the outright DENY.
+        """
         arbiter = VramArbiter()
-        # ceiling = 16375 - 512 - 1912 = 13951; the 14573 candidate exceeds it and cannot fit an empty card.
+        # ceiling = 16375 - 512 - 1912 = 13951, so the allowance is the 1024 MB cap; 15500 clears both.
         state = self._empty_card(total_vram_mb=16375.0, foreign_floor_mb=1912.0)
         arbiter.begin_cycle(_snapshot(state))
-        verdict = arbiter.evaluate(self._starved_head())
+        verdict = arbiter.evaluate(self._starved_head(candidate_delta_mb=15500.0))
         assert verdict.disposition == VramDisposition.DENY
         assert verdict.measured_attempt is False
         assert arbiter.measured_attempts == 0
@@ -1138,3 +1145,148 @@ class TestMeasuredAttemptEscapeHatch:
         verdict = arbiter.evaluate(self._starved_head(is_head_of_queue=False, starved_seconds=0.0))
         assert verdict.measured_attempt is False
         assert arbiter.measured_attempts == 0
+
+
+class TestCeilingMeasuredAttempt:
+    """A candidate just over the achievable ceiling earns one real load rather than a permanent DENY.
+
+    The ceiling is measured; the candidate is predicted. When a prediction clears a measured ceiling by a
+    small margin, believing the prediction costs everything: the DENY is terminal, the ceiling hold it arms
+    can only lift on a candidate below the ceiling, and a static prediction never moves, so the card is priced
+    out of that model for good. An 8 GB card offering 7680 MB against an SDXL candidate carrying an 8000 MB
+    static figure is exactly that case, on a card that provably serves the model. One real load settles it.
+    """
+
+    _TOTAL_MB = 8192.0
+    _NOISE_MB = 512.0
+    _CEILING_MB = 7680.0
+    """total - noise - foreign floor: the most this card could ever offer one load."""
+    _STATIC_SDXL_MB = 8000.0
+    """The unmeasured per-baseline figure that sits 320 MB above the ceiling."""
+
+    def _card(self, **overrides: object) -> DeviceVramState:
+        """A converged-empty 8 GB card whose instantaneous reading also refuses the candidate."""
+        defaults: dict[str, object] = {
+            "total_vram_mb": self._TOTAL_MB,
+            "noise_buffer_mb": self._NOISE_MB,
+            "foreign_floor_mb": 0.0,
+            "device_free_mb": 7000.0,
+            "planned_unmaterialized_mb": 0.0,
+        }
+        defaults.update(overrides)
+        return _roomy_state(**defaults)
+
+    def _head(self, **overrides: object) -> VramRequest:
+        """The head of queue asking for the over-ceiling candidate, with nothing left to reclaim for it."""
+        defaults: dict[str, object] = {
+            "candidate_delta_mb": self._STATIC_SDXL_MB,
+            "is_head_of_queue": True,
+            "head_job_id": "job-1",
+        }
+        defaults.update(overrides)
+        return _preload(**defaults)
+
+    def test_modest_overshoot_reaches_the_measured_attempt(self) -> None:
+        """The trigger case, which previously denied outright: a FITS flagged as a measured attempt."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head())
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+        # The candidate genuinely exceeds both the reading and the ceiling; the admit is the escape hatch.
+        assert verdict.measured.fits is False
+        assert arbiter.measured_attempts == 1
+
+    def test_attempt_needs_no_starvation_wait(self) -> None:
+        """The ceiling trigger fires immediately: a DENY is terminal, so no starvation can ever accrue."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head(starved_seconds=0.0))
+        assert verdict.measured_attempt is True
+
+    def test_absurd_candidate_denies_with_no_attempt(self) -> None:
+        """Twice the card is not prediction error: it denies outright rather than banging the card."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head(candidate_delta_mb=self._TOTAL_MB * 2))
+        assert verdict.disposition == VramDisposition.DENY
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_overshoot_just_past_the_allowance_denies(self) -> None:
+        """The bound is a real edge: 10% of the ceiling admits an attempt, a hair more does not."""
+        allowance_mb = min(self._CEILING_MB * _CEILING_ATTEMPT_OVERSHOOT_FRACTION, _CEILING_ATTEMPT_OVERSHOOT_CAP_MB)
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        assert (
+            arbiter.evaluate(self._head(candidate_delta_mb=self._CEILING_MB + allowance_mb)).measured_attempt is True
+        )
+
+        beyond = VramArbiter()
+        beyond.begin_cycle(_snapshot(self._card()))
+        verdict = beyond.evaluate(self._head(candidate_delta_mb=self._CEILING_MB + allowance_mb + 1.0))
+        assert verdict.disposition == VramDisposition.DENY
+        assert beyond.measured_attempts == 0
+
+    def test_large_card_allowance_is_capped(self) -> None:
+        """The proportional allowance never opens a multi-GB attempt window on a large card."""
+        arbiter = VramArbiter()
+        big = self._card(total_vram_mb=48000.0, noise_buffer_mb=1000.0, device_free_mb=40000.0)
+        ceiling_mb = 47000.0
+        arbiter.begin_cycle(_snapshot(big))
+        verdict = arbiter.evaluate(self._head(candidate_delta_mb=ceiling_mb + _CEILING_ATTEMPT_OVERSHOOT_CAP_MB + 1.0))
+        assert verdict.disposition == VramDisposition.DENY
+        assert arbiter.measured_attempts == 0
+
+    def test_one_shot_then_the_deny_stands(self) -> None:
+        """No retry storm: the attempt fires once and the job falls back to the terminal DENY afterwards."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        assert arbiter.evaluate(self._head()).measured_attempt is True
+        arbiter.begin_cycle(_snapshot(self._card()))
+        second = arbiter.evaluate(self._head())
+        assert second.disposition == VramDisposition.DENY
+        assert second.measured_attempt is False
+        assert arbiter.measured_attempts == 1
+
+    def test_in_progress_attempt_keeps_being_admitted(self) -> None:
+        """A tagged job keeps its admit so the preload -> dispatch progression completes on one attempt."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head(measured_attempt_in_progress=True))
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+        assert arbiter.measured_attempts == 0
+
+    def test_card_with_reclaim_left_denies_instead_of_attempting(self) -> None:
+        """The attempt runs only against the most room the card will ever offer, never over live work."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head(has_reclaimable_idle_model=True))
+        assert verdict.disposition == VramDisposition.DENY
+        assert arbiter.measured_attempts == 0
+
+    def test_reroutable_candidate_denies_so_the_other_card_takes_it(self) -> None:
+        """Rerouting to a card that fits the candidate beats attempting on one that may not."""
+        arbiter = VramArbiter()
+        roomy = _roomy_state(total_vram_mb=48000.0, device_free_mb=40000.0)
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._card(), 1: roomy}))
+        verdict = arbiter.evaluate(self._head())
+        assert verdict.disposition == VramDisposition.DENY
+        assert arbiter.measured_attempts == 0
+
+    def test_non_head_requests_never_attempt(self) -> None:
+        """Only the head of queue may spend the attempt; a line-skipping request denies as before."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head(is_head_of_queue=False))
+        assert verdict.disposition == VramDisposition.DENY
+        assert arbiter.measured_attempts == 0
+
+    def test_attempt_reason_names_the_ceiling_arithmetic(self) -> None:
+        """The admit explains itself: candidate, ceiling, and the overshoot that was tolerated."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head())
+        assert "measured load attempt" in verdict.reason
+        assert "achievable ceiling" in verdict.reason

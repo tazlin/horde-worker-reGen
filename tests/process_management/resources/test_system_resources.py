@@ -9,6 +9,8 @@ out-of-process precisely to keep the orchestrator torch-free (see ``test_orchest
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from collections.abc import Iterator
 
@@ -16,7 +18,12 @@ import pytest
 
 import horde_worker_regen.utils.accelerator_probe as accelerator_probe_module
 from horde_worker_regen.process_management.process_manager import SystemResources
-from horde_worker_regen.utils.accelerator_probe import ProbedAccelerator, probe_accelerators
+from horde_worker_regen.utils.accelerator_probe import (
+    _RESULT_PREFIX,
+    ProbedAccelerator,
+    _first_context_overhead_mb,
+    probe_accelerators,
+)
 
 _MB = 1024 * 1024
 
@@ -130,3 +137,84 @@ def test_probe_measures_overhead_and_marginal_on_real_device() -> None:
             "the per-additional-context marginal must be smaller than the one-time-inclusive first-context "
             f"overhead (got marginal={primary.marginal_overhead_mb} >= overhead={primary.runtime_overhead_mb})"
         )
+
+
+class TestFirstContextOverheadExcludesTheDeviceBaseline:
+    """The first-context overhead is the context's own cost, not everything the card already held.
+
+    A device-wide *used* reading taken after the probe's context materialises contains every other tenant on
+    the card: a desktop compositor, a browser, another application. Charged whole as the worker's per-process
+    overhead, that figure measures the host's business rather than the worker's, and applied to a small card
+    it removes more budget than the models the card is being asked to serve. Netting the pre-context baseline
+    out leaves the term its name claims.
+    """
+
+    _BASELINE_MB = 3600
+    """A desktop host's pre-existing device usage: nothing to do with the worker."""
+    _CONTEXT_COST_MB = 278
+    """What the context itself actually costs."""
+
+    def _payload(self, **overrides: object) -> str:
+        """One probe result line carrying a synthetic before/after pair."""
+        entry: dict[str, object] = {
+            "index": 0,
+            "name": "GPU0",
+            "total_vram_mb": 8192,
+            "kind": "cuda",
+            "context_device_used_mb": self._BASELINE_MB + self._CONTEXT_COST_MB,
+            "device_baseline_mb": self._BASELINE_MB,
+            "marginal_overhead_mb": 240,
+        }
+        entry.update(overrides)
+        return _RESULT_PREFIX + json.dumps([entry])
+
+    def _run_probe(self, monkeypatch: pytest.MonkeyPatch, payload: str) -> list[ProbedAccelerator]:
+        """Run ``probe_accelerators`` against a canned child result, with no subprocess and no GPU."""
+        monkeypatch.setattr(
+            accelerator_probe_module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(args=[], returncode=0, stdout=payload, stderr=""),
+        )
+        return probe_accelerators()
+
+    def test_pre_existing_baseline_is_not_charged_to_the_worker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The reported overhead is the delta, so a large synthetic baseline leaves no trace in it."""
+        accelerators = self._run_probe(monkeypatch, self._payload())
+        assert len(accelerators) == 1
+        assert accelerators[0].runtime_overhead_mb == self._CONTEXT_COST_MB
+        # The raw readings survive for diagnostics; only the derived term excludes the baseline.
+        assert accelerators[0].device_baseline_mb == self._BASELINE_MB
+        assert accelerators[0].context_device_used_mb == self._BASELINE_MB + self._CONTEXT_COST_MB
+
+    def test_overhead_stays_a_small_fraction_of_a_small_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The point of the delta: a desktop host's baseline no longer eats an 8 GB card's budget."""
+        accelerators = self._run_probe(monkeypatch, self._payload())
+        overhead_mb = accelerators[0].runtime_overhead_mb
+        assert overhead_mb < 0.1 * accelerators[0].total_vram_mb, (
+            f"a first-context overhead of {overhead_mb} MB on an 8 GB card is a device-wide reading, not a "
+            "context cost"
+        )
+
+    def test_unmeasurable_baseline_keeps_the_raw_reading(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without a baseline (a non-NVIDIA backend) the raw reading stands: over-counting, never under."""
+        accelerators = self._run_probe(monkeypatch, self._payload(device_baseline_mb=None))
+        assert accelerators[0].runtime_overhead_mb == self._BASELINE_MB + self._CONTEXT_COST_MB
+
+    def test_inverted_samples_never_credit_negative_overhead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A tenant releasing memory between the two samples yields 0, never a negative charge."""
+        accelerators = self._run_probe(monkeypatch, self._payload(context_device_used_mb=100))
+        assert accelerators[0].runtime_overhead_mb == 0
+
+    def test_payload_without_the_pair_keeps_its_reported_overhead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A result predating the before/after pair is passed through rather than zeroed."""
+        accelerators = self._run_probe(
+            monkeypatch,
+            _RESULT_PREFIX
+            + json.dumps([{"index": 0, "name": "GPU0", "total_vram_mb": 8192, "runtime_overhead_mb": 1288}]),
+        )
+        assert accelerators[0].runtime_overhead_mb == 1288
+
+    def test_derivation_is_a_plain_subtraction(self) -> None:
+        """The arithmetic itself, independent of any probe plumbing."""
+        assert _first_context_overhead_mb(context_device_used_mb=3878, device_baseline_mb=3600) == 278
+        assert _first_context_overhead_mb(context_device_used_mb=3878, device_baseline_mb=None) == 3878

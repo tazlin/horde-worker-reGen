@@ -198,14 +198,15 @@ class TestStreamForecastClassification:
     def test_reserve_covers_activation_working_set_not_flat_floor(self) -> None:
         """The forecast reserve is the model's activation working set, not the flat configured floor.
 
-        Flux's per-step activations (~2.5 GB at 512^2, more at higher resolution) dwarf the ~2 GB reserve
-        floor. A weights-plus-flat-reserve forecast judges Flux co-resident, and the sampling step then
-        drives free VRAM to zero and spills activations to host RAM. The reserve must reflect the
-        activation-inclusive peak.
+        Flux's per-step activations grow with resolution and pass the ~2 GB reserve floor well before the
+        card's own limit. A weights-plus-flat-reserve forecast judges Flux co-resident, and the sampling step
+        then drives free VRAM to zero and spills activations to host RAM. The reserve must reflect the
+        activation-inclusive peak, so a job whose working set clears the floor raises it and one below it
+        does not.
         """
-        job = make_job_pop_response(_FLUX_MODEL)
+        heavy = make_job_pop_response(_FLUX_MODEL, width=1024, height=1024)
         forecast = forecast_weight_streaming(
-            job,
+            heavy,
             "flux_1",
             free_now_mb=15000.0,
             total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
@@ -214,6 +215,21 @@ class TestStreamForecastClassification:
             configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
         )
         assert forecast.reserve_mb > float(_VRAM_RESERVE_MB)
+
+        # The floor is a floor, not a ceiling: the smaller job's working set is genuinely under it, and the
+        # reserve settles at the operator's figure rather than being talked up by a per-baseline constant.
+        light = make_job_pop_response(_FLUX_MODEL, width=512, height=512)
+        light_forecast = forecast_weight_streaming(
+            light,
+            "flux_1",
+            free_now_mb=15000.0,
+            total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
+            per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+            num_inference_processes=1,
+            configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
+        )
+        assert light_forecast.reserve_mb == float(_VRAM_RESERVE_MB)
+        assert light_forecast.reserve_mb < forecast.reserve_mb
 
     def test_safety_on_gpu_charge_lowers_current_achievable_free(self) -> None:
         """A safety-on-GPU process is charged against the *current* achievable free (free_after_model_evict).
@@ -413,9 +429,10 @@ class TestWholeCardSiblingTeardown:
         assert admitted is False, "the whole-card head must defer until the device is cleared"
         assert job_tracker.is_admitted_exclusive(head_job) is True
         # Flux needs the whole card: teardown all the way down to one inference process. The shrink is tagged
-        # with the whole-card model so it spares that head's holder (and stops queued-model siblings).
+        # with the whole-card model so it spares that head's holder (and stops queued-model siblings), and with
+        # the slot this preload will load into, which carries no model yet and so the tag cannot reach.
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(
-            1, device_index=None, protected_model=_FLUX_MODEL
+            1, device_index=None, protected_model=_FLUX_MODEL, spared_process_id=1
         )
         assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
 

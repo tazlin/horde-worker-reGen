@@ -1074,9 +1074,20 @@ def predict_job_sampling_vram_mb(job: ImageGenerateJobPopResponse, baseline: str
     """Return a job's predicted *sampling-phase* peak VRAM (MB), or None when unavailable.
 
     This is the peak that governs weight *residency* and *preload admission*: the resident weights plus the
-    per-step sampling activation that must stay in VRAM together while the model samples, taken as the larger
-    of the sampling-phase burden (``BurdenEstimate.vram_sampling_mb``) and the baseline's transient *load
-    peak* (a combined checkpoint co-resides its text encoder and diffusion weights while loading).
+    per-step sampling activation that must stay in VRAM together while the model samples, priced from the
+    sampling-phase burden (``BurdenEstimate.vram_sampling_mb``) alone.
+
+    The baseline's ``min_recommended_vram_mb`` (:func:`_baseline_load_peak_mb`) is deliberately NOT a floor on
+    that price. It is a *recommendation* field: a per-baseline suggestion of how much card an operator should
+    bring, not a measurement of any peak this job will reach. Used as a floor it prices every job of a baseline
+    at the recommendation whatever the job actually asks for, and on a card whose achievable ceiling sits below
+    the recommendation (SDXL's 8000 MB recommendation against an 8 GB card's ~7680 MB ceiling) that unmeasured
+    figure alone declares the candidate structurally impossible, denying admission and dropping the model from
+    the offer on a card that provably serves it. Nothing unmeasured may push a candidate past a card's ceiling,
+    so the recommendation is used only where there is no estimate at all to price from (below), never to raise
+    one that exists. The load transient it was standing in for (a combined checkpoint briefly co-residing its
+    text encoder and diffusion weights) is real but is not what this field measures; it is carried by the
+    measured/learned peaks the residency path already feeds back.
 
     It deliberately excludes the post-processing activation (upscaler/face-fixer). That peak runs *after*
     sampling on the already-loaded model (often after the inference slot is released for overlap, sometimes
@@ -1087,20 +1098,19 @@ def predict_job_sampling_vram_mb(job: ImageGenerateJobPopResponse, baseline: str
     :func:`predict_job_post_processing_vram_mb` and the scheduler's committed post-processing reserve.
 
     Falls back to the combined steady estimate (as :func:`predict_job_vram_mb`) when the pinned hordelib
-    predates the phase-split, so an older engine keeps its prior, more conservative behavior. Never raises.
+    predates the phase-split, so an older engine keeps its prior, more conservative behavior. With no burden
+    estimate at all there is no priced peak, so the baseline recommendation stands as the only available
+    signal; that is a seed in the absence of a price, not a floor over one. Never raises.
     """
     burden = _estimate_job_burden(job, baseline)
     if burden is None:
         return _baseline_load_peak_mb(baseline)
     try:
-        sampling_mb: float | None = float(burden.vram_sampling_mb)
+        return float(burden.vram_sampling_mb)
     except AttributeError:
         # Older hordelib without the phase-split: the sampling-only figure is unknown, so fall back to the
         # combined steady estimate (conservative) rather than losing the residency signal entirely.
-        sampling_mb = float(burden.vram_mb)
-    load_peak_mb = _baseline_load_peak_mb(baseline)
-    candidates = [value for value in (sampling_mb, load_peak_mb) if value is not None]
-    return max(candidates) if candidates else None
+        return float(burden.vram_mb)
 
 
 def predict_job_sampler_only_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
@@ -1151,7 +1161,12 @@ def predict_job_decode_spike_mb(job: ImageGenerateJobPopResponse, baseline: str 
 
 
 def _baseline_load_peak_mb(baseline: str | None) -> float | None:
-    """Return hordelib's recommended-VRAM load peak (MB) for ``baseline``, or None when unavailable.
+    """Return hordelib's per-baseline recommended VRAM (MB) for ``baseline``, or None when unavailable.
+
+    A coarse per-baseline seed, used only where no per-job estimate exists to price from. It is an unmeasured
+    recommendation, so it never raises a peak that was actually estimated (see
+    :func:`predict_job_sampling_vram_mb`): doing so lets a static figure exceed a small card's achievable
+    ceiling and price a servable model off that card entirely.
 
     Sourced from ``hordelib.feature_impact.get_baseline_burden`` (``min_recommended_vram_mb``), the
     recommended free-VRAM headroom for a baseline's transient load peak. Imported from the torch-free

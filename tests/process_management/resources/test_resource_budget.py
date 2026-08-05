@@ -1562,3 +1562,58 @@ class TestSchedulerReservationOverlay:
         after_death = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
         assert after_death.planned_unmaterialized_mb == 0.0
         assert self._candidate_fits(after_death, candidate_mb=8000.0) is True
+
+
+class TestRecommendationIsNotAPeakFloor:
+    """A baseline's ``min_recommended_vram_mb`` must never raise a job's priced sampling peak.
+
+    That field is a recommendation of how much card to bring, not a measurement of any peak a job reaches.
+    Flooring the sampling prediction with it priced every job of a baseline at the recommendation, and on a
+    card whose achievable ceiling sits below that figure the unmeasured number alone made the candidate
+    structurally impossible: an 8 GB card offers ~7680 MB after the noise buffer and the foreign floor, SDXL
+    recommends 8000 MB, and a 512x512 SDXL job whose real sampling estimate is well under the ceiling was
+    denied and the model dropped from the offer.
+    """
+
+    _EIGHT_GB_ACHIEVABLE_CEILING_MB = 7680.0
+    """What an 8 GB card can actually offer one load: 8192 total, less the noise buffer and the foreign floor."""
+
+    def test_recommendation_does_not_raise_a_priced_sampling_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An absurd baseline recommendation leaves the sampling prediction exactly where the estimate put it."""
+        job = make_mock_job(width=512, height=512)
+        priced_mb = resource_budget.predict_job_sampling_vram_mb(job, "stable_diffusion_xl")
+        assert priced_mb is not None
+
+        monkeypatch.setattr(resource_budget, "_baseline_load_peak_mb", lambda _baseline: 99000.0)
+        assert resource_budget.predict_job_sampling_vram_mb(job, "stable_diffusion_xl") == priced_mb
+
+    def test_sdxl_at_512_prices_under_an_8gb_card_ceiling(self) -> None:
+        """The operator's premise, as arithmetic: a 512x512 SDXL job fits what an 8 GB card can offer."""
+        job = make_mock_job(width=512, height=512)
+        priced_mb = resource_budget.predict_job_sampling_vram_mb(job, "stable_diffusion_xl")
+        assert priced_mb is not None
+        assert priced_mb <= self._EIGHT_GB_ACHIEVABLE_CEILING_MB, (
+            f"a 512x512 SDXL job prices at {priced_mb:.0f} MB, above the "
+            f"{self._EIGHT_GB_ACHIEVABLE_CEILING_MB:.0f} MB an 8 GB card can offer; an 8 GB worker cannot "
+            "serve SDXL at this price"
+        )
+
+    def test_recommendation_still_seeds_when_no_estimate_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no burden estimate at all the recommendation stands: a seed in place of a price, not a floor."""
+        job = make_mock_job(width=512, height=512)
+        monkeypatch.setattr(resource_budget, "_estimate_job_burden", lambda _job, _baseline: None)
+        monkeypatch.setattr(resource_budget, "_baseline_load_peak_mb", lambda _baseline: 8000.0)
+        assert resource_budget.predict_job_sampling_vram_mb(job, "stable_diffusion_xl") == 8000.0
+
+    def test_a_larger_job_still_prices_higher(self) -> None:
+        """Dropping the floor does not flatten the prediction: resolution still moves the priced peak."""
+        small_mb = resource_budget.predict_job_sampling_vram_mb(
+            make_mock_job(width=512, height=512),
+            "stable_diffusion_xl",
+        )
+        large_mb = resource_budget.predict_job_sampling_vram_mb(
+            make_mock_job(width=1024, height=1024),
+            "stable_diffusion_xl",
+        )
+        assert small_mb is not None and large_mb is not None
+        assert large_mb > small_mb

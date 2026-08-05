@@ -44,7 +44,9 @@ does or does not fit:
   remaining deficit is exactly its own idle sibling contexts (a bare CUDA context weight eviction cannot
   reclaim, freed only when the process exits) escalates to a verified context teardown: it DEFERS with a
   REDUCE_LIVE_CONTEXTS actuation and re-asks once the room frees.
-- A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it.
+- A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it,
+  unless it clears the achievable ceiling by so little that the prediction is the likelier explanation (see
+  :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION`), where one real load settles it instead.
 - A card with no device-free reading yet DEFERS with a throttled diagnostic: the primary admission input is
   absent, so the arbiter neither denies nor fabricates a fictional free figure; it waits for the next reading.
 
@@ -57,6 +59,14 @@ the conservative static prediction: a success teaches the learned peak the true 
 strongest possible evidence and arms the ceiling hold. The attempt rides the ordinary FITS path, so every
 downstream safety applies unchanged, and it fires at most once per head-starvation episode. A shortfall beyond
 the band, or a card with reclaim still to do, keeps deferring.
+
+The same one real load is reached from the other side of the arithmetic. A head at a converged-empty card whose
+predicted demand sits *above* the achievable ceiling by no more than
+:data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION` of that ceiling, and which no other card could seat, is admitted
+once rather than denied. There the DENY would be terminal and self-confirming: it drops the model from the
+offer, the ceiling hold that follows only lifts on a candidate below the ceiling, and a static prediction never
+moves, so a card that provably serves the model is priced out of it forever on a figure nothing measured. An
+overshoot beyond the allowance still denies outright, with no doomed attempt.
 
 Absent that escape hatch, a head that never becomes admittable while the device is idle is caught by the
 structural-queue-wedge recovery supervisor (the deadlock detector feeding the worker recovery coordinator),
@@ -120,6 +130,29 @@ foreign dip explains the gap. Admitting one measured load lets reality decide: a
 peak the true figure, a failure (child OOM) is the strongest possible evidence and arms the ceiling hold. The
 band is wide enough to cover ordinary prediction conservatism yet small enough that a genuinely oversized
 demand keeps deferring toward the give-up backstop rather than banging the card with a hopeless attempt."""
+
+_CEILING_ATTEMPT_OVERSHOOT_FRACTION = 0.10
+"""Fraction of a card's achievable ceiling by which a candidate may exceed it and still earn one real load
+attempt instead of an outright DENY.
+
+The ceiling test compares a *predicted* candidate against a measured ceiling, and the prediction carries
+error the ceiling does not: a static per-baseline figure with no measurement behind it can sit a few hundred
+MB above what the model really needs. A small card is where that error decides everything, because the
+overshoot only has to be a few percent of the card to cross the ceiling and turn a permanent DENY into a
+model dropped from the offer (the ceiling hold then never lifts, since lifting needs a candidate below the
+ceiling and the prediction never moves). Scaling the tolerance with the ceiling keeps it proportionate: a
+fixed MB allowance is a quarter of a 4 GB card and a rounding error on a 48 GB one.
+
+Ten percent is the width that covers ordinary prediction error without covering a genuine misfit. A candidate
+beyond it is not a card that might hold it after all; it DENIES with no attempt, so an absurd demand (twice
+the card) never gets a doomed load."""
+
+_CEILING_ATTEMPT_OVERSHOOT_CAP_MB = _MEASURED_ATTEMPT_BAND_MB
+"""Absolute ceiling-overshoot allowance (MB), capping :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION` on a large
+card. Pinned to the same uncertainty band the within-available measured attempt uses so the two attempt paths
+express one policy: past this much unexplained demand, the worker stops believing the gap is prediction error.
+On a big card the proportional allowance would otherwise open a multi-GB attempt window, which is a size no
+prediction error plausibly reaches."""
 
 _CONVERGED_EMPTY_RESERVATION_EPSILON_MB = 1.0
 """Slack (MB) below which the net outstanding worker reservations count as zero when judging a card
@@ -660,10 +693,16 @@ class VramArbiter:
             )
 
         # The candidate does not fit available room. If it cannot fit even an empty card, no escalation on this
-        # card could ever seat it, so it DENIES. Otherwise it DEFERS: a starved head whose deficit is its own
-        # idle sibling contexts escalates to a verified teardown, every other non-fitting demand rides the
-        # per-cycle reclaim ladder and re-asks once the room frees.
-        if self._structurally_impossible(request, state):
+        # card could ever seat it, so it DENIES, unless it clears the ceiling by so little that the prediction
+        # itself is the likelier explanation and one real load can settle it. Otherwise it DEFERS: a starved
+        # head whose deficit is its own idle sibling contexts escalates to a verified teardown, every other
+        # non-fitting demand rides the per-cycle reclaim ladder and re-asks once the room frees.
+        structurally_impossible = self._structurally_impossible(request, state)
+        measured_attempt = self._measured_attempt(request, measured, state, impossible=structurally_impossible)
+        if measured_attempt is not None:
+            return measured_attempt
+
+        if structurally_impossible:
             return VramVerdict(
                 disposition=VramDisposition.DENY,
                 request_kind=request.kind,
@@ -671,10 +710,6 @@ class VramArbiter:
                 reason=self._impossibility_reason(request, state, measured),
                 measured=measured,
             )
-
-        measured_attempt = self._measured_attempt(request, measured)
-        if measured_attempt is not None:
-            return measured_attempt
 
         teardown_actuations = self._starvation_context_teardown(request)
         if teardown_actuations is not None:
@@ -749,23 +784,32 @@ class VramArbiter:
         self,
         request: VramRequest,
         measured: AdmissionVerdict,
+        state: DeviceVramState,
+        *,
+        impossible: bool,
     ) -> VramVerdict | None:
-        """Return a measured-load FITS for a starved head at a converged-empty card, or None to defer as usual.
+        """Return a measured-load FITS for a head at a converged-empty card, or None to fall through as usual.
 
-        Reached only for a non-fitting candidate that is not structurally impossible. The measured-truth identity
-        refuses on arithmetic, but that arithmetic is built on a conservative static prediction and an
-        instantaneous device-free reading that oscillates as foreign VRAM breathes. When the head has starved
-        past the diagnostic horizon, the card is converged-empty (the worker has nothing left to reclaim for it),
-        the candidate is under the achievable ceiling, and the shortfall against available is within the
-        uncertainty band, deferring only burns an idle card on arithmetic that may be wrong. This admits one real
+        Two triggers reach the same one real load, differing only in which arithmetic refused. ``impossible``
+        False is the within-available trigger: a starved head whose candidate misses the instantaneous reading
+        by a within-band shortfall. ``impossible`` True is the ceiling trigger: the candidate exceeds what an
+        emptied card could ever offer, but by so little that the prediction is the likelier culprit
+        (:meth:`_ceiling_attempt_eligible`); without it the DENY is terminal and permanent on that card.
+
+        Both triggers rest on the same reasoning. The arithmetic that refused is built on a conservative static
+        prediction and (for the within-available trigger) an instantaneous device-free reading that oscillates
+        as foreign VRAM breathes. When the card is converged-empty the worker has nothing left to reclaim for
+        this head, so refusing only burns an idle card on arithmetic that may be wrong. This admits one real
         load so measured reality decides; every downstream safety (per-step floors, watchdogs, OOM
         classification, whole-card residency) applies unchanged because it rides the ordinary FITS path.
 
-        The one-shot is per head-starvation episode: the first eligible evaluation emits the attempt (and logs
-        the arithmetic once), subsequent evaluations of the same job defer as before. Once the scheduler has
-        tagged the job (``measured_attempt_in_progress``), the arbiter keeps admitting it so the preload ->
-        dispatch progression completes without a second one-shot. Returns None for every request the escape hatch
-        does not cover, so the caller's ordinary teardown/ladder/defer path runs.
+        The one-shot is per job: the first eligible evaluation emits the attempt (and logs the arithmetic once),
+        subsequent evaluations of the same job take the verdict they would have taken without the hatch (a defer
+        for the within-available trigger, the terminal DENY for the ceiling trigger). Nothing here retries, so a
+        load that OOMs arms the ceiling hold on that measured evidence and the job never bangs the card again.
+        Once the scheduler has tagged the job (``measured_attempt_in_progress``), the arbiter keeps admitting it
+        so the preload -> dispatch progression completes without a second one-shot. Returns None for every
+        request the escape hatch does not cover, so the caller's ordinary teardown/ladder/defer path runs.
         """
         if not request.is_head_of_queue:
             return None
@@ -773,22 +817,79 @@ class VramArbiter:
             return None
         if request.measured_attempt_in_progress:
             return self._measured_attempt_verdict(request, measured, first_emission=False)
-        if not self._measured_attempt_eligible(request, measured):
+        if impossible:
+            if not self._ceiling_attempt_eligible(request, measured, state):
+                return None
+        elif not self._measured_attempt_eligible(request, measured):
             return None
         key = request.head_job_id or request.job_label
         if key in self._measured_attempts_started:
             return None
         self._measured_attempts_started.add(key)
         self.measured_attempts += 1
-        available_mb = measured.available_mb if measured.available_mb is not None else 0.0
-        logger.warning(
-            f"VRAM: attempting a measured load of head-of-queue {request.job_label}: candidate "
-            f"{measured.candidate_outstanding_mb:.0f} MB vs available {available_mb:.0f} MB, a "
-            f"{measured.candidate_outstanding_mb - available_mb:.0f} MB shortfall within the "
-            f"{_MEASURED_ATTEMPT_BAND_MB:.0f} MB band; the card is empty with nothing left to reclaim and the "
-            f"static prediction may be conservative, so one real load decides. measured: {measured.reason()}",
-        )
+        if impossible:
+            ceiling_mb = state.achievable_ceiling_mb() or 0.0
+            logger.warning(
+                f"VRAM: attempting a measured load of head-of-queue {request.job_label}: predicted candidate "
+                f"{measured.candidate_outstanding_mb:.0f} MB is above this card's achievable ceiling "
+                f"{ceiling_mb:.0f} MB by {measured.candidate_outstanding_mb - ceiling_mb:.0f} MB, within the "
+                f"{self._ceiling_attempt_allowance_mb(ceiling_mb):.0f} MB allowance; the card is empty with "
+                "nothing left to reclaim, so one real load decides whether the prediction or the card is wrong. "
+                f"measured: {measured.reason()}",
+            )
+        else:
+            available_mb = measured.available_mb if measured.available_mb is not None else 0.0
+            logger.warning(
+                f"VRAM: attempting a measured load of head-of-queue {request.job_label}: candidate "
+                f"{measured.candidate_outstanding_mb:.0f} MB vs available {available_mb:.0f} MB, a "
+                f"{measured.candidate_outstanding_mb - available_mb:.0f} MB shortfall within the "
+                f"{_MEASURED_ATTEMPT_BAND_MB:.0f} MB band; the card is empty with nothing left to reclaim and "
+                f"the static prediction may be conservative, so one real load decides. measured: "
+                f"{measured.reason()}",
+            )
         return self._measured_attempt_verdict(request, measured, first_emission=True)
+
+    @staticmethod
+    def _ceiling_attempt_allowance_mb(ceiling_mb: float) -> float:
+        """Return how far (MB) above the achievable ceiling a candidate may sit and still earn one load attempt.
+
+        Proportional to the ceiling so the tolerance means the same thing on a small card as on a large one,
+        capped so a large card cannot open a multi-GB attempt window. See
+        :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION` and :data:`_CEILING_ATTEMPT_OVERSHOOT_CAP_MB`.
+        """
+        return min(max(0.0, ceiling_mb) * _CEILING_ATTEMPT_OVERSHOOT_FRACTION, _CEILING_ATTEMPT_OVERSHOOT_CAP_MB)
+
+    def _ceiling_attempt_eligible(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+        state: DeviceVramState,
+    ) -> bool:
+        """Whether a candidate over the achievable ceiling still earns one real load instead of a DENY.
+
+        The ceiling is measured; the candidate is predicted. A predicted figure that clears a measured ceiling
+        by a small margin is far more likely to be prediction error than a model the card genuinely cannot
+        hold, and the cost of believing the prediction is total: the DENY is terminal, the ceiling hold that
+        follows can only lift on a candidate below the ceiling, and the prediction never moves, so the card is
+        priced out of that model permanently. One real load resolves it: the load either succeeds (the card
+        held it, and the learned peak records the truth) or OOMs (the strongest possible evidence, which arms
+        the hold on measurement rather than on arithmetic).
+
+        Three conditions bound it. The overshoot must sit inside
+        :meth:`_ceiling_attempt_allowance_mb`, so an absurd demand (twice the card) denies outright with no
+        doomed attempt. The card must be converged-empty, so the attempt runs against the most room the card
+        will ever offer and cannot disturb live work. And no other card may be able to seat the candidate:
+        rerouting to a card that fits it is strictly better than attempting on one that may not.
+        """
+        ceiling_mb = state.achievable_ceiling_mb()
+        if ceiling_mb is None:
+            return False
+        overshoot_mb = measured.candidate_outstanding_mb - ceiling_mb
+        if overshoot_mb <= 0.0 or overshoot_mb > self._ceiling_attempt_allowance_mb(ceiling_mb):
+            return False
+        if not self._card_converged_empty(request, measured):
+            return False
+        return not self.any_other_device_can_seat(request, exclude_device_index=request.device_index)
 
     def _measured_attempt_eligible(
         self,
