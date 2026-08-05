@@ -15,11 +15,16 @@ from loguru import logger
 
 from horde_worker_regen.process_management.process_manager import (
     POP_LIVENESS_ERROR_SECONDS,
+    POP_LIVENESS_FROZEN_QUEUE_SECONDS,
     POP_LIVENESS_WARN_SECONDS,
     HordeWorkerProcessManager,
 )
 from horde_worker_regen.process_management.scheduling.pop_governor_registry import PopGovernorReading
-from tests.process_management.conftest import make_testable_process_manager
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_testable_process_manager,
+    track_popped_job_async,
+)
 
 
 def _capture(level: str) -> tuple[list[str], int]:
@@ -206,3 +211,91 @@ class TestPopLivenessSentinel:
             logger.remove(warn_sink)
 
         assert warnings == []
+
+
+_FROZEN_QUEUE_PHRASE = "full and not draining"
+"""The phrase identifying the full-but-frozen escalation, distinct from the ordinary silence disclosure."""
+
+
+async def _full_queue_manager(head_model: str = "head_model") -> tuple[HordeWorkerProcessManager, float]:
+    """Build a manager whose local queue is genuinely full and whose pops are held at that gate.
+
+    The queue depth is the popper's own, and the gate is recorded through the popper's own gate-noting
+    entry point, so the held condition is the one the pop loop would produce rather than a hand-set field.
+
+    Returns:
+        The manager and the wall-clock time the gate began holding.
+    """
+    manager = make_testable_process_manager()
+    await track_popped_job_async(manager._job_tracker, make_job_pop_response(head_model))
+    while not manager._job_popper._is_queue_full(manager.bridge_data):
+        await track_popped_job_async(manager._job_tracker, make_job_pop_response("trailing_model"))
+    manager._job_popper._note_pop_gate("queue_full")
+    held_since = manager._state.last_pop_gate_since
+    manager._state.last_pop_attempt_completed_at = held_since
+    return manager, held_since
+
+
+class TestFullButFrozenQueue:
+    """A full local queue is healthy only while it drains; a full queue that stops moving is a wedge."""
+
+    async def test_a_full_queue_that_stops_draining_escalates_and_names_the_head(self) -> None:
+        """Pops held at the full-queue gate with nothing dispatched or completed is not backpressure.
+
+        The full-queue gate explains why no pop reaches the horde, and taking that as the whole explanation
+        leaves the worker's most complete stall (queue full, every slot idle, nothing moving) reported as
+        ordinary capacity management. The escalation has to name the head, because the head is the job whose
+        block is holding everything behind it.
+        """
+        manager, held_since = await _full_queue_manager()
+        assert manager._job_popper._is_queue_full(manager.bridge_data) is True
+        assert manager._state.last_pop_gate == "queue_full"
+
+        errors, sink_id = _capture("ERROR")
+        try:
+            for tick in range(0, int(POP_LIVENESS_FROZEN_QUEUE_SECONDS) * 2, 10):
+                manager._check_pop_liveness(held_since + tick)
+        finally:
+            logger.remove(sink_id)
+
+        frozen = [line for line in errors if _FROZEN_QUEUE_PHRASE in line]
+        assert len(frozen) == 1, errors
+        assert "head_model" in frozen[0]
+
+    async def test_a_full_queue_that_keeps_draining_is_quiet(self) -> None:
+        """Backpressure on a worker that is serving must not be reported as a stall.
+
+        A worker at its queue depth holds this gate continuously and attempts no pops while it does, so the
+        only thing separating capacity management from a wedge is whether work is still moving.
+        """
+        manager, held_since = await _full_queue_manager()
+
+        errors, error_sink = _capture("ERROR")
+        warnings, warn_sink = _capture("WARNING")
+        try:
+            for tick in range(0, int(POP_LIVENESS_FROZEN_QUEUE_SECONDS) * 2, 10):
+                await manager._job_tracker.increment_jobs_completed()
+                manager._check_pop_liveness(held_since + tick)
+        finally:
+            logger.remove(warn_sink)
+            logger.remove(error_sink)
+
+        assert [line for line in errors if _FROZEN_QUEUE_PHRASE in line] == []
+        # The sentinel really did run past the thresholds that would have reached the escalation: the
+        # ordinary silence disclosure fired on the same ticks.
+        assert [line for line in warnings if "queue_full" in line] != []
+
+    async def test_the_frozen_escalation_is_time_boxed_not_per_tick(self) -> None:
+        """A stall the operator has already been told about restates itself on a clock, not on every tick."""
+        manager, held_since = await _full_queue_manager()
+
+        errors, sink_id = _capture("ERROR")
+        try:
+            span = int(POP_LIVENESS_FROZEN_QUEUE_SECONDS) * 3
+            for tick in range(0, span, 5):
+                manager._check_pop_liveness(held_since + tick)
+        finally:
+            logger.remove(sink_id)
+
+        frozen = [line for line in errors if _FROZEN_QUEUE_PHRASE in line]
+        assert len(frozen) == 2, frozen

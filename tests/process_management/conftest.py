@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from unittest.mock import Mock
 
 import pytest
@@ -621,6 +621,7 @@ def make_test_recovery_coordinator(
     structural_wedge: bool = False,
     ready_lane: bool = True,
     lane_state: HordeProcessState = HordeProcessState.WAITING_FOR_JOB,
+    head_block_reason_provider: Callable[[], str | None] | None = None,
     **scheduler_overrides: bool,
 ) -> WorkerRecoveryCoordinator:
     """Create a WorkerRecoveryCoordinator over a single inference lane with mocked collaborators.
@@ -636,6 +637,8 @@ def make_test_recovery_coordinator(
         ready_lane: Whether the process map contains an inference lane at all.
         lane_state: The lane's reported process state, so a test can present a slot that is running a job
             rather than idle.
+        head_block_reason_provider: What the coordinator reads as the named constraint blocking the head.
+            Omitted means "no reason is published", which is the unwired default.
         **scheduler_overrides: Scheduler predicate return values to override from their inactive default.
 
     Returns:
@@ -691,6 +694,7 @@ def make_test_recovery_coordinator(
         bridge_data_provider=lambda: bridge_data,
         max_inference_processes_provider=lambda: 1,
         terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
+        head_block_reason=head_block_reason_provider or (lambda: None),
         recovery_supervisor=RecoverySupervisor(clock=clock),
         clock=clock,
     )

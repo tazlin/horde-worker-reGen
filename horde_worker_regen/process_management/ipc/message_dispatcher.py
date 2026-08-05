@@ -1939,30 +1939,30 @@ class MessageDispatcher:
             self._queue_deadlock_summary_logged = False
 
         if not self._in_queue_deadlock and queue_deadlock_condition:
-            currently_loaded_models = set()
             model_process_map: dict[str, int] = {}
             for process in self._process_map.values():
                 if process.loaded_horde_model_name is not None:
-                    currently_loaded_models.add(process.loaded_horde_model_name)
                     model_process_map[process.loaded_horde_model_name] = process.process_id
 
-            for job in unheld_pending:
-                if job.model is not None and job.model in currently_loaded_models:
-                    self._in_queue_deadlock = True
-                    self._last_queue_deadlock_detected_time = time.time()
-                    self._queue_deadlock_model = job.model
-                    self._queue_deadlock_process_id = model_process_map[job.model]
-                    break
-            else:
-                # No diagnostics here: the condition is one tick old at this edge, so the sustain gate below
-                # decides whether it ever lasted long enough to be worth reporting.
-                self._in_queue_deadlock = True
-                self._last_queue_deadlock_detected_time = time.time()
-                self._queue_deadlock_model = unheld_pending[0].model
+            # Attribution names the head of the queue. The head is the job the queue is stopped on; every
+            # later entry is merely waiting its turn behind it, so naming whichever one happens to match a
+            # resident model sends the reader after a job that is not blocked at all. No diagnostics here:
+            # the condition is one tick old at this edge, so the sustain gate below decides whether it ever
+            # lasted long enough to be worth reporting.
+            head = unheld_pending[0]
+            self._in_queue_deadlock = True
+            self._last_queue_deadlock_detected_time = time.time()
+            self._queue_deadlock_model = head.model
+            if head.model is not None:
+                self._queue_deadlock_process_id = model_process_map.get(head.model)
 
         elif self._in_queue_deadlock and (self._last_queue_deadlock_detected_time + 30) < time.time():
-            if self._process_map.num_starting_processes() > 0:
-                logger.debug("Queue deadlock detected but some processes are starting. Waiting.")
+            if self._process_map.num_starting_inference_processes() > 0:
+                # Only an inference slot booting is capacity arriving for the pending queue, so only that is
+                # worth restarting this clock for. A recovery remedy that cycles a safety or service-lane
+                # child does so on its own cadence, and crediting those boots as progress would let such a
+                # remedy hold the wedge clock at zero for as long as it keeps running.
+                logger.debug("Queue deadlock detected but an inference slot is starting. Waiting.")
                 self._last_queue_deadlock_detected_time = time.time()
                 return
 
@@ -1973,9 +1973,9 @@ class MessageDispatcher:
                 self._print_deadlock_info()
 
                 if self._queue_deadlock_model is not None:
-                    logger.debug(f"Model causing deadlock: {self._queue_deadlock_model}")
+                    logger.debug(f"Model of the blocked head of queue: {self._queue_deadlock_model}")
                 else:
-                    logger.warning("Queue deadlock detected but no model causing it.")
+                    logger.warning("Queue deadlock detected but the head of queue names no model.")
 
             # Keep the flag set so the recovery supervisor can act on a sustained deadlock.
 

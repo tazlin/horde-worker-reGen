@@ -925,6 +925,18 @@ POP_LIVENESS_ERROR_SECONDS = 300.0
 At this point the worker has served nothing for minutes with no governor and no pause to account for it, so
 the condition is escalated from a notice to an error."""
 
+POP_LIVENESS_QUEUE_FULL_GATE = "queue_full"
+"""The pop gate the popper records when the local queue is already at its configured depth."""
+
+POP_LIVENESS_FROZEN_QUEUE_SECONDS = 120.0
+"""How long a full local queue may go without dispatching or completing anything before it is a stall.
+
+A full queue is the ordinary shape of a busy worker and explains why no pop reaches the horde, so on its own
+it is not a condition worth reporting. What makes it one is the queue no longer moving: nothing dispatched
+and nothing completed for the whole span while every slot sits idle. Two minutes is far longer than any
+single job's turnaround, and comfortably ahead of the recovery escalation that acts on a held gate, so the
+disclosure reaches the operator before the remedies start."""
+
 POP_LIVENESS_NON_EXPLAINING_GOVERNORS: frozenset[str] = frozenset({"pop_error_backoff"})
 """Governor spells the pop-liveness sentinel must not accept as an explanation for absent pop attempts.
 
@@ -1757,6 +1769,7 @@ class HordeWorkerProcessManager:
             terminal_recovery_callback=self._request_terminal_recovery,
             release_disaggregated_job=self._disaggregation_orchestrator.release_job,
             head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
+            head_block_reason=self._head_block_reason,
         )
 
         self._job_submitter = JobSubmitter(
@@ -1843,6 +1856,15 @@ class HordeWorkerProcessManager:
         self._pop_liveness_attempt_seen = 0.0
         self._pop_liveness_warned_at = 0.0
         self._pop_liveness_errored_at = 0.0
+        # The full-queue hold currently being judged for movement: the ``last_pop_gate_since`` stamp it is
+        # keyed on, plus the completed-job and inference-start counts as they stood when movement was last
+        # seen. None while pops are not held at the full-queue gate. Keying on the stamp means a new hold
+        # gets its own baseline with no explicit reset.
+        self._pop_liveness_frozen_baseline: tuple[float, int, int] | None = None
+        # When the queue was last observed to move (or the hold to begin), which is what the frozen span is
+        # measured from, and when the frozen escalation was last emitted (its repeat clock).
+        self._pop_liveness_frozen_since = 0.0
+        self._pop_liveness_frozen_errored_at = 0.0
 
         self._alchemy_coordinator = AlchemyCoordinator(
             state=self._state,
@@ -4281,6 +4303,21 @@ class HordeWorkerProcessManager:
             return False
         return self._aux_prefetch_coordinator.has_live_deadline(head.id_)
 
+    def _pending_head_job(self) -> ImageGenerateJobPopResponse | None:
+        """Return the head of the pending inference queue: the first accepted job not yet dispatched."""
+        in_progress = set(self._job_tracker.jobs_in_progress)
+        return next((job for job in self._job_tracker.jobs_pending_inference if job not in in_progress), None)
+
+    def _head_block_reason(self) -> str | None:
+        """Return the constraint the scheduler last named as holding the head of queue back, if any.
+
+        The scheduler publishes this as its dispatch-stall attribution. Recovery reads it to judge whether a
+        resource-freeing remedy has any bearing on the block it is being issued against, and the work ledger
+        surfaces it to the operator. None means the scheduler names nothing, which is the ordinary state of a
+        worker that is dispatching.
+        """
+        return self._inference_scheduler.head_dispatch_block_reason
+
     def _aux_prefetch_in_flight_downloads(self) -> dict[str, tuple[int, int]]:
         """The ad-hoc LoRA/TI prefetch downloads the downloader shows in flight, as name -> (downloaded, total).
 
@@ -5037,7 +5074,12 @@ class HordeWorkerProcessManager:
         if silent_seconds < POP_LIVENESS_WARN_SECONDS:
             return
         if self._state.workload_intake_paused:
+            self._pop_liveness_frozen_baseline = None
+            self._pop_liveness_frozen_errored_at = 0.0
             return
+        # Judged ahead of the governor check below: a governor explains why pops are not being attempted, but
+        # nothing explains a queue of accepted work that neither dispatches nor completes.
+        self._check_full_queue_liveness(now)
         # The error-backoff spell must not excuse the silence: it only stretches the pop cadence to a few
         # seconds and it can only close when an attempt completes, so treating it as an explanation would
         # let one failed pop followed by a latched gate mute this sentinel forever.
@@ -5055,6 +5097,56 @@ class HordeWorkerProcessManager:
         if self._pop_liveness_warned_at == 0.0:
             self._pop_liveness_warned_at = now
             logger.warning(self._pop_liveness_line(now, silent_seconds))
+
+    def _full_queue_frozen_line(self, frozen_seconds: float) -> str:
+        """Compose the disclosure for a local queue that has been full and motionless for ``frozen_seconds``."""
+        head = self._pending_head_job()
+        head_model = str(head.model) if head is not None and head.model is not None else "unknown"
+        blocker = self._head_block_reason()
+        blocker_text = f" The scheduler names the block as: {blocker}." if blocker else ""
+        return (
+            f"Pop liveness: the local job queue has been full and not draining for {frozen_seconds:.0f}s "
+            f"({len(self._job_tracker.jobs_pending_inference)} accepted job(s) waiting, head model "
+            f"'{head_model}'), with nothing dispatched and nothing completed in that time. A full queue holds "
+            f"pops back legitimately only while it moves, so the worker is serving nothing.{blocker_text}"
+        )
+
+    def _check_full_queue_liveness(self, now: float) -> None:
+        """Escalate a local queue that is full and has stopped moving.
+
+        The full-queue gate accounts for the absence of pop attempts, and treating it as the whole story
+        leaves the worker's most complete stall indistinguishable from a worker at its configured depth doing
+        its job. The two are separated by movement, not by the gate: work dispatched or completed since the
+        hold began proves the depth is being managed, and its absence over a long span proves it is not.
+
+        Disclosure only, on a repeat clock rather than per tick. The remedy for a held gate belongs to the
+        recovery coordinator's pop-gate wedge, which acts on the same hold over a longer horizon.
+        """
+        if self._state.last_pop_gate != POP_LIVENESS_QUEUE_FULL_GATE:
+            self._pop_liveness_frozen_baseline = None
+            self._pop_liveness_frozen_errored_at = 0.0
+            return
+
+        held_since = self._state.last_pop_gate_since
+        movement = (self._job_tracker.total_num_completed_jobs, self._job_tracker.total_num_inference_starts)
+        baseline = self._pop_liveness_frozen_baseline
+        if baseline is None or baseline[0] != held_since or movement != baseline[1:]:
+            # Either a fresh hold, or the queue moved: re-anchor and let the span start over.
+            self._pop_liveness_frozen_baseline = (held_since, *movement)
+            self._pop_liveness_frozen_errored_at = 0.0
+            self._pop_liveness_frozen_since = now
+            return
+
+        frozen_seconds = now - self._pop_liveness_frozen_since
+        if frozen_seconds < POP_LIVENESS_FROZEN_QUEUE_SECONDS:
+            return
+        if (
+            self._pop_liveness_frozen_errored_at != 0.0
+            and (now - self._pop_liveness_frozen_errored_at) < POP_LIVENESS_FROZEN_QUEUE_SECONDS
+        ):
+            return
+        self._pop_liveness_frozen_errored_at = now
+        logger.error(self._full_queue_frozen_line(frozen_seconds))
 
     def _has_post_inference_image_work(self) -> bool:
         """Return whether accepted image work remains after the inference stage."""
@@ -6174,7 +6266,7 @@ class HordeWorkerProcessManager:
             features=features if not features.is_empty() else None,
             age_seconds=max(0.0, now - tracked.current_stage_since) if tracked.current_stage_since else None,
             intent=intent,
-            raw_reason=getattr(self._inference_scheduler, "_dispatch_stall_last_reason", None),
+            raw_reason=self._head_block_reason(),
             queue_order=queue_order_by_job_id.get(job_id),
         )
 
@@ -6288,7 +6380,7 @@ class HordeWorkerProcessManager:
         safety, idle). Each early-return path that stops job popping should have a distinct
         intent so the operator can see *why* the worker is not taking new work.
         """
-        raw_gate = getattr(self._inference_scheduler, "_dispatch_stall_last_reason", None)
+        raw_gate = self._head_block_reason()
         head = next(
             (job for job in self._job_tracker.jobs_pending_inference if job not in self._job_tracker.jobs_in_progress),
             None,

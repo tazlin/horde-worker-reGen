@@ -9,6 +9,7 @@ escalation reachable.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
@@ -406,6 +407,118 @@ class TestRemedyBudgetsBoundTheEscalation:
         rungs_after_rebuild = [issued_at for issued_at in rung_times if issued_at > soft_reset_calls[0]]
         assert len(rungs_before_rebuild) == coordinator.RECLAIM_RUNG_ALLOTMENT
         assert rungs_after_rebuild
+
+
+async def _make_structural_wedge_coordinator(
+    *,
+    candidates: LadderCandidates,
+    head_block_reason: Callable[[], str | None],
+    pending_jobs: int = 3,
+) -> tuple[WorkerRecoveryCoordinator, FakeClock, list[str]]:
+    """Build a structural queue wedge over a healthy, idle inference lane with a named head blocker.
+
+    The pool is fine and the card has room; the queue simply does not move. This is the shape in which a
+    resource-freeing remedy has to justify itself, because nothing about it is a resource shortfall unless
+    the named blocker says so.
+
+    Returns:
+        The coordinator, its clock, and the shared transcript recording rung kinds and recovery faults.
+    """
+    clock = FakeClock()
+    job_tracker = JobTracker(clock=clock)
+    coordinator = make_test_recovery_coordinator(
+        job_tracker=job_tracker,
+        clock=clock,
+        structural_wedge=True,
+        head_block_reason_provider=head_block_reason,
+    )
+    coordinator._inference_scheduler.build_reclaim_ladder_candidates.return_value = candidates
+
+    for _ in range(pending_jobs):
+        await track_popped_job_async(job_tracker, make_job_pop_response())
+
+    transcript: list[str] = []
+    _arm_reclaim_actuator(coordinator, transcript)
+    return coordinator, clock, transcript
+
+
+class TestRemediesAnswerToTheNamedBlocker:
+    """A remedy that provably does not move the named blocker stops being a reason to hold off faulting."""
+
+    async def test_rungs_stop_once_they_do_not_change_the_named_blocker(self) -> None:
+        """A blocker no reclaim rung touches bounds the ladder rather than consuming all of it.
+
+        Every rung frees card memory, which addresses nothing when the head is held by an admission decision
+        rather than by a shortfall. Left unbounded, the ladder issues its whole sequence against that blocker
+        while each issued rung renews the "a remedy remains" excuse that holds the give-up backstop off, so
+        the accepted work is neither served nor released.
+        """
+        coordinator, clock, transcript = await _make_structural_wedge_coordinator(
+            candidates=_many_rung_candidates(),
+            head_block_reason=lambda: "the head is deferred by an admission decision",
+        )
+        _spy_on_scheduling_recovery_faults(coordinator, transcript)
+
+        for _ in range(_ESCALATION_TICK_BUDGET):
+            coordinator.run_recovery_supervisor()
+            clock.advance(_TICK_SECONDS)
+            if "fault" in transcript:
+                break
+
+        assert "fault" in transcript, "the give-up backstop must still be reachable"
+        rungs_before_fault = transcript[: transcript.index("fault")]
+        assert len(rungs_before_fault) == coordinator.RECLAIM_NO_EFFECT_LIMIT
+        assert coordinator.reclaim_ladder_ruled_irrelevant is True
+
+    async def test_a_remedy_that_moves_the_named_blocker_keeps_the_ladder(self) -> None:
+        """A rung that changes what blocks the head is working, so the ladder is not curtailed.
+
+        This is the shortfall case the ladder exists for: each rung frees room and the head's blocker moves
+        with it. Curtailing the ladder here would stop the escalation short of the rung that would have
+        served the queue.
+        """
+        transcript: list[str] = []
+        coordinator, clock, transcript = await _make_structural_wedge_coordinator(
+            candidates=_many_rung_candidates(),
+            head_block_reason=lambda: f"the card is short of room for the head ({len(transcript)} freed)",
+        )
+        _spy_on_scheduling_recovery_faults(coordinator, transcript)
+
+        for _ in range(_ESCALATION_TICK_BUDGET):
+            coordinator.run_recovery_supervisor()
+            clock.advance(_TICK_SECONDS)
+            if "fault" in transcript:
+                break
+
+        rungs_before_fault = transcript[: transcript.index("fault")] if "fault" in transcript else transcript
+        assert len(rungs_before_fault) > coordinator.RECLAIM_NO_EFFECT_LIMIT
+        assert coordinator.reclaim_ladder_ruled_irrelevant is False
+
+    async def test_an_unmoved_blocker_stops_excusing_the_give_up(self) -> None:
+        """The settling window of a rung ruled irrelevant is no longer a reason to defer faulting.
+
+        The give-up defers while a remedy may still land. A remedy demonstrated not to address the blocker
+        cannot land, so continuing to defer to its window is what turns a bounded escalation into an
+        indefinite hold over accepted work.
+        """
+        coordinator, clock, transcript = await _make_structural_wedge_coordinator(
+            candidates=_many_rung_candidates(),
+            head_block_reason=lambda: "the head is deferred by an admission decision",
+        )
+        _spy_on_scheduling_recovery_faults(coordinator, transcript)
+
+        for _ in range(_ESCALATION_TICK_BUDGET):
+            coordinator.run_recovery_supervisor()
+            if coordinator.reclaim_ladder_ruled_irrelevant:
+                break
+            clock.advance(_TICK_SECONDS)
+
+        assert coordinator.reclaim_ladder_ruled_irrelevant is True
+        # Present the hazard the guard exists for: a rung inside its settling window, which is exactly the
+        # state that used to return "a remedy remains".
+        coordinator.reclaim_rung_issued_at = clock.now
+        assert coordinator._reclaim_rung_settling() is True
+        assert coordinator._give_up_yields_to_remedy() is False
 
 
 class TestReclaimIsSequencedAheadOfTheOtherRungs:

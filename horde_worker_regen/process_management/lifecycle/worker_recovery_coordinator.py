@@ -120,6 +120,16 @@ class WorkerRecoveryCoordinator:
     hold accepted work past this, so the give-up that reissues those jobs to the horde stays reachable on a
     condition no rung fixes."""
 
+    RECLAIM_NO_EFFECT_LIMIT = 2
+    """Consecutive rungs that may leave the named head blocker untouched before the ladder is set aside.
+
+    Every rung on the ladder frees card memory, which addresses the head only when a shortfall is what holds
+    it. When the head's blocker is published and neither it nor the inference-start count moves across a
+    rung's full settling window, that rung demonstrably did not address the block. Two such rungs in a row is
+    the ladder answering a constraint it has no purchase on, and continuing to issue rungs against it both
+    churns resident state and renews the "a remedy remains" excuse that holds the give-up backstop off. One
+    is deliberately not enough: a single window can coincide with an unrelated hold lifting."""
+
     MAX_GIVE_UP_YIELDS_PER_EPISODE = 3
     """Give-ups one wedge episode may refund to an in-flight remedy before it must actually fire.
 
@@ -175,6 +185,7 @@ class WorkerRecoveryCoordinator:
         terminal_recovery_callback: Callable[[], RecoveryDisposition],
         release_disaggregated_job: Callable[[GenerationID], None] = lambda _job_id: None,
         head_aux_prefetch_in_flight: Callable[[], bool] = lambda: False,
+        head_block_reason: Callable[[], str | None] = lambda: None,
         recovery_supervisor: RecoverySupervisor | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -204,6 +215,10 @@ class WorkerRecoveryCoordinator:
                 waiting on an in-flight auxiliary download is capacity in flight, not a wedge. It is
                 self-bounding by that deadline, so a stalled prefetch stops deferring once the deadline lapses
                 (the coordinator faults the job then). Defaults to "never in flight" for an unwired caller.
+            head_block_reason: Report the constraint the scheduler currently names as holding the head of
+                queue, or None when it names none. The constructive remedy ladder judges its own relevance
+                against this: a rung that leaves the named constraint unchanged did not address it. An
+                unwired caller reports None, which leaves the ladder's budgets the only bound on it.
             recovery_supervisor: Optional recovery policy object for tests.
             clock: Wall-clock provider for grace windows and rolling recovery counts.
         """
@@ -221,6 +236,7 @@ class WorkerRecoveryCoordinator:
         self._terminal_recovery_callback = terminal_recovery_callback
         self._release_disaggregated_job = release_disaggregated_job
         self._head_aux_prefetch_in_flight = head_aux_prefetch_in_flight
+        self._head_block_reason = head_block_reason
         self._clock = clock
 
         self.recovery_supervisor = recovery_supervisor or RecoverySupervisor()
@@ -258,6 +274,13 @@ class WorkerRecoveryCoordinator:
         self.reclaim_rungs_issued_in_allotment = 0
         self.reclaim_rung_issued_at: float | None = None
         self.reclaim_remedy_started_at: float | None = None
+        # Relevance accounting for the constructive ladder: the named head blocker and inference-start count
+        # as they stood when the most recent rung was issued (None once that rung's effect has been judged),
+        # how many rungs in a row have left both unchanged, and the episode latch that sets the ladder aside
+        # once that run reaches its limit.
+        self.reclaim_effect_baseline: tuple[str, int] | None = None
+        self.reclaim_no_effect_cycles = 0
+        self.reclaim_ladder_ruled_irrelevant = False
         # Give-ups refunded to the constructive rung's settling window. The PP-specific remedy uses its own
         # independently bounded clock and does not consume or inflate this count.
         self.give_up_yields_spent = 0
@@ -941,6 +964,9 @@ class WorkerRecoveryCoordinator:
                 self.episode_saw_unrecoverable_pool = False
             else:
                 is_wedged = True
+        # Judged before the availability question is asked, so a ladder that has just been measured as having
+        # no bearing on the head's blocker is not offered as a reason to defer this tick's escalation.
+        self.settle_reclaim_relevance()
         # Consulted only while the worker actually reads as wedged: the candidate snapshot walks the process map,
         # and a healthy worker has no episode for a rung to belong to.
         constructive_remedy_available = is_wedged and self.constructive_remedy_available()
@@ -1090,11 +1116,48 @@ class WorkerRecoveryCoordinator:
         """
         if self._reclaim_remedy_time_budget_spent():
             return False
+        if self.reclaim_ladder_ruled_irrelevant:
+            return False
         if self._reclaim_rung_settling():
             return True
         if self.reclaim_rungs_issued_in_allotment >= self.RECLAIM_RUNG_ALLOTMENT:
             return False
         return self._next_reclaim_rung() is not None
+
+    def settle_reclaim_relevance(self) -> None:
+        """Judge whether the rung that has finished settling changed what the scheduler says blocks the head.
+
+        Called once per escalation tick, and only acts once a rung's settling window has fully elapsed, so
+        each issued rung is judged exactly once and on a full window. The judgement needs a published
+        blocker: with none named there is nothing to measure a rung against, so the ladder keeps its
+        ordinary budgets as its only bound.
+
+        A rung counts as having done something if the named blocker changed or an inference start happened;
+        either disproves "this rung addressed nothing" and resets the run. Once
+        :attr:`RECLAIM_NO_EFFECT_LIMIT` rungs in a row have done neither, the ladder is set aside for the
+        rest of the episode: it stops being issued and stops standing in the way of the give-up backstop.
+        The escalation above it is untouched, so recovery still ends in a running worker.
+        """
+        if self.reclaim_effect_baseline is None or self._reclaim_rung_settling():
+            return
+        baseline_reason, baseline_starts = self.reclaim_effect_baseline
+        self.reclaim_effect_baseline = None
+        if (
+            self._head_block_reason() != baseline_reason
+            or self._job_tracker.total_num_inference_starts > baseline_starts
+        ):
+            self.reclaim_no_effect_cycles = 0
+            return
+        self.reclaim_no_effect_cycles += 1
+        if self.reclaim_no_effect_cycles < self.RECLAIM_NO_EFFECT_LIMIT:
+            return
+        self.reclaim_ladder_ruled_irrelevant = True
+        logger.warning(
+            f"Save-our-ship: {self.reclaim_no_effect_cycles} constructive remedies in a row left the head's "
+            f"stated blocker unchanged ({baseline_reason}) with no inference started, so freeing more card "
+            "memory is not what this head is waiting on. The reclaim ladder is set aside for this episode and "
+            "no longer defers the escalation.",
+        )
 
     def _frozen_reclaim_ladder(self) -> tuple[ReclaimRung, ...]:
         """Return this episode's reclaim rungs, ordering them cheapest-first on the first call.
@@ -1147,7 +1210,7 @@ class WorkerRecoveryCoordinator:
             The rung that was performed, or None when the last rung is still settling, the allotment is spent,
             or nothing in the frozen list acts any more.
         """
-        if self._reclaim_rung_settling():
+        if self._reclaim_rung_settling() or self.reclaim_ladder_ruled_irrelevant:
             return None
         now = self._clock()
         ladder = self._frozen_reclaim_ladder()
@@ -1161,12 +1224,18 @@ class WorkerRecoveryCoordinator:
             # change the resource condition.
             if rung.promised_freed_mb < _MIN_CONSTRUCTIVE_RUNG_MB:
                 continue
+            # Snapshot what this rung is supposed to move, taken before it acts so any change it causes is
+            # credited to it. Its settling window is then judged on that outcome rather than on the rung
+            # merely having been performed.
+            head_blocker = self._head_block_reason()
+            starts_before_rung = self._job_tracker.total_num_inference_starts
             if not execute_reclaim_rung(rung, self._inference_scheduler):
                 continue
             self.reclaim_rungs_issued_in_allotment += 1
             self.reclaim_rung_issued_at = now
             if self.reclaim_remedy_started_at is None:
                 self.reclaim_remedy_started_at = now
+            self.reclaim_effect_baseline = (head_blocker, starts_before_rung) if head_blocker is not None else None
             if rung.kind in LANE_PAUSE_RUNG_KINDS:
                 self.reclaim_paused_lanes.append(rung)
             logger.warning(
@@ -1234,6 +1303,9 @@ class WorkerRecoveryCoordinator:
         self.reclaim_rungs_issued_in_allotment = 0
         self.reclaim_rung_issued_at = None
         self.reclaim_remedy_started_at = None
+        self.reclaim_effect_baseline = None
+        self.reclaim_no_effect_cycles = 0
+        self.reclaim_ladder_ruled_irrelevant = False
         self.give_up_yields_spent = 0
 
     def _give_up_yields_to_remedy(self) -> bool:
@@ -1250,7 +1322,14 @@ class WorkerRecoveryCoordinator:
             return self._give_up_yields_to_pp_reclaim()
         if self.give_up_yields_spent >= self.MAX_GIVE_UP_YIELDS_PER_EPISODE:
             return False
-        reclaim_rung_still_settling = self._reclaim_rung_settling() and not self._reclaim_remedy_time_budget_spent()
+        reclaim_rung_still_settling = (
+            self._reclaim_rung_settling()
+            and not self._reclaim_remedy_time_budget_spent()
+            # A ladder ruled irrelevant cannot unblock this head, so its settling window is not a remedy
+            # about to land. Deferring to it would hold accepted work behind an action already measured as
+            # having no bearing on the block.
+            and not self.reclaim_ladder_ruled_irrelevant
+        )
         if reclaim_rung_still_settling:
             return True
         return self._give_up_yields_to_pp_reclaim()

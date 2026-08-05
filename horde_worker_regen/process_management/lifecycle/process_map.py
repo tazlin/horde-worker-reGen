@@ -939,6 +939,23 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
+    def num_starting_inference_processes(self) -> int:
+        """Return the number of *inference* slots that are currently starting.
+
+        Narrower than :meth:`num_starting_processes` for the callers whose question is "is capacity for the
+        pending inference queue on its way": only an inference slot can take that work, so a safety or
+        service-lane child booting is not an answer to it. Those children are cycled by remedies of their
+        own, and reading their boots as inference capacity arriving lets a remedy that runs on a cadence
+        keep resetting a wedge clock indefinitely.
+        """
+        count = 0
+        for p in self.values():
+            if p.process_type != HordeProcessType.INFERENCE:
+                continue
+            if p.last_process_state == HordeProcessState.PROCESS_STARTING:
+                count += 1
+        return count
+
     def keep_single_inference(
         self,
         *,
