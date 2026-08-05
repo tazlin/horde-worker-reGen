@@ -1343,6 +1343,19 @@ back with no work for the resident model, and it is skipped entirely on a host d
 Those ends, and why each is shaped the way it is, are in
 [Resource governance](resource_governance.md).
 
+A claim changes what the worker *asks* for rather than what it does with what arrives, so it leaves no trace
+in the job stream: a stretch where one model served everything looks the same whether that was the demand or
+the claim. Three surfaces close that gap. The scheduler states each engage and release once, the release
+naming which of the ends fired. The residency status snapshot carries the standing claim (its model and the
+time left on the maximum hold) and, for a short window after a release, which end fired, so the Overview's
+residency panel and hero banner explain both the narrowed offer and its widening back out. And `horde-log`
+pairs the edges into episodes: an informational
+[`detect_whole_card_pop_claim_episodes`][horde_worker_regen.analysis.detectors.detect_whole_card_pop_claim_episodes]
+rollup of how long each claim held and how it ended, plus a warning-grade
+[`detect_whole_card_pop_claim_monopoly`][horde_worker_regen.analysis.detectors.detect_whole_card_pop_claim_monopoly]
+when claims repeatedly have to be ended by the maximum hold while another model's head sits parked, which is
+a mixed queue being squeezed rather than a burst that ran its course.
+
 ### Governor observability
 
 These limiters, whole-card residency, and the other conditions that hold back or reshape pops (post-inference

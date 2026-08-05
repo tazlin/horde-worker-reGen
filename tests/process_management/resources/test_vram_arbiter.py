@@ -916,14 +916,63 @@ def test_every_verdict_carries_a_populated_measured_verdict() -> None:
         assert verdict.measured.available_known is True
 
 
-def test_reason_line_renders_the_measured_arithmetic() -> None:
-    """A verdict's reason renders the identity physically: candidate vs (device-free - reservations - noise)."""
+def test_stated_verdict_renders_the_measured_arithmetic() -> None:
+    """A verdict as a person reads it renders the identity physically: candidate vs (free - reservations - noise)."""
     arbiter = VramArbiter()
     arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=8000.0, planned_unmaterialized_mb=1000.0)))
     verdict = arbiter.evaluate(_preload(candidate_delta_mb=1000.0))
-    assert "device-free" in verdict.reason
-    assert "reservations" in verdict.reason
-    assert "noise" in verdict.reason
+    assert "device-free" in verdict.stated
+    assert "reservations" in verdict.stated
+    assert "noise" in verdict.stated
+    assert "device-free" not in verdict.reason, "the compared half carries the block, never the measurements"
+
+
+class TestTheComparedReasonSurvivesDriftingReadings:
+    """A stored verdict reason must change when the block changes and only then.
+
+    The reason is compared across cycles by the defer line's coalescing and across a settling window by the
+    recovery coordinator's remedy-relevance judgement. Measured megabytes move every cycle as foreign VRAM
+    breathes and reservations decay, so a reason carrying them would report a new block every cycle: the line
+    would repeat forever and every remedy would look like it moved something.
+    """
+
+    @staticmethod
+    def _defer_reason(*, device_free_mb: float, planned_unmaterialized_mb: float) -> str:
+        """Return the stored reason for one non-fitting evaluation at the given readings."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(
+            _snapshot(
+                _roomy_state(
+                    device_free_mb=device_free_mb,
+                    planned_unmaterialized_mb=planned_unmaterialized_mb,
+                ),
+            ),
+        )
+        return arbiter.evaluate(_preload(candidate_delta_mb=9000.0)).reason
+
+    def test_the_same_block_under_drifting_readings_reads_as_one_block(self) -> None:
+        """The candidate misses by a different margin each cycle; it is still the one refusal."""
+        reasons = {
+            self._defer_reason(device_free_mb=free, planned_unmaterialized_mb=reservations)
+            for free, reservations in ((6000.0, 0.0), (6431.0, 250.0), (5872.0, 811.0))
+        }
+        assert len(reasons) == 1, f"drifting readings produced {len(reasons)} distinct stored reasons: {reasons}"
+
+    def test_a_different_block_reads_as_a_different_block(self) -> None:
+        """A card that cannot be priced at all is not the same objection as a candidate that does not fit."""
+        does_not_fit = self._defer_reason(device_free_mb=6000.0, planned_unmaterialized_mb=0.0)
+
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=None)))
+        unreadable = arbiter.evaluate(_preload(candidate_delta_mb=9000.0))
+        assert unreadable.disposition == VramDisposition.DEFER
+        assert unreadable.reason != does_not_fit
+
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state()))
+        fits = arbiter.evaluate(_preload(candidate_delta_mb=6000.0))
+        assert fits.disposition == VramDisposition.FITS
+        assert fits.reason != does_not_fit
 
 
 class TestForeignAwareImpossibility:
@@ -986,11 +1035,12 @@ class TestForeignAwareImpossibility:
         arbiter.begin_cycle(_snapshot(self._state(foreign_floor_mb=self._FOREIGN_MB)))
         verdict = arbiter.evaluate(_preload(candidate_delta_mb=self._CANDIDATE_MB))
         assert verdict.disposition == VramDisposition.DENY
-        reason = verdict.reason
-        assert "14573" in reason
-        assert "13644" in reason  # achievable ceiling
-        assert "1912" in reason  # foreign floor
-        assert "16375" in reason  # total
+        stated = verdict.stated
+        assert "14573" in stated
+        assert "13644" in stated  # achievable ceiling
+        assert "1912" in stated  # foreign floor
+        assert "16375" in stated  # total
+        assert "achievable ceiling" in verdict.reason, "the compared half still names which wall was hit"
 
     def test_any_other_device_can_seat_finds_a_roomy_sibling_card(self) -> None:
         """A multi-card cycle where one sibling could seat the candidate reports a reroute target exists."""

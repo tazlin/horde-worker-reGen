@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.scheduling.scheduler_budget import SchedulerBudget
 
 __all__ = [
     "GraceBudgetStatus",
@@ -39,6 +40,7 @@ __all__ = [
     "WholeCardGrantKind",
     "WholeCardPhase",
     "WholeCardPopClaim",
+    "WholeCardPopClaimRelease",
     "WholeCardResidency",
     "WholeCardResidencyLedger",
     "WholeCardResidencyMachine",
@@ -170,6 +172,23 @@ class WholeCardPopClaim:
     """When the residency behind the claim was established, which is where the maximum hold is measured from."""
     expires_at: float
     """When the maximum hold elapses, after which the pool returns whatever the residency itself is doing."""
+
+
+class WholeCardPopClaimRelease(StrEnum):
+    """Why a standing claim over the pop offer stopped narrowing what the worker advertises.
+
+    The three ends call for different responses, so they are distinguished rather than reported as one
+    "claim over" event: a cap expiry says the burst outlasted the window the operator set, the empty-pop
+    finding says the demand went away, and a residency release says the card simply stopped holding the
+    model. Enumerated so the status surfaces and the disclosure line name the same set.
+    """
+
+    MAXIMUM_HOLD = "maximum_hold"
+    """The operator's maximum hold elapsed while the residency still held the card."""
+    NO_FURTHER_WORK = "no_further_work"
+    """The run of empty pops established that the resident model's demand had dried up."""
+    RESIDENCY_RELEASED = "residency_released"
+    """The residency behind the claim let go, and the claim went with it."""
 
 
 @dataclass
@@ -424,6 +443,23 @@ class WholeCardResidencyLedger:
         if state is None or state.model is None:
             return False
         return now < state.min_hold_until
+
+    def min_hold_disclosure(self, device_index: int | None, *, now: float) -> str | None:
+        """Return what the minimum hold is withholding right now, or None when it is not in force.
+
+        The stamp names :attr:`SchedulerBudget.WHOLE_CARD_MIN_HOLD`, which is the only runtime surface the
+        floor has: it holds a ready head without returning an admission verdict, so a reader who sees a
+        different-model head waiting behind a drained residency has nothing else to attribute it to. The
+        figures tick, so this belongs to a formatted line and never to a compared reason.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.model is None or now >= state.min_hold_until:
+            return None
+        return (
+            f"{SchedulerBudget.WHOLE_CARD_MIN_HOLD.value}: {state.model} took the card "
+            f"{now - state.established_at:.0f}s ago and is not preemptable for a further "
+            f"{state.min_hold_until - now:.0f}s"
+        )
 
     def pop_claim(
         self,

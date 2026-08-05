@@ -354,7 +354,7 @@ class PostProcessOrchestrator:
                 f"{measured.outstanding_reservations_mb:.0f} MB outstanding reservations and "
                 f"{measured.noise_buffer_mb:.0f} MB noise"
                 if available_mb is not None and device_free_mb is not None
-                else verdict.reason
+                else verdict.stated
             )
             logger.warning(
                 f"Deferring post-processing for job {job_id}: candidate {reserve_vram_mb:.0f} MB does not fit "

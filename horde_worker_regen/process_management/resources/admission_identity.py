@@ -119,8 +119,30 @@ class AdmissionVerdict:
             return None
         return available - self.candidate_outstanding_mb
 
+    def stable_reason(self) -> str:
+        """Return what the identity decided, with none of the figures it decided from.
+
+        Every measurement in :meth:`reason` moves between cycles: the free reading breathes as foreign VRAM
+        does, and the reservations decay as loads materialise. A caller that stores or compares the verdict
+        text (a coalesced defer record, a stall attribution held across a settling window, a throttle keyed on
+        the objection being unchanged) needs the block, not the arithmetic, or an unchanged refusal reads as a
+        new one every cycle and nothing can throttle or judge it. Those callers take this; the lines a person
+        reads render it alongside :meth:`reason`.
+        """
+        if not self.available_known:
+            return "no device-free reading for this card, so admission is indeterminate"
+        return (
+            "the candidate fits the measured available room"
+            if self.fits
+            else "the candidate does not fit the measured available room"
+        )
+
     def reason(self) -> str:
-        """Return the identity rendered for a log line, so a denial or unload is self-explaining."""
+        """Return the identity rendered for a log line, so a denial or unload is self-explaining.
+
+        Carries the cycle's measurements, so it belongs to a line a person reads. Anything that stores or
+        compares a verdict across cycles takes :meth:`stable_reason` instead.
+        """
         if not self.available_known:
             return (
                 "device-free reading unavailable for this card; admission deferred (no fictional fallback, "

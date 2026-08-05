@@ -493,17 +493,29 @@ class MeasuredVramSnapshot:
 
 @dataclass(frozen=True)
 class VramVerdict:
-    """The arbiter's outcome for one request: disposition, reason, and described actuations.
+    """The arbiter's outcome for one request: disposition, reason, detail, and described actuations.
 
     ``measured`` is always attached so a log line renders the full admission identity the disposition was
     reasoned from.
+
+    The reason/detail split is the same one the whole-card churn governors' holds use, and exists for the same
+    consumers. A verdict's text is not only read: it is stored as the deferral's recorded reason, coalesced on
+    for the defer line, and compared across a settling window to judge whether a recovery remedy moved the
+    block. Measured megabytes drift every cycle while the block stays exactly the same, so a text carrying
+    them makes every one of those comparisons report a change and none of them can do its job.
     """
 
     disposition: VramDisposition
     request_kind: VramRequestKind
     device_index: int | None
     reason: str
+    """What the arbiter decided and the structural facts that distinguish it from another block.
+
+    Stable while the same block persists: it never carries a measurement, a countdown, or a running total.
+    This is what every stored and compared surface takes."""
     measured: AdmissionVerdict
+    detail: str = ""
+    """This cycle's arithmetic behind :attr:`reason`, for disclosure only; empty when there is none."""
     required_actuations: tuple[ActuatorCommand, ...] = ()
     measured_attempt: bool = False
     """True when this FITS is the measured-attempt escape hatch rather than an ordinary fit: the candidate did
@@ -517,6 +529,11 @@ class VramVerdict:
     def admits(self) -> bool:
         """Whether this verdict would let the request proceed (FITS)."""
         return self.disposition is VramDisposition.FITS
+
+    @property
+    def stated(self) -> str:
+        """Return the verdict as a person should read it: the block, then the arithmetic behind it."""
+        return self.reason if not self.detail else f"{self.reason} ({self.detail})"
 
 
 def _relaxed_verdict(request: VramRequest, device_index: int | None) -> VramVerdict:
@@ -663,8 +680,9 @@ class VramArbiter:
                 disposition=VramDisposition.FITS,
                 request_kind=request.kind,
                 device_index=request.device_index,
-                reason=f"candidate already resident on the target process; no new VRAM. {measured.reason()}",
+                reason="candidate already resident on the target process; no new VRAM",
                 measured=measured,
+                detail=measured.reason(),
             )
 
         if not measured.available_known:
@@ -676,8 +694,9 @@ class VramArbiter:
                 disposition=VramDisposition.DEFER,
                 request_kind=request.kind,
                 device_index=request.device_index,
-                reason=measured.reason(),
+                reason=measured.stable_reason(),
                 measured=measured,
+                detail=measured.reason(),
             )
 
         if measured.fits:
@@ -688,8 +707,9 @@ class VramArbiter:
                 disposition=VramDisposition.FITS,
                 request_kind=request.kind,
                 device_index=request.device_index,
-                reason=measured.reason(),
+                reason=measured.stable_reason(),
                 measured=measured,
+                detail=measured.reason(),
             )
 
         # The candidate does not fit available room. If it cannot fit even an empty card, no escalation on this
@@ -707,8 +727,9 @@ class VramArbiter:
                 disposition=VramDisposition.DENY,
                 request_kind=request.kind,
                 device_index=request.device_index,
-                reason=self._impossibility_reason(request, state, measured),
+                reason=("candidate exceeds this card's achievable ceiling; no reclaim on this card can seat it"),
                 measured=measured,
+                detail=self._impossibility_detail(request, state, measured),
             )
 
         teardown_actuations = self._starvation_context_teardown(request)
@@ -719,12 +740,14 @@ class VramArbiter:
                 request_kind=request.kind,
                 device_index=request.device_index,
                 reason=(
-                    f"head starved {request.starved_seconds:.0f}s (past the "
-                    f"{_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s teardown grace) with weight reclaim exhausted and "
-                    f"idle sibling contexts holding the deficit; tearing idle contexts down. measured: "
-                    f"{measured.reason()}"
+                    "the head is starved past the teardown grace with weight reclaim exhausted and idle "
+                    "sibling contexts holding the deficit; tearing idle contexts down"
                 ),
                 measured=measured,
+                detail=(
+                    f"starved {request.starved_seconds:.0f}s against a "
+                    f"{_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s grace; {measured.reason()}"
+                ),
                 required_actuations=teardown_actuations,
             )
 
@@ -740,8 +763,9 @@ class VramArbiter:
             disposition=VramDisposition.DEFER,
             request_kind=request.kind,
             device_index=request.device_index,
-            reason=measured.reason(),
+            reason=measured.stable_reason(),
             measured=measured,
+            detail=measured.reason(),
             required_actuations=actuations,
         )
 
@@ -772,12 +796,15 @@ class VramArbiter:
             request_kind=request.kind,
             device_index=request.device_index,
             reason=(
-                f"candidate {measured.candidate_outstanding_mb:.0f} MB fits available "
-                f"{available_mb:.0f} MB, but admitting it would leave {remaining_after_admit_mb:.0f} MB, "
-                f"below the head of queue's {request.head_outstanding_mb:.0f} MB demand; held for the head. "
-                f"measured: {measured.reason()}"
+                "the candidate fits available room, but admitting it would leave less than the head of "
+                "queue's demand; held for the head"
             ),
             measured=measured,
+            detail=(
+                f"candidate {measured.candidate_outstanding_mb:.0f} MB fits available {available_mb:.0f} MB, "
+                f"but admitting it would leave {remaining_after_admit_mb:.0f} MB against the head's "
+                f"{request.head_outstanding_mb:.0f} MB demand; {measured.reason()}"
+            ),
         )
 
     def _measured_attempt(
@@ -952,10 +979,10 @@ class VramArbiter:
             device_index=request.device_index,
             reason=(
                 f"{prefix}: candidate does not fit the instantaneous reading but the card is empty and the "
-                f"demand is under the achievable ceiling; admitting one real load to let measured reality decide. "
-                f"measured: {measured.reason()}"
+                f"demand is under the achievable ceiling; admitting one real load to let measured reality decide"
             ),
             measured=measured,
+            detail=measured.reason(),
             measured_attempt=True,
         )
 
@@ -992,21 +1019,23 @@ class VramArbiter:
                 disposition=VramDisposition.FITS,
                 request_kind=request.kind,
                 device_index=request.device_index,
-                reason=(
-                    f"sampling: active {active_total_mb:.0f} + peak {peak_mb:.0f} = "
-                    f"{demand_mb:.0f} MB within headroom {headroom_mb:.0f} MB"
-                ),
+                reason="sampling demand is within the concurrent-sampling headroom",
                 measured=measured,
+                detail=(
+                    f"active {active_total_mb:.0f} + peak {peak_mb:.0f} = {demand_mb:.0f} MB within headroom "
+                    f"{headroom_mb:.0f} MB"
+                ),
             )
         return VramVerdict(
             disposition=VramDisposition.DEFER,
             request_kind=request.kind,
             device_index=request.device_index,
-            reason=(
-                f"sampling: active {state.active_sampling_peaks_total_mb:.0f} + peak {peak_mb:.0f} = "
-                f"{demand_mb:.0f} MB exceeds headroom {headroom_mb:.0f} MB"
-            ),
+            reason="sampling demand exceeds the concurrent-sampling headroom",
             measured=measured,
+            detail=(
+                f"active {state.active_sampling_peaks_total_mb:.0f} + peak {peak_mb:.0f} = {demand_mb:.0f} MB "
+                f"exceeds headroom {headroom_mb:.0f} MB"
+            ),
             required_actuations=self._escalation_ladder(state, request),
         )
 
@@ -1161,7 +1190,7 @@ class VramArbiter:
         return candidate_delta_mb > ceiling_mb
 
     @staticmethod
-    def _impossibility_reason(
+    def _impossibility_detail(
         request: VramRequest,
         state: DeviceVramState,
         measured: AdmissionVerdict,
@@ -1172,9 +1201,9 @@ class VramArbiter:
         total_mb = state.total_vram_mb or 0.0
         foreign_mb = state.foreign_floor_mb or 0.0
         return (
-            f"candidate {candidate_delta_mb:.0f} MB exceeds this card's achievable ceiling {ceiling_mb:.0f} MB "
-            f"(total {total_mb:.0f} - noise {state.noise_buffer_mb:.0f} - foreign floor {foreign_mb:.0f}); no "
-            f"reclaim on this card can seat it. measured: {measured.reason()}"
+            f"candidate {candidate_delta_mb:.0f} MB against an achievable ceiling of {ceiling_mb:.0f} MB "
+            f"(total {total_mb:.0f} - noise {state.noise_buffer_mb:.0f} - foreign floor {foreign_mb:.0f}); "
+            f"{measured.reason()}"
         )
 
     def device_state(self, device_index: int | None) -> DeviceVramState | None:

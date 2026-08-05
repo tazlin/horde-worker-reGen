@@ -108,6 +108,14 @@ _POOL_SOURCE_GLYPHS: dict[str, tuple[str, str]] = {
 """Seat-source glyphs mirroring the Insights seats table (M manual pin, R ranker fill, S rescue), so the two
 model-pool surfaces read as one feature."""
 
+_POP_CLAIM_RELEASE_TEXT: dict[str, str] = {
+    "maximum_hold": "the maximum hold elapsed",
+    "no_further_work": "the horde had no further work for it",
+    "residency_released": "the residency released",
+}
+"""How each ``WholeCardPopClaimRelease`` reads to an operator watching the offer widen back out. An unknown
+value is shown as it arrives, so a worker newer than the dashboard still says something true."""
+
 
 def _join_styled(parts: list[tuple[str, str]], separator: str) -> list[tuple[str, str] | str]:
     """Return Rich Text.assemble fragments with a plain separator between styled parts."""
@@ -776,7 +784,9 @@ class OverviewView(Vertical):
         """A hero line explaining an active whole-card residency: what is happening, why, and by how much.
 
         Reassures the operator that the disappeared inference rows and cycled safety process are a
-        deliberate response to a very heavy model, not a fault.
+        deliberate response to a very heavy model, not a fault. A standing pop claim is named with them: it
+        is why the worker has stopped being offered its other models, which otherwise reads as the horde
+        having gone quiet.
         """
         model = residency.model or "a heavy model"
         line = Text.assemble(
@@ -795,6 +805,13 @@ class OverviewView(Vertical):
                 f"; needs ~{human_mb(residency.weights_mb)} of {human_mb(residency.total_vram_mb)} for weights",
                 style="grey70",
             )
+        if residency.pop_claim_model is not None:
+            claim_window = (
+                f" for another {human_duration(residency.pop_claim_remaining_seconds)}"
+                if residency.pop_claim_remaining_seconds is not None
+                else ""
+            )
+            line.append(f"; advertising only {residency.pop_claim_model}{claim_window}", style="grey70")
         if residency.phase == "establishing":
             line.append(" (establishing…)", style="italic yellow")
         else:
@@ -877,6 +894,25 @@ class OverviewView(Vertical):
                 else "-"
             )
             grid.add_row("Max co-resident", max_resident, "Restores in", cooldown_left)
+
+        # The claim is what the worker is asking the horde for, which changes what arrives rather than only
+        # what runs, so it is shown whether or not a residency reads as active right now.
+        if residency.pop_claim_model is not None:
+            grid.add_row(
+                "Pop claim",
+                Text(residency.pop_claim_model, style="#f0beff"),
+                "Claim ends in",
+                human_duration(residency.pop_claim_remaining_seconds)
+                if residency.pop_claim_remaining_seconds is not None
+                else "-",
+            )
+        elif residency.pop_claim_release is not None:
+            grid.add_row(
+                "Pop claim",
+                Text("released", style="grey62"),
+                "Because",
+                Text(_POP_CLAIM_RELEASE_TEXT.get(residency.pop_claim_release, residency.pop_claim_release)),
+            )
 
         border = "#f0beff" if residency.active else "grey37"
         subtitle = (

@@ -37,6 +37,8 @@ from tests.analysis.test_detectors import (
     _force_admit,
     _give_up,
     _maintenance_pop,
+    _pop_claim_engaged,
+    _pop_claim_released,
     _recovery,
     _safety_lost_result,
     _safety_requeue,
@@ -279,6 +281,25 @@ CONTRACTS: dict[str, Contract] = {
             _whole_card_reserve("07:54:50.000"),
             _whole_card_reserve("07:55:45.000", model="CyberRealistic Pony"),
             _whole_card_reserve("07:57:46.000"),
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_whole_card_pop_claim_episodes": Contract(
+        bridge=_bridge(
+            _pop_claim_engaged("07:51:00.000"),
+            _pop_claim_released("07:53:00.000", release="the horde had no further work for it"),
+        ),
+        severity=Severity.INFO,
+    ),
+    "detect_whole_card_pop_claim_monopoly": Contract(
+        # Two claims each run to the cap with another model's head parked behind them.
+        bridge=_bridge(
+            _pop_claim_engaged("07:51:00.000"),
+            _dispatch_stall("07:52:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+            _pop_claim_released("07:54:00.000"),
+            _pop_claim_engaged("07:55:00.000"),
+            _dispatch_stall("07:56:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+            _pop_claim_released("07:58:00.000"),
         ),
         severity=Severity.WARNING,
     ),

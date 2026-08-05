@@ -663,6 +663,27 @@ def _whole_card_reserve(ts: str, *, model: str = "AlbedoBase XL (SDXL)") -> str:
     )
 
 
+_FLUX = "Flux.1-Schnell fp8 (Compact)"
+"""The heavy model used as the whole-card residency's claimant in the pop-claim fixtures."""
+
+
+def _pop_claim_engaged(ts: str, *, model: str = _FLUX, max_hold: int = 180) -> str:
+    """inference_scheduler._disclose_pop_claim_edge: a residency taking the worker's pop offer."""
+    return (
+        f"2026-06-25 {ts} | INFO | horde_worker_regen.process_management.scheduling.inference_scheduler:_disclose_pop_claim_edge:3012 - "
+        f"Whole-card pop claim engaged for {model}: advertising that model alone while it holds the card, for "
+        f"at most {max_hold}s."
+    )
+
+
+def _pop_claim_released(ts: str, *, model: str = _FLUX, release: str = "the maximum hold elapsed") -> str:
+    """inference_scheduler._disclose_pop_claim_edge: the claim ending, naming which of its ends fired."""
+    return (
+        f"2026-06-25 {ts} | INFO | horde_worker_regen.process_management.scheduling.inference_scheduler:_disclose_pop_claim_edge:3027 - "
+        f"Whole-card pop claim released for {model}: {release}; advertising the full pool again."
+    )
+
+
 _DISPATCH_GATE_REASON = (
     "its model is resident and idle on process 1, but the concurrency cap is reached (in_progress=1, cap=1)"
 )
@@ -871,6 +892,88 @@ class TestWholeCardResidencyChurn:
         """One deliberate reservation is normal and must not fire (only sustained cycling does)."""
         findings = _diagnose(tmp_path, self._bridge(_whole_card_reserve("07:54:50.000")))
         assert "whole_card_residency_churn" not in findings
+
+
+class TestWholeCardPopClaim:
+    """The claim's engage/release edges: the episodes, and a cap-ended claim squeezing a mixed queue."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        """A single-session bridge log opened by the startup boundary."""
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_episodes_are_summarised_with_their_ends(self, tmp_path: Path) -> None:
+        """The informational rollup names the claimed model, how long it held, and how the claim ended."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _pop_claim_engaged("07:51:00.000"),
+                _pop_claim_released("07:53:00.000", release="the horde had no further work for it"),
+            ),
+        )
+        finding = findings["whole_card_pop_claim_episodes"]
+        assert finding.severity is Severity.INFO
+        assert _FLUX in finding.verdict
+        assert "no further work" in finding.verdict
+        assert "120s" in finding.verdict
+
+    def test_a_claim_still_standing_at_the_end_is_reported(self, tmp_path: Path) -> None:
+        """A session that ended inside a claim still says the offer was narrowed and by what."""
+        findings = _diagnose(tmp_path, self._bridge(_pop_claim_engaged("07:51:00.000")))
+        assert "still standing" in findings["whole_card_pop_claim_episodes"].verdict
+
+    def test_no_claim_lines_report_nothing(self, tmp_path: Path) -> None:
+        """A worker whose residencies never claim the offer produces no episode finding at all."""
+        findings = _diagnose(tmp_path, self._bridge(_whole_card_reserve("07:54:50.000")))
+        assert "whole_card_pop_claim_episodes" not in findings
+
+    def test_repeated_cap_ends_with_foreign_heads_parked_is_a_warning(self, tmp_path: Path) -> None:
+        """Claims run to their cap while another model's head waits: the monopoly squeezing a mixed queue."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _pop_claim_engaged("07:51:00.000"),
+                _dispatch_stall("07:52:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+                _pop_claim_released("07:54:00.000", release="the maximum hold elapsed"),
+                _pop_claim_engaged("07:55:00.000"),
+                _dispatch_stall("07:56:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+                _pop_claim_released("07:58:00.000", release="the maximum hold elapsed"),
+            ),
+        )
+        finding = findings["whole_card_pop_claim_monopoly"]
+        assert finding.severity is Severity.WARNING
+        assert "Juggernaut XL" in finding.verdict
+        assert finding.see_also == "whole_card_pop_claim_episodes"
+
+    def test_cap_ends_with_nothing_else_queued_are_not_a_monopoly(self, tmp_path: Path) -> None:
+        """A worker serving only the claimed model rides its cap without squeezing anything."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _pop_claim_engaged("07:51:00.000"),
+                _pop_claim_released("07:54:00.000", release="the maximum hold elapsed"),
+                _pop_claim_engaged("07:55:00.000"),
+                _pop_claim_released("07:58:00.000", release="the maximum hold elapsed"),
+            ),
+        )
+        assert "whole_card_pop_claim_monopoly" not in findings
+
+    def test_claims_that_release_themselves_are_not_a_monopoly(self, tmp_path: Path) -> None:
+        """Ending on the empty-pop evidence is the claim giving the intake back on its own."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _pop_claim_engaged("07:51:00.000"),
+                _dispatch_stall("07:52:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+                _pop_claim_released("07:54:00.000", release="the horde had no further work for it"),
+                _pop_claim_engaged("07:55:00.000"),
+                _dispatch_stall("07:56:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+                _pop_claim_released("07:58:00.000", release="the residency released"),
+            ),
+        )
+        assert "whole_card_pop_claim_monopoly" not in findings
 
 
 class TestHeadDispatchStall:

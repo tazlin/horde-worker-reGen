@@ -8,15 +8,15 @@ The completeness check is deliberately structural rather than a source grep. Eve
 holding at names itself on one of a small number of enumerable runtime surfaces: the preload pass's
 ``AdmissionDecision``, the pop coroutine's ``PopGate`` stamp, the whole-card churn governors, the dispatch
 attribution buckets, the service-lane ``PauseOwner``, the self-throttle ``PopPauseOwner``, and
-``RecoveryParkReason``. Each of those is a closed ``StrEnum`` in production code, so a new gate has to take a
-member, and a member without a registry entry fails here. A heuristic that scanned for defer-shaped branches
-would miss the ones spelled differently and flag the ones that are not gates; enumerating the surfaces the
-gates already have to use cannot.
+``RecoveryParkReason``, and the scheduler-side ``SchedulerBudget``. Each of those is a closed ``StrEnum`` in
+production code, so a new gate has to take a member, and a member without a registry entry fails here. A
+heuristic that scanned for defer-shaped branches would miss the ones spelled differently and flag the ones
+that are not gates; enumerating the surfaces the gates already have to use cannot.
 
-The residual gap is stated rather than papered over: ``SCHEDULER_BUDGET`` carries the gates that hold work
-without stamping a name on any enumerable surface (the affinity line-skip window, the whole-card minimum
-hold). Those are hand-listed, and nothing here can detect a further one. Closing that gap means giving those
-budgets a named runtime stamp of their own.
+The scheduler budgets are the surface that had to be built rather than found: the affinity line-skip window
+and the whole-card minimum hold hold work on a clock without returning any admission verdict, so each stamps
+its ``SchedulerBudget`` member on the line disclosing its engagement. A third budget therefore has to take a
+member, which brings it here.
 """
 
 from __future__ import annotations
@@ -37,14 +37,21 @@ from horde_worker_regen.process_management.liveness.gate_registry import (
     entry_for,
     registered_keys,
 )
-from horde_worker_regen.process_management.scheduling.dispatch_affinity import _AFFINITY_BUDGET_MAX_SECONDS
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
+    _AFFINITY_BUDGET_MAX_SECONDS,
+    AffinitySkipState,
+    affinity_skip_disclosure,
+    record_affinity_skip,
+)
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
     _MIN_HOLD_SECONDS,
     WholeCardGovernor,
+    WholeCardResidencyLedger,
 )
+from horde_worker_regen.process_management.scheduling.scheduler_budget import SchedulerBudget
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 
 _HOLDS: tuple[GateEntry, ...] = tuple(entry for entry in GATE_REGISTRY if entry.kind is GateKind.HOLD)
@@ -69,6 +76,7 @@ def _surface_members() -> list[tuple[GateSurface, frozenset[str]]]:
         (GateSurface.LANE_PAUSE, frozenset(member.value for member in PauseOwner)),
         (GateSurface.POP_PAUSE, frozenset(member.value for member in PopPauseOwner)),
         (GateSurface.RECOVERY_PARK, frozenset(member.value for member in RecoveryParkReason)),
+        (GateSurface.SCHEDULER_BUDGET, frozenset(member.value for member in SchedulerBudget)),
     ]
 
 
@@ -107,13 +115,12 @@ class TestEveryGateIsRegistered:
         orphaned = sorted(registered_keys(surface) - runtime_keys)
         assert not orphaned, f"{surface.value} registry entries whose key no longer exists in production: {orphaned}."
 
-    def test_every_surface_is_either_enumerated_or_declared_unenumerable(self) -> None:
-        """The completeness guarantee covers every surface except the one documented as hand-listed."""
+    def test_every_surface_is_enumerated(self) -> None:
+        """The completeness guarantee covers every surface: none is hand-listed and so unprotected."""
         enumerated = {surface for surface, _keys in _surface_members()}
-        unenumerated = set(GateSurface) - enumerated
-        assert unenumerated == {GateSurface.SCHEDULER_BUDGET}, (
-            "a new gate surface must either be enumerated here (so the guardrail covers it) or be a "
-            "deliberate hand-listed exception this test names."
+        assert set(GateSurface) - enumerated == set(), (
+            "a new gate surface must be enumerated here, against the closed runtime set its keys come from, "
+            "or the guardrail cannot tell when a gate ships without a declared release path."
         )
 
     def test_keys_are_unique_within_a_surface(self) -> None:
@@ -162,6 +169,39 @@ class TestEveryHoldDeclaresAReleasePath:
             f"{entry.surface.value}.{entry.key} is registered as an outcome but does not state why it cannot "
             "hold work; if it can, register it as a hold with a release path."
         )
+
+
+class TestEachSchedulerBudgetStampsItsMember:
+    """The budgets are only enumerable because each puts its member where a reader can see it.
+
+    Every other surface is a decision the code already had to name; these two hold work on a clock and would
+    otherwise stamp nothing. If a disclosure stops carrying its member, the enumeration above still passes
+    while the runtime surface it claims to describe has gone, so the stamps are pinned here.
+    """
+
+    def test_the_line_skip_disclosure_names_its_budget(self) -> None:
+        """The committed-skip line attributes the head's spent queue position to the line-skip budget."""
+        state = record_affinity_skip(AffinitySkipState(), "head", 100.0)
+        disclosure = affinity_skip_disclosure(state, now=110.0, budget_seconds=45.0, max_skips=6)
+        assert SchedulerBudget.AFFINITY_LINE_SKIP.value in disclosure
+        assert "1/6" in disclosure, "the count bound is half of what ends the bypass"
+        assert "35s" in disclosure, "the wall-clock bound is the other half"
+
+    def test_the_min_hold_disclosure_names_its_budget_only_while_it_holds(self) -> None:
+        """The floor speaks while it is in force and says nothing once it has lapsed."""
+        ledger = WholeCardResidencyLedger()
+        ledger.record_grant(
+            None,
+            model="heavy",
+            forecast=None,
+            cooldown_until=0.0,
+            now=0.0,
+        )
+        disclosure = ledger.min_hold_disclosure(None, now=_MIN_HOLD_SECONDS - 1.0)
+        assert disclosure is not None
+        assert SchedulerBudget.WHOLE_CARD_MIN_HOLD.value in disclosure
+        assert "heavy" in disclosure
+        assert ledger.min_hold_disclosure(None, now=_MIN_HOLD_SECONDS) is None
 
 
 class TestDeclaredBoundsMatchTheProductionConstants:

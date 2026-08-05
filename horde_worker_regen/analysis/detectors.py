@@ -129,6 +129,19 @@ _WHOLE_CARD_ESTABLISH_RE = re.compile(r"Whole-card residency: reserving the devi
 # model on a host with no measured per-context cost). Surfaced as the positive counterpart: it confirms the
 # trust gate is actively preventing reservation churn rather than the churn simply being absent.
 _WHOLE_CARD_DECLINED_RE = re.compile(r"Declined a whole-card residency for")
+# A whole-card residency claiming the worker's pop offer: while the claim stands the worker advertises only
+# the resident model, so nothing else can arrive. The claim is invisible in the job stream (it changes what
+# the horde is asked for, not what the worker does with what arrives), so the edges are the only record of it.
+# Both phrases are the scheduler's verbatim engage/release disclosures.
+_POP_CLAIM_ENGAGED_RE = re.compile(r"Whole-card pop claim engaged for (?P<model>.+?): advertising that model alone")
+_POP_CLAIM_RELEASED_RE = re.compile(
+    r"Whole-card pop claim released for (?P<model>.+?): (?P<release>[^;]+); advertising the full pool again",
+)
+_POP_CLAIM_CAP_RELEASE = "the maximum hold elapsed"
+"""The release phrase for the maximum hold: the claim outlasted its window rather than ending on its own.
+
+The other two ends are self-correcting (the demand dried up, or the residency let go), so only this one says
+the claim was still narrowing the offer when the cap had to stop it."""
 
 # The stuck-step watchdog reaping a slot whose ComfyUI generation looped on one sampling step. The slot
 # kept heart-beating (so the silence watchdog stayed blind), which is exactly why this needs its own
@@ -181,6 +194,11 @@ _SLOW_ABORT_SPIRAL_THRESHOLD = 3
 # A whole-card residency established at or above this many times in a session is reservation churn (the
 # process pool repeatedly torn down and rebuilt, safety cycled off/on the GPU), not a single deliberate hold.
 _WHOLE_CARD_CHURN_THRESHOLD = 3
+
+# Claims that had to be ended by the maximum hold, with other models' heads parked behind them, at or above
+# this count is a pattern rather than one long burst: the resident model is repeatedly holding the offer for
+# its full window while the queue carries work it will not let in.
+_POP_CLAIM_CAP_MONOPOLY_THRESHOLD = 2
 
 # A pool that flapped through at least this many soft resets is "stuck recovering", not a one-off blip.
 _SOFT_RESET_FLAP_THRESHOLD = 2
@@ -1433,6 +1451,189 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
     ]
 
 
+@dataclass(frozen=True)
+class _PopClaimEpisode:
+    """One span during which a whole-card residency held the worker's pop offer to a single model."""
+
+    model: str
+    engaged: LogRecord
+    released: LogRecord | None
+    release: str | None
+    """The phrase naming which of the claim's ends fired, or None for a claim still standing at the end."""
+
+    @property
+    def seconds(self) -> float | None:
+        """How long the claim stood, or None when either edge carried no timestamp."""
+        start = self.engaged.timestamp
+        end = self.released.timestamp if self.released is not None else None
+        if start is None or end is None:
+            return None
+        return max(0.0, (end - start).total_seconds())
+
+
+def _pop_claim_episodes(records: list[LogRecord]) -> list[_PopClaimEpisode]:
+    """Pair the pop claim's engage and release disclosures into episodes, in order.
+
+    Both edges are stated once per episode, so pairing each engage with the next release reconstructs the
+    spans. A claim still standing at the last record is kept with no release: an episode the session ended
+    inside is exactly the one an operator asking why the offer is narrow wants to see.
+    """
+    episodes: list[_PopClaimEpisode] = []
+    open_engaged: LogRecord | None = None
+    open_model = ""
+    for record in records:
+        engaged = _POP_CLAIM_ENGAGED_RE.search(record.message)
+        if engaged is not None:
+            open_engaged = record
+            open_model = engaged.group("model")
+            continue
+        released = _POP_CLAIM_RELEASED_RE.search(record.message)
+        if released is None or open_engaged is None:
+            continue
+        episodes.append(
+            _PopClaimEpisode(
+                model=open_model or released.group("model"),
+                engaged=open_engaged,
+                released=record,
+                release=released.group("release").strip(),
+            ),
+        )
+        open_engaged = None
+        open_model = ""
+    if open_engaged is not None:
+        episodes.append(_PopClaimEpisode(model=open_model, engaged=open_engaged, released=None, release=None))
+    return episodes
+
+
+def _foreign_heads_parked_during(records: list[LogRecord], episode: _PopClaimEpisode) -> dict[str, int]:
+    """Return how often each other model's head was parked while ``episode``'s claim stood.
+
+    A parked head for a model the claim does not advertise is work the worker already accepted and cannot
+    make progress on, sitting behind an offer that will not let its model's siblings in. Counted per model so
+    the finding can say which work the claim was squeezing. Empty when the episode's edges are untimestamped,
+    since nothing can then be placed inside it.
+    """
+    end = episode.released.timestamp if episode.released is not None else None
+    parked: dict[str, int] = {}
+    for record in _records_in_window(records, episode.engaged.timestamp, end):
+        fields = _DISPATCH_STALL_FIELDS_RE.search(record.message)
+        if fields is None or fields.group("model") == episode.model:
+            continue
+        parked[fields.group("model")] = parked.get(fields.group("model"), 0) + 1
+    return parked
+
+
+def detect_whole_card_pop_claim_episodes(context: SessionContext) -> list[Finding]:
+    """The spans in which a whole-card residency held the pop offer to its own model.
+
+    A claim changes what the worker asks the horde for, not what it does with what arrives, so it leaves no
+    trace in the job stream: a session where one model served everything looks the same whether that was the
+    demand or the claim. Reporting the episodes makes the difference visible, and the release reasons say how
+    each one ended, which is what distinguishes a burst that finished (the demand dried up) from one the
+    maximum hold had to stop.
+    """
+    episodes = _pop_claim_episodes(context.session.records)
+    if not episodes:
+        return []
+
+    per_model: dict[str, int] = {}
+    per_release: dict[str, int] = {}
+    durations: list[float] = []
+    for episode in episodes:
+        per_model[episode.model] = per_model.get(episode.model, 0) + 1
+        per_release[episode.release or "still standing at the end of the session"] = (
+            per_release.get(episode.release or "still standing at the end of the session", 0) + 1
+        )
+        seconds = episode.seconds
+        if seconds is not None:
+            durations.append(seconds)
+
+    model_breakdown = ", ".join(
+        f"{model} x{count}" for model, count in sorted(per_model.items(), key=lambda kv: -kv[1])
+    )
+    release_breakdown = ", ".join(
+        f"{release} x{count}" for release, count in sorted(per_release.items(), key=lambda kv: -kv[1])
+    )
+    held_text = (
+        f" They held the offer for {sum(durations):.0f}s in total (longest {max(durations):.0f}s)."
+        if durations
+        else ""
+    )
+    return [
+        Finding(
+            id="whole_card_pop_claim_episodes",
+            severity=Severity.INFO,
+            title="Whole-card residency claimed the pop offer",
+            verdict=(
+                f"A whole-card residency narrowed the worker's advertised model set to its own model "
+                f"{len(episodes)} time(s) this session. Per model: {model_breakdown}. How each ended: "
+                f"{release_breakdown}.{held_text} While a claim stands the horde is only asked for that model, "
+                "which is what keeps the resident weights on the card."
+            ),
+            remediation=(
+                "Nothing to do if the claims match the heavy work this worker exists to serve. If they are "
+                "long and frequent for a model the operator did not intend to specialise in, the levers are "
+                "the served model set and whole_card_residency_max_hold_seconds, which caps how long one "
+                "residency may own the intake."
+            ),
+            evidence=[_evidence(episode.engaged) for episode in episodes[:3]],
+            see_also="whole_card_pop_claim_monopoly",
+        ),
+    ]
+
+
+def detect_whole_card_pop_claim_monopoly(context: SessionContext) -> list[Finding]:
+    """Claims repeatedly ended by the maximum hold while other models' heads were parked behind them.
+
+    The claim's self-correcting end is the run of empty pops: when the resident model's demand dries up the
+    claim releases itself. A claim that instead runs to the cap was still narrowing the offer when the cap
+    stopped it, and doing that repeatedly while heads of other models sit parked is a mixed queue being
+    squeezed: the accepted work cannot progress and the offer will not admit anything that would relieve it.
+    One such episode is a legitimately long burst; a pattern of them is the residency outstaying the demand
+    that justified it.
+    """
+    episodes = _pop_claim_episodes(context.session.records)
+    squeezing = [
+        (episode, _foreign_heads_parked_during(context.session.records, episode))
+        for episode in episodes
+        if episode.release == _POP_CLAIM_CAP_RELEASE
+    ]
+    squeezing = [(episode, parked) for episode, parked in squeezing if parked]
+    if len(squeezing) < _POP_CLAIM_CAP_MONOPOLY_THRESHOLD:
+        return []
+
+    starved: dict[str, int] = {}
+    for _episode, parked in squeezing:
+        for model, count in parked.items():
+            starved[model] = starved.get(model, 0) + count
+    starved_breakdown = ", ".join(
+        f"{model} x{count}" for model, count in sorted(starved.items(), key=lambda kv: -kv[1])
+    )
+    claimants = sorted({episode.model for episode, _parked in squeezing})
+    return [
+        Finding(
+            id="whole_card_pop_claim_monopoly",
+            severity=Severity.WARNING,
+            title="Whole-card pop claim held to its cap while other models' work waited",
+            verdict=(
+                f"{len(squeezing)} pop claim(s) ran to the maximum hold rather than releasing on their own, and "
+                f"each did so with another model's head parked behind it. Claimed by: {', '.join(claimants)}. "
+                f"Heads parked meanwhile: {starved_breakdown}. A claim that has to be ended by its cap was still "
+                "asking the horde for one model only while the queue held work it would not admit, so accepted "
+                "jobs aged behind a narrowed offer."
+            ),
+            remediation=(
+                "Decide whether this worker should specialise. If it should, the parked models do not belong in "
+                "its served set and removing them ends the contention. If it should serve a mix, lower "
+                "whole_card_residency_max_hold_seconds so a residency gives the intake back sooner, or take the "
+                "claimed model out of the pool if it can only run with the whole card."
+            ),
+            evidence=[_evidence(episode.engaged) for episode, _parked in squeezing[:3]],
+            see_also="whole_card_pop_claim_episodes",
+        ),
+    ]
+
+
 def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     """A head-of-queue job that did not dispatch despite pending work and an idle, model-resident process.
 
@@ -1687,6 +1888,8 @@ DETECTORS: list[Detector] = [
     detect_whole_card_convergence_wedge,
     detect_whole_card_nonhead_residency_starvation,
     detect_whole_card_residency_churn,
+    detect_whole_card_pop_claim_monopoly,
+    detect_whole_card_pop_claim_episodes,
     detect_head_dispatch_stall,
     detect_residency_reconciliation_holds,
     detect_consecutive_failure_pause,

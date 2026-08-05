@@ -12,6 +12,11 @@ is reached the bypass stops and dispatch falls back to making room for the head,
 position. The bound is unconditional: there is no path that raises it to infinity. A ``max_skips`` of 0 is a
 full off-switch (no affinity skips at all).
 
+The budget is one of the two members of :class:`SchedulerBudget`, and
+:func:`affinity_skip_disclosure` is where that member reaches a reader: the bypass holds the head without
+returning any admission verdict, so the disclosure is the only runtime surface that names which budget is
+spending the head's queue position.
+
 Pure and table-testable; no scheduler/process imports. The scheduler owns the mutable ``AffinitySkipState``
 and advances it only on committed dispatch.
 """
@@ -19,6 +24,8 @@ and advances it only on committed dispatch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from horde_worker_regen.process_management.scheduling.scheduler_budget import SchedulerBudget
 
 _AFFINITY_MAX_SKIPS = 6
 """The hard ceiling on how many times one head may be passed by affinity line-skips before it reclaims."""
@@ -123,4 +130,33 @@ def record_affinity_skip(state: AffinitySkipState, head_job_id: str, now: float)
         head_job_id=head_job_id,
         first_skip_time=state.first_skip_time,
         skip_count=state.skip_count + 1,
+    )
+
+
+def affinity_skip_disclosure(
+    state: AffinitySkipState,
+    *,
+    now: float,
+    budget_seconds: float,
+    max_skips: int,
+) -> str:
+    """Return what the budget has spent on the tracked head, stamped with its enumerable name.
+
+    Both bounds are reported because either alone ends the bypass, and the stamp names the budget doing the
+    holding: a reader who sees a head being passed can otherwise only infer which rule is spending its queue
+    position. Purely observed quantities, so this belongs to a formatted line and never to a compared reason.
+
+    Args:
+        state: The current skip window (its counters are what is reported).
+        now: The current wall-clock time in seconds.
+        budget_seconds: The wall-clock bypass budget from :func:`affinity_budget_seconds`.
+        max_skips: The hard skip ceiling the count is measured against.
+
+    Returns:
+        The budget member, the committed skips against the ceiling, and the wall-clock window left.
+    """
+    remaining_seconds = max(0.0, budget_seconds - (now - state.first_skip_time))
+    return (
+        f"{SchedulerBudget.AFFINITY_LINE_SKIP.value} {state.skip_count}/{max_skips}, "
+        f"remaining budget {remaining_seconds:.0f}s"
     )

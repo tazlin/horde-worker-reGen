@@ -31,6 +31,12 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     forecast_weight_streaming,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    _POP_CLAIM_EMPTY_POP_RUN,
+    _POP_CLAIM_EMPTY_POP_WINDOW_SECONDS,
+    WholeCardPopClaimRelease,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _SAFETY_GPU_LOAD_CHARGE_MB,
     InferenceScheduler,
@@ -662,6 +668,51 @@ class TestWholeCardResidencyState:
         assert state.free_if_alone_mb == 15087.0
         assert state.cooldown_remaining_seconds is not None
         assert state.cooldown_remaining_seconds > 0
+
+    def test_active_state_reports_the_standing_pop_claim(self) -> None:
+        """A held residency that claims the offer says which model it is advertising, and for how long."""
+        scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_established_at = time.time()
+
+        state = scheduler.whole_card_residency_state()
+
+        max_hold = scheduler._runtime_config.bridge_data.whole_card_residency_max_hold_seconds
+        assert state.pop_claim_model == _FLUX_MODEL
+        assert state.pop_claim_remaining_seconds is not None
+        assert 0 < state.pop_claim_remaining_seconds <= max_hold
+        assert state.pop_claim_release is None, "a standing claim has not ended, so nothing explains its end"
+
+    def test_a_released_claim_reports_why_the_offer_widened(self) -> None:
+        """Once the claim ends the snapshot carries which of its ends fired, so the widening is explained."""
+        scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_established_at = time.time()
+        # Disclose the standing claim, then let the empty-pop evidence end it: the run has to both reach its
+        # count and cover its span, so the pops are spread over the window the ledger requires.
+        scheduler._disclose_pop_claim_edge()
+        for _ in range(_POP_CLAIM_EMPTY_POP_RUN):
+            scheduler.note_whole_card_pop_outcome(served=False)
+        state = scheduler._whole_card_ledger.state_for(None)
+        state.pop_claim_empty_pop_since -= _POP_CLAIM_EMPTY_POP_WINDOW_SECONDS + 1.0
+        scheduler.note_whole_card_pop_outcome(served=False)
+        scheduler._disclose_pop_claim_edge()
+
+        snapshot = scheduler.whole_card_residency_state()
+
+        assert snapshot.pop_claim_model is None
+        assert snapshot.pop_claim_remaining_seconds is None
+        assert snapshot.pop_claim_release == WholeCardPopClaimRelease.NO_FURTHER_WORK.value
+
+    def test_a_stale_release_stops_explaining_the_current_offer(self) -> None:
+        """Past its visibility window the reason is dropped: an unclaimed offer is then the ordinary state."""
+        scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
+        scheduler._pop_claim_release = (
+            WholeCardPopClaimRelease.MAXIMUM_HOLD,
+            time.time() - (_sched_mod._POP_CLAIM_RELEASE_VISIBLE_SECONDS + 1.0),
+        )
+
+        assert scheduler.whole_card_residency_state().pop_claim_release is None
 
     def test_phase_holding_after_establish_grace(self) -> None:
         """Once the establish grace elapses, an active residency reads as holding (serving), not establishing."""

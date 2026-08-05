@@ -786,6 +786,48 @@ def test_residency_panel_shows_forecast_numbers_when_active() -> None:
     assert "Restores in" in text
 
 
+def test_residency_panel_shows_a_standing_pop_claim() -> None:
+    """A claim narrows what the worker asks for, so the panel names the model and when the claim ends."""
+    text = _render(
+        OverviewView._render_residency_panel(
+            _active_residency(pop_claim_model="Flux.1-dev", pop_claim_remaining_seconds=95.0),
+        ),
+    )
+
+    assert "Pop claim" in text
+    assert "Claim ends in" in text
+
+
+def test_residency_panel_explains_a_recently_released_claim() -> None:
+    """With the claim gone the panel says which of its ends fired, so the widened offer is not a mystery."""
+    text = _render(
+        OverviewView._render_residency_panel(
+            _active_residency(active=False, model=None, pop_claim_release="no_further_work"),
+        ),
+    )
+
+    assert "released" in text
+    assert "no further work" in text
+
+
+def test_hero_banner_names_the_model_the_claim_advertises() -> None:
+    """The hero line explains the narrowed offer alongside the paused processes it already explains."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_flux_holder_process()],
+        worker_registered=True,
+        whole_card_residency=_active_residency(
+            pop_claim_model="Flux.1-dev",
+            pop_claim_remaining_seconds=95.0,
+        ),
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "advertising only Flux.1-dev" in hero
+
+
 def test_residency_panel_armed_when_only_possible() -> None:
     """When the feature can engage but is not active, the panel shows the armed posture, not live rows."""
     text = _render(

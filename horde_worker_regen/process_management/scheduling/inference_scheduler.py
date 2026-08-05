@@ -124,6 +124,7 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     AffinitySkipState,
     affinity_budget_seconds,
     affinity_skip_allowed,
+    affinity_skip_disclosure,
     record_affinity_skip,
 )
 from horde_worker_regen.process_management.scheduling.governance import (
@@ -150,6 +151,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     StopTrackingWorkerShed,
     WholeCardGovernor,
     WholeCardPopClaim,
+    WholeCardPopClaimRelease,
     WholeCardResidency,
     WholeCardResidencyMachine,
     WorkerProcessShedState,
@@ -453,6 +455,13 @@ on-GPU, each a ~20s spawn during which the queue is briefly unservable. Without 
 looks like a structural wedge and soft-resets the pools, which then cascades into further whole-card
 churn and more resets. Covers the respawn window; bounded so a genuine post-restore wedge still trips
 the supervisor."""
+
+_POP_CLAIM_RELEASE_VISIBLE_SECONDS = 120.0
+"""How long a released pop claim's end is still reported alongside the residency posture.
+
+The reason answers "why is the full pool being advertised again", which is only a live question while the
+widening is what the operator is looking at. Long enough to cover the restore churn that usually follows a
+release, short enough that a stale reason never sits beside an offer nothing has claimed for minutes."""
 
 _HEAVY_HEAD_LOAD_GRACE_SECONDS = 120.0
 """How long after a heavy head is admitted on the over-budget classification path (for example under
@@ -1047,9 +1056,16 @@ class InferenceScheduler:
         # Whether the empty-pop evidence ended the standing claim, so the release line names that reason
         # rather than the cap. Consumed by the disclosure that reports the release.
         self._pop_claim_empty_release_pending: bool = False
+        # How the last standing claim ended and when, so the status snapshot can still say why the offer
+        # widened back out after the disclosure line has scrolled. None before any claim has been released.
+        self._pop_claim_release: tuple[WholeCardPopClaimRelease, float] | None = None
         # Edge-trigger latch for the disclosure that a residency on this multi-card host does not claim the
         # worker-wide offer, so its absence reads as deliberate rather than as the feature failing.
         self._pop_claim_multi_gpu_disclosed: bool = False
+        # Per-card edge-trigger latch for the whole-card minimum hold's disclosure: the residency model whose
+        # floor was last reported as holding a ready different-model head off that card. Cleared when the
+        # residency restores, so each episode's floor is stated once.
+        self._min_hold_disclosed: dict[int | None, str | None] = {}
         # When an idle inference slot was last deliberately cycled to reclaim allocator-retained RAM
         # (_replace_stale_ram_unload_process). The respawn + the next head's preload leave the queue
         # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
@@ -3000,7 +3016,8 @@ class InferenceScheduler:
         Edge-triggered against the claim last surfaced, so a claim held across many ticks is stated once and
         a released one is stated once. The release names which of the claim's ends fired, since the remedies
         differ: a cap expiry says the burst outlasted its window, an empty-pop release says the demand went
-        away, and neither reads the same as the residency simply finishing its work.
+        away, and neither reads the same as the residency simply finishing its work. The same end is retained
+        for the status snapshot, which is asked about the offer widening back out after the line has scrolled.
         """
         claim = self.whole_card_pop_claim()
         previous = self._pop_claim_disclosed
@@ -3009,6 +3026,7 @@ class InferenceScheduler:
                 return
             self._pop_claim_disclosed = claim
             self._pop_claim_empty_release_pending = False
+            self._pop_claim_release = None
             logger.info(
                 f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
                 f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.",
@@ -3018,13 +3036,32 @@ class InferenceScheduler:
             return
         self._pop_claim_disclosed = None
         if self._pop_claim_empty_release_pending:
+            release = WholeCardPopClaimRelease.NO_FURTHER_WORK
             reason = "the horde had no further work for it"
         elif self._clock() >= previous.expires_at:
+            release = WholeCardPopClaimRelease.MAXIMUM_HOLD
             reason = "the maximum hold elapsed"
         else:
+            release = WholeCardPopClaimRelease.RESIDENCY_RELEASED
             reason = "the residency released"
         self._pop_claim_empty_release_pending = False
+        self._pop_claim_release = (release, self._clock())
         logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
+
+    def _recent_pop_claim_release(self, now: float) -> WholeCardPopClaimRelease | None:
+        """Return why the last claim ended while that still explains the offer, else None.
+
+        The release is only an answer to "why is the full pool being advertised again" for as long as the
+        question is being asked about this release; past
+        :data:`_POP_CLAIM_RELEASE_VISIBLE_SECONDS` an unclaimed offer is just the ordinary state and a stale
+        reason beside it would read as a claim that had only just ended.
+        """
+        if self._pop_claim_release is None:
+            return None
+        release, released_at = self._pop_claim_release
+        if (now - released_at) >= _POP_CLAIM_RELEASE_VISIBLE_SECONDS:
+            return None
+        return release
 
     def whole_card_residency_grace_active(self) -> bool:
         """Whether a whole-card residency is establishing, so the held queue is intentional (not a wedge).
@@ -3096,7 +3133,8 @@ class InferenceScheduler:
         tear-down-able: more than one inference process, or a safety process that can be moved off-GPU);
         it powers the operator heads-up so a teardown is not a surprise. The remaining fields describe a
         residency that is currently held (its model, the establish/hold phase, the reduced process count,
-        the safety-pause state, and the establishing forecast's hard numbers for the detailed view).
+        the safety-pause state, the establishing forecast's hard numbers for the detailed view, and the claim
+        it holds over the pop offer or the reason its last claim ended).
         Tolerant of partially-mocked config (used in tests that build snapshots): config flags are read
         with boolean coercion so a non-bool never leaks a truthy Mock into ``possible``.
         """
@@ -3139,6 +3177,11 @@ class InferenceScheduler:
             forecast.total_vram_mb if forecast is not None else self._process_map.get_reported_total_vram_mb()
         )
 
+        # The claim is a separate fact from the residency: a card can hold a model without narrowing the
+        # offer to it, and the offer is what an operator watching models come and go actually sees change.
+        pop_claim = self.whole_card_pop_claim()
+        pop_claim_release = self._recent_pop_claim_release(now) if pop_claim is None else None
+
         return WholeCardResidencyState(
             possible=possible,
             enabled=enabled,
@@ -3154,6 +3197,9 @@ class InferenceScheduler:
             processes_target=processes_target,
             processes_max=self._max_inference_processes,
             cooldown_remaining_seconds=cooldown_remaining,
+            pop_claim_model=pop_claim.model if pop_claim is not None else None,
+            pop_claim_remaining_seconds=max(0.0, pop_claim.expires_at - now) if pop_claim is not None else None,
+            pop_claim_release=pop_claim_release.value if pop_claim_release is not None else None,
             weights_mb=weights_mb,
             reserve_mb=reserve_mb,
             free_now_mb=free_now_mb,
@@ -3214,10 +3260,18 @@ class InferenceScheduler:
             # A ready head for a different model may cut the cooldown short, but not before the residency has
             # held long enough to amortize the teardown and the regrowth the release itself will pay for;
             # otherwise a queue alternating heavy and light heads rebuilds the pool on every job.
-            preempt_cooldown = self._ready_different_model_head_on_device(
+            ready_different_model_head = self._ready_different_model_head_on_device(
                 residency_model=model,
                 device_index=device_index,
-            ) and not self._whole_card_ledger.min_hold_active(device_index, now=now)
+            )
+            min_hold_disclosure = (
+                self._whole_card_ledger.min_hold_disclosure(device_index, now=now)
+                if ready_different_model_head
+                else None
+            )
+            if min_hold_disclosure is not None:
+                self._disclose_whole_card_min_hold(device_index, model, min_hold_disclosure)
+            preempt_cooldown = ready_different_model_head and min_hold_disclosure is None
             if self._clock() < state.cooldown_until and not preempt_cooldown and not retention_ended:
                 # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
                 continue
@@ -3231,6 +3285,7 @@ class InferenceScheduler:
                 now=granted_at,
                 restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
             )
+            self._min_hold_disclosed.pop(device_index, None)
             if self._reclaim_ladder is not None:
                 self._reclaim_ladder.discharge_context_reduction(device_index)
             post_process_restored = (
@@ -3274,6 +3329,24 @@ class InferenceScheduler:
                 model,
             )
         self._disclose_pop_claim_edge()
+
+    def _disclose_whole_card_min_hold(
+        self,
+        device_index: int | None,
+        model: str | None,
+        disclosure: str,
+    ) -> None:
+        """State once per residency episode that the minimum hold is what kept a ready head off the card.
+
+        The floor holds a different-model head without returning any admission verdict, so silence leaves the
+        wait attributable only to the cooldown, which a ready head is otherwise allowed to cut short. Keyed to
+        the card and the residency's model so one episode speaks once however many cycles it holds for, and a
+        later residency speaks for itself; cleared when the residency restores.
+        """
+        if self._min_hold_disclosed.get(device_index) == model:
+            return
+        self._min_hold_disclosed[device_index] = model
+        logger.info(f"A ready different-model head may not release this residency yet: {disclosure}.")
 
     def _ready_different_model_head_on_device(
         self,
@@ -6555,8 +6628,10 @@ class InferenceScheduler:
             raise ValueError(f"job.model is None ({job})")
 
         # Each return below names why it declined, so the recorded admission decision (and the dispatch-stall
-        # line that quotes it) carries the deciding arithmetic instead of the generic gate label. Cleared per
-        # call so a later decline can never inherit an earlier one's reason.
+        # line that quotes it) carries the deciding block instead of the generic gate label. The recorded text
+        # is compared across cycles by the stall-line throttle and across recovery settling windows, so it is
+        # the stable half of a verdict and never the arithmetic. Cleared per call so a later decline can never
+        # inherit an earlier one's reason.
         self._last_budget_defer_reason = None
 
         baseline = self._model_metadata.get_baseline(job.model)
@@ -6683,8 +6758,9 @@ class InferenceScheduler:
         # Completion is observed via the next cycle's frozen snapshot; the actuations are never awaited inline.
         # Emitted whatever the predictive forecast said. A defer against a candidate the static forecast calls
         # a fit is the case most worth naming: the arithmetic the arbiter objects to is then visible nowhere
-        # else, and a head can sit deferred behind it for as long as the queue holds. Coalesced on the reason
-        # rather than latched, so a changed objection always speaks and an unchanged one is counted.
+        # else, and a head can sit deferred behind it for as long as the queue holds. Coalesced on the stable
+        # reason rather than latched, so a changed objection always speaks and an unchanged one is counted;
+        # the line itself renders the arithmetic behind that reason, which moves every cycle.
         self._last_budget_defer_reason = verdict.reason
         suppressed = self._scheduler_diagnostic_suppressed_count(
             "preload_budget_defer",
@@ -6693,7 +6769,7 @@ class InferenceScheduler:
         if suppressed is not None:
             forecast_note = "" if not vram_verdict.fits else " (the static forecast calls this a fit)"
             logger.opt(colors=True).warning(
-                f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.reason}{forecast_note}. "
+                f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.stated}{forecast_note}. "
                 f"Reclaiming idle VRAM.{self._suppressed_suffix(suppressed)}</>",
                 job.model,
             )
@@ -9706,7 +9782,7 @@ class InferenceScheduler:
                 else " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
             )
             logger.opt(colors=True).warning(
-                f"<fg #f0beff>Holding dispatch of {{}} to reconcile residency: {verdict.reason}.{reclaim_note}</>",
+                f"<fg #f0beff>Holding dispatch of {{}} to reconcile residency: {verdict.stated}.{reclaim_note}</>",
                 next_job.model,
             )
         return True
@@ -10021,11 +10097,11 @@ class InferenceScheduler:
 
         if line_skip is not None:
             if line_skip.reason == "resident_bypass":
-                budget_seconds = affinity_budget_seconds(self._state.recent_job_ttl)
-                remaining_budget = max(0.0, budget_seconds - self.latest_affinity_skip_seconds())
-                skip_detail = (
-                    f"affinity line-skip {self.latest_affinity_skips()}/{_AFFINITY_MAX_SKIPS}, "
-                    f"remaining budget {remaining_budget:.0f}s"
+                skip_detail = affinity_skip_disclosure(
+                    self._affinity_skip_state,
+                    now=self._clock(),
+                    budget_seconds=affinity_budget_seconds(self._state.recent_job_ttl),
+                    max_skips=_AFFINITY_MAX_SKIPS,
                 )
             else:
                 skip_detail = "the displaced job's process is busy sampling its own model"

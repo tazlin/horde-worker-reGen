@@ -45,9 +45,7 @@ class GateSurface(StrEnum):
     """The enumerable runtime surface a gate's identity comes from.
 
     Each surface is a closed set in production code (a ``StrEnum``, or an enum-keyed decision), so the
-    guardrail can enumerate it and demand an entry per member. ``SCHEDULER_BUDGET`` is the exception and
-    carries the gates that hold work without stamping a name anywhere a reader can enumerate; those are
-    listed by hand and the guardrail cannot catch a new one, which is itself worth knowing.
+    guardrail can enumerate it and demand an entry per member.
     """
 
     PRELOAD_ADMISSION = "preload_admission"
@@ -65,7 +63,7 @@ class GateSurface(StrEnum):
     RECOVERY_PARK = "recovery_park"
     """A member of ``RecoveryParkReason``: which exhausted escalation parked the worker."""
     SCHEDULER_BUDGET = "scheduler_budget"
-    """A scheduler-side budget that holds work without naming itself on an enumerable surface."""
+    """A member of ``SchedulerBudget``: a scheduling budget that holds work for a bounded span."""
 
 
 class GateKind(StrEnum):
@@ -1071,7 +1069,7 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at="WorkerState.recovery_parked with its RecoveryParkReason, and the action ledger",
     ),
     # endregion
-    # region scheduler budgets with no enumerable runtime key
+    # region scheduler budgets
     GateEntry(
         key="affinity_line_skip",
         surface=GateSurface.SCHEDULER_BUDGET,
@@ -1095,7 +1093,11 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
             "the bound is unconditional: no path raises it, and a max_skips of zero disables bypassing "
             "entirely, so the head always reclaims the slot it never lost"
         ),
-        observable_at="the head-starvation diagnostic, which names the skip count and the span it covered",
+        observable_at=(
+            "the committed-skip line, which dispatch_affinity.affinity_skip_disclosure stamps with "
+            "SchedulerBudget.AFFINITY_LINE_SKIP, the skip count against its ceiling and the window left; and "
+            "the head-starvation diagnostic, which names the skip count and the span it covered"
+        ),
     ),
     GateEntry(
         key="whole_card_min_hold",
@@ -1113,13 +1115,16 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
             "the floor is deliberately shorter than the establish grace window, so it can never be the thing "
             "keeping a residency alive past the point the recovery supervisor is watching"
         ),
-        observable_at="WholeCardResidency.min_hold_until, and the residency status snapshot",
+        observable_at=(
+            "WholeCardResidency.min_hold_until and the residency status snapshot; and, when a ready "
+            "different-model head is actually held off, the once-per-episode line that "
+            "WholeCardResidencyLedger.min_hold_disclosure stamps with SchedulerBudget.WHOLE_CARD_MIN_HOLD"
+        ),
     ),
     # endregion
 )
 """Every gate that can hold or defer work, with its declared release path and bound.
 
-Ordered by surface for reading. The guardrail test enumerates each surface's runtime members and fails on
-any member without an entry here, so the tuple cannot fall behind the code for the surfaces it can
-enumerate. ``SCHEDULER_BUDGET`` entries are hand-listed and carry no such protection.
+Ordered by surface for reading. The guardrail test enumerates every surface's runtime members and fails on
+any member without an entry here, so the tuple cannot fall behind the code.
 """

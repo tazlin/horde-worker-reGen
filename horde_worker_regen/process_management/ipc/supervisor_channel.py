@@ -748,6 +748,17 @@ class WholeCardResidencyStatus(BaseModel):
     cooldown_remaining_seconds: float | None = None
     """Seconds left before the residency restores once its jobs drained, or None when not active."""
 
+    pop_claim_model: str | None = None
+    """The model a standing claim narrows the pop offer to, or None when the pool is unclaimed.
+
+    A residency can be held without claiming the offer (a multi-card host, or a maximum hold of zero), so
+    this is not simply ``model`` repeated: it is what the worker is currently asking the horde for."""
+    pop_claim_remaining_seconds: float | None = None
+    """Seconds until the maximum hold ends the standing claim, or None when no claim stands."""
+    pop_claim_release: str | None = None
+    """Why the last claim ended (``maximum_hold`` | ``no_further_work`` | ``residency_released``), while that
+    is still recent; None otherwise."""
+
     weights_mb: int | None = None
     """Resident weight footprint of the residency model (detail view)."""
     reserve_mb: int | None = None
