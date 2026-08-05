@@ -1619,6 +1619,17 @@ class InferenceScheduler:
         """
         return self._whole_card_ledger.state_for(device_index)
 
+    def _serving_under_whole_card(self, model: str | None, device_index: int | None) -> bool:
+        """Whether a whole-card exclusive residency for ``model`` is held on the card a job is dispatched to.
+
+        Recorded per job at dispatch so a cost analysis can separate work served with the card to itself
+        (which carries the amortized cost of establishing that residency) from co-resident work of the same
+        shape. A residency held for a different model is not this job's, so it reads False.
+        """
+        if model is None:
+            return False
+        return self._residency_state(device_index).model == model
+
     def _held_residencies(self) -> list[tuple[int | None, WholeCardResidency]]:
         """Return ``(device_index, state)`` for every card currently holding a whole-card residency.
 
@@ -8776,7 +8787,12 @@ class InferenceScheduler:
         if not registered:
             return False
 
-        await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
+        await self._job_tracker.mark_inference_started(
+            next_job,
+            device_index=dispatched_device_index,
+            whole_card=self._serving_under_whole_card(model, dispatched_device_index),
+            process_age_seconds=time.time() - process_with_model.spawned_at,
+        )
         # The pinned process references this job so the orphaned-job watchdog credits it as owned across the
         # whole encode-and-sample window (the reservation, not a START_INFERENCE flag, is that ownership
         # record: see WorkerRecoveryCoordinator.inference_slot_owns_job). No sampling-timing stamp is set here;
@@ -8860,7 +8876,12 @@ class InferenceScheduler:
                 skipped_aux_models=self._job_tracker.skipped_aux_for_job(next_job),
             ),
         ):
-            await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
+            await self._job_tracker.mark_inference_started(
+                next_job,
+                device_index=dispatched_device_index,
+                whole_card=self._serving_under_whole_card(next_job.model, dispatched_device_index),
+                process_age_seconds=time.time() - process_with_model.spawned_at,
+            )
             horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
             # Under the clearance lease a dispatch only stages the job: its weights load at clearance, so book
             # the encode-only charge now and upgrade to the full materialisation peak when the parent clears it.

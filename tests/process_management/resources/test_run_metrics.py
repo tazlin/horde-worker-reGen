@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics, ModelLoadEvent, SamplingStats
 from pytest import MonkeyPatch
 
@@ -62,19 +63,28 @@ def _finalize_job(
     n_iter: int = 1,
     kudos_reward: float | None = None,
     payload_overrides: dict[str, object] | None = None,
+    loras: list[LorasPayloadEntry] | None = None,
+    aux_models_prepared_at: float | None = None,
+    queue_depth_at_dispatch: int | None = None,
+    post_processing_depth_at_dispatch: int | None = None,
+    served_whole_card: bool | None = None,
+    serving_process_age_seconds: float | None = None,
 ) -> str:
     """Finalize a synthetic tracked job and return its job id string."""
     job = dummy_job_factory("Deliberate")
     assert job.id_ is not None
+    job_id = job.id_
     payload_updates: dict[str, object] = {}
     if n_iter != 1:
         payload_updates["n_iter"] = n_iter
+    if loras is not None:
+        payload_updates["loras"] = loras
     if payload_overrides:
         payload_updates.update(payload_overrides)
     if payload_updates:
         job = job.model_copy(update={"payload": job.payload.model_copy(update=payload_updates)})
     tracked = TrackedJob(
-        job_id=job.id_,
+        job_id=job_id,
         sdk_api_job_info=job,
         stage=JobStage.PENDING_SUBMIT,
         time_popped=100.0,
@@ -86,6 +96,11 @@ def _finalize_job(
             "PENDING_SUBMIT": 111.0,
             "FINALIZED": 112.0,
         },
+        aux_models_prepared_at=aux_models_prepared_at,
+        queue_depth_at_dispatch=queue_depth_at_dispatch,
+        post_processing_depth_at_dispatch=post_processing_depth_at_dispatch,
+        served_whole_card=served_whole_card,
+        serving_process_age_seconds=serving_process_age_seconds,
     )
     job_info = HordeJobInfo(
         sdk_api_job_info=job,
@@ -254,6 +269,121 @@ class TestJobCorrelation:
         rollups = {row.model: row for row in metrics.form_rollups()}
         assert rollups["caption"].jobs == 2
         assert rollups["caption"].e2e_seconds == 6.0
+
+
+class TestWorkerConditionFields:
+    """The per-job conditions a cost analysis controls for: load, auxiliary wait, contention, residency."""
+
+    def test_model_load_seconds_counts_only_this_jobs_model(self) -> None:
+        """A job is charged the loads of its own checkpoint, never a neighbouring model's staging."""
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        message = _job_metrics_message(str(job.id_))
+        message.phase_metrics.model_loads.append(
+            ModelLoadEvent(model_name="AlbedoBase XL", phase="disk_to_ram", duration_seconds=9.9, timestamp=1.0),
+        )
+        metrics.on_job_metrics(message)
+        tracked = TrackedJob(
+            job_id=job.id_,
+            sdk_api_job_info=job,
+            stage=JobStage.PENDING_SUBMIT,
+            time_popped=100.0,
+            stage_timestamps={"FINALIZED": 110.0},
+        )
+        metrics.on_job_finalized(
+            tracked,
+            HordeJobInfo(sdk_api_job_info=job, state=GENERATION_STATE.ok, time_popped=100.0),
+        )
+
+        assert metrics.snapshot().jobs[0].model_load_seconds == 4.2 + 1.1
+
+    def test_resident_model_records_a_measured_zero_load(self) -> None:
+        """A job that loaded nothing reads 0.0, which is distinct from the unknown of an uncorrelated job."""
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        message = _job_metrics_message(str(job.id_))
+        message.phase_metrics.model_loads.clear()
+        metrics.on_job_metrics(message)
+        tracked = TrackedJob(
+            job_id=job.id_,
+            sdk_api_job_info=job,
+            stage=JobStage.PENDING_SUBMIT,
+            time_popped=100.0,
+            stage_timestamps={"FINALIZED": 110.0},
+        )
+        metrics.on_job_finalized(
+            tracked,
+            HordeJobInfo(sdk_api_job_info=job, state=GENERATION_STATE.ok, time_popped=100.0),
+        )
+
+        assert metrics.snapshot().jobs[0].model_load_seconds == 0.0
+
+    def test_uncorrelated_job_leaves_the_load_cost_unknown(self) -> None:
+        """Without child phase metrics there is nothing to charge, so the field stays absent."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics)
+        assert metrics.snapshot().jobs[0].model_load_seconds is None
+
+    def test_lora_wait_is_the_blocked_share_of_the_queue_wait(self) -> None:
+        """A LoRA job's wait runs from the pop to auxiliary readiness, not to dispatch."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, loras=[LorasPayloadEntry(name="detail")], aux_models_prepared_at=101.5)
+
+        record = metrics.snapshot().jobs[0]
+        assert record.queue_wait_seconds == 2.5
+        assert record.lora_wait_seconds == 1.5
+
+    def test_lora_wait_is_clamped_into_the_queue_wait(self) -> None:
+        """Readiness stamped after dispatch cannot have delayed a dispatch that already happened."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, loras=[LorasPayloadEntry(name="detail")], aux_models_prepared_at=108.0)
+        assert metrics.snapshot().jobs[0].lora_wait_seconds == 2.5
+
+    def test_job_without_loras_records_no_lora_wait(self) -> None:
+        """A job with no LoRAs has no auxiliary wait to measure, so the field is absent rather than zero."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, aux_models_prepared_at=101.0)
+        assert metrics.snapshot().jobs[0].lora_wait_seconds is None
+
+    def test_dispatch_conditions_reach_the_record(self) -> None:
+        """Contention, whole-card residency, and process age are carried from the tracker as stamped."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(
+            metrics,
+            queue_depth_at_dispatch=3,
+            post_processing_depth_at_dispatch=1,
+            served_whole_card=True,
+            serving_process_age_seconds=42.5,
+        )
+
+        record = metrics.snapshot().jobs[0]
+        assert record.queue_depth_at_dispatch == 3
+        assert record.post_processing_depth_at_dispatch == 1
+        assert record.whole_card is True
+        assert record.process_age_seconds == 42.5
+
+    def test_undispatched_job_leaves_the_conditions_unknown(self) -> None:
+        """A job that never reached dispatch reports no conditions rather than a fabricated zero."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics)
+
+        record = metrics.snapshot().jobs[0]
+        assert record.queue_depth_at_dispatch is None
+        assert record.post_processing_depth_at_dispatch is None
+        assert record.whole_card is None
+        assert record.process_age_seconds is None
+
+    def test_record_parses_without_the_worker_condition_fields(self) -> None:
+        """A record written before these fields existed still parses, with every one unknown."""
+        record = JobMetricsRecord.model_validate({"job_id": "old", "model_name": "Deliberate"})
+        assert record.model_load_seconds is None
+        assert record.lora_wait_seconds is None
+        assert record.queue_depth_at_dispatch is None
+        assert record.post_processing_depth_at_dispatch is None
+        assert record.whole_card is None
+        assert record.process_age_seconds is None
 
 
 class TestStageMetrics:
@@ -565,6 +695,67 @@ class TestSessionAndResourceEvents:
         assert end_events[0]["reason"] == "graceful_shutdown"
         assert end_events[0]["jobs_submitted"] == 7
         assert end_events[0]["jobs_faulted"] == 1
+
+    def test_session_end_counters_partition_the_emitted_job_records(
+        self,
+        tmp_path: Path,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        """Without explicit totals, the counters sum to the job_completed records in the same file."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+        metrics.record_session_start(config={}, timestamp=100.0)
+        _finalize_job(metrics)
+        _finalize_job(metrics)
+        _finalize_job(metrics, faulted=True)
+        metrics.record_alchemy_form(form_id="form-1", form="caption", e2e_seconds=1.0, faulted=False)
+        metrics.record_session_end(reason="graceful_shutdown", timestamp=160.0)
+
+        events = _read_export_events(tmp_path)
+        completed = [event for event in events if event["event"] == "job_completed"]
+        end_event = events[-1]
+        assert end_event["event"] == "session_end"
+        assert end_event["jobs_submitted"] == 3
+        assert end_event["jobs_faulted"] == 1
+        assert end_event["jobs_submitted"] + end_event["jobs_faulted"] == len(completed)
+
+    def test_session_end_counts_only_records_the_stream_holds(
+        self,
+        tmp_path: Path,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        """Jobs finalized before the export was switched on are not counted: they are not in the file."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics)
+        metrics.set_stats_export(True, worker_version="1.0.0")
+        _finalize_job(metrics)
+        metrics.record_session_end(reason="graceful_shutdown", timestamp=160.0)
+
+        events = _read_export_events(tmp_path)
+        completed = [event for event in events if event["event"] == "job_completed"]
+        assert len(completed) == 1
+        assert events[-1]["jobs_submitted"] == 1
+        assert events[-1]["jobs_faulted"] == 0
+
+    def test_a_benchmark_level_reset_keeps_the_stream_totals(
+        self,
+        tmp_path: Path,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        """A level boundary clears the aggregates but not the tally of what the file already holds."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+        _finalize_job(metrics)
+        metrics.reset()
+        _finalize_job(metrics)
+        metrics.record_session_end(reason="graceful_shutdown", timestamp=160.0)
+
+        events = _read_export_events(tmp_path)
+        completed = [event for event in events if event["event"] == "job_completed"]
+        assert events[-1]["jobs_submitted"] == len(completed) == 2
 
     def test_resource_state_event_serializes(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
         """A resource_state transition serializes with its discriminator and flat inputs."""

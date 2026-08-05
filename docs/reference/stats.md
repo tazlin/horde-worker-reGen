@@ -36,7 +36,7 @@ deletion; a foreign file, a leftover `.tmp`, or a nested folder is never touched
 | `event`          | Emitted | Carries |
 | ---------------- | ------- | ------- |
 | `session_start`  | Once, when export begins | `worker_version`, `timestamp`, and a flat `config` snapshot of the throughput-relevant resolved bridge_data (max_power, max_threads, queue_size, residency and post-processing flags, disaggregation, model count, ...). The anchor for attributing a behavioural change to the configuration it ran under. |
-| `session_end`    | Once, on clean shutdown | Terminal `reason`, `duration_seconds`, `jobs_submitted`, `jobs_faulted`, `process_recoveries`. |
+| `session_end`    | Once, as the last line of the session | Terminal `reason`, `duration_seconds`, `jobs_submitted`, `jobs_faulted`, `process_recoveries`. |
 | `job_completed`  | Per finished job or alchemy form | The full [`JobMetricsRecord`][horde_worker_regen.process_management.resources.run_metrics.JobMetricsRecord] (stage timings, queue-wait/e2e/sampling seconds, model, resolution, sampler/scheduler/cfg_scale, post-processing, VRAM high-water) and its resolved `baseline`. |
 | `stats_sample`   | At most once per second | A periodic [`StatsSample`][horde_worker_regen.process_management.ipc.supervisor_channel.StatsSample] (throughput, kudos/hr, VRAM/RAM, duty cycle). |
 | `decision`       | On an admission/dispatch/reclaim verdict (coalesced) | `decision_kind`, `subject`, `verdict`, `reason`, and a flat `inputs` map of the quantities the arbiter decided from. |
@@ -47,6 +47,51 @@ and batch count it carries `sampler_name` (as the horde advertised it, uncanonic
 (the schedule sampled on, `karras`/`normal` when the request only carried the legacy karras bool) and
 `cfg_scale`, against measured `sampling_seconds` and the horde's `kudos_reward`. Records written before
 these fields existed simply omit them.
+
+### Worker-condition fields on `job_completed`
+
+Two jobs of identical shape can cost very different amounts depending on what the worker was doing around
+them, so a record also carries the conditions it was served under. All of these are optional: a record
+that could not measure one omits it (or writes `null`), which is distinct from a measured zero.
+
+| Field | Meaning |
+| ----- | ------- |
+| `model_load_seconds` | Seconds spent loading *this job's own* checkpoint inside its metrics window, summed over the disk-to-RAM and RAM-to-VRAM phases the child reported for that model. `0.0` when the model was already resident, so the field separates the jobs that paid a model switch from those that did not. A load performed under a preceding job's window (a preload staged ahead of dispatch) is attributed to that window. |
+| `lora_wait_seconds` | Seconds the job spent blocked on its LoRA/TI files being placed on disk, measured from the pop to the moment its auxiliary set was marked prepared and clamped into `queue_wait_seconds`. A residual wait, not a download duration: a fetch that overlapped other waiting contributes only the part the job actually waited on. Absent for a job carrying no LoRAs and for one whose auxiliary readiness was never stamped (no prefetch pipeline ran). Without it, a cache-miss LoRA appears only as an inflated `queue_wait_seconds`. |
+| `queue_depth_at_dispatch` | How many *other* jobs were queued for or running inference at the moment this job was dispatched. |
+| `post_processing_depth_at_dispatch` | How many *other* jobs were queued for or running post-processing at that same moment. A job that requests post-processing behind a busy lane pays a tail its own generation did not cause. |
+| `whole_card` | Whether a [whole-card exclusive residency](../explanation/resource_governance.md) for this job's model was held on its card at dispatch. Such a job ran with the card to itself and carries the amortized cost of establishing that residency. |
+| `process_age_seconds` | How long the inference process serving the job had been alive at dispatch. A young process has cold component and RAM caches, so its first jobs pay loads a long-lived process does not; a mid-session respawn contaminates the jobs around it. |
+
+A re-dispatched job (one whose first attempt failed and was retried) reports the dispatch conditions of the
+attempt that actually ran, not of its first.
+
+The `baseline` on a `job_completed` record is the model's baseline as the loaded model reference states it
+(`stable_diffusion_1`, `stable_diffusion_xl`, `flux_1`, ...), or `null` when no record for the model was
+available. A harness or benchmark session resolves it from the same reference a production worker uses.
+
+### Reconciling `session_end` with the stream
+
+`session_end` closes the session's file: the worker writes it only once every loop that can still finalize
+a job (the submitter and the control loop's post-inference drain) has returned, so no `job_completed`
+record can follow it. Its two job counters partition exactly those records: `jobs_submitted` counts the
+`job_completed` records for work that did not fault and `jobs_faulted` those that did, both covering image
+jobs and alchemy forms, so the pair sums to the number of `job_completed` lines above the marker. Records
+finalized while the export was switched off are absent from both, because they are absent from the file.
+A session that ends without a `session_end` line was killed rather than shut down.
+
+### Scenario provenance on `session_start`
+
+A session driven by the harness or the benchmark (rather than by live horde traffic) additionally carries
+`scenario_id` and `scenario_revision` in its `config` snapshot, naming the workload definition it ran and
+that definition's revision. They identify which workload produced the session's records, so streams
+gathered on different machines can be paired by workload rather than only by configuration, and a workload
+edit does not silently blend two different job mixes under one name. A production worker runs no scenario
+and its snapshot omits both keys.
+
+The driver publishes them through the `HORDE_WORKER_SCENARIO_ID` and `HORDE_WORKER_SCENARIO_REVISION`
+environment variables rather than through `bridgeData.yaml`: the workload belongs to whatever is driving
+the worker, not to the operator's configuration, so it stays off the user-facing config surfaces.
 
 ### The `decision` record and its coalescing contract
 

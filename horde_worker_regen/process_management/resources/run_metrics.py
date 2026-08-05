@@ -10,6 +10,7 @@ crash events, and headline counters into one :class:`RunMetricsSnapshot`.
 from __future__ import annotations
 
 import enum
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -73,6 +74,70 @@ evicted so the coalescing table cannot grow without bound."""
 FlatScalarMap = dict[str, str | int | float | bool | None]
 """A flat, JSON-scalar-only mapping. Decision/config/resource-state payloads stay one level deep so any
 downstream reader (a timeline tool, a spreadsheet) can consume them without walking nested structures."""
+
+SCENARIO_ID_ENV_VAR = "HORDE_WORKER_SCENARIO_ID"
+"""Environment variable naming the workload a session is running, stamped into the ``session_start``
+config snapshot as ``scenario_id``.
+
+Scenario identity belongs to whatever drives the worker (the harness, the benchmark), not to the
+operator's configuration, so it travels out-of-band rather than as a bridge_data field: a config field
+would surface in the user-facing config surfaces (the ``.env`` writer, the template, the dashboard form)
+for something no operator ever sets. A production worker leaves it unset and its snapshot omits the key."""
+
+SCENARIO_REVISION_ENV_VAR = "HORDE_WORKER_SCENARIO_REVISION"
+"""Environment variable naming the revision of the workload named by :data:`SCENARIO_ID_ENV_VAR`.
+
+Two machines' stats streams are only comparable when they ran the same workload definition, so the
+revision pairs snapshots taken from different hosts (or from the same host across a workload edit)."""
+
+
+def scenario_provenance_from_env() -> FlatScalarMap:
+    """Return the scenario identity stamped into this process's environment, if any.
+
+    Absent (or blank) variables yield no keys at all, so a production session's config snapshot is
+    byte-identical to what it was before scenario provenance existed.
+    """
+    provenance: FlatScalarMap = {}
+    scenario_id = os.environ.get(SCENARIO_ID_ENV_VAR, "").strip()
+    if scenario_id:
+        provenance["scenario_id"] = scenario_id
+    revision = os.environ.get(SCENARIO_REVISION_ENV_VAR, "").strip()
+    if revision:
+        provenance["scenario_revision"] = revision
+    return provenance
+
+
+def _model_load_seconds(phase_metrics: JobPhaseMetrics | None, model_name: str | None) -> float | None:
+    """Seconds the child spent loading ``model_name`` inside this job's metrics window.
+
+    Sums every reported load phase for that model (disk to RAM and RAM to VRAM), so a job that found its
+    checkpoint resident reads 0.0 and one that paid a switch reads what the switch cost. Loads of other
+    models in the same window (a preload staged for the next job) belong to that job, not this one, so they
+    are excluded. None when the child reported no metrics for the job, or the job's model is unknown.
+    """
+    if phase_metrics is None or model_name is None:
+        return None
+    return sum(load.duration_seconds for load in phase_metrics.model_loads if load.model_name == model_name)
+
+
+def _lora_wait_seconds(tracked: TrackedJob, *, queue_wait: float | None) -> float | None:
+    """The share of a job's queue wait it spent blocked on its LoRA/TI files reaching disk.
+
+    Measured from the pop to the auxiliary-readiness stamp, so a fetch that overlapped other waiting
+    contributes only the part the job actually waited on. Clamped into ``[0, queue_wait]``: readiness
+    reached after dispatch (a re-dispatch after an auxiliary invalidation) cannot have delayed the dispatch
+    that already happened. None for a job carrying no LoRAs and for one whose readiness was never stamped,
+    which are different from a measured zero.
+    """
+    if not tracked.sdk_api_job_info.payload.loras:
+        return None
+    prepared_at = tracked.aux_models_prepared_at
+    if prepared_at is None or tracked.time_popped is None:
+        return None
+    wait = max(0.0, prepared_at - tracked.time_popped)
+    if queue_wait is not None:
+        wait = min(wait, max(0.0, queue_wait))
+    return wait
 
 
 class DecisionKind(enum.StrEnum):
@@ -160,6 +225,39 @@ class JobMetricsRecord(BaseModel):
     batch_count: int = 1
     megapixelsteps: float = 0.0
     sampling_seconds: float | None = None
+    model_load_seconds: float | None = None
+    """Seconds this job paid loading its own checkpoint, summed over the load phases the child reported for
+    the job's model (disk to RAM and RAM to VRAM).
+
+    0.0 when the model was already resident and the job loaded nothing, None when no phase metrics were
+    correlated. A load the child performed under a *previous* job's metrics window (a preload issued ahead
+    of dispatch) is attributed to that window, so this measures the load cost inside this job's own span."""
+    lora_wait_seconds: float | None = None
+    """Seconds this job spent blocked on its LoRA/TI files being placed on disk before it was dispatchable.
+
+    Measured from the pop to the moment the job's auxiliary set was marked prepared, clamped into
+    ``queue_wait_seconds``: it is the share of the queue wait attributable to auxiliary fetching rather than
+    to scheduling, and it is a residual wait, not a download duration (a fetch that overlapped other waiting
+    contributes only the part the job actually waited on). None for a job carrying no LoRAs, and for a job
+    whose auxiliary readiness was never stamped (no prefetch pipeline ran)."""
+    queue_depth_at_dispatch: int | None = None
+    """Other jobs queued for or running inference at the moment this job was dispatched. None when the job
+    never reached dispatch."""
+    post_processing_depth_at_dispatch: int | None = None
+    """Other jobs queued for or running post-processing at the moment this job was dispatched.
+
+    A job that requests post-processing behind a busy lane pays a tail its own generation did not cause."""
+    whole_card: bool | None = None
+    """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
+
+    Such a job ran with the card to itself and carries the amortized cost of establishing that residency.
+    None when the job never reached dispatch (and on alchemy forms, which do not run under one)."""
+    process_age_seconds: float | None = None
+    """How long the inference process serving this job had been alive at dispatch, in seconds.
+
+    A young process has cold component/RAM caches, so its first jobs pay loads a long-lived process would
+    not; a mid-session respawn therefore contaminates the cells around it. None when no process was
+    attributed."""
     kudos_reward: float | None = None
     """What the horde's submit response paid for this job (summed over a batch's generations).
 
@@ -198,7 +296,11 @@ class SessionStartEvent(BaseModel):
 
 
 class SessionEndEvent(BaseModel):
-    """One JSONL export event marking a worker session's clean end with terminal totals."""
+    """One JSONL export event marking a worker session's clean end with terminal totals.
+
+    It is the last line of the file: it is written once every loop that can still finalize a job has
+    returned, so no ``job_completed`` record follows it and its counters cover the whole stream.
+    """
 
     event: Literal["session_end"] = "session_end"
     worker_version: str
@@ -206,7 +308,12 @@ class SessionEndEvent(BaseModel):
     reason: str = ""
     duration_seconds: float | None = None
     jobs_submitted: int = 0
+    """``job_completed`` records written this session for work that did not fault (jobs and alchemy forms)."""
     jobs_faulted: int = 0
+    """``job_completed`` records written this session for work that faulted (jobs and alchemy forms).
+
+    With :attr:`jobs_submitted` this partitions the session's ``job_completed`` records, so the two sum
+    to the number of such lines in the file."""
     process_recoveries: int = 0
     kudos_per_hour: float | None = None
 
@@ -556,6 +663,8 @@ class WorkerRunMetrics:
         self._stats_export_enabled = False
         self._worker_version = ""
         self._session_start_time: float | None = None
+        self._exported_jobs_submitted = 0
+        self._exported_jobs_faulted = 0
         self._decision_states: dict[tuple[DecisionKind, str], _DecisionCoalesceState] = {}
         self._churn_event_times: dict[ChurnKind, list[float]] = {
             "model_swap": [],
@@ -564,7 +673,12 @@ class WorkerRunMetrics:
         }
 
     def reset(self) -> None:
-        """Clear all aggregated metrics, e.g. at a benchmark level boundary on a warm worker."""
+        """Clear all aggregated metrics, e.g. at a benchmark level boundary on a warm worker.
+
+        The exported-record tallies are deliberately kept: they count what the session's JSONL stream
+        already holds, and that file spans every level, so clearing them would leave ``session_end``
+        disagreeing with the records above it.
+        """
         self._jobs.clear()
         self._stage_metrics.clear()
         self._downloads.clear()
@@ -670,6 +784,8 @@ class WorkerRunMetrics:
         sampling_seconds = (
             phase_metrics.sampling.duration_seconds if phase_metrics is not None and phase_metrics.sampling else None
         )
+        model_load_seconds = _model_load_seconds(phase_metrics, model_name)
+        lora_wait_seconds = _lora_wait_seconds(tracked, queue_wait=queue_wait)
         # The horde may name the schedule outright; when it does not, the legacy karras bool decides it,
         # where false means `normal`. Read through getattr rather than the attribute so an SDK predating
         # the scheduler field cannot fault job finalization.
@@ -709,6 +825,12 @@ class WorkerRunMetrics:
             batch_count=batch_count,
             megapixelsteps=megapixelsteps,
             sampling_seconds=sampling_seconds,
+            model_load_seconds=model_load_seconds,
+            lora_wait_seconds=lora_wait_seconds,
+            queue_depth_at_dispatch=tracked.queue_depth_at_dispatch,
+            post_processing_depth_at_dispatch=tracked.post_processing_depth_at_dispatch,
+            whole_card=tracked.served_whole_card,
+            process_age_seconds=tracked.serving_process_age_seconds,
             kudos_reward=tracked.kudos_reward,
         )
         self._jobs.append(record)
@@ -800,14 +922,22 @@ class WorkerRunMetrics:
         self,
         *,
         reason: str,
-        jobs_submitted: int = 0,
-        jobs_faulted: int = 0,
+        jobs_submitted: int | None = None,
+        jobs_faulted: int | None = None,
         process_recoveries: int = 0,
         kudos_per_hour: float | None = None,
         timestamp: float | None = None,
     ) -> None:
-        """Emit a ``session_end`` marker with terminal totals. Writes only when export is enabled."""
+        """Emit a ``session_end`` marker with terminal totals. Writes only when export is enabled.
+
+        ``jobs_submitted`` and ``jobs_faulted`` default to this session's own tally of the
+        ``job_completed`` records it wrote (non-faulted and faulted respectively), so the two counters
+        sum to the number of ``job_completed`` lines above the marker in the same file. Passing either
+        explicitly overrides that tally, which only a caller counting something else should do.
+        """
         now = time.time() if timestamp is None else timestamp
+        submitted = self._exported_jobs_submitted if jobs_submitted is None else jobs_submitted
+        faulted = self._exported_jobs_faulted if jobs_faulted is None else jobs_faulted
         duration = None if self._session_start_time is None else max(0.0, now - self._session_start_time)
         self._write_export_event(
             SessionEndEvent(
@@ -815,8 +945,8 @@ class WorkerRunMetrics:
                 timestamp=now,
                 reason=reason,
                 duration_seconds=duration,
-                jobs_submitted=jobs_submitted,
-                jobs_faulted=jobs_faulted,
+                jobs_submitted=submitted,
+                jobs_faulted=faulted,
                 process_recoveries=process_recoveries,
                 kudos_per_hour=kudos_per_hour,
             ),
@@ -1086,7 +1216,16 @@ class WorkerRunMetrics:
         self._write_export_event(StatsSampleEvent(sample=sample))
 
     def _write_job_event(self, record: JobMetricsRecord, *, baseline: str | None) -> None:
+        if not self._stats_export_enabled or self._stats_exporter is None:
+            return
         self._write_export_event(StatsJobCompletedEvent(job=record, baseline=baseline))
+        if not self._stats_export_enabled:
+            # The write failed and disabled the export, so the record is not in the stream to be counted.
+            return
+        if record.faulted:
+            self._exported_jobs_faulted += 1
+        else:
+            self._exported_jobs_submitted += 1
 
     def _decimated_stats_samples(self) -> list[StatsSample]:
         if len(self._all_stats_samples) <= _STATS_ALL_SESSION_POINTS:

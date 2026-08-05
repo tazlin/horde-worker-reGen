@@ -98,6 +98,12 @@ class HordeProcessInfo:
     """The kinds of work this process can be dispatched (job routing keys on this)."""
     last_process_state: HordeProcessState
     """The last known state of this process."""
+    spawned_at: float
+    """Epoch time this slot's current process was launched (a replacement slot gets a fresh stamp).
+
+    A young process has cold caches (component cache, staged checkpoints, allocator arenas), so work it
+    serves early pays loads a long-lived process does not. Recorded per job at dispatch so an analysis can
+    tell a cold-process job from a warm one."""
     last_process_state_started_at: float
     """Epoch time when ``last_process_state`` was first observed.
 
@@ -315,6 +321,7 @@ class HordeProcessInfo:
         self.device_index = device_index
         self.capabilities = capabilities if capabilities is not None else DEFAULT_CAPABILITIES[process_type]
         self.last_process_state = last_process_state
+        self.spawned_at = time.time()
         self.last_process_state_started_at = time.time()
         self.last_received_timestamp = time.time()
         self.has_ever_reported = False
