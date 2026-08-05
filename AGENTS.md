@@ -19,8 +19,13 @@ linking a reader to a doc page over duplicating it here.
 > - **API reference pages auto-generate** from docstrings via `docs/build_docs.py`. After adding or
 >   removing a module under `horde_worker_regen/`, run `uv run --no-sync python docs/build_docs.py` and
 >   commit the regenerated stub(s). The page content still comes from your docstrings, so write them.
+>   `build_docs.py` may also rewrite unrelated stubs with line-ending-only churn (`git diff` shows
+>   nothing but `git status` shows them modified); `git checkout --` those to keep the diff clean.
 > - Follow [Diátaxis](docs/index.md): put facts in the right quadrant (tutorial / how-to / reference /
 >   explanation) and interlink rather than duplicate.
+> - **`docs/index.md` is the map.** Start there to find the page that owns a changed concept, and grep
+>   `docs/` for the touched terms to catch drift you did not anticipate. When you rename a section, grep
+>   for inbound `other.md#old-anchor` links and re-point them; verify every anchor you link exists.
 > - When you cannot fully reconcile a doc in the same change, say so explicitly in the change description
 >   rather than leaving it silently stale.
 
