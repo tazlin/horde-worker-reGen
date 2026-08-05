@@ -6697,6 +6697,7 @@ class InferenceScheduler:
             available_process,
             for_head_of_queue=is_head_blocker,
             device_index=target_device_index,
+            make_room_for_model=job.model,
         )
         live_inference_processes = self._process_map.num_loaded_inference_processes(
             device_index=target_device_index,
@@ -7130,27 +7131,62 @@ class InferenceScheduler:
         can_reduce = context_reduction_demanded and self._whole_card_warranted(forecast)
         return max_resident, can_reduce
 
+    def _target_slot_is_spared(
+        self,
+        process_info: HordeProcessInfo,
+        *,
+        make_room_for_model: str | None,
+    ) -> bool:
+        """Return whether the slot a load is aimed at must be spared from the reclaim being performed for it.
+
+        Reclaim aimed at seating a model on a slot spares that slot: whatever it holds is about to be written
+        anyway, so evicting it buys nothing and costs a reload. That reasoning covers the slot's own copy of
+        the model being seated (its residency is credit against the load, not memory to reclaim) and a slot
+        that is already mid-load, whose weights are arriving rather than idle. It does not cover a *different*
+        model sitting idle on the slot: those weights are the ordinary cost of a model swap, and on a worker
+        whose card has one inference lane they are the only memory a starved head can be given.
+
+        ``make_room_for_model`` None means the caller named no model to seat (a bare pressure sweep, where the
+        slot is passed purely as a process to protect), so the slot is spared outright.
+        """
+        if make_room_for_model is None:
+            return True
+        if process_info.process_type is not HordeProcessType.INFERENCE:
+            return True
+        # PRELOADING_MODEL / PRELOADED_MODEL / DOWNLOADING_MODEL all report busy, so a slot whose weights are
+        # on their way is never mistaken for an idle resident.
+        if process_info.is_process_busy():
+            return True
+        loaded_model = process_info.loaded_horde_model_name
+        return loaded_model is None or loaded_model == make_room_for_model
+
     def _has_reclaimable_idle_model(
         self,
         process_with_model: HordeProcessInfo,
         *,
         for_head_of_queue: bool,
         device_index: int | None,
+        make_room_for_model: str | None = None,
     ) -> bool:
         """Return whether an idle resident model could be evicted on the card to reclaim VRAM for this head.
 
         A read-only mirror of the eviction targeting :meth:`unload_models_from_vram` performs under pressure:
         a post-processing lane not already unloading, or an inference process holding a model that is not in
         progress, not spared by the queued-lookahead or residency guards (both of which the head escalation
-        overrides), and not already unloading. It excludes the head's own target slot and never counts an
-        in-progress model. When this is False, and no idle cache and no warranted context reduction remain,
-        reclamation is structurally exhausted for this head.
+        overrides), and not already unloading. It never counts an in-progress model, and it excludes the head's
+        own target slot on the terms :meth:`_target_slot_is_spared` sets: unconditionally when the caller names
+        no model to seat, otherwise only while that slot holds the head's own model or is mid-load. When this
+        is False, and no idle cache and no warranted context reduction remain, reclamation is structurally
+        exhausted for this head.
         """
         wanted_models = self._compute_wanted_models()
         next_n_models = list(self.get_next_n_models(self._max_inference_processes))
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
         for process_info in self._process_map.values():
-            if process_info.process_id == process_with_model.process_id:
+            if process_info.process_id == process_with_model.process_id and self._target_slot_is_spared(
+                process_info,
+                make_room_for_model=make_room_for_model,
+            ):
                 continue
             if device_index is not None and process_info.device_index != device_index:
                 continue
@@ -7261,8 +7297,9 @@ class InferenceScheduler:
     def evict_idle_model(self, device_index: int | None, *, for_head_of_queue: bool) -> bool:
         """Evict an idle resident model on the card to reclaim its weights (:class:`VramActuator`).
 
-        The head being admitted keeps its own target slot: the eviction protects that process and never
-        touches a live in-progress model.
+        The head being admitted keeps its own model's weights wherever they sit, including on its own target
+        slot, and no live in-progress model is ever touched. A *different* model idle on that target slot is
+        evictable: seating the head there is a model swap, and it is the only reclaim a single-lane card has.
         """
         actuation = self._preload_actuation
         anchor = (
@@ -7277,6 +7314,7 @@ class InferenceScheduler:
             under_pressure=True,
             for_head_of_queue=for_head_of_queue,
             device_index=device_index,
+            make_room_for_model=actuation.job.model if actuation is not None else None,
         )
 
     def reduce_live_contexts(self, device_index: int | None) -> bool:
@@ -9819,6 +9857,7 @@ class InferenceScheduler:
             process_with_model,
             for_head_of_queue=is_head_of_queue,
             device_index=device_index,
+            make_room_for_model=next_job.model,
         )
         candidate_delta_mb = (
             candidate_delta_override_mb
@@ -10358,6 +10397,7 @@ class InferenceScheduler:
         under_pressure: bool = False,
         for_head_of_queue: bool = False,
         device_index: int | None = None,
+        make_room_for_model: str | None = None,
     ) -> bool:
         """Unload models from VRAM from processes that are not running a job.
 
@@ -10373,6 +10413,12 @@ class InferenceScheduler:
         ``device_index`` restricts eviction to idle resident copies on that one card: reclaiming VRAM for a
         load onto card C must evict from card C, since freeing another card's model returns no VRAM to C.
         None (the single-GPU / worker-wide case) considers every card's idle residents.
+
+        ``make_room_for_model`` names the model ``process_with_model`` is being cleared for, which decides how
+        far that slot is spared (:meth:`_target_slot_is_spared`). A caller that names no model is performing a
+        bare pressure sweep and the slot is spared outright; a caller that names one keeps the slot's own copy
+        of that model and its in-flight load, while a different idle resident there is evicted as the ordinary
+        model swap. On a worker with one inference lane that swap is the only reclaim the card has to offer.
 
         Returns True if an idle resident model's unload was issued (room is on the way), False if there
         was nothing to reclaim.
@@ -10390,7 +10436,10 @@ class InferenceScheduler:
 
         unloaded_any = False
         for process_info in self._process_map.values():
-            if process_info.process_id == process_with_model.process_id:
+            if process_info.process_id == process_with_model.process_id and self._target_slot_is_spared(
+                process_info,
+                make_room_for_model=make_room_for_model,
+            ):
                 continue
 
             if process_info.process_type == HordeProcessType.POST_PROCESS:

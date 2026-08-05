@@ -1,28 +1,23 @@
 """Whether a single-lane worker can swap the model its only lane holds for the head's.
 
-A worker configured with one inference process has exactly one place to put a model. When that lane holds an
-idle resident model and the head of the queue wants a different one, every reclaim surface the admission path
-offers is aimed at *other* processes: the eviction scan and its read-only mirror both skip the head's own
-target slot, and the arbiter's ladder never asks the target lane to release the cache it is about to load
-into. On a multi-lane worker that exclusion is right (the target is about to be written anyway); with one lane
-it removes the only holder of the memory the head needs.
+A worker configured with one inference process has exactly one place to put a model. The reclaim surfaces the
+admission path offers spare the head's own target slot, because on a multi-lane worker that slot is about to
+be written anyway; with one lane it is also the only holder of the memory the head needs, so the sparing has
+to distinguish what sits there rather than which slot it is.
 
-These tests hold the topology fixed and vary only whether the lane is occupied and by how much the head is
-short, so the answer cannot come from the sizing: the same head, on the same card, is served from an empty
-lane, and the occupied-lane arms differ from it only in what already sits on the card.
+These tests hold the topology fixed and vary only what the lane holds and by how much the head is short, so
+the answer cannot come from the sizing: the same head, on the same card, is served from an empty lane, and
+the occupied-lane arms differ from it only in what already sits on the card.
 
-What they establish is that the head's rescue does not come from a swap at all. Inside the arbiter's
-measured-attempt uncertainty band, a starved head on a card the worker has nothing left to reclaim is let
-through on one real load attempt, which happens to displace the resident weights as a side effect. Outside
-that band the same topology serves nothing: the shortfall is too large for the attempt to be eligible, and no
-reclaim rung addresses the one lane holding the memory.
+What they establish is that the sparing keys on model identity, not on the slot. The head's own weights,
+wherever they sit, are credit against its load and are never reclaimed; a foreign idle resident on the target
+lane is evicted as the ordinary model swap, at any size of shortfall.
 """
 
 from __future__ import annotations
 
 from unittest.mock import Mock
 
-import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.ipc.messages import (
@@ -120,22 +115,25 @@ async def _build_scenario(
     *,
     lane_holds_resident: bool,
     free_with_resident_mb: float,
+    resident_model: str = _RESIDENT_MODEL,
 ) -> tuple[InferenceScheduler, ProcessMap, _Device, JobTracker]:
     """Build the one-lane worker with a pending head, with the lane occupied or empty.
 
-    The occupied and empty arms differ in exactly two facts: whether the lane holds the resident model, and
+    The occupied and empty arms differ in exactly two facts: whether the lane holds a resident model, and
     whether that model's weights are on the card. Everything the head is priced against is identical.
 
     Args:
-        lane_holds_resident: Whether the single lane already holds the idle resident model.
+        lane_holds_resident: Whether the single lane already holds an idle resident model.
         free_with_resident_mb: The card's free reading while those weights are on it; the empty arm reads the
             same figure with the weights returned.
+        resident_model: Which model the lane holds. The default is a different checkpoint than the head's;
+            naming the head's own model instead puts the lane in the resident-credit case.
 
     Returns:
         The scheduler, its process map, the card's free-VRAM reading, and the job tracker holding the head.
     """
     resident_weight_mb = predict_job_weight_mb(
-        make_job_pop_response(_RESIDENT_MODEL, **_HEAD_JOB_SHAPE),  # pyrefly: ignore - shape is a literal kwargs dict
+        make_job_pop_response(resident_model, **_HEAD_JOB_SHAPE),  # pyrefly: ignore - shape is a literal kwargs dict
         "stable_diffusion_xl",
     )
     assert resident_weight_mb is not None
@@ -144,7 +142,7 @@ async def _build_scenario(
         {
             _LANE: make_mock_process_info(
                 _LANE,
-                model_name=_RESIDENT_MODEL if lane_holds_resident else None,
+                model_name=resident_model if lane_holds_resident else None,
                 state=HordeProcessState.WAITING_FOR_JOB,
             ),
         },
@@ -152,7 +150,7 @@ async def _build_scenario(
     horde_model_map = HordeModelMap(root={})
     if lane_holds_resident:
         horde_model_map.update_entry(
-            horde_model_name=_RESIDENT_MODEL,
+            horde_model_name=resident_model,
             load_state=ModelLoadState.LOADED_IN_VRAM,
             process_id=_LANE,
         )
@@ -308,14 +306,14 @@ class TestSingleLaneDifferentModelSwap:
         assert served is True, "an empty lane on a card with room must seat the head"
         assert process_map[_LANE].loaded_horde_model_name == _HEAD_MODEL
 
-    async def test_a_within_band_shortfall_is_rescued_by_the_measured_attempt(self) -> None:
-        """A head short by less than the uncertainty band is let through, and no eviction is involved.
+    async def test_a_within_band_shortfall_is_served_by_the_swap(self) -> None:
+        """A head short by less than the uncertainty band is given room rather than gambled through.
 
-        This is the path that serves the occupied lane, and it is worth pinning for what it is not: the
-        arbiter never orders the resident weights out, and no reclaim rung names the lane. The head is
-        admitted because it has starved past the diagnostic horizon on a card the worker has nothing left to
-        reclaim, and one real load is allowed to settle a close arithmetic verdict. The displacement of the
-        resident model is a side effect of that load, not a decision anything made.
+        A shortfall this small would also clear the arbiter's measured-attempt hatch, which lets a starved
+        head take one real load on a card nothing can free. The card can be freed here, so the hatch is not
+        reached: the foreign resident is visible as reclaimable, the card is not converged-empty, and the head
+        is served by an ordered eviction. Buying the room outright is the cheaper of the two, and it is the
+        one a head at any shortfall can rely on.
         """
         scheduler, process_map, device, job_tracker = await _build_scenario(
             lane_holds_resident=True,
@@ -328,25 +326,35 @@ class TestSingleLaneDifferentModelSwap:
         served, flags = await _drive_until_served(scheduler, process_map, device)
 
         assert served is True
-        assert HordeControlFlag.UNLOAD_MODELS_FROM_VRAM not in flags, (
-            "the head was not given room; it was let through past a card nothing had freed"
-        )
+        assert HordeControlFlag.UNLOAD_MODELS_FROM_VRAM in flags, "the head was given room, not gambled through"
         arbiter = scheduler._ensure_preload_arbiter()
-        assert arbiter.measured_attempts == 1, "the head reached the lane through the measured-attempt hatch"
+        assert arbiter.measured_attempts == 0, "a card with room to reclaim is not converged-empty, so no attempt"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "A single-lane worker has no eviction path for a head wanting a different model than its one "
-            "resident, so a head short by more than the measured-attempt band is never served. Both eviction "
-            "surfaces skip the head's own target slot (InferenceScheduler.unload_models_from_vram and "
-            "_has_reclaimable_idle_model), the arbiter's escalation ladder never emits RELEASE_CACHE for the "
-            "request's target process, and _measured_admission_candidate_delta_mb credits resident weights "
-            "only when the resident model is the candidate's own. The head is therefore priced against a card "
-            "whose only reclaimable memory nothing will ever reclaim, and the measured-attempt hatch that "
-            "rescues a near-miss is ineligible at this shortfall."
-        ),
-    )
+    async def test_a_resident_head_model_is_credited_and_not_evicted(self) -> None:
+        """The lane's copy of the head's *own* model is credit against the load, so nothing evicts it.
+
+        The control for the swap: the same one-lane topology, the same card reading, the same shortfall
+        against a card priced without the credit. Only the identity of the resident model differs. Its weights
+        are already the head's, so the head is priced net of them and seated on them, and the eviction
+        surfaces must leave the lane alone. Were the target slot reclaimable on slot identity rather than
+        model identity, this head would evict the very weights it is about to reload.
+        """
+        scheduler, process_map, device, job_tracker = await _build_scenario(
+            lane_holds_resident=True,
+            free_with_resident_mb=_BEYOND_BAND_FREE_MB,
+            resident_model=_HEAD_MODEL,
+        )
+        assert process_map[_LANE].is_process_busy() is False, "precondition: the resident lane is idle"
+        assert not job_tracker.jobs_in_progress, "precondition: nothing is running, so nothing protects the resident"
+
+        served, flags = await _drive_until_served(scheduler, process_map, device)
+
+        assert served is True, "a head whose model is already resident is priced net of those weights"
+        assert HordeControlFlag.UNLOAD_MODELS_FROM_VRAM not in flags, (
+            "the head's own resident weights are credit against its load, never memory to reclaim for it"
+        )
+        assert process_map[_LANE].loaded_horde_model_name == _HEAD_MODEL
+
     async def test_a_beyond_band_shortfall_still_swaps_the_model(self) -> None:
         """The head must be served whatever the size of the shortfall the idle resident is holding.
 
@@ -366,7 +374,9 @@ class TestSingleLaneDifferentModelSwap:
 
         served, flags = await _drive_until_served(scheduler, process_map, device)
 
-        assert flags == [], "nothing was ever asked of the lane holding the memory the head needs"
+        assert HordeControlFlag.UNLOAD_MODELS_FROM_VRAM in flags, (
+            "the lane holding the memory the head needs was asked to give it up"
+        )
         assert served is True, (
             "the only lane holds an idle model nothing wants and the head needs its memory, so some path must "
             "trade one for the other rather than leaving the worker serving nothing"
