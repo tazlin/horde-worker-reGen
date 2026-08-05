@@ -32,8 +32,17 @@ When a process is started, the lifecycle manager:
 3. Adds it to `ProcessMap`.
 4. Launches a `multiprocessing.Process` targeting the appropriate entry point
    (`ProcessEntryPoints`).
-5. The child immediately sends a `PROCESS_STARTING` state-change message to
+5. The child sends `PROCESS_STARTING` state-change messages as it initialises, to
    confirm it's alive.
+
+A cold start is the one window in which a child cannot heartbeat: the heartbeat
+and memory-reporter threads only start with its main loop, and there is no
+intermediate state between `PROCESS_STARTING` and readiness to announce. Its only
+liveness signal is therefore a repeat of the state it is already in, which the
+parent counts as a report (it refreshes the silence clock the watchdogs read, and
+applies none of the transition side effects). Without that, the whole cold start
+reads as one unbroken silence, and a start slower than `preload_timeout` is reaped
+as "stuck starting" and respawned into the same window.
 
 Inference processes are started up to `max_inference_processes` (derived
 `queue_size + max_threads`). Safety processes are started up to

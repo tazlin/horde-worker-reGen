@@ -1103,6 +1103,10 @@ class MessageDispatcher:
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:
         """Handle a process state change message."""
         if self._process_map[message.process_id].last_process_state == message.process_state:
+            # No transition to apply, but the report is still evidence the child is alive. A child that
+            # re-sends its current state (a boot progress beat, where no heartbeat is legal yet) must not be
+            # judged silent for the whole window it spends there.
+            self._process_map.note_liveness_report(message.process_id)
             return
 
         # Captured before the slot's state is advanced below; the lost-result reap needs the state the

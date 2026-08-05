@@ -306,6 +306,15 @@ class HordeInferenceProcess(HordeProcess):
 
             ensure_offline_reference_manager()
 
+            # A boot progress beat before the model-manager load, which scans every model database under the
+            # shared disk lock and can block on a busy host. No heartbeat is legal while starting (the main
+            # loop is not running yet), so this repeat of the current state is the only liveness the parent
+            # gets between the end of the hordelib bring-up and the slot reporting itself ready.
+            self.send_process_state_change_message(
+                process_state=HordeProcessState.PROCESS_STARTING,
+                info="Loading model managers",
+            )
+
             SharedModelManager.load_model_managers(
                 multiprocessing_lock=self.disk_lock,
                 # Reference saves are coordinated by this process under disk_lock; the lora

@@ -473,6 +473,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         ):
             self.reset_heartbeat_state(process_id)
 
+    def note_liveness_report(self, process_id: int) -> None:
+        """Record that a process reported in without telling the parent anything new.
+
+        A repeated state report carries no information about *what* the child is doing, but it is proof the
+        child is alive and still driving its own loop, which is what the silence-based watchdogs measure. A
+        booting child in particular cannot heartbeat (its main loop has not started) and cannot change state,
+        so without this its whole cold start reads as one unbroken silence.
+        """
+        self[process_id].last_received_timestamp = time.time()
+
     def on_last_job_reference_change(
         self,
         process_id: int,

@@ -1531,6 +1531,33 @@ def test_stuck_starting_safety_arms_replacement() -> None:
     assert plm.safety_processes_should_be_replaced is True
 
 
+def test_a_booting_slot_that_beats_is_not_reaped_as_stuck_starting() -> None:
+    """A cold start longer than ``preload_timeout`` survives as long as the child keeps reporting in.
+
+    The child has no heartbeat and no intermediate state to announce while it initialises, so its only
+    liveness signal is a repeat of ``PROCESS_STARTING``. Without counting that, a slow cold start is reaped
+    and respawned into the same window, and the slot never reaches the point where it can serve work.
+    """
+    booting = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+    booting.last_received_timestamp = time.time() - 1000
+    booting.last_heartbeat_timestamp = time.time() - 1000
+    process_map = ProcessMap({1: booting})
+    plm = _make_plm(process_map=process_map)
+    replace = Mock()
+    plm._replace_inference_process = replace  # type: ignore[method-assign]
+
+    assert plm._check_and_replace_process(booting, 150.0, HordeProcessState.PROCESS_STARTING, "stuck") is True, (
+        "a slot that has genuinely gone silent while starting is still reaped"
+    )
+    replace.assert_called_once()
+
+    replace.reset_mock()
+    process_map.note_liveness_report(1)
+
+    assert plm._check_and_replace_process(booting, 150.0, HordeProcessState.PROCESS_STARTING, "stuck") is False
+    replace.assert_not_called()
+
+
 def test_stuck_utilities_lane_arms_its_replacement() -> None:
     """A utilities lane meeting a timeout condition must actually be replaced, not just announced.
 

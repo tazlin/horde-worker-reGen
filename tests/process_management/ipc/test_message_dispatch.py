@@ -549,6 +549,47 @@ class TestInferenceStartingIsTypeScoped:
             dispatcher._handle_process_state_change(self._inference_starting_message(0))
 
 
+class TestBootProgressBeatKeepsASlotAlive:
+    """A child that repeats its current state is reporting liveness, and the parent must count it as such.
+
+    A booting inference child cannot heartbeat (its main loop has not started) and has no intermediate state
+    to announce, so its whole cold start is one silence to the parent's watchdogs. Its only available signal
+    is a repeat of ``PROCESS_STARTING``, which the dispatcher used to drop before any timestamp was touched:
+    a cold start slower than ``preload_timeout`` was then reaped and respawned into the same window.
+    """
+
+    def _starting_message(self, process_id: int) -> HordeProcessStateChangeMessage:
+        return HordeProcessStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            process_state=HordeProcessState.PROCESS_STARTING,
+            info="Loading model managers",
+        )
+
+    def test_a_repeated_state_report_refreshes_the_liveness_stamp(self) -> None:
+        """The report carries no transition, but it advances the silence clock the watchdogs read."""
+        booting = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+        booting.last_received_timestamp = time.time() - 1000
+        dispatcher = _make_dispatcher(process_map=ProcessMap({1: booting}))
+
+        dispatcher._handle_process_state_change(self._starting_message(1))
+
+        assert time.time() - booting.last_received_timestamp < 5.0
+        assert booting.last_process_state == HordeProcessState.PROCESS_STARTING
+
+    def test_the_state_transition_side_effects_are_still_skipped(self) -> None:
+        """Only the liveness stamp moves: a repeat is not a transition and must not restart the state clock."""
+        booting = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+        booting.last_received_timestamp = time.time() - 1000
+        state_started_at = time.time() - 1000
+        booting.last_process_state_started_at = state_started_at
+        dispatcher = _make_dispatcher(process_map=ProcessMap({1: booting}))
+
+        dispatcher._handle_process_state_change(self._starting_message(1))
+
+        assert booting.last_process_state_started_at == state_started_at
+
+
 class TestHandleInferenceResult:
     """Tests for _handle_inference_result."""
 
