@@ -77,16 +77,28 @@ The `execute_arbiter_commands` receipt returns exactly the pauses whose actuator
 borrow restores only a pause it truly acquired, never a same-owner pause an independent episode already held. A
 conservative self-heal backstop in the governor tick reclaims any reclaim-ladder lane pause that has outlived
 both owners (no live episode, no borrow receipt) once the card has been debounced-`HEALTHY`, so a lost claimant
-can never strand a lane off the GPU indefinitely.
+can never strand a lane off the GPU indefinitely. The recovery coordinator's constructive remedy takes its lane
+pauses through the same actuator, so the lifecycle records the ladder as their owner while the coordinator holds
+the receipt: the backstop consults that claim too, or it would read a live remedy as an orphan, lift the pause
+inside the remedy's yield window, and cold-start the lane process on every re-issue.
 
-A live-context reduction is the episode's other restore obligation, and it strands differently. Its only
-responsible restore is that same LIFO unwind, which runs on `HEALTHY`; a card that leaves saturation but settles
-below the soft floor never reaches it, so the pool stays at emergency depth and the worker serves at reduced
-concurrency long after the pressure that bought the reduction. A second backstop in the governor tick closes
-that: while the card is no longer `SATURATED` and an episode still owes a reduction, it regrows the pool through
-the same actuator the unwind uses once that has held for the same debounce interval. It arms only off
-saturation, so a card the ladder is still working keeps the contexts it reclaimed and a card that dips and
-re-saturates restarts the clock. The actuator stands down while a whole-card residency owns the pool (that
+A live-context reduction is the episode's other restore obligation, and it unwinds on different terms because
+undoing it costs a process cold start. Regrowing the pool on the first `HEALTHY` sample after a reduction reads
+the reduction's own success as evidence the pressure has passed: the freed per-context VRAM is *why* the card is
+healthy, so the regrowth re-inflates the footprint, the head whose rejected peak bought the reduction is
+rejected again, and the pair oscillates at one cold start per cycle. The unwind therefore takes the reduction
+only once the card has been continuously `HEALTHY` for a dwell and no head of queue is still parked, and the
+reduction itself is rate-limited per card so a head that re-asks every cycle cannot buy one teardown per cycle.
+Lane rungs keep the plain LIFO behaviour.
+
+The reduction's only responsible restore is that same LIFO unwind, which runs on `HEALTHY`; a card that leaves
+saturation but settles below the soft floor never reaches it, so the pool stays at emergency depth and the
+worker serves at reduced concurrency long after the pressure that bought the reduction. A second backstop in the
+governor tick closes that: while the card is no longer `SATURATED` and an episode still owes a reduction, it
+regrows the pool through the same actuator the unwind uses once that has held for the same debounce interval. It
+arms only off saturation, so a card the ladder is still working keeps the contexts it reclaimed and a card that
+dips and re-saturates restarts the clock, and it holds like the unwind while a head of queue is still parked, so
+the debounce cannot discharge an obligation the dwell is deliberately retaining. The actuator stands down while a whole-card residency owns the pool (that
 residency's own restore owns the regrowth), and the obligation is discharged only when the actuator reports it
 acted, so a stood-down card is retried rather than left shrunk.
 
@@ -284,6 +296,13 @@ measured admission. If the candidate does not physically fit (or
 the requester is not the head), the disposition is `DEFER` and the `admission_foreign_pressure_defers` counter
 advances. The dispatch-reconciliation gate plumbs the same truth, presenting `is_head_of_queue=False` for a
 line-skip dispatch and retaining head protection except for that preparation-only pending state.
+
+Head protection is bounded. Reserving physical room for a head is only worth its cost while the head is
+converging on a dispatch; a head whose own admission keeps declining otherwise holds an idle card against
+siblings that measurably fit, for as long as the queue lasts, and the worker serves nothing. Once the head has
+been parked past its protection window without dispatching, the gate stops presenting its outstanding demand, a
+fitting sibling is admitted, and the release is disclosed and recorded as a dispatch decision. The head keeps
+its queue position and first claim on the next opportunity.
 
 The "foreign" label is earned, not assumed. Before a non-fitting head is charged to foreign pressure, the
 arbiter separates a shortfall the worker can itself reclaim: a head whose deficit is held by its own idle

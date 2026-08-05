@@ -113,9 +113,10 @@ same line many times per second. The exporter therefore **coalesces** a decision
 So a sustained hold reads as one opening record, occasional heartbeats, and one resolution, not a flood.
 `first_seen_ts` marks when the current unresolved condition first appeared.
 
-`decision_kind` is one of `vram_admission`, `inference_dispatch`, `pp_deferral`, or `reclaim_rung`;
-`verdict` is one of `admit`, `defer`, `deny`, `withhold`, `freed`, or `no_op` (the last three of which are
-*resolving*).
+`decision_kind` is one of `vram_admission`, `inference_dispatch`, `pp_deferral`, `reclaim_rung`, or
+`image_utilities_routing`; `verdict` is one of `admit`, `defer`, `deny`, `withhold`, `freed`, or `no_op` (the
+last three of which are *resolving*). Preload admission records under `vram_admission`, carrying the gate's
+decision and its reason, so a head that never loads can be attributed offline without a log.
 
 ## Stats tab: the Model pool section
 

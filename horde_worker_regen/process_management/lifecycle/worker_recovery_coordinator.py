@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.lifecycle.recovery_supervisor import 
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     LANE_PAUSE_RUNG_KINDS,
     ReclaimRung,
+    ReclaimRungKind,
     build_reclaim_ladder,
     execute_reclaim_rung,
     restore_reclaim_rung,
@@ -49,6 +50,16 @@ class RecoveryDisposition(enum.Enum):
 
     RESTART_PROCESS = enum.auto()
     """A relauncher is available; finish bounded cleanup and leave the process with failure status."""
+
+
+_MIN_CONSTRUCTIVE_RUNG_MB = 1.0
+"""Smallest promised free that makes a reclaim rung worth issuing as a constructive remedy.
+
+A rung is priced from its tenant's measured give-back (a resident model's footprint, a process's reclaimable
+reservation, a lane's context charge plus reservations), so one that promises essentially nothing has nothing
+to return, and issuing it waits out a settling window against an unchanged resource condition. Lane rungs
+always carry at least their stopped process's CUDA-context charge, so in practice this skips unmeasured or
+empty tenants, never a lane with a context to give back."""
 
 
 class WorkerRecoveryCoordinator:
@@ -1144,6 +1155,11 @@ class WorkerRecoveryCoordinator:
                 return None
             rung = ladder[self.reclaim_cursor]
             self.reclaim_cursor += 1
+            # A rung that promises nothing frees nothing, so spending a settling window on it is
+            # indistinguishable from doing nothing while the wedge stands. Skip to a rung that can actually
+            # change the resource condition.
+            if rung.promised_freed_mb < _MIN_CONSTRUCTIVE_RUNG_MB:
+                continue
             if not execute_reclaim_rung(rung, self._inference_scheduler):
                 continue
             self.reclaim_rungs_issued_in_allotment += 1
@@ -1179,6 +1195,16 @@ class WorkerRecoveryCoordinator:
         episode's total stays bounded by the frozen list.
         """
         self.reclaim_rungs_issued_in_allotment = 0
+
+    def holds_lane_pause(self, kind: ReclaimRungKind) -> bool:
+        """Whether this coordinator's own remedy is currently holding a lane pause of ``kind``.
+
+        The pause is taken through the reclaim-ladder actuator, so the lifecycle records it under the ladder's
+        owner. Without this the ladder's stranded-pause backstop reads a live recovery remedy as an orphan and
+        restores it, which both defeats the remedy inside its yield window and restarts the lane process each
+        time the remedy is re-issued. :meth:`restore_reclaimed_lanes` remains the responsible restore.
+        """
+        return any(rung.kind is kind for rung in self.reclaim_paused_lanes)
 
     def restore_reclaimed_lanes(self) -> None:
         """Restart every lane this episode's rungs paused, in reverse issue order.

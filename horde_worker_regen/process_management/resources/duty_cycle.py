@@ -68,6 +68,9 @@ _CHURN_LABELS = {
     "model_swap": "model swaps",
     "vram_eviction": "VRAM evictions",
     "process_cycle": "process cycles",
+    "context_reduction": "context reductions",
+    "context_restore": "context regrowths",
+    "lane_cycle": "lane cycles",
 }
 """Human-friendly names for the between-jobs reload/respawn churn counts shown on the duty line."""
 

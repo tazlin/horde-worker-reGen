@@ -255,6 +255,58 @@ def test_post_processing_lane_rung_is_available_when_lane_is_enabled() -> None:
     assert any(candidate.kind is ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
 
 
+def test_lane_pause_promises_its_context_charge_even_with_an_empty_allocator() -> None:
+    """An idle lane with no allocator reservation still promises its CUDA-context give-back.
+
+    A lane pause stops the lane's process, and the context VRAM returns only with the process, so a lane rung
+    priced from the allocator reservation alone would read zero and be skipped as non-constructive while a
+    real give-back stands behind it.
+    """
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = None  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    lane = next(candidate for candidate in candidates.lanes if candidate.kind is ReclaimRungKind.PAUSE_PP_LANE)
+    assert lane.promised_mb == scheduler.resolved_context_constant_mb()
+    assert lane.promised_mb > 0.0
+
+
+def test_lane_pause_promises_its_reservation_plus_its_context_charge() -> None:
+    """A measured lane reservation is charged on top of the context constant, not instead of it."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    lane = next(candidate for candidate in candidates.lanes if candidate.kind is ReclaimRungKind.PAUSE_PP_LANE)
+    assert lane.promised_mb == scheduler.resolved_context_constant_mb() + 1288.0
+
+
 def test_busy_post_processing_lane_is_not_a_pause_rung() -> None:
     """A lane actively post-processing image work is not reclaimable as an idle lane."""
     post_process = make_mock_process_info(

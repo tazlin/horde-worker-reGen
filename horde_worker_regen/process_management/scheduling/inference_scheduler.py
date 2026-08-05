@@ -198,6 +198,19 @@ class LatestPreloadAdmission:
     """Worker wall-clock time when the decision was recorded."""
 
 
+_PRELOAD_ADMISSION_VERDICTS: dict[AdmissionDecision, DecisionVerdict] = {
+    AdmissionDecision.ADMIT: DecisionVerdict.ADMIT,
+    AdmissionDecision.ALREADY_LOADED: DecisionVerdict.NO_OP,
+    AdmissionDecision.QUARANTINED: DecisionVerdict.DENY,
+    AdmissionDecision.UNSERVICEABLE: DecisionVerdict.DENY,
+    AdmissionDecision.NEXT_JOB: DecisionVerdict.WITHHOLD,
+    AdmissionDecision.STOP_PASS: DecisionVerdict.WITHHOLD,
+}
+"""Preload-admission decisions whose recorded verdict is not a plain defer.
+
+Only the resolving and terminal decisions are mapped: everything else holds the job for a later cycle and
+records as ``DEFER``, which is what the coalescing recorder collapses while the hold persists."""
+
 _STAGING_ENCODE_VRAM_MB = 2048.0
 """VRAM a staged (dispatched but not-yet-cleared) job actually charges the device under the clearance
 lease: the text-encoder footprint plus the conditioning working set for the largest supported family
@@ -393,6 +406,24 @@ never reported; only a head that has been parked this long, with nothing dispatc
 _DISPATCH_STALL_LOG_INTERVAL_SECONDS = 30.0
 """Minimum gap between repeats of the dispatch-stall diagnostic for an unchanged reason, so the
 sub-second control loop cannot spam it. A changed reason logs immediately (the stall's cause shifted)."""
+
+_CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS = 60.0
+"""Minimum gap between live-context reductions on one card.
+
+Each reduction costs the cold start of the process it stops plus the cold start of the regrowth that unwinds
+it, and the head whose peak was rejected asks again every scheduling cycle. Rate-limiting the relief keeps a
+head that cannot be admitted from buying one teardown per cycle; it does not change what the reduction does
+when it is taken. Paired with the restore dwell, so a reduction and its regrowth cannot chase each other."""
+
+_HEAD_PROTECTION_MAX_STARVE_SECONDS = 120.0
+"""How long a parked head may reserve card room from the jobs behind it before the reservation is released.
+
+Head protection holds physical room so the head, not a line-skipper, gets the next opportunity. That is only
+worth its cost while the head is actually converging on a dispatch: a head whose own admission keeps
+declining otherwise holds an idle card against fitting siblings for as long as the queue lasts, and the
+worker serves nothing at all. Set well above the ordinary drain of an in-flight job (the wait the protection
+exists to cover) so a normal handoff never trips it, and far below the horizon at which a stalled queue
+starts missing the horde's dispatch deadlines."""
 
 _WHOLE_CARD_ESTABLISH_GRACE_SECONDS = 120.0
 """How long after a whole-card residency is established the worker may keep the queue intentionally held
@@ -644,10 +675,11 @@ class InferenceScheduler:
     _vram_budget: VramBudget
     _ram_budget: RamBudget
     _reserve_ledger: CommittedReserveLedger
-    _vram_budget_defer_notified: bool
     _ram_budget_defer_notified: bool
     _ram_pressure_notified: bool
     _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
+    _last_budget_defer_reason: str | None
+    _context_reduction_at: dict[int | None, float]
     _last_preload_admission: LatestPreloadAdmission | None
     _post_processing_lane_commitments_provider: Callable[[], int]
     _pool_protected_models_provider: Callable[[], frozenset[str]]
@@ -914,9 +946,10 @@ class InferenceScheduler:
         self._vram_budget = VramBudget(reserve_mb=_DEFAULT_VRAM_RESERVE_MB)
         self._ram_budget = RamBudget(reserve_mb=_DEFAULT_RAM_RESERVE_MB)
         self._reserve_ledger = reserve_ledger if reserve_ledger is not None else CommittedReserveLedger()
-        self._vram_budget_defer_notified = False
         self._ram_budget_defer_notified = False
         self._ram_pressure_notified = False
+        self._last_budget_defer_reason = None
+        self._context_reduction_at = {}
         # Credited RAM admissions awaiting the measured-truth reconciliation, keyed by target process id.
         self._pending_reuse_credits: dict[int, _ReuseCreditRecord] = {}
         # Last credited-admission log key, so an unchanged credited admit is not re-logged (edge-triggered).
@@ -1540,8 +1573,8 @@ class InferenceScheduler:
 
         The measured per-additional-context marginal when the overhead model has one, else the platform seed
         (243 MB Windows / 144 MB Linux / the generic fallback), resolved by
-        :func:`platform_context_constant_mb`. Consumed by the observational committed-VRAM ledger and drift
-        reconciliation, not by admission.
+        :func:`platform_context_constant_mb`. Consumed by the observational committed-VRAM ledger, drift
+        reconciliation, and reclaim-ladder lane pricing, not by admission.
         """
         return platform_context_constant_mb(self._marginal_process_overhead_mb())
 
@@ -2973,8 +3006,7 @@ class InferenceScheduler:
         device_index: int | None,
     ) -> bool:
         """Return whether a ready queue head on this card should preempt a drained residency cooldown."""
-        in_progress = set(self._job_tracker.jobs_in_progress)
-        head = next((job for job in self._job_tracker.jobs_pending_inference if job not in in_progress), None)
+        head = self._undispatched_head()
         if head is None or head.model is None or head.model == residency_model:
             return False
         process_info = self._resident_process_for_job(head)
@@ -3037,6 +3069,13 @@ class InferenceScheduler:
             return 0.0
         return time.time() - self._head_starvation_since
 
+    def _undispatched_head(self) -> ImageGenerateJobPopResponse | None:
+        """Return the first queued job no process is running yet (the head of queue), or None when there is none."""
+        return next(
+            (job for job in self._job_tracker.jobs_pending_inference if job not in self._job_tracker.jobs_in_progress),
+            None,
+        )
+
     def head_model_materializing(self) -> bool:
         """Return whether the head-of-queue inference job's model is actively loading onto an idle pool.
 
@@ -3052,8 +3091,7 @@ class InferenceScheduler:
             return False
         if self._process_map.has_inference_in_progress():
             return False
-        in_progress = set(self._job_tracker.jobs_in_progress)
-        head = next((job for job in pending if job not in in_progress), None)
+        head = self._undispatched_head()
         if head is None or head.model is None:
             return False
         return self._horde_model_map.is_model_loading(head.model) or self._model_recently_missing
@@ -3172,9 +3210,18 @@ class InferenceScheduler:
                     f"{nonhead_residency_model!r}: the card is reserved for that model and its siblings were "
                     f"torn down, so this head cannot load until that residency restores" + affinity_suffix
                 )
+            # Quote the admission gate's own verdict rather than pointing at budget lines that may not exist:
+            # the defer notice is coalesced on an unchanged reason, so a head that has been declined for the
+            # same arithmetic all along has no live line to read. The record is only quoted when it names this
+            # head's model, since it holds the most recent decision for any job.
+            admission = self._last_preload_admission
+            if admission is not None and admission.model == head.model and admission.reason:
+                return SlotDutyBucket.PRELOAD_DEFERRED, (
+                    f"its model is not resident and its preload was declined ({admission.decision.value}): "
+                    f"{admission.reason}" + affinity_suffix
+                )
             return SlotDutyBucket.PRELOAD_DEFERRED, (
-                "its model is not resident and no preload has been admitted "
-                "(usually a VRAM/RAM budget defer; see the budget lines above)" + affinity_suffix
+                "its model is not resident and no preload has been attempted for it this cycle" + affinity_suffix
             )
         if not process.can_accept_job():
             return SlotDutyBucket.RESIDENT_SLOT_BUSY, (
@@ -3386,10 +3433,7 @@ class InferenceScheduler:
         between-jobs gap is silent), then at most once per :data:`_DISPATCH_STALL_LOG_INTERVAL_SECONDS` for an
         unchanged reason. Read-only: it explains the stall, it does not change scheduling.
         """
-        head = next(
-            (j for j in self._job_tracker.jobs_pending_inference if j not in self._job_tracker.jobs_in_progress),
-            None,
-        )
+        head = self._undispatched_head()
         if head is None or self._head_starved_seconds(head) < _DISPATCH_STALL_MIN_SECONDS:
             return
         try:
@@ -3452,7 +3496,7 @@ class InferenceScheduler:
                 hold = SlotDutyBucket.CLEARANCE_HOLD
                 waiting = primed_count
             else:
-                head = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress), None)
+                head = self._undispatched_head()
                 waiting = len(self._job_tracker.jobs_pending_inference) - len(in_progress)
                 if head is not None and busy < capacity:
                     try:
@@ -3470,7 +3514,7 @@ class InferenceScheduler:
             return
 
         busy = len(in_progress)
-        head = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress), None)
+        head = self._undispatched_head()
         waiting = len(self._job_tracker.jobs_pending_inference) - busy
 
         hold = None
@@ -6139,6 +6183,11 @@ class InferenceScheduler:
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
 
+        # Each return below names why it declined, so the recorded admission decision (and the dispatch-stall
+        # line that quotes it) carries the deciding arithmetic instead of the generic gate label. Cleared per
+        # call so a later decline can never inherit an earlier one's reason.
+        self._last_budget_defer_reason = None
+
         baseline = self._model_metadata.get_baseline(job.model)
         target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
         # A head waiting behind live work is queued, not starved. With no live job holding this card, the
@@ -6153,6 +6202,7 @@ class InferenceScheduler:
         # holding new inference off the card (and nudging idle reclaim toward it) is the only way the card
         # drains enough for the safety pool to come up. Held whatever the arbiter's own verdict would be.
         if self._safety_recovery_hold_active(target_device_index):
+            self._last_budget_defer_reason = "the card is held for a safety pool whose GPU start is deferred"
             return False
 
         forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
@@ -6169,6 +6219,7 @@ class InferenceScheduler:
             target_device_index=target_device_index,
         )
         if whole_card is _WholeCardDemandOutcome.DEFER:
+            self._last_budget_defer_reason = "a whole-card residency demand for this model is deferred"
             return False
         if whole_card is _WholeCardDemandOutcome.PRESTAGE:
             # A RAM-only pre-stage of a whole-card head: the VRAM budget deliberately does not fit it
@@ -6222,7 +6273,6 @@ class InferenceScheduler:
         verdict = arbiter.evaluate(request)
 
         if verdict.disposition is VramDisposition.FITS:
-            self._vram_budget_defer_notified = False
             if verdict.measured_attempt:
                 self._mark_measured_attempt(job, request, device_index=target_device_index)
             # A FITS is a real fit against the truthful device-free reading (the identity already accounts for
@@ -6256,12 +6306,22 @@ class InferenceScheduler:
         # head that stays deferred while the device is idle is rerouted by the structural-queue-wedge recovery
         # supervisor, and the arbiter emits a starvation diagnostic naming the arithmetic before then.
         # Completion is observed via the next cycle's frozen snapshot; the actuations are never awaited inline.
-        if not self._vram_budget_defer_notified and not vram_verdict.fits:
+        # Emitted whatever the predictive forecast said. A defer against a candidate the static forecast calls
+        # a fit is the case most worth naming: the arithmetic the arbiter objects to is then visible nowhere
+        # else, and a head can sit deferred behind it for as long as the queue holds. Coalesced on the reason
+        # rather than latched, so a changed objection always speaks and an unchanged one is counted.
+        self._last_budget_defer_reason = verdict.reason
+        suppressed = self._scheduler_diagnostic_suppressed_count(
+            "preload_budget_defer",
+            (str(job.model), verdict.disposition.value, verdict.reason),
+        )
+        if suppressed is not None:
+            forecast_note = "" if not vram_verdict.fits else " (the static forecast calls this a fit)"
             logger.opt(colors=True).warning(
-                f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.reason}. Reclaiming idle VRAM.</>",
+                f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.reason}{forecast_note}. "
+                f"Reclaiming idle VRAM.{self._suppressed_suffix(suppressed)}</>",
                 job.model,
             )
-            self._vram_budget_defer_notified = True
         self._preload_actuation = _PreloadActuation(
             job=job,
             available_process=available_process,
@@ -6514,8 +6574,17 @@ class InferenceScheduler:
         skipper when admitting it would leave the card short of the room the head needs. None (an unpriceable
         head, or a model-less one) skips the protection rather than fabricating a figure, degrading to admitting
         the skipper.
+
+        Head protection is also released once the head has been parked past
+        :data:`_HEAD_PROTECTION_MAX_STARVE_SECONDS` without dispatching. Reserving room for a head is only
+        worth anything if the head eventually takes it: a head whose own admission keeps declining holds the
+        card empty while runnable siblings that fit are turned away, which serves nobody. The head keeps its
+        queue position and first claim on the next opportunity; it simply stops blocking work in the meantime.
         """
         if displaced_head.model is None:
+            return None
+        if self._head_starved_seconds(displaced_head) >= _HEAD_PROTECTION_MAX_STARVE_SECONDS:
+            self._note_head_protection_released(displaced_head)
             return None
         baseline = self._model_metadata.get_baseline(displaced_head.model)
         return self._measured_admission_candidate_delta_mb(
@@ -6523,6 +6592,37 @@ class InferenceScheduler:
             baseline,
             process_id=None,
             disaggregated=self._is_disaggregation_class_eligible(displaced_head),
+        )
+
+    def _note_head_protection_released(self, head: ImageGenerateJobPopResponse) -> None:
+        """Disclose that a starved head has stopped reserving room from the jobs behind it."""
+        if head.id_ is None:
+            return
+        starved_seconds = self._head_starved_seconds(head)
+        if self._decision_sink is not None:
+            self._decision_sink(
+                decision_kind=DecisionKind.INFERENCE_DISPATCH,
+                subject=str(head.id_),
+                verdict=DecisionVerdict.NO_OP,
+                reason="head protection released: the head has not dispatched within its protection window",
+                inputs={
+                    "model": str(head.model),
+                    "starved_seconds": round(starved_seconds, 1),
+                },
+            )
+        suppressed = self._scheduler_diagnostic_suppressed_count(
+            "head_protection_released",
+            (str(head.id_),),
+        )
+        if suppressed is None:
+            return
+        logger.opt(colors=True).warning(
+            "<fg #ff8c69>Head {} ({}) has been parked {:.0f}s without dispatching, so it no longer reserves "
+            "card room from the jobs behind it; a fitting sibling may dispatch. The head keeps its queue "
+            f"position.{self._suppressed_suffix(suppressed)}</>",
+            str(head.id_)[:8],
+            head.model,
+            starved_seconds,
         )
 
     def _context_reduction_demand(
@@ -6729,8 +6829,9 @@ class InferenceScheduler:
         grown back when the card recovers (:meth:`restore_live_contexts`) rather than leaving the worker at
         emergency depth for the rest of the session.
 
-        A no-op when no head-preload context is recorded, the target could not be sized, or the command is
-        stale and the live pool is already at or below its target.
+        A no-op when no head-preload context is recorded, the target could not be sized, the command is stale
+        and the live pool is already at or below its target, or another reduction on this card is still inside
+        :data:`_CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS`.
         """
         actuation = self._preload_actuation
         if actuation is None:
@@ -6738,6 +6839,11 @@ class InferenceScheduler:
         target = actuation.max_resident
         live_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
         if target is None or target >= live_processes:
+            return False
+        # A head re-asks every cycle, so without a floor on the rate one rejected peak can buy a reduction per
+        # cycle: each costs a cold start, and the pool it shrinks is regrown between them.
+        last_reduction = self._context_reduction_at.get(device_index)
+        if last_reduction is not None and (time.time() - last_reduction) < _CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS:
             return False
         # The head's own holder is the process the reduction is making room for, so it is named here to spare
         # it and to drop the "spare any process whose model is queued" protection, which would otherwise let a
@@ -6755,6 +6861,10 @@ class InferenceScheduler:
         )
         if self._reclaim_ladder is not None:
             self._reclaim_ladder.record_context_reduction(device_index)
+        # Stamped only once the reduction has actually been taken, so a bail-out added above can never charge
+        # the rate limit for a reduction that did not happen.
+        self._context_reduction_at[device_index] = time.time()
+        self._record_churn("context_reduction")
         logger.info(
             f"Reclaiming live inference contexts for {actuation.job.model} "
             f"(inference processes {live_processes} -> {after} of {self._max_inference_processes}, target "
@@ -6779,6 +6889,7 @@ class InferenceScheduler:
             return False
         after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
         self._reconcile_worker_shed_to_pool()
+        self._record_churn("context_restore")
         logger.info(
             f"Card recovered; restoring the inference contexts reclaimed under pressure "
             f"({current} -> {after} of {ceiling}).",
@@ -6805,8 +6916,9 @@ class InferenceScheduler:
         reclaimable-cache targets reuse the arbiter's release-cache selection (idle processes whose reservation
         exceeds allocation by the release threshold, holding no model). Lane and safety candidates are included
         only while their context is on the GPU, in the fixed pause order the ladder escalates through.
-        Promised-free figures are the tenants' measured reservations where known, so verification compares
-        realized frees against measured expectations.
+        Promised-free figures are the tenants' measured reservations where known; lane pauses additionally
+        charge each stopped process's CUDA-context constant, since stopping the process is what returns that
+        VRAM. Verification compares realized frees against these expectations.
         """
         now_monotonic = time.monotonic()
         now_wall = time.time()
@@ -6928,7 +7040,7 @@ class InferenceScheduler:
                 LaneReclaimCandidate(
                     kind=ReclaimRungKind.PAUSE_PP_LANE,
                     tenant_label="post-processing lane",
-                    promised_mb=self._reserved_mb_for_type(HordeProcessType.POST_PROCESS, device_index),
+                    promised_mb=self._lane_promised_free_mb(HordeProcessType.POST_PROCESS, device_index),
                 ),
             )
         if (
@@ -6941,7 +7053,7 @@ class InferenceScheduler:
                 LaneReclaimCandidate(
                     kind=ReclaimRungKind.PAUSE_VAE_LANE,
                     tenant_label="VAE lane",
-                    promised_mb=self._reserved_mb_for_type(HordeProcessType.VAE_LANE, device_index),
+                    promised_mb=self._lane_promised_free_mb(HordeProcessType.VAE_LANE, device_index),
                 ),
             )
         if (
@@ -6954,7 +7066,7 @@ class InferenceScheduler:
                 LaneReclaimCandidate(
                     kind=ReclaimRungKind.PAUSE_COMPONENT_LANE,
                     tenant_label="component lane",
-                    promised_mb=self._reserved_mb_for_type(HordeProcessType.COMPONENT, device_index),
+                    promised_mb=self._lane_promised_free_mb(HordeProcessType.COMPONENT, device_index),
                 ),
             )
         return tuple(lanes)
@@ -6975,6 +7087,26 @@ class InferenceScheduler:
             tenant_label="safety",
             promised_mb=reserved_mb if reserved_mb > 0 else self._safety_footprint_mb(),
         )
+
+    def _lane_promised_free_mb(self, process_type: HordeProcessType, device_index: int | None) -> float:
+        """Price a lane pause's promised free as each live process's context charge plus its reservation.
+
+        A lane pause stops the lane's process off the GPU, so the give-back is the process's full device
+        footprint (``context_constant + process_reserved_mb``), not the allocator reservation alone: an idle
+        lane whose allocator is empty still returns its CUDA context. Priced with the same resolved context
+        constant the committed-VRAM ledger charges, so a lane rung never promises zero while a real context
+        give-back stands behind it; where the driver has already demoted the context, the shortfall surfaces
+        through the ladder's promised-vs-realized verification instead of a silent zero promise.
+        """
+        context_constant_mb = self.resolved_context_constant_mb()
+        total_mb = 0.0
+        for process_info in self._process_map.values():
+            if process_info.process_type != process_type:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            total_mb += context_constant_mb + float(process_info.process_reserved_mb or 0)
+        return total_mb
 
     def _reserved_mb_for_type(self, process_type: HordeProcessType, device_index: int | None) -> float:
         """Sum the measured device reservation (MB) of a process type's live processes on a card."""
@@ -7066,7 +7198,9 @@ class InferenceScheduler:
 
     def pause_post_process_lane(self, device_index: int | None) -> bool:
         """Pause the post-processing lane off the GPU to reclaim its context (reclaim-ladder actuator)."""
-        return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+        return self._note_lane_cycle(
+            self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+        )
 
     def pause_vae_lane(self, device_index: int | None) -> bool:
         """Pause the VAE lane off the GPU to reclaim its context (reclaim-ladder actuator).
@@ -7089,11 +7223,21 @@ class InferenceScheduler:
                 )
             return False
         self._vae_pause_deferred_for_decode = False
-        return self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+        return self._note_lane_cycle(self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER))
 
     def pause_component_lane(self, device_index: int | None) -> bool:
         """Pause the component lane off the GPU to reclaim its context (reclaim-ladder actuator)."""
-        return self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+        return self._note_lane_cycle(self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER))
+
+    def _note_lane_cycle(self, paused: bool) -> bool:
+        """Count a service-lane pause that acted as churn, passing the actuator's answer through.
+
+        Only a pause that acted costs anything: the lane is stopped now and cold-starts when it is restored,
+        so the pause is the countable event and its restore is the second half of the same cycle.
+        """
+        if paused:
+            self._record_churn("lane_cycle")
+        return paused
 
     def safety_off_gpu(self, device_index: int | None) -> bool:
         """Move the on-GPU safety context off the card to reclaim it (reclaim-ladder actuator).
@@ -7247,13 +7391,31 @@ class InferenceScheduler:
         process: HordeProcessInfo | None = None,
         reason: str = "",
     ) -> None:
-        """Remember one preload-admission decision for operator diagnostics."""
+        """Remember one preload-admission decision for operator diagnostics, and record it as a decision.
+
+        The stored record answers "why is this head not loading?" for the status surfaces; the decision event
+        gives the same answer to offline analysis, which previously saw nothing at all from this gate. The
+        sink coalesces repeats, so a head declined for the same reason every cycle costs one event.
+        """
         self._last_preload_admission = LatestPreloadAdmission(
             decision=decision,
             model=job.model if job is not None else None,
             process_id=process.process_id if process is not None else None,
             reason=reason,
             timestamp=time.time(),
+        )
+        if self._decision_sink is None or job is None or job.id_ is None:
+            return
+        self._decision_sink(
+            decision_kind=DecisionKind.VRAM_ADMISSION,
+            subject=str(job.id_),
+            verdict=_PRELOAD_ADMISSION_VERDICTS.get(decision, DecisionVerdict.DEFER),
+            reason=reason or decision.value,
+            inputs={
+                "model": str(job.model),
+                "decision": decision.value,
+                "process_id": process.process_id if process is not None else None,
+            },
         )
 
     def _preload_outcome(
@@ -7486,7 +7648,10 @@ class InferenceScheduler:
             is_head_blocker=is_head_blocker,
         ):
             return self._preload_outcome(
-                AdmissionDecision.DEFER_BUDGET, job=job, process=available_process, reason="VRAM/RAM budget gate"
+                AdmissionDecision.DEFER_BUDGET,
+                job=job,
+                process=available_process,
+                reason=self._last_budget_defer_reason or "VRAM/RAM budget gate",
             )
 
         if self._send_preload(job, available_process):
@@ -9120,10 +9285,16 @@ class InferenceScheduler:
             (str(next_job.id_), verdict.disposition.value),
         )
         if suppressed is not None:
+            # Only claim the eviction when one was actually requested. A head-protection hold describes no
+            # actuations at all (it is withholding room, not reclaiming it), and announcing a reclaim that
+            # never runs sends the operator looking for an eviction that was never going to happen.
+            reclaim_note = (
+                " Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM."
+                if outcome.actuations_requested
+                else " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
+            )
             logger.opt(colors=True).warning(
-                "<fg #f0beff>Holding dispatch of {} to reconcile residency: "
-                f"{verdict.reason}. "
-                "Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM.</>",
+                f"<fg #f0beff>Holding dispatch of {{}} to reconcile residency: {verdict.reason}.{reclaim_note}</>",
                 next_job.model,
             )
         return True
@@ -9275,6 +9446,21 @@ class InferenceScheduler:
             device_index=device_index,
             actuations_requested=bool(actuations),
         )
+
+    def head_of_queue_is_parked(self) -> bool:
+        """Whether the queue has stopped moving behind a head that is not dispatching.
+
+        The same clock the dispatch-stall diagnostic reads, exposed so resource owners can tell a card that is
+        merely idle from one whose queue is not moving. Two facts are required, because either alone is
+        ordinary: a head undispatched past the stall threshold is normal backpressure while a sibling samples,
+        and an idle pool is normal when there is nothing to serve. Together they are a queue no one is serving.
+        """
+        if self._process_map.has_inference_in_progress():
+            return False
+        head = self._undispatched_head()
+        if head is None:
+            return False
+        return self._head_starved_seconds(head) >= _DISPATCH_STALL_MIN_SECONDS
 
     def latest_dispatch_reconciliation_holds(self) -> int:
         """Return the count of dispatches held for residency reconciliation this run (calibration visibility)."""

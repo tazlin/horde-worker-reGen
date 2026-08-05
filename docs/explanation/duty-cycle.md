@@ -111,6 +111,11 @@ The second attribution counts the between-jobs reload and respawn events in the 
 - A **VRAM eviction** is an idle model unloaded to make room (see
   [model eviction](performance_and_backpressure.md#model-eviction-lru)).
 - A **process cycle** is a healthy idle process restarted to reclaim system RAM.
+- A **context reduction** is an idle inference context stopped to return the VRAM a live process retains,
+  and a **context regrowth** is its unwind. Each costs a cold start, so counts that track each other
+  closely describe an oscillation between the reduction and its restore rather than relief that held.
+- A **lane cycle** is a service lane stopped off the GPU for its context, which the lane pays for with a
+  cold start when it is restored.
 
 None of these are faults; they are the normal mechanics of fitting more models than processes onto a
 finite card. What matters is their *rate*. High churn inflates `queue_wait` and `disk_load`, so naming

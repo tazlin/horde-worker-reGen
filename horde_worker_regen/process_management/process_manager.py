@@ -169,6 +169,7 @@ from horde_worker_regen.process_management.resources.device_free_governor import
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
+    ReclaimRungKind,
     VerifiedReclaimLadder,
     build_reclaim_ladder,
 )
@@ -3431,6 +3432,7 @@ class HordeWorkerProcessManager:
                 ladder_builder=lambda dev=device_index: build_reclaim_ladder(
                     self._inference_scheduler.build_reclaim_ladder_candidates(dev),
                 ),
+                context_restore_ready=self._context_restore_ready(device_index),
             )
 
             # Defence in depth: restore a reclaim-ladder service-lane pause that has lost its restore owner (no
@@ -3469,6 +3471,31 @@ class HordeWorkerProcessManager:
     keeps it from racing those owners or lifting a lane while the card is still tight: only a pause that has
     outlived both owners on a card that no longer needs the memory is reclaimed."""
 
+    _CONTEXT_RESTORE_DWELL_SECONDS = 60.0
+    """How long a card must have been continuously HEALTHY before a live-context reduction is regrown.
+
+    A reduction frees the per-context VRAM the driver retains, which is what returns the card to HEALTHY, so
+    the first healthy sample after one is not evidence that the pressure has passed: it is evidence that the
+    reduction worked. Regrowing on it costs a full process cold start and re-creates the footprint that bought
+    the reduction, and the head that motivated it then asks again. The dwell makes the recovery prove itself
+    for a bounded interval first, and matches the debounce the stranded-reduction backstop already applies."""
+
+    def _context_restore_ready(self, device_index: int) -> bool:
+        """Whether a reclaim episode may regrow the inference pool a context reduction shrank.
+
+        Two facts must hold: the card has been continuously HEALTHY for
+        :attr:`_CONTEXT_RESTORE_DWELL_SECONDS`, and no head of queue is still parked. A parked head is the
+        demand the reduction was made for; regrowing the pool underneath it re-adds the context whose
+        footprint is part of why the head cannot be admitted, so the pair oscillates at one cold start per
+        cycle while the queue is served by nobody.
+        """
+        healthy_since = self._healthy_since_by_device.get(device_index)
+        if healthy_since is None:
+            return False
+        if (time.monotonic() - healthy_since) < self._CONTEXT_RESTORE_DWELL_SECONDS:
+            return False
+        return not self._inference_scheduler.head_of_queue_is_parked()
+
     def _reclaim_stranded_service_lane_pauses(self, device_index: int) -> None:
         """Restore a reclaim-ladder service-lane pause on ``device_index`` that has lost its restore owner.
 
@@ -3498,11 +3525,13 @@ class HordeWorkerProcessManager:
         lifecycle = self._process_lifecycle
         scheduler = self._inference_scheduler
         orchestrator = self._post_process_orchestrator
+        recovery = self._recovery_coordinator
 
         if (
             lifecycle.is_vae_lane_gpu_paused
             and lifecycle.vae_lane_pause_owner is PauseOwner.RECLAIM_LADDER
             and not orchestrator.is_service_lane_borrowed(ActuatorCommandKind.PAUSE_VAE_LANE)
+            and not recovery.holds_lane_pause(ReclaimRungKind.PAUSE_VAE_LANE)
         ):
             logger.warning(
                 f"Restoring a stranded VAE lane on device {device_index}: the reclaim ladder paused it, but no "
@@ -3515,6 +3544,7 @@ class HordeWorkerProcessManager:
             lifecycle.is_component_gpu_paused
             and lifecycle.component_pause_owner is PauseOwner.RECLAIM_LADDER
             and not orchestrator.is_service_lane_borrowed(ActuatorCommandKind.PAUSE_COMPONENT_LANE)
+            and not recovery.holds_lane_pause(ReclaimRungKind.PAUSE_COMPONENT_LANE)
         ):
             logger.warning(
                 f"Restoring a stranded component lane on device {device_index}: the reclaim ladder paused it, "
@@ -3523,7 +3553,11 @@ class HordeWorkerProcessManager:
             )
             scheduler.restore_component_lane(device_index)
 
-        if lifecycle.is_post_process_gpu_paused and lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER:
+        if (
+            lifecycle.is_post_process_gpu_paused
+            and lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+            and not recovery.holds_lane_pause(ReclaimRungKind.PAUSE_PP_LANE)
+        ):
             logger.warning(
                 f"Restoring a stranded post-processing lane on device {device_index}: the reclaim ladder paused "
                 "it, but no saturation episode still claims it and the card has been healthy.",
@@ -3542,7 +3576,11 @@ class HordeWorkerProcessManager:
         This closes that gap on the stranded-lane backstop's terms. It arms only while the card is no longer
         SATURATED, since a card the ladder is still working keeps the contexts it reclaimed, and acts once that
         has held for :attr:`_STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS`, so a card that dips and re-saturates never
-        regrows underneath the ladder. Regrowth goes through the same actuator the unwind uses, which stands
+        regrows underneath the ladder. Like the episode's own unwind, it holds while a head of queue is still
+        parked: the parked head is the demand the reduction was made for, and regrowing underneath it re-adds
+        the context whose footprint is part of why the head cannot be admitted, so acting then would discharge
+        an obligation the dwell-gated unwind is deliberately retaining and restart the oscillation the dwell
+        exists to break. Regrowth goes through the same actuator the unwind uses, which stands
         down while a whole-card residency owns the pool, and the obligation is discharged only when that
         actuator reports it acted, so a stood-down card is retried on later ticks rather than left shrunk.
 
@@ -3558,6 +3596,13 @@ class HordeWorkerProcessManager:
 
         stranded_since = self._context_reduction_stranded_since_by_device.setdefault(device_index, time.monotonic())
         if (time.monotonic() - stranded_since) < self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS:
+            return
+
+        # A parked head is the demand the reduction was made for. The episode's own unwind is holding this
+        # same obligation on that evidence, so discharging it here would bypass that gate: the regrowth
+        # re-inflates the footprint the head cannot be admitted over, and the head buys the next reduction.
+        # The clock is left armed so the regrowth runs as soon as the queue moves.
+        if self._inference_scheduler.head_of_queue_is_parked():
             return
 
         for key in outstanding:

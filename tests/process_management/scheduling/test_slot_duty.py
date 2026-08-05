@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -148,7 +149,48 @@ class TestSchedulerClassifierBuckets:
         bucket, text = scheduler._classify_dispatch_stall(head, {})
 
         assert bucket is SlotDutyBucket.PRELOAD_DEFERRED
-        assert "no preload has been admitted" in text
+        assert "no preload has been attempted" in text
+
+    async def test_preload_deferred_quotes_the_admission_gates_own_verdict(self) -> None:
+        """The stall names why the head was declined, since the defer notice coalesces on an unchanged reason.
+
+        A head declined for the same arithmetic every cycle has no live log line to read, so pointing the
+        operator at the budget lines leaves them looking for output that is not there.
+        """
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        scheduler = self._scheduler(
+            ProcessMap({1: make_mock_process_info(1, model_name=None)}), HordeModelMap(root={}), job_tracker
+        )
+        scheduler._record_preload_admission(
+            AdmissionDecision.DEFER_BUDGET,
+            job=head,
+            reason="candidate 9576 MB vs available 2472 MB: does NOT fit",
+        )
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.PRELOAD_DEFERRED
+        assert "candidate 9576 MB vs available 2472 MB: does NOT fit" in text
+
+    async def test_an_admission_record_for_another_model_is_not_quoted(self) -> None:
+        """The record holds the latest decision for any job, so it is only quoted when it names this head."""
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        scheduler = self._scheduler(
+            ProcessMap({1: make_mock_process_info(1, model_name=None)}), HordeModelMap(root={}), job_tracker
+        )
+        scheduler._record_preload_admission(
+            AdmissionDecision.DEFER_BUDGET,
+            job=make_job_pop_response(model="model-b"),
+            reason="a decision about a different model",
+        )
+
+        _bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert "a different model" not in text
 
     async def test_busy_resident_slot_classifies_resident_slot_busy(self) -> None:
         """A head whose model is resident only on a busy process prices as RESIDENT_SLOT_BUSY."""

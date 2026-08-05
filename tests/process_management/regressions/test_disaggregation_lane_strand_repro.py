@@ -30,6 +30,7 @@ from loguru import logger
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRung, ReclaimRungKind
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommandKind
 from horde_worker_regen.process_management.workers import post_process_orchestrator as pp_orchestrator_module
 from tests.process_management.regressions.test_post_process_drain_context_reclaim_repro import (
@@ -153,6 +154,39 @@ async def test_backstop_leaves_whole_card_and_borrowed_pauses_untouched(monkeypa
     assert manager2._process_lifecycle.vae_lane_pause_owner is PauseOwner.RECLAIM_LADDER
 
 
+async def test_backstop_leaves_a_recovery_remedys_own_lane_pause_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lane the recovery coordinator's constructive remedy paused has a live owner and must not be reclaimed.
+
+    The remedy takes the pause through the reclaim-ladder actuator, so the lifecycle records the ladder as its
+    owner while the coordinator holds the receipt and the responsible restore. Reading that as an orphan both
+    defeats the remedy inside its yield window and cold-starts the lane process on every re-issue.
+    """
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    coordinator = manager._recovery_coordinator
+
+    assert manager._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    coordinator.reclaim_paused_lanes.append(
+        ReclaimRung(
+            kind=ReclaimRungKind.PAUSE_PP_LANE,
+            tenant_label="post-processing lane",
+            promised_freed_mb=512.0,
+            device_index=0,
+        ),
+    )
+    manager._healthy_since_by_device[0] = time.monotonic() - (manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0)
+
+    manager._reclaim_stranded_service_lane_pauses(0)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+    assert manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+
+    # Once the remedy's own unwind has run, the receipt is gone and the backstop is free to act on a pause that
+    # really did outlive its owner.
+    coordinator.reclaim_paused_lanes.clear()
+    manager._reclaim_stranded_service_lane_pauses(0)
+    assert manager._process_lifecycle.is_post_process_gpu_paused is False
+
+
 async def test_backstop_waits_for_healthy_debounce(monkeypatch: pytest.MonkeyPatch) -> None:
     """The backstop does not lift a pause on a card that has not been HEALTHY long enough."""
     manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
@@ -220,6 +254,30 @@ async def test_stranded_context_reduction_regrows_the_pool(monkeypatch: pytest.M
     )
 
 
+async def test_context_restore_readiness_needs_a_dwell_and_a_moving_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The episode's own regrowth waits for a sustained recovery and for the head it was made for to move.
+
+    The freed VRAM is why the card reads HEALTHY, so the first healthy sample after a reduction proves only
+    that the reduction worked. Regrowing on it cold-starts a process, re-inflates the footprint, and lets the
+    same rejected head buy the next reduction: one teardown per cycle while the queue is served by nobody.
+    """
+    manager, _requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
+    manager._inference_scheduler.head_of_queue_is_parked = lambda: False  # type: ignore[method-assign]
+
+    # Never reported HEALTHY, and freshly HEALTHY: neither is a sustained recovery.
+    assert manager._context_restore_ready(0) is False
+    manager._healthy_since_by_device[0] = time.monotonic()
+    assert manager._context_restore_ready(0) is False
+
+    manager._healthy_since_by_device[0] = time.monotonic() - (manager._CONTEXT_RESTORE_DWELL_SECONDS + 5.0)
+    assert manager._context_restore_ready(0) is True
+
+    # A head that is still parked is the demand the reduction was made for; regrowing underneath it re-adds
+    # the context whose footprint is part of why it cannot be admitted.
+    manager._inference_scheduler.head_of_queue_is_parked = lambda: True  # type: ignore[method-assign]
+    assert manager._context_restore_ready(0) is False
+
+
 async def test_stranded_context_reduction_waits_for_the_backstop_debounce(monkeypatch: pytest.MonkeyPatch) -> None:
     """Below the debounce, and while the card is still saturated, the pool is left where the reclaim put it."""
     manager, requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
@@ -240,6 +298,32 @@ async def test_stranded_context_reduction_waits_for_the_backstop_debounce(monkey
     manager._restore_stranded_context_reductions(0, saturated=False)
     assert requested_targets == []
     assert manager._process_map.num_loaded_inference_processes(device_index=0) == 1
+
+
+async def test_stranded_reduction_backstop_holds_while_the_head_is_parked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The backstop must not regrow underneath a parked head, or it bypasses the unwind's own hold.
+
+    The episode's dwell-gated unwind retains the obligation while the head the reduction was made for is still
+    parked. The backstop discharges the same obligation through the same actuator, so acting on debounce alone
+    would restart the reduction/regrowth oscillation the dwell exists to break. The clock stays armed, so the
+    regrowth runs as soon as the queue moves.
+    """
+    manager, requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
+    manager._inference_scheduler.head_of_queue_is_parked = lambda: True  # type: ignore[method-assign]
+
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    manager._context_reduction_stranded_since_by_device[0] -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
+    manager._restore_stranded_context_reductions(0, saturated=False)
+
+    assert requested_targets == []
+    assert manager._reclaim_ladder.has_context_reduction(0) is True, (
+        "the obligation must survive the hold so the regrowth still has an owner once the queue moves"
+    )
+
+    manager._inference_scheduler.head_of_queue_is_parked = lambda: False  # type: ignore[method-assign]
+    manager._restore_stranded_context_reductions(0, saturated=False)
+    assert requested_targets == [2]
+    assert manager._reclaim_ladder.has_context_reduction(0) is False
 
 
 async def test_stranded_context_reduction_stands_down_under_a_whole_card_residency(

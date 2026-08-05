@@ -43,13 +43,24 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
     from horde_worker_regen.process_management.jobs.job_tracker import TrackedJob
 
-ChurnKind = Literal["model_swap", "vram_eviction", "process_cycle"]
+ChurnKind = Literal[
+    "model_swap",
+    "vram_eviction",
+    "process_cycle",
+    "context_reduction",
+    "context_restore",
+    "lane_cycle",
+]
 """A between-jobs reload/respawn event whose frequency erodes duty cycle.
 
 ``model_swap``: a preload that displaced a *different* model already resident on that process (the
 prior model's load work is thrown away). ``vram_eviction``: an idle resident model was unloaded from
 VRAM to make room. ``process_cycle``: a healthy idle inference process was deliberately restarted to
-reclaim allocator-stranded RAM. None are faults; their *rate* is the churn signal.
+reclaim allocator-stranded RAM. ``context_reduction``: an idle inference context was stopped to return the
+VRAM a live process retains, and ``context_restore`` its regrowth, which cold-starts a process; a session
+where the two counts track each other closely is an oscillation, not relief. ``lane_cycle``: a service lane
+was stopped off the GPU for its context, which costs that lane a cold start when it is restarted. None are
+faults; their *rate* is the churn signal.
 """
 
 _CHURN_EVENT_RETENTION_SECONDS = 3600.0
@@ -670,6 +681,9 @@ class WorkerRunMetrics:
             "model_swap": [],
             "vram_eviction": [],
             "process_cycle": [],
+            "context_reduction": [],
+            "context_restore": [],
+            "lane_cycle": [],
         }
 
     def reset(self) -> None:

@@ -482,7 +482,14 @@ The escalation, in order:
    episode, its cursor only advances, and both its issue allotment and aggregate time are bounded. SOS protects
    models demanded by pending work, so the rung cannot unload the exact resident model the wedged head needs.
    A post-processing module unload has one independent wall-clock grace and is issued at most once per episode;
-   it cannot reset its own deadline indefinitely.
+   it cannot reset its own deadline indefinitely. A rung whose own promised free is effectively zero is skipped
+   rather than issued: it has nothing to give back, so spending a settling window on it is indistinguishable
+   from doing nothing while the wedge stands. Lane rungs are priced as their stopped process's CUDA-context
+   charge plus its allocator reservation, since stopping the process is what returns the context, so a lane
+   with a context on the card never prices as zero and remains available as a remedy. The lane pauses the
+   remedy does take are stamped with the reclaim ladder's owner (it acts through
+   that actuator), so the ladder's stranded-pause backstop consults the coordinator's own receipt before
+   treating one as an orphan; the coordinator's unwind remains the responsible restore.
 2. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools
    in place (kill and respawn every child, un-quarantine slots), preserving the
    configured concurrency (`max_threads`). The rebuild alone clears a transient

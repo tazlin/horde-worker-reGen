@@ -462,6 +462,7 @@ class VerifiedReclaimLadder:
         device_free_mb: float,
         actuator: ReclaimLadderActuator,
         ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
+        context_restore_ready: bool = True,
     ) -> None:
         """Advance the reclaim episode for one card by one governor sample.
 
@@ -493,6 +494,12 @@ class VerifiedReclaimLadder:
                 shortfalls.
             ladder_builder: Builds the ordered rungs when a new episode begins; called at most once per
                 episode so the ladder is frozen against the topology at the moment the card crossed the cliff.
+            context_restore_ready: Whether a live-context reduction may be unwound this sample. A lane pause
+                is cheap to undo, but regrowing the pool costs a full process cold start, and the freed VRAM
+                is exactly why the card reads HEALTHY: unwinding on the first healthy sample regrows the
+                context, re-inflates the footprint, and buys the next reduction, which is a cold start per
+                cycle for no net change. The caller supplies the dwell and the evidence that the demand the
+                reduction was made for has cleared; lane rungs are unaffected.
         """
         if not saturated:
             if healthy:
@@ -500,7 +507,11 @@ class VerifiedReclaimLadder:
                     episode = self._episodes.get(key)
                     if episode is None:
                         continue
-                    if self._unwind_restore_obligations(episode, actuator):
+                    if self._unwind_restore_obligations(
+                        episode,
+                        actuator,
+                        context_restore_ready=context_restore_ready,
+                    ):
                         self._episodes.pop(key, None)
                         continue
                     # An obligation the actuator refused is still owed, so the episode survives as a debt
@@ -693,7 +704,12 @@ class VerifiedReclaimLadder:
         return _TEARDOWN_VERIFICATION_SAMPLES if kind in _TEARDOWN_RUNG_KINDS else _VERIFICATION_SAMPLES
 
     @staticmethod
-    def _unwind_restore_obligations(episode: _Episode, actuator: ReclaimLadderActuator) -> bool:
+    def _unwind_restore_obligations(
+        episode: _Episode,
+        actuator: ReclaimLadderActuator,
+        *,
+        context_restore_ready: bool = True,
+    ) -> bool:
         """Undo everything this episode owes the card, in reverse order of the actions taken (LIFO unwind).
 
         The unwind mirrors the order the memory was taken back in: the last lane stopped (or context reduced)
@@ -705,13 +721,17 @@ class VerifiedReclaimLadder:
         An actuator that reports it did not act has not discharged the debt: the context restore stands down
         for as long as a whole-card residency owns the pool, and dropping the obligation on that answer would
         leave the card shrunk with nobody left to regrow it. Such an obligation is retained in its original
-        order for a later attempt, so the debt outlives this pass.
+        order for a later attempt, so the debt outlives this pass. A context reduction the caller says is not
+        yet ready to unwind is retained the same way, so the debt survives until its dwell is met.
 
         Returns:
             True when every obligation was discharged and the episode owes the card nothing.
         """
         retained: list[RestoreObligation] = []
         for obligation in reversed(episode.restore_obligations):
+            if isinstance(obligation, ContextReduction) and not context_restore_ready:
+                retained.append(obligation)
+                continue
             if not unwind_restore_obligation(obligation, actuator):
                 retained.append(obligation)
         retained.reverse()
@@ -739,8 +759,9 @@ class VerifiedReclaimLadder:
             ),
         )
         logger.debug(
-            f"Reclaim episode on device {device_index} still owes the card {kinds}: the restore actuator "
-            "declined to act, so the obligation is kept and retried once the card can take it back.",
+            f"Reclaim episode on device {device_index} still owes the card {kinds}: the restore was not taken "
+            "this sample (the actuator declined, or the restore is holding for its dwell), so the obligation "
+            "is kept and retried once the card can take it back.",
         )
 
     @staticmethod

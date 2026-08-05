@@ -18,10 +18,12 @@ import pytest
 from horde_worker_regen.process_management import main_entry_point
 from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.lifecycle import worker_recovery_coordinator
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
     RecoveryDisposition,
     WorkerRecoveryCoordinator,
 )
+from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRung, ReclaimRungKind
 from tests.process_management.conftest import make_testable_process_manager
 
 
@@ -317,6 +319,47 @@ class TestRecoveryParkReprobeState:
         assert coordinator.reclaim_remedy_started_at is None
         assert coordinator.give_up_yields_spent == 0
         coordinator.restore_reclaimed_lanes.assert_called_once()
+
+
+class TestConstructiveRemedySelection:
+    """A remedy is only constructive if it can change the resource condition the wedge is about."""
+
+    def test_a_rung_promising_nothing_is_skipped_for_one_that_frees_memory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A zero-promise rung must not consume the settling window; the next rung that can free room runs."""
+        process_manager = make_testable_process_manager(exit_on_unhandled_faults=False)
+        coordinator = process_manager._recovery_coordinator
+
+        empty_lane = ReclaimRung(
+            kind=ReclaimRungKind.PAUSE_PP_LANE,
+            tenant_label="post-processing lane",
+            promised_freed_mb=0.0,
+            device_index=0,
+        )
+        real_relief = ReclaimRung(
+            kind=ReclaimRungKind.UNLOAD_IDLE_MODEL,
+            tenant_label="model#4",
+            promised_freed_mb=4096.0,
+            device_index=0,
+            target_process_id=4,
+        )
+        coordinator.reclaim_rungs = (empty_lane, real_relief)
+
+        executed: list[ReclaimRung] = []
+
+        def _execute(rung: ReclaimRung, _scheduler: object) -> bool:
+            executed.append(rung)
+            return True
+
+        monkeypatch.setattr(worker_recovery_coordinator, "execute_reclaim_rung", _execute)
+
+        issued = coordinator.issue_next_constructive_remedy()
+
+        assert issued is real_relief
+        assert executed == [real_relief], "the zero-promise rung must never be issued"
+        assert coordinator.reclaim_paused_lanes == [], "a skipped lane pause leaves no restore obligation"
 
 
 def _abandoned_count(coordinator: WorkerRecoveryCoordinator) -> int:

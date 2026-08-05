@@ -353,6 +353,57 @@ class TestReclaimLadderVerifiedRestore:
         assert actuator.calls == [("restore_contexts", 0)]
         assert engine.has_context_reduction(0) is False
 
+    def test_context_restore_waits_for_the_callers_dwell(self) -> None:
+        """A healthy sample the caller has not cleared holds the regrowth, and a later cleared one takes it."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+
+        engine.record_context_reduction(0)
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            context_restore_ready=False,
+        )
+        assert actuator.calls == []
+        assert engine.has_context_reduction(0) is True
+
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            context_restore_ready=True,
+        )
+        assert actuator.calls == [("restore_contexts", 0)]
+        assert engine.has_context_reduction(0) is False
+
+    def test_a_held_context_restore_does_not_hold_back_a_lane_restore(self) -> None:
+        """A lane pause is cheap to undo, so it unwinds on the healthy sample the context reduction waits out."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
+
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.record_context_reduction(0)
+
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            context_restore_ready=False,
+        )
+        assert actuator.calls == [("pp", None), ("restore_pp", None)]
+        assert engine.has_context_reduction(0) is True
+
     def test_worker_wide_reduction_is_regrown_by_the_governed_card(self) -> None:
         """A reduction booked against the card-agnostic scope unwinds on the one governed card's recovery."""
         engine = VerifiedReclaimLadder()

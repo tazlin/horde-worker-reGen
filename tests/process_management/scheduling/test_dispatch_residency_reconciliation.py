@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramRequestKind,
     VramVerdict,
 )
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -227,6 +228,34 @@ class TestLineSkipDispatchHeadTruth:
         assert scheduler._dispatch_residency_reconciliation_holds(job, target, is_head_of_queue=False) is False
         assert capture.last_request is not None
         assert capture.last_request.is_head_of_queue is False
+
+
+class TestHeadProtectionIsBounded:
+    """Reserving card room for the head is worth its cost only while the head converges on a dispatch.
+
+    Head protection withholds room from the jobs behind the head so the head, not a line-skipper, takes the
+    next opportunity. A head whose own admission keeps declining never takes it, and the reservation then
+    holds an idle card against siblings that fit for as long as the queue lasts: the worker serves nothing at
+    all. Past a bound the protection is released and the head keeps its queue position.
+    """
+
+    async def test_a_briefly_parked_head_still_reserves_its_room(self) -> None:
+        """Within the window the head is priced as outstanding, so a line-skipper is measured against it."""
+        scheduler, job, _target, _sibling = await _scheduler_with_idle_sibling()
+        _install_cycle(scheduler, _fitting_state())
+        scheduler._head_starved_seconds = Mock(return_value=5.0)  # type: ignore[method-assign]
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
+
+    async def test_a_head_parked_past_the_bound_stops_reserving_room(self) -> None:
+        """Past the window the head prices as no demand, so a fitting sibling is admitted rather than held."""
+        scheduler, job, _target, _sibling = await _scheduler_with_idle_sibling()
+        _install_cycle(scheduler, _fitting_state())
+        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
+            return_value=inference_scheduler_module._HEAD_PROTECTION_MAX_STARVE_SECONDS + 1.0,
+        )
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
 
 
 class TestStarvedDispatchHeadSignals:
