@@ -196,6 +196,12 @@ class JobMetricsRecord(BaseModel):
     job_id: str
     is_alchemy: bool = False
     faulted: bool = False
+    fault_reason: str | None = None
+    """Why the job faulted, as reported by the stage that faulted it, or None when it did not fault.
+
+    A faulted record otherwise names no cause, so reading a fault out of the stats stream meant correlating
+    it against the parent log by timestamp. Free-form text (an exception's type and message for a stage
+    failure, a sentence for a worker-side decision), so treat it as a diagnostic, not a key to group by."""
     time_popped: float | None = None
     stage_timestamps: dict[str, float] = {}
     """Epoch time of first entry into each ``JobStage`` (plus ``FINALIZED``)."""
@@ -815,9 +821,11 @@ class WorkerRunMetrics:
             )
             * float(batch_count)
         )
+        faulted = completed_job_info.state == GENERATION_STATE.faulted
         record = JobMetricsRecord(
             job_id=job_id,
-            faulted=completed_job_info.state == GENERATION_STATE.faulted,
+            faulted=faulted,
+            fault_reason=tracked.fault_reason if faulted else None,
             time_popped=time_popped,
             stage_timestamps=stage_timestamps,
             queue_wait_seconds=queue_wait,

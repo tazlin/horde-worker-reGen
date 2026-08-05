@@ -1551,7 +1551,13 @@ class MessageDispatcher:
                 f"Post-processing faulted for job {message.job_id} on process {message.process_id}; "
                 f"reporting the job faulted without images so the horde reissues it: {fault_reason}",
             )
-            self._job_tracker.note_post_processing_overcommit_fault()
+            # Only a resource-class failure is evidence the card cannot host the post-processing peak, which
+            # is what this counter drives (a VRAM reclaim now, and the breaker that disables post-processing
+            # worker-wide if they keep coming). A lane that failed for any other reason (a loader raising, a
+            # model file that will not read) says nothing about VRAM, and counting it spends reclaim on a
+            # problem reclaim cannot fix and moves the worker toward dropping a feature it can still serve.
+            if message.fault_is_resource_class:
+                self._job_tracker.note_post_processing_overcommit_fault()
             self._action_ledger.record(
                 LedgerEventType.POST_PROCESS_FAULTED,
                 process_id=message.process_id,

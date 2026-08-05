@@ -60,6 +60,7 @@ def _finalize_job(
     metrics: WorkerRunMetrics,
     *,
     faulted: bool = False,
+    fault_reason: str | None = None,
     n_iter: int = 1,
     kudos_reward: float | None = None,
     payload_overrides: dict[str, object] | None = None,
@@ -89,6 +90,7 @@ def _finalize_job(
         stage=JobStage.PENDING_SUBMIT,
         time_popped=100.0,
         kudos_reward=kudos_reward,
+        fault_reason=fault_reason,
         stage_timestamps={
             "PENDING_INFERENCE": 100.0,
             "INFERENCE_IN_PROGRESS": 102.5,
@@ -154,6 +156,19 @@ class TestJobCorrelation:
         metrics = WorkerRunMetrics()
         _finalize_job(metrics, faulted=True)
         assert metrics.snapshot().jobs[0].faulted
+
+    def test_faulted_job_carries_the_reason_the_tracker_recorded(self) -> None:
+        """The record names why the job faulted, so a fault can be read without correlating logs."""
+        metrics = WorkerRunMetrics()
+        reason = "RuntimeError: model_loader (UpscaleModelLoader): ModuleNotFoundError"
+        _finalize_job(metrics, faulted=True, fault_reason=reason)
+        assert metrics.snapshot().jobs[0].fault_reason == reason
+
+    def test_unfaulted_job_carries_no_reason(self) -> None:
+        """A reason left on a job whose images were adopted after all does not reach its record."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, faulted=False, fault_reason="withdrawn post-inference fault")
+        assert metrics.snapshot().jobs[0].fault_reason is None
 
     def test_submit_reward_reaches_the_job_record(self) -> None:
         """The reward the tracker holds at finalize is what the job's metrics record carries.

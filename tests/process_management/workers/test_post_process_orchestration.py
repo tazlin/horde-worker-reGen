@@ -573,7 +573,7 @@ class TestPostProcessResultHandling:
         assert process_manager._reserve_ledger.total_vram_mb() == 0.0
 
     async def test_faulted_result_reports_no_image_fault(self) -> None:
-        """A faulted result clears images, feeds the breaker window, and reaches submit as a fault."""
+        """A faulted result clears images and reaches submit as a fault."""
         process_manager = make_testable_process_manager()
         job_info = await self._job_being_post_processed(process_manager)
 
@@ -592,7 +592,48 @@ class TestPostProcessResultHandling:
         assert job_info in process_manager._job_tracker.jobs_pending_submit
         assert job_info.state == GENERATION_STATE.faulted
         assert job_info.job_image_results is None
-        assert process_manager._job_tracker.count_recent_post_processing_faults(60.0) == 1
+
+    async def test_only_resource_class_faults_feed_the_breaker_window(self) -> None:
+        """The over-commit window counts a lane OOM and ignores a failure that says nothing about VRAM.
+
+        The counter drives a VRAM reclaim and, sustained, the breaker that disables post-processing
+        worker-wide. A loader raising (a module or model file that will not read) is a fault the card
+        cannot be blamed for and reclaim cannot fix.
+        """
+        process_manager = make_testable_process_manager()
+        tracker = process_manager._job_tracker
+
+        loader_failure = await self._job_being_post_processed(process_manager)
+        await process_manager._message_dispatcher._handle_post_process_result(
+            HordePostProcessResultMessage(
+                process_id=7,
+                process_launch_identifier=0,
+                info="post-processing failed",
+                time_elapsed=1.0,
+                job_id=loader_failure.sdk_api_job_info.id_,
+                job_image_results=None,
+                state=GENERATION_STATE.faulted,
+                fault_is_resource_class=False,
+                fault_reason="RuntimeError: model_loader (UpscaleModelLoader): ModuleNotFoundError",
+            ),
+        )
+        assert tracker.count_recent_post_processing_faults(60.0) == 0
+
+        oom = await self._job_being_post_processed(process_manager)
+        await process_manager._message_dispatcher._handle_post_process_result(
+            HordePostProcessResultMessage(
+                process_id=7,
+                process_launch_identifier=0,
+                info="post-processing failed",
+                time_elapsed=1.0,
+                job_id=oom.sdk_api_job_info.id_,
+                job_image_results=None,
+                state=GENERATION_STATE.faulted,
+                fault_is_resource_class=True,
+                fault_reason="RuntimeError: CUDA out of memory",
+            ),
+        )
+        assert tracker.count_recent_post_processing_faults(60.0) == 1
 
     async def test_faulted_result_preserves_oom_reason(self) -> None:
         """A lane OOM is submitted as a no-image fault with the real allocator text in metadata."""
@@ -617,6 +658,11 @@ class TestPostProcessResultHandling:
         faults = await process_manager._job_tracker.get_faults_for_job(job_info.sdk_api_job_info.id_)
         assert faults
         assert fault_reason in (faults[-1].ref or "")
+
+        # The same text is kept on the tracked job, which is what puts it in the job's metrics record.
+        tracked = process_manager._job_tracker.get_tracked_job(job_info.sdk_api_job_info.id_)
+        assert tracked is not None
+        assert tracked.fault_reason == fault_reason
 
 
 class TestPostProcessOrphanRecovery:

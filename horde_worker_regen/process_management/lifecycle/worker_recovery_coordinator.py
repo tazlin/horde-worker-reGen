@@ -514,6 +514,7 @@ class WorkerRecoveryCoordinator:
                     process_timeout=self.bridge_data.process_timeout,
                     retryable=False,
                     scheduling_fault=True,
+                    fault_reason=f"safety check unrecoverable ({reason})",
                 )
                 self.orphan_safety_since.pop(job_id, None)
                 self.safety_requeue_count.pop(job_id, None)

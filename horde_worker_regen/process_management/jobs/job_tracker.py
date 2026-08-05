@@ -295,6 +295,14 @@ class TrackedJob:
     a safety re-check). Drives the status dump's per-stage aging so a stuck stage shows a growing age."""
     inference_attempts: int = 0
     """How many inference attempts have failed for this job; bounds retry against ``max_inference_attempts``."""
+    fault_reason: str | None = None
+    """Why this job faulted, or None while it has not.
+
+    The same text the fault rides to the horde on, kept in plain form so the finalize observers can put it in
+    the job's metrics record. A faulted job carries no image and no stage marker naming its cause, so without
+    this a post-mortem can see only that the job faulted and has to reconstruct the reason from logs.
+    Cleared when a post-inference fault is withdrawn, so a job whose images were adopted after all does not
+    finalize carrying the reason it briefly held."""
     degraded_retry_used: bool = False
     """Whether this job has already spent its one degraded (isolated) retry for a resource failure."""
     needs_degraded_dispatch: bool = False
@@ -1745,6 +1753,7 @@ class JobTracker:
         previous_stage = tracked.stage
         job_info.fault_job()
         tracked.job_info = job_info
+        tracked.fault_reason = reason
         self._job_faults.setdefault(tracked.job_id, []).append(
             GenMetadataEntry(
                 type=METADATA_TYPE.information,
@@ -1802,6 +1811,7 @@ class JobTracker:
                 for entry in faults
                 if entry.ref is None or not entry.ref.startswith(_POST_INFERENCE_FAULT_REF_PREFIX)
             ]
+        tracked.fault_reason = None
         job_info.job_image_results = job_image_results
         job_info.state = GENERATION_STATE.ok
         tracked.job_info = job_info
@@ -2451,6 +2461,7 @@ class JobTracker:
         it faulted that reaches the horde. The reason and attempt count also aid local post-mortems.
         """
         reason = fault_reason or ("resource/OOM" if is_resource_failure else "inference failure")
+        tracked.fault_reason = reason
         self._job_faults.setdefault(tracked.job_id, []).append(
             GenMetadataEntry(
                 type=METADATA_TYPE.information,
