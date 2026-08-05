@@ -55,3 +55,31 @@ def make_dummy_source_png_bytes(width: int, height: int, seed: int = 0) -> bytes
     ihdr = struct.pack(">IIBBBBB", safe_width, safe_height, 8, 2, 0, 0, 0)
     idat = zlib.compress(bytes(raw))
     return _PNG_SIGNATURE + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", idat) + _png_chunk(b"IEND", b"")
+
+
+@functools.lru_cache(maxsize=128)
+def make_dummy_mask_png_bytes(width: int, height: int) -> bytes:
+    """Return a deterministic grayscale inpainting mask PNG at the requested size.
+
+    White marks the region to repaint, black is kept, and the mask is a centered rectangle covering a
+    quarter of each dimension's span (half-width by half-height): large enough that the inpaint pass does
+    real denoising work, bounded so the job remains an inpaint rather than a full regeneration. Stdlib-only
+    and byte-identical for a given ``(width, height)``, matching the source-image builder's determinism
+    contract so two builds of the same job present the same inputs.
+    """
+    safe_width = max(1, width)
+    safe_height = max(1, height)
+    left = safe_width // 4
+    right = safe_width - left
+    top = safe_height // 4
+    bottom = safe_height - top
+
+    masked_row = b"\x00" + b"\x00" * left + b"\xff" * (right - left) + b"\x00" * (safe_width - right)
+    kept_row = b"\x00" + b"\x00" * safe_width
+    raw = bytearray()
+    for row_index in range(safe_height):
+        raw += masked_row if top <= row_index < bottom else kept_row
+
+    ihdr = struct.pack(">IIBBBBB", safe_width, safe_height, 8, 0, 0, 0, 0)
+    idat = zlib.compress(bytes(raw))
+    return _PNG_SIGNATURE + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", idat) + _png_chunk(b"IEND", b"")

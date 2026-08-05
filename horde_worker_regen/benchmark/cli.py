@@ -4,6 +4,7 @@ Subcommands:
 - ``run``: prove the capability catalog on one warm worker via the canned-job harness (no API).
 - ``plan``: preview each probe's resource needs and run/skip verdict (no worker is started).
 - ``download``: fetch the checkpoints the selected tiers need, ahead of a timed run.
+- ``pricing-corpus``: run the cost-attribution corpus whose stats records fit a pricing model.
 - ``report``: re-render the markdown report from an existing output directory.
 - ``monitor``: tail a run's progress.jsonl live (attach or replay).
 - ``live``: open-loop load generation against a live AI-Horde API (separate phase).
@@ -155,6 +156,61 @@ def _add_download_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Read pause/resume/rate control commands (one JSON object per line) from stdin (used by the TUI).",
     )
     download.add_argument("--directml", type=int, default=None, help="DirectML device index (for Windows AMD GPUs).")
+
+
+def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``pricing-corpus`` subcommand: the cost-attribution corpus used to fit a pricing model."""
+    corpus = subparsers.add_parser(
+        "pricing-corpus",
+        help="Run the pricing corpus: a deterministic, axis-sweeping workload whose stats records are "
+        "training data for a cost model. Emits a definition artifact that labels every job's cell.",
+    )
+    corpus.add_argument(
+        "--tier",
+        default="smoke",
+        choices=("smoke", "standard", "census"),
+        help="standard = the marginal-cost fit set (hours); census = every value of every categorical "
+        "axis the kudos manifest encodes, plus a conflated sample (about four hours); smoke = a short "
+        "subset that proves the corpus runs.",
+    )
+    corpus.add_argument(
+        "--emit-definition",
+        type=Path,
+        default=None,
+        help="Write the definition artifact here instead of next to the session stats.",
+    )
+    corpus.add_argument(
+        "--dry-list",
+        action="store_true",
+        help="Print the ordered cell ids and exit; nothing is run and no worker is started.",
+    )
+    corpus.add_argument(
+        "--lora-version-id",
+        action="append",
+        default=[],
+        metavar="VERSION_ID",
+        help="A real CivitAI LoRA version id for the LoRA cells (repeatable; the standard tier needs five).",
+    )
+    corpus.add_argument(
+        "--ti-name",
+        default=None,
+        help="A real textual-inversion reference for the TI cell.",
+    )
+    corpus.add_argument(
+        "--no-lora-eviction",
+        action="store_true",
+        help="Skip evicting the pinned LoRAs before the run; any still cached turns its miss cell into a "
+        "hit measurement.",
+    )
+    corpus.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
+    corpus.add_argument(
+        "--timeout",
+        type=float,
+        default=6.0 * 60.0 * 60.0,
+        help="Overall run timeout in seconds (the standard tier is a multi-hour workload).",
+    )
+    # The corpus measures real inference costs; a fabricated duration is not a price.
+    corpus.set_defaults(process_mode="real")
 
 
 def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
@@ -757,6 +813,142 @@ def _run_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _evict_pinned_loras(version_ids: tuple[str, ...]) -> bool:
+    """Evict the corpus's LoRA versions from the cache so the first use of each is a genuine miss.
+
+    Deletion goes through the LoRA model manager's ``delete_lora`` (removing the file and its
+    reference-db entry together), in a subprocess: the model-manager import chain must stay out of this
+    process, which goes on to host the worker parent. An id that is already absent only draws the
+    manager's not-found warning, so eviction is idempotent across reruns.
+
+    Returns:
+        True when the eviction subprocess completed; False when it failed, since running on without it
+        would silently turn the miss cells into hit measurements.
+    """
+    import subprocess
+
+    script = (
+        "import sys\n"
+        "from hordelib.model_manager.lora import LoraModelManager\n"
+        "manager = LoraModelManager()\n"
+        "for version_id in sys.argv[1:]:\n"
+        "    manager.delete_lora(version_id)\n"
+    )
+    logger.info(f"Evicting {len(version_ids)} pinned LoRA version(s) so the miss cells measure real fetches.")
+    result = subprocess.run([sys.executable, "-c", script, *version_ids], check=False)
+    if result.returncode != 0:
+        logger.error(f"LoRA eviction failed (exit {result.returncode}); refusing to run with a warm cache.")
+        return False
+    return True
+
+
+def _pricing_corpus_bridge_overrides(tier: str) -> dict[str, object]:
+    """Return the bridge capabilities a corpus tier's workload needs advertised.
+
+    The harness derives LoRA, post-processing and max_power advertising from the scenario, but the
+    controlnet and source-image gates are not derived, and a capability the bridge does not advertise
+    narrows what the worker will accept. The census sweeps every control type the manifest encodes and
+    every source-processing mode, so it has to advertise the whole surface or its coverage claim is
+    false while the definition still pairs every job.
+    """
+    if tier != "census":
+        return {}
+    return {
+        "allow_controlnet": True,
+        "extended_controlnet": True,
+        "allow_img2img": True,
+        "allow_inpainting": True,
+        "allow_lora": True,
+        "allow_post_processing": True,
+    }
+
+
+def _run_pricing_corpus(args: argparse.Namespace) -> int:
+    """Build (and, unless listing, run) the pricing corpus, persisting its definition artifact."""
+    from horde_worker_regen.benchmark.pricing_corpus import (
+        PRICING_CORPUS_LORA_VERSION_IDS,
+        PRICING_CORPUS_TI_NAME,
+        PricingCorpusError,
+        build_pricing_corpus_scenario,
+        write_definition_artifact,
+    )
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+    from horde_worker_regen.harness import HarnessConfig, run_harness
+    from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
+    from horde_worker_regen.stats_operations import default_stats_dir
+
+    lora_version_ids = tuple(args.lora_version_id) if args.lora_version_id else PRICING_CORPUS_LORA_VERSION_IDS
+    try:
+        scenario, definition = build_pricing_corpus_scenario(
+            args.tier,
+            lora_version_ids=lora_version_ids,
+            ti_name=args.ti_name if args.ti_name else PRICING_CORPUS_TI_NAME,
+        )
+    except PricingCorpusError as error:
+        logger.error(str(error))
+        return 2
+
+    if args.emit_definition is not None:
+        write_definition_artifact(definition, args.emit_definition)
+        logger.info(f"Wrote the corpus definition to {args.emit_definition.resolve()}.")
+
+    if args.dry_list:
+        for job in definition.jobs:
+            print(f"{job.position:4d}  {job.permutation:8s}  {job.cell_id}")  # noqa: T201
+        print(  # noqa: T201
+            f"\n{len(definition.jobs)} jobs ({definition.warmup_job_count} warmup) over "
+            f"{len(definition.cells)} cells; shuffle seeds {', '.join(definition.shuffle_seeds)}.",
+        )
+        return 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / f"pricing-corpus-{stamp}"
+    _setup_benchmark_file_logging(out_dir)
+    if args.emit_definition is None:
+        # The artifact is the only key from a stats record back to the cell (and so to the axis values)
+        # that produced it, so it lands with the stats stream rather than in a run directory that a later
+        # reader of the stats has no reason to look in.
+        definition_path = default_stats_dir() / f"pricing-corpus-{definition.tier}-{stamp}.json"
+        write_definition_artifact(definition, definition_path)
+        logger.info(f"Wrote the corpus definition to {definition_path.resolve()}.")
+
+    if args.no_lora_eviction:
+        logger.warning(
+            "LoRA eviction skipped: any pinned LoRA already cached makes its miss cell measure a hit.",
+        )
+    elif not _evict_pinned_loras(lora_version_ids):
+        return 2
+
+    ensure_worker_env(args.process_mode, [BenchTier.SD15, BenchTier.SDXL])
+    # The corpus exists to price jobs, and price varies by model class, so every job's stats record must
+    # carry the model's real baseline. Initializing the reference here (a plain sync context, before the
+    # harness event loop starts) is what lets the harness resolve real records instead of stubbing them.
+    try:
+        ensure_model_reference_manager_initialized()
+    except Exception as reference_error:  # noqa: BLE001 - a reference miss degrades records, not the run
+        logger.warning(
+            f"Could not initialize the model reference ({type(reference_error).__name__}); corpus records "
+            "will carry stubbed baselines.",
+        )
+    logger.info(
+        f"Running the {definition.tier} pricing corpus: {len(definition.jobs)} jobs over "
+        f"{len(definition.cells)} cells, models {', '.join(scenario.models_referenced())}.",
+    )
+    result = run_harness(
+        HarnessConfig.from_scenario(
+            scenario,
+            process_mode=args.process_mode,
+            timeout_seconds=args.timeout,
+            bridge_data_overrides=_pricing_corpus_bridge_overrides(definition.tier),
+        ),
+    )
+    logger.info(
+        f"Corpus finished: {result.num_jobs_completed}/{result.num_jobs_expected} jobs completed, "
+        f"{result.num_jobs_faulted} faulted, in {result.elapsed_seconds:.0f}s ({result.exit_reason}).",
+    )
+    return 0 if result.succeeded else 1
+
+
 def _record_capability_benchmark_in_app_state(report: CapabilityReport, out_dir: Path) -> None:
     """Record a finished capability run in app state, best-effort (bookkeeping must not fail the run)."""
     try:
@@ -835,6 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_run_parser(subparsers)
     _add_plan_parser(subparsers)
     _add_download_parser(subparsers)
+    _add_pricing_corpus_parser(subparsers)
 
     report = subparsers.add_parser("report", help="Re-render the markdown report from an output directory.")
     report.add_argument("out_dir", type=Path)
@@ -858,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_plan(args)
     if args.command == "download":
         return _run_download(args)
+    if args.command == "pricing-corpus":
+        return _run_pricing_corpus(args)
     if args.command == "report":
         return _run_report(args)
     if args.command == "monitor":

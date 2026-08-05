@@ -47,7 +47,11 @@ from horde_worker_regen.process_management.process_manager import (
     SystemResources,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
+from horde_worker_regen.process_management.resources.run_metrics import (
+    SCENARIO_ID_ENV_VAR,
+    SCENARIO_REVISION_ENV_VAR,
+    RunMetricsSnapshot,
+)
 from horde_worker_regen.process_management.scheduling.model_demand_poller import (
     DemandSnapshot,
     ModelDemandRecord,
@@ -242,6 +246,26 @@ class HarnessConfig:
     audit: bool = True
     """If True, attach a JobLifecycleAuditor and report invariant violations in the result."""
 
+    stats_export: bool = True
+    """Whether a real-mode run writes its per-session stats JSONL stream (honored in real mode only).
+
+    The stats stream is the machine-readable record of what each job cost, so a real-mode run is the
+    only kind whose timings mean anything: fake and dry-run children fabricate their durations, and
+    exporting those would put synthetic costs in the same format real measurements use. Set False to
+    run a real-mode scenario without leaving a stats file behind."""
+
+    scenario_id: str | None = None
+    """Identity of the workload this run executes, stamped into the session's ``session_start`` record.
+
+    Set from the :class:`Scenario` name by :meth:`from_scenario`; None for the low-level constructor's
+    ad-hoc workloads and for production, whose sessions carry no scenario identity."""
+
+    scenario_revision: str | None = None
+    """Revision of the workload named by :attr:`scenario_id`, or None when it is unversioned.
+
+    Two hosts' records are only comparable when both ran the same workload definition, so the revision
+    is what lets an assembler pair (or reject) snapshots taken on different machines."""
+
     soak_seconds: float | None = None
     """When set, run a time-bounded sustained-load soak instead of a fixed scenario.
 
@@ -303,6 +327,8 @@ class HarnessConfig:
                 audit=audit,
                 on_progress=on_progress,
                 progress_interval_seconds=progress_interval_seconds,
+                scenario_id=scenario.name,
+                scenario_revision=scenario.revision,
             )
         arrival = scenario.arrival_schedule()
         return cls(
@@ -317,6 +343,8 @@ class HarnessConfig:
             audit=audit,
             on_progress=on_progress,
             progress_interval_seconds=progress_interval_seconds,
+            scenario_id=scenario.name,
+            scenario_revision=scenario.revision,
         )
 
 
@@ -548,6 +576,9 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         "dry_run_skip_safety": config.process_mode != "real",
         "dry_run_skip_post_processing": config.process_mode != "real",
         "dry_run_inference_delay": config.job_delay_seconds,
+        # Only a real run measures anything: fake/dry-run children fabricate their durations, and
+        # exporting those would mix synthetic costs into the stream real measurements are read from.
+        "stats_export_enabled": config.stats_export and config.process_mode == "real",
     }
     if config.alchemy_forms or config.soak_alchemy_templates:
         bridge_data_fields["alchemist"] = True
@@ -605,25 +636,46 @@ def _fallback_baseline_for_harness_model(model_name: str) -> KNOWN_IMAGE_GENERAT
     return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
 
 
+def _real_image_model_reference(
+    reference_manager: ModelReferenceManager | None,
+) -> dict[str, ImageGenerationModelRecord]:
+    """Resolve the real image-generation reference, or an empty mapping when none is available.
+
+    Falls back to the process-wide :class:`ModelReferenceManager` singleton when no manager is passed,
+    so a caller that has already initialized the reference (any real-mode driver) gets real records
+    without having to thread the manager through the harness config. An unreadable or unpopulated
+    reference resolves to an empty mapping, leaving the caller's synthetic fallback in charge.
+    """
+    manager = reference_manager
+    if manager is None:
+        if not ModelReferenceManager.has_instance():
+            return {}
+        manager = ModelReferenceManager.get_instance()
+    try:
+        resolved = manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
+    except Exception as reference_error:  # noqa: BLE001 - a reference miss must not fail harness startup
+        logger.warning(f"Could not resolve the image model reference: {type(reference_error).__name__}")
+        return {}
+    return resolved if isinstance(resolved, dict) else {}
+
+
 def build_harness_model_reference(
     scenario: list[ImageGenerateJobPopResponse],
     reference_manager: ModelReferenceManager | None = None,
 ) -> dict[str, ImageGenerationModelRecord]:
     """Build a model reference covering every model in the scenario.
 
-    When a real reference manager is supplied, each scenario model resolves to its actual record
-    (and therefore its real baseline, e.g. flux_1 for Flux rather than a blanket stable_diffusion_1).
-    This matters for real-process benchmarks: the worker derives every VRAM/RAM burden estimate from
-    the baseline, so a stubbed stable_diffusion_1 would make a heavy model (Flux) look like a small
-    SD1.5 checkpoint and silently mask the very residency dynamics a real run is meant to exercise.
-    Models genuinely absent from the real reference (synthetic test-only names) fall back to a minimal
-    stable_diffusion_1 record so fake-process scenarios keep working without a populated reference.
+    Each scenario model resolves to its actual record (and therefore its real baseline, e.g. flux_1 for
+    Flux rather than a blanket stable_diffusion_1) whenever a real reference is available, whether it
+    arrives as ``reference_manager`` or as the process-wide singleton. This matters twice over: the
+    worker derives every VRAM/RAM burden estimate from the baseline, so a stubbed stable_diffusion_1
+    would make a heavy model (Flux) look like a small SD1.5 checkpoint and silently mask the very
+    residency dynamics a real run is meant to exercise; and the baseline is exported on every
+    ``job_completed`` stats record, where a stubbed value misattributes the job's cost to the wrong
+    model class. Models genuinely absent from the real reference (synthetic test-only names) fall back
+    to a minimal stable_diffusion_1 record so fake-process scenarios keep working without a reference.
     """
-    real_reference: dict[str, ImageGenerationModelRecord] = {}
-    if reference_manager is not None:
-        resolved = reference_manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
-        if isinstance(resolved, dict):
-            real_reference = resolved
+    real_reference = _real_image_model_reference(reference_manager)
 
     reference: dict[str, ImageGenerationModelRecord] = {}
     for job in scenario:
@@ -669,6 +721,24 @@ def _representative_soak_scenario(templates: list[SoakImageTemplate]) -> list[Im
         if template.model not in seen:
             seen[template.model] = make_canned_job(template.model, width=template.width, height=template.height)
     return list(seen.values())
+
+
+def _apply_scenario_provenance_env(config: HarnessConfig) -> None:
+    """Publish this run's scenario identity where the manager's stats snapshot reads it.
+
+    The identity is stamped on the environment rather than passed through bridge data because it
+    describes the workload, not the operator's configuration (see ``SCENARIO_ID_ENV_VAR``). Both
+    variables are rewritten on every run, including being cleared, so a run without a scenario cannot
+    inherit the identity of an earlier run in the same process.
+    """
+    for env_var, value in (
+        (SCENARIO_ID_ENV_VAR, config.scenario_id),
+        (SCENARIO_REVISION_ENV_VAR, config.scenario_revision),
+    ):
+        if value:
+            os.environ[env_var] = value
+        else:
+            os.environ.pop(env_var, None)
 
 
 def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerProcessManager, int]:
@@ -761,6 +831,10 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
     system_resources = None
     if config.process_mode != "real":
         system_resources = config.system_resources or _build_harness_system_resources()
+
+    # The manager writes its session_start record during construction, so the identity must be in
+    # place before it is built.
+    _apply_scenario_provenance_env(config)
 
     manager = HordeWorkerProcessManager(
         ctx=multiprocessing.get_context("spawn"),
@@ -1245,15 +1319,11 @@ def _warm_model_reference(
 ) -> dict[str, ImageGenerationModelRecord]:
     """Build a model reference covering every model the warm session may run.
 
-    As with build_harness_model_reference, a supplied reference manager resolves real records (and
-    real baselines) so a real warm benchmark exercises production VRAM/RAM dynamics; absent models
-    fall back to a minimal stable_diffusion_1 record.
+    As with build_harness_model_reference, an available reference (supplied or the process-wide
+    singleton) resolves real records and real baselines, so a real warm benchmark exercises production
+    VRAM/RAM dynamics; absent models fall back to a minimal stable_diffusion_1 record.
     """
-    real_reference: dict[str, ImageGenerationModelRecord] = {}
-    if reference_manager is not None:
-        resolved = reference_manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
-        if isinstance(resolved, dict):
-            real_reference = resolved
+    real_reference = _real_image_model_reference(reference_manager)
 
     reference: dict[str, ImageGenerationModelRecord] = {}
     for name in model_names:

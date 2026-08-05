@@ -13,6 +13,7 @@ report can be sent.
 
 from __future__ import annotations
 
+import os
 import threading
 
 import pytest
@@ -202,3 +203,89 @@ class TestHarnessBridgeDataCapabilities:
         largest = max(t.width * t.height for t in config.soak_image_templates)
         assert bridge_data.max_power is not None
         assert bridge_data.max_power * 8 * 64 * 64 >= largest
+
+
+class TestHarnessStatsExport:
+    """Only a real-mode run exports stats, and the knob can still turn that off.
+
+    The stats stream is the machine-readable record of what each job cost, so a run whose children
+    fabricate their durations must not write one.
+    """
+
+    def test_real_mode_enables_stats_export(self) -> None:
+        """A real-mode run writes its session stats stream without any caller opt-in."""
+        from horde_worker_regen.harness import build_harness_bridge_data
+
+        config = HarnessConfig(scenario=make_simple_scenario(1), process_mode="real", timeout_seconds=60.0)
+        bridge_data = build_harness_bridge_data(config, config.scenario or [])
+
+        assert bridge_data.stats_export_enabled is True
+
+    def test_fake_mode_leaves_stats_export_off(self) -> None:
+        """Fake and dry-run timings are synthetic, so those runs never write a stats stream."""
+        from horde_worker_regen.harness import build_harness_bridge_data
+
+        for process_mode in ("fake", "dry_run"):
+            config = HarnessConfig(
+                scenario=make_simple_scenario(1),
+                process_mode=process_mode,  # type: ignore[arg-type]
+                timeout_seconds=60.0,
+            )
+            bridge_data = build_harness_bridge_data(config, config.scenario or [])
+
+            assert bridge_data.stats_export_enabled is False, process_mode
+
+    def test_knob_disables_stats_export_in_real_mode(self) -> None:
+        """A real-mode run can be asked to leave no stats file behind."""
+        from horde_worker_regen.harness import build_harness_bridge_data
+
+        config = HarnessConfig(
+            scenario=make_simple_scenario(1),
+            process_mode="real",
+            timeout_seconds=60.0,
+            stats_export=False,
+        )
+        bridge_data = build_harness_bridge_data(config, config.scenario or [])
+
+        assert bridge_data.stats_export_enabled is False
+
+
+class TestHarnessScenarioProvenance:
+    """A scenario-driven run publishes its workload identity for the session's stats snapshot."""
+
+    def test_scenario_identity_reaches_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The scenario's name and revision are stamped where the manager's snapshot reads them."""
+        from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, Scenario
+        from horde_worker_regen.harness import _apply_scenario_provenance_env
+        from horde_worker_regen.process_management.resources.run_metrics import (
+            SCENARIO_ID_ENV_VAR,
+            SCENARIO_REVISION_ENV_VAR,
+        )
+
+        monkeypatch.delenv(SCENARIO_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(SCENARIO_REVISION_ENV_VAR, raising=False)
+        scenario = Scenario(name="pricing_corpus", revision="3", image_jobs=[CannedImageJobSpec()])
+        config = HarnessConfig.from_scenario(scenario, process_mode="fake", timeout_seconds=60.0)
+
+        assert config.scenario_id == "pricing_corpus"
+        assert config.scenario_revision == "3"
+
+        _apply_scenario_provenance_env(config)
+        assert os.environ[SCENARIO_ID_ENV_VAR] == "pricing_corpus"
+        assert os.environ[SCENARIO_REVISION_ENV_VAR] == "3"
+
+    def test_run_without_a_scenario_clears_a_prior_identity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An ad-hoc run cannot inherit the identity an earlier run left in the same process."""
+        from horde_worker_regen.harness import _apply_scenario_provenance_env
+        from horde_worker_regen.process_management.resources.run_metrics import (
+            SCENARIO_ID_ENV_VAR,
+            SCENARIO_REVISION_ENV_VAR,
+        )
+
+        monkeypatch.setenv(SCENARIO_ID_ENV_VAR, "stale_scenario")
+        monkeypatch.setenv(SCENARIO_REVISION_ENV_VAR, "1")
+
+        _apply_scenario_provenance_env(HarnessConfig(num_jobs=1, timeout_seconds=60.0))
+
+        assert SCENARIO_ID_ENV_VAR not in os.environ
+        assert SCENARIO_REVISION_ENV_VAR not in os.environ

@@ -149,6 +149,78 @@ class TestDeterministicPayloadKnobs:
         assert job.payload.prompt == "a snowy owl"
 
 
+class TestSamplerAndSchedulerAxes:
+    """Sampler and schedule are requestable per spec and reach the per-job stats record.
+
+    Their per-step work differs, so a corpus that cannot vary them cannot attribute cost to them.
+    """
+
+    def test_defaults_preserve_the_pinned_sampling_choice(self) -> None:
+        """A spec that names neither axis expands to the factory's pinned sampler and schedule."""
+        pinned = make_canned_job()
+        job = Scenario(name="defaults", image_jobs=[CannedImageJobSpec()]).expand_image_jobs()[0]
+
+        assert job.payload.sampler_name == pinned.payload.sampler_name
+        assert job.payload.karras == pinned.payload.karras
+
+    def test_spec_axes_reach_the_expanded_payload(self) -> None:
+        """The requested sampler and schedule land on every job the spec expands to."""
+        jobs = Scenario(
+            name="fixed",
+            image_jobs=[CannedImageJobSpec(count=2, sampler_name="k_dpmpp_2m", scheduler="karras")],
+        ).expand_image_jobs()
+
+        assert all(str(job.payload.sampler_name) == "k_dpmpp_2m" for job in jobs)
+        assert all(str(job.payload.scheduler) == "karras" for job in jobs)
+
+    def test_legacy_karras_bool_tracks_the_named_schedule(self) -> None:
+        """The two schedules the legacy bool can express keep it consistent with the named schedule."""
+        assert make_canned_job(scheduler="karras").payload.karras is True
+        assert make_canned_job(scheduler="normal").payload.karras is False
+
+    def test_spec_axes_reach_generated_soak_jobs(self) -> None:
+        """The axes survive the soak-template path so a generating source mints them onto every job."""
+        image_templates, _alchemy = Scenario(
+            name="soak",
+            image_jobs=[CannedImageJobSpec(sampler_name="k_euler_a", scheduler="normal")],
+        ).to_soak_templates()
+
+        job = GeneratingJobSource(image_templates, seed=0).next_pop_response()
+
+        assert str(job.payload.sampler_name) == "k_euler_a"
+        assert str(job.payload.scheduler) == "normal"
+
+    def test_axes_reach_the_finalized_job_record(self) -> None:
+        """A canned job's sampler and schedule arrive on the record the stats stream is written from."""
+        from horde_sdk.ai_horde_api import GENERATION_STATE
+
+        from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+        from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
+        from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
+
+        job = Scenario(
+            name="corpus",
+            image_jobs=[CannedImageJobSpec(sampler_name="k_dpmpp_2m", scheduler="karras")],
+        ).expand_image_jobs()[0]
+        assert job.id_ is not None
+
+        metrics = WorkerRunMetrics()
+        metrics.on_job_finalized(
+            TrackedJob(
+                job_id=job.id_,
+                sdk_api_job_info=job,
+                stage=JobStage.PENDING_SUBMIT,
+                time_popped=100.0,
+                stage_timestamps={"FINALIZED": 110.0},
+            ),
+            HordeJobInfo(sdk_api_job_info=job, state=GENERATION_STATE.ok, time_popped=100.0),
+        )
+
+        record = metrics.snapshot().jobs[0]
+        assert record.sampler_name == "k_dpmpp_2m"
+        assert record.scheduler == "karras"
+
+
 class TestImg2ImgSourceImage:
     """A plain img2img/remix source-processing job carries a deterministic synthetic start image."""
 
@@ -177,6 +249,37 @@ class TestImg2ImgSourceImage:
     def test_txt2img_job_carries_no_source_image(self) -> None:
         """A job with no source_processing (and no control/workflow) stays a plain txt2img job."""
         assert make_canned_job(seed="1").source_image is None
+
+
+class TestInpaintingSourceInputs:
+    """An inpainting job carries both a start image and a mask, deterministically.
+
+    Without the mask the pipeline either faults or quietly regenerates the whole frame, so the job's
+    measured cost would not be an inpaint's.
+    """
+
+    def test_inpainting_job_gets_a_source_image_and_a_mask(self) -> None:
+        """Both inputs are present and the mask is sized to the job."""
+        import base64
+        import struct
+
+        job = make_canned_job(width=768, height=512, source_processing="inpainting", seed="42")
+        assert job.source_image, "an inpainting job must carry a start image"
+        assert job.source_mask, "an inpainting job must carry a mask"
+        raw = base64.b64decode(job.source_mask)
+        width, height = struct.unpack(">II", raw[16:24])
+        assert (width, height) == (768, 512)
+
+    def test_inpainting_inputs_are_deterministic(self) -> None:
+        """Two builds with the same seed and size embed byte-identical source image and mask."""
+        first = make_canned_job(width=256, height=256, source_processing="inpainting", seed="99")
+        second = make_canned_job(width=256, height=256, source_processing="inpainting", seed="99")
+        assert first.source_image == second.source_image
+        assert first.source_mask == second.source_mask
+
+    def test_img2img_job_carries_no_mask(self) -> None:
+        """The mask is an inpainting input; img2img-class jobs do not gain one."""
+        assert make_canned_job(source_processing="img2img", seed="7").source_mask is None
 
 
 class TestAlchemyScenario:

@@ -38,6 +38,13 @@ class CannedImageJobSpec(BaseModel):
     cfg_scale: float | None = None
     n_iter: int = 1
     hires_fix: bool = False
+    sampler_name: str | None = None
+    """Sampler every job this spec expands to requests, or None to keep the canned factory's default.
+
+    Sampler and schedule are cost axes in their own right (their per-step work differs), so a corpus
+    that never varies them cannot attribute cost to them."""
+    scheduler: str | None = None
+    """Sigma schedule every job this spec expands to requests, or None to keep the factory's default."""
     seed: str | None = None
     """Fixed seed for every job this spec expands to, or None to keep the canned factory's pinned default.
 
@@ -47,6 +54,12 @@ class CannedImageJobSpec(BaseModel):
     """Fixed prompt for every job this spec expands to, or None to keep the canned factory's pinned default."""
     source_processing: str | None = None
     """Source-processing mode (e.g. ``img2img``) for every expanded job, or None to keep the txt2img default."""
+    denoising_strength: float | None = None
+    """Denoise for every expanded job, or None to keep the canned factory's default.
+
+    An img2img job samples a fraction of its step count set by the denoise, so a corpus that leaves it at
+    the default measures img2img at full strength and cannot separate the source-processing cost from the
+    sampling it displaces."""
     lora_names: list[str] = Field(default_factory=list)
     lora_is_version: bool = False
     """Whether ``lora_names`` are CivitAI version ids rather than model names.
@@ -80,6 +93,12 @@ class Scenario(BaseModel):
     """
 
     name: str
+    revision: str | None = None
+    """Version of this workload's definition, or None while it is unversioned.
+
+    Records produced under one revision only compare against records produced under the same one, so
+    bumping it whenever the specs change is what keeps a cross-machine corpus from silently mixing two
+    different workloads under one name. It travels into the session's ``session_start`` stats record."""
     image_jobs: list[CannedImageJobSpec] = Field(default_factory=list)
     alchemy_forms: list[CannedAlchemyFormSpec] = Field(default_factory=list)
     arrival_kind: str = "all_at_once"
@@ -139,8 +158,11 @@ class Scenario(BaseModel):
                         workflow=spec.workflow,
                         post_processing=spec.post_processing if spec.post_processing else None,
                         source_processing=spec.source_processing,
+                        denoising_strength=spec.denoising_strength,
                         seed=spec.seed,
                         prompt=spec.prompt,
+                        sampler_name=spec.sampler_name,
+                        scheduler=spec.scheduler,
                     ),
                 )
         return jobs
@@ -178,9 +200,12 @@ class Scenario(BaseModel):
                 steps=spec.steps,
                 cfg_scale=spec.cfg_scale,
                 n_iter=spec.n_iter,
+                sampler_name=spec.sampler_name,
+                scheduler=spec.scheduler,
                 seed=spec.seed,
                 prompt=spec.prompt,
                 source_processing=spec.source_processing,
+                denoising_strength=spec.denoising_strength,
                 control_type=spec.control_type,
                 workflow=spec.workflow,
                 post_processing=list(spec.post_processing),

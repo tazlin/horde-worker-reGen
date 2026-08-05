@@ -137,6 +137,7 @@ Progressive worker benchmarking. Subcommands:
 |------------|---------|
 | `run` | Run the capability-probe benchmark: prove what this machine can do, on one warm worker. |
 | `plan` | Show each probe's resource requirements and predicted run/skip verdict (no worker is started). |
+| `pricing-corpus` | Run the cost-attribution corpus that a pricing model is fitted against. |
 | `report OUT_DIR` | Re-render the markdown report from an existing output directory. |
 | `monitor OUT_DIR` | Tail a run's `progress.jsonl` live (attach to or replay a run). |
 | `live` | Open-loop load generation against a live API (not yet implemented). |
@@ -226,6 +227,75 @@ preview matches exactly what the run would do. The same plan table is also print
 too. Fake-mode plans skip device discovery because fake runs do not use or gate on GPU resources; real-mode
 plans still probe the machine for their fit verdicts. Pass `--force` to see probes that do not fit (or lack a
 token) reported as `RUN` instead of `SKIP`.
+
+### `pricing-corpus`: measure what each payload axis costs
+
+A cost model can only price an axis it has seen vary, so this subcommand runs a workload that sweeps
+one axis at a time against a per-model anchor: steps, resolution, batch, cfg, sampler, schedule, source
+processing, post-processing, controlnet, hires fix, LoRA cache state, textual inversions, and
+base-model cold loads. The expansion is deterministic (same tier, same jobs, same order, on every
+machine), and every job's cell is recorded in a **definition artifact** written next to the session's
+stats stream, which is what lets a later fit label each stats record with the axis values that produced
+it.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--tier {smoke,standard,census}` | `smoke` | `standard` is the marginal-cost fit set (multi-hour); `census` covers every value of every categorical axis the kudos manifest encodes (about four hours); `smoke` is a short subset that proves the corpus runs. |
+| `--emit-definition PATH` | — | Write the definition artifact here instead of next to the session stats. |
+| `--dry-list` | off | Print the ordered cell ids and exit; no worker is started. |
+| `--lora-version-id ID` | pinned set | Override a pinned CivitAI LoRA *version* id for the LoRA cells (repeatable; the standard and census tiers need five). |
+| `--ti-name NAME` | pinned id | Override the pinned textual-inversion reference for the TI cell. |
+| `--no-lora-eviction` | off | Skip evicting the pinned LoRAs before the run; any still cached turns its miss cell into a hit measurement. |
+| `--out DIR` | `benchmark_results/<ts>` | Output directory for the controller log. |
+| `--timeout SECONDS` | `21600` | Overall run timeout. |
+
+```bash
+# See what the full corpus would run, without starting a worker:
+horde-benchmark pricing-corpus --tier standard --dry-list
+
+# Short end-to-end check on this GPU:
+horde-benchmark pricing-corpus --tier smoke
+
+# The real fit run (the pinned LoRA/TI references apply unless overridden):
+horde-benchmark pricing-corpus --tier standard
+
+# Full vocabulary coverage, for a model that must price values the standard tier never runs:
+horde-benchmark pricing-corpus --tier census
+```
+
+#### The `census` tier
+
+The standard tier moves each axis a few steps so a marginal cost can be read off it. The census answers
+a different question: does the corpus contain *every value* a request can name? Its vocabularies are read
+from the kudos feature manifest that hordelib ships, not from lists restated in the worker, so a value the
+manifest gains is a value the census sweeps. Each value gets its own replicated cell against a fixed
+anchor (every sampler, every schedule, every post-processor, every control type, every source-processing
+mode, hires fix, the LoRA count levels, textual inversions), and the remaining budget goes to a
+conflation block whose axes vary jointly, so the marginals can be checked against conditions where
+several of them move at once. The combination space is sampled, not covered: full pairwise over these
+vocabularies is orders of magnitude past any sitting.
+
+A value the census cannot run is named in the definition artifact's `census.exclusions`, with the reason,
+alongside a per-axis `census.coverage` count and the projected job count and runtime. Absence is always a
+declared decision: `k_dpm_adaptive` is out because it picks its own step count, the baselines with no
+model in the corpus are out, and `dpmpp_3m_sde` is not paired with the `normal` schedule because the
+solver diverges there and hordelib substitutes another schedule underneath the request. The census run
+advertises the whole capability surface it exercises (controlnet, extended controlnet, img2img,
+inpainting, LoRA, post-processing), because a capability the bridge does not advertise narrows what the
+worker accepts and would leave the definition's jobs unpaired.
+
+Requires a hordelib that ships `hordelib.kudos_training.manifest`; without it the tier refuses to build
+rather than falling back to a hand-written vocabulary. Sweeping every control type also fetches every
+annotator checkpoint on first use (several gigabytes, one time, on top of the run itself).
+
+The LoRA and TI cells reference pinned, real CivitAI version ids (near the ad-hoc LoRA size cap, so the
+miss cells measure the worst legitimate per-job download). Run preparation must evict the five pinned
+LoRAs through the LoRA model manager's `delete_lora` so the first use of each is a genuine cache miss;
+the run itself re-downloads them, leaving the cache as it was. The ordering is constrained,
+not free, because three of the costs are properties of a job's *position* rather than its payload: a
+cold-load cell is always preceded by a different model, a LoRA reference is always first used by a
+cache-miss cell, and one cell deliberately runs three post-processing jobs back to back while every
+other post-processing job is spaced apart.
 
 ## `horde-log`
 
