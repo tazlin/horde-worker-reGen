@@ -1,14 +1,16 @@
 """End-to-end harness for running the worker against canned job scenarios.
 
 The harness runs the *real* orchestration layer (``HordeWorkerProcessManager`` and
-its full asyncio main loop, with real OS child processes and real IPC primitives)
-while letting the caller choose which heavy subsystems are real:
+its full asyncio main loop, with real IPC primitives) while letting the caller
+choose which heavy subsystems are real:
 
 - **API**: ``skip_api=True`` replaces job pops/submits with a canned scenario and
   makes zero network calls. ``skip_api=False`` talks to the live AI Horde API.
 - **Worker processes** (``process_mode``):
-    - ``"fake"``: child processes run the protocol-faithful fakes from
-      ``fake_worker_processes``; no hordelib/torch anywhere, no GPU needed.
+    - ``"fake"``: spawned children run the protocol-faithful fakes from
+      ``fake_worker_processes``; the parent-resident image-utilities adapter is also
+      replaced with an in-memory protocol fake. No hordelib/torch, capability-service
+      subprocess, socket, live model reference, or GPU is needed.
     - ``"dry_run"``: the real ``HordeInferenceProcess``/``HordeSafetyProcess`` run,
       but skip model loading and inference (requires the ML deps installed).
     - ``"real"``: full production behavior (GPU, model downloads); benchmark mode.
@@ -40,7 +42,9 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
-from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
+from horde_worker_regen.process_management.gpu.gpu_eligibility import JobFeatures, classify_job_features
+from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
@@ -69,6 +73,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_simple_scenario,
 )
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
+    create_fake_utilities_adapter,
     start_fake_download_process,
     start_fake_inference_process,
     start_fake_post_process_process,
@@ -149,6 +154,49 @@ async def _seed_synthetic_demand_periodically(
         await asyncio.sleep(_SYNTHETIC_DEMAND_RESEED_SECONDS)
 
 
+@dataclass(frozen=True)
+class HarnessStageDeadlines:
+    """Optional wall-clock bounds for attributable full-worker stages."""
+
+    process_starting_seconds: float | None = None
+    pending_inference_seconds: float | None = None
+    inference_seconds: float | None = None
+    post_processing_seconds: float | None = None
+    safety_seconds: float | None = None
+    submission_seconds: float | None = None
+    terminal_accounting_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class HarnessStageSnapshot:
+    """Worker state captured before a harness stage or overall deadline aborts the run."""
+
+    reason: str
+    exceeded_stage: str | None
+    exceeded_subject: str | None
+    exceeded_age_seconds: float | None
+    job_stages: dict[str, str]
+    job_stage_ages_seconds: dict[str, float]
+    process_states: dict[int, str]
+    process_types: dict[int, str]
+    process_models: dict[int, str | None]
+    process_launches: dict[int, int]
+    processes_reported: dict[int, bool]
+    model_availability_known: bool
+    available_models: tuple[str, ...]
+    failed_models: tuple[str, ...]
+    planned_vram_mb: float
+    pop_gate: str | None
+    pop_gate_age_seconds: float | None
+    last_pop_attempt_age_seconds: float | None
+    source_exhausted: bool | None
+    source_progress: str | None
+    aux_prefetch_summary: str | None
+    scheduler_defer_reason: str | None
+    whole_card_summary: str
+    recent_actions: tuple[str, ...]
+
+
 @dataclass
 class HarnessConfig:
     """Describes one harness run."""
@@ -177,6 +225,18 @@ class HarnessConfig:
 
     timeout_seconds: float = 120.0
     """Abort the run if the scenario has not completed within this time."""
+
+    stage_deadlines: HarnessStageDeadlines | None = None
+    """Optional per-stage liveness bounds; a violation captures a structured snapshot before aborting."""
+
+    control_loop_interval_seconds: float | None = None
+    """Optional harness-only orchestration cadence; None keeps the production interval.
+
+    Generated simulations can use a shorter interval because their child work and external I/O are already
+    replaced with deterministic fakes. This advances the same control-loop transitions without paying the
+    production wall-clock pacing between each synthetic stage. Fault/watchdog tests that judge real elapsed
+    time leave this unset.
+    """
 
     bridge_data_overrides: dict[str, object] = field(default_factory=dict)
     """Extra fields applied to the constructed bridge data (e.g. max_threads, queue_size)."""
@@ -357,6 +417,8 @@ class HarnessResult:
     num_jobs_faulted: int
     elapsed_seconds: float
     timed_out: bool
+    stage_timeout_snapshot: HarnessStageSnapshot | None = None
+    """State captured before a stage/overall timeout abort, or None for a normally completed run."""
     started_at_epoch: float = 0.0
     """Wall-clock epoch the run's measured window began (set by the driver).
 
@@ -434,6 +496,21 @@ class HarnessResult:
             parts.append(f"exit_reason={self.exit_reason}")
         if self.timed_out:
             parts.append("timed_out=True")
+        if self.stage_timeout_snapshot is not None:
+            snapshot = self.stage_timeout_snapshot
+            stage = snapshot.exceeded_stage or "overall"
+            subject = f" subject={snapshot.exceeded_subject}" if snapshot.exceeded_subject is not None else ""
+            age = f" age={snapshot.exceeded_age_seconds:.1f}s" if snapshot.exceeded_age_seconds is not None else ""
+            parts.append(
+                f"deadline={stage}{subject}{age}; jobs={snapshot.job_stages}; "
+                f"processes={snapshot.process_states}; process_types={snapshot.process_types}; "
+                f"process_models={snapshot.process_models}; pop_gate={snapshot.pop_gate}; "
+                f"source={snapshot.source_progress}; aux={snapshot.aux_prefetch_summary}; "
+                f"scheduler_defer={snapshot.scheduler_defer_reason}; whole_card={snapshot.whole_card_summary}; "
+                f"models_known={snapshot.model_availability_known}; available={snapshot.available_models}; "
+                f"failed={snapshot.failed_models}; planned_vram_mb={snapshot.planned_vram_mb:.0f}; "
+                f"actions={snapshot.recent_actions}"
+            )
         if self.num_jobs_faulted > 0:
             parts.append(f"jobs_faulted={self.num_jobs_faulted}")
         if self.num_jobs_completed < self.num_jobs_expected:
@@ -554,6 +631,40 @@ class JobLifecycleAuditor:
 def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerateJobPopResponse]) -> reGenBridgeData:
     """Construct bridge data appropriate for the given harness configuration."""
     models_in_scenario = sorted({job.model for job in scenario if job.model is not None})
+    scenario_features = [
+        classify_job_features(
+            source_processing=job.source_processing,
+            has_source_image=job.source_image is not None,
+            has_source_mask=job.source_mask is not None,
+            has_lora=bool(job.payload.loras),
+            has_ti=bool(job.payload.tis),
+            control_type=job.payload.control_type,
+            workflow=job.payload.workflow,
+            has_post_processing=bool(job.payload.post_processing),
+            is_sdxl=(
+                job.model is not None
+                and _fallback_baseline_for_harness_model(job.model)
+                == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+            ),
+        )
+        for job in scenario
+    ]
+    template_features = [
+        classify_job_features(
+            source_processing=template.source_processing,
+            has_lora=bool(template.loras),
+            has_ti=bool(template.tis),
+            control_type=template.control_type,
+            workflow=template.workflow,
+            has_post_processing=bool(template.post_processing),
+            is_sdxl=(
+                _fallback_baseline_for_harness_model(template.model)
+                == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+            ),
+        )
+        for template in config.soak_image_templates
+    ]
+    workload_features: list[JobFeatures] = [*scenario_features, *template_features]
 
     # Field aliases (dreamer_name, models_to_load) are required here: the bridge data
     # model populates by alias, matching the on-disk config file format.
@@ -580,19 +691,25 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         # exporting those would mix synthetic costs into the stream real measurements are read from.
         "stats_export_enabled": config.stats_export and config.process_mode == "real",
     }
+    if any(features.needs_source_image for features in workload_features):
+        bridge_data_fields["allow_img2img"] = True
+    if any(features.needs_painting for features in workload_features):
+        bridge_data_fields["allow_painting"] = True
+    if any(features.needs_controlnet for features in workload_features):
+        bridge_data_fields["allow_controlnet"] = True
+    if any(features.needs_extended_controlnet for features in workload_features):
+        bridge_data_fields["extended_controlnet"] = True
+    if any(features.needs_sdxl_controlnet for features in workload_features):
+        bridge_data_fields["allow_sdxl_controlnet"] = True
     if config.alchemy_forms or config.soak_alchemy_templates:
         bridge_data_fields["alchemist"] = True
     # A workload that carries LoRA/TI references needs the worker to advertise LoRA support, or the
     # simulated pop matching (which honours the request exactly as the live API does) filters every
     # auxiliary-bearing job out of the run and the harness silently measures only the control group.
-    carries_aux_references = any(bool(job.payload.loras) or bool(job.payload.tis) for job in scenario) or any(
-        bool(template.loras) or bool(template.tis) for template in config.soak_image_templates
-    )
+    carries_aux_references = any(features.has_lora or features.has_ti for features in workload_features)
     if carries_aux_references:
         bridge_data_fields["allow_lora"] = True
-    carries_post_processing = any(bool(job.payload.post_processing) for job in scenario) or any(
-        bool(template.post_processing) for template in config.soak_image_templates
-    )
+    carries_post_processing = any(features.has_post_processing for features in workload_features)
     if carries_post_processing:
         bridge_data_fields["allow_post_processing"] = True
     # max_power gates the largest resolution the pop request advertises (max_pixels = power * 8 * 64 * 64),
@@ -611,7 +728,10 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         startup_budget = max(_REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS, int(config.timeout_seconds))
         bridge_data_fields["preload_timeout"] = startup_budget
         bridge_data_fields["process_timeout"] = startup_budget
-    bridge_data_fields.update(config.bridge_data_overrides)
+    bridge_data_overrides = dict(config.bridge_data_overrides)
+    if "allow_inpainting" in bridge_data_overrides:
+        bridge_data_overrides.setdefault("allow_painting", bridge_data_overrides.pop("allow_inpainting"))
+    bridge_data_fields.update(bridge_data_overrides)
     bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
     # Prevent the manager from watching/reloading a bridge data file from disk.
     bridge_data._loaded_from_env_vars = True
@@ -625,6 +745,8 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
 
 def _fallback_baseline_for_harness_model(model_name: str) -> KNOWN_IMAGE_GENERATION_BASELINE:
     """Return a representative baseline for a synthetic harness model record."""
+    if model_name in {"AlbedoBase XL (SDXL)", "Juggernaut XL"}:
+        return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
     if model_name == "Flux.1-Schnell fp8 (Compact)":
         return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
     if model_name == "Flux.1-Schnell fp16 (Compact)":
@@ -662,12 +784,14 @@ def _real_image_model_reference(
 def build_harness_model_reference(
     scenario: list[ImageGenerateJobPopResponse],
     reference_manager: ModelReferenceManager | None = None,
+    *,
+    consult_real_reference: bool = True,
 ) -> dict[str, ImageGenerationModelRecord]:
     """Build a model reference covering every model in the scenario.
 
-    Each scenario model resolves to its actual record (and therefore its real baseline, e.g. flux_1 for
-    Flux rather than a blanket stable_diffusion_1) whenever a real reference is available, whether it
-    arrives as ``reference_manager`` or as the process-wide singleton. This matters twice over: the
+    When ``consult_real_reference`` is true, each scenario model resolves to its actual record (and therefore
+    its real baseline, e.g. flux_1 rather than a blanket stable_diffusion_1) whenever a real reference is
+    available, whether it arrives as ``reference_manager`` or as the process-wide singleton. This matters twice: the
     worker derives every VRAM/RAM burden estimate from the baseline, so a stubbed stable_diffusion_1
     would make a heavy model (Flux) look like a small SD1.5 checkpoint and silently mask the very
     residency dynamics a real run is meant to exercise; and the baseline is exported on every
@@ -675,7 +799,7 @@ def build_harness_model_reference(
     model class. Models genuinely absent from the real reference (synthetic test-only names) fall back
     to a minimal stable_diffusion_1 record so fake-process scenarios keep working without a reference.
     """
-    real_reference = _real_image_model_reference(reference_manager)
+    real_reference = _real_image_model_reference(reference_manager) if consult_real_reference else {}
 
     reference: dict[str, ImageGenerationModelRecord] = {}
     for job in scenario:
@@ -756,6 +880,10 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
 
     bridge_data = build_harness_bridge_data(config, scenario)
 
+    system_resources = None
+    if config.process_mode != "real":
+        system_resources = config.system_resources or _build_harness_system_resources()
+
     entry_points: ProcessEntryPoints | None = None
     if config.process_mode == "fake":
         # functools.partial of a module-level function stays picklable under spawn, so we can bind the
@@ -765,6 +893,11 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             inference_kwargs["fail_every_n"] = config.fail_every_n
         if config.inference_fault_profile is not None:
             inference_kwargs["fault_profile"] = config.inference_fault_profile
+        assert system_resources is not None
+        inference_kwargs["sim_total_vram_mb_by_device"] = {
+            device_index: device.total_memory / (1024 * 1024)
+            for device_index, device in system_resources.device_map.root.items()
+        }
         if config.sim_vram_ledger is not None:
             inference_kwargs["sim_vram_ledger"] = config.sim_vram_ledger
             inference_kwargs["sim_weights_mb"] = config.sim_inference_weights_mb
@@ -811,6 +944,7 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             post_process_entry_point=post_process_entry_point,
             vae_lane_entry_point=start_fake_vae_lane_process,
             download_entry_point=download_entry_point,
+            utilities_adapter_factory=create_fake_utilities_adapter,
         )
 
     canned_job_source: CannedJobSource | None = None
@@ -827,10 +961,6 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         canned_alchemy_source = GeneratingAlchemySource(config.soak_alchemy_templates)
     elif config.skip_api and config.alchemy_forms:
         canned_alchemy_source = CannedAlchemySource(config.alchemy_forms)
-
-    system_resources = None
-    if config.process_mode != "real":
-        system_resources = config.system_resources or _build_harness_system_resources()
 
     # The manager writes its session_start record during construction, so the identity must be in
     # place before it is built.
@@ -849,7 +979,11 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         horde_model_reference_manager=config.horde_model_reference_manager,
         system_resources=system_resources,
         skip_api_init=True,
-        stable_diffusion_reference=build_harness_model_reference(scenario, config.horde_model_reference_manager),
+        stable_diffusion_reference=build_harness_model_reference(
+            scenario,
+            config.horde_model_reference_manager,
+            consult_real_reference=config.process_mode == "real",
+        ),
         process_entry_points=entry_points,
         canned_job_source=canned_job_source,
         canned_alchemy_source=canned_alchemy_source,
@@ -860,7 +994,124 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         ),
     )
 
+    if config.control_loop_interval_seconds is not None:
+        if config.control_loop_interval_seconds <= 0:
+            raise ValueError("control_loop_interval_seconds must be greater than zero")
+        manager._loop_interval = config.control_loop_interval_seconds
+
     return manager, len(scenario)
+
+
+_HARNESS_STAGE_BUDGET_FIELDS: dict[JobStage, str] = {
+    JobStage.PENDING_INFERENCE: "pending_inference_seconds",
+    JobStage.PENDING_ANNOTATION: "pending_inference_seconds",
+    JobStage.INFERENCE_IN_PROGRESS: "inference_seconds",
+    JobStage.DISAGGREGATION_DECODING: "inference_seconds",
+    JobStage.DETACHED: "inference_seconds",
+    JobStage.PENDING_POST_PROCESSING: "post_processing_seconds",
+    JobStage.POST_PROCESSING: "post_processing_seconds",
+    JobStage.PENDING_STRIP: "post_processing_seconds",
+    JobStage.PENDING_SAFETY_CHECK: "safety_seconds",
+    JobStage.SAFETY_CHECKING: "safety_seconds",
+    JobStage.PENDING_SUBMIT: "submission_seconds",
+}
+
+
+def _capture_harness_stage_snapshot(
+    manager: HordeWorkerProcessManager,
+    *,
+    reason: str,
+    exceeded_stage: str | None,
+    exceeded_subject: str | None,
+    exceeded_age_seconds: float | None,
+) -> HarnessStageSnapshot:
+    """Capture attributable job, process, availability, reservation, and action state before teardown."""
+    now = time.time()
+    tracked_jobs = manager._job_tracker.tracked_jobs()
+    availability = manager._model_availability
+    recent_actions = manager._action_ledger.recent(limit=12)
+    state = manager._state
+    job_popper = getattr(manager, "_job_popper", None)
+    source = getattr(job_popper, "_canned_job_source", None)
+    total_jobs = source.total_jobs if source is not None else None
+    jobs_emitted = source.jobs_emitted if source is not None else None
+    source_progress = f"{jobs_emitted}/{total_jobs}" if jobs_emitted is not None and total_jobs is not None else None
+    pop_gate_age = (
+        max(0.0, now - state.last_pop_gate_since)
+        if state.last_pop_gate is not None and state.last_pop_gate_since > 0
+        else None
+    )
+    last_pop_attempt_age = (
+        max(0.0, now - state.last_pop_attempt_completed_at) if state.last_pop_attempt_completed_at > 0 else None
+    )
+    residency = manager._inference_scheduler.whole_card_residency_state()
+    whole_card_summary = (
+        f"active={residency.active},model={residency.model},phase={residency.phase or 'none'},"
+        f"processes={residency.processes_now}/{residency.processes_target}/{residency.processes_max},"
+        f"safety_paused={residency.safety_paused},free_now_mb={residency.free_now_mb},"
+        f"free_if_alone_mb={residency.free_if_alone_mb}"
+    )
+    return HarnessStageSnapshot(
+        reason=reason,
+        exceeded_stage=exceeded_stage,
+        exceeded_subject=exceeded_subject,
+        exceeded_age_seconds=exceeded_age_seconds,
+        job_stages={str(tracked.job_id): tracked.stage.name for tracked in tracked_jobs},
+        job_stage_ages_seconds={
+            str(tracked.job_id): max(0.0, now - tracked.current_stage_since) for tracked in tracked_jobs
+        },
+        process_states={info.process_id: info.last_process_state.name for info in manager._process_map.values()},
+        process_types={info.process_id: info.process_type.name for info in manager._process_map.values()},
+        process_models={info.process_id: info.loaded_horde_model_name for info in manager._process_map.values()},
+        process_launches={info.process_id: info.process_launch_identifier for info in manager._process_map.values()},
+        processes_reported={info.process_id: info.has_ever_reported for info in manager._process_map.values()},
+        model_availability_known=availability.is_known,
+        available_models=tuple(sorted(availability.present or ())),
+        failed_models=tuple(sorted(availability.failed)),
+        planned_vram_mb=manager._reserve_ledger.total_vram_mb(),
+        pop_gate=state.last_pop_gate,
+        pop_gate_age_seconds=pop_gate_age,
+        last_pop_attempt_age_seconds=last_pop_attempt_age,
+        source_exhausted=source.exhausted if source is not None else None,
+        source_progress=source_progress,
+        aux_prefetch_summary=manager._aux_prefetch_coordinator.hold_summary(now),
+        scheduler_defer_reason=manager._inference_scheduler._last_budget_defer_reason,
+        whole_card_summary=whole_card_summary,
+        recent_actions=tuple(event.event_type.name for event in recent_actions),
+    )
+
+
+def _stage_deadline_violation(
+    manager: HordeWorkerProcessManager,
+    deadlines: HarnessStageDeadlines,
+) -> tuple[str, str, float] | None:
+    """Return the most-overdue bounded stage as ``(stage, subject, age)``."""
+    now = time.time()
+    violations: list[tuple[float, str, str, float]] = []
+    startup_budget = deadlines.process_starting_seconds
+    if startup_budget is not None:
+        for info in manager._process_map.values():
+            if info.last_process_state is not HordeProcessState.PROCESS_STARTING:
+                continue
+            age = max(0.0, now - info.last_process_state_started_at)
+            if age > startup_budget:
+                violations.append((age - startup_budget, "process_starting", str(info.process_id), age))
+
+    for tracked in manager._job_tracker.tracked_jobs():
+        field_name = _HARNESS_STAGE_BUDGET_FIELDS.get(tracked.stage)
+        if field_name is None:
+            continue
+        budget = getattr(deadlines, field_name)
+        if budget is None:
+            continue
+        age = max(0.0, now - tracked.current_stage_since)
+        if age > budget:
+            violations.append((age - budget, tracked.stage.name.lower(), str(tracked.job_id), age))
+
+    if not violations:
+        return None
+    _overage, stage, subject, age = max(violations)
+    return stage, subject, age
 
 
 async def _watch_for_scenario_completion(
@@ -869,6 +1120,8 @@ async def _watch_for_scenario_completion(
     num_jobs_expected: int,
     num_forms_expected: int = 0,
     timeout_seconds: float,
+    stage_deadlines: HarnessStageDeadlines | None = None,
+    timeout_snapshots: list[HarnessStageSnapshot] | None = None,
 ) -> bool:
     """Trigger shutdown once all jobs and alchemy forms are accounted for, or abort on timeout.
 
@@ -876,13 +1129,66 @@ async def _watch_for_scenario_completion(
         True if the run timed out, False otherwise.
     """
     time_started = time.time()
+    terminal_accounting_gap_since: float | None = None
 
     while True:
         await asyncio.sleep(0.1)
 
+        if stage_deadlines is not None:
+            violation = _stage_deadline_violation(manager, stage_deadlines)
+            if violation is not None:
+                stage, subject, age = violation
+                snapshot = _capture_harness_stage_snapshot(
+                    manager,
+                    reason="stage_deadline_exceeded",
+                    exceeded_stage=stage,
+                    exceeded_subject=subject,
+                    exceeded_age_seconds=age,
+                )
+                if timeout_snapshots is not None:
+                    timeout_snapshots.append(snapshot)
+                logger.error(
+                    f"Harness stage deadline exceeded: {stage} for {subject} has remained unchanged for "
+                    f"{age:.1f}s; jobs={snapshot.job_stages}; processes={snapshot.process_states}",
+                )
+                manager._abort()
+                return True
+
         jobs_accounted_for = manager._job_tracker.total_num_completed_jobs + manager._job_tracker.num_jobs_faulted
         coordinator = manager._alchemy_coordinator
         forms_accounted_for = coordinator.num_canned_forms_completed + coordinator.num_canned_forms_faulted
+
+        source = manager._job_popper._canned_job_source
+        has_terminal_accounting_gap = (
+            source is not None
+            and source.exhausted
+            and len(manager._job_tracker.jobs_lookup) == 0
+            and jobs_accounted_for < num_jobs_expected
+        )
+        if has_terminal_accounting_gap:
+            if terminal_accounting_gap_since is None:
+                terminal_accounting_gap_since = time.time()
+            accounting_budget = stage_deadlines.terminal_accounting_seconds if stage_deadlines is not None else None
+            accounting_gap_age = time.time() - terminal_accounting_gap_since
+            if accounting_budget is not None and accounting_gap_age > accounting_budget:
+                snapshot = _capture_harness_stage_snapshot(
+                    manager,
+                    reason="stage_deadline_exceeded",
+                    exceeded_stage="terminal_accounting",
+                    exceeded_subject=f"{jobs_accounted_for}/{num_jobs_expected}",
+                    exceeded_age_seconds=accounting_gap_age,
+                )
+                if timeout_snapshots is not None:
+                    timeout_snapshots.append(snapshot)
+                logger.error(
+                    "Harness terminal accounting did not converge after the finite source and tracker drained: "
+                    f"{jobs_accounted_for}/{num_jobs_expected} jobs accounted for; source={snapshot.source_progress}",
+                )
+                manager._abort()
+                return True
+        else:
+            terminal_accounting_gap_since = None
+
         if jobs_accounted_for >= num_jobs_expected and forms_accounted_for >= num_forms_expected:
             logger.info(
                 f"Harness scenario complete ({jobs_accounted_for}/{num_jobs_expected} jobs, "
@@ -904,6 +1210,16 @@ async def _watch_for_scenario_completion(
             return False
 
         if time.time() - time_started > timeout_seconds:
+            if timeout_snapshots is not None:
+                timeout_snapshots.append(
+                    _capture_harness_stage_snapshot(
+                        manager,
+                        reason="overall_deadline_exceeded",
+                        exceeded_stage=None,
+                        exceeded_subject=None,
+                        exceeded_age_seconds=time.time() - time_started,
+                    ),
+                )
             logger.error(
                 f"Harness timed out after {timeout_seconds}s with "
                 f"{jobs_accounted_for}/{num_jobs_expected} jobs and "
@@ -1034,6 +1350,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
     time_started = time.time()
 
     num_forms_expected = len(config.alchemy_forms) if (config.alchemy_forms and config.skip_api) else 0
+    timeout_snapshots: list[HarnessStageSnapshot] = []
 
     # Sample real GPU core utilization across the soak's *steady-state* window (the watcher
     # starts it once warmed up and stops it before the drain), so cold-start model load does
@@ -1059,6 +1376,8 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
                 num_jobs_expected=num_jobs_expected,
                 num_forms_expected=num_forms_expected,
                 timeout_seconds=config.timeout_seconds,
+                stage_deadlines=config.stage_deadlines,
+                timeout_snapshots=timeout_snapshots,
             ),
         )
 
@@ -1190,6 +1509,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         elapsed_seconds=time.time() - time_started,
         started_at_epoch=time_started,
         timed_out=timed_out,
+        stage_timeout_snapshot=timeout_snapshots[0] if timeout_snapshots else None,
         audit_failures=audit_failures,
         num_jobs_submitted_faulted=num_jobs_submitted_faulted,
         exit_reason=exit_reason,
@@ -1295,8 +1615,10 @@ def _collect_run_diagnostics(
             f"(expected {num_jobs_expected}); check for stale .abort file or blocked job pop"
         )
 
-    popped = len(manager._job_tracker.jobs_lookup)
-    if popped == 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
+    job_popper = getattr(manager, "_job_popper", None)
+    source = getattr(job_popper, "_canned_job_source", None)
+    jobs_ever_popped = source.jobs_emitted if source is not None else len(manager._job_tracker.jobs_lookup)
+    if jobs_ever_popped == 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
         diags.append("No jobs were ever popped; check canned_job_source or process availability")
 
     return diags
@@ -1344,6 +1666,8 @@ def _all_inference_processes_dead(manager: HordeWorkerProcessManager) -> bool:
 def _warm_model_reference(
     model_names: list[str],
     reference_manager: ModelReferenceManager | None = None,
+    *,
+    consult_real_reference: bool = True,
 ) -> dict[str, ImageGenerationModelRecord]:
     """Build a model reference covering every model the warm session may run.
 
@@ -1351,7 +1675,7 @@ def _warm_model_reference(
     singleton) resolves real records and real baselines, so a real warm benchmark exercises production
     VRAM/RAM dynamics; absent models fall back to a minimal stable_diffusion_1 record.
     """
-    real_reference = _real_image_model_reference(reference_manager)
+    real_reference = _real_image_model_reference(reference_manager) if consult_real_reference else {}
 
     reference: dict[str, ImageGenerationModelRecord] = {}
     for name in model_names:
@@ -1470,11 +1794,16 @@ class WarmHarnessSession:
                 safety_entry_point=start_fake_safety_process,
                 post_process_entry_point=start_fake_post_process_process,
                 vae_lane_entry_point=start_fake_vae_lane_process,
+                utilities_adapter_factory=create_fake_utilities_adapter,
             )
         system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
         # Inject a minimal reference covering every level's models in all modes (mirrors
         # build_harness_process_manager); the real model load on disk uses hordelib's own reference.
-        reference = _warm_model_reference(self._model_names, self._horde_model_reference_manager)
+        reference = _warm_model_reference(
+            self._model_names,
+            self._horde_model_reference_manager,
+            consult_real_reference=self._process_mode == "real",
+        )
         return HordeWorkerProcessManager(
             ctx=multiprocessing.get_context("spawn"),
             bridge_data=_build_warm_bridge_data(

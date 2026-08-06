@@ -208,24 +208,50 @@ worker. See [Frontend and Durable State](frontend_and_state.md).
 When `dry_run_skip_api` is active,
 [`CannedJobSource`][horde_worker_regen.process_management.simulation._canned_scenarios.CannedJobSource]
 substitutes synthetic jobs instead of calling the API, and
-`fake_worker_processes` substitutes fake download, inference, and safety child
-processes instead of running real model downloads, inference, or safety
-evaluation. Everything else (the job tracker, the scheduler, the message
-dispatcher) runs identically. The e2e harness can also inject synthetic system
+`fake_worker_processes` substitutes protocol-faithful download, inference, safety,
+post-processing, VAE, and component workers instead of running real model work.
+It also substitutes an in-memory image-utilities adapter: ControlNet annotation,
+annotator availability, memory reporting, and shutdown still traverse the normal
+control/message protocol, but no capability-service subprocess or loopback HTTP
+request is involved. Synthetic-mode model metadata is derived locally rather than
+consulting a live model-reference singleton. Everything else (the job tracker, the
+scheduler, the message dispatcher, IPC queues, and ordinary spawned-child lifecycle)
+runs identically. Generated simulations may shorten the control-loop interval: this
+preserves transition ordering while removing production idle pacing between synthetic
+stages; tests for elapsed-time watchdogs retain the production cadence. A small slow-band
+smoke layer retains real spawn/replacement and pipe coverage. Its committed rows are a
+coverage-preserving subset of a larger generated candidate corpus: contracts require the
+subset to retain every drawn configuration, queue, system-state, payload, topology, arrival,
+and child-disturbance value. Warm harness sessions reuse spawned children across compatible
+workloads. Generated configuration and queue sweeps do not need to pay unrelated
+external-service or interpreter startup per row. The e2e harness can also inject synthetic system
 resources (RAM, card count, per-card VRAM, backend kind, and process-overhead
 estimates) and script the fake download process's initial model availability,
 which lets canary simulations exercise representative volunteer-host topologies,
 cold-start model availability, and background-download queue pressure without
-touching the network or a GPU.
+touching the network or a GPU. Fake inference children report the injected card's
+capacity through the normal memory-message protocol. When the inventory is injected,
+the measured-truth arbiter consumes that protocol reading rather than consulting the
+host's NVML device; predictive scheduling and measured admission therefore reason about
+the same simulated card. A mutable shared VRAM ledger remains opt-in for tests that need
+allocations and reclamation to change the reading over time.
+
+Bounded runs diagnose each pipeline stage separately. They also bound terminal
+accounting: once a finite source is exhausted and the tracker has finalized every
+job, a missing completion transition fails promptly with source, pop-gate, process,
+and action state rather than consuming the overall run timeout.
 
 The popper builds the same `ImageGenerateJobPopRequest` in live and dry-run modes and passes it to the
 synthetic source at the point where the live API call would occur. Fixed-list sources intentionally replay
-their scripted response verbatim, which keeps deterministic recovery and fault scenarios stable. Sustained-load
+their scripted response verbatim, which keeps deterministic recovery and fault scenarios stable. The harness
+derives a capability envelope that covers those scripted payloads (source-image, painting, ControlNet,
+SDXL-ControlNet, extended ControlNet, LoRA/TI, and post-processing); an explicit bridge override remains
+authoritative when a test intentionally needs a contradictory worker. Sustained-load
 `GeneratingJobSource` instances instead emulate the Horde's eligibility filtering over every request property
 they can resolve from a template alone: offered models, pixel limit, LoRA/TI support, post-processing, ControlNet
 variants, and source-image support. Server/account-dependent constraints such as prompt blacklists, requester kudos
 or IP, NSFW intent, and model-average step limiting are not synthesized. Consequently dynamic pop shaping such as
-multi-GPU targeting, LoRA intake suppression, and the idle-fill model/size ladder remains load-bearing in
+multi-GPU targeting, LoRA intake suppression, and the idle-fill model/size ladder remain load-bearing in
 simulation rather than being bypassed by its job source.
 
 ## Where the code lives

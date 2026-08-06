@@ -845,11 +845,9 @@ def _evict_pinned_loras(version_ids: tuple[str, ...]) -> bool:
 def _pricing_corpus_bridge_overrides(tier: str) -> dict[str, object]:
     """Return the bridge capabilities a corpus tier's workload needs advertised.
 
-    The harness derives LoRA, post-processing and max_power advertising from the scenario, but the
-    controlnet and source-image gates are not derived, and a capability the bridge does not advertise
-    narrows what the worker will accept. The census sweeps every control type the manifest encodes and
-    every source-processing mode, so it has to advertise the whole surface or its coverage claim is
-    false while the definition still pairs every job.
+    The harness derives its envelope from the workload, while the census also pins the complete capability
+    surface explicitly: the corpus is a declared cross-capability measurement, so a future template or harness
+    derivation change must not silently narrow what the worker offers.
     """
     if tier != "census":
         return {}

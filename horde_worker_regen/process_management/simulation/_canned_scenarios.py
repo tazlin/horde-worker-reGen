@@ -21,7 +21,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 from horde_sdk.ai_horde_api.fields import GenerationID
 
-from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES, KNOWN_CONTROLNET_WORKFLOWS
+from horde_worker_regen.process_management.gpu.gpu_eligibility import classify_job_features
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.simulation._dummy_images import (
     make_dummy_mask_png_bytes,
@@ -100,6 +100,11 @@ class CannedJobSource:
         if self._cycle:
             return None
         return len(self._jobs)
+
+    @property
+    def jobs_emitted(self) -> int:
+        """The number of job responses handed to the popper so far."""
+        return self._next_index
 
     def next_pop_response(self, pop_request: ImageGenerateJobPopRequest | None = None) -> ImageGenerateJobPopResponse:
         """Return the next canned job, or a no-job-available response once exhausted.
@@ -544,30 +549,37 @@ class GeneratingJobSource(CannedJobSource):
 
         The generating source can only enforce requirements represented by :class:`SoakImageTemplate`.
         Request properties requiring synthetic metadata or server-side knowledge (prompt blacklist, requester
-        kudos/IP, NSFW intent, painting mode, and model-average step limits) remain outside simulation;
-        fixed-list sources deliberately replay their scripts verbatim.
+        kudos/IP, NSFW intent, and model-average step limits) remain outside simulation; fixed-list sources
+        deliberately replay their scripts verbatim.
         """
         if template.model not in pop_request.models:
             return False
         if template.width * template.height > pop_request.max_pixels:
             return False
-        if (template.loras or template.tis) and not pop_request.allow_lora:
+        features = classify_job_features(
+            source_processing=template.source_processing,
+            has_lora=bool(template.loras),
+            has_ti=bool(template.tis),
+            control_type=template.control_type,
+            workflow=template.workflow,
+            has_post_processing=bool(template.post_processing),
+        )
+
+        if features.has_lora and not pop_request.allow_lora:
             return False
-        if template.post_processing and not pop_request.allow_post_processing:
+        if features.has_post_processing and not pop_request.allow_post_processing:
             return False
 
-        needs_source_image = template.control_type is not None or template.workflow is not None
-        needs_controlnet = template.control_type is not None or template.workflow in KNOWN_CONTROLNET_WORKFLOWS
-        if needs_controlnet and not pop_request.allow_controlnet:
+        if features.needs_controlnet and not pop_request.allow_controlnet:
             return False
-        if template.control_type in EXTENDED_CONTROL_TYPES and not pop_request.allow_extended_controlnet:
+        if features.needs_extended_controlnet and not pop_request.allow_extended_controlnet:
             return False
-        if template.workflow in KNOWN_CONTROLNET_WORKFLOWS and not pop_request.allow_sdxl_controlnet:
+        if features.needs_sdxl_controlnet and not pop_request.allow_sdxl_controlnet:
+            return False
+        if features.needs_painting and not pop_request.allow_painting:
             return False
 
-        # make_canned_job supplies a source image for ControlNet and every workflow template. The worker-side
-        # eligibility contract treats every source-image job as img2img-class in addition to any feature gate.
-        return not (needs_source_image and not pop_request.allow_img2img)
+        return not (features.needs_source_image and not pop_request.allow_img2img)
 
     def _eligible_templates(
         self,

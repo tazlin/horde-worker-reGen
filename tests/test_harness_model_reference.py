@@ -5,9 +5,10 @@ from __future__ import annotations
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 import horde_worker_regen.harness as harness
-from horde_worker_regen.harness import build_harness_model_reference
+from horde_worker_regen.harness import HarnessConfig, build_harness_bridge_data, build_harness_model_reference
 from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 
 _SDXL_MODEL = "AlbedoBase XL (SDXL)"
@@ -73,6 +74,24 @@ def test_reference_singleton_is_used_when_no_manager_is_passed(monkeypatch: pyte
     assert reference[_SDXL_MODEL].baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
 
 
+def test_synthetic_reference_mode_does_not_consult_the_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fake run derives known baselines locally without touching process-wide reference state."""
+
+    class _ForbiddenSingleton:
+        @staticmethod
+        def has_instance() -> bool:
+            raise AssertionError("synthetic reference construction consulted the live singleton")
+
+    monkeypatch.setattr(harness, "ModelReferenceManager", _ForbiddenSingleton)
+
+    reference = build_harness_model_reference(
+        [make_canned_job(_SDXL_MODEL)],
+        consult_real_reference=False,
+    )
+
+    assert reference[_SDXL_MODEL].baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+
+
 def test_models_absent_from_the_reference_keep_the_synthetic_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """A synthetic test-only model still gets a record, so fake-process scenarios keep running."""
     _install_singleton(monkeypatch, _StubReferenceManager({_SDXL_MODEL: _sdxl_record()}))
@@ -83,9 +102,44 @@ def test_models_absent_from_the_reference_keep_the_synthetic_fallback(monkeypatc
 
 
 def test_no_reference_at_all_falls_back_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without any reference the harness still builds a usable record set."""
+    """Without any reference the harness keeps the known synthetic model's baseline class."""
     _install_singleton(monkeypatch, None)
 
     reference = build_harness_model_reference([make_canned_job(_SDXL_MODEL)])
 
-    assert reference[_SDXL_MODEL].baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+    assert reference[_SDXL_MODEL].baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+
+
+def test_bridge_capability_envelope_covers_fixed_scenario_payloads() -> None:
+    """A verbatim canned pop is supported by the worker configuration the harness builds for it."""
+    scenario = [
+        make_canned_job(
+            _SDXL_MODEL,
+            source_processing="inpainting",
+            control_type="canny",
+            loras=[LorasPayloadEntry(name="test-lora")],
+            post_processing=["GFPGAN"],
+        ),
+    ]
+
+    bridge_data = build_harness_bridge_data(HarnessConfig(), scenario)
+
+    assert bridge_data.allow_img2img is True
+    assert bridge_data.allow_inpainting is True
+    assert bridge_data.allow_controlnet is True
+    assert bridge_data.allow_sdxl_controlnet is True
+    assert bridge_data.allow_lora is True
+    assert bridge_data.allow_post_processing is True
+
+
+def test_explicit_bridge_override_can_construct_a_contradictory_worker() -> None:
+    """A focused rejection test may explicitly disable a capability required by its canned pop."""
+    scenario = [make_canned_job(_SDXL_MODEL, source_processing="inpainting")]
+
+    bridge_data = build_harness_bridge_data(
+        HarnessConfig(bridge_data_overrides={"allow_inpainting": False}),
+        scenario,
+    )
+
+    assert bridge_data.allow_img2img is True
+    assert bridge_data.allow_inpainting is False

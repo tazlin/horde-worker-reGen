@@ -1,16 +1,17 @@
-"""Fake inference and safety processes for orchestration testing.
+"""Protocol-faithful worker-lane fakes for orchestration testing.
 
 These classes speak the exact same pipe/queue message protocol as the real
-``HordeInferenceProcess`` and ``HordeSafetyProcess``, but never import hordelib,
+worker lanes, but never import hordelib,
 torch, or any other ML dependency. They allow the full multiprocessing
 orchestration layer (process manager, scheduler, safety orchestrator,
 job tracker) to be exercised end-to-end on machines with no GPU and without
 the heavy dependency stack loaded into the child processes.
 
-The module-level entry points mirror the signatures of
-``worker_entry_points.start_inference_process`` / ``start_safety_process`` so
-they can be passed directly as ``multiprocessing.Process`` targets (they must
-remain module-level functions to stay picklable under spawn).
+The module-level process entry points mirror their production signatures so they
+can be passed directly as ``multiprocessing.Process`` targets (they must remain
+module-level functions to stay picklable under spawn). The utilities lane is a
+parent-resident adapter in production, so its fake uses the matching factory seam
+and keeps the same control/message behavior without a subprocess or socket.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ANNOTATION_CONTROL_TYPES
 from hordelib.metrics import JobPhaseMetrics, SamplingStats
 from loguru import logger
 
@@ -75,6 +77,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
+from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesProcessAdapter
 from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 from horde_worker_regen.process_management.simulation.fault_injection import (
@@ -100,6 +103,131 @@ def _hang_forever(process_label: str, reason: str) -> None:
         time.sleep(3600)
 
 
+class _FakeUtilitiesMemoryReport:
+    """Zero-cost memory reading shaped like the capability client's response."""
+
+    process_rss_bytes = 0
+    torch_reserved_bytes = 0
+    torch_allocated_bytes = 0
+
+
+class _FakeUtilitiesClient:
+    """In-memory implementation of the capability-client operations the adapter polls."""
+
+    def health(self, *, timeout: float | None = None) -> bool:
+        """Report the simulated service as healthy."""
+        return True
+
+    def get_memory_report(self) -> _FakeUtilitiesMemoryReport:
+        """Return a zeroed process-memory reading."""
+        return _FakeUtilitiesMemoryReport()
+
+    def release_cache(self) -> _FakeUtilitiesMemoryReport:
+        """Acknowledge allocator-cache release without changing simulated residency."""
+        return self.get_memory_report()
+
+    def shutdown(self) -> None:
+        """Acknowledge a graceful shutdown request."""
+
+
+class _FakeUtilitiesServer:
+    """Capability-server lifecycle seam with no subprocess, socket, or external environment."""
+
+    def __init__(self) -> None:
+        self._running = False
+        self._exit_code: int | None = None
+        self._client = _FakeUtilitiesClient()
+
+    @property
+    def is_running(self) -> bool:
+        """Return whether the simulated service has started and not stopped."""
+        return self._running
+
+    @property
+    def exit_code(self) -> int | None:
+        """Return zero after shutdown and None while the service is active."""
+        return self._exit_code
+
+    @property
+    def base_url(self) -> str:
+        """Return a non-network address; fake adapter operations never dereference it."""
+        return "memory://image-utilities"
+
+    @property
+    def pid(self) -> int | None:
+        """Return None because this simulation deliberately owns no OS process."""
+        return None
+
+    @property
+    def client(self) -> _FakeUtilitiesClient:
+        """Return the in-memory capability client."""
+        return self._client
+
+    def start(self) -> None:
+        """Mark the simulated service ready."""
+        self._running = True
+        self._exit_code = None
+
+    def stop(self) -> None:
+        """Mark the simulated service stopped."""
+        self._running = False
+        self._exit_code = 0
+
+
+class FakeUtilitiesProcessAdapter(UtilitiesProcessAdapter):
+    """Protocol-faithful utilities lane that performs image operations in memory."""
+
+    @override
+    def annotate(self, control_type: str, image_bytes: bytes, resolution: int = 512) -> bytes:
+        """Return a valid canned control-map PNG without HTTP or detector execution."""
+        return make_dummy_png_bytes()
+
+    @override
+    def remove_background(self, image_bytes: bytes) -> bytes:
+        """Return the supplied image as the simulated background-removal result."""
+        return image_bytes
+
+    @override
+    def list_annotators(self) -> list[dict[str, object]]:
+        """Advertise every named annotator as available to the fake worker."""
+        return [
+            {
+                "name": control_type.value,
+                "available": True,
+                "weights_present": "present",
+                "loaded": False,
+            }
+            for control_type in KNOWN_ANNOTATION_CONTROL_TYPES
+        ]
+
+
+def create_fake_utilities_adapter(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    control_connection: Connection,
+    process_launch_identifier: int,
+    *,
+    device_index: int,
+    python_executable: str,
+    child_env: dict[str, str],
+    log_path: str | None = None,
+) -> FakeUtilitiesProcessAdapter:
+    """Build a utilities adapter with no subprocess, network, or external package environment."""
+    _ = (python_executable, child_env, log_path)
+    return FakeUtilitiesProcessAdapter(
+        process_id=process_id,
+        process_message_queue=process_message_queue,
+        control_connection=control_connection,
+        process_launch_identifier=process_launch_identifier,
+        # The production protocol names the concrete HTTP client, while this in-memory client intentionally
+        # implements only the operations the adapter calls and must not import that external package.
+        server=_FakeUtilitiesServer(),  # pyrefly: ignore [bad-argument-type]
+        device_index=device_index,
+        heartbeat_interval_seconds=0.1,
+        memory_interval_seconds=0.5,
+    )
+
+
 class FakeInferenceProcess(HordeProcess):
     """A lightweight stand-in for ``HordeInferenceProcess``.
 
@@ -108,12 +236,14 @@ class FakeInferenceProcess(HordeProcess):
     """
 
     _active_model_name: str | None = None
+    _periodic_report_includes_vram = True
     _inference_semaphore: Semaphore
     _job_delay_seconds: float
     _fail_every_n: int
     _jobs_started: int = 0
     _fault_profile: FaultProfile
     _sim_vram_ledger: SimVramLedger | None = None
+    _sim_total_vram_mb: float = 0.0
     _sim_weights_mb: float = 0.0
     _sim_context_mb: float = 0.0
 
@@ -131,6 +261,7 @@ class FakeInferenceProcess(HordeProcess):
         fail_every_n: int = 0,
         fault_profile: FaultProfile | None = None,
         sim_vram_ledger: SimVramLedger | None = None,
+        sim_total_vram_mb: float = 0.0,
         sim_weights_mb: float = 0.0,
         sim_context_mb: float = 0.0,
     ) -> None:
@@ -153,6 +284,9 @@ class FakeInferenceProcess(HordeProcess):
             sim_vram_ledger (SimVramLedger | None, optional): A shared simulated-VRAM ledger. When given, \
                 the process registers its weights/context on it and reports ledger-derived device VRAM, so \
                 the orchestrator's budget/forecast see a simulated device. Defaults to None (inert).
+            sim_total_vram_mb (float, optional): Card capacity reported when no mutable VRAM ledger is wired. \
+                This lets ordinary fake runs exercise measured-capacity admission without a manager process. \
+                Defaults to 0.0 (no device telemetry).
             sim_weights_mb (float, optional): This process's resident model-weight footprint to register on \
                 the ledger when a model is loaded. Defaults to 0.0.
             sim_context_mb (float, optional): This process's fixed CUDA-context overhead to register on the \
@@ -171,6 +305,7 @@ class FakeInferenceProcess(HordeProcess):
         self._fail_every_n = fail_every_n
         self._fault_profile = fault_profile if fault_profile is not None else FaultProfile()
         self._sim_vram_ledger = sim_vram_ledger
+        self._sim_total_vram_mb = sim_total_vram_mb
         self._sim_weights_mb = sim_weights_mb
         self._sim_context_mb = sim_context_mb
 
@@ -201,11 +336,16 @@ class FakeInferenceProcess(HordeProcess):
         return 0
 
     @override
+    def _offthread_vram_sampling_ready(self) -> bool:
+        """Allow periodic synthetic VRAM reports; no device initialization can occur in this fake."""
+        return True
+
+    @override
     def get_vram_total_mb(self) -> int:
-        """Return the simulated card's total VRAM from the ledger, or a fixed 0 when none is wired in."""
+        """Return the simulated card's total VRAM from the mutable ledger or fixed harness topology."""
         if self._sim_vram_ledger is not None:
             return int(self._sim_vram_ledger.total_mb(self.device_index))
-        return 0
+        return int(self._sim_total_vram_mb)
 
     @override
     def get_process_vram_stats(self) -> tuple[int, int, int, int] | None:
@@ -732,6 +872,7 @@ def start_fake_inference_process(
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
+    sim_total_vram_mb_by_device: dict[int, float] | None = None,
     sim_weights_mb: float = 0.0,
     sim_context_mb: float = 0.0,
 ) -> None:
@@ -746,8 +887,10 @@ def start_fake_inference_process(
     corrupt message), letting harnesses exercise the recovery paths. ``sim_vram_ledger`` (with
     ``sim_weights_mb`` / ``sim_context_mb``) wires this fake to a shared simulated-VRAM ledger so a
     ``fault_profile.post_processing_peak_mb`` drives deterministic post-processing VRAM pressure
-    (stall-and-recover vs. complete) without a GPU. Inject any of these with ``functools.partial``
-    (partials of module-level functions stay picklable under spawn).
+    (stall-and-recover vs. complete) without a GPU. Without a mutable ledger,
+    ``sim_total_vram_mb_by_device`` makes the fake report the harness's injected device capacity while
+    keeping device usage at zero. Inject any of these with ``functools.partial`` (partials of module-level
+    functions stay picklable under spawn).
     """
     enable_child_faulthandler(f"fake_inference_{process_id}")
     logger.remove()
@@ -765,6 +908,7 @@ def start_fake_inference_process(
             fail_every_n=fail_every_n,
             fault_profile=fault_profile,
             sim_vram_ledger=sim_vram_ledger,
+            sim_total_vram_mb=(sim_total_vram_mb_by_device or {}).get(device_index, 0.0),
             sim_weights_mb=sim_weights_mb,
             sim_context_mb=sim_context_mb,
         )

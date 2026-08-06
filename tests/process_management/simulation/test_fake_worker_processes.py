@@ -15,6 +15,8 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HordeAnnotationResultMessage,
+    HordeAnnotatorAvailabilityMessage,
     HordeControlFlag,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
@@ -27,6 +29,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSafetyResultMessage,
     HordeSampleControlMessage,
     HordeSampleResultMessage,
+    HordeStartAnnotationControlMessage,
     HordeVaeDecodeControlMessage,
     HordeVaeDecodeResultMessage,
     HordeVaeEncodeControlMessage,
@@ -39,6 +42,7 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
     FakeInferenceProcess,
     FakePostProcessProcess,
     FakeSafetyProcess,
+    create_fake_utilities_adapter,
 )
 from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 from tests.process_management.conftest import make_job_pop_response
@@ -110,6 +114,43 @@ def make_vae_lane_process() -> tuple[HordeVaeLaneProcess, RecordingQueue]:
     return process, queue
 
 
+class TestFakeUtilitiesProcessAdapter:
+    """The fake utilities lane preserves its message contract without external I/O."""
+
+    def test_annotation_and_availability_are_served_in_memory(self) -> None:
+        """A ControlNet annotation returns a PNG and advertises the simulated detector set."""
+        queue = RecordingQueue()
+        adapter = create_fake_utilities_adapter(
+            2,
+            queue,  # type: ignore[arg-type]
+            Mock(),
+            7,
+            device_index=0,
+            python_executable="unused",
+            child_env={},
+        )
+        job = make_job_pop_response()
+        assert job.id_ is not None
+
+        adapter._refresh_servable_control_types()
+        adapter._handle_control_message(
+            HordeStartAnnotationControlMessage(
+                job_id=job.id_,
+                control_type="canny",
+                source_image_bytes=b"source",
+                resolution=512,
+            ),
+        )
+
+        availability = queue.of_type(HordeAnnotatorAvailabilityMessage)
+        assert availability and "canny" in availability[-1].servable_control_types
+        results = queue.of_type(HordeAnnotationResultMessage)
+        assert len(results) == 1
+        assert results[0].state == GENERATION_STATE.ok
+        assert results[0].control_map_bytes is not None
+        assert results[0].control_map_bytes.startswith(b"\x89PNG")
+
+
 def make_fake_safety_process() -> tuple[FakeSafetyProcess, RecordingQueue]:
     """Construct a FakeSafetyProcess wired to a recording queue and mock primitives."""
     queue = RecordingQueue()
@@ -140,6 +181,15 @@ class TestFakeInferenceProcess:
         states = queue.state_changes()
         assert states[0] == HordeProcessState.PROCESS_STARTING
         assert HordeProcessState.WAITING_FOR_JOB in states
+
+    def test_fixed_topology_capacity_is_reported_without_a_shared_ledger(self) -> None:
+        """Ordinary fake runs expose their injected card size without starting a manager process."""
+        process, _queue = make_fake_inference_process(sim_total_vram_mb=16384.0)
+
+        assert process.get_vram_usage_mb() == 0
+        assert process.get_vram_total_mb() == 16384
+        assert process._periodic_report_includes_vram is True
+        assert process._offthread_vram_sampling_ready() is True
 
     def test_preload_emits_model_state_sequence(self) -> None:
         """Preloading must emit PRELOADING_MODEL then PRELOADED_MODEL for the requested model."""

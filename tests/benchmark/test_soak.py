@@ -258,7 +258,6 @@ class TestGeneratingSources:
         ("template", "request_override"),
         [
             (SoakImageTemplate(loras=[LorasPayloadEntry(name="lora")]), {"allow_lora": False}),
-            (SoakImageTemplate(tis=[TIPayloadEntry(name="ti", inject_ti="prompt")]), {"allow_lora": False}),
             (SoakImageTemplate(post_processing=["GFPGAN"]), {"allow_post_processing": False}),
             (SoakImageTemplate(control_type="canny"), {"allow_controlnet": False}),
             (SoakImageTemplate(control_type="mlsd"), {"allow_extended_controlnet": False}),
@@ -278,6 +277,18 @@ class TestGeneratingSources:
         response = source.next_pop_response(self._pop_request(**request_override))
 
         assert response.id_ is None
+
+    def test_textual_inversion_is_independent_of_lora_capability(self) -> None:
+        """Withholding LoRA capability does not suppress a textual-inversion-only template."""
+        source = GeneratingJobSource(
+            [SoakImageTemplate(tis=[TIPayloadEntry(name="ti", inject_ti="prompt")])],
+            seed=1,
+        )
+
+        response = source.next_pop_response(self._pop_request(allow_lora=False))
+
+        assert response.id_ is not None
+        assert [entry.name for entry in response.payload.tis or []] == ["ti"]
 
     def test_pop_request_redistributes_weights_over_eligible_templates(self) -> None:
         """An excluded high-weight template cannot starve a zero-weight but eligible fallback."""

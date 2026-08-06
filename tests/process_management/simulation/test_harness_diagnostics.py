@@ -23,6 +23,7 @@ from horde_worker_regen.harness import (
     build_harness_process_manager,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     start_fake_download_process,
     start_fake_inference_process,
@@ -43,7 +44,10 @@ class TestFakeModeWiring:
         manager, _ = build_harness_process_manager(HarnessConfig(process_mode="fake", skip_api=True, num_jobs=1))
         entry_points = manager._process_lifecycle._entry_points
 
-        assert entry_points.inference_entry_point is start_fake_inference_process
+        assert getattr(entry_points.inference_entry_point, "func", None) is start_fake_inference_process
+        assert getattr(entry_points.inference_entry_point, "keywords", {})["sim_total_vram_mb_by_device"] == {
+            0: 8192.0,
+        }
         assert entry_points.safety_entry_point is start_fake_safety_process
         assert getattr(entry_points.download_entry_point, "func", None) is start_fake_download_process
 
@@ -387,6 +391,21 @@ class TestCollectRunDiagnostics:
             elapsed=5.0,
         )
         assert any("No jobs were ever popped" in d for d in diags)
+
+    def test_drained_tracker_does_not_erase_pop_history(self) -> None:
+        """A consumed finite source proves intake happened after finalized jobs leave the tracker."""
+        manager = make_testable_process_manager()
+        source = CannedJobSource([make_job_pop_response()])
+        manager._job_popper.set_canned_job_source(source)
+        source.next_pop_response()
+
+        diags = _collect_run_diagnostics(
+            manager=manager,
+            num_jobs_expected=1,
+            elapsed=5.0,
+        )
+
+        assert not any("No jobs were ever popped" in diagnostic for diagnostic in diags)
 
 
 class TestHarnessResultFailureSummary:
