@@ -1154,7 +1154,16 @@ window warm-up withholds any floor until a full window is observed, so the pre-f
 at cold start.
 
 When a candidate exceeds the achievable ceiling it cannot fit even an emptied card *at the card's current
-foreign usage*. For the true head of queue with no other card that could seat it (a single-device worker, or
+foreign usage*. Two things soften that before it becomes terminal. A candidate clearing the ceiling by less
+than the attempt allowance (10% of the ceiling, capped at 1024 MB) is more likely a conservative prediction
+than a genuine misfit, so it earns one real measured load instead. And that load is judged only from a card
+that has actually converged: while the worker still holds anything reclaimable, such a head **defers** and the
+reclaim is routed, because a card mid-teardown has not yet shown what it can offer. Denying there would make
+servability depend on the pool's shape rather than on the card, faulting a head that the same card serves once
+its idle contexts have exited.
+
+Past that allowance, or once the card has converged and the demand still does not fit, the verdict is terminal.
+For the true head of queue with no other card that could seat it (a single-device worker, or
 every other card equally impossible), the arbiter's verdict is a terminal **DENY**, not a defer: the
 scheduler faults the head so the horde reissues it to a worker that can serve it now (a job is time-bound, so
 faulting it while it cannot fit is correct), and places the model on a **conditional ceiling hold** so pop

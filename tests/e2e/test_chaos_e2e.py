@@ -38,8 +38,8 @@ _HANG_DETECT_TIMEOUT_SECONDS = 45.0 * _SPAWN_SLOWDOWN
 
 # A deterministic crash-on-start is only recoverable by the save-our-ship escalation: the crash-loop
 # breaker must quarantine the pool (several process re-spawns), the supervisor attempts a soft reset,
-# then gives up and abandons ship. Each step is bounded by real process-spawn cost (notably slow on
-# Windows), so this allows generous headroom over the observed ~20-30s rather than a tight wedge bound.
+# then gives up and reaches its terminal rung. Each step is bounded by real process-spawn cost (notably
+# slow on Windows), so this allows generous headroom rather than a tight wedge bound.
 _SAVE_OUR_SHIP_TIMEOUT_SECONDS = 60.0 * _SPAWN_SLOWDOWN
 
 
@@ -182,11 +182,12 @@ async def test_stale_launch_duplicate_result_is_ignored() -> None:
 
 @pytest.mark.e2e
 async def test_inference_crash_on_start_is_circuit_broken() -> None:
-    """A permanently-failing inference start must be circuit-broken and abandoned, not left to wedge.
+    """A permanently-failing inference start must be circuit-broken, not left to wedge or churn.
 
-    The crash-loop breaker quarantines the slot, the recovery supervisor attempts a soft reset, and when
-    that cannot restore a working pool it abandons ship cleanly (the last resort) so the worker stops
-    instead of spinning forever.
+    The crash-loop breaker quarantines the slot and the recovery supervisor attempts a soft reset. When
+    that cannot restore a working pool the escalation reaches its terminal rung: with no relaunch contract
+    configured, exiting would leave nothing to restart the worker, so the ladder ends in a recovery park
+    (intake stopped, no further rebuilds) instead of spinning forever.
     """
     scenario = make_simple_scenario(2)
     result = await run_harness_async(
@@ -200,6 +201,7 @@ async def test_inference_crash_on_start_is_circuit_broken() -> None:
     )
 
     assert not result.timed_out, result.failure_summary()
+    assert result.exit_reason == "recovery_parked", result.failure_summary()
 
 
 @pytest.mark.e2e
@@ -207,8 +209,9 @@ async def test_safety_crash_on_start_does_not_wedge_image_jobs() -> None:
     """A safety process that crashes on every start must not wedge the worker forever.
 
     The safety pool is rebuilt on each crash (including a crash during startup, before it ever loads);
-    once it has crash-looped past its threshold the recovery supervisor recognizes the pool as failing
-    and abandons ship cleanly rather than holding jobs in safety indefinitely.
+    once it has crash-looped past its threshold the recovery supervisor recognizes the pool as failing and
+    ends its escalation at the terminal rung (a recovery park, since no relaunch contract is configured)
+    rather than holding jobs in safety indefinitely.
     """
     scenario = make_simple_scenario(2)
     result = await run_harness_async(
@@ -222,6 +225,7 @@ async def test_safety_crash_on_start_does_not_wedge_image_jobs() -> None:
     )
 
     assert not result.timed_out, result.failure_summary()
+    assert result.exit_reason == "recovery_parked", result.failure_summary()
 
 
 @pytest.mark.e2e

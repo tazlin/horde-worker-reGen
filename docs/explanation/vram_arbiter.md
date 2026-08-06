@@ -386,22 +386,36 @@ The first concurrent sampling of its kind admits on an empty ledger.
 
 Between a plain `DEFER` and a structural `DENY` sits one bounded escape hatch: the **measured-load attempt**. A
 candidate under the achievable ceiling is possible on this card in principle, so a static sampling-VRAM
-prediction that misses the instantaneous available reading by only a little may simply be conservative, or the
-foreign VRAM may have breathed up for one reading. When the true head has starved past the 60s diagnostic
-horizon at a *converged-empty* card (no worker reservations outstanding and no worker-resident model to evict:
-make-room has nothing left to reclaim), and the shortfall against available is within a band (1024 MB), the
-arbiter stops deferring an idle card on arithmetic that may be wrong and admits the head for exactly one real
-load, so measured reality decides. The attempt rides the ordinary `FITS` path, so every downstream safety (the
-per-step floors, the watchdogs, the OOM classification, the whole-card residency machinery) applies unchanged.
-It is one-shot per head-starvation episode: a success teaches the learned peak the true figure so future
-arithmetic improves and nothing else happens; a failure (the child faults with the out-of-memory
-classification) is the strongest possible evidence the demand does not fit this card now, so the job is faulted
-terminally as a scheduling-recovery action (excluded from the consecutive-failure pop pause, exactly like the
-unroutable-head fault) and the model's conditional ceiling hold is armed against the demand the real load
-actually failed at, with the operator warning firing once. A shortfall beyond the band, or a card with reclaim
-still to do, keeps deferring toward the give-up backstop as before: the escape hatch only fires where the
-arithmetic says close-but-no at an empty card, which is exactly where a real attempt is worth more than another
-deferral.
+prediction that misses the instantaneous available reading may simply be conservative, or the foreign VRAM may
+have breathed up for one reading. When the true head has starved past the 60s diagnostic horizon at a
+*converged-empty* card (no worker reservations outstanding, no worker-resident model to evict and no idle
+sibling context to tear down: make-room has nothing left to reclaim), the arbiter stops deferring an idle card
+on arithmetic that may be wrong and admits the head for exactly one real load, so measured reality decides. The
+attempt rides the ordinary `FITS` path, so every downstream safety (the per-step floors, the watchdogs, the OOM
+classification, the whole-card residency machinery) applies unchanged. It is one-shot per head-starvation
+episode: a success teaches the learned peak the true figure so future arithmetic improves and nothing else
+happens; a failure (the child faults with the out-of-memory classification) is the strongest possible evidence
+the demand does not fit this card now, so the job is faulted terminally as a scheduling-recovery action
+(excluded from the consecutive-failure pop pause, exactly like the unroutable-head fault) and the model's
+conditional ceiling hold is armed against the demand the real load actually failed at, with the operator
+warning firing once.
+
+The shortfall's *size* does not gate that attempt, and deliberately so. A band expresses how far the arithmetic
+may be wrong before waiting beats trying, and waiting is only a bet on a card whose available reading can still
+improve. On a converged card it cannot: the choice is exactly two-way, take the load or hold the head against a
+figure that will never move, so refusing a wider shortfall parks the head with nothing to wait for. What bounds
+the demand there is the achievable ceiling, not a band. The 1024 MB uncertainty figure still sizes the
+*ceiling* allowance below.
+
+A card that has **not** converged is different: something the worker can free is still outstanding, so the
+reading can improve and deferring has a purpose. There the head defers and the reclaim is routed. That also
+decides what happens to a candidate *over* the ceiling by less than the ceiling allowance (10% of the ceiling,
+capped at 1024 MB): it is granted its one real load only from a converged card, and while the card still holds
+reclaimable state it takes a `DEFER` that drives the teardown rather than the terminal `DENY`. Denying it
+earlier would settle servability from a pool shape that is still changing: the identical head on a pool some
+other mechanism happened to collapse first would be served, while this one is faulted for reissue and its model
+put on the ceiling hold. The terminal verdict stays reachable, but only from a card that has actually run out
+of things to free.
 
 Disaggregated sampling is priced differently: the static concurrent-sampling headroom now lives on the
 device state alone (device total net of baseline, minus the fixed and marginal context overheads, the

@@ -32,7 +32,12 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 
 
 def _full_card_state() -> DeviceVramState:
-    """A device state whose card is physically full (device-free at zero), so no candidate fits."""
+    """A device state whose card is physically full (device-free at zero), so no candidate fits.
+
+    The room is held by processes outside this worker, which the sustained foreign floor records. That is what
+    makes the card full *and* nothing for the worker to reclaim: with no foreign floor the same reading would
+    say the worker itself holds the card, which would mean an eviction could still free it.
+    """
     return DeviceVramState(
         total_vram_mb=16000.0,
         baseline_mb=0.0,
@@ -40,6 +45,7 @@ def _full_card_state() -> DeviceVramState:
         planned_unmaterialized_mb=0.0,
         committed_is_stale=False,
         device_free_mb=0.0,
+        foreign_floor_mb=16000.0,
     )
 
 

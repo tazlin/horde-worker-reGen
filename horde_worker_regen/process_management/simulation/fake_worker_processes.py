@@ -33,8 +33,11 @@ from loguru import logger
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
+    AuxPrefetchOutcome,
     HordeAlchemyControlMessage,
     HordeAlchemyResultMessage,
+    HordeAuxPrefetchControlMessage,
+    HordeAuxPrefetchResultMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeDownloadAvailabilityMessage,
@@ -1182,6 +1185,37 @@ class FakeDownloadProcess(HordeProcess):
         self._rate_limit_kbps = rate_limit_kbps if (rate_limit_kbps or 0) > 0 else None
         self._send_availability()
 
+    def _handle_aux_prefetch_request(self, message: HordeAuxPrefetchControlMessage) -> None:
+        """Report every requested auxiliary file as placed on disk.
+
+        A simulated job's LoRAs and textual inversions are references only: the fake inference lane reads
+        no files, so there is nothing to fetch and every entry succeeds. Answering is what matters, since
+        a popped job carrying auxiliary references stays pending until its prefetch reports back, and the
+        scripted download delay is charged once for the batch so a prefetch still costs time.
+        """
+        if not message.entries:
+            return
+        effective_delay = self._download_delay_seconds * self._fault_profile.slow_factor
+        if effective_delay > 0:
+            time.sleep(effective_delay)
+        self.process_message_queue.put(
+            HordeAuxPrefetchResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info="aux prefetch complete",
+                outcomes=[
+                    AuxPrefetchOutcome(
+                        kind=entry.kind,
+                        name=entry.name,
+                        is_version=entry.is_version,
+                        ok=True,
+                        requesting_job_ids=[entry.requesting_job_id],
+                    )
+                    for entry in message.entries
+                ],
+            ),
+        )
+
     def _status_snapshot(self) -> DownloadStatusSnapshot:
         """Project the fake's state into the same rich snapshot the real process emits."""
         if self._currently_downloading is not None:
@@ -1228,6 +1262,9 @@ class FakeDownloadProcess(HordeProcess):
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         if message.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE:
             # The fake holds no real model managers; a reference reload is a no-op here.
+            return
+        if isinstance(message, HordeAuxPrefetchControlMessage):
+            self._handle_aux_prefetch_request(message)
             return
         if not isinstance(message, HordeDownloadControlMessage):
             logger.warning(f"Fake download process received unexpected message: {type(message).__name__}")

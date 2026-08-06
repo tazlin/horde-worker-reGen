@@ -483,3 +483,50 @@ class TestMemoryReportLogThrottle:
             process_map.on_memory_report(process_id=0, ram_usage_bytes=2048)
 
         assert self._memory_report_levels(records) == ["DEBUG", "DEBUG", "TRACE"]
+
+
+class TestLaunchTally:
+    """Tests for the cumulative per-type launch tally.
+
+    Teardown and pool rebuilds empty the active map, so run-level questions of the form "did this worker
+    ever start an inference child" must be answered from a counter that removal does not decrement.
+    """
+
+    def test_initial_entries_are_tallied(self) -> None:
+        """Processes present at construction count as launches of their type."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0),
+                10: make_mock_process_info(10, model_name=None, process_type=HordeProcessType.SAFETY),
+            },
+        )
+
+        assert process_map.num_processes_ever_started(HordeProcessType.INFERENCE) == 1
+        assert process_map.num_processes_ever_started(HordeProcessType.SAFETY) == 1
+
+    def test_tally_survives_removal_and_clear(self) -> None:
+        """Retiring a process, and clearing the whole map, leave the historical count intact."""
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+        process_map[1] = make_mock_process_info(1)
+
+        process_map.retire_process(process_map[1], "scale-down")
+        assert process_map.num_processes_ever_started(HordeProcessType.INFERENCE) == 2
+
+        process_map.clear()
+        assert process_map.num_processes_ever_started(HordeProcessType.INFERENCE) == 2
+        assert process_map.num_inference_processes() == 0
+
+    def test_replacement_launch_counts_again(self) -> None:
+        """A replacement installed under a reused process id is a further launch."""
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+        process_map[0] = make_mock_process_info(0)
+
+        assert process_map.num_processes_ever_started(HordeProcessType.INFERENCE) == 2
+
+    def test_reinstalling_the_same_launch_is_not_a_new_launch(self) -> None:
+        """Rewriting the same process info under its own id is bookkeeping, not a launch."""
+        process_info = make_mock_process_info(0)
+        process_map = ProcessMap({0: process_info})
+        process_map[0] = process_info
+
+        assert process_map.num_processes_ever_started(HordeProcessType.INFERENCE) == 1

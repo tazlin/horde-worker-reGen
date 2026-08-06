@@ -55,11 +55,16 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 _SDXL = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
 
 # Faithful to the reproduced incident: a 16375 MB card whose desktop/other processes sustain ~1912 MB, so the
-# achievable ceiling is total - noise(818.75) - foreign(1912) = 13644.25 MB. The head needs 14573 MB and can
-# never fit; a sibling needs 5000 MB and fits.
+# achievable ceiling is total - noise(818.75) - foreign(1912) = 13644.25 MB. The head can never fit; a sibling
+# needs 5000 MB and fits.
 _TOTAL_MB = 16375.0
 _FOREIGN_MB = 1912.0
-_IMPOSSIBLE_CANDIDATE_MB = 14573.0
+_IMPOSSIBLE_CANDIDATE_MB = 15000.0
+"""A demand past the ceiling by more than the one-real-load allowance, so it is unroutable outright.
+
+The margin matters: a candidate over the ceiling by less than that allowance is not judged impossible at all,
+it earns one measured load once the card converges (see the ceiling attempt in the arbiter). Only a demand
+past the allowance is the unroutable head this module is about."""
 _FITTABLE_CANDIDATE_MB = 13000.0
 _SIBLING_CANDIDATE_MB = 5000.0
 

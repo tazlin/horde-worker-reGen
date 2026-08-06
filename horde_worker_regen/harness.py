@@ -836,6 +836,13 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
     # place before it is built.
     _apply_scenario_provenance_env(config)
 
+    # A fake run keeps the download lane out of the way unless the scenario needs it. It needs it whenever a
+    # job carries LoRA or textual-inversion references: with no downloader there is no prefetch, and the
+    # worker faults an auxiliary-bearing job on pop rather than leaving it pending forever. The fake lane
+    # answers those prefetches as satisfied, so an auxiliary scenario drains instead of faulting its way into
+    # the consecutive-failure pause.
+    scenario_needs_aux_prefetch = any(job.payload.loras or job.payload.tis for job in scenario)
+
     manager = HordeWorkerProcessManager(
         ctx=multiprocessing.get_context("spawn"),
         bridge_data=bridge_data,
@@ -847,7 +854,10 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         canned_job_source=canned_job_source,
         canned_alchemy_source=canned_alchemy_source,
         enable_background_downloads=config.process_mode == "real"
-        or (config.process_mode == "fake" and config.fake_initially_available_models is not None),
+        or (
+            config.process_mode == "fake"
+            and (config.fake_initially_available_models is not None or scenario_needs_aux_prefetch)
+        ),
     )
 
     return manager, len(scenario)
@@ -877,6 +887,18 @@ async def _watch_for_scenario_completion(
             logger.info(
                 f"Harness scenario complete ({jobs_accounted_for}/{num_jobs_expected} jobs, "
                 f"{forms_accounted_for}/{num_forms_expected} alchemy forms accounted for)",
+            )
+            manager._shutdown()
+            return False
+
+        # A recovery park is the ladder's last rung for a worker with no relaunch contract: every remedy is
+        # spent, intake stops, and the worker stays up re-probing. Nothing in the scenario can be served from
+        # there, so the run has its answer; waiting out the timeout would only mislabel a reached terminal
+        # state as a hang.
+        if manager._state.recovery_parked:
+            logger.error(
+                f"Harness ending early: recovery parked with {jobs_accounted_for}/{num_jobs_expected} jobs "
+                f"and {forms_accounted_for}/{num_forms_expected} alchemy forms accounted for",
             )
             manager._shutdown()
             return False
@@ -1205,6 +1227,9 @@ def _determine_exit_reason(
     jobs_accounted = manager._job_tracker.total_num_completed_jobs + manager._job_tracker.num_jobs_faulted
     if jobs_accounted >= num_jobs_expected:
         return "completed"
+    if manager._state.recovery_parked:
+        # Reported ahead of the shutdown reason: the park is why the run ended, and the shutdown is how.
+        return "recovery_parked"
     if manager._state.shut_down:
         return "shut_down_before_completion"
     return "unknown"
@@ -1252,8 +1277,11 @@ def _collect_run_diagnostics(
     """Collect non-fatal diagnostic messages about the run for debugging failures."""
     diags: list[str] = []
 
-    num_inference = manager._process_map.num_inference_processes()
-    num_safety = manager._process_map.num_safety_processes()
+    # Asked of the cumulative launch tally, not live membership: this runs after the main loop has returned,
+    # and worker teardown empties the active process map, so a run whose children all started and worked
+    # cleanly would otherwise report that none were ever started.
+    num_inference = manager._process_map.num_processes_ever_started(HordeProcessType.INFERENCE)
+    num_safety = manager._process_map.num_processes_ever_started(HordeProcessType.SAFETY)
     if num_inference == 0:
         diags.append("No inference processes were started")
     if num_safety == 0:

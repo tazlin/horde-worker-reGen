@@ -939,3 +939,31 @@ class TestStaleDriftSkipLogThrottle:
             self._evaluate_with_stale_contributor(pm)
 
         assert self._skip_levels(records) == ["DEBUG", "TRACE", "TRACE"]
+
+
+class TestInjectedInventorySuppressesDeviceUsedReads:
+    """A run whose device inventory was injected must not anchor on this host's cards.
+
+    The device-used reading reaches admission through the baseline estimate, which is subtracted from a
+    card's stated capacity. When the inventory describes cards the host does not have (a simulated run
+    states its own capacities), that reading belongs to different hardware, and charging a simulated card
+    for whatever else the host holds makes admission depend on the host's desktop rather than the run.
+    """
+
+    def test_injected_inventory_reports_no_device_used(self) -> None:
+        """With an injected inventory the reader answers None, so no baseline is ever captured."""
+        pm = make_testable_process_manager()
+
+        assert pm._device_inventory_is_injected is True
+        assert pm._read_device_used_mb(0) is None
+
+        pm._process_map.clear()
+        pm._process_map[0] = make_mock_process_info(  # type: ignore[index]
+            0,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        pm._last_vram_attribution_time = 0.0
+        pm._evaluate_vram_attribution_drift()
+
+        assert pm.latest_baseline_estimate_mb(0) is None

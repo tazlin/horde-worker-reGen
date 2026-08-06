@@ -148,6 +148,18 @@ uv run pytest tests/process_management/
   - A band skips only when the `-m` expression does not name it, so `-m "not slow"` and `-m slow`
     both behave as written. The day-to-day flow is: bare `pytest` while iterating, `-m slow` before pushing
     a change that touches the worker lifecycle, `-m gpu` on a GPU box, the chaos sweep before a release.
+- **Targeted selection: never rerun a multi-minute band to inspect one failure.** Every `FAILED` line
+  carries a full node id; rerun exactly that:
+    - one test: `pytest "tests/path/file.py::Class::test_name" -q`; one parametrized cell: append its
+      bracketed id verbatim (`::test_row[seed1163-8gb-alternating-t1-n5]`) and quote the whole node id;
+    - one matrix row across its properties: `-k <row-label>` (row labels are unique by construction);
+    - one chaos seed: `HORDE_CHAOS_SEEDS=<seed>` with the sweep marker runs that seed alone; a range
+      (`1000:1100`) or list (`7,19`) widens it. Debug a single seed this way, never by rerunning the sweep;
+    - long runs are teed to a file once and grepped; the tee is the record, the node ids in it are the
+      rerun commands.
+  Iterating on a fix means iterating against the pinned reproduction test (seconds), not the band it came
+  from; the band reruns once when the fix is believed complete. One pytest invocation per working copy at
+  a time: concurrent suites in the same checkout abort each other's runs.
 - Most pipeline tests run **without a GPU or network** using dry-run mode (`CannedJobSource` +
   `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode)
   and `harness.py`.

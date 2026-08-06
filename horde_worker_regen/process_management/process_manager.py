@@ -1242,6 +1242,10 @@ class HordeWorkerProcessManager:
 
         self.target_vram_overhead_bytes_map = target_vram_overhead_bytes_map  # TODO
 
+        # An injected inventory describes cards this host may not have (a simulated run states its own device
+        # map and capacities), so this host's NVML readings do not describe them. The device-wide readers
+        # consult this before reporting a figure; see ``_read_device_used_mb``.
+        self._device_inventory_is_injected = system_resources is not None
         if system_resources is None:
             system_resources = SystemResources.detect()
 
@@ -3747,7 +3751,13 @@ class HordeWorkerProcessManager:
         is a per-process view; it is read here from the *parent* (outside any CUDA workload) so the number is
         not a per-process artefact, and via NVML directly (never torch) so the orchestrator stays torch-free.
         None off NVIDIA / when NVML is unavailable, so the reconciliation degrades rather than raising.
+
+        Also None when the device inventory was injected: the reading would then describe this host's cards
+        rather than the ones the run drives, and it reaches admission through the baseline estimate, so a
+        simulated card's capacity would be charged for whatever else the host has on screen.
         """
+        if self._device_inventory_is_injected:
+            return None
         try:
             from hordelib.utils.nvml import get_device_memory_mb
         except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash

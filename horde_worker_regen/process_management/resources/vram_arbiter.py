@@ -117,19 +117,22 @@ has exhausted every reclaim, so a close-but-no arithmetic verdict on a card the 
 is the moment to let one real load decide rather than defer indefinitely."""
 
 _MEASURED_ATTEMPT_BAND_MB = 1024.0
-"""Uncertainty band (MB) within which a starved head at a converged-empty card is admitted for one real load
-attempt despite not fitting the instantaneous available reading.
+"""How far (MB) a predicted candidate may sit above a measured figure before the gap stops reading as
+prediction error.
 
 The measured-truth identity refuses on arithmetic (candidate > available), but a static sampling-VRAM
 prediction is deliberately conservative relative to a model's true peak, and the instantaneous device-free
-reading oscillates as foreign (desktop/OS) VRAM breathes. When the head has starved past the diagnostic
-horizon, the card is converged-empty (no worker reservations, no worker-resident model, nothing left for
-make-room to reclaim), and the candidate is under the achievable ceiling (so it is possible on this card in
-principle), a shortfall this small is exactly the regime where the prediction's conservatism or a transient
-foreign dip explains the gap. Admitting one measured load lets reality decide: a success teaches the learned
-peak the true figure, a failure (child OOM) is the strongest possible evidence and arms the ceiling hold. The
-band is wide enough to cover ordinary prediction conservatism yet small enough that a genuinely oversized
-demand keeps deferring toward the give-up backstop rather than banging the card with a hopeless attempt."""
+reading oscillates as foreign (desktop/OS) VRAM breathes. This is the width of that combined uncertainty:
+wide enough to cover ordinary prediction conservatism, narrow enough that a genuinely oversized demand is not
+mistaken for it.
+
+It sizes the *ceiling* attempt allowance (:data:`_CEILING_ATTEMPT_OVERSHOOT_CAP_MB`), where it decides between
+one real load and a terminal DENY. It deliberately does not gate the within-available attempt on a
+converged-empty card: there, available cannot improve, so a shortfall of any size leaves the same two options
+and no third one to wait for. See
+:meth:`~horde_worker_regen.process_management.resources.vram_arbiter.VramArbiter._measured_attempt_eligible`.
+The demand there is bounded from above by the achievable ceiling instead, which is the test that separates a
+load that is possible on this card from one that never is."""
 
 _CEILING_ATTEMPT_OVERSHOOT_FRACTION = 0.10
 """Fraction of a card's achievable ceiling by which a candidate may exceed it and still earn one real load
@@ -714,15 +717,19 @@ class VramArbiter:
 
         # The candidate does not fit available room. If it cannot fit even an empty card, no escalation on this
         # card could ever seat it, so it DENIES, unless it clears the ceiling by so little that the prediction
-        # itself is the likelier explanation and one real load can settle it. Otherwise it DEFERS: a starved
-        # head whose deficit is its own idle sibling contexts escalates to a verified teardown, every other
-        # non-fitting demand rides the per-cycle reclaim ladder and re-asks once the room frees.
+        # itself is the likelier explanation and one real load can settle it. That settlement is only readable on
+        # a converged card, so while the card still holds reclaimable state the verdict is a DEFER that routes
+        # the reclaim (:meth:`_ceiling_attempt_pending_convergence`): the terminal verdict is reachable only once
+        # nothing the worker can free is left, and never on the strength of a pool shape that is still changing.
+        # Otherwise it DEFERS: a starved head whose deficit is its own idle sibling contexts escalates to a
+        # verified teardown, every other non-fitting demand rides the per-cycle reclaim ladder and re-asks once
+        # the room frees.
         structurally_impossible = self._structurally_impossible(request, state)
         measured_attempt = self._measured_attempt(request, measured, state, impossible=structurally_impossible)
         if measured_attempt is not None:
             return measured_attempt
 
-        if structurally_impossible:
+        if structurally_impossible and not self._ceiling_attempt_pending_convergence(request, measured, state):
             return VramVerdict(
                 disposition=VramDisposition.DENY,
                 request_kind=request.kind,
@@ -818,10 +825,10 @@ class VramArbiter:
         """Return a measured-load FITS for a head at a converged-empty card, or None to fall through as usual.
 
         Two triggers reach the same one real load, differing only in which arithmetic refused. ``impossible``
-        False is the within-available trigger: a starved head whose candidate misses the instantaneous reading
-        by a within-band shortfall. ``impossible`` True is the ceiling trigger: the candidate exceeds what an
-        emptied card could ever offer, but by so little that the prediction is the likelier culprit
-        (:meth:`_ceiling_attempt_eligible`); without it the DENY is terminal and permanent on that card.
+        False is the within-available trigger: a starved head at a card with nothing left to reclaim, whose
+        candidate misses the instantaneous reading. ``impossible`` True is the ceiling trigger: the candidate
+        exceeds what an emptied card could ever offer, but by so little that the prediction is the likelier
+        culprit (:meth:`_ceiling_attempt_eligible`); without it the DENY is terminal and permanent on that card.
 
         Both triggers rest on the same reasoning. The arithmetic that refused is built on a conservative static
         prediction and (for the within-available trigger) an instantaneous device-free reading that oscillates
@@ -918,24 +925,64 @@ class VramArbiter:
             return False
         return not self.any_other_device_can_seat(request, exclude_device_index=request.device_index)
 
+    def _ceiling_attempt_pending_convergence(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+        state: DeviceVramState,
+    ) -> bool:
+        """Whether an over-ceiling candidate is still owed the convergence its one real load is judged on.
+
+        The mirror of :meth:`_ceiling_attempt_eligible`: the same candidate, the same allowance, the same
+        reroute test, but on a card that has *not* yet converged. Such a head is refused the attempt on a
+        condition it does not control, and the terminal DENY sits ahead of the very teardown that would satisfy
+        it, so the head could never reach the state its own attempt is judged from. Whether it was served then
+        depended on whether some other mechanism happened to collapse the pool first, which makes servability a
+        property of the pool's shape rather than of the card.
+
+        True holds the terminal verdict back and lets the caller's teardown and ladder rungs run, so the card is
+        driven toward converged-empty deliberately. It cannot loop: every rung it routes strictly reduces what
+        the card holds, and once nothing reclaimable is left this returns False and the head takes either the
+        attempt or the DENY on a settled card.
+        """
+        if not request.is_head_of_queue:
+            return False
+        if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
+            return False
+        ceiling_mb = state.achievable_ceiling_mb()
+        if ceiling_mb is None:
+            return False
+        overshoot_mb = measured.candidate_outstanding_mb - ceiling_mb
+        if overshoot_mb <= 0.0 or overshoot_mb > self._ceiling_attempt_allowance_mb(ceiling_mb):
+            return False
+        if self._card_converged_empty(request, measured):
+            return False
+        return not self.any_other_device_can_seat(request, exclude_device_index=request.device_index)
+
     def _measured_attempt_eligible(
         self,
         request: VramRequest,
         measured: AdmissionVerdict,
     ) -> bool:
-        """Whether the measured-attempt trigger holds: starved head, converged-empty card, within-band shortfall.
+        """Whether the measured-attempt trigger holds: a starved head at a converged-empty card.
 
-        The candidate is already known not to fit and not to be structurally impossible. This adds the three
-        remaining conditions: the head has starved past the diagnostic horizon, the shortfall against available
-        is a small positive figure within the uncertainty band, and the card is converged-empty for make-room.
+        The candidate is already known not to fit and not to be structurally impossible. Two conditions
+        remain: the head has starved past the diagnostic horizon, and the card is converged-empty for
+        make-room.
+
+        The shortfall's size is deliberately not one of them. A band expresses how far the arithmetic may be
+        wrong before waiting is the better bet, and waiting is only a bet on a card whose available reading can
+        still improve. On a converged card nothing is left to reclaim, so the reading is final and the choice is
+        exactly two-way: take the one real load, or hold the head against a figure that will never move. Sizing
+        that choice by the shortfall parks a head permanently whenever the conservative prediction misses by a
+        little more than the band, which is a wedge with no bound rather than a refusal with a reason. The
+        demand is still bounded from above by the achievable ceiling, which is what separates a possible load
+        from an impossible one; the band continues to describe the uncertainty the ceiling allowance is sized
+        from (see :data:`_CEILING_ATTEMPT_OVERSHOOT_CAP_MB`).
         """
         if request.starved_seconds < _STARVATION_DIAGNOSTIC_SECONDS:
             return False
-        available_mb = measured.available_mb
-        if available_mb is None:
-            return False
-        shortfall_mb = measured.candidate_outstanding_mb - available_mb
-        if shortfall_mb <= 0.0 or shortfall_mb > _MEASURED_ATTEMPT_BAND_MB:
+        if measured.available_mb is None:
             return False
         return self._card_converged_empty(request, measured)
 

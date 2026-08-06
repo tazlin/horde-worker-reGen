@@ -271,16 +271,19 @@ _UNBOUNDED_PIXELS = 1 << 30
 """Stands for "this card serves this model at any geometry the vocabulary offers"."""
 
 _PIXEL_BUDGETS: dict[tuple[str, str], int] = {
-    (CARD_8GB.label, MODEL_MID.label): 512 * 512,
+    (CARD_8GB.label, MODEL_MID.label): 768 * 768,
 }
 """Measured caps on what a card serves outright, keyed by ``(card label, model label)``.
 
 A model's weights fitting a card is not the whole servability question: the priced sampling peak grows with
-the requested geometry, and a mid-class checkpoint on the smallest card is admitted at the smallest
-geometry and deferred above it. The cap is the largest geometry measured as served by the scheduling loop
-alone. It is deliberately conservative: a larger geometry that happens to be served by taking the whole
-card is not encoded, because that outcome depends on the lane count as well and the generated space is
-meant to hold one uniform verdict.
+the requested geometry, so a card serves a checkpoint up to a geometry and not beyond it. The cap is the
+largest geometry measured as served by the scheduling loop alone, and a queued job above it would be a head
+the card genuinely cannot seat, which is the unservable-head bound's subject rather than this space's.
+
+A mid-class checkpoint on the smallest card is served across the whole range up to this cap, including the
+geometries whose predicted peak clears the card's achievable ceiling: those are admitted through one real
+measured load once the card converges, which is a served outcome and not a deferred one. The cap sits where
+the demand stops being recoverable by that route.
 
 Entries are absent for every combination the card serves unconditionally.
 """
@@ -473,9 +476,11 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "bounded-dispatch matrix's subject.",
     ),
     (
-        "the mid class is generated only at the smallest geometry on the smallest card",
-        "above that geometry its priced sampling peak is deferred rather than admitted outright, so those "
-        "compositions rest on the recovery supervisor's reroute rather than on the scheduling loop alone.",
+        "the mid class is generated on the smallest card only up to 768x768",
+        "above that geometry its priced sampling peak exceeds what the card can seat at all, so such a job "
+        "would be an unservable head: the bound above, and the bounded-dispatch matrix's subject. Up to it the "
+        "class is generated at every geometry, including the ones the card serves only by converging and "
+        "taking one real measured load.",
     ),
     (
         "the model vocabulary is four checkpoints in three weight classes",

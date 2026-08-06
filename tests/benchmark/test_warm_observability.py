@@ -55,6 +55,10 @@ class _StubProcessMap:
     def num_safety_processes(self) -> int:
         return sum(1 for i in self._infos if i.process_type == HordeProcessType.SAFETY)
 
+    def num_processes_ever_started(self, process_type: HordeProcessType) -> int:
+        # The stub map is never torn down, so every process it holds is also one it once launched.
+        return sum(1 for i in self._infos if i.process_type == process_type)
+
     def get_first_available_inference_process(self) -> None:
         # Never ready: the whole point of these tests is the not-ready/dead worker.
         return None

@@ -377,8 +377,15 @@ class TestStarvationDiagnostic:
         return _roomy_state(device_free_mb=400.0)
 
     def test_diagnostic_emitted_past_the_horizon_without_admitting(self) -> None:
-        """Past the horizon the diagnostic counter advances but the head still defers."""
+        """Past the horizon, once the head's one measured attempt is spent, it defers and the diagnostic fires.
+
+        The card here is converged-empty, so the head's first ask past the horizon takes its single real load
+        (nothing is left to reclaim, so there is nothing for a deferral to wait for). The attempt is one-shot
+        per job: from the next ask onward the head takes the deferral this diagnostic backstops.
+        """
         arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._wedged_state()))
+        arbiter.evaluate(self._wedged_head(_STARVATION_DIAGNOSTIC_SECONDS + 5.0))
         arbiter.begin_cycle(_snapshot(self._wedged_state()))
         verdict = arbiter.evaluate(self._wedged_head(_STARVATION_DIAGNOSTIC_SECONDS + 5.0))
         assert verdict.disposition == VramDisposition.DEFER
@@ -451,8 +458,14 @@ class TestStarvationContextTeardown:
         assert arbiter.starvation_context_teardowns == 0
 
     def test_no_teardownable_contexts_no_escalation(self) -> None:
-        """Without idle contexts to reclaim, a starved head defers via the ordinary shortfall path."""
+        """Without idle contexts to reclaim, a starved head defers with an empty ladder and no teardown.
+
+        Such a head sits on a converged-empty card, so its first ask spends its one measured load; the
+        escalation this covers is what happens from the next ask on, when nothing is left to describe.
+        """
         arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
+        arbiter.evaluate(self._starved_head(idle_contexts_teardownable=False))
         arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
         verdict = arbiter.evaluate(self._starved_head(idle_contexts_teardownable=False))
         assert verdict.disposition == VramDisposition.DEFER
@@ -535,15 +548,20 @@ class TestFirstPartyContextDefer:
         assert arbiter.starvation_context_teardowns == 0
 
     def test_head_with_no_teardownable_contexts_is_not_a_first_party_defer(self) -> None:
-        """A starved head with no teardownable contexts defers via the ordinary path, not as first-party."""
+        """A starved head with no teardownable contexts defers via the ordinary path, not as first-party.
+
+        With no reclaimable model and no teardownable context the card is converged-empty, so the head's
+        first ask spends its one measured load and the deferral being classified here is the next one.
+        """
         arbiter = VramArbiter()
-        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
-        verdict = arbiter.evaluate(
-            self._first_party_head(
-                idle_contexts_teardownable=False,
-                starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 5.0,
-            ),
+        head = self._first_party_head(
+            idle_contexts_teardownable=False,
+            starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 5.0,
         )
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
+        arbiter.evaluate(head)
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=4000.0)))
+        verdict = arbiter.evaluate(head)
         assert verdict.disposition == VramDisposition.DEFER
         assert arbiter.first_party_context_defers == 0
         assert arbiter.starvation_diagnostics == 1
@@ -614,13 +632,17 @@ class TestFirstPartyTeardownGraceTiming:
         arbiter.evaluate(past_grace)
         assert arbiter.starvation_diagnostics == 0
 
-        arbiter.begin_cycle(_snapshot(self._state()))
         past_diagnostic = _preload(
             candidate_delta_mb=5000.0,
             is_head_of_queue=True,
             starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 1.0,
             idle_contexts_teardownable=False,
         )
+        # This card has nothing left to reclaim, so the head's first ask past the horizon spends its one
+        # measured load. The diagnostic is what backstops every ask after that.
+        arbiter.begin_cycle(_snapshot(self._state()))
+        arbiter.evaluate(past_diagnostic)
+        arbiter.begin_cycle(_snapshot(self._state()))
         arbiter.evaluate(past_diagnostic)
         assert arbiter.starvation_diagnostics == 1
 
@@ -1134,15 +1156,21 @@ class TestMeasuredAttemptEscapeHatch:
         # A continuation is not a fresh emission, so the attempts counter does not advance.
         assert arbiter.measured_attempts == 0
 
-    def test_beyond_band_shortfall_defers_as_today(self) -> None:
-        """A shortfall past the uncertainty band keeps deferring: give-up remains the backstop, not a gamble."""
+    def test_beyond_band_shortfall_on_a_converged_card_still_attempts(self) -> None:
+        """On a card with nothing left to reclaim the shortfall's size does not decide: the head attempts.
+
+        A band expresses how far the arithmetic may be wrong before waiting beats trying, and waiting is only
+        a bet on a card whose reading can still improve. Here it cannot, so a wider shortfall does not make
+        the head wait: it makes it wait forever. The demand is bounded from above by the achievable ceiling
+        instead, and a real load that fails arms the ceiling hold on that evidence.
+        """
         arbiter = VramArbiter()
         # available = 14356; a candidate 1100 MB over it is beyond the 1024 MB band but under the ceiling.
         arbiter.begin_cycle(_snapshot(self._empty_card()))
         verdict = arbiter.evaluate(self._starved_head(candidate_delta_mb=14356.0 + 1100.0))
-        assert verdict.disposition == VramDisposition.DEFER
-        assert verdict.measured_attempt is False
-        assert arbiter.measured_attempts == 0
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+        assert arbiter.measured_attempts == 1
 
     def test_beyond_the_ceiling_allowance_still_denies(self) -> None:
         """Past the ceiling by more than prediction error can explain, the candidate DENIES with no attempt.
@@ -1308,13 +1336,21 @@ class TestCeilingMeasuredAttempt:
         assert verdict.measured_attempt is True
         assert arbiter.measured_attempts == 0
 
-    def test_card_with_reclaim_left_denies_instead_of_attempting(self) -> None:
-        """The attempt runs only against the most room the card will ever offer, never over live work."""
+    def test_card_with_reclaim_left_defers_toward_convergence_instead_of_attempting(self) -> None:
+        """The attempt runs only against the most room the card will ever offer, never over live work.
+
+        The card still holds something reclaimable, so the attempt is refused. The verdict is a DEFER that
+        routes that reclaim rather than the terminal DENY: the head is refused on a condition it does not
+        control, and denying it there would decide servability from a pool shape that is still changing. The
+        terminal verdict stays reachable, from a card that has actually converged.
+        """
         arbiter = VramArbiter()
         arbiter.begin_cycle(_snapshot(self._card()))
         verdict = arbiter.evaluate(self._head(has_reclaimable_idle_model=True))
-        assert verdict.disposition == VramDisposition.DENY
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.measured_attempt is False
         assert arbiter.measured_attempts == 0
+        assert ActuatorCommandKind.EVICT_IDLE_MODEL in [c.kind for c in verdict.required_actuations]
 
     def test_reroutable_candidate_denies_so_the_other_card_takes_it(self) -> None:
         """Rerouting to a card that fits the candidate beats attempting on one that may not."""

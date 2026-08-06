@@ -147,8 +147,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     ) -> None:
         """Initialize the process map and its retired-launch tombstone registry."""
         super().__init__()
+        # Cumulative per-type launch tally. The active map is emptied by teardown (and by a pool rebuild),
+        # so "did this run ever start an inference/safety child" cannot be answered from live membership;
+        # it is a historical question and is answered from this counter, which no removal decrements.
+        self._launch_counts: dict[HordeProcessType, int] = {}
         if initial is not None:
+            # ``dict.update`` does not route through ``__setitem__``, so the initial entries are tallied here.
             self.update(initial)
+            for process_info in self.values():
+                self._launch_counts[process_info.process_type] = (
+                    self._launch_counts.get(process_info.process_type, 0) + 1
+                )
         self._retired_launches: dict[tuple[int, int], RetiredProcessLaunch] = {}
         # Inference process ids reserved as the pinned sampler of an in-flight disaggregated job. A pinned
         # sampler is booked for that job from the moment the scheduler routes it (in place of START_INFERENCE)
@@ -156,6 +165,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         # scheduler cannot dispatch a second (monolithic or disaggregated) job onto it. Unlike a monolithic
         # dispatch, no child message marks the pin, so this parent-side set is the sole booking record.
         self._disaggregation_reserved_process_ids: set[int] = set()
+
+    @override
+    def __setitem__(self, process_id: int, process_info: HordeProcessInfo) -> None:
+        """Install a process launch, tallying it against its type's cumulative launch count."""
+        if self.get(process_id) is not process_info:
+            self._launch_counts[process_info.process_type] = self._launch_counts.get(process_info.process_type, 0) + 1
+        super().__setitem__(process_id, process_info)
+
+    def num_processes_ever_started(self, process_type: HordeProcessType) -> int:
+        """Return how many launches of this process type this map has held, including removed ones."""
+        return self._launch_counts.get(process_type, 0)
 
     def reserve_for_disaggregation(self, process_id: int) -> None:
         """Reserve an inference process as a pinned disaggregation sampler (skipped by availability finders)."""
