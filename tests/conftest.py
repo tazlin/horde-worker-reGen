@@ -156,6 +156,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     gpu"`` runs both bands). Naming a marker in the ``-m`` expression, even negated as in ``-m "not slow"``,
     leaves that band to pytest's own marker filtering rather than this blanket skip.
 
+    ``chaos_sweep`` follows the same contract for a different reason: the generated sweep runs hundreds of
+    seeded scenarios as a pre-release and nightly gate, and the default suite runs its representative core
+    slice instead. Its full-worker half also carries ``slow``, so running that half means naming both bands
+    (``-m "chaos_sweep and slow"``).
+
     The run order is defined by ``_ORDER_PHASES_FIRST`` / ``_ORDER_PHASES_LAST``; the sort is stable, so tests
     sharing a phase keep their collection order (siblings in a namespace stay together).
     """
@@ -181,6 +186,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if item.get_closest_marker("slow"):
                 item.add_marker(skip_slow)
+
+    if "chaos_sweep" not in m_expression:
+        skip_sweep = pytest.mark.skip(
+            reason="the generated chaos sweep is opt-in: request it with -m chaos_sweep (hundreds of seeded "
+            "scenarios; the default suite runs its representative core slice instead)",
+        )
+        for item in items:
+            if item.get_closest_marker("chaos_sweep"):
+                item.add_marker(skip_sweep)
 
     items.sort(key=_run_order_rank)
 

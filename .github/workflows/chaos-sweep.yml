@@ -1,0 +1,41 @@
+name: Chaos Sweep
+
+# The generated wedge-liveness sweep: hundreds of seeded scenarios judged for end-to-end completion with
+# nothing given up on. It is a release gate rather than a per-push check, because it prices in minutes what
+# the default suite covers in seconds through its representative core slice. Nightly keeps a regression from
+# waiting for the next release; the manual trigger is how a widened or replayed seed range is run on demand.
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'Seed override (range "1000:1400" or list "7,19,23"); empty runs the committed ranges'
+        required: false
+        default: ''
+
+jobs:
+  chaos-sweep:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9
+        with:
+          python-version: ${{ matrix.python }}
+      # The scheduling-loop tier drives every scenario on a fake clock, so its cost is scenarios rather than
+      # wall time; it runs the wide committed range.
+      - name: Run the scheduling-loop chaos sweep
+        env:
+          HORDE_CHAOS_SEEDS: ${{ inputs.seeds }}
+        run: uv run pytest tests/process_management/liveness/test_chaos_generated.py -m chaos_sweep
+      # The full-worker tier boots a worker and spawns real child processes per scenario, so it runs the
+      # truncated range the suite commits to. Naming both bands is required: the module carries `slow` too.
+      - name: Run the full-worker chaos sweep
+        env:
+          HORDE_CHAOS_SEEDS: ${{ inputs.seeds }}
+        run: uv run pytest tests/e2e/test_chaos_generated_e2e.py -m "chaos_sweep and slow"

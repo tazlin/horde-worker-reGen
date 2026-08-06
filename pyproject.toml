@@ -301,4 +301,5 @@ markers = [
     "gpu: needs a real CUDA/accelerator device and boots real workers (minutes each); opt-in via -m gpu, skipped otherwise, and skipped even then when no device is present",
     "slow: spawns real OS subprocesses or runs multi-second workloads; opt-in via -m slow, skipped otherwise so a default `pytest` sweep stays fast",
     "network: needs a real network connection to the AI Horde or other external service; opt-in via -m network, skipped otherwise",
+    "chaos_sweep: the full generated wedge-liveness chaos sweep (hundreds of seeded scenarios); opt-in via -m chaos_sweep, skipped otherwise, and run as a pre-release gate and nightly",
 ]

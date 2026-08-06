@@ -271,6 +271,7 @@ class _DispatchWorld:
         whole_card_enabled: bool = True,
         cooldown_seconds: int = 0,
         max_hold_seconds: int = 180,
+        tick_seconds: float = _TICK_SECONDS,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -284,8 +285,13 @@ class _DispatchWorld:
                 the rows that need the residency to still be standing when they make their assertion.
             max_hold_seconds: The operator ceiling on one residency episode, which is also what bounds its
                 claim over the offer.
+            tick_seconds: How much of the world's clock one tick advances. The default reaches the governance
+                windows these rows turn on; a caller whose scenarios turn on the scheduler's short budgets
+                (the affinity line-skip window has a fifteen-second floor) passes a shorter tick, so those
+                budgets are sampled several times rather than stepped over in one advance.
         """
         self.card = card
+        self.tick_seconds = tick_seconds
         self.tick = 0
         self.now = 10_000.0
         """The world's clock, shared with the tracker and the scheduler so every window they gate on is
@@ -702,7 +708,7 @@ class _DispatchWorld:
     async def step(self) -> None:
         """Advance one scheduling tick, in the control loop's order."""
         self.tick += 1
-        self.now += _TICK_SECONDS
+        self.now += self.tick_seconds
         self._apply_control_flags()
         self._materialise_preloads()
         await self._complete_finished_samplers()

@@ -1,0 +1,295 @@
+"""Generated chaos against real child processes: the same seeded compositions, at full-worker altitude.
+
+``tests/process_management/liveness/test_chaos_generated.py`` drives generated scenarios through the
+scheduling loop on a fake clock. This module drives the same seeds through the whole worker: the real
+process manager, real OS child processes running the protocol-faithful fakes, the real message pump,
+recovery supervisor, safety and submit paths, and real wall-clock time. Where that module can express a
+lane death and an outside reclaim, this one can express what a misbehaving child does: crashing mid-job,
+running slow, reporting an out-of-memory result, emitting a misrouted message.
+
+The property is the same one, read through what a whole run reports:
+
+    Every job the scenario queues is completed, no job is given up on by scheduling recovery, no lifecycle
+    invariant is violated, and no job's queue wait exceeds a bound derived from the scenario's own shape.
+
+The give-up is read from the worker's own action ledger rather than inferred from a fault count, because a
+give-up faults accepted work for reissue and that is exactly the outcome the campaign counts as the
+failure rather than the remedy.
+
+Each scenario boots a worker and spawns real child processes, so this module carries both ``slow`` and
+``chaos_sweep`` and runs as a pre-release gate and nightly rather than in the default suite:
+
+    pytest tests/e2e/test_chaos_generated_e2e.py -m "chaos_sweep and slow"
+
+``HORDE_CHAOS_SEEDS`` overrides which seeds run (``HORDE_CHAOS_SEEDS=1007`` to replay one), and every
+failure message carries the seed and the whole scenario.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import math
+import os
+import sys
+from collections.abc import Iterator
+
+import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+
+from horde_worker_regen import harness as harness_module
+from horde_worker_regen.harness import HarnessConfig, HarnessResult, run_harness_async
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager, SystemResources
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.simulation._canned_scenarios import ArrivalSchedule, make_canned_job
+from horde_worker_regen.process_management.simulation.chaos_scenarios import (
+    DISCLOSED_BOUNDS,
+    SEED_ENV_VAR,
+    SWEEP_FULL_WORKER_SEEDS,
+    ChaosArrival,
+    ChaosEventKind,
+    ChaosScenario,
+    generate_scenarios,
+    parse_seed_spec,
+)
+from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
+
+# Spawning a fresh child re-imports the whole stack and is several times slower on Windows than on the
+# Linux CI runner, and a scenario that kills a child pays that cost again per replacement. Scale the
+# budgets by this factor there; CI keeps the tighter values so a genuine regression still surfaces.
+_SPAWN_SLOWDOWN = 4.0 if sys.platform == "win32" else 1.0
+
+_BASE_TIMEOUT_SECONDS = 45.0
+"""Boot, model preload, and teardown for a run that queues nothing unusual."""
+
+_TIMEOUT_SECONDS_PER_JOB = 8.0
+"""Added per queued job."""
+
+_TIMEOUT_SECONDS_PER_EVENT = 25.0
+"""Added per disturbance: a crashed child is detected immediately, but its replacement is a fresh spawn."""
+
+_QUEUE_WAIT_SECONDS_PER_JOB = 10.0
+"""Queue wait allowed per job ahead of one in the queue."""
+
+_QUEUE_WAIT_BASE_SECONDS = 30.0
+"""Queue wait allowed for the boot and first preload every job's wait includes."""
+
+_QUEUE_WAIT_SECONDS_PER_EVENT = 25.0
+"""Queue wait allowed per disturbance, which a job may sit through while its lane is replaced."""
+
+_SLOW_CHILD_FACTOR = 4.0
+"""How much longer a slow child takes than its expected per-job time."""
+
+_JOB_DELAY_SECONDS = 0.02
+"""What a fake job pretends to take, so a slow child is measurably slower without costing the clock."""
+
+
+def _seeds() -> tuple[int, ...]:
+    """Return the seeds to run: the environment override when set, otherwise the committed range."""
+    override = os.environ.get(SEED_ENV_VAR)
+    return parse_seed_spec(override) if override else SWEEP_FULL_WORKER_SEEDS
+
+
+_SCENARIOS = generate_scenarios(_seeds())
+
+
+def _system_resources(scenario: ChaosScenario) -> SystemResources:
+    """Build the synthetic host the scenario's card profile describes."""
+    return SystemResources(
+        total_ram_bytes=scenario.card.host_ram_gb * 1024 * 1024 * 1024,
+        device_map=TorchDeviceMap(
+            root={
+                0: TorchDeviceInfo(
+                    device_name=f"Chaos {scenario.card.label}",
+                    device_index=0,
+                    total_memory=scenario.card.total_vram_mb * 1024 * 1024,
+                    kind="cuda",
+                ),
+            },
+        ),
+        per_process_overhead_mb=scenario.card.per_process_overhead_mb,
+        marginal_process_overhead_mb=scenario.card.marginal_process_overhead_mb,
+    )
+
+
+def _jobs(scenario: ChaosScenario) -> list[ImageGenerateJobPopResponse]:
+    """Expand the scenario's queue into canned pop responses."""
+    return [
+        make_canned_job(
+            model.harness_name,
+            width=scenario.width,
+            height=scenario.height,
+            ddim_steps=scenario.steps,
+        )
+        for model in scenario.models
+    ]
+
+
+def _arrival(scenario: ChaosScenario) -> ArrivalSchedule | None:
+    """Return the arrival schedule, or None when the whole queue is available at once."""
+    if scenario.arrival is ChaosArrival.BURSTS:
+        return ArrivalSchedule(
+            kind="bursts",
+            burst_size=scenario.burst_size,
+            burst_interval_seconds=0.2,
+        )
+    if scenario.arrival is ChaosArrival.STEADY:
+        return ArrivalSchedule(kind="steady", rate_per_minute=600.0)
+    return None
+
+
+def _fault_profile(scenario: ChaosScenario) -> FaultProfile | None:
+    """Script the inference children from the disturbances this altitude can express.
+
+    Returns:
+        The profile, or None when the scenario draws no child-side disturbance.
+    """
+    events = scenario.child_events()
+    if not events:
+        return None
+    fields: dict[str, object] = {}
+    for event in events:
+        if event.kind is ChaosEventKind.LANE_DEATH:
+            fields["crash_on_job_n"] = event.at_job_ordinal
+        elif event.kind is ChaosEventKind.SLOW_CHILD:
+            fields["slow_factor"] = _SLOW_CHILD_FACTOR
+        elif event.kind is ChaosEventKind.RESOURCE_FAULT:
+            fields["oom_on_job_n"] = event.at_job_ordinal
+        elif event.kind is ChaosEventKind.MISROUTED_MESSAGE:
+            fields["corrupt_on_job_n"] = event.at_job_ordinal
+    return FaultProfile(**fields)  # type: ignore[arg-type]
+
+
+def _timeout_seconds(scenario: ChaosScenario) -> float:
+    """Return the wall-clock budget for the whole run, derived from the scenario's shape."""
+    budget = (
+        _BASE_TIMEOUT_SECONDS
+        + _TIMEOUT_SECONDS_PER_JOB * scenario.job_count
+        + _TIMEOUT_SECONDS_PER_EVENT * len(scenario.child_events())
+    )
+    return budget * _SPAWN_SLOWDOWN
+
+
+def _queue_wait_bound_seconds(scenario: ChaosScenario) -> float:
+    """Return the longest a job of this scenario may wait between being popped and reaching inference."""
+    sequential = math.ceil(scenario.job_count / scenario.max_threads)
+    budget = (
+        _QUEUE_WAIT_BASE_SECONDS
+        + _QUEUE_WAIT_SECONDS_PER_JOB * sequential
+        + _QUEUE_WAIT_SECONDS_PER_EVENT * len(scenario.child_events())
+    )
+    return budget * _SPAWN_SLOWDOWN
+
+
+@contextlib.contextmanager
+def _capture_manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[HordeWorkerProcessManager]]:
+    """Record the manager a harness run builds, so its ledger can be read once the run has ended.
+
+    The run's result reports faults, not who issued them, and a give-up is a fault the worker issued
+    against work it had accepted. The manager's action ledger records that decision directly, so the
+    verdict reads the decision rather than inferring it from a count.
+    """
+    built: list[HordeWorkerProcessManager] = []
+    original = harness_module.build_harness_process_manager
+
+    def _recording(config: HarnessConfig) -> tuple[HordeWorkerProcessManager, int]:
+        manager, expected = original(config)
+        built.append(manager)
+        return manager, expected
+
+    monkeypatch.setattr(harness_module, "build_harness_process_manager", _recording)
+    yield built
+
+
+def _give_up_events(manager: HordeWorkerProcessManager) -> list[str]:
+    """Return the reasons recorded for every give-up on accepted work during the run."""
+    return [
+        event.reason
+        for event in manager._action_ledger.recent(limit=100_000)
+        if event.event_type is LedgerEventType.RECOVERY_ABANDONED
+    ]
+
+
+def _message(scenario: ChaosScenario, result: HarnessResult, complaint: str) -> str:
+    """Return a failure message carrying the complaint, the seed, the scenario, and the run's own summary."""
+    return (
+        f"{complaint}\n"
+        f"  scenario: {scenario.summary()}\n"
+        f"  replay:   {SEED_ENV_VAR}={scenario.seed} pytest tests/e2e/test_chaos_generated_e2e.py "
+        f'-m "chaos_sweep and slow"\n'
+        f"  run:      {result.failure_summary()}"
+    )
+
+
+# Every scenario boots a worker and spawns real OS child processes, and the sweep runs many of them, so the
+# module is opt-in on both counts.
+pytestmark = [pytest.mark.slow, pytest.mark.chaos_sweep]
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("scenario", _SCENARIOS, ids=[scenario.label for scenario in _SCENARIOS])
+async def test_generated_scenario_completes_against_real_children(
+    scenario: ChaosScenario,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generated composition run against real children completes, with nothing given up on."""
+    jobs = _jobs(scenario)
+    with _capture_manager(monkeypatch) as managers:
+        result = await run_harness_async(
+            HarnessConfig(
+                scenario=jobs,
+                arrival=_arrival(scenario),
+                process_mode="fake",
+                skip_api=True,
+                job_delay_seconds=_JOB_DELAY_SECONDS,
+                timeout_seconds=_timeout_seconds(scenario),
+                system_resources=_system_resources(scenario),
+                inference_fault_profile=_fault_profile(scenario),
+                bridge_data_overrides={
+                    "max_threads": scenario.max_threads,
+                    "queue_size": scenario.queue_size,
+                },
+            ),
+        )
+
+    assert not result.timed_out, _message(scenario, result, "the run did not finish inside its budget")
+    assert result.num_jobs_completed == len(jobs), _message(
+        scenario,
+        result,
+        f"{len(jobs) - result.num_jobs_completed} of {len(jobs)} queued jobs did not complete",
+    )
+    assert result.num_jobs_faulted == 0, _message(scenario, result, "queued work was faulted rather than served")
+    assert result.audit_failures == [], _message(scenario, result, "a job lifecycle invariant was violated")
+
+    assert managers, "the harness built no manager, so the give-up verdict would read nothing"
+    give_ups = _give_up_events(managers[0])
+    assert give_ups == [], _message(scenario, result, f"the worker gave up on accepted work: {give_ups}")
+
+    assert result.metrics is not None, _message(scenario, result, "the run reported no metrics to judge")
+    bound = _queue_wait_bound_seconds(scenario)
+    waits = [record.queue_wait_seconds for record in result.metrics.jobs if record.queue_wait_seconds is not None]
+    assert waits, _message(scenario, result, "no job reported a queue wait, so the age bound judged nothing")
+    assert max(waits) <= bound, _message(
+        scenario,
+        result,
+        f"a job waited {max(waits):.0f}s to reach inference, past the {bound:.0f}s this scenario's shape allows",
+    )
+
+
+def test_the_full_worker_sweep_discloses_its_coverage(pytestconfig: pytest.Config) -> None:
+    """The suite prints what it ran and what it did not explore, so no truncation is silent."""
+    reporter = pytestconfig.pluginmanager.get_plugin("terminalreporter")
+    expressible = sorted(kind.value for scenario in _SCENARIOS for kind in {event.kind for event in scenario.events})
+    lines = [
+        f"generated chaos (full worker): {len(_SCENARIOS)} scenarios, seeds {_seeds()[0]}:{_seeds()[-1] + 1} "
+        f"(override with {SEED_ENV_VAR})",
+        f"  disturbance kinds drawn: {sorted(set(expressible))}",
+        "  not explored:",
+        *(f"    - {axis}: {reason}" for axis, reason in DISCLOSED_BOUNDS),
+    ]
+    if reporter is not None:
+        reporter.write_line("")
+        for line in lines:
+            reporter.write_line(line)
+
+    assert DISCLOSED_BOUNDS, "the generated space's truncations must be listed, never silent"

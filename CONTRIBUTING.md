@@ -26,10 +26,24 @@
 
 ## Testing
 
-* Run the suite with `uv run pytest`. The default sweep is fast because two bands are **opt-in** and skipped unless you ask for them:
+* Run the suite with `uv run pytest`. The default sweep is fast because three bands are **opt-in** and skipped unless you ask for them:
     * `-m slow` runs the tests that spawn real OS subprocesses (the end-to-end worker-lifecycle family) or take multiple seconds. Run this before pushing a change that touches the worker lifecycle.
     * `-m gpu` runs the tests that need a real accelerator; they auto-skip when no CUDA device is present.
+    * `-m chaos_sweep` runs the generated wedge-liveness chaos sweep. See below; the default sweep runs its representative core slice instead.
 * `-m "slow or gpu"` runs both opt-in bands at once. CI runs the fast sweep and the `slow` band as separate steps, so the full-lifecycle coverage is exercised on every push.
+
+### The generated chaos sweep (pre-release gate)
+
+Seeded scenarios compose a queue structure, a worker configuration, and a schedule of disturbances, and each is judged for end-to-end completion of all the work it queues, with no job given up on and no job waiting past a bound derived from its own shape. Run both tiers before a release, and after any change to admission, reclaim, residency, scheduling, or lifecycle:
+
+```sh
+uv run pytest tests/process_management/liveness/test_chaos_generated.py -m chaos_sweep
+uv run pytest tests/e2e/test_chaos_generated_e2e.py -m "chaos_sweep and slow"
+```
+
+The first drives the scheduling loop on a fake clock (minutes); the second boots a worker with real child processes per scenario (longer, and it needs both marker names because it is also in the `slow` band). Both print how many scenarios they ran and which axes the generated space does not explore. The same pair runs nightly, and on demand, through the `Chaos Sweep` workflow.
+
+Set `HORDE_CHAOS_SEEDS` to replay or widen: `HORDE_CHAOS_SEEDS=1063` for a single seed, `HORDE_CHAOS_SEEDS=2000:2500` for a range, `HORDE_CHAOS_SEEDS=7,19,23` for a list. Every failure prints the seed and the whole scenario, so a red run replays from its message.
 
 ## Pull Requests
 

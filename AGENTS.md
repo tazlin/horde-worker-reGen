@@ -124,6 +124,7 @@ prek run --all-files
 uv run pytest                       # default sweep: fast; the opt-in `slow` and `gpu` bands are skipped
 uv run pytest -m slow               # the slow band: real subprocess spawns / multi-second workloads
 uv run pytest -m "slow or gpu"      # both opt-in bands at once (gpu still needs a real device)
+uv run pytest -m chaos_sweep        # the generated chaos sweep (see the marker contract below)
 uv run pytest tests/process_management/
 ```
 
@@ -139,9 +140,14 @@ uv run pytest tests/process_management/
     - `@pytest.mark.gpu`: the test needs a real accelerator and boots real workers (minutes each). Run it
       with `-m gpu`; even then it **auto-skips** when no CUDA device is present, so CI and GPU-less dev boxes
       stay green.
-  - Both bands skip only when the `-m` expression does not name them, so `-m "not slow"` and `-m slow`
+    - `@pytest.mark.chaos_sweep`: the generated wedge-liveness sweep, hundreds of seeded scenarios run as a
+      pre-release gate and nightly. The default suite runs its representative core slice instead. Its
+      full-worker half is also in the `slow` band, so running that half means naming both:
+      `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` carries the gate commands and the `HORDE_CHAOS_SEEDS`
+      replay/widen override.
+  - A band skips only when the `-m` expression does not name it, so `-m "not slow"` and `-m slow`
     both behave as written. The day-to-day flow is: bare `pytest` while iterating, `-m slow` before pushing
-    a change that touches the worker lifecycle, `-m gpu` on a GPU box.
+    a change that touches the worker lifecycle, `-m gpu` on a GPU box, the chaos sweep before a release.
 - Most pipeline tests run **without a GPU or network** using dry-run mode (`CannedJobSource` +
   `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode)
   and `harness.py`.
