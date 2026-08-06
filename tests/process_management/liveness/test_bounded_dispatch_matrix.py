@@ -269,6 +269,10 @@ class _DispatchWorld:
         max_threads: int,
         queue_depth: int,
         whole_card_enabled: bool = True,
+        enable_vram_budget: bool = True,
+        high_performance_mode: bool = False,
+        moderate_performance_mode: bool = False,
+        unload_models_from_vram_often: bool = False,
         cooldown_seconds: int = 0,
         max_hold_seconds: int = 180,
         tick_seconds: float = _TICK_SECONDS,
@@ -281,6 +285,10 @@ class _DispatchWorld:
             max_threads: The concurrent-sampling cap (the ``max_threads`` config axis).
             queue_depth: The configured queue size, so an at-depth row can express a full queue.
             whole_card_enabled: Whether preventative whole-card exclusive residency is on.
+            enable_vram_budget: Whether measured VRAM admission and its recovery actions are enabled.
+            high_performance_mode: Whether the high-throughput overlap posture is enabled.
+            moderate_performance_mode: Whether the moderate-throughput overlap posture is enabled.
+            unload_models_from_vram_often: Whether idle model residency is released eagerly.
             cooldown_seconds: How long a drained residency is retained for a follow-on heavy job. Raised by
                 the rows that need the residency to still be standing when they make their assertion.
             max_hold_seconds: The operator ceiling on one residency episode, which is also what bounds its
@@ -323,7 +331,7 @@ class _DispatchWorld:
         bridge_data = make_mock_bridge_data(
             max_threads=max_threads,
             queue_size=queue_depth,
-            enable_vram_budget=True,
+            enable_vram_budget=enable_vram_budget,
             whole_card_exclusive_residency=whole_card_enabled,
             whole_card_residency_safety_off_gpu=False,
             safety_on_gpu=False,
@@ -332,6 +340,9 @@ class _DispatchWorld:
             vram_per_process_overhead_mb=_FIRST_CONTEXT_MB,
             whole_card_residency_cooldown_seconds=cooldown_seconds,
             whole_card_residency_max_hold_seconds=max_hold_seconds,
+            high_performance_mode=high_performance_mode,
+            moderate_performance_mode=moderate_performance_mode,
+            unload_models_from_vram_often=unload_models_from_vram_often,
             image_models_to_load=[model.name for model in _MODEL_CLASSES],
         )
         self.offers: dict[int, frozenset[str]] = {}
@@ -409,6 +420,12 @@ class _DispatchWorld:
     async def pop(self, job: ImageGenerateJobPopResponse) -> None:
         """Record a popped job, exactly as the pop path hands one to the tracker."""
         await track_popped_job_async(self._job_tracker, job, time_popped=self.now)
+        for lora in job.payload.loras or []:
+            self._job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
+        for ti in job.payload.tis or []:
+            self._job_tracker.mark_aux_prefetched(ti.name, is_version=False, is_ti=True)
+        if job.id_ is not None:
+            self._job_tracker.mark_job_aux_prepared_if_ready(job.id_)
 
     # -- intake -------------------------------------------------------------------------------------------
 
@@ -504,7 +521,10 @@ class _DispatchWorld:
                 censored=False,
                 time_popped=self.now,
             )
-            await self._job_tracker.queue_for_safety(job_info)
+            if job.payload.post_processing:
+                await self._job_tracker.queue_for_post_processing(job_info)
+            else:
+                await self._job_tracker.queue_for_safety(job_info)
             self._dispatched_at.pop(str(job_id), None)
             lane_id = self._lane_of.pop(str(job_id), None)
             lane = self._process_map.get(lane_id) if lane_id is not None else None
@@ -528,6 +548,12 @@ class _DispatchWorld:
             await self._job_tracker.begin_safety_check(job_info)
             await self._job_tracker.queue_for_submit(job_info)
             await self._job_tracker.finalize_submitted(job_info)
+
+    async def _drain_post_processing(self) -> None:
+        """Complete pending post-processing on the hand-driven lane and pass its result to safety."""
+        for job_info in list(self._job_tracker.jobs_pending_post_processing):
+            await self._job_tracker.begin_post_processing(job_info, process_id=-1, process_launch_identifier=1)
+            await self._job_tracker.queue_for_safety_post_processed(job_info)
 
     async def _dispatch_until_full(self) -> None:
         """Dispatch onto free lanes, recording the tick each job first reached sampling."""
@@ -717,6 +743,7 @@ class _DispatchWorld:
         self._apply_control_flags()
         self._materialise_preloads()
         await self._complete_finished_samplers()
+        await self._drain_post_processing()
         await self._drain_safety()
         self._begin_arbiter_cycle()
         self._scheduler.run_governance_tick()

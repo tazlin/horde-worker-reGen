@@ -33,26 +33,33 @@ from dataclasses import dataclass
 from itertools import combinations
 
 import pytest
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
+from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     CORE_SEEDS,
     DISCLOSED_BOUNDS,
     SEED_ENV_VAR,
     SWEEP_SEEDS,
     ChaosArrival,
+    ChaosAuxKind,
+    ChaosControlKind,
     ChaosDemandShape,
     ChaosEvent,
     ChaosEventKind,
     ChaosInitialResidency,
+    ChaosJob,
     ChaosModel,
+    ChaosPerformance,
+    ChaosPostProcessing,
     ChaosQueueShape,
+    ChaosSamplerProfile,
     ChaosScenario,
+    ChaosSourceMode,
     generate_scenarios,
     parse_seed_spec,
 )
-from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness.test_bounded_dispatch_matrix import (
     _MODEL_CLASSES,
     _CardClass,
@@ -141,6 +148,41 @@ def _model_class(model: ChaosModel) -> _ModelClass:
     raise LookupError(f"no modelled card class for {model.scheduler_name!r}")
 
 
+def _make_job(job: ChaosJob, *, ordinal: int) -> ImageGenerateJobPopResponse:
+    """Translate one generated payload description into the SDK object the scheduler receives."""
+    has_lora = job.aux_kind in {ChaosAuxKind.LORA, ChaosAuxKind.BOTH}
+    has_ti = job.aux_kind in {ChaosAuxKind.TEXTUAL_INVERSION, ChaosAuxKind.BOTH}
+    post_processing = {
+        ChaosPostProcessing.NONE: None,
+        ChaosPostProcessing.FACE_FIX: ["GFPGAN"],
+        ChaosPostProcessing.UPSCALE: ["RealESRGAN_x4plus"],
+        ChaosPostProcessing.CHAIN: ["GFPGAN", "RealESRGAN_x4plus"],
+    }[job.post_processing]
+    sampler_name, scheduler = {
+        ChaosSamplerProfile.EULER_NORMAL: ("k_euler", "normal"),
+        ChaosSamplerProfile.DPM_KARRAS: ("k_dpmpp_2m", "karras"),
+        ChaosSamplerProfile.LCM_SIMPLE: ("lcm", "simple"),
+    }[job.sampler_profile]
+    has_control = job.control_kind is not ChaosControlKind.NONE
+    return make_canned_job(
+        _model_class(job.model).name,
+        width=job.width,
+        height=job.height,
+        ddim_steps=job.steps,
+        n_iter=job.n_iter,
+        loras=[LorasPayloadEntry(name=f"generated-lora-{ordinal % 3}")] if has_lora else None,
+        tis=[TIPayloadEntry(name=f"generated-ti-{ordinal % 2}", inject_ti="prompt")] if has_ti else None,
+        control_type="canny" if has_control else None,
+        return_control_map=job.control_kind is ChaosControlKind.RETURN_MAP,
+        image_is_control=job.control_kind is ChaosControlKind.PREANNOTATED,
+        post_processing=post_processing,
+        hires_fix=job.hires_fix,
+        source_processing=job.source_mode.value,
+        sampler_name=sampler_name,
+        scheduler=scheduler,
+    )
+
+
 def _release_offset_seconds(scenario: ChaosScenario, index: int) -> float:
     """Return how long after the run starts a queued job becomes available to the worker."""
     if scenario.arrival is ChaosArrival.STEADY:
@@ -201,6 +243,11 @@ class _ChaosRun:
             lane_count=scenario.lanes,
             max_threads=scenario.max_threads,
             queue_depth=scenario.queue_size,
+            whole_card_enabled=scenario.whole_card_enabled,
+            enable_vram_budget=scenario.enable_vram_budget,
+            high_performance_mode=scenario.performance is ChaosPerformance.HIGH,
+            moderate_performance_mode=scenario.performance is ChaosPerformance.MODERATE,
+            unload_models_from_vram_often=scenario.unload_models_from_vram_often,
             tick_seconds=_CHAOS_TICK_SECONDS,
         )
         self.jobs: list[ImageGenerateJobPopResponse] = []
@@ -245,12 +292,7 @@ class _ChaosRun:
             self.world.tick
         ):
             job_spec = self.scenario.jobs[len(self.jobs)]
-            job = make_job_pop_response(
-                _model_class(job_spec.model).name,
-                width=job_spec.width,
-                height=job_spec.height,
-                ddim_steps=job_spec.steps,
-            )
+            job = _make_job(job_spec, ordinal=len(self.jobs))
             await self.world.pop(job)
             self.jobs.append(job)
 
@@ -394,9 +436,21 @@ def test_the_core_slice_spans_the_generated_axes() -> None:
     assert {scenario.queue_size for scenario in _CORE_SCENARIOS} == {0, 1, 3, 4}
     assert {scenario.demand_shape for scenario in _CORE_SCENARIOS} == set(ChaosDemandShape)
     assert {scenario.initial_residency for scenario in _CORE_SCENARIOS} == set(ChaosInitialResidency)
+    assert {scenario.enable_vram_budget for scenario in _CORE_SCENARIOS} == {False, True}
+    assert {scenario.whole_card_enabled for scenario in _CORE_SCENARIOS} == {False, True}
+    assert {scenario.performance for scenario in _CORE_SCENARIOS} == set(ChaosPerformance)
+    assert {scenario.unload_models_from_vram_often for scenario in _CORE_SCENARIOS} == {False, True}
     assert {event.kind for scenario in _CORE_SCENARIOS for event in scenario.events} == set(ChaosEventKind)
     assert {len(scenario.events) for scenario in _CORE_SCENARIOS} >= {0, 1, 2}
     assert any(scenario.heavy_job_count > 0 for scenario in _CORE_SCENARIOS)
+    jobs = [job for scenario in _CORE_SCENARIOS for job in scenario.jobs]
+    assert {job.source_mode for job in jobs} == set(ChaosSourceMode)
+    assert {job.aux_kind for job in jobs} == set(ChaosAuxKind)
+    assert {job.control_kind for job in jobs} == set(ChaosControlKind)
+    assert {job.post_processing for job in jobs} == set(ChaosPostProcessing)
+    assert {job.n_iter for job in jobs} == {1, 2, 4}
+    assert {job.hires_fix for job in jobs} == {False, True}
+    assert {job.sampler_profile for job in jobs} == set(ChaosSamplerProfile)
 
 
 def _coverage_features(scenario: ChaosScenario) -> dict[str, object]:
@@ -408,7 +462,41 @@ def _coverage_features(scenario: ChaosScenario) -> dict[str, object]:
         "topology_request": (scenario.max_threads, scenario.topology.requested_queue_size),
         "demand_shape": scenario.demand_shape,
         "initial_residency": scenario.initial_residency,
+        "vram_budget": scenario.enable_vram_budget,
+        "whole_card": scenario.whole_card_enabled,
+        "performance": scenario.performance,
+        "unload_often": scenario.unload_models_from_vram_often,
         "queue_length": scenario.job_count,
+    }
+
+
+def _job_coverage_features(scenario: ChaosScenario, index: int) -> dict[str, object]:
+    """Return queue context and payload axes for one executed generated job."""
+    job = scenario.jobs[index]
+    if index == 0:
+        position = "head"
+    elif index == scenario.job_count - 1:
+        position = "tail"
+    else:
+        position = "middle"
+    return {
+        "source": job.source_mode,
+        "aux": job.aux_kind,
+        "control": job.control_kind,
+        "post_processing": job.post_processing,
+        "batch": job.n_iter,
+        "hires_fix": job.hires_fix,
+        "sampler": job.sampler_profile,
+        "card": scenario.card.label,
+        "queue_shape": scenario.shape,
+        "arrival": scenario.arrival,
+        "initial_residency": scenario.initial_residency,
+        "vram_budget": scenario.enable_vram_budget,
+        "whole_card": scenario.whole_card_enabled,
+        "performance": scenario.performance,
+        "unload_often": scenario.unload_models_from_vram_often,
+        "model": job.model.label,
+        "queue_position": position,
     }
 
 
@@ -429,6 +517,81 @@ def test_the_committed_sweep_covers_every_pair_of_semantic_axes() -> None:
     assert not missing, "the committed sweep lost pairwise coverage:\n  " + "\n  ".join(missing)
 
 
+def test_the_committed_sweep_crosses_every_payload_pair_and_queue_context() -> None:
+    """Payload choices cover every pair with each other and with the state that receives the job."""
+    if os.environ.get(SEED_ENV_VAR):
+        pytest.skip(f"{SEED_ENV_VAR} overrides the committed sweep, so its coverage is the caller's to choose")
+
+    rows = [
+        _job_coverage_features(scenario, index) for scenario in _SWEEP_SCENARIOS for index in range(scenario.job_count)
+    ]
+    payload_axes = ("source", "aux", "control", "post_processing", "batch", "hires_fix", "sampler")
+    context_axes = (
+        "card",
+        "queue_shape",
+        "arrival",
+        "initial_residency",
+        "vram_budget",
+        "whole_card",
+        "performance",
+        "unload_often",
+        "model",
+        "queue_position",
+    )
+    axis_values = {axis: {row[axis] for row in rows} for axis in (*payload_axes, *context_axes)}
+    missing: list[str] = []
+    pairs = [
+        *combinations(payload_axes, 2),
+        *((context, payload) for context in context_axes for payload in payload_axes),
+    ]
+    for first, second in pairs:
+        expected = {
+            (a, b)
+            for a in axis_values[first]
+            for b in axis_values[second]
+            if not (
+                first == "model"
+                and a == "heavy"
+                and (
+                    (second == "control" and b is not ChaosControlKind.NONE)
+                    or (second == "batch" and b != 1)
+                    or (second == "hires_fix" and b is True)
+                )
+            )
+        }
+        actual = {(row[first], row[second]) for row in rows}
+        for first_value, second_value in sorted(expected - actual, key=repr):
+            missing.append(f"{first}={first_value!r} + {second}={second_value!r}")
+
+    assert not missing, "the generated job corpus lost payload/context pair coverage:\n  " + "\n  ".join(missing)
+
+
+def test_generated_payload_descriptions_reach_the_sdk_jobs_unchanged() -> None:
+    """The runner materializes every modeled feature instead of varying labels around plain jobs."""
+    ordinal = 0
+    for scenario in _CORE_SCENARIOS:
+        for spec in scenario.jobs:
+            job = _make_job(spec, ordinal=ordinal)
+            ordinal += 1
+            has_lora = spec.aux_kind in {ChaosAuxKind.LORA, ChaosAuxKind.BOTH}
+            has_ti = spec.aux_kind in {ChaosAuxKind.TEXTUAL_INVERSION, ChaosAuxKind.BOTH}
+            assert bool(job.payload.loras) is has_lora
+            assert bool(job.payload.tis) is has_ti
+            assert bool(job.payload.control_type) is (spec.control_kind is not ChaosControlKind.NONE)
+            assert bool(job.payload.return_control_map) is (spec.control_kind is ChaosControlKind.RETURN_MAP)
+            assert bool(job.payload.image_is_control) is (spec.control_kind is ChaosControlKind.PREANNOTATED)
+            assert bool(job.payload.post_processing) is (spec.post_processing is not ChaosPostProcessing.NONE)
+            assert bool(job.payload.hires_fix) is spec.hires_fix
+            assert job.payload.n_iter == spec.n_iter
+            assert str(job.source_processing) == spec.source_mode.value
+            if spec.source_mode is not ChaosSourceMode.TXT2IMG:
+                assert job.source_image is not None
+            if spec.source_mode is ChaosSourceMode.INPAINTING:
+                assert job.source_mask is not None
+            else:
+                assert job.source_mask is None
+
+
 def test_the_queue_corpus_contains_job_dependent_demand_orderings() -> None:
     """The sweep executes heterogeneous demand within one model, not only model-name permutations."""
     if os.environ.get(SEED_ENV_VAR):
@@ -447,6 +610,39 @@ def test_the_queue_corpus_contains_job_dependent_demand_orderings() -> None:
     assert any(
         scenario.queue_size == 0 and scenario.lanes == 1 and scenario.max_threads == 1 for scenario in _SWEEP_SCENARIOS
     ), "the minimum production topology is absent from the executed sweep"
+
+
+def test_the_queue_corpus_contains_compound_payload_orderings() -> None:
+    """The sweep includes feature interactions both within jobs and across queue neighbors."""
+    if os.environ.get(SEED_ENV_VAR):
+        pytest.skip(f"{SEED_ENV_VAR} overrides the committed sweep, so its coverage is the caller's to choose")
+
+    jobs = [job for scenario in _SWEEP_SCENARIOS for job in scenario.jobs]
+    assert any(
+        job.source_mode is ChaosSourceMode.INPAINTING
+        and job.aux_kind is ChaosAuxKind.BOTH
+        and job.control_kind is not ChaosControlKind.NONE
+        and job.post_processing is ChaosPostProcessing.CHAIN
+        for job in jobs
+    ), "the corpus contains no masked job combining both aux classes, ControlNet, and a post-processing chain"
+
+    neighbor_pairs = [
+        (before, after)
+        for scenario in _SWEEP_SCENARIOS
+        for before, after in zip(scenario.jobs, scenario.jobs[1:], strict=False)
+    ]
+    assert any(
+        before.control_kind is ChaosControlKind.RETURN_MAP and after.control_kind is not ChaosControlKind.RETURN_MAP
+        for before, after in neighbor_pairs
+    ), "the corpus never returns from a control-map delivery job to an ordinary generation path"
+    assert any(
+        before.post_processing is not ChaosPostProcessing.NONE and after.post_processing is ChaosPostProcessing.NONE
+        for before, after in neighbor_pairs
+    ), "the corpus never drains a post-processing-bearing head before a plain follower"
+    assert any(
+        before.aux_kind is not ChaosAuxKind.NONE and after.aux_kind is ChaosAuxKind.NONE
+        for before, after in neighbor_pairs
+    ), "the corpus never moves from auxiliary preparation pressure to an aux-free follower"
 
 
 def test_the_sweep_discloses_its_coverage_and_its_bounds(pytestconfig: pytest.Config) -> None:

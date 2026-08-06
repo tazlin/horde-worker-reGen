@@ -1,10 +1,11 @@
 """Seeded generation of worker-load scenarios for the generated chaos sweep.
 
 A scenario is a composition of three things a wedge needs in order to happen: a queue structure (how much
-work arrives, for which models, in what order and on what schedule), a worker configuration (how many
-sampling slots and lanes it has, how deep its queue is, what card it runs on), and a schedule of
-disturbances fired part-way through (a lane dying, an outside reclaim, a slow child, a resource fault, a
-misrouted message). An integer seed fully determines all three, so a red run replays from its seed alone.
+work arrives, for which models, with which payload features, in what order and on what schedule), a worker
+configuration (sampling slots, lanes, queue depth, card, memory policy, residency policy, throughput posture,
+and unload posture), and a schedule of disturbances fired part-way through (a lane dying, an outside reclaim,
+a slow child, a resource fault, or a misrouted message). An integer seed fully determines all three, so a red
+run replays from its seed alone.
 
 The generator is deterministic: it draws from ``random.Random(seed)``, resolves requested thread/queue
 settings through the worker's production configuration rules, and returns a frozen description. Two
@@ -24,9 +25,9 @@ than claiming coverage for events it cannot target. :data:`DISCLOSED_BOUNDS` sta
 truncates, and why; the suites print it, so the sweep's coverage is never taken on trust.
 
 Model identity carries two names because the two altitudes resolve models differently. The scheduling-loop
-runner prices from a synthetic reference keyed by ``scheduler_name``; the full-worker runner resolves
-``harness_name`` through the real image-model reference when one is present, and through a name-keyed
-fallback otherwise. Both names denote the same weight class in the space this module generates.
+runner prices from a synthetic reference keyed by ``scheduler_name``; the full-worker runner uses the
+harness's local name-keyed synthetic reference. Both names denote the same weight class in the space this
+module generates, without requiring live model-reference state.
 """
 
 from __future__ import annotations
@@ -36,7 +37,12 @@ import random
 from dataclasses import dataclass
 
 from horde_worker_regen.bridge_data.data_model import cap_queue_size
-from horde_worker_regen.process_management.process_manager import resolve_card_concurrency
+from horde_worker_regen.process_management.process_manager import (
+    _EstimatedContextFootprint,
+    cap_card_process_counts,
+    cap_card_processes_to_vram_fit,
+    resolve_card_concurrency,
+)
 
 SEED_ENV_VAR = "HORDE_CHAOS_SEEDS"
 """Environment override for which seeds a sweep runs.
@@ -154,19 +160,85 @@ class ChaosInitialResidency(enum.StrEnum):
     FOREIGN_IN_VRAM = "foreign_in_vram"
 
 
+class ChaosPerformance(enum.StrEnum):
+    """Throughput posture applied to one generated worker."""
+
+    NORMAL = "normal"
+    MODERATE = "moderate"
+    HIGH = "high"
+
+
+class ChaosSourceMode(enum.StrEnum):
+    """Source-image structure carried by one generated job."""
+
+    TXT2IMG = "txt2img"
+    IMG2IMG = "img2img"
+    INPAINTING = "inpainting"
+
+
+class ChaosAuxKind(enum.StrEnum):
+    """Auxiliary-model references carried by one generated job."""
+
+    NONE = "none"
+    LORA = "lora"
+    TEXTUAL_INVERSION = "ti"
+    BOTH = "lora_ti"
+
+
+class ChaosControlKind(enum.StrEnum):
+    """ControlNet input and output structure carried by one generated job."""
+
+    NONE = "none"
+    ANNOTATE = "annotate"
+    PREANNOTATED = "preannotated"
+    RETURN_MAP = "return_map"
+
+
+class ChaosPostProcessing(enum.StrEnum):
+    """Post-processing work requested after generation."""
+
+    NONE = "none"
+    FACE_FIX = "face_fix"
+    UPSCALE = "upscale"
+    CHAIN = "chain"
+
+
+class ChaosSamplerProfile(enum.StrEnum):
+    """Representative sampler and scheduler pair requested by one job."""
+
+    EULER_NORMAL = "euler_normal"
+    DPM_KARRAS = "dpm_karras"
+    LCM_SIMPLE = "lcm_simple"
+
+
 @dataclass(frozen=True)
 class ChaosJob:
-    """One queued image job with its own model and sampling demand."""
+    """One queued image job with its own model, payload structure, and sampling demand."""
 
     model: ChaosModel
     width: int
     height: int
     steps: int
+    n_iter: int = 1
+    source_mode: ChaosSourceMode = ChaosSourceMode.TXT2IMG
+    aux_kind: ChaosAuxKind = ChaosAuxKind.NONE
+    control_kind: ChaosControlKind = ChaosControlKind.NONE
+    post_processing: ChaosPostProcessing = ChaosPostProcessing.NONE
+    hires_fix: bool = False
+    sampler_profile: ChaosSamplerProfile = ChaosSamplerProfile.EULER_NORMAL
 
     @property
     def pixels(self) -> int:
         """Return the requested image area."""
         return self.width * self.height
+
+    @property
+    def feature_label(self) -> str:
+        """Return a compact payload identity for scenario summaries and parametrized failures."""
+        return (
+            f"b{self.n_iter}-{self.source_mode.value}-{self.aux_kind.value}-{self.control_kind.value}-"
+            f"{self.post_processing.value}-h{int(self.hires_fix)}-{self.sampler_profile.value}"
+        )
 
 
 @dataclass(frozen=True)
@@ -256,6 +328,10 @@ class ChaosScenario:
     demand_shape: ChaosDemandShape
     initial_residency: ChaosInitialResidency
     events: tuple[ChaosEvent, ...]
+    enable_vram_budget: bool = True
+    whole_card_enabled: bool = True
+    performance: ChaosPerformance = ChaosPerformance.NORMAL
+    unload_models_from_vram_often: bool = False
 
     @property
     def job_count(self) -> int:
@@ -310,7 +386,9 @@ class ChaosScenario:
 
     def summary(self) -> str:
         """A one-line description carrying everything needed to reproduce and read the scenario."""
-        queue = ">".join(f"{job.model.label}:{job.width}x{job.height}@{job.steps}" for job in self.jobs)
+        queue = ">".join(
+            f"{job.model.label}:{job.width}x{job.height}@{job.steps}:{job.feature_label}" for job in self.jobs
+        )
         events = (
             ",".join(f"{event.kind.value}@{event.at_job_ordinal}" for event in self.events) if self.events else "none"
         )
@@ -318,7 +396,9 @@ class ChaosScenario:
             f"seed={self.seed} card={self.card.label} shape={self.shape.value} queue=[{queue}] "
             f"arrival={self.arrival.value}(burst={self.burst_size}) threads={self.max_threads} "
             f"lanes={self.lanes} queue_size={self.queue_size} demand={self.demand_shape.value} "
-            f"residency={self.initial_residency.value} "
+            f"residency={self.initial_residency.value} vram_budget={self.enable_vram_budget} "
+            f"whole_card={self.whole_card_enabled} performance={self.performance.value} "
+            f"unload_often={self.unload_models_from_vram_often} "
             f"events=[{events}]"
         )
 
@@ -421,8 +501,14 @@ def _resolve_topology(
     max_threads: int,
     requested_queue_size: int,
     num_models_to_load: int,
+    card: ChaosCard | None = None,
 ) -> ChaosTopology:
-    """Resolve a generated configuration through the same cap and concurrency rules as the worker."""
+    """Resolve a generated configuration through the worker's configuration and hardware caps.
+
+    ``card`` is supplied by the full-worker projection, whose declared lane count must include the manager's
+    spawn-time VRAM and shared-RAM sizing. The fake-clock projection omits it because its modeled lane pool is
+    intentionally the configuration-level topology, independent of OS-process footprint.
+    """
     queue_size = cap_queue_size(
         max_threads=max_threads,
         queue_size=requested_queue_size,
@@ -436,11 +522,26 @@ def _resolve_topology(
         gpu_sampling_lease_slots=None,
         max_threads_ceiling=max_threads,
     )
+    target_process_count = concurrency.target_process_count
+    if card is not None:
+        target_process_count = cap_card_processes_to_vram_fit(
+            per_card_target_processes={0: target_process_count},
+            total_vram_mb_by_card={0: float(card.total_vram_mb)},
+            idle_context_overhead_mb=_EstimatedContextFootprint.IDLE_CONTEXT_VRAM_MB,
+            working_set_footprint_mb=_EstimatedContextFootprint.SDXL_CONTEXT_VRAM_MB,
+        )[0]
+        total_ram_bytes = card.host_ram_gb * 1024 * 1024 * 1024
+        target_ram_overhead_bytes = min(total_ram_bytes // 2, 9 * 1024 * 1024 * 1024)
+        target_process_count = cap_card_process_counts(
+            per_card_target_processes={0: target_process_count},
+            total_ram_bytes=total_ram_bytes,
+            target_ram_overhead_bytes=target_ram_overhead_bytes,
+        )[0]
     return ChaosTopology(
         max_threads=max_threads,
         requested_queue_size=requested_queue_size,
         queue_size=queue_size,
-        lanes=concurrency.target_process_count,
+        lanes=target_process_count,
         num_models_to_load=num_models_to_load,
     )
 
@@ -448,6 +549,7 @@ def _resolve_topology(
 def _draw_jobs(
     rng: random.Random,
     *,
+    feature_rng: random.Random,
     card: ChaosCard,
     models: tuple[ChaosModel, ...],
     demand_shape: ChaosDemandShape,
@@ -465,7 +567,46 @@ def _draw_jobs(
             size = sizes[-1] if index == 0 else sizes[0]
         else:
             size = rng.choice(sizes)
-        jobs.append(ChaosJob(model=model, width=size[0], height=size[1], steps=size[2]))
+        control_kind = feature_rng.choice(list(ChaosControlKind))
+        n_iter = feature_rng.choice((1, 2, 4))
+        hires_fix = feature_rng.choice((False, True))
+        source_mode = feature_rng.choice(list(ChaosSourceMode))
+        aux_kind = feature_rng.choice(list(ChaosAuxKind))
+        post_processing = feature_rng.choice(list(ChaosPostProcessing))
+        sampler_profile = feature_rng.choice(list(ChaosSamplerProfile))
+        # A positive generated verdict must stay inside the capability envelope it claims. Whole-card
+        # checkpoints are represented by a Flux-class model, for which ControlNet and hires-fix are not valid
+        # workload choices. On the smallest card, large and XL-class jobs use one sampling image without the
+        # activation multipliers that would turn a servable model/geometry pair into an unservable payload.
+        if model is MODEL_HEAVY:
+            n_iter = 1
+            hires_fix = False
+            control_kind = ChaosControlKind.NONE
+        elif card is CARD_8GB:
+            if size[0] * size[1] > 512 * 512 or model is MODEL_MID:
+                n_iter = 1
+                hires_fix = False
+                control_kind = ChaosControlKind.NONE
+                if model is MODEL_MID and size[0] * size[1] > 512 * 512:
+                    source_mode = ChaosSourceMode.TXT2IMG
+                    post_processing = ChaosPostProcessing.NONE
+            elif n_iter > 1:
+                hires_fix = False
+        jobs.append(
+            ChaosJob(
+                model=model,
+                width=size[0],
+                height=size[1],
+                steps=size[2],
+                n_iter=n_iter,
+                source_mode=source_mode,
+                aux_kind=aux_kind,
+                control_kind=control_kind,
+                post_processing=post_processing,
+                hires_fix=hires_fix,
+                sampler_profile=sampler_profile,
+            ),
+        )
     return tuple(jobs)
 
 
@@ -540,6 +681,7 @@ def _generate_scenario(
         max_threads=requested_threads,
         requested_queue_size=requested_queue_size,
         num_models_to_load=len(set(models)),
+        card=card if full_worker else None,
     )
     uniform_size = rng.choice(_servable_sizes(card, models))
     events = _draw_events(rng, job_count=length)
@@ -551,11 +693,13 @@ def _generate_scenario(
                 max_threads=1,
                 requested_queue_size=0,
                 num_models_to_load=len(set(models)),
+                card=card,
             )
 
     demand_shape = rng.choice(list(ChaosDemandShape))
     jobs = _draw_jobs(
         rng,
+        feature_rng=random.Random(f"{seed}:job-features"),
         card=card,
         models=models,
         demand_shape=demand_shape,
@@ -569,6 +713,7 @@ def _generate_scenario(
                 max_threads=1,
                 requested_queue_size=1,
                 num_models_to_load=len(set(models)),
+                card=card if full_worker else None,
             )
 
     return ChaosScenario(
@@ -582,6 +727,10 @@ def _generate_scenario(
         demand_shape=demand_shape,
         initial_residency=initial_residency,
         events=events,
+        enable_vram_budget=random.Random(f"{seed}:runtime-vram-budget").choice((False, True)),
+        whole_card_enabled=random.Random(f"{seed}:runtime-whole-card").choice((False, True)),
+        performance=random.Random(f"{seed}:runtime-performance").choice(list(ChaosPerformance)),
+        unload_models_from_vram_often=random.Random(f"{seed}:runtime-unload").choice((False, True)),
     )
 
 
@@ -666,13 +815,17 @@ coverage, so a draw-order change that collapses the slice fails loudly instead o
 SWEEP_SEEDS: tuple[int, ...] = tuple(range(1000, 1250))
 """The scheduling-loop sweep's committed range: wide enough to reach combinations the slice never draws."""
 
-SWEEP_FULL_WORKER_SEEDS: tuple[int, ...] = tuple(range(1000, 1024))
-"""The full-worker sweep's committed range.
+FULL_WORKER_CANDIDATE_SEEDS: tuple[int, ...] = tuple(range(1000, 1024))
+"""The finite candidate corpus used to select the spawned-process smoke rows."""
 
-Each of these boots a worker and spawns real child processes, so the range is a deliberate truncation of
-:data:`SWEEP_SEEDS` (its first 24 seeds) rather than a second sample. The subprocess generator resolves the
-same queue vocabulary through its affordable topology projection and fault-targeting constraints, so a seed
-can be compared across altitudes without claiming that both construct an identical process pool.
+SWEEP_FULL_WORKER_SEEDS: tuple[int, ...] = (1000, 1005, 1006, 1010, 1013, 1018, 1020)
+"""The full-worker sweep's committed spawned-process rows.
+
+Together these rows preserve every configuration, queue-shape, system-state, payload, arrival, topology,
+and child-disturbance value drawn by :data:`FULL_WORKER_CANDIDATE_SEEDS`. The larger scheduling-loop sweep
+still judges hundreds of compositions without process startup. This tier spends fresh interpreter startup
+only where it adds process-boundary evidence: ordinary IPC, multi-lane topology, child replacement, slow
+execution, resource failure, and stale-message rejection.
 """
 
 
@@ -702,13 +855,25 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "and repeated residency/recovery cycles. Longer stochastic sequences remain a nightly widening axis.",
     ),
     (
-        "no alchemy, LoRA, controlnet, or post-processing traffic is generated",
-        "those paths have their own suites, and mixing them in would make a red seed's cause ambiguous "
-        "between the scheduling composition under test and the auxiliary path.",
+        "image-job features use semantic representatives rather than every SDK field value",
+        "the generated vocabulary crosses source-image and masked jobs, LoRA and textual-inversion references, "
+        "ControlNet annotation/delivery modes, post-processing chains, batches, hires-fix, and three sampler "
+        "profiles. Exact numeric sampler knobs and custom workflow documents stay in focused contract tests.",
+    ),
+    (
+        "alchemy jobs are outside the image-job generated space",
+        "alchemy has a separate queue, coordinator, process role, and generated source; mixing its forms into "
+        "an image queue would not exercise the same scheduling path.",
     ),
     (
         "multi-card hosts are not generated",
         "every scenario runs one card. Card-count topology is the canary simulations' axis.",
+    ),
+    (
+        "runtime settings use the scheduling choices that alter this runner's state transitions",
+        "the generated rows vary VRAM budgeting, whole-card residency, normal/moderate/high performance, eager "
+        "VRAM unload, thread count, and queue depth. Safety placement, process exit policy, sampling leases, "
+        "and dedicated post-processing topology remain in their focused stateful or exhaustive contracts.",
     ),
     (
         "the scheduling-loop tier expresses only the lane-death and outside-reclaim disturbances",
@@ -729,11 +894,6 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "each is detected by waiting out a watchdog window with a floor of fifteen seconds, so generating them "
         "would price the sweep in watchdog timeouts rather than in scenarios. They are covered as named "
         "probes in the hand-written chaos suite.",
-    ),
-    (
-        "a full-worker run without a real image-model reference prices mid-class checkpoints as light ones",
-        "the name-keyed fallback recognises the whole-card checkpoint and treats everything else as the light "
-        "class, so at that tier the weight-class axis genuinely varies between light and whole-card only.",
     ),
 )
 """Every way the generated space is fixed or truncated, with the reason. The suites print this, so a reader
