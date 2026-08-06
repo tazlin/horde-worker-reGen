@@ -6,17 +6,21 @@ sampling slots and lanes it has, how deep its queue is, what card it runs on), a
 disturbances fired part-way through (a lane dying, an outside reclaim, a slow child, a resource fault, a
 misrouted message). An integer seed fully determines all three, so a red run replays from its seed alone.
 
-The generator is pure: it draws from ``random.Random(seed)`` and returns a frozen description. It commits
-to no altitude. Two runners consume it, and each maps what it can express:
+The generator is deterministic: it draws from ``random.Random(seed)``, resolves requested thread/queue
+settings through the worker's production configuration rules, and returns a frozen description. Two
+runners consume it:
 
 - the scheduling-loop runner drives the composition over a modelled card on a fake clock, where a lane
   death and an outside reclaim are expressible and the child-side faults are not;
-- the full-worker runner drives it against real child processes scripted with a
+- the full-worker runner uses the same seed over a bounded production-topology projection and drives it
+  against real child processes scripted with a
   :class:`~horde_worker_regen.process_management.simulation.fault_injection.FaultProfile`, where the
   child-side faults are expressible and an outside reclaim is not.
 
-:data:`WORLD_EVENT_KINDS` and :data:`CHILD_EVENT_KINDS` state that split, so a runner never silently drops
-an event it cannot express. :data:`DISCLOSED_BOUNDS` states every axis the generated space fixes or
+:data:`WORLD_EVENT_KINDS` and :data:`CHILD_EVENT_KINDS` state that split. The scheduling runner requires
+an effective receipt for every requested world event. The subprocess generator retains only one child event
+on a single-lane topology, where the fake's process-local ordinal is the scenario-global ordinal, rather
+than claiming coverage for events it cannot target. :data:`DISCLOSED_BOUNDS` states every axis the space fixes or
 truncates, and why; the suites print it, so the sweep's coverage is never taken on trust.
 
 Model identity carries two names because the two altitudes resolve models differently. The scheduling-loop
@@ -30,6 +34,9 @@ from __future__ import annotations
 import enum
 import random
 from dataclasses import dataclass
+
+from horde_worker_regen.bridge_data.data_model import cap_queue_size
+from horde_worker_regen.process_management.process_manager import resolve_card_concurrency
 
 SEED_ENV_VAR = "HORDE_CHAOS_SEEDS"
 """Environment override for which seeds a sweep runs.
@@ -125,6 +132,59 @@ class ChaosQueueShape(enum.StrEnum):
     """A free draw over the card's servable models."""
 
 
+class ChaosDemandShape(enum.StrEnum):
+    """How per-job sampling demand changes as the queue advances."""
+
+    UNIFORM = "uniform"
+    """Every job uses one shared geometry."""
+    LOW_HIGH_LOW = "low_high_low"
+    """Demand rises at the second job and then falls, including within one model residency."""
+    HIGH_LOW = "high_low"
+    """A high-demand head is followed by lower-demand work."""
+    MIXED = "mixed"
+    """Each job independently draws a geometry its model/card pairing can serve."""
+
+
+class ChaosInitialResidency(enum.StrEnum):
+    """The modelled card state before the first queue arrival."""
+
+    EMPTY = "empty"
+    HEAD_IN_RAM = "head_in_ram"
+    HEAD_IN_VRAM = "head_in_vram"
+    FOREIGN_IN_VRAM = "foreign_in_vram"
+
+
+@dataclass(frozen=True)
+class ChaosJob:
+    """One queued image job with its own model and sampling demand."""
+
+    model: ChaosModel
+    width: int
+    height: int
+    steps: int
+
+    @property
+    def pixels(self) -> int:
+        """Return the requested image area."""
+        return self.width * self.height
+
+
+@dataclass(frozen=True)
+class ChaosTopology:
+    """A requested worker configuration and the effective single-card process topology it resolves to."""
+
+    max_threads: int
+    requested_queue_size: int
+    queue_size: int
+    lanes: int
+    num_models_to_load: int
+
+    @property
+    def label(self) -> str:
+        """Return a stable compact identity for coverage reports."""
+        return f"t{self.max_threads}-q{self.queue_size}-l{self.lanes}-m{self.num_models_to_load}"
+
+
 class ChaosEventKind(enum.StrEnum):
     """A disturbance fired part-way through a scenario."""
 
@@ -156,12 +216,13 @@ CHILD_EVENT_KINDS = frozenset(
 
 @dataclass(frozen=True)
 class ChaosEvent:
-    """One disturbance, anchored to a job ordinal so both altitudes can place it.
+    """One disturbance, carrying a job ordinal for deterministic placement and subprocess targeting.
 
     Attributes:
         kind: What happens.
-        at_job_ordinal: The 1-based job ordinal the disturbance is anchored to. A full-worker run scripts
-            its child against that ordinal directly; the scheduling-loop runner converts it to a tick.
+        at_job_ordinal: The 1-based ordinal a full-worker child targets directly. The scheduling runner uses
+            it as a release-relative time anchor except for an outside reclaim, which fires against its
+            explicitly constructed initial foreign residency.
     """
 
     kind: ChaosEventKind
@@ -176,36 +237,50 @@ class ChaosScenario:
         seed: The integer that produced this scenario. Printed on every failure so a red run replays.
         card: The card profile the worker runs on.
         shape: The model ordering the queue was drawn with.
-        models: The queued jobs' models, head first.
+        jobs: The queued jobs, including each job's model and sampling demand, head first.
         arrival: How the jobs become available.
         burst_size: Jobs released per burst (bursts arrival only).
-        max_threads: The concurrent-sampling cap.
-        lanes: How many inference lanes the pool holds.
-        queue_size: The configured local queue depth.
-        width: Generated job width in pixels.
-        height: Generated job height in pixels.
-        steps: Generated job sampling steps.
+        topology: Requested settings and the effective topology resolved from production rules.
+        demand_shape: How sampling demand changes across the queue.
+        initial_residency: Card residency before the first arrival.
         events: The disturbance schedule, ordered by job ordinal.
     """
 
     seed: int
     card: ChaosCard
     shape: ChaosQueueShape
-    models: tuple[ChaosModel, ...]
+    jobs: tuple[ChaosJob, ...]
     arrival: ChaosArrival
     burst_size: int
-    max_threads: int
-    lanes: int
-    queue_size: int
-    width: int
-    height: int
-    steps: int
+    topology: ChaosTopology
+    demand_shape: ChaosDemandShape
+    initial_residency: ChaosInitialResidency
     events: tuple[ChaosEvent, ...]
 
     @property
     def job_count(self) -> int:
         """How many jobs the scenario queues."""
-        return len(self.models)
+        return len(self.jobs)
+
+    @property
+    def models(self) -> tuple[ChaosModel, ...]:
+        """Return the queued models, head first."""
+        return tuple(job.model for job in self.jobs)
+
+    @property
+    def max_threads(self) -> int:
+        """Return the effective concurrent-sampling cap."""
+        return self.topology.max_threads
+
+    @property
+    def lanes(self) -> int:
+        """Return the effective number of inference lanes."""
+        return self.topology.lanes
+
+    @property
+    def queue_size(self) -> int:
+        """Return the effective local queue depth."""
+        return self.topology.queue_size
 
     @property
     def model_switches(self) -> int:
@@ -220,7 +295,10 @@ class ChaosScenario:
     @property
     def label(self) -> str:
         """A stable, readable identity for the scenario (used as the parametrized test id)."""
-        return f"seed{self.seed}-{self.card.label}-{self.shape.value}-t{self.max_threads}-n{self.job_count}"
+        return (
+            f"seed{self.seed}-{self.card.label}-{self.shape.value}-{self.demand_shape.value}-"
+            f"{self.topology.label}-n{self.job_count}"
+        )
 
     def world_events(self) -> tuple[ChaosEvent, ...]:
         """The disturbances the scheduling-loop runner can express."""
@@ -232,28 +310,47 @@ class ChaosScenario:
 
     def summary(self) -> str:
         """A one-line description carrying everything needed to reproduce and read the scenario."""
-        queue = ">".join(model.label for model in self.models)
+        queue = ">".join(f"{job.model.label}:{job.width}x{job.height}@{job.steps}" for job in self.jobs)
         events = (
             ",".join(f"{event.kind.value}@{event.at_job_ordinal}" for event in self.events) if self.events else "none"
         )
         return (
             f"seed={self.seed} card={self.card.label} shape={self.shape.value} queue=[{queue}] "
             f"arrival={self.arrival.value}(burst={self.burst_size}) threads={self.max_threads} "
-            f"lanes={self.lanes} queue_size={self.queue_size} job={self.width}x{self.height}@{self.steps} "
+            f"lanes={self.lanes} queue_size={self.queue_size} demand={self.demand_shape.value} "
+            f"residency={self.initial_residency.value} "
             f"events=[{events}]"
         )
 
 
-MAX_QUEUE_SIZE = 4
-"""The deepest local queue an operator can configure, mirroring the bridge data's own ceiling.
+_QUEUE_LENGTHS: tuple[int, ...] = (2, 3, 5, 8)
+"""Short, retry-boundary, queue-boundary, and repeated-recovery sequence lengths."""
+_TOPOLOGY_REQUESTS: tuple[tuple[int, int], ...] = (
+    (1, 0),
+    (1, 1),
+    (1, 4),
+    (2, 0),
+    (2, 4),
+    (3, 0),
+    (3, 4),
+    (16, 0),
+    (16, 4),
+)
+"""Semantic boundaries of the public thread and queue ranges.
 
-A generated worker configuration has to be one the worker would accept, or the scenario cannot be run at
-the full-worker altitude at all.
+The queue-four rows exercise the production cap to three when more than one sampler is configured. The
+sixteen-thread rows cover the upper validation boundary without asking the subprocess tier to spawn that
+many children; :func:`generate_full_worker_scenarios` projects onto the bounded subset below.
 """
 
-_QUEUE_LENGTHS: tuple[int, ...] = (2, 3, 4, 5)
-_MAX_THREADS: tuple[int, ...] = (1, 2)
-_LANE_COUNTS: tuple[int, ...] = (2, 3)
+_FULL_WORKER_TOPOLOGY_REQUESTS: tuple[tuple[int, int], ...] = (
+    (1, 0),
+    (1, 1),
+    (1, 4),
+    (2, 0),
+    (2, 4),
+)
+"""Production-valid topology boundaries affordable at the real-subprocess altitude."""
 _JOB_SIZES: tuple[tuple[int, int, int], ...] = (
     (512, 512, 8),
     (512, 768, 12),
@@ -263,7 +360,7 @@ _JOB_SIZES: tuple[tuple[int, int, int], ...] = (
 """Generated job geometries. Steps stay low so a full-worker run's fake children finish promptly; the axis
 varies the priced sampling peak, which is what admission reads, not how long a fake pretends to sample."""
 
-_EVENT_COUNT_DRAW: tuple[int, ...] = (0, 0, 1, 1, 1, 2)
+_EVENT_COUNT_DRAW: tuple[int, ...] = (0, 0, 1, 1, 2, 3)
 """How many disturbances a scenario fires, drawn with the weighting this tuple encodes. Undisturbed runs
 stay in the space on purpose: a wedge that only appears when nothing is being injected is still a wedge."""
 
@@ -319,6 +416,59 @@ def _servable_sizes(card: ChaosCard, models: tuple[ChaosModel, ...]) -> tuple[tu
     return tuple(size for size in _JOB_SIZES if size[0] * size[1] <= budget)
 
 
+def _resolve_topology(
+    *,
+    max_threads: int,
+    requested_queue_size: int,
+    num_models_to_load: int,
+) -> ChaosTopology:
+    """Resolve a generated configuration through the same cap and concurrency rules as the worker."""
+    queue_size = cap_queue_size(
+        max_threads=max_threads,
+        queue_size=requested_queue_size,
+        log=False,
+    )
+    concurrency = resolve_card_concurrency(
+        max_threads=max_threads,
+        queue_size=queue_size,
+        num_models_to_load=num_models_to_load,
+        gpu_sampling_lease_enabled=False,
+        gpu_sampling_lease_slots=None,
+        max_threads_ceiling=max_threads,
+    )
+    return ChaosTopology(
+        max_threads=max_threads,
+        requested_queue_size=requested_queue_size,
+        queue_size=queue_size,
+        lanes=concurrency.target_process_count,
+        num_models_to_load=num_models_to_load,
+    )
+
+
+def _draw_jobs(
+    rng: random.Random,
+    *,
+    card: ChaosCard,
+    models: tuple[ChaosModel, ...],
+    demand_shape: ChaosDemandShape,
+    uniform_size: tuple[int, int, int],
+) -> tuple[ChaosJob, ...]:
+    """Give every queued model an independently servable sampling demand."""
+    jobs: list[ChaosJob] = []
+    for index, model in enumerate(models):
+        sizes = _servable_sizes(card, (model,))
+        if demand_shape is ChaosDemandShape.UNIFORM:
+            size = uniform_size if uniform_size in sizes else sizes[-1]
+        elif demand_shape is ChaosDemandShape.LOW_HIGH_LOW:
+            size = sizes[-1] if index == 1 else sizes[0]
+        elif demand_shape is ChaosDemandShape.HIGH_LOW:
+            size = sizes[-1] if index == 0 else sizes[0]
+        else:
+            size = rng.choice(sizes)
+        jobs.append(ChaosJob(model=model, width=size[0], height=size[1], steps=size[2]))
+    return tuple(jobs)
+
+
 def _draw_queue(
     rng: random.Random,
     *,
@@ -342,16 +492,26 @@ def _draw_queue(
 
 
 def _draw_events(rng: random.Random, *, job_count: int) -> tuple[ChaosEvent, ...]:
-    """Draw the disturbance schedule, at most one disturbance per job ordinal."""
+    """Draw the disturbance schedule, with unique kinds and job ordinals.
+
+    Repeating a reclaim or lane death without constructing a second eligible target makes the later draw a
+    known no-op. Longer sequences vary composition depth; each disturbance kind appears at most once until
+    the generator can construct and verify repeated preconditions explicitly.
+    """
     count = min(rng.choice(_EVENT_COUNT_DRAW), job_count)
     if count == 0:
         return ()
     ordinals = sorted(rng.sample(range(1, job_count + 1), count))
-    kinds = list(ChaosEventKind)
-    return tuple(ChaosEvent(kind=rng.choice(kinds), at_job_ordinal=ordinal) for ordinal in ordinals)
+    kinds = rng.sample(list(ChaosEventKind), count)
+    return tuple(ChaosEvent(kind=kind, at_job_ordinal=ordinal) for ordinal, kind in zip(ordinals, kinds, strict=True))
 
 
-def generate_scenario(seed: int) -> ChaosScenario:
+def _generate_scenario(
+    seed: int,
+    *,
+    topology_requests: tuple[tuple[int, int], ...],
+    full_worker: bool,
+) -> ChaosScenario:
     """Return the scenario the given seed denotes.
 
     The draw order is part of the contract: changing it renumbers every seed, so a committed seed list and
@@ -360,6 +520,8 @@ def generate_scenario(seed: int) -> ChaosScenario:
 
     Args:
         seed: The integer that fully determines the scenario.
+        topology_requests: The production configuration boundaries this runner can afford.
+        full_worker: Whether to enforce subprocess fault-targeting constraints.
 
     Returns:
         The frozen scenario description.
@@ -373,36 +535,81 @@ def generate_scenario(seed: int) -> ChaosScenario:
     models = _draw_queue(rng, shape=shape, servable=servable, length=length)
     arrival = rng.choice(list(ChaosArrival))
     burst_size = rng.randint(1, max(1, length - 1))
-    max_threads = rng.choice(_MAX_THREADS)
-    lanes = rng.choice(_LANE_COUNTS)
-    # A queue configured shallower than the work offered is the at-depth shape: intake is gated on the
-    # local queue draining, which is where a full-but-frozen queue would hide. The worker's own config
-    # caps the depth, so the draw is clamped to what an operator could actually set.
-    deep = min(length, MAX_QUEUE_SIZE)
-    queue_size = rng.choice((deep, max(1, deep - 1)))
-    width, height, steps = rng.choice(_servable_sizes(card, models))
+    requested_threads, requested_queue_size = rng.choice(topology_requests)
+    topology = _resolve_topology(
+        max_threads=requested_threads,
+        requested_queue_size=requested_queue_size,
+        num_models_to_load=len(set(models)),
+    )
+    uniform_size = rng.choice(_servable_sizes(card, models))
     events = _draw_events(rng, job_count=length)
+    if full_worker:
+        child_events = [event for event in events if event.kind in CHILD_EVENT_KINDS]
+        events = tuple(child_events[:1])
+        if child_events and topology.lanes != 1:
+            topology = _resolve_topology(
+                max_threads=1,
+                requested_queue_size=0,
+                num_models_to_load=len(set(models)),
+            )
+
+    demand_shape = rng.choice(list(ChaosDemandShape))
+    jobs = _draw_jobs(
+        rng,
+        card=card,
+        models=models,
+        demand_shape=demand_shape,
+        uniform_size=uniform_size,
+    )
+    initial_residency = rng.choice(list(ChaosInitialResidency))
+    if any(event.kind is ChaosEventKind.EXTERNAL_RECLAIM for event in events):
+        initial_residency = ChaosInitialResidency.FOREIGN_IN_VRAM
+        if topology.lanes < 2:
+            topology = _resolve_topology(
+                max_threads=1,
+                requested_queue_size=1,
+                num_models_to_load=len(set(models)),
+            )
 
     return ChaosScenario(
         seed=seed,
         card=card,
         shape=shape,
-        models=models,
+        jobs=jobs,
         arrival=arrival,
         burst_size=burst_size,
-        max_threads=max_threads,
-        lanes=lanes,
-        queue_size=queue_size,
-        width=width,
-        height=height,
-        steps=steps,
+        topology=topology,
+        demand_shape=demand_shape,
+        initial_residency=initial_residency,
         events=events,
     )
+
+
+def generate_scenario(seed: int) -> ChaosScenario:
+    """Return a scheduling-loop scenario for ``seed`` over the full topology boundary vocabulary."""
+    return _generate_scenario(seed, topology_requests=_TOPOLOGY_REQUESTS, full_worker=False)
 
 
 def generate_scenarios(seeds: tuple[int, ...]) -> tuple[ChaosScenario, ...]:
     """Return the scenarios for a list of seeds, in the order given."""
     return tuple(generate_scenario(seed) for seed in seeds)
+
+
+def generate_full_worker_scenarios(seeds: tuple[int, ...]) -> tuple[ChaosScenario, ...]:
+    """Return subprocess scenarios with production topology boundaries that keep the sweep affordable.
+
+    Child-side disturbances are restricted to one per scenario and a single inference lane. This makes a
+    fault profile's process-local job ordinal identical to the scenario's global ordinal; the subprocess
+    runner rejects any scenario that violates that mapping.
+    """
+    return tuple(
+        _generate_scenario(
+            seed,
+            topology_requests=_FULL_WORKER_TOPOLOGY_REQUESTS,
+            full_worker=True,
+        )
+        for seed in seeds
+    )
 
 
 def parse_seed_spec(spec: str) -> tuple[int, ...]:
@@ -431,6 +638,7 @@ def parse_seed_spec(spec: str) -> tuple[int, ...]:
 
 CORE_SEEDS: tuple[int, ...] = (
     1,
+    2,
     3,
     7,
     12,
@@ -450,10 +658,9 @@ CORE_SEEDS: tuple[int, ...] = (
 """The representative slice the default suite runs.
 
 Chosen (not drawn) so the slice spans the axes rather than whatever a contiguous range happens to hit:
-between them these seeds cover all three cards, all four queue shapes, both sampling caps, both lane
-counts, every arrival kind, every event kind, and both the undisturbed and two-disturbance ends of the
-event draw. ``test_the_core_slice_spans_the_generated_axes`` holds that coverage, so a change to the draw
-order that collapses the slice fails loudly instead of quietly narrowing the default suite.
+between them these seeds cover all cards, queue and demand shapes, topology boundaries, initial residency
+states, arrivals, event kinds, and event counts. ``test_the_core_slice_spans_the_generated_axes`` holds that
+coverage, so a draw-order change that collapses the slice fails loudly instead of quietly narrowing it.
 """
 
 SWEEP_SEEDS: tuple[int, ...] = tuple(range(1000, 1250))
@@ -463,8 +670,9 @@ SWEEP_FULL_WORKER_SEEDS: tuple[int, ...] = tuple(range(1000, 1024))
 """The full-worker sweep's committed range.
 
 Each of these boots a worker and spawns real child processes, so the range is a deliberate truncation of
-:data:`SWEEP_SEEDS` (its first 24 scenarios) rather than a second sample: the two tiers then judge the same
-compositions at both altitudes, and a seed red in one can be read against the other.
+:data:`SWEEP_SEEDS` (its first 24 seeds) rather than a second sample. The subprocess generator resolves the
+same queue vocabulary through its affordable topology projection and fault-targeting constraints, so a seed
+can be compared across altitudes without claiming that both construct an identical process pool.
 """
 
 
@@ -473,7 +681,7 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "unservable heads are outside the generated space",
         "a scenario only queues models its card can serve, at a geometry that card serves them at, so every "
         "generated verdict is a positive one. The ceiling-hold exit a genuinely unservable head takes is the "
-        "bounded-dispatch matrix's subject.",
+        "bounded-dispatch matrix's subject; advertised-demand contradictions have pinned boundary contracts.",
     ),
     (
         "the mid class is generated on the smallest card only up to 768x768",
@@ -489,9 +697,9 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "still reachable.",
     ),
     (
-        "queue length is bounded to 2-5 jobs",
-        "a longer queue repeats the same residency rotations at higher cost; depth of composition is varied "
-        "through the shape, arrival, and disturbance axes instead.",
+        "queue length uses the semantic boundaries 2, 3, 5, and 8",
+        "these reach a follower, the default retry boundary plus one, the configured queue boundary plus one, "
+        "and repeated residency/recovery cycles. Longer stochastic sequences remain a nightly widening axis.",
     ),
     (
         "no alchemy, LoRA, controlnet, or post-processing traffic is generated",
@@ -512,9 +720,9 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "an outside reclaim is an actor operating on the card's residency, which a fake child cannot stage.",
     ),
     (
-        "the full-worker tier does not vary lane count",
-        "the pool size follows from the sampling cap there; lane count is varied at the scheduling-loop tier, "
-        "where the pool is constructed directly.",
+        "the full-worker tier limits requested sampling concurrency to one or two",
+        "its lane count is still resolved by the real manager and checked against the scenario, but larger "
+        "thread boundaries stay in the fake-clock tier to avoid spawning dozens of processes per row.",
     ),
     (
         "hang, crash-on-start, and preload-stall faults are outside the generated space",

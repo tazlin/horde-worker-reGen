@@ -966,6 +966,22 @@ orchestrator, and job tracker through these faults and assert the worker
 recovers: the job eventually completes-or-faults, the slot is replaced, no
 semaphore is orphaned, and the worker keeps running.
 
+The generated scheduling sweep also drives a fake-clock composition over the
+real scheduler and job tracker. Its jobs carry independent geometries, so the
+queue includes low/high/low and high/low demand changes within one checkpoint,
+not only model-name permutations. Requested thread and queue settings are
+resolved through the production concurrency rules; the corpus includes the
+one-lane/zero-prefetch boundary, the queue cap, and the maximum thread boundary.
+Initial empty, RAM-staged, VRAM-resident, and foreign-resident states are axes.
+
+Coverage is contractual rather than inferred from the seed count. The committed
+sweep must cover every pair of its semantic axes. A modelled-card disturbance
+counts only when it changes its intended state and produces a receipt; a drawn
+event that remains inapplicable fails the scenario. The subprocess projection
+keeps at most one child event on one inference lane, where the fake process's
+local job ordinal has one unambiguous global target, and verifies that the real
+manager resolves the lane count declared by the scenario.
+
 ## See also
 
 - [Process Lifecycle](process_lifecycle.md): slot replacement, semaphores, and

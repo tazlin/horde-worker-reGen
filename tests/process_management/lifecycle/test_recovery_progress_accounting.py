@@ -83,6 +83,25 @@ class TestSafetyBacklogIsNotProgress:
         assert coordinator.made_progress_since_episode() is True
 
 
+class TestFaultedWorkIsNotRecoveryProgress:
+    """A terminal fault drains accounting but does not prove that the worker can serve accepted work."""
+
+    async def test_terminal_fault_cannot_close_the_episode_that_produced_it(self) -> None:
+        """Moving a pending job to faulted submission is not successful forward progress."""
+        clock = FakeClock()
+        job_tracker = JobTracker(clock=clock)
+        coordinator = make_test_recovery_coordinator(job_tracker=job_tracker, clock=clock)
+
+        job = await track_popped_job_async(job_tracker, make_job_pop_response())
+        coordinator._capture_progress_baseline()
+
+        job_tracker.handle_job_fault_now(job, retryable=False)
+
+        assert coordinator.episode_progress_baseline is not None
+        assert job_tracker.total_num_completed_jobs > coordinator.episode_progress_baseline
+        assert coordinator.made_progress_since_episode() is False
+
+
 def _job_info_for(job: object) -> Mock:
     """Wrap a popped job in the job-info shape the safety queue expects."""
     job_info = Mock()

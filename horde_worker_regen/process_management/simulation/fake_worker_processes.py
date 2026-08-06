@@ -317,7 +317,7 @@ class FakeInferenceProcess(HordeProcess):
 
         self._inference_semaphore.acquire()
         time_start = time.time()
-        effective_delay = self._job_delay_seconds * profile.slow_factor
+        effective_delay = self._job_delay_seconds * profile.delay_factor_for_ordinal(self._jobs_started)
         try:
             if effective_delay > 0:
                 deadline = time_start + effective_delay
@@ -673,7 +673,7 @@ class FakeSafetyProcess(HordeProcess):
         )
 
         time_start = time.time()
-        effective_delay = self._evaluation_delay_seconds * profile.slow_factor
+        effective_delay = self._evaluation_delay_seconds * profile.delay_factor_for_ordinal(self._evals_started)
         if effective_delay > 0:
             time.sleep(effective_delay)
 
@@ -929,7 +929,7 @@ class FakePostProcessProcess(HordeProcess):
             self._sim_vram_ledger.clear_transient(self.device_index, self.process_id)
 
         time_start = time.time()
-        effective_delay = self._post_processing_delay_seconds * profile.slow_factor
+        effective_delay = self._post_processing_delay_seconds * profile.delay_factor_for_ordinal(self._jobs_started)
         if effective_delay > 0:
             time.sleep(effective_delay)
 

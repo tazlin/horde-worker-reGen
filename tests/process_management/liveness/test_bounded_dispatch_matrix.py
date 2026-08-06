@@ -624,11 +624,14 @@ class _DispatchWorld:
 
     # -- disturbances -------------------------------------------------------------------------------------
 
-    def kill_lane_holding(self, model: _ModelClass) -> None:
+    def kill_lane_holding(self, model: _ModelClass) -> bool:
         """Kill the lane holding (or loading) ``model`` and replace it with a fresh empty lane.
 
         Mirrors the lifecycle's replacement of a dead inference process: the dead lane leaves the map (taking
         its model-map entry and its VRAM with it) and a new, empty lane of the same id takes its place.
+
+        Returns:
+            True when a matching lane was replaced; False when the requested disturbance had no target.
         """
         victim: int | None = None
         for lane in self._process_map.values():
@@ -641,7 +644,7 @@ class _DispatchWorld:
                     victim = lane_id
                     break
         if victim is None:
-            return
+            return False
         self._resident_mb.pop(victim, None)
         self._staged_mb.pop(victim, None)
         self._loading.pop(victim, None)
@@ -651,9 +654,10 @@ class _DispatchWorld:
         replacement = make_mock_process_info(victim, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         self._process_map[victim] = replacement
         self._sync_reported_vram()
+        return True
 
-    def evict_idle_resident_sibling(self, *, except_model: _ModelClass) -> None:
-        """Evict one idle resident model other than ``except_model``, as an outside reclaim actor would."""
+    def evict_idle_resident_sibling(self, *, except_model: _ModelClass) -> bool:
+        """Evict an idle sibling and report whether the requested disturbance changed card state."""
         for lane in self._process_map.values():
             name = lane.loaded_horde_model_name
             if (
@@ -670,7 +674,8 @@ class _DispatchWorld:
             if entry is not None and entry.process_id == lane.process_id:
                 self._model_map.root.pop(name, None)
             self._sync_reported_vram()
-            return
+            return True
+        return False
 
     # -- the loop -----------------------------------------------------------------------------------------
 

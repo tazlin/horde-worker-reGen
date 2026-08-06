@@ -358,6 +358,8 @@ class TestReceiveAndHandleProcessMessages:
         _enqueue(message_dispatcher, msg)
         await message_dispatcher.receive_and_handle_process_messages()
 
+        assert message_dispatcher.stale_messages_ignored == 1
+
     async def test_unknown_process_id_is_dropped_not_fatal(self) -> None:
         """A message from a process the map no longer knows must be dropped, never crash the worker.
 
@@ -378,6 +380,8 @@ class TestReceiveAndHandleProcessMessages:
         _enqueue(message_dispatcher, msg)
         # Must not raise; the message is simply dropped.
         await message_dispatcher.receive_and_handle_process_messages()
+
+        assert message_dispatcher.stale_messages_ignored == 1
 
     @pytest.mark.parametrize(
         "message",

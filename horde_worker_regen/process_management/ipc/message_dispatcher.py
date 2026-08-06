@@ -364,6 +364,8 @@ class MessageDispatcher:
         stays set is a read that cannot return, which the corruption watchdog reads."""
         self._on_channel_corrupt: Callable[[str], None] | None = None
         self._channel_corruption_reported = False
+        self._stale_messages_ignored = 0
+        """Messages rejected because their process slot or launch identity is no longer current."""
         self._last_model_load_change_at: dict[int, float] = {}
         """Epoch time each process last had a child-confirmed model-load state change.
 
@@ -384,6 +386,11 @@ class MessageDispatcher:
         lost = self._post_process_results_known_lost
         self._post_process_results_known_lost = set()
         return lost
+
+    @property
+    def stale_messages_ignored(self) -> int:
+        """Return how many messages this dispatcher rejected for a missing or replaced launch."""
+        return self._stale_messages_ignored
 
     def set_alchemy_result_handler(self, handler: Callable[[HordeAlchemyResultMessage], None]) -> None:
         """Register the callback invoked when a child process reports an alchemy form result."""
@@ -532,6 +539,7 @@ class MessageDispatcher:
             # always safe (the process is gone); raising here would crash the control loop and take the
             # whole worker down over a stale status update, which is exactly the fragility that stopping
             # processes mid-session must not introduce.
+            self._stale_messages_ignored += 1
             logger.warning(
                 f"Ignoring message from process {message.process_id} that is no longer in the process map "
                 f"(launch {message.process_launch_identifier}); it was most likely intentionally stopped: "
@@ -547,6 +555,7 @@ class MessageDispatcher:
             # leave many queued messages behind, and logging each as an error floods the errors-only
             # trace with benign noise that makes a routine replacement (e.g. a maintenance-mode pool
             # reload) look like an error storm in the recovery diagnostics.
+            self._stale_messages_ignored += 1
             logger.warning(
                 f"Ignoring a stale message from process {message.process_id} (launch identifier "
                 f"{message.process_launch_identifier}, expected {known_launch_identifier}); the process "

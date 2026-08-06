@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
+from itertools import combinations
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -40,8 +42,10 @@ from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     SEED_ENV_VAR,
     SWEEP_SEEDS,
     ChaosArrival,
+    ChaosDemandShape,
     ChaosEvent,
     ChaosEventKind,
+    ChaosInitialResidency,
     ChaosModel,
     ChaosQueueShape,
     ChaosScenario,
@@ -120,6 +124,15 @@ _EVENT_DELAY_SECONDS = 30.0
 """After its job's release that a disturbance fires, so the worker has committed to a plan first."""
 
 
+@dataclass(frozen=True)
+class _EventReceipt:
+    """Proof that a requested modelled-card disturbance changed its intended target state."""
+
+    event: ChaosEvent
+    fired_tick: int
+    target_model: str
+
+
 def _model_class(model: ChaosModel) -> _ModelClass:
     """Resolve a generated model to the matrix's model class, which the world prices from."""
     for candidate in _MODEL_CLASSES:
@@ -191,12 +204,35 @@ class _ChaosRun:
             tick_seconds=_CHAOS_TICK_SECONDS,
         )
         self.jobs: list[ImageGenerateJobPopResponse] = []
+        self.event_receipts: list[_EventReceipt] = []
+        self._fired_events: set[ChaosEvent] = set()
         self.oldest_waiting_age_seconds = 0.0
         """The largest age any job reached while still waiting for inference, over the whole run."""
+        self._seed_initial_residency()
+
+    def _seed_initial_residency(self) -> None:
+        """Materialise the scenario's explicit starting card state before any job arrives."""
+        residency = self.scenario.initial_residency
+        if residency is ChaosInitialResidency.EMPTY:
+            return
+        head = _model_class(self.scenario.jobs[0].model)
+        if residency is ChaosInitialResidency.HEAD_IN_RAM:
+            self.world.seed_resident(0, head, in_vram=False)
+            return
+        if residency is ChaosInitialResidency.HEAD_IN_VRAM:
+            self.world.seed_resident(0, head, in_vram=True)
+            return
+        foreign = next(
+            model
+            for model in _MODEL_CLASSES
+            if model.name != head.name and model.weights_mb <= self.scenario.card.total_vram_mb - 512
+        )
+        self.world.seed_resident(0, foreign, in_vram=True)
 
     async def drive(self) -> None:
         """Pop the queue on its arrival schedule, fire its disturbances, and run out its ticks."""
         await self._release_due_jobs()
+        self._fire_due_events()
         for _ in range(_run_ticks(self.scenario)):
             await self.world.step()
             await self._release_due_jobs()
@@ -208,29 +244,47 @@ class _ChaosRun:
         while len(self.jobs) < self.scenario.job_count and _release_tick(self.scenario, len(self.jobs)) <= (
             self.world.tick
         ):
-            model = self.scenario.models[len(self.jobs)]
+            job_spec = self.scenario.jobs[len(self.jobs)]
             job = make_job_pop_response(
-                _model_class(model).name,
-                width=self.scenario.width,
-                height=self.scenario.height,
-                ddim_steps=self.scenario.steps,
+                _model_class(job_spec.model).name,
+                width=job_spec.width,
+                height=job_spec.height,
+                ddim_steps=job_spec.steps,
             )
             await self.world.pop(job)
             self.jobs.append(job)
 
     def _fire_due_events(self) -> None:
-        """Apply each disturbance whose tick has come."""
+        """Apply due disturbances and retain only receipts for actions that changed state.
+
+        A preconditioned disturbance remains pending until its target state exists. The final property then
+        fails when the runner requested an event but never exercised it, instead of counting a no-op draw as
+        coverage.
+        """
         for event in self.scenario.world_events():
-            if self._event_tick(event) != self.world.tick:
+            if event in self._fired_events or self._event_tick(event) > self.world.tick:
                 continue
-            target = _model_class(self.scenario.models[event.at_job_ordinal - 1])
+            target = _model_class(self.scenario.jobs[event.at_job_ordinal - 1].model)
             if event.kind is ChaosEventKind.LANE_DEATH:
-                self.world.kill_lane_holding(target)
+                effective = False
+                for resident in _MODEL_CLASSES:
+                    if self.world.kill_lane_holding(resident):
+                        target = resident
+                        effective = True
+                        break
             else:
-                self.world.evict_idle_resident_sibling(except_model=target)
+                effective = self.world.evict_idle_resident_sibling(except_model=target)
+            if not effective:
+                continue
+            self._fired_events.add(event)
+            self.event_receipts.append(
+                _EventReceipt(event=event, fired_tick=self.world.tick, target_model=target.name),
+            )
 
     def _event_tick(self, event: ChaosEvent) -> int:
         """Return the tick a disturbance fires on, measured from its own job's arrival."""
+        if event.kind is ChaosEventKind.EXTERNAL_RECLAIM:
+            return 0
         offset = _release_offset_seconds(self.scenario, event.at_job_ordinal - 1) + _EVENT_DELAY_SECONDS
         return math.ceil(offset / _CHAOS_TICK_SECONDS)
 
@@ -270,6 +324,10 @@ async def _assert_scenario_is_served(scenario: ChaosScenario) -> None:
     await run.drive()
 
     age_bound_seconds = _dispatch_budget_seconds(scenario)
+
+    assert {receipt.event for receipt in run.event_receipts} == set(scenario.world_events()), run.message(
+        "one or more requested disturbances never found their required state and changed nothing",
+    )
 
     for index, job in enumerate(run.jobs):
         assert job.id_ is not None
@@ -331,11 +389,64 @@ def test_the_core_slice_spans_the_generated_axes() -> None:
     assert {scenario.card.label for scenario in _CORE_SCENARIOS} == {"8gb", "16gb", "24gb"}
     assert {scenario.shape for scenario in _CORE_SCENARIOS} == set(ChaosQueueShape)
     assert {scenario.arrival for scenario in _CORE_SCENARIOS} == set(ChaosArrival)
-    assert {scenario.max_threads for scenario in _CORE_SCENARIOS} == {1, 2}
-    assert {scenario.lanes for scenario in _CORE_SCENARIOS} == {2, 3}
+    assert {scenario.max_threads for scenario in _CORE_SCENARIOS} == {1, 2, 3, 16}
+    assert {scenario.topology.requested_queue_size for scenario in _CORE_SCENARIOS} == {0, 1, 4}
+    assert {scenario.queue_size for scenario in _CORE_SCENARIOS} == {0, 1, 3, 4}
+    assert {scenario.demand_shape for scenario in _CORE_SCENARIOS} == set(ChaosDemandShape)
+    assert {scenario.initial_residency for scenario in _CORE_SCENARIOS} == set(ChaosInitialResidency)
     assert {event.kind for scenario in _CORE_SCENARIOS for event in scenario.events} == set(ChaosEventKind)
     assert {len(scenario.events) for scenario in _CORE_SCENARIOS} >= {0, 1, 2}
     assert any(scenario.heavy_job_count > 0 for scenario in _CORE_SCENARIOS)
+
+
+def _coverage_features(scenario: ChaosScenario) -> dict[str, object]:
+    """Return the independent semantic axes whose pairwise coverage the committed sweep guarantees."""
+    return {
+        "card": scenario.card.label,
+        "queue_shape": scenario.shape,
+        "arrival": scenario.arrival,
+        "topology_request": (scenario.max_threads, scenario.topology.requested_queue_size),
+        "demand_shape": scenario.demand_shape,
+        "initial_residency": scenario.initial_residency,
+        "queue_length": scenario.job_count,
+    }
+
+
+def test_the_committed_sweep_covers_every_pair_of_semantic_axes() -> None:
+    """Every pair of independently valid axis values appears in at least one executed sweep scenario."""
+    if os.environ.get(SEED_ENV_VAR):
+        pytest.skip(f"{SEED_ENV_VAR} overrides the committed sweep, so its coverage is the caller's to choose")
+
+    rows = [_coverage_features(scenario) for scenario in _SWEEP_SCENARIOS]
+    axis_values = {axis: {row[axis] for row in rows} for axis in rows[0]}
+    missing: list[str] = []
+    for first, second in combinations(axis_values, 2):
+        expected = {(a, b) for a in axis_values[first] for b in axis_values[second]}
+        actual = {(row[first], row[second]) for row in rows}
+        for first_value, second_value in sorted(expected - actual, key=repr):
+            missing.append(f"{first}={first_value!r} + {second}={second_value!r}")
+
+    assert not missing, "the committed sweep lost pairwise coverage:\n  " + "\n  ".join(missing)
+
+
+def test_the_queue_corpus_contains_job_dependent_demand_orderings() -> None:
+    """The sweep executes heterogeneous demand within one model, not only model-name permutations."""
+    if os.environ.get(SEED_ENV_VAR):
+        pytest.skip(f"{SEED_ENV_VAR} overrides the committed sweep, so its coverage is the caller's to choose")
+
+    same_model = [scenario for scenario in _SWEEP_SCENARIOS if len(set(scenario.models)) == 1]
+    assert any(
+        len(scenario.jobs) >= 3
+        and scenario.jobs[0].pixels < scenario.jobs[1].pixels
+        and scenario.jobs[2].pixels < scenario.jobs[1].pixels
+        for scenario in same_model
+    ), "the queue corpus contains no same-model low/high/low demand transition"
+    assert any(
+        len(scenario.jobs) >= 2 and scenario.jobs[0].pixels > scenario.jobs[1].pixels for scenario in same_model
+    ), "the queue corpus contains no same-model high-head/lower-follower transition"
+    assert any(
+        scenario.queue_size == 0 and scenario.lanes == 1 and scenario.max_threads == 1 for scenario in _SWEEP_SCENARIOS
+    ), "the minimum production topology is absent from the executed sweep"
 
 
 def test_the_sweep_discloses_its_coverage_and_its_bounds(pytestconfig: pytest.Config) -> None:

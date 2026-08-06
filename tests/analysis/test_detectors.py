@@ -1216,6 +1216,22 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge, {"bridge_1.log": child})
 
+    def test_empty_generation_field_is_not_dedicated_post_processing_activity(self, tmp_path: Path) -> None:
+        """An inference request with an empty post-processing list does not prove downstream activity."""
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | DEBUG | inference_process:start_inference:1048 - "
+                "{'width': 1024, 'height': 1024, 'post_processing': []}",
+                self._reserve_warning("16:53:15.000"),
+            ],
+        )
+        bridge = self._bridge(
+            "2026-06-28 16:53:10.000 | INFO | x:y:1 - allow_post_processing: False | dedicated_post_processing: off",
+            "2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active",
+        )
+
+        assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge, {"bridge_1.log": child})
+
     @staticmethod
     def _free_vram_readout(ts: str, *, free_mb: int) -> str:
         """The routine device-wide free-VRAM readout hordelib emits on every log_free_ram call (DEBUG)."""

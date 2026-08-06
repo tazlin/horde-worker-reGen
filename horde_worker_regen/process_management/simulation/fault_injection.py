@@ -72,6 +72,9 @@ class FaultProfile(BaseModel):
     slow_factor: float = 1.0
     """Multiplies the per-job delay; ``> 1`` makes jobs run slower than their expected time."""
 
+    slow_on_job_n: int | None = None
+    """Limit ``slow_factor`` to this process-local job ordinal; None applies it to every job."""
+
     oom_on_job_n: int | None = None
     """On this job ordinal, report a faulted result tagged as an out-of-memory failure instead of images."""
 
@@ -112,3 +115,9 @@ class FaultProfile(BaseModel):
         if self.post_processing_peak_mb is not None:
             kinds.add(FaultKind.POST_PROCESSING_STALL)
         return kinds
+
+    def delay_factor_for_ordinal(self, ordinal: int) -> float:
+        """Return the configured delay multiplier for one process-local work ordinal."""
+        if self.slow_on_job_n is not None and self.slow_on_job_n != ordinal:
+            return 1.0
+        return self.slow_factor

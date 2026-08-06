@@ -1,7 +1,8 @@
 """Generated chaos against real child processes: the same seeded compositions, at full-worker altitude.
 
 ``tests/process_management/liveness/test_chaos_generated.py`` drives generated scenarios through the
-scheduling loop on a fake clock. This module drives the same seeds through the whole worker: the real
+scheduling loop on a fake clock. This module drives a bounded production-topology projection of the same
+seeds through the whole worker: the real
 process manager, real OS child processes running the protocol-faithful fakes, the real message pump,
 recovery supervisor, safety and submit paths, and real wall-clock time. Where that module can express a
 lane death and an outside reclaim, this one can express what a misbehaving child does: crashing mid-job,
@@ -11,6 +12,10 @@ The property is the same one, read through what a whole run reports:
 
     Every job the scenario queues is completed, no job is given up on by scheduling recovery, no lifecycle
     invariant is violated, and no job's queue wait exceeds a bound derived from the scenario's own shape.
+
+Every child disturbance also needs a receipt: replacement for a lane death, retry for a resource fault,
+dispatcher rejection for a stale message, or an elevated sampling duration for a slow child. Generated
+child faults use one lane and one event so the fake's process-local ordinal has one global target.
 
 The give-up is read from the worker's own action ledger rather than inferred from a fault count, because a
 give-up faults accepted work for reissue and that is exactly the outcome the campaign counts as the
@@ -49,7 +54,7 @@ from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     ChaosArrival,
     ChaosEventKind,
     ChaosScenario,
-    generate_scenarios,
+    generate_full_worker_scenarios,
     parse_seed_spec,
 )
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
@@ -90,7 +95,7 @@ def _seeds() -> tuple[int, ...]:
     return parse_seed_spec(override) if override else SWEEP_FULL_WORKER_SEEDS
 
 
-_SCENARIOS = generate_scenarios(_seeds())
+_SCENARIOS = generate_full_worker_scenarios(_seeds())
 
 
 def _system_resources(scenario: ChaosScenario) -> SystemResources:
@@ -116,12 +121,12 @@ def _jobs(scenario: ChaosScenario) -> list[ImageGenerateJobPopResponse]:
     """Expand the scenario's queue into canned pop responses."""
     return [
         make_canned_job(
-            model.harness_name,
-            width=scenario.width,
-            height=scenario.height,
-            ddim_steps=scenario.steps,
+            job.model.harness_name,
+            width=job.width,
+            height=job.height,
+            ddim_steps=job.steps,
         )
-        for model in scenario.models
+        for job in scenario.jobs
     ]
 
 
@@ -147,12 +152,17 @@ def _fault_profile(scenario: ChaosScenario) -> FaultProfile | None:
     events = scenario.child_events()
     if not events:
         return None
+    if scenario.lanes != 1 or len(events) != 1:
+        raise ValueError(
+            "child fault ordinals are process-local, so generated subprocess faults require one lane and one event",
+        )
     fields: dict[str, object] = {}
     for event in events:
         if event.kind is ChaosEventKind.LANE_DEATH:
             fields["crash_on_job_n"] = event.at_job_ordinal
         elif event.kind is ChaosEventKind.SLOW_CHILD:
             fields["slow_factor"] = _SLOW_CHILD_FACTOR
+            fields["slow_on_job_n"] = event.at_job_ordinal
         elif event.kind is ChaosEventKind.RESOURCE_FAULT:
             fields["oom_on_job_n"] = event.at_job_ordinal
         elif event.kind is ChaosEventKind.MISROUTED_MESSAGE:
@@ -210,6 +220,53 @@ def _give_up_events(manager: HordeWorkerProcessManager) -> list[str]:
     ]
 
 
+def _assert_child_event_was_observed(
+    manager: HordeWorkerProcessManager,
+    result: HarnessResult,
+    scenario: ChaosScenario,
+) -> None:
+    """Require observable evidence for the scenario's single child-side disturbance."""
+    events = scenario.child_events()
+    if not events:
+        return
+    event = events[0]
+    ledger_types = {entry.event_type for entry in manager._action_ledger.recent(limit=100_000)}
+    if event.kind is ChaosEventKind.LANE_DEATH:
+        assert LedgerEventType.PROCESS_REPLACED in ledger_types, _message(
+            scenario,
+            result,
+            "the requested lane death produced no process-replacement receipt",
+        )
+        return
+    if event.kind is ChaosEventKind.RESOURCE_FAULT:
+        assert LedgerEventType.INFERENCE_RETRIED in ledger_types, _message(
+            scenario,
+            result,
+            "the requested resource fault produced no inference-retry receipt",
+        )
+        return
+    if event.kind is ChaosEventKind.MISROUTED_MESSAGE:
+        assert manager._message_dispatcher.stale_messages_ignored > 0, _message(
+            scenario,
+            result,
+            "the requested stale message produced no dispatcher rejection receipt",
+        )
+        return
+
+    assert result.metrics is not None
+    sampling_seconds = [
+        record.phase_metrics.sampling.duration_seconds
+        for record in result.metrics.jobs
+        if record.phase_metrics is not None and record.phase_metrics.sampling is not None
+    ]
+    minimum_slow_seconds = _JOB_DELAY_SECONDS * _SLOW_CHILD_FACTOR * 0.75
+    assert sampling_seconds and max(sampling_seconds) >= minimum_slow_seconds, _message(
+        scenario,
+        result,
+        "the requested slow child produced no elevated sampling-duration receipt",
+    )
+
+
 def _message(scenario: ChaosScenario, result: HarnessResult, complaint: str) -> str:
     """Return a failure message carrying the complaint, the seed, the scenario, and the run's own summary."""
     return (
@@ -224,6 +281,27 @@ def _message(scenario: ChaosScenario, result: HarnessResult, complaint: str) -> 
 # Every scenario boots a worker and spawns real OS child processes, and the sweep runs many of them, so the
 # module is opt-in on both counts.
 pytestmark = [pytest.mark.slow, pytest.mark.chaos_sweep]
+
+
+def test_child_fault_scripts_have_a_bijective_scenario_target() -> None:
+    """Every child event maps to one profile field on a topology where its ordinal is unambiguous."""
+    child_scenarios = [scenario for scenario in _SCENARIOS if scenario.child_events()]
+    assert child_scenarios, "the subprocess corpus contains no child-side disturbance"
+    assert all(scenario.lanes == 1 for scenario in child_scenarios)
+    assert all(len(scenario.child_events()) == 1 for scenario in child_scenarios)
+
+    for scenario in child_scenarios:
+        event = scenario.child_events()[0]
+        profile = _fault_profile(scenario)
+        assert profile is not None
+        if event.kind is ChaosEventKind.LANE_DEATH:
+            assert profile.crash_on_job_n == event.at_job_ordinal
+        elif event.kind is ChaosEventKind.SLOW_CHILD:
+            assert profile.slow_on_job_n == event.at_job_ordinal
+        elif event.kind is ChaosEventKind.RESOURCE_FAULT:
+            assert profile.oom_on_job_n == event.at_job_ordinal
+        else:
+            assert profile.corrupt_on_job_n == event.at_job_ordinal
 
 
 @pytest.mark.e2e
@@ -262,6 +340,12 @@ async def test_generated_scenario_completes_against_real_children(
     assert result.audit_failures == [], _message(scenario, result, "a job lifecycle invariant was violated")
 
     assert managers, "the harness built no manager, so the give-up verdict would read nothing"
+    assert managers[0]._card_runtimes[0].target_process_count == scenario.lanes, _message(
+        scenario,
+        result,
+        "the full worker resolved a different lane topology than the scenario declared",
+    )
+    _assert_child_event_was_observed(managers[0], result, scenario)
     give_ups = _give_up_events(managers[0])
     assert give_ups == [], _message(scenario, result, f"the worker gave up on accepted work: {give_ups}")
 
