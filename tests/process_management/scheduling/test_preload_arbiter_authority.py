@@ -161,6 +161,45 @@ class TestActuationExecution:
         scheduler.release_allocator_cache.assert_called_once_with(idle_pid)
         assert all(call.args != (busy_pid,) for call in scheduler.release_allocator_cache.call_args_list)
 
+    def test_execution_receipt_contains_only_commands_that_changed_state(self) -> None:
+        """Requested and applied commands remain distinguishable when an actuator declines one rung."""
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(),
+            job_tracker=JobTracker(),
+            bridge_data=make_mock_bridge_data(enable_vram_budget=True),
+        )
+        scheduler.release_cache = Mock(return_value=False)  # type: ignore[method-assign]
+        scheduler.evict_idle_model = Mock(return_value=True)  # type: ignore[method-assign]
+        requested = (
+            ActuatorCommand(kind=ActuatorCommandKind.RELEASE_CACHE, device_index=0, target_process_id=7),
+            ActuatorCommand(kind=ActuatorCommandKind.EVICT_IDLE_MODEL, device_index=0),
+        )
+
+        applied = scheduler._execute_preload_actuations(requested, device_index=0, for_head_of_queue=True)
+
+        assert applied == (requested[1],)
+        scheduler.release_cache.assert_called_once_with(7)
+        scheduler.evict_idle_model.assert_called_once_with(0, for_head_of_queue=True)
+
+    def test_execution_receipt_is_empty_when_no_actuator_accepts_a_command(self) -> None:
+        """A proposed reclaim cannot be reported as performed when every actuator returns False."""
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(),
+            job_tracker=JobTracker(),
+            bridge_data=make_mock_bridge_data(enable_vram_budget=True),
+        )
+        scheduler.release_cache = Mock(return_value=False)  # type: ignore[method-assign]
+        requested = (ActuatorCommand(kind=ActuatorCommandKind.RELEASE_CACHE, device_index=0, target_process_id=7),)
+
+        assert (
+            scheduler._execute_preload_actuations(
+                requested,
+                device_index=0,
+                for_head_of_queue=True,
+            )
+            == ()
+        )
+
     async def test_deferred_preload_runs_the_release_then_readmits_next_cycle(self) -> None:
         """A full-card preload defers and releases the idle lane cache; the relieved re-ask admits."""
         scheduler, job, target = await _budgeted_scheduler_with_head()

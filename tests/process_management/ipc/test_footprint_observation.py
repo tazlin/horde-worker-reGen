@@ -139,7 +139,7 @@ async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
     """A monolithic inference slot's peak, with a running job and known baseline, lands under its key."""
     process_info = make_mock_process_info(1, model_name=_MODEL)
     job = make_job_pop_response(model=_MODEL, width=512, height=512)
-    process_info.last_job_referenced = job
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
     process_map = ProcessMap({1: process_info})
     job_tracker = JobTracker()
     await mark_job_in_progress_async(job_tracker, job)

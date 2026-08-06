@@ -1336,6 +1336,54 @@ class TestCeilingMeasuredAttempt:
         assert verdict.measured_attempt is True
         assert arbiter.measured_attempts == 0
 
+    def test_accepted_ram_staged_job_may_attempt_when_its_weights_fit_the_ceiling(self) -> None:
+        """Activation-inclusive prediction cannot permanently refuse accepted work whose checkpoint fits."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+
+        verdict = arbiter.evaluate(
+            self._head(
+                candidate_delta_mb=self._CEILING_MB + _CEILING_ATTEMPT_OVERSHOOT_CAP_MB + 1000.0,
+                candidate_weights_mb=self._CEILING_MB - 1000.0,
+                accepted_work=True,
+            )
+        )
+
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+
+    def test_tracker_owned_spent_receipt_survives_arbiter_replacement(self) -> None:
+        """A fresh arbiter still refuses a job/card pair whose tracker receipt says the attempt was spent."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+
+        verdict = arbiter.evaluate(self._head(measured_attempt_already_spent=True))
+
+        assert verdict.disposition == VramDisposition.DENY
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
+    def test_active_continuation_precedes_the_spent_receipt(self) -> None:
+        """A preload already underway can reach dispatch even though starting it recorded the spent receipt."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+
+        verdict = arbiter.evaluate(self._head(measured_attempt_in_progress=True, measured_attempt_already_spent=True))
+
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+
+    def test_distinct_cards_each_have_one_attempt(self) -> None:
+        """One card's spent attempt does not suppress the same accepted head's opportunity on another card."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._card(), 1: self._card()}))
+        first = arbiter.evaluate(self._head(device_index=0))
+        second = arbiter.evaluate(self._head(device_index=1))
+
+        assert first.measured_attempt is True
+        assert second.measured_attempt is True
+        assert arbiter.measured_attempts == 2
+
     def test_card_with_reclaim_left_defers_toward_convergence_instead_of_attempting(self) -> None:
         """The attempt runs only against the most room the card will ever offer, never over live work.
 

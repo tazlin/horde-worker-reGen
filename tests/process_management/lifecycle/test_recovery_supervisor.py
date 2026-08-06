@@ -49,6 +49,29 @@ def test_grace_precedes_first_soft_reset() -> None:
     """A wedge shorter than the grace window does not trigger a reset (rides out brief blips)."""
     supervisor, clock = _make()
     assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.NONE
+
+
+def test_unrelated_progress_defers_one_rung_without_spending_it() -> None:
+    """A caller-bounded observation delay preserves the reset budget and its ordinary timing."""
+    supervisor, clock = _make()
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.NONE
+
+    clock.advance(2)
+    assert (
+        supervisor.evaluate(
+            is_wedged=True,
+            pool_ready=True,
+            unrelated_progress_deferral_available=True,
+        )
+        is RecoveryAction.OBSERVE
+    )
+    assert supervisor.limp_by_level == 0
+
+    clock.advance(1)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.NONE
+    clock.advance(1)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
+    assert supervisor.limp_by_level == 1
     clock.advance(1)
     assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.NONE
 
@@ -73,7 +96,7 @@ def test_escalates_soft_reset_then_give_up() -> None:
 
 
 def test_give_up_held_off_while_pool_not_ready() -> None:
-    """The incident: after a soft reset, give-up must not fire while the rebuilt pool is still booting.
+    """After a soft reset, give-up must not fire while the rebuilt pool is still booting.
 
     A structural wedge triggers a soft reset; the replacement children then spend the boot window not-ready
     (no lane accepting). Through that window the give-up clock must not advance. When the children finish

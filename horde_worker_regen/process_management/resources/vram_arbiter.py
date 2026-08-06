@@ -284,6 +284,15 @@ class VramRequest:
     device_index: int | None
     target_process_id: int | None = None
     candidate_delta_mb: float | None = None
+    candidate_weights_mb: float | None = None
+    accepted_work: bool = False
+    """Whether the worker already accepted this job from the service and tracks it locally.
+
+    Accepted work whose checkpoint weights fit an emptied card may receive the same bounded measured-load
+    attempt as a small prediction miss even when its activation-inclusive prediction is farther above the
+    static ceiling. Untracked planning probes and malformed synthetic requests leave this false and retain the
+    conservative overshoot allowance.
+    """
     candidate_already_resident: bool = False
     """True when the candidate's weights are already materialised in VRAM on the target process, so admitting
     this request adds no new device footprint. A dispatch or preload onto an already-resident idle model moves
@@ -304,16 +313,23 @@ class VramRequest:
     load count at most once, while every other unit's reservation stays fully charged."""
     is_head_of_queue: bool = False
     head_job_id: str | None = None
-    """The head job's stable unique id, keying the measured-attempt one-shot so at most one real load is
-    attempted per head-starvation episode. None falls back to :attr:`job_label` (the model), which is unique
-    enough within a single evaluation but not across two jobs of the same model, so the scheduler passes the
-    job id proper. Only consulted for the measured-attempt escape hatch."""
+    """The head job's stable unique id, paired with the device index to key the measured-attempt one-shot.
+
+    None falls back to :attr:`job_label` (the model), which is unique enough within a single evaluation but not
+    across two jobs of the same model, so the scheduler passes the job id proper. Only consulted for the
+    measured-attempt escape hatch.
+    """
     measured_attempt_in_progress: bool = False
     """True when the scheduler has already begun a measured load attempt for this head (it tagged the job on a
     prior admit). The arbiter then keeps admitting the request so the preload -> dispatch progression completes
     without a fresh one-shot: the attempt is underway and re-gating it mid-load would strand a job the card is
     already loading. Distinct from the first emission, which the one-shot set gates. Left False for every
     ordinary request."""
+    measured_attempt_already_spent: bool = False
+    """True when this accepted job has already used its measured attempt on this device in an earlier
+    execution attempt. Unlike the arbiter's in-memory emission set, this fact is owned by the job tracker and
+    therefore survives arbiter replacement. An active continuation takes precedence; otherwise a spent
+    job/device pair falls through to the ordinary denial or deferral path."""
     head_outstanding_mb: float | None = None
     """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
     when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
@@ -580,7 +596,7 @@ class VramArbiter:
         # Head jobs (by id) whose measured-load escape hatch has already fired this session, so the one-shot is
         # never re-emitted within an episode: a marked job either runs (leaves the head) or faults terminally
         # (leaves the head), so an id is added once per genuine episode and never re-queried after the job clears.
-        self._measured_attempts_started: set[str] = set()
+        self._measured_attempts_started: set[tuple[str, int | None]] = set()
         self.admission_foreign_pressure_defers = 0
         self.first_party_context_defers = 0
         self.starvation_diagnostics = 0
@@ -837,10 +853,10 @@ class VramArbiter:
         load so measured reality decides; every downstream safety (per-step floors, watchdogs, OOM
         classification, whole-card residency) applies unchanged because it rides the ordinary FITS path.
 
-        The one-shot is per job: the first eligible evaluation emits the attempt (and logs the arithmetic once),
-        subsequent evaluations of the same job take the verdict they would have taken without the hatch (a defer
-        for the within-available trigger, the terminal DENY for the ceiling trigger). Nothing here retries, so a
-        load that OOMs arms the ceiling hold on that measured evidence and the job never bangs the card again.
+        The one-shot is per job and card: the first eligible evaluation emits the attempt (and logs the
+        arithmetic once), while subsequent evaluations on that card take the verdict they would have taken
+        without the hatch (a defer for the within-available trigger, the terminal DENY for the ceiling trigger).
+        Nothing here retries; the tracker bounds retries and a load that OOMs arms a card-scoped ceiling hold.
         Once the scheduler has tagged the job (``measured_attempt_in_progress``), the arbiter keeps admitting it
         so the preload -> dispatch progression completes without a second one-shot. Returns None for every
         request the escape hatch does not cover, so the caller's ordinary teardown/ladder/defer path runs.
@@ -851,12 +867,14 @@ class VramArbiter:
             return None
         if request.measured_attempt_in_progress:
             return self._measured_attempt_verdict(request, measured, first_emission=False)
+        if request.measured_attempt_already_spent:
+            return None
         if impossible:
             if not self._ceiling_attempt_eligible(request, measured, state):
                 return None
         elif not self._measured_attempt_eligible(request, measured):
             return None
-        key = request.head_job_id or request.job_label
+        key = (request.head_job_id or request.job_label, request.device_index)
         if key in self._measured_attempts_started:
             return None
         self._measured_attempts_started.add(key)
@@ -918,8 +936,7 @@ class VramArbiter:
         ceiling_mb = state.achievable_ceiling_mb()
         if ceiling_mb is None:
             return False
-        overshoot_mb = measured.candidate_outstanding_mb - ceiling_mb
-        if overshoot_mb <= 0.0 or overshoot_mb > self._ceiling_attempt_allowance_mb(ceiling_mb):
+        if not self._ceiling_attempt_candidate_eligible(request, measured, ceiling_mb):
             return False
         if not self._card_converged_empty(request, measured):
             return False
@@ -952,12 +969,36 @@ class VramArbiter:
         ceiling_mb = state.achievable_ceiling_mb()
         if ceiling_mb is None:
             return False
-        overshoot_mb = measured.candidate_outstanding_mb - ceiling_mb
-        if overshoot_mb <= 0.0 or overshoot_mb > self._ceiling_attempt_allowance_mb(ceiling_mb):
+        if not self._ceiling_attempt_candidate_eligible(request, measured, ceiling_mb):
             return False
         if self._card_converged_empty(request, measured):
             return False
         return not self.any_other_device_can_seat(request, exclude_device_index=request.device_index)
+
+    def _ceiling_attempt_candidate_eligible(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+        ceiling_mb: float,
+    ) -> bool:
+        """Whether an over-ceiling candidate is bounded enough to earn convergence and one real attempt.
+
+        Planning probes and work not yet owned by the worker retain the prediction-error allowance. Once the
+        worker has accepted a job, a checkpoint whose resident weights fit the emptied-card ceiling also earns
+        one attempt: activation-inclusive predictions are intentionally conservative and cannot become an
+        immutable downstream refusal for work intake already promised. The remaining measured-attempt guards
+        still require a true head, a converged empty card, no better card, and a job/card one-shot.
+        """
+        overshoot_mb = measured.candidate_outstanding_mb - ceiling_mb
+        if overshoot_mb <= 0.0:
+            return False
+        if overshoot_mb <= self._ceiling_attempt_allowance_mb(ceiling_mb):
+            return True
+        return (
+            request.accepted_work
+            and request.candidate_weights_mb is not None
+            and 0.0 < request.candidate_weights_mb <= ceiling_mb
+        )
 
     def _measured_attempt_eligible(
         self,

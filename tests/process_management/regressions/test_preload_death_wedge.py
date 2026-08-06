@@ -141,8 +141,8 @@ async def test_unexpected_process_ended_during_preload_is_recovered() -> None:
     assert plm._job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
 
-async def test_hard_crash_during_preload_requeues_referenced_job() -> None:
-    """A hard crash (no PROCESS_ENDING message) retains last_job_referenced; the job is requeued."""
+async def test_hard_crash_during_preload_preserves_unstarted_job() -> None:
+    """A hard crash during model preparation leaves the pending job and its retry budget untouched."""
     model_map = HordeModelMap(
         root={
             "stable_diffusion": ModelInfo(
@@ -170,9 +170,12 @@ async def test_hard_crash_during_preload_requeues_referenced_job() -> None:
     assert recovered is True
     assert plm._num_process_recoveries == 1
     assert "stable_diffusion" not in model_map.root
-    # The crash faults the slot's referenced job (retryable, but the default single-attempt policy makes
-    # it terminal). Either way it leaves pending-start/in-progress and the queue drains; it is not pinned.
-    assert plm._job_tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
+    # Preload intent is not execution ownership. The replacement clears the dead model association, while the
+    # job remains eligible for its first real attempt and no retry is spent on preparation that never dispatched.
+    assert plm._job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    tracked = plm._job_tracker.get_tracked_job(job.id_)
+    assert tracked is not None
+    assert tracked.inference_attempts == 0
 
 
 async def test_intended_end_is_not_reaped_or_recovered() -> None:

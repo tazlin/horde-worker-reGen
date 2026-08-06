@@ -941,7 +941,7 @@ class TestStaleDriftSkipLogThrottle:
         assert self._skip_levels(records) == ["DEBUG", "TRACE", "TRACE"]
 
 
-class TestInjectedInventorySuppressesDeviceUsedReads:
+class TestInjectedInventorySuppressesHostDeviceReads:
     """A run whose device inventory was injected must not anchor on this host's cards.
 
     The device-used reading reaches admission through the baseline estimate, which is subtracted from a
@@ -967,3 +967,15 @@ class TestInjectedInventorySuppressesDeviceUsedReads:
         pm._evaluate_vram_attribution_drift()
 
         assert pm.latest_baseline_estimate_mb(0) is None
+
+    def test_injected_inventory_uses_child_report_for_device_free(self) -> None:
+        """Admission reads the simulated child's card, not an unrelated host NVML device."""
+        pm = make_testable_process_manager()
+        process = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+        process.device_index = 0
+        process.total_vram_mb = 16384
+        process.vram_usage_mb = 1400
+        pm._process_map.clear()
+        pm._process_map[0] = process  # type: ignore[index]
+
+        assert pm._read_device_free_total_mb(0) == (14984.0, 16384.0)

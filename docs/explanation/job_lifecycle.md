@@ -116,8 +116,10 @@ gauntlet of gates before any network call, so the worker never pulls work it can
 1. Not shutting down; not in consecutive-failure backoff (`_handle_consecutive_failures`, 3 failures →
    pause `CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS`).
 2. Queue not full (`_is_queue_full`: `queue_size + 1 + (max_threads - 1)`).
-3. Hold-back gate: while jobs are pending inference but none has completed yet this session, skip. This
-   is a warm-up guard, letting the very first job finish before pulling more.
+3. Hold-back gate: while jobs are pending inference but none has completed its generation stage yet this
+   session, skip. This is a warm-up guard, letting the first output finish before pulling more. A
+   `return_control_map` output produced by the annotation lane counts as generation-stage completion even
+   though it intentionally bypasses inference.
 4. A safety process and an inference process are available.
 5. Megapixelstep backpressure (`PopThrottler.should_wait_for_megapixelsteps`) and pop-rate throttle
    (`is_pop_too_soon`).
@@ -155,7 +157,9 @@ depend on this queue-gated cycle running; see
    available inference process, send `PRELOAD_MODEL`, and mark the model `LOADING` in `HordeModelMap`. On a
    multi-GPU host the target card is chosen by model stickiness, per-card inference load, and measured free
    VRAM. The preload is subject to the [VRAM and RAM budget](performance_and_backpressure.md#the-vram-and-ram-budget);
-   concurrent-preload limits differ under `very_fast_disk_mode`.
+   concurrent-preload limits differ under `very_fast_disk_mode`. The process records this association as
+   preload intent, not execution ownership: a replacement during preparation cannot spend an inference retry
+   for work that was never dispatched.
 2. **Look-ahead**: `get_next_job_and_process(information_only=True)` peeks at the next runnable job to
    decide heavy-model/batch blocking. This method is called _twice_ per cycle (peek, then launch) and
    must agree with itself; line-skip decisions (an already-resident job jumping ahead of a head whose
@@ -185,7 +189,9 @@ depend on this queue-gated cycle running; see
    success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. By the
    [dual-presence rule](job_state_machine.md#the-stage-dual-presence-rule) it stays visible in the
    `jobs_pending_inference` view until the result arrives. On send failure the job faults straight to
-   `PENDING_SUBMIT` (`handle_job_fault`).
+   `PENDING_SUBMIT` (`handle_job_fault`). A successful send records typed execution ownership containing the
+   job, process-launch identifier, and attempt ordinal. Crash recovery, lost-result reaping, clearance, and
+   overlap decisions consult that record rather than the display-oriented last-job compatibility view.
 6. **`unload_models()` / `unload_models_from_vram()`**: evict idle models not needed by the upcoming
    queue (LRU-informed; see [model eviction](performance_and_backpressure.md#model-eviction-lru)).
 

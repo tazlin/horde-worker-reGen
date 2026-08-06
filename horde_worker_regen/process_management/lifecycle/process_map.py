@@ -324,7 +324,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_process_state_started_at = time.time()
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
-        self[process_id].last_job_referenced = None
+        self[process_id].clear_job_references()
         self[process_id].batch_amount = 1
 
         # Drop this slot's last VRAM/RAM sample. A dead process reports nothing further, so its final
@@ -553,7 +553,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             ):
                 logger.trace(f"Resetting heartbeat for process {process_id}")
                 self.reset_heartbeat_state(process_id)
-            self[process_id].last_job_referenced = last_job_referenced
+            self[process_id].record_preload_intent(last_job_referenced)
 
     def reconcile_reported_os_pid(self, process_id: int, reported_os_pid: int | None) -> None:
         """Adopt a child's self-reported ``os.getpid()`` as the authoritative OS pid for per-PID telemetry.
@@ -596,7 +596,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
-        self[process_id].last_job_referenced = None
+        self[process_id].clear_job_references()
         self[process_id].recently_unloaded_from_ram = True
         self[process_id].last_received_timestamp = time.time()
         # The model left VRAM, so it no longer has a materialization time; the next materialization restamps.

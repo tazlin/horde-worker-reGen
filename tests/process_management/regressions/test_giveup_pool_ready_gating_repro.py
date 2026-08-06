@@ -33,6 +33,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
     make_testable_process_manager,
+    mark_job_in_progress_async,
     track_popped_job_async,
 )
 
@@ -410,8 +411,9 @@ class TestZeroProgressSoftResetDoesNotReLogAsFirst:
                 break
         assert pm._recovery_coordinator.recovery_supervisor.limp_by_level == 1
 
-        # The rebuilt pool serves work: a completion past the post-reset baseline is real forward progress.
-        pm._job_tracker._total_num_completed_jobs += 1
+        # The rebuilt pool serves the blocked frontier: its own stage advances past the post-reset baseline.
+        head = pm._job_tracker.jobs_pending_inference[0]
+        await mark_job_in_progress_async(pm._job_tracker, head)
 
         for _ in range(6):
             clock.advance(1)

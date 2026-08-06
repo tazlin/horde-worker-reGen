@@ -339,13 +339,21 @@ class TrackedJob:
 
     A resource (OOM) fault of such a job is not the ordinary transient over-commit that earns a degraded retry:
     it is the real attempt failing, the strongest possible evidence the demand does not fit this card now. The
-    fault path routes it to a terminal scheduling-recovery fault (excluded from the consecutive-failure pop
-    pause, so it does not manufacture a maintenance pause) and arms the model's conditional ceiling hold with the
-    attempted demand, so the model is not offered into the same wall until the ceiling recedes. A success clears
+    fault path arms the model's conditional ceiling hold with the attempted demand, so the model is not offered
+    into the same wall until the ceiling recedes. Subject to the ordinary attempt cap, the job may retry on a
+    different eligible card, but cannot spend the exceptional attempt twice on one card. A success clears
     naturally when the job leaves the tracker and the learned-peak machinery records the true figure."""
     measured_attempt_candidate_mb: float = 0.0
     """The candidate demand (MB) the measured-load attempt was admitted under, recorded so a failing attempt
     arms the ceiling hold against the demand the real load actually failed at rather than a re-derived estimate."""
+    measured_attempt_device_index: int | None = None
+    """The card owning the active measured attempt; None is also the single-card scope.
+
+    ``measured_attempt`` distinguishes an active single-card attempt from no active attempt. The device value
+    prevents a retry routed to another card from inheriting the prior card's continuation admit.
+    """
+    measured_attempted_device_indices: set[int | None] = field(default_factory=set)
+    """Cards on which this job has already spent its one exceptional measured attempt."""
     premade_control_map_bytes: bytes | None = None
     """The ControlNet control map (PNG bytes) the image-utilities lane annotated ahead of dispatch, or None.
 
@@ -1167,7 +1175,13 @@ class JobTracker:
         tracked.annotation_process_id = None
         tracked.job_info.job_image_results = [HordeImageResult(image_bytes=control_map_bytes)]
         tracked.job_info.state = GENERATION_STATE.ok
-        return self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+        routed = self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+        if routed:
+            # The annotation result is this job's generation-stage output. Keep terminal-progress accounting
+            # equivalent to the inference-result route it intentionally bypasses; otherwise mixed queues can
+            # drain every tracked job while completion-based liveness and harness consumers wait forever.
+            self._total_num_completed_jobs += 1
+        return routed
 
     @property
     def jobs_pending_strip(self) -> tuple[TrackedJob, ...]:
@@ -2157,12 +2171,14 @@ class JobTracker:
 
         Idempotent within an episode: re-tagging an already-tagged job (the preload -> dispatch continuation)
         only refreshes the recorded candidate. See :attr:`TrackedJob.measured_attempt` for how a subsequent
-        resource fault is then routed to a terminal ceiling-hold fault rather than a degraded retry.
+        resource fault arms a card-scoped ceiling hold and bypasses the same-card degraded retry.
         """
         tracked = self._tracked_for(job)
         if tracked is not None:
             tracked.measured_attempt = True
             tracked.measured_attempt_candidate_mb = candidate_mb
+            tracked.measured_attempt_device_index = device_index
+            tracked.measured_attempted_device_indices.add(device_index)
             if device_index is not None:
                 tracked.last_dispatched_device_index = device_index
 
@@ -2170,6 +2186,26 @@ class JobTracker:
         """Whether this job was admitted through the arbiter's measured-load escape hatch (a peek)."""
         tracked = self._tracked_for(job)
         return tracked is not None and tracked.measured_attempt
+
+    def is_measured_attempt_on_device(
+        self,
+        job: ImageGenerateJobPopResponse,
+        device_index: int | None,
+    ) -> bool:
+        """Whether ``job`` has an active measured attempt on ``device_index``."""
+        tracked = self._tracked_for(job)
+        return (
+            tracked is not None and tracked.measured_attempt and tracked.measured_attempt_device_index == device_index
+        )
+
+    def has_spent_measured_attempt_on_device(
+        self,
+        job: ImageGenerateJobPopResponse,
+        device_index: int | None,
+    ) -> bool:
+        """Whether ``job`` has ever started a measured attempt on ``device_index``."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and device_index in tracked.measured_attempted_device_indices
 
     def mark_admitted_exclusive(
         self,
@@ -2347,16 +2383,34 @@ class JobTracker:
         # over-committed slot that would only kill a second process.
         resource_failure = is_resource_failure or tracked.admitted_over_budget
 
-        # A job admitted through the arbiter's measured-load escape hatch that then faults on resources is the
-        # real load failing: the strongest evidence the demand does not fit this converged-empty card now. It is
-        # not the transient over-commit a degraded retry clears (there is nothing left to reclaim for it), so it
-        # is faulted terminally as a scheduling-recovery action (excluded from the consecutive-failure pop pause,
-        # like the unroutable-head fault) and its model is placed on the conditional ceiling hold below. Banging
-        # the same card again would only burn another dispatch on a wall measured reality just proved.
+        # A measured attempt belongs to one job/card pair. Any failed execution ends its continuation admit;
+        # the arbiter's per-card one-shot prevents a replacement from repeating it on the same card. A resource
+        # failure additionally proves that card cannot seat the demand under its current ceiling, so arm the
+        # card-scoped hold immediately. The ordinary retry cap may still route the job to a different eligible
+        # card; it never earns the same-card degraded retry because the attempt already ran converged and alone.
+        measured_attempt_failed = tracked.measured_attempt
         measured_attempt_oom = resource_failure and tracked.measured_attempt
+        measured_attempt_device_index = tracked.measured_attempt_device_index
+        measured_attempt_candidate_mb = tracked.measured_attempt_candidate_mb
+        if measured_attempt_failed:
+            tracked.measured_attempt = False
+            tracked.measured_attempt_device_index = None
         if measured_attempt_oom:
-            retryable = False
             fault_origin = JobFaultOrigin.SCHEDULING_RECOVERY
+            self.measured_attempt_faults += 1
+            newly_armed = self.hold_model_by_ceiling(
+                faulted_job.model,
+                device_index=measured_attempt_device_index,
+                candidate_mb=measured_attempt_candidate_mb,
+            )
+            if newly_armed:
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>VRAM: a real measured load of {} "
+                    f"({measured_attempt_candidate_mb:.0f} MB) failed with a resource fault on an empty card; "
+                    "holding the model on that card while its ceiling is unchanged. A bounded retry may use a "
+                    "different eligible card; the same card cannot repeat the exceptional attempt.</>",
+                    faulted_job.model,
+                )
 
         # A job with no pop timestamp was never formally queued (registered late, e.g. mid-flight), so it
         # has no pending-inference position to return to; such a job is always faulted terminally.
@@ -2381,7 +2435,7 @@ class JobTracker:
                 # the same staged path would fault it again. Latch it monolithic so the eligibility predicate
                 # keeps the retry off the pipeline and the whole-job graph (which accommodates the job) runs.
                 tracked.disaggregation_declined = True
-            degraded = resource_failure and not tracked.degraded_retry_used
+            degraded = resource_failure and not measured_attempt_oom and not tracked.degraded_retry_used
             if degraded:
                 tracked.degraded_retry_used = True
                 tracked.needs_degraded_dispatch = True
@@ -2410,27 +2464,6 @@ class JobTracker:
             # on a single-GPU host keeps it worker-wide. The live process's index is not used for the key so
             # the fault and the success that clears it always agree on the card.
             self._record_resource_fault(faulted_job.model, device_index=tracked.last_dispatched_device_index)
-
-        if measured_attempt_oom:
-            # The measured load the arbiter admitted failed on resources: arm the model's conditional ceiling
-            # hold against the demand the real load actually failed at, so pop advertising and dispatch stop
-            # offering it into the same wall until the ceiling recedes (the foreign floor drops). Edge-triggered
-            # on the fresh arm so the real-attempt warning fires once per arm, not on every re-evaluation.
-            self.measured_attempt_faults += 1
-            newly_armed = self.hold_model_by_ceiling(
-                faulted_job.model,
-                device_index=tracked.last_dispatched_device_index,
-                candidate_mb=tracked.measured_attempt_candidate_mb,
-            )
-            if newly_armed:
-                logger.opt(colors=True).warning(
-                    "<fg #f0beff>VRAM: a real measured load of {} "
-                    f"({tracked.measured_attempt_candidate_mb:.0f} MB) failed with a resource fault on an empty "
-                    "card; holding the model (not offering it) while other processes hold that VRAM, and "
-                    "faulting this job for reissue. The hold frees automatically once that VRAM is released "
-                    "(close other GPU apps), or you can remove the model from this worker's config.</>",
-                    faulted_job.model,
-                )
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
             # A crash/timeout-faulted job never produces an inference RESULT message, so the

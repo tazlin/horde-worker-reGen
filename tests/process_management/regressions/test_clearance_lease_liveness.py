@@ -191,7 +191,12 @@ class TestClearanceAdmission:
     def test_admits_and_upgrades_when_device_has_ample_room(self) -> None:
         """An ample card admits the staged child's clearance and upgrades its reservation to the full peak."""
         scheduler = _make_inference_scheduler(
-            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+            bridge_data=make_mock_bridge_data(
+                gpu_sampling_lease_enabled=True,
+                enable_vram_budget=True,
+                vram_reserve_mb=2048,
+                ram_reserve_mb=4096,
+            ),
             device_free_mb=24000.0,
         )
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_PRIMED)

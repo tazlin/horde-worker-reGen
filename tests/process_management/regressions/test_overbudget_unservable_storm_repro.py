@@ -306,7 +306,7 @@ class TestOverBudgetStepGrace:
         job = make_job_pop_response(model=_UNSERVABLE_MODEL)
         await job_tracker.record_popped_job(job)
         proc = make_mock_process_info(1, model_name=_UNSERVABLE_MODEL)
-        proc.last_job_referenced = job
+        proc.record_inference_ownership(job, attempt_ordinal=1)
 
         stub = Mock()
         stub._job_tracker = job_tracker

@@ -122,6 +122,12 @@ class RecoveryAction(enum.Enum):
     back) rather than rebuilding identically or faulting work, so it is attempted before any pool rebuild and
     before any give-up. The caller owns which remedy this maps to and owns bounding how many it will perform;
     the policy only sequences it."""
+    OBSERVE = enum.auto()
+    """Wait one bounded action interval without consuming an escalation rung.
+
+    This is available only when unrelated work demonstrably moved while the recovery frontier did not. It
+    permits one observation window for that throughput to reach the frontier, but is not recovery credit and
+    cannot repeat within the caller's recovery episode."""
     SOFT_RESET = enum.auto()
     """Rebuild the process pools in-place; the configured concurrency is preserved across the rebuild."""
     GIVE_UP = enum.auto()
@@ -299,6 +305,7 @@ class RecoverySupervisor:
         head_recovery_in_flight: bool = False,
         boot_in_progress: bool = False,
         constructive_remedy_available: bool = False,
+        unrelated_progress_deferral_available: bool = False,
     ) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 
@@ -334,6 +341,9 @@ class RecoverySupervisor:
                 The caller owns the budget that makes this go False, and it must (a frozen candidate list and a
                 counted allotment), or the pool rebuild and the give-up backstop below become unreachable.
                 Defaults to False so an unwired caller escalates rather than stalling.
+            unrelated_progress_deferral_available: Whether work outside the unchanged recovery frontier moved
+                and the caller still permits its single observation delay. This never closes the episode or
+                spends a recovery rung. The caller must bound it; False preserves the ordinary escalation.
         """
         now = self._clock()
         self._give_up_is_terminal = False
@@ -446,6 +456,9 @@ class RecoverySupervisor:
             and self._ready_wedged_since is not None
             and (now - self._ready_wedged_since) >= self._pool_ready_grace_seconds
         ):
+            if unrelated_progress_deferral_available:
+                self._ready_wedged_since = now
+                return RecoveryAction.OBSERVE
             self._gave_up_latched = True
             self._gave_up_at = now
             self._give_up_is_terminal = self._give_up_cycles >= 1
@@ -459,6 +472,9 @@ class RecoverySupervisor:
             and (now - self._last_action_time) >= self._reset_interval_seconds
             and self._soft_resets_done < self._max_soft_resets
         ):
+            if unrelated_progress_deferral_available:
+                self._last_action_time = now
+                return RecoveryAction.OBSERVE
             self._soft_resets_done += 1
             self._episode_spent_a_soft_reset = True
             self._last_action_time = now

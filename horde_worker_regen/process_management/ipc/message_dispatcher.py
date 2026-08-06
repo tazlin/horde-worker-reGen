@@ -519,6 +519,7 @@ class MessageDispatcher:
 
         retired_launch_action = self._classify_retired_launch_message(message)
         if retired_launch_action is _RetiredLaunchMessageAction.IGNORE:
+            self._record_stale_discard()
             return
         if retired_launch_action is _RetiredLaunchMessageAction.ACCEPT_POST_PROCESS_RESULT:
             if isinstance(message, HordePostProcessResultMessage):
@@ -539,7 +540,7 @@ class MessageDispatcher:
             # always safe (the process is gone); raising here would crash the control loop and take the
             # whole worker down over a stale status update, which is exactly the fragility that stopping
             # processes mid-session must not introduce.
-            self._stale_messages_ignored += 1
+            self._record_stale_discard()
             logger.warning(
                 f"Ignoring message from process {message.process_id} that is no longer in the process map "
                 f"(launch {message.process_launch_identifier}); it was most likely intentionally stopped: "
@@ -555,7 +556,7 @@ class MessageDispatcher:
             # leave many queued messages behind, and logging each as an error floods the errors-only
             # trace with benign noise that makes a routine replacement (e.g. a maintenance-mode pool
             # reload) look like an error storm in the recovery diagnostics.
-            self._stale_messages_ignored += 1
+            self._record_stale_discard()
             logger.warning(
                 f"Ignoring a stale message from process {message.process_id} (launch identifier "
                 f"{message.process_launch_identifier}, expected {known_launch_identifier}); the process "
@@ -651,6 +652,10 @@ class MessageDispatcher:
                 await self._on_strip_result(message)
             else:
                 logger.error(f"Received background-strip result with no handler registered: {message.job_id}")
+
+    def _record_stale_discard(self) -> None:
+        """Record exactly one message discarded because its process launch is no longer current."""
+        self._stale_messages_ignored += 1
 
     def set_channel_corruption_handler(self, handler: Callable[[str], None]) -> None:
         """Register the callback fired once when the shared child-to-parent channel is judged corrupt.
@@ -907,7 +912,7 @@ class MessageDispatcher:
         if message.heartbeat_type == HordeHeartbeatType.INFERENCE_STEP and self._on_inference_step is not None:
             self._on_inference_step(message.process_id)
 
-        in_progress_job_info = self._process_map[message.process_id].last_job_referenced
+        in_progress_job_info = self._process_map[message.process_id].current_inference_job()
 
         if message.process_warning is not None and (
             in_progress_job_info is not None and in_progress_job_info.payload.n_iter < 4
@@ -977,7 +982,7 @@ class MessageDispatcher:
             return
 
         model_name = process_info.loaded_horde_model_name
-        job = process_info.last_job_referenced
+        job = process_info.current_inference_job()
         if model_name is None or job is None:
             return
 
@@ -1054,7 +1059,7 @@ class MessageDispatcher:
         if model_name is None:
             return
 
-        job = process_info.last_job_referenced
+        job = process_info.current_inference_job()
         if job is not None and job in self._job_tracker.jobs_in_progress:
             return
 
@@ -1243,7 +1248,7 @@ class MessageDispatcher:
         remains the backstop for losses where even this transition never arrives (e.g. the slot is
         replaced outright before reporting idle).
 
-        That reasoning only holds for a slot returning to idle *after* running the job. ``last_job_referenced``
+        That reasoning only holds for a slot returning to idle *after* running the job. Execution ownership
         and the in-progress mark are stamped by the scheduler the instant it dispatches a job, before the
         child acknowledges it, so a slot can carry a freshly dispatched job while it is still draining
         state messages from *before* the dispatch: the ``WAITING_FOR_JOB`` it reports after unloading the
@@ -1271,7 +1276,7 @@ class MessageDispatcher:
         # stage results, so this reap does not apply to it.
         if process_info.process_type != HordeProcessType.INFERENCE:
             return
-        job = process_info.last_job_referenced
+        job = process_info.current_inference_job()
         if job is None or job not in self._job_tracker.jobs_in_progress:
             return
 
@@ -1401,9 +1406,11 @@ class MessageDispatcher:
         # jobs_lookup) that left ``current_inference_started_at`` set could otherwise leave the slot looking
         # like the dispatch-in-flight owner of a *different* freshly dispatched job.
         if message.process_id in self._process_map:
-            self._process_map[message.process_id].current_inference_started_at = None
-            self._process_map[message.process_id].current_first_step_at = None
-            self._process_map[message.process_id].current_job_expected_sampling_seconds = None
+            process_info = self._process_map[message.process_id]
+            process_info.current_inference_started_at = None
+            process_info.current_first_step_at = None
+            process_info.current_job_expected_sampling_seconds = None
+            process_info.retire_inference_ownership(message.sdk_api_job_info)
 
         job_info = await self._job_tracker.get_job_info(message.sdk_api_job_info)
         if job_info is None:

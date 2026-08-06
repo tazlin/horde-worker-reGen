@@ -211,6 +211,12 @@ match, the message is discarded with a debug log. This handles the race where a
 killed process's messages are still in the queue when its replacement is already
 running.
 
+Every stale boundary—retired launch, missing process record, or launch mismatch—passes
+through one discard receipt. Each discarded message increments the stale-message count
+exactly once, regardless of which guard recognized it. A result accepted from a live
+post-processing process is not a stale discard merely because that lane is being retired
+after the result.
+
 When the discarded message is an inference *result*, the job it belonged to would
 be left marked in-progress with no completion signal. That case is not silently
 lost: it is recovered by the

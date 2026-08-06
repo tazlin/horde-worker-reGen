@@ -174,7 +174,9 @@ capability flag the worker can withhold. The pop request has no per-request
 textual-inversion capability flag (no textual-inversion analogue to `allow_lora`), so
 the textual-inversion backoff influences fault classification only: it cannot suppress
 textual-inversion traffic at the pop, and the popper's advertising logic gates on the
-LoRA backoff alone.
+LoRA backoff alone. For the same reason, `allow_lora: false` excludes LoRA jobs but
+does not exclude textual-inversion jobs. TI preparation remains available, and a
+terminal TI preparation failure remains visible through the job fault path.
 
 The worker-wide LoRA-advertising suppression (`background_download_active`, which stops
 new LoRA pops while the download subsystem is transferring) is scoped away from this

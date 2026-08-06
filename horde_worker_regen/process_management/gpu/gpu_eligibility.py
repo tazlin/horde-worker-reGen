@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from loguru import logger
 
+from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES, KNOWN_CONTROLNET_WORKFLOWS
+
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -33,7 +35,57 @@ if TYPE_CHECKING:
 # Source-processing values (from horde_sdk.generation_parameters.image.consts.KNOWN_IMAGE_SOURCE_PROCESSING)
 # that imply an img2img-class job; ``inpainting`` is gated separately on allow_inpainting.
 _IMG2IMG_SOURCE_PROCESSING = frozenset({"img2img", "remix"})
-_INPAINTING_SOURCE_PROCESSING = "inpainting"
+_PAINTING_SOURCE_PROCESSING = frozenset({"inpainting", "outpainting"})
+
+
+@dataclass(frozen=True)
+class JobFeatures:
+    """Objective payload facts shared by routing and request-aware simulation."""
+
+    needs_source_image: bool
+    needs_painting: bool
+    needs_controlnet: bool
+    needs_extended_controlnet: bool
+    needs_sdxl_controlnet: bool
+    has_lora: bool
+    has_ti: bool
+    has_post_processing: bool
+
+
+def classify_job_features(
+    *,
+    source_processing: str | None,
+    has_source_image: bool = False,
+    has_source_mask: bool = False,
+    has_lora: bool = False,
+    has_ti: bool = False,
+    control_type: str | None = None,
+    workflow: str | None = None,
+    has_post_processing: bool = False,
+    is_sdxl: bool = False,
+) -> JobFeatures:
+    """Derive feature facts without applying any worker or service capability policy."""
+    source_mode = source_processing or ""
+    known_controlnet_workflow = workflow in KNOWN_CONTROLNET_WORKFLOWS
+    needs_controlnet = control_type is not None or known_controlnet_workflow
+    needs_painting = has_source_mask or source_mode in _PAINTING_SOURCE_PROCESSING
+    needs_source_image = (
+        has_source_image
+        or source_mode in _IMG2IMG_SOURCE_PROCESSING
+        or needs_painting
+        or control_type is not None
+        or workflow is not None
+    )
+    return JobFeatures(
+        needs_source_image=needs_source_image,
+        needs_painting=needs_painting,
+        needs_controlnet=needs_controlnet,
+        needs_extended_controlnet=control_type in EXTENDED_CONTROL_TYPES,
+        needs_sdxl_controlnet=known_controlnet_workflow or (is_sdxl and needs_controlnet),
+        has_lora=has_lora,
+        has_ti=has_ti,
+        has_post_processing=has_post_processing,
+    )
 
 
 @dataclass(frozen=True)
@@ -74,6 +126,9 @@ class JobRequirements:
     needs_inpainting: bool
     needs_nsfw: bool
     pixels: int
+    needs_extended_controlnet: bool = False
+    needs_sdxl_controlnet: bool = False
+    has_ti: bool = False
 
 
 def describe_job_requirements(
@@ -93,24 +148,36 @@ def describe_job_requirements(
     """
     payload = job.payload
 
-    source_processing = str(job.source_processing) if job.source_processing is not None else ""
-    needs_img2img = job.source_image is not None or source_processing in _IMG2IMG_SOURCE_PROCESSING
-    needs_inpainting = source_processing == _INPAINTING_SOURCE_PROCESSING
+    is_sdxl = baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value
+    features = classify_job_features(
+        source_processing=str(job.source_processing) if job.source_processing is not None else None,
+        has_source_image=job.source_image is not None,
+        has_source_mask=job.source_mask is not None,
+        has_lora=bool(payload.loras),
+        has_ti=bool(payload.tis),
+        control_type=str(payload.control_type) if payload.control_type is not None else None,
+        workflow=str(payload.workflow) if payload.workflow is not None else None,
+        has_post_processing=bool(payload.post_processing),
+        is_sdxl=is_sdxl,
+    )
 
     return JobRequirements(
         model=job.model,
         baseline=baseline,
         weight_mb=weight_mb,
-        is_sdxl=baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value,
-        needs_controlnet=bool(payload.control_type),
-        needs_lora=bool(payload.loras),
-        needs_post_processing=bool(payload.post_processing),
-        needs_img2img=needs_img2img,
-        needs_inpainting=needs_inpainting,
+        is_sdxl=is_sdxl,
+        needs_controlnet=features.needs_controlnet,
+        needs_lora=features.has_lora,
+        needs_post_processing=features.has_post_processing,
+        needs_img2img=features.needs_source_image,
+        needs_inpainting=features.needs_painting,
         # A job the requester allows to be served uncensored (use_nsfw_censor False) was only routed to NSFW
         # workers by the server; only a card with nsfw enabled may run it. A censored job any card can serve.
         needs_nsfw=not payload.use_nsfw_censor,
         pixels=int(payload.width) * int(payload.height),
+        needs_extended_controlnet=features.needs_extended_controlnet,
+        needs_sdxl_controlnet=features.needs_sdxl_controlnet,
+        has_ti=features.has_ti,
     )
 
 
@@ -151,7 +218,7 @@ def card_can_serve(card: CardProfile, req: JobRequirements) -> bool:
 
     if req.needs_controlnet and not config.allow_controlnet:
         return False
-    if req.needs_controlnet and req.is_sdxl and not config.allow_sdxl_controlnet:
+    if req.needs_sdxl_controlnet and not config.allow_sdxl_controlnet:
         return False
     if req.needs_lora and not config.allow_lora:
         return False

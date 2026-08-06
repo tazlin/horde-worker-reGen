@@ -888,8 +888,12 @@ otherwise keep staged for fast reload, and logs prominently when it does so.
 
 Cold start (no VRAM telemetry yet) and a missing burden estimate both **admit**,
 so the budget never wedges a worker that has not yet reported memory. Set
-`enable_vram_budget: false` to restore the prior availability-only behavior (not
-recommended on a shared or consumer GPU).
+`enable_vram_budget: false` to restore availability-only behavior (not recommended
+on a shared or consumer GPU). The switch bypasses measured VRAM/RAM admission at
+both preload and dispatch materialisation, including the leased-child clearance
+point. It does not disable model availability, process readiness, post-processing
+co-residency, queue ordering, or other non-budget safety gates; those rules solve
+different problems and remain active.
 
 The system-RAM side of that marginal check carries a **staging credit** so a
 reload onto a warm slot is not priced as a cold one. An inference process that

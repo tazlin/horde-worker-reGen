@@ -367,7 +367,7 @@ def _job_is_feature_heavy(process_info: HordeProcessInfo) -> bool:
     every one of these, so we read them from it rather than re-deriving from the payload. Returns False
     when the job cannot be characterised (no baseline / malformed payload).
     """
-    job = process_info.last_job_referenced
+    job = process_info.current_inference_job()
     if job is None:
         return False
     signature = signature_from_job(job, process_info.loaded_horde_model_baseline)
@@ -3589,7 +3589,7 @@ class ProcessLifecycleManager:
         # INFERENCE_IN_PROGRESS with no owner, wedging the head of the queue indefinitely.
         # The orphaned-job watchdog in the manager is the backstop for any in-progress job that still
         # ends up without an owner; this is the primary, correct path.
-        job_to_remove = process_info.last_job_referenced
+        job_to_remove = process_info.current_inference_job()
         if job_to_remove is not None and job_to_remove not in self._job_tracker.jobs_lookup:
             job_to_remove = None
 
@@ -3935,9 +3935,8 @@ class ProcessLifecycleManager:
                 continue
             process_info.current_job_slowdown_level = level
 
-            job_id = (
-                str(process_info.last_job_referenced.id_) if process_info.last_job_referenced is not None else None
-            )
+            owned_job = process_info.current_inference_job()
+            job_id = str(owned_job.id_) if owned_job is not None else None
             if level >= 2:
                 self._num_slowdown_events += 1
                 # Include the residency snapshot: a slowdown this severe on a small-VRAM card is usually
@@ -4024,7 +4023,8 @@ class ProcessLifecycleManager:
         first_step_at = process_info.current_first_step_at
         ratio = (now - first_step_at) / expected if (first_step_at is not None and expected) else float("nan")
         model = process_info.loaded_horde_model_name
-        job_id = str(process_info.last_job_referenced.id_) if process_info.last_job_referenced is not None else None
+        owned_job = process_info.current_inference_job()
+        job_id = str(owned_job.id_) if owned_job is not None else None
         # PDH per-PID attribution is hint-only now: surface the slot's shared figure if it happens to appear,
         # but never gate on it.
         shared_hint_mb = paging_victims.get(os_pid) if os_pid is not None else None
@@ -4104,7 +4104,7 @@ class ProcessLifecycleManager:
           silences), bounded by ``contended_step_timeout``.
         """
         base = bridge_data.inference_step_timeout
-        job = process_info.last_job_referenced
+        job = process_info.current_inference_job()
         if job is None:
             return base
 
@@ -4261,12 +4261,11 @@ class ProcessLifecycleManager:
                     f"generation as wedged and replacing it (stuck-step watchdog).",
                 )
                 hung_model = process_info.loaded_horde_model_name
-                # Captured before the replacement, which clears the slot's job reference: the quarantine
+                # Captured before the replacement, which clears the slot's execution ownership: the quarantine
                 # counter needs to know which job hung so repeated kills of one job cannot look like a
                 # pattern across jobs.
-                hung_job_id = (
-                    str(process_info.last_job_referenced.id_) if process_info.last_job_referenced is not None else None
-                )
+                owned_job = process_info.current_inference_job()
+                hung_job_id = str(owned_job.id_) if owned_job is not None else None
                 self._action_ledger.record(
                     LedgerEventType.TIMEOUT_DETECTED,
                     process_id=process_info.process_id,

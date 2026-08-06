@@ -658,7 +658,8 @@ class _MaterializationOutcome:
     verdict: VramVerdict
     candidate_delta_mb: float | None
     device_index: int | None
-    actuations_requested: bool
+    actuations_requested: tuple[ActuatorCommand, ...]
+    actuations_applied: tuple[ActuatorCommand, ...]
 
 
 def _preload_outcome_from_admission(decision: AdmissionDecision) -> _PreloadJobOutcome:
@@ -5004,6 +5005,8 @@ class InferenceScheduler:
         reserves is never double-counted here. No actuations run: the arbiter verdict's actuations are ignored
         because reclaim stays single-owner (the preload path drives it).
         """
+        if not self._budget_active():
+            return None
         arbiter = self._vram_arbiter
         if arbiter is None or not arbiter.has_cycle or candidate_job.model is None:
             return None
@@ -5335,14 +5338,14 @@ class InferenceScheduler:
     def _process_running_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The inference process currently dispatched the given in-flight job, if any.
 
-        Matches on the slot's ``last_job_referenced`` (stamped at dispatch) so the overlap gate can read
-        the running job's live step progress.
+        Matches on typed execution ownership so a preload attribution cannot make the overlap gate read model
+        preparation as a running job.
         """
         job_id = job.id_
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
-            referenced = process_info.last_job_referenced
+            referenced = process_info.current_inference_job()
             if referenced is not None and referenced.id_ == job_id:
                 return process_info
         return None
@@ -5395,7 +5398,7 @@ class InferenceScheduler:
             if process_info.device_index != device_index:
                 continue
             state = process_info.last_process_state
-            referenced = process_info.last_job_referenced
+            referenced = process_info.current_inference_job()
             if state == HordeProcessState.INFERENCE_PRIMED:
                 # Earlier dispatch time sorts closer to the head; a process with no stamp yet sorts last.
                 dispatched_at = process_info.current_inference_started_at or float("inf")
@@ -5441,7 +5444,7 @@ class InferenceScheduler:
         process_info = self._process_map.get(process_id)
         if process_info is None:
             return False
-        job = process_info.last_job_referenced
+        job = process_info.current_inference_job()
         if job is None or job.model is None:
             # Nothing priceable to hold on; let the child proceed rather than wedge it.
             return True
@@ -5450,9 +5453,13 @@ class InferenceScheduler:
         # clearance, so the post-processing chain fit is checked here (the dispatch-side check still guards the
         # non-lease path). A deferral withholds the grant without faulting the job.
         if self._should_defer_dispatch_for_post_processing(job, process_with_model=process_info):
-            self._note_clearance_hold(job, reclaim_requested=False)
+            self._note_clearance_hold(job, reclaim_applied=False)
             self._log_clearance_hold(process_id, job, reason="post_processing_coresidency", verdict=None)
             return False
+
+        if not self._budget_active():
+            self._resolve_clearance_hold(job)
+            return True
 
         outcome = self._evaluate_materialization_admission(
             job,
@@ -5469,7 +5476,7 @@ class InferenceScheduler:
             )
             return True
 
-        self._note_clearance_hold(job, reclaim_requested=outcome.actuations_requested)
+        self._note_clearance_hold(job, reclaim_applied=bool(outcome.actuations_applied))
         self._log_clearance_hold(process_id, job, reason=outcome.verdict.disposition.value, verdict=outcome.verdict)
         return False
 
@@ -5507,12 +5514,12 @@ class InferenceScheduler:
             f"for room (or samples via its lease-acquire timeout); this repeats at most once per distinct cause.",
         )
 
-    def _note_clearance_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_requested: bool) -> None:
+    def _note_clearance_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_applied: bool) -> None:
         """Record that ``job``'s clearance was withheld this pass, so the empty sampling slot is attributed.
 
         The clearance counterpart of :meth:`_note_dispatch_hold`, keyed on the primed in-progress job rather
-        than a pending head. ``reclaim_requested`` (unused for now beyond symmetry) notes that this pass emitted
-        eviction commands, matching the dispatch gate's release attribution.
+        than a pending head. ``reclaim_applied`` (unused for now beyond symmetry) records that an actuator
+        accepted at least one eviction command, matching the dispatch gate's release attribution.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
@@ -6909,6 +6916,8 @@ class InferenceScheduler:
                 process_id=available_process.process_id,
                 disaggregated=self._is_disaggregation_class_eligible(job),
             ),
+            candidate_weights_mb=predict_job_weight_mb(job, baseline),
+            accepted_work=job.id_ is not None and self._job_tracker.get_tracked_job(job.id_) is not None,
             candidate_already_resident=self._candidate_weights_resident_on_process(
                 job.model,
                 available_process.process_id,
@@ -6919,7 +6928,14 @@ class InferenceScheduler:
             ),
             is_head_of_queue=is_head_blocker,
             head_job_id=str(job.id_) if job.id_ is not None else None,
-            measured_attempt_in_progress=self._job_tracker.is_measured_attempt(job),
+            measured_attempt_in_progress=self._job_tracker.is_measured_attempt_on_device(
+                job,
+                target_device_index,
+            ),
+            measured_attempt_already_spent=self._job_tracker.has_spent_measured_attempt_on_device(
+                job,
+                target_device_index,
+            ),
             starved_seconds=self._head_starved_seconds(job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             can_reduce_live_contexts=can_reduce_live_contexts,
@@ -7270,7 +7286,7 @@ class InferenceScheduler:
         *,
         device_index: int | None,
         for_head_of_queue: bool,
-    ) -> None:
+    ) -> tuple[ActuatorCommand, ...]:
         """Run the pressure-relief commands a deferred preload verdict described, at most once each this cycle.
 
         RELEASE_CACHE returns an idle lane's cached allocator reservation to the card; EVICT_IDLE_MODEL frees
@@ -7283,7 +7299,7 @@ class InferenceScheduler:
         single-owner rule): the two triggers can never become two mechanisms evicting the same card by
         different rules.
         """
-        VerifiedReclaimLadder.execute_arbiter_commands(
+        return VerifiedReclaimLadder.execute_arbiter_commands(
             commands,
             self,
             device_index=device_index,
@@ -7647,7 +7663,7 @@ class InferenceScheduler:
             ),
         ):
             return False
-        process_info.last_job_referenced = None
+        process_info.clear_job_references()
         process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         self._record_churn("vram_eviction")
         logger.info(f"Reclaim ladder: unloading model {model_name} from VRAM on idle process {process_id}")
@@ -9488,7 +9504,11 @@ class InferenceScheduler:
         # whole encode-and-sample window (the reservation, not a START_INFERENCE flag, is that ownership
         # record: see WorkerRecoveryCoordinator.inference_slot_owns_job). No sampling-timing stamp is set here;
         # the sampler reports its own INFERENCE_STARTING when the sample stage runs.
-        process_with_model.last_job_referenced = next_job
+        tracked = self._job_tracker.get_tracked_job(next_job.id_) if next_job.id_ is not None else None
+        process_with_model.record_inference_ownership(
+            next_job,
+            attempt_ordinal=(tracked.inference_attempts + 1) if tracked is not None else 1,
+        )
         process_with_model.loaded_horde_model_name = model
         process_with_model.loaded_horde_model_baseline = self._model_metadata.get_baseline(model)
         if degraded_dispatch:
@@ -9618,7 +9638,11 @@ class InferenceScheduler:
             )
 
             process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
-            process_with_model.last_job_referenced = next_job
+            tracked = self._job_tracker.get_tracked_job(next_job.id_) if next_job.id_ is not None else None
+            process_with_model.record_inference_ownership(
+                next_job,
+                attempt_ordinal=(tracked.inference_attempts + 1) if tracked is not None else 1,
+            )
             process_with_model.loaded_horde_model_name = next_job.model
             process_with_model.loaded_horde_model_baseline = horde_model_baseline
             # Optimistically mark the slot primed at dispatch (staging toward sampling, not yet in the
@@ -9653,12 +9677,12 @@ class InferenceScheduler:
             self._resolve_dispatch_decision(held_id, reason="left_pending_queue")
         self._post_processing_defer_holds.intersection_update(pending_ids)
 
-    def _note_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_requested: bool) -> None:
+    def _note_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_applied: bool) -> None:
         """Record that the dispatch of ``job`` was held this pass, stamping the first hold and its cause.
 
         Every hold pass counts a conflict; the first hold for a job also stamps the hold-start instant and
-        counts a distinct held dispatch. A pass that emitted eviction commands marks the job so its eventual
-        release is attributed to reclaim rather than to the card recovering on its own.
+        counts a distinct held dispatch. A pass whose actuator accepted an eviction command marks the job so
+        its eventual release is attributed to reclaim rather than to the card recovering on its own.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
@@ -9667,7 +9691,7 @@ class InferenceScheduler:
         if job_id not in self._dispatch_hold_since:
             self._dispatch_hold_since[job_id] = self._clock()
             self._dispatch_reconciliation_holds += 1
-        if reclaim_requested:
+        if reclaim_applied:
             self._dispatch_hold_reclaim_requested.add(job_id)
 
     def _resolve_dispatch_hold(self, job: ImageGenerateJobPopResponse) -> None:
@@ -9784,7 +9808,7 @@ class InferenceScheduler:
             self._resolve_dispatch_hold(next_job)
             return False
 
-        self._note_dispatch_hold(next_job, reclaim_requested=outcome.actuations_requested)
+        self._note_dispatch_hold(next_job, reclaim_applied=bool(outcome.actuations_applied))
 
         if self._decision_sink is not None and next_job.id_ is not None:
             measured = verdict.measured
@@ -9802,7 +9826,12 @@ class InferenceScheduler:
                     "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
                     "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
                     "is_head_of_queue": is_head_of_queue,
-                    "reclaim_requested": outcome.actuations_requested,
+                    "reclaim_requested": bool(outcome.actuations_requested),
+                    "reclaim_applied": bool(outcome.actuations_applied),
+                    "reclaim_requested_kinds": ",".join(
+                        command.kind.value for command in outcome.actuations_requested
+                    ),
+                    "reclaim_applied_kinds": ",".join(command.kind.value for command in outcome.actuations_applied),
                 },
             )
 
@@ -9811,13 +9840,17 @@ class InferenceScheduler:
             (str(next_job.id_), verdict.disposition.value),
         )
         if suppressed is not None:
-            # Only claim the eviction when one was actually requested. A head-protection hold describes no
-            # actuations at all (it is withholding room, not reclaiming it), and announcing a reclaim that
-            # never runs sends the operator looking for an eviction that was never going to happen.
+            # Only claim the eviction when an actuator accepted it. A proposed command can be declined because
+            # its target became busy, protected, or was already reclaimed; that leaves the measured state
+            # unchanged and must not be described as room being on the way.
             reclaim_note = (
                 " Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM."
-                if outcome.actuations_requested
-                else " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
+                if outcome.actuations_applied
+                else (
+                    " Reclaim was proposed but no actuator accepted it; the hold remains eligible for escalation."
+                    if outcome.actuations_requested
+                    else " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
+                )
             )
             logger.opt(colors=True).warning(
                 f"<fg #f0beff>Holding dispatch of {{}} to reconcile residency: {verdict.stated}.{reclaim_note}</>",
@@ -9907,6 +9940,8 @@ class InferenceScheduler:
             device_index=device_index,
             target_process_id=process_with_model.process_id,
             candidate_delta_mb=candidate_delta_mb,
+            candidate_weights_mb=predict_job_weight_mb(next_job, baseline),
+            accepted_work=(next_job.id_ is not None and self._job_tracker.get_tracked_job(next_job.id_) is not None),
             # An ordinary dispatch onto resident weights is a no-materialisation fast path. A prepared head
             # re-entering while another job owns a live reservation is not: its weights may be resident, but
             # its activations would overlap that admitted peak. Reprice the activation-only delta so the
@@ -9924,7 +9959,14 @@ class InferenceScheduler:
             ),
             is_head_of_queue=is_head_of_queue,
             head_job_id=str(next_job.id_) if next_job.id_ is not None else None,
-            measured_attempt_in_progress=self._job_tracker.is_measured_attempt(next_job),
+            measured_attempt_in_progress=self._job_tracker.is_measured_attempt_on_device(
+                next_job,
+                device_index,
+            ),
+            measured_attempt_already_spent=self._job_tracker.has_spent_measured_attempt_on_device(
+                next_job,
+                device_index,
+            ),
             head_outstanding_mb=head_outstanding_mb,
             starved_seconds=self._head_starved_seconds(next_job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
@@ -9946,7 +9988,8 @@ class InferenceScheduler:
                 verdict=verdict,
                 candidate_delta_mb=candidate_delta_mb,
                 device_index=device_index,
-                actuations_requested=False,
+                actuations_requested=(),
+                actuations_applied=(),
             )
 
         # The materialisation cannot land yet. Route the described idle-resident eviction through the single
@@ -9960,7 +10003,7 @@ class InferenceScheduler:
             max_resident=max_resident,
         )
         try:
-            self._execute_preload_actuations(
+            applied_actuations = self._execute_preload_actuations(
                 actuations,
                 device_index=device_index,
                 for_head_of_queue=is_head_of_queue,
@@ -9971,7 +10014,8 @@ class InferenceScheduler:
             verdict=verdict,
             candidate_delta_mb=candidate_delta_mb,
             device_index=device_index,
-            actuations_requested=bool(actuations),
+            actuations_requested=actuations,
+            actuations_applied=applied_actuations,
         )
 
     def head_of_queue_is_parked(self) -> bool:
@@ -10095,7 +10139,7 @@ class InferenceScheduler:
             return False
 
         line_skip = next_job_and_process.line_skip
-        if self._dispatch_residency_reconciliation_holds(
+        if self._budget_active() and self._dispatch_residency_reconciliation_holds(
             next_job,
             process_with_model,
             # A line-skip dispatch is not the true head of queue, so it presents is_head_of_queue=False and the
@@ -10525,7 +10569,7 @@ class InferenceScheduler:
                             horde_model_name=process_info.loaded_horde_model_name,
                         ),
                     )
-                    process_info.last_job_referenced = None
+                    process_info.clear_job_references()
                     process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
                     unloaded_any = True
                     self._record_churn("vram_eviction")
@@ -10618,7 +10662,7 @@ class InferenceScheduler:
                 process_id=process_id,
             )
 
-            process_info.last_job_referenced = None
+            process_info.clear_job_references()
             process_info.loaded_horde_model_name = None
             process_info.loaded_horde_model_baseline = None
             process_info.recently_unloaded_from_ram = True

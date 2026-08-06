@@ -396,6 +396,20 @@ class TestReturnControlMapDelivery:
         assert tracked.job_info.images_bytes == [b"the-control-map"]
         # It never entered the inference queue: the map is the deliverable, produced entirely on the lane.
         assert job not in pm._job_tracker.jobs_pending_inference
+        assert pm._job_tracker.total_num_completed_jobs == 1
+
+        # A duplicate child result cannot count the same terminal generation-stage outcome twice.
+        pm._on_annotation_result(
+            HordeAnnotationResultMessage(
+                process_id=_UTILITIES_PROCESS_ID,
+                process_launch_identifier=0,
+                info="duplicate",
+                job_id=job.id_,
+                control_map_bytes=b"the-control-map",
+                state=GENERATION_STATE.ok,
+            ),
+        )
+        assert pm._job_tracker.total_num_completed_jobs == 1
 
     async def test_return_control_map_fault_falls_through_in_graph(self) -> None:
         """A faulted return_control_map annotation releases the job to inference for the in-graph path."""

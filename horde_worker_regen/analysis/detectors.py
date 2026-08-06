@@ -153,7 +153,8 @@ _STUCK_STEP_RE = re.compile(r"stuck on a non-advancing sampling step|stuck-step 
 # an upscaler/face-fixer allocation landing after sampling, concurrent with warm inference siblings.
 _POST_PROCESSING_STALL_RE = re.compile(r"seems to be stuck post processing")
 _DEDICATED_POST_PROCESS_RE = re.compile(
-    r"\bPOST_PROCESS(?:\)|ING\b)|Post-processing (?:job|for job|finished)|dedicated post-process",
+    r"(?:last_process_state=HordeProcessState\.(?:INFERENCE_POST_PROCESSING|POST_PROCESSING)\b|"
+    r"^Post-processing (?:job|for job|finished for job) \S+)",
     re.IGNORECASE,
 )
 # The routine device-wide free-VRAM readout hordelib emits on *every* log_free_ram call. Its

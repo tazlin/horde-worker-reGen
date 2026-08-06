@@ -6,6 +6,7 @@ import enum
 import time
 from collections.abc import Callable
 
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
@@ -18,7 +19,6 @@ from horde_worker_regen.process_management.config.worker_state import (
 )
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
@@ -245,6 +245,8 @@ class WorkerRecoveryCoordinator:
         self.episode_progress_baseline: int | None = None
         self.episode_inference_start_baseline: int | None = None
         self.episode_post_processing_progress_baseline: int | None = None
+        self.episode_frontier_baseline: tuple[GenerationID, JobStage] | None = None
+        self.unrelated_progress_deferral_spent = False
         self.recovery_event_times: list[float] = []
         self.last_seen_recovery_count = 0
         # Edge latch so a runaway-recovery abort the worker declined is recorded once rather than every tick
@@ -387,22 +389,10 @@ class WorkerRecoveryCoordinator:
                 continue
             if not process_info.is_process_alive():
                 continue
-            referenced = process_info.last_job_referenced
-            if referenced is None or referenced.id_ != job_id:
+            owned_job = process_info.current_inference_job()
+            if owned_job is None or owned_job.id_ != job_id:
                 continue
-            if not process_info.can_accept_job():
-                return True
-            if (
-                process_info.last_control_flag == HordeControlFlag.START_INFERENCE
-                and process_info.current_inference_started_at is not None
-            ):
-                return True
-            # A disaggregated job pins its sampler across the encode window (no START_INFERENCE is sent, so
-            # the slot reads idle while the encode service produces conditioning). The reservation is the
-            # ownership record for that window, so a pinned slot referencing this job owns it and it must not
-            # be punted as orphaned.
-            if self._process_map.is_reserved_for_disaggregation(process_info.process_id):
-                return True
+            return True
         return False
 
     def reconcile_orphaned_in_progress_jobs(self) -> None:
@@ -726,6 +716,23 @@ class WorkerRecoveryCoordinator:
         self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
         self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
         self.episode_post_processing_progress_baseline = self._job_tracker.total_num_post_processing_progress
+        self.episode_frontier_baseline = self._current_recovery_frontier()
+
+    def _current_recovery_frontier(self) -> tuple[GenerationID, JobStage] | None:
+        """Return the oldest nonterminal accepted job and its current stage.
+
+        Recovery for accepted work belongs to the oldest unresolved frontier, not to worker-wide counters a
+        follower can advance. A successful terminal head leaves this view, and a head entering a later stage
+        changes it. Fault and retry transitions are filtered by :meth:`_frontier_made_progress`; a recovery
+        action cannot manufacture its own proof by faulting or requeueing the head.
+        """
+        active = [
+            tracked for tracked in self._job_tracker.tracked_jobs() if tracked.stage is not JobStage.PENDING_SUBMIT
+        ]
+        if not active:
+            return None
+        head = min(active, key=lambda tracked: tracked.pop_order)
+        return head.job_id, head.stage
 
     def made_progress_since_episode(self) -> bool:
         """Return whether accepted work moved forward since the most recent recovery baseline.
@@ -733,12 +740,37 @@ class WorkerRecoveryCoordinator:
         The baseline is captured when the episode opens and re-captured on each soft reset, so this reports
         progress since the latest soft reset once one has been attempted.
 
-        Credit requires motion the stalled stage cannot produce by itself. A job completion counts
-        unconditionally, since it proves every downstream stage cleared. An inference *start* is only an
-        attempt, so it counts only when no downstream stage is holding accepted work: a post-processing or
-        safety backlog keeps admitting fresh starts while nothing leaves the stage, and crediting those would
-        close a wedge episode on the very symptom that defines it.
+        When accepted work has a frontier, only movement of that same oldest unresolved job counts. Aggregate
+        counters remain a fallback for pool-level episodes with no accepted frontier. They are also observed
+        separately to permit one bounded delay, but follower throughput never closes or resets the blocked
+        head's escalation.
         """
+        if self.episode_frontier_baseline is not None:
+            return self._frontier_made_progress()
+
+        return self._worker_progress_since_episode()
+
+    def _frontier_made_progress(self) -> bool:
+        """Return whether the baseline head advanced rather than faulting or retrying."""
+        baseline = self.episode_frontier_baseline
+        if baseline is None:
+            return False
+        baseline_job_id, baseline_stage = baseline
+        current = self._current_recovery_frontier()
+        if current == baseline:
+            return False
+
+        tracked = self._job_tracker.get_tracked_job(baseline_job_id)
+        if tracked is None:
+            return False
+        if tracked.job_info is not None and tracked.job_info.state is GENERATION_STATE.faulted:
+            return False
+        if current is None or current[0] != baseline_job_id:
+            return tracked.stage is JobStage.PENDING_SUBMIT
+        return current[1].value > baseline_stage.value
+
+    def _worker_progress_since_episode(self) -> bool:
+        """Return whether aggregate completion or stage counters advanced since the episode baseline."""
         if (
             self.episode_progress_baseline is None
             or self.episode_inference_start_baseline is None
@@ -759,6 +791,15 @@ class WorkerRecoveryCoordinator:
             # stalled stage manufacture its own proof of recovery and reset the escalation it should be climbing.
             return False
         return self._job_tracker.total_num_inference_starts > self.episode_inference_start_baseline
+
+    def _unrelated_progress_deferral_available(self) -> bool:
+        """Return whether follower throughput earns the episode's one observation delay."""
+        return (
+            not self.unrelated_progress_deferral_spent
+            and self.episode_frontier_baseline is not None
+            and self._current_recovery_frontier() == self.episode_frontier_baseline
+            and self._worker_progress_since_episode()
+        )
 
     def enter_recovery_park(self, reason: RecoveryParkReason, detail: dict[str, str | int | float | bool]) -> None:
         """Hold escalation quiescent because its remedies are spent and the exit rung was withheld.
@@ -832,6 +873,8 @@ class WorkerRecoveryCoordinator:
         self.episode_progress_baseline = None
         self.episode_inference_start_baseline = None
         self.episode_post_processing_progress_baseline = None
+        self.episode_frontier_baseline = None
+        self.unrelated_progress_deferral_spent = False
         self.episode_saw_unrecoverable_pool = False
         self.pp_reclaim_remedy_issued_at = None
         self.head_recovery_in_flight_since = None
@@ -977,6 +1020,7 @@ class WorkerRecoveryCoordinator:
             head_recovery_in_flight=head_recovery_in_flight,
             boot_in_progress=boot_in_progress,
             constructive_remedy_available=constructive_remedy_available,
+            unrelated_progress_deferral_available=self._unrelated_progress_deferral_available(),
         )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:
@@ -985,6 +1029,12 @@ class WorkerRecoveryCoordinator:
             self._clear_recovery_episode_accounting()
         if action is RecoveryAction.RECLAIM:
             self.issue_next_constructive_remedy()
+        elif action is RecoveryAction.OBSERVE:
+            self.unrelated_progress_deferral_spent = True
+            logger.info(
+                "Save-our-ship: unrelated work advanced while the recovery frontier remained unchanged; "
+                "waiting one bounded action interval before continuing escalation."
+            )
         elif action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()
             # Re-anchor the progress baseline to the reset: the episode may close only when work moves forward

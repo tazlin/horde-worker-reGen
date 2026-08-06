@@ -193,13 +193,13 @@ class TestMeasuredAttemptRegimeIsSetUp:
 
 
 class TestMeasuredAttemptDispatchesThenFaultArmsHold:
-    """The failure branch: the head attempts and dispatches, its OOM faults it terminally and arms the hold."""
+    """The failure branch: the head attempts, its OOM excludes that card, and retry remains bounded."""
 
-    async def test_head_attempts_dispatches_then_oom_faults_holds_and_sibling_runs(
+    async def test_head_attempts_then_oom_requeues_without_repeating_on_the_same_card(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Within a bounded pass the head dispatches (attempt); its OOM faults it (recovery), holds it, frees GPU."""
+        """The OOM requeues for another card, but its receipt prevents another exceptional load on this card."""
         world = _World(staged_model=_HEAD_MODEL, monkeypatch=monkeypatch)
         head = await world.pop(_HEAD_MODEL)
         assert head.id_ is not None
@@ -218,25 +218,53 @@ class TestMeasuredAttemptDispatchesThenFaultArmsHold:
         # does not fit this card now. This is the signal the dispatcher computes and hands the tracker.
         resolution = await world.job_tracker.handle_job_fault(head, is_resource_failure=True, retryable=True)
 
-        # Terminal, not a degraded retry: a converged-empty card has nothing left to reclaim for a second try.
-        assert resolution is InferenceFailureResolution.FAULTED
-        assert world.job_tracker.get_stage(head.id_) is JobStage.PENDING_SUBMIT
-        assert world.job_tracker.jobs_lookup[head].state is GENERATION_STATE.faulted
-        # The fault is a scheduling-recovery action, so it is excluded from the consecutive-failure pop pause.
-        assert world.job_tracker.was_faulted_by_scheduling_recovery(head.id_) is True
-        # A real attempt failed, so the model is held (real-attempt evidence) and the fault counter advanced once.
+        # The ordinary cap leaves one attempt for another eligible card. This is not a degraded retry: the
+        # failed card was already converged and alone, so isolating the same card again cannot change reality.
+        assert resolution is InferenceFailureResolution.RETRY
+        assert world.job_tracker.get_stage(head.id_) is JobStage.PENDING_INFERENCE
+        assert world.job_tracker.jobs_lookup[head].state is not GENERATION_STATE.faulted
+        assert world.job_tracker.is_measured_attempt(head) is False
+        assert world.job_tracker.has_spent_measured_attempt_on_device(head, None) is True
+        # A real attempt failed, so this card is held (real-attempt evidence) and the fault counter advanced once.
         assert world.job_tracker.is_model_held_by_ceiling(_HEAD_MODEL) is True
         assert world.job_tracker.measured_attempt_faults == 1
 
-        # GPU-feeding outcome: with the head resolved, a queued sibling reaches the GPU (no head-protection wedge).
-        world.restage(_SIBLING_MODEL)
-        sibling = await world.pop(_SIBLING_MODEL)
-        world.starve_head(sibling, seconds=0.0)
+        # Re-evaluating the same job on the held card cannot emit another measured attempt. The scheduler may
+        # resolve the unroutable retry immediately or leave it for its bounded recovery path, but it cannot send
+        # another exceptional load to this card.
+        world.restage(_HEAD_MODEL)
+        world.starve_head(head, seconds=90.0)
         world.freeze()
-        dispatched_sibling = await world.dispatch()
-        assert dispatched_sibling is True
-        assert sibling in world.job_tracker.jobs_in_progress
-        assert world.scheduler._process_map[0].last_control_flag is HordeControlFlag.START_INFERENCE
+        assert world.scheduler._vram_arbiter is not None
+        attempts_before = world.scheduler._vram_arbiter.measured_attempts
+        dispatched_again = await world.dispatch()
+        assert dispatched_again is False
+        assert head not in world.job_tracker.jobs_in_progress
+        assert world.scheduler._vram_arbiter.measured_attempts == attempts_before
+
+    async def test_distinct_card_retry_uses_the_ordinary_attempt_cap(self) -> None:
+        """A failed measured load may move to another card once, then terminates at the configured cap."""
+        tracker = JobTracker()
+        tracker.set_retry_policy(2)
+        job = make_job_pop_response(_HEAD_MODEL)
+        await track_popped_job_async(tracker, job)
+
+        tracker.mark_measured_attempt(job, candidate_mb=_HEAD_CANDIDATE_MB, device_index=0)
+        await tracker.mark_inference_started(job, device_index=0)
+        first = await tracker.handle_job_fault(job, is_resource_failure=True, retryable=True)
+
+        assert first is InferenceFailureResolution.RETRY
+        assert tracker.has_spent_measured_attempt_on_device(job, 0) is True
+        assert tracker.has_spent_measured_attempt_on_device(job, 1) is False
+
+        tracker.mark_measured_attempt(job, candidate_mb=_HEAD_CANDIDATE_MB, device_index=1)
+        await tracker.mark_inference_started(job, device_index=1)
+        second = await tracker.handle_job_fault(job, is_resource_failure=True, retryable=True)
+
+        assert second is InferenceFailureResolution.FAULTED
+        assert tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        assert tracker.has_spent_measured_attempt_on_device(job, 0) is True
+        assert tracker.has_spent_measured_attempt_on_device(job, 1) is True
 
 
 class TestMeasuredAttemptSuccessArmsNothing:

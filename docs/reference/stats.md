@@ -68,7 +68,9 @@ attempt that actually ran, not of its first.
 
 The `baseline` on a `job_completed` record is the model's baseline as the loaded model reference states it
 (`stable_diffusion_1`, `stable_diffusion_xl`, `flux_1`, ...), or `null` when no record for the model was
-available. A harness or benchmark session resolves it from the same reference a production worker uses.
+available. A real-mode benchmark resolves it from the production model reference. A fake harness session
+uses an explicit local mapping for its named synthetic checkpoints, so it preserves the modeled baseline
+class without live reference access.
 
 ### Reconciling `session_end` with the stream
 

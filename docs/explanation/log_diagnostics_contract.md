@@ -37,6 +37,12 @@ The logging layer itself is intentionally left untouched by the diagnostics code
 operators first, and the detectors adapt to it, not the other way around. That keeps log messages free
 to read naturally instead of being constrained to a machine-parseable schema.
 
+Detector signatures are anchored to emitted lifecycle events, not merely to distinctive words that may
+also appear inside serialized payloads, configuration dumps, or exception context. For example, a
+post-processing stall detector accepts the process-state event and the stable post-processing job event
+forms; a payload field containing the same state name is evidence only when an actual event line accompanies
+it. Negative contract rows preserve that boundary.
+
 ## One facade, two front-ends
 
 Both front-ends call the same entry point,

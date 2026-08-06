@@ -199,8 +199,8 @@ When a process dies unexpectedly (crash, OOM kill, hung timeout):
 1. The old process entry is removed from `ProcessMap`.
 2. Any model ownership entries in `HordeModelMap` tied to that process are
    cleared.
-3. If inference was in progress on that process, the job **that slot was running**
-   (its own `last_job_referenced`) is faulted via `JobTracker.handle_job_fault_now`
+3. If inference was in progress on that process, the job **that exact launch was running**
+   (its typed execution-ownership record) is faulted via `JobTracker.handle_job_fault_now`
    as *retryable*: it returns to `PENDING_INFERENCE` for a fresh attempt while any
    remain, and only skips to `PENDING_SUBMIT` once the attempt budget is exhausted
    (see [Layer 1](resilience_and_recovery.md#layer-1-bounded-and-degraded-job-retry)).
@@ -210,6 +210,8 @@ When a process dies unexpectedly (crash, OOM kill, hung timeout):
    passes `sampler_overtime_reap` so the job is faulted non-retryably: that reap is
    a verdict on the payload, which the next slot would burn on identically (see
    [the stuck-step watchdog](resilience_and_recovery.md#the-stuck-step-watchdog-and-its-final-step-allowance)).
+   A preload intent is deliberately excluded: preparation associates a model with a
+   job for scheduling and display, but it does not prove an inference attempt began.
 4. A new process is started with a fresh `process_launch_identifier`, or queued
    as a deferred GPU start if the assigned card is below its start headroom.
 5. The `process_launch_identifier` bump ensures any stale messages from the dead

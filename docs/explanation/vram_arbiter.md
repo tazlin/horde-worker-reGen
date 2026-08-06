@@ -73,8 +73,10 @@ owner. A pause the governor's saturation episode issued is restored by that epis
 returns `HEALTHY`; a lane the per-cycle post-processing DEFER path borrowed is restored by that drain's
 applied-action receipt (see
 [Process lanes and chaining](process_lanes_and_chaining.md#restore-ownership-every-lane-pause-has-exactly-one-responsible-owner)).
-The `execute_arbiter_commands` receipt returns exactly the pauses whose actuator reported it acted, so the
-borrow restores only a pause it truly acquired, never a same-owner pause an independent episode already held. A
+The `execute_arbiter_commands` receipt returns exactly the commands whose actuator reported it acted. Decision
+records retain both the ordered requested tuple and the ordered applied tuple; a proposed cache release,
+eviction, context reduction, or lane pause is never reported as performed merely because the arbiter requested
+it. A borrow therefore restores only a pause it truly acquired, never a same-owner pause an independent episode already held. A
 conservative self-heal backstop in the governor tick reclaims any reclaim-ladder lane pause that has outlived
 both owners (no live episode, no borrow receipt) once the card has been debounced-`HEALTHY`, so a lost claimant
 can never strand a lane off the GPU indefinitely. The recovery coordinator's constructive remedy takes its lane
@@ -392,15 +394,22 @@ have breathed up for one reading. When the true head has starved past the 60s di
 sibling context to tear down: make-room has nothing left to reclaim), the arbiter stops deferring an idle card
 on arithmetic that may be wrong and admits the head for exactly one real load, so measured reality decides. The
 attempt rides the ordinary `FITS` path, so every downstream safety (the per-step floors, the watchdogs, the OOM
-classification, the whole-card residency machinery) applies unchanged. It is one-shot per head-starvation
-episode: a success teaches the learned peak the true figure so future arithmetic improves and nothing else
-happens; a failure (the child faults with the out-of-memory classification) is the strongest possible evidence
-the demand does not fit this card now, so the job is faulted terminally as a scheduling-recovery action
-(excluded from the consecutive-failure pop pause, exactly like the unroutable-head fault) and the model's
-conditional ceiling hold is armed against the demand the real load actually failed at, with the operator
-warning firing once.
+classification, the whole-card residency machinery) applies unchanged. It is one-shot per accepted job and
+card. The job tracker owns the spent-card receipt, so replacing the arbiter or inference process cannot re-arm
+the same exceptional attempt; an active preload-to-dispatch continuation remains admitted because it is still
+the same attempt. A success teaches the learned peak the true figure and arms no hold. An out-of-memory failure
+ends the continuation and immediately arms that card's conditional ceiling hold. The ordinary inference retry
+cap may offer the job to a different eligible card, but the failure never earns a degraded retry on the same
+card: the card was already converged and alone. When the normal cap is spent, the job faults through the usual
+terminal path.
 
-The shortfall's *size* does not gate that attempt, and deliberately so. A band expresses how far the arithmetic
+For work the worker has not accepted, the shortfall's *size* does not gate an under-ceiling attempt, and the
+over-ceiling escape stays limited to the prediction-error allowance. Accepted RAM-staged work adds one case:
+when the checkpoint weights themselves fit the achievable ceiling, an activation-inclusive static prediction
+above that ceiling cannot become an immutable refusal after intake. That job/card pair receives the same single
+measured attempt, still subject to the true-head, converged-empty, and no-better-card guards.
+
+A band expresses how far the arithmetic
 may be wrong before waiting beats trying, and waiting is only a bet on a card whose available reading can still
 improve. On a converged card it cannot: the choice is exactly two-way, take the load or hold the head against a
 figure that will never move, so refusing a wider shortfall parks the head with nothing to wait for. What bounds

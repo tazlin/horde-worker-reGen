@@ -65,6 +65,9 @@ def _scheduler(
         max_threads=max_threads,
         high_performance_mode=high_performance_mode,
         moderate_performance_mode=moderate_performance_mode,
+        enable_vram_budget=True,
+        vram_reserve_mb=2048,
+        ram_reserve_mb=4096,
         image_models_to_load=[_HEAD_MODEL, _BACKFILL_MODEL],
     )
     reference = {

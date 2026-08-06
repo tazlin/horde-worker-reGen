@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Protocol, override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -63,6 +64,23 @@ class ChildProcessHandle(Protocol):
     def join(self, timeout: float | None = None) -> None:
         """Wait for the process to exit, up to ``timeout`` seconds."""
         ...
+
+
+@dataclass(frozen=True)
+class PreloadJobIntent:
+    """A job that selected this launch for model preparation, without execution ownership."""
+
+    job: ImageGenerateJobPopResponse
+    process_launch_identifier: int
+
+
+@dataclass(frozen=True)
+class InferenceExecutionOwnership:
+    """A dispatched inference attempt owned by one exact process launch."""
+
+    job: ImageGenerateJobPopResponse
+    process_launch_identifier: int
+    attempt_ordinal: int
 
 
 class HordeProcessInfo:
@@ -142,7 +160,10 @@ class HordeProcessInfo:
     last_preload_requested_at: float
     """Epoch time when the parent last sent ``PRELOAD_MODEL`` to this process."""
 
-    last_job_referenced: ImageGenerateJobPopResponse | None
+    preload_job_intent: PreloadJobIntent | None
+    """The job that requested the current preload, which is not evidence that inference started."""
+    inference_ownership: InferenceExecutionOwnership | None
+    """The job attempt this exact process launch owns after successful dispatch."""
 
     current_inference_started_at: float | None
     """Epoch time inference was dispatched to this slot for its current job, or None when not inferring.
@@ -336,7 +357,8 @@ class HordeProcessInfo:
         self.heartbeats_inference_steps = 0
         self.last_heartbeat_percent_complete = None
 
-        self.last_job_referenced = None
+        self.preload_job_intent = None
+        self.inference_ownership = None
         self.current_inference_started_at = None
         self.current_first_step_at = None
         self.current_job_expected_sampling_seconds = None
@@ -377,6 +399,85 @@ class HordeProcessInfo:
 
         self.process_launch_identifier = process_launch_identifier
         self.end_intended = False
+
+    @property
+    def last_job_referenced(self) -> ImageGenerateJobPopResponse | None:
+        """Return the job most useful for display and model attribution.
+
+        Execution ownership takes precedence over preload intent. Correctness decisions that fault, retry, or
+        adopt results must inspect :attr:`inference_ownership` directly; this compatibility view deliberately
+        cannot answer whether a job actually ran.
+        """
+        if self.inference_ownership is not None:
+            return self.inference_ownership.job
+        if self.preload_job_intent is not None:
+            return self.preload_job_intent.job
+        return None
+
+    @last_job_referenced.setter
+    def last_job_referenced(self, job: ImageGenerateJobPopResponse | None) -> None:
+        """Maintain compatibility for callers while preserving preload versus execution meaning.
+
+        New production callers use :meth:`record_preload_intent` or :meth:`record_inference_ownership`.
+        Assignments in older integrations and tests are classified from the slot state/control flag.
+        """
+        if job is None:
+            self.clear_job_references()
+            return
+        if self.last_control_flag == HordeControlFlag.START_INFERENCE or self.last_process_state in {
+            HordeProcessState.INFERENCE_PRIMED,
+            HordeProcessState.INFERENCE_STARTING,
+            HordeProcessState.INFERENCE_COMPLETE,
+        }:
+            self.record_inference_ownership(job, attempt_ordinal=0)
+            return
+        self.record_preload_intent(job)
+
+    def record_preload_intent(self, job: ImageGenerateJobPopResponse) -> None:
+        """Attribute model preparation to ``job`` without granting it execution ownership."""
+        self.preload_job_intent = PreloadJobIntent(job, self.process_launch_identifier)
+
+    def record_inference_ownership(self, job: ImageGenerateJobPopResponse, *, attempt_ordinal: int) -> None:
+        """Record that this exact launch owns a successfully dispatched inference attempt."""
+        self.inference_ownership = InferenceExecutionOwnership(
+            job=job,
+            process_launch_identifier=self.process_launch_identifier,
+            attempt_ordinal=attempt_ordinal,
+        )
+        if self.preload_job_intent is not None and self.preload_job_intent.job == job:
+            self.preload_job_intent = None
+
+    def current_inference_job(self) -> ImageGenerateJobPopResponse | None:
+        """Return the job owned by this exact process launch, or None for stale or absent ownership."""
+        ownership = self.inference_ownership
+        if ownership is None or ownership.process_launch_identifier != self.process_launch_identifier:
+            return None
+        return ownership.job
+
+    def retire_inference_ownership(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Retire matching execution ownership while retaining resident-model attribution.
+
+        Returns False when the slot owns another job or launch, so a delayed result cannot clear a newer
+        dispatch. The completed job becomes preload intent when no newer preparation intent exists; this
+        preserves the display and resident-workflow association that historically outlived execution without
+        allowing it to spend retries or shield an orphan.
+        """
+        ownership = self.inference_ownership
+        if (
+            ownership is None
+            or ownership.process_launch_identifier != self.process_launch_identifier
+            or ownership.job.id_ != job.id_
+        ):
+            return False
+        self.inference_ownership = None
+        if self.preload_job_intent is None:
+            self.record_preload_intent(ownership.job)
+        return True
+
+    def clear_job_references(self) -> None:
+        """Clear preload attribution and execution ownership at a job/process boundary."""
+        self.preload_job_intent = None
+        self.inference_ownership = None
 
     def is_process_busy(self) -> bool:
         """Return true if the process is actively engaged in a task.

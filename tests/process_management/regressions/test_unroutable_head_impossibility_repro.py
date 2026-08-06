@@ -54,7 +54,7 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 
 _SDXL = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
 
-# Faithful to the reproduced incident: a 16375 MB card whose desktop/other processes sustain ~1912 MB, so the
+# A 16375 MB card whose desktop/other processes sustain ~1912 MB, so the
 # achievable ceiling is total - noise(818.75) - foreign(1912) = 13644.25 MB. The head can never fit; a sibling
 # needs 5000 MB and fits.
 _TOTAL_MB = 16375.0
@@ -85,6 +85,11 @@ def _bridge_data() -> Mock:
 
 def _candidate_by_model(head_mb: float) -> object:
     """A sampling-VRAM predictor keyed by model: the head gets ``head_mb``, the sibling a fittable figure."""
+    return lambda job, baseline: head_mb if job.model == _HEAD_MODEL else _SIBLING_CANDIDATE_MB
+
+
+def _weights_by_model(head_mb: float) -> object:
+    """A checkpoint-weight predictor that keeps the head's structural regime explicit."""
     return lambda job, baseline: head_mb if job.model == _HEAD_MODEL else _SIBLING_CANDIDATE_MB
 
 
@@ -131,6 +136,7 @@ class _World:
 
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", _candidate_by_model(head_candidate_mb))
         monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", _candidate_by_model(head_candidate_mb))
+        monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", _weights_by_model(head_candidate_mb))
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
         monkeypatch.setattr(self._scheduler, "_measured_available_ram_mb", lambda: 64000.0)
 

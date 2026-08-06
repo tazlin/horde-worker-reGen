@@ -36,10 +36,9 @@ class TestSafetyBacklogIsNotProgress:
         coordinator = make_test_recovery_coordinator(job_tracker=job_tracker, clock=clock)
 
         parked = await track_popped_job_async(job_tracker, make_job_pop_response())
-        coordinator._capture_progress_baseline()
-
         # The generated job parks waiting on safety, and a fresh job starts inference behind it.
         await queue_job_for_safety_async(job_tracker, _job_info_for(parked))
+        coordinator._capture_progress_baseline()
         follower = await track_popped_job_async(job_tracker, make_job_pop_response())
         await mark_job_in_progress_async(job_tracker, follower)
 
@@ -54,9 +53,8 @@ class TestSafetyBacklogIsNotProgress:
         coordinator = make_test_recovery_coordinator(job_tracker=job_tracker, clock=clock)
 
         parked = await track_popped_job_async(job_tracker, make_job_pop_response())
-        coordinator._capture_progress_baseline()
-
         await move_job_to_being_safety_checked_async(job_tracker, _job_info_for(parked))
+        coordinator._capture_progress_baseline()
         follower = await track_popped_job_async(job_tracker, make_job_pop_response())
         await mark_job_in_progress_async(job_tracker, follower)
 

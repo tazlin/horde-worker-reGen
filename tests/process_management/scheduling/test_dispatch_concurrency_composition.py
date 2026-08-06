@@ -77,6 +77,7 @@ async def _run_cycle_scheduler(
     job_tracker: JobTracker,
     *,
     max_concurrent: int = 2,
+    enable_vram_budget: bool = False,
     job_a: ImageGenerateJobPopResponse | None = None,
     job_b: ImageGenerateJobPopResponse | None = None,
 ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse]:
@@ -97,7 +98,12 @@ async def _run_cycle_scheduler(
         process_map=process_map,
         horde_model_map=horde_model_map,
         job_tracker=job_tracker,
-        bridge_data=make_mock_bridge_data(max_threads=max_concurrent),
+        bridge_data=make_mock_bridge_data(
+            max_threads=max_concurrent,
+            enable_vram_budget=enable_vram_budget,
+            vram_reserve_mb=2048,
+            ram_reserve_mb=4096,
+        ),
         max_concurrent=max_concurrent,
         max_inference=2,
     )
@@ -262,7 +268,7 @@ class TestSchedulingCycleSerializers:
 
     async def test_dispatch_residency_hold_serializes_otherwise_ready_small_job(self, job_tracker: JobTracker) -> None:
         """Residency reconciliation can hold a resident candidate before it materializes VRAM."""
-        scheduler, second_job = await _run_cycle_scheduler(job_tracker)
+        scheduler, second_job = await _run_cycle_scheduler(job_tracker, enable_vram_budget=True)
         first = await scheduler.start_inference()
         assert first is True
         scheduler._dispatch_residency_reconciliation_holds = Mock(return_value=True)  # type: ignore[method-assign]

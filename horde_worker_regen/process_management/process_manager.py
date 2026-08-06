@@ -3372,7 +3372,17 @@ class HordeWorkerProcessManager:
         device-wide truth and the orchestrator stays torch-free. On Windows/WDDM the device-level free figure
         is the only signal that does not lie once the driver demotes an over-commit to system memory. None off
         NVIDIA / when NVML is unavailable, so the governor simply governs no card on those hosts.
+
+        When the device inventory was injected, the host's NVML reading describes different hardware. Use the
+        child protocol's reported free/total pair instead; a simulation can therefore provide truthful device
+        telemetry without importing a GPU runtime, while a real worker retains the stronger NVML source.
         """
+        if self._device_inventory_is_injected:
+            free_mb = self._process_map.get_free_vram_mb(device_index=device_index)
+            total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+            if free_mb is None or total_mb is None:
+                return None
+            return free_mb, total_mb
         try:
             from hordelib.utils.nvml import get_device_memory_mb
         except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash
@@ -3696,7 +3706,8 @@ class HordeWorkerProcessManager:
         process_info = self._process_map.get(process_id)
         if process_info is None or process_info.process_type != HordeProcessType.INFERENCE:
             return
-        job = process_info.last_job_referenced
+        ownership = process_info.inference_ownership
+        job = ownership.job if ownership is not None else None
         expected_total = process_info.current_job_expected_sampling_seconds
         if job is None or expected_total is None or expected_total <= 0:
             return

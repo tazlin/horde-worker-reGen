@@ -80,9 +80,17 @@ raise on a surprising message.
 A single crashed or hung slot is handled by the
 [`ProcessLifecycleManager`](process_lifecycle.md#process-replacement): the dead
 process is removed from `ProcessMap`, its model ownership is cleared, the job
-**that slot was running** (taken from its own `last_job_referenced`, never by
-scanning the map for the first in-flight job) is faulted into Layer 1, and a
+**that exact process launch was running** (taken from typed execution ownership,
+never from preload intent or by scanning the map for the first in-flight job) is
+faulted into Layer 1, and a
 replacement is spawned with a fresh `process_launch_identifier`.
+
+Process association has two explicit meanings. `PreloadJobIntent` attributes model
+preparation for display and scheduling, but grants no retry-spending ownership.
+`InferenceExecutionOwnership` records the dispatched job, launch identifier, and
+attempt ordinal. Replacement and orphan recovery accept the latter only when its
+launch still matches the live slot; a preload-only replacement cannot fault work
+that never ran.
 
 A slot that **crash-loops** (repeatedly dies shortly after being replaced) is
 *quarantined* rather than respawned forever: the lifecycle manager tracks
@@ -246,7 +254,7 @@ window is already a verdict.
 
 Hangs are counted per **distinct job** (`count_model_incidents`), which is why
 `record_model_incident` takes the `job_id` the watchdog read from the slot's
-`last_job_referenced`. A hung job is requeued when its slot is replaced and can
+current execution ownership. A hung job is requeued when its slot is replaced and can
 reach the watchdog again on the next slot, and one generation failing repeatedly
 is a single piece of evidence however many slots it costs; without the dedupe a
 lone unlucky job could quarantine a model that runs everything else fine. An
@@ -297,9 +305,9 @@ holds anyway:
   cannot misfire on a normally completed job. The job is released retryably
   (Layer 1) the tick the loss becomes observable. The slot is alive, so this is
   **not** treated as a process crash. The "from an inference-active state"
-  qualifier is essential, but not sufficient by itself: `last_job_referenced` and
-  the in-progress mark are stamped by the scheduler the instant it *dispatches* a
-  job, before the child has acknowledged it, so a slot can carry a freshly
+  qualifier is essential, but not sufficient by itself: typed execution ownership
+  and the in-progress mark are stamped by the scheduler the instant it *dispatches*
+  a job, before the child has acknowledged it, so a slot can carry a freshly
   dispatched job while it is still draining state messages from *before* the
   dispatch (the idle it reports after unloading the previous model to free VRAM,
   say). The reaper also compares the active dispatch timestamp with the state
@@ -313,12 +321,12 @@ holds anyway:
   working** is punted (retryably) once it has been un-owned for a short grace
   window. The grace rides out the brief dispatch race between marking a job
   in-progress and the slot reporting `INFERENCE_PRIMED`. The key subtlety is
-  *ownership*: a slot only owns its job while it cannot accept new work. An
-  **idle** slot (`can_accept_job()` is true) whose `last_job_referenced` still
-  points at the job does **not** shield it, because that reference is retained
-  across completion and is not a "currently running" flag. Treating a stale idle
-  reference as ownership is what previously let a single stranded job wedge the
-  whole worker.
+  *ownership*: a live slot shields only the typed execution record stamped for its
+  current launch. A preload intent and a compatibility/display reference do not
+  shield the job. An **idle** slot (`can_accept_job()` is true) likewise does not
+  prove execution is still making progress; the active-state and dispatch-epoch
+  checks decide the prompt lost-result path, while the periodic grace remains the
+  backstop.
 
 A *recurring* storm of orphan punts means something upstream keeps stranding jobs
 (a flaky GPU, say); that feeds the wedge assessment below so SOS can limp the
@@ -464,16 +472,17 @@ manager-side **actions**:
   across the transient window, so a pool that keeps rebuilding without ever serving
   work climbs the ladder to give-up instead.
 
-  The progress signal is objective forward movement: a job completion or a new
-  inference start proves upstream accepted work is moving again, so stale
-  unrecoverable-pool state is also cleared instead of carrying a past queue deadlock
-  into another soft reset. When accepted post-processing work is still pending or
-  running, though, upstream starts are not enough: only a post-processing drain
-  transition (dispatch to the lane, requeue after a lost attempt, processed result
-  moving to safety, or no-image fault) proves that the downstream lane itself is
-  making headway. The baseline these compare against is captured when the episode
-  opens and re-captured on every soft reset, so the credit is progress since the
-  latest recovery attempt, not since the episode began.
+  When accepted work exists, the progress signal is movement of the episode's
+  recovery frontier: the oldest unresolved accepted job must advance to a later stage
+  or complete successfully. Faulting or requeueing that head is not progress the
+  recovery path may use to prove itself. A follower starting or completing cannot prove that an unchanged
+  blocked head recovered. Aggregate completion and stage counters remain the
+  fallback for pool-level episodes with no accepted frontier. If unrelated work
+  advances while the frontier does not, it may earn one observation interval for
+  that throughput to reach the head; this delay neither closes the episode nor
+  consumes a reset/give-up rung, and it cannot repeat within the episode. The
+  baseline is captured when the episode opens and re-captured after a soft reset,
+  so recovery credit always describes motion since the latest recovery attempt.
 
 The escalation, in order:
 
@@ -967,20 +976,96 @@ recovers: the job eventually completes-or-faults, the slot is replaced, no
 semaphore is orphaned, and the worker keeps running.
 
 The generated scheduling sweep also drives a fake-clock composition over the
-real scheduler and job tracker. Its jobs carry independent geometries, so the
-queue includes low/high/low and high/low demand changes within one checkpoint,
-not only model-name permutations. Requested thread and queue settings are
-resolved through the production concurrency rules; the corpus includes the
-one-lane/zero-prefetch boundary, the queue cap, and the maximum thread boundary.
-Initial empty, RAM-staged, VRAM-resident, and foreign-resident states are axes.
+real scheduler and job tracker. Its jobs carry independent geometries and
+payload structures, so the queue includes low/high/low and high/low demand
+changes within one checkpoint alongside source-image and masked work, LoRA and
+textual-inversion references, ControlNet annotation and delivery modes,
+post-processing chains, batches, hires-fix, and representative sampler/scheduler
+pairs. Requested thread and queue settings are resolved through the production
+concurrency rules; the corpus includes the one-lane/zero-prefetch boundary, the
+queue cap, and the maximum thread boundary. Initial empty, RAM-staged,
+VRAM-resident, and foreign-resident states are axes, as are VRAM budgeting,
+whole-card residency, normal/moderate/high performance, and eager VRAM unload.
+
+The hand-driven child boundary completes auxiliary preparation and
+post-processing through the same tracker transitions the real child messages
+use. This keeps the scheduling projection deterministic while ensuring those
+payloads are not merely labels around plain jobs. The subprocess projection
+materializes the same descriptions as real SDK responses and sends them through
+the complete manager and protocol-faithful fake children.
+
+Generated valid traffic and capability extraction share one objective job-feature
+descriptor for source-image modes, painting, known ControlNet workflows, extended
+and SDXL ControlNet, LoRA, textual inversion, and post-processing. The generator
+therefore cannot make a row pass by silently withholding a valid payload its worker
+configuration should accept. Invalid traffic remains an explicit scripted-source
+test rather than being mixed into the valid generator.
 
 Coverage is contractual rather than inferred from the seed count. The committed
-sweep must cover every pair of its semantic axes. A modelled-card disturbance
-counts only when it changes its intended state and produces a receipt; a drawn
-event that remains inapplicable fails the scenario. The subprocess projection
-keeps at most one child event on one inference lane, where the fake process's
-local job ordinal has one unambiguous global target, and verifies that the real
-manager resolves the lane count declared by the scenario.
+sweep must cover every pair of its scenario axes, every pair of payload axes,
+and each payload choice with the queue, model, card, worker-state, and runtime
+setting that receives it. A modelled-card disturbance counts only when it
+changes its intended state and produces a receipt; a drawn event that remains
+inapplicable fails the scenario. Generated positive rows are constrained by
+model/card capability (for example, the Flux-class whole-card representative
+does not request ControlNet or hires-fix). The rejected side of those boundaries
+is retained in a separate fast popped-job contract rather than silently pruned.
+The subprocess projection keeps at most one child event on one inference lane,
+where the fake process's local job ordinal has one unambiguous global target,
+and verifies that the real manager resolves the lane count declared by the
+scenario.
+
+Full-worker rows also carry per-stage deadlines for child boot, pending inference,
+inference, post-processing, safety, and submission. A violation captures the oldest
+stage subject, stage age, every tracked job stage and age, process state and launch,
+model availability, planned VRAM, and recent action names before aborting. The
+overall scenario timeout remains a final backstop, but it is no longer the first
+diagnostic for a stage-local stall.
+
+The popped-job contract constructs real SDK responses from a pairwise array over
+baseline family, source mode, auxiliary-reference shape, ControlNet/workflow
+shape, post-processing depth, censor posture, and geometry. It independently
+asserts the capability requirements extracted from each response, then crosses
+the payload corpus with every pair of ControlNet, SDXL-ControlNet, LoRA,
+post-processing, img2img, painting, and NSFW settings. The simulated job source
+is held to the same source-mode advertising rules. Explicit higher-order rows
+retain XL ControlNet with both auxiliary classes, masked ControlNet combined with
+a post-processing chain, and uncensored XL outpainting. These decisions are pure
+and cheap, so rejected combinations and boundary arithmetic are checked without
+turning the subprocess sweep into a Cartesian product.
+
+A second fake-clock composition covers the state that a scheduling-only world
+cannot represent: process generations and recovery episodes. It constructs a
+testable process manager and leaves its tracker, process map, scheduler,
+lifecycle manager, dispatcher, recovery coordinator, and recovery supervisor
+wired by reference exactly as they are in the worker. Only child creation,
+termination, and queue transport are replaced with deterministic boundaries.
+
+Its generated replacement array pairwise-covers:
+
+- no job reference, a preload reference, and a started inference attempt;
+- unexpected child exit, recovery soft reset, and resource-driven replacement;
+- zero and one prior failed attempt;
+- one- and two-lane process maps; and
+- an empty tail, one follower, a same-model burst, and an alternating-model tail.
+
+Those rows assert generation changes, attempt deltas, terminal stages, stable
+tail ordering, and stale-message receipts. Sequence tests then exercise the
+paths a Cartesian settings test cannot: crash then successful retry, two crashes
+through retry exhaustion, crash-on-start quarantine then soft-reset revival,
+and persistent wedges with ready, absent, or live-but-hung replacement boots.
+Recovery-episode rows hold the same queue head blocked while no motion, head
+motion, follower start, follower completion, and follower fault are observed.
+This distinguishes global counters changing from the blocked condition actually
+changing. Follower throughput may defer one action interval, but cannot reset the
+frontier or defer escalation again. Positive flows accompany the non-firing assertions, so a disabled
+watchdog or inert replacement path cannot make the suite pass.
+
+The same composition exhaustively crosses orphaned inference, safety, and
+post-processing ownership with a single recoverable loss or loss through the
+stage's retry bound, against both a single job and a queued burst. This verifies
+that each stage requeues to its own pending state, reaches its own bounded
+terminal path, and leaves unrelated followers ordered and pending.
 
 ## See also
 
