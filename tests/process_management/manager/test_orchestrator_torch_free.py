@@ -30,6 +30,8 @@ _TORCH_FREE_IMPORT_MODULES = [
     "horde_worker_regen.process_management.models.component_residency_map",
     "horde_worker_regen.process_management.resources.resource_budget",
     "horde_worker_regen.process_management.jobs.job_popper",
+    "horde_worker_regen.process_management.gpu.gpu_eligibility",
+    "horde_worker_regen.process_management.gpu.gpu_pop_shaping",
     "horde_worker_regen.process_management.jobs.pool_lanes",
     "horde_worker_regen.process_management.scheduling.model_pool",
     "horde_worker_regen.process_management.scheduling.pool_ranker",
@@ -128,4 +130,25 @@ def test_building_the_gpu_sampler_reader_does_not_load_torch() -> None:
     assert result.returncode == 0, (
         f"building the GPU sampler reader loaded torch into the orchestrator:\n{result.stdout}\n{result.stderr}\n"
         "Read utilization via the torch-free hordelib.utils.nvml helper, never get_accelerator_utilization_percent."
+    )
+
+
+def test_building_a_card_feature_profile_does_not_load_torch() -> None:
+    """A real effective-card config can reach the SDK compatibility seam in a clean orchestrator."""
+    result = _run_torch_free_snippet(
+        "from horde_worker_regen.bridge_data.data_model import reGenBridgeData\n"
+        "from horde_worker_regen.process_management.gpu.gpu_eligibility import image_worker_feature_flags\n"
+        "config = reGenBridgeData.model_validate({\n"
+        "    'api_key': '0' * 22,\n"
+        "    'dreamer_name': 'startup-smoke',\n"
+        "    'models_to_load': ['Deliberate'],\n"
+        "    'allow_img2img': True,\n"
+        "    'allow_controlnet': True,\n"
+        "})\n"
+        "profile = image_worker_feature_flags(config)\n"
+        "assert profile.image_generation_feature_flags.baselines\n",
+    )
+    assert result.returncode == 0, (
+        f"building a card's canonical feature profile failed or loaded torch:\n{result.stdout}\n{result.stderr}\n"
+        "The orchestrator-side config adapter must use torch-free SDK and hordelib capability vocabularies."
     )

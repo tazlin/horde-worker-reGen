@@ -371,6 +371,7 @@ def make_job_pop_response(
     r2_upload: str | None = None,
     post_processing: list[str] | None = None,
     workflow: str | None = None,
+    use_nsfw_censor: bool = True,
 ) -> ImageGenerateJobPopResponse:
     """Create a real ImageGenerateJobPopResponse for testing."""
     job_id = uuid.uuid4()
@@ -386,6 +387,7 @@ def make_job_pop_response(
             "n_iter": n_iter,
             "seed": seed,
             "sampler_name": "k_euler",
+            "use_nsfw_censor": use_nsfw_censor,
         },
         "skipped": {},
         "source_processing": "txt2img",

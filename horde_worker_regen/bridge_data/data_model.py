@@ -568,13 +568,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     gpu_pop_balance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    """Local-queue imbalance fraction that switches the next pop from union to a single under-fed card.
+    """Local-queue imbalance fraction that prioritizes the next pop for one under-fed card.
 
-    With multiple cards the worker pops the *union* of every card's capabilities by default, then routes
-    each returned job to an eligible card. When at least this fraction of the held/in-flight work is
-    servable by only a subset of cards, the next pop is instead scoped to the under-fed card's capability
-    set, so the horde returns work that card can actually run. 0 always targets the most under-fed card;
-    1 effectively disables targeting (pure union pops). No effect on a single-GPU worker.
+    Heterogeneous cards always rotate complete card-scoped offers because independent capability unions can
+    describe jobs no card serves. When at least this fraction of held/in-flight work is unservable by one
+    card, that card is selected ahead of the normal rotation. Equivalent cards may share one combined offer.
+    0 prioritizes any observed imbalance; 1 disables imbalance prioritization. No effect on a single-GPU worker.
     """
 
     disable_terminal_ui: bool = Field(

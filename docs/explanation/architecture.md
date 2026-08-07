@@ -248,11 +248,20 @@ derives a capability envelope that covers those scripted payloads (source-image,
 SDXL-ControlNet, extended ControlNet, LoRA/TI, and post-processing); an explicit bridge override remains
 authoritative when a test intentionally needs a contradictory worker. Sustained-load
 `GeneratingJobSource` instances instead emulate the Horde's eligibility filtering over every request property
-they can resolve from a template alone: offered models, pixel limit, LoRA/TI support, post-processing, ControlNet
-variants, and source-image support. Server/account-dependent constraints such as prompt blacklists, requester kudos
+they can resolve from a template alone. Templates are materialized through the same SDK wire-feature adapter used by
+production routing, including their representative model baseline, then projected onto the pop protocol's coarse
+offer fields: models, pixel limit, LoRA/TI support, post-processing, ControlNet variants, and source-image support.
+Server/account-dependent constraints such as prompt blacklists, requester kudos
 or IP, NSFW intent, and model-average step limiting are not synthesized. Consequently dynamic pop shaping such as
 multi-GPU targeting, LoRA intake suppression, and the idle-fill model/size ladder remain load-bearing in
 simulation rather than being bypassed by its job source.
+
+A dedicated slow-band canary combines that server-style request matching with a heterogeneous two-card runtime,
+real spawned fake children, and an otherwise attractive cross-card job. It proves the startup-to-submit chain
+uses complete card-scoped SDK offers and exact dispatch routing; an independent union of model and feature axes
+would admit the cross-card job and fail the canary. A companion bounded-queue canary replaces inference children
+on both non-equivalent card routes and requires every accepted job to finish after replacement. The broader
+recovery matrix remains in separate named probes rather than multiplying every fault by every card shape.
 
 ## Where the code lives
 

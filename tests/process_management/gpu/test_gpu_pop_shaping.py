@@ -1,18 +1,24 @@
-"""Tests for A6.1 union pop advertising (gpu_pop_shaping.advertised_capabilities).
+"""Tests for card capability aggregation and safe multi-card pop shaping.
 
-A multi-GPU worker advertises one capability envelope that is the union of its cards: every model any card
-serves, a feature/NSFW flag if any card allows it, the largest max_power, and the summed thread count. The
-worker then routes each returned job to a card that can actually serve it. A single-card plan reduces to that
-one card's config.
+The aggregate helper exposes independent field unions for analysis. Production emits that envelope only for
+externally equivalent cards; heterogeneous cards require complete card-scoped requests so model, feature,
+policy, and resolution correlations remain intact. A single-card plan reduces to that card's config.
 """
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.gpu.gpu_pop_shaping import advertised_capabilities, under_fed_card
+import pytest
+
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
+    advertised_capabilities,
+    requires_card_scoped_pops,
+    under_fed_card,
+)
 from tests.process_management.conftest import make_mock_bridge_data, make_test_card_runtimes
 
 
-def _card(*, device_index: int, max_concurrent: int, **config_overrides: object) -> object:
+def _card(*, device_index: int, max_concurrent: int, **config_overrides: object) -> CardRuntime:
     """A single CardRuntime whose effective config carries the given overrides."""
     config = make_mock_bridge_data(**config_overrides)
     runtimes = make_test_card_runtimes(
@@ -24,7 +30,7 @@ def _card(*, device_index: int, max_concurrent: int, **config_overrides: object)
 
 
 class TestUnionAdvertising:
-    """The advertised envelope is the most permissive value across the driven cards."""
+    """The aggregate envelope is the most permissive value across the selected cards."""
 
     def test_unions_models_features_resolution_and_threads(self) -> None:
         """Models union, features OR, max_power max, and threads sum across the two cards."""
@@ -74,6 +80,69 @@ class TestUnionAdvertising:
         assert envelope.allow_post_processing is False
         assert envelope.max_power == 8
         assert envelope.threads == 2
+
+    def test_sdxl_controlnet_union_requires_one_card_with_that_exact_support(self) -> None:
+        """A broad ControlNet opt-in on every card does not imply SDXL ControlNet support."""
+        classic_only = _card(
+            device_index=0,
+            max_concurrent=1,
+            allow_img2img=True,
+            allow_controlnet=True,
+            allow_sdxl_controlnet=False,
+        )
+        sdxl = _card(
+            device_index=1,
+            max_concurrent=1,
+            allow_img2img=True,
+            allow_controlnet=True,
+            allow_sdxl_controlnet=True,
+        )
+
+        assert advertised_capabilities({0: classic_only}).allow_controlnet is True
+        assert advertised_capabilities({0: classic_only}).allow_sdxl_controlnet is False
+        assert advertised_capabilities({0: classic_only, 1: sdxl}).allow_sdxl_controlnet is True
+
+    def test_extended_offer_requires_every_server_extended_type(self) -> None:
+        """A backend missing any extended type must not emit the protocol's all-extended bit."""
+        card = _card(
+            device_index=0,
+            max_concurrent=1,
+            allow_img2img=True,
+            allow_controlnet=True,
+            allow_sdxl_controlnet=True,
+        )
+
+        assert advertised_capabilities({0: card}).allow_extended_controlnet is False
+
+    def test_empty_card_plan_cannot_create_a_feature_offer(self) -> None:
+        """An absent runtime plan is handled by the caller rather than represented as a fictitious profile."""
+        with pytest.raises(ValueError, match="At least one card"):
+            advertised_capabilities({})
+
+    def test_heterogeneous_models_and_features_require_card_scoped_pops(self) -> None:
+        """Do not flatten model-feature correlations into an unsafe Cartesian union."""
+        plain = _card(
+            device_index=0,
+            max_concurrent=1,
+            image_models_to_load=["plain-model"],
+            allow_controlnet=False,
+        )
+        control = _card(
+            device_index=1,
+            max_concurrent=1,
+            image_models_to_load=["control-model"],
+            allow_img2img=True,
+            allow_controlnet=True,
+        )
+
+        assert requires_card_scoped_pops({0: plain, 1: control}) is True
+
+    def test_equivalent_card_offers_remain_safe_to_union(self) -> None:
+        """Thread and hardware differences do not force scoping when every returned-job field is equivalent."""
+        first = _card(device_index=0, max_concurrent=1, image_models_to_load=["shared"], max_power=8)
+        second = _card(device_index=1, max_concurrent=2, image_models_to_load=["shared"], max_power=8)
+
+        assert requires_card_scoped_pops({0: first, 1: second}) is False
 
 
 class TestUnderFedCard:

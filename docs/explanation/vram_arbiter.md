@@ -645,9 +645,10 @@ apps; if it has not been captured yet the offer filter reads it as zero rather t
 noise term is the same proportional admission buffer used by runtime admission.
 
 At pop time, a model is excluded only when every card in the current offer scope that serves it fails that
-inequality. Multi-GPU union pops keep a model if any serving card can host it; targeted pops are scoped to
-the under-fed card's capabilities, so the same arithmetic applies to the card being advertised. Each excluded
-model logs one INFO line naming the arithmetic per card.
+inequality. A heterogeneous offer scope contains one card; equivalent cards may share a combined scope and
+keep a model if any serving card can host it. Queue imbalance can prioritize an under-fed card, so the same
+arithmetic applies to the card being advertised. Each excluded model logs one INFO line naming the arithmetic
+per card.
 
 If a doomed job still arrives because the horde answered an older offer or the reference changed, the
 scheduler faults it before any `PRELOAD_MODEL` or inference control message is sent. The fault is

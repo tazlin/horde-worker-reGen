@@ -11,6 +11,7 @@ import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopPayload,
     ImageGenerateJobPopRequest,
@@ -20,8 +21,11 @@ from horde_sdk.ai_horde_api.apimodels import (
     TIPayloadEntry,
 )
 from horde_sdk.ai_horde_api.fields import GenerationID
+from horde_sdk.generation_parameters.image.object_models import ImageGenerationFeatureFlags
+from horde_sdk.worker.dispatch.ai_horde.image.convert import image_job_pop_response_to_feature_flags
 
-from horde_worker_regen.process_management.gpu.gpu_eligibility import classify_job_features
+from horde_worker_regen.consts import VRAM_HEAVY_MODELS
+from horde_worker_regen.process_management.gpu.gpu_pop_shaping import pop_request_supports_image_features
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.simulation._dummy_images import (
     make_dummy_mask_png_bytes,
@@ -506,6 +510,53 @@ class SoakImageTemplate:
     """Relative likelihood of this template being chosen on each pop."""
 
 
+def representative_baseline_for_model(model_name: str) -> KNOWN_IMAGE_GENERATION_BASELINE:
+    """Return the representative baseline used for synthetic model records and generated jobs."""
+    if model_name in {"AlbedoBase XL (SDXL)", "Juggernaut XL"}:
+        return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+    if model_name in {"Flux.1-Schnell fp8 (Compact)", "Flux.1-Schnell fp16 (Compact)"}:
+        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
+    if model_name == "Stable Cascade 1.0":
+        return KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade
+    if model_name in VRAM_HEAVY_MODELS:
+        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
+    return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+
+
+def make_job_from_template(template: SoakImageTemplate) -> ImageGenerateJobPopResponse:
+    """Materialize one fresh accepted job from a sustained-load template."""
+    return make_canned_job(
+        template.model,
+        width=template.width,
+        height=template.height,
+        ddim_steps=template.steps,
+        n_iter=template.n_iter,
+        control_type=template.control_type,
+        return_control_map=template.return_control_map,
+        image_is_control=template.image_is_control,
+        workflow=template.workflow,
+        post_processing=template.post_processing or None,
+        hires_fix=template.hires_fix,
+        cfg_scale=template.cfg_scale,
+        loras=template.loras or None,
+        tis=template.tis or None,
+        source_processing=template.source_processing,
+        denoising_strength=template.denoising_strength,
+        seed=template.seed,
+        prompt=template.prompt,
+        sampler_name=template.sampler_name,
+        scheduler=template.scheduler,
+    )
+
+
+def image_template_to_feature_flags(template: SoakImageTemplate) -> ImageGenerationFeatureFlags:
+    """Return canonical SDK requirements for a generated-job template."""
+    return image_job_pop_response_to_feature_flags(
+        make_job_from_template(template),
+        resolved_baseline=representative_baseline_for_model(template.model),
+    )
+
+
 class GeneratingJobSource(CannedJobSource):
     """A never-exhausting job source that mints fresh jobs from weighted templates.
 
@@ -520,6 +571,7 @@ class GeneratingJobSource(CannedJobSource):
         if not templates:
             raise ValueError("GeneratingJobSource requires at least one template")
         self._templates = list(templates)
+        self._template_features = [image_template_to_feature_flags(template) for template in templates]
         self._weights = [max(template.weight, 0.0) for template in templates]
         if sum(self._weights) <= 0:
             self._weights = [1.0] * len(templates)
@@ -543,6 +595,7 @@ class GeneratingJobSource(CannedJobSource):
     @staticmethod
     def _template_matches_pop_request(
         template: SoakImageTemplate,
+        features: ImageGenerationFeatureFlags,
         pop_request: ImageGenerateJobPopRequest,
     ) -> bool:
         """Return whether the simulated Horde may assign ``template`` for this pop request.
@@ -556,30 +609,7 @@ class GeneratingJobSource(CannedJobSource):
             return False
         if template.width * template.height > pop_request.max_pixels:
             return False
-        features = classify_job_features(
-            source_processing=template.source_processing,
-            has_lora=bool(template.loras),
-            has_ti=bool(template.tis),
-            control_type=template.control_type,
-            workflow=template.workflow,
-            has_post_processing=bool(template.post_processing),
-        )
-
-        if features.has_lora and not pop_request.allow_lora:
-            return False
-        if features.has_post_processing and not pop_request.allow_post_processing:
-            return False
-
-        if features.needs_controlnet and not pop_request.allow_controlnet:
-            return False
-        if features.needs_extended_controlnet and not pop_request.allow_extended_controlnet:
-            return False
-        if features.needs_sdxl_controlnet and not pop_request.allow_sdxl_controlnet:
-            return False
-        if features.needs_painting and not pop_request.allow_painting:
-            return False
-
-        return not (features.needs_source_image and not pop_request.allow_img2img)
+        return pop_request_supports_image_features(pop_request, features)
 
     def _eligible_templates(
         self,
@@ -591,8 +621,13 @@ class GeneratingJobSource(CannedJobSource):
 
         eligible = [
             (template, weight)
-            for template, weight in zip(self._templates, self._weights, strict=True)
-            if self._template_matches_pop_request(template, pop_request)
+            for template, features, weight in zip(
+                self._templates,
+                self._template_features,
+                self._weights,
+                strict=True,
+            )
+            if self._template_matches_pop_request(template, features, pop_request)
         ]
         templates = [template for template, _weight in eligible]
         weights = [weight for _template, weight in eligible]
@@ -614,28 +649,7 @@ class GeneratingJobSource(CannedJobSource):
         if not templates:
             return make_empty_pop_response()
         template = self._rng.choices(templates, weights=weights, k=1)[0]
-        return make_canned_job(
-            template.model,
-            width=template.width,
-            height=template.height,
-            ddim_steps=template.steps,
-            n_iter=template.n_iter,
-            control_type=template.control_type,
-            return_control_map=template.return_control_map,
-            image_is_control=template.image_is_control,
-            workflow=template.workflow,
-            post_processing=template.post_processing or None,
-            hires_fix=template.hires_fix,
-            cfg_scale=template.cfg_scale,
-            loras=template.loras or None,
-            tis=template.tis or None,
-            source_processing=template.source_processing,
-            denoising_strength=template.denoising_strength,
-            seed=template.seed,
-            prompt=template.prompt,
-            sampler_name=template.sampler_name,
-            scheduler=template.scheduler,
-        )
+        return make_job_from_template(template)
 
 
 SoakAlchemyForm = tuple[str, float] | tuple[str, float, str | None]

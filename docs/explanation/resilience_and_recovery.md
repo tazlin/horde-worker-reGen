@@ -1028,7 +1028,13 @@ shape, post-processing depth, censor posture, and geometry. It independently
 asserts the capability requirements extracted from each response, then crosses
 the payload corpus with every pair of ControlNet, SDXL-ControlNet, LoRA,
 post-processing, img2img, painting, and NSFW settings. The simulated job source
-is held to the same source-mode advertising rules. Explicit higher-order rows
+also feeds representative plain, LoRA, post-processing, legacy/extended
+ControlNet, SD1, and SDXL jobs through one-, two-, and three-card offer scopes.
+Those rows vary model assignment, features, resolution ceilings, and dynamic
+feature withdrawal, and require every simulated returned job to retain at least
+one exact route. Heterogeneous cards must therefore remain card-scoped; only
+equivalent externally visible offers may be combined. The source is held to the
+same source-mode advertising rules. Explicit higher-order rows
 retain XL ControlNet with both auxiliary classes, masked ControlNet combined with
 a post-processing chain, and uncensored XL outpainting. These decisions are pure
 and cheap, so rejected combinations and boundary arithmetic are checked without

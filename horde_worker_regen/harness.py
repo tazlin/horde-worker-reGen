@@ -38,11 +38,16 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_sdk.ai_horde_api.fields import GenerationID
+from horde_sdk.generation_parameters.image.consts import (
+    KNOWN_IMAGE_SOURCE_PROCESSING,
+    KNOWN_IMAGE_WORKFLOWS,
+)
+from horde_sdk.generation_parameters.image.object_models import ImageGenerationFeatureFlags
+from horde_sdk.worker.dispatch.ai_horde.image.convert import image_job_pop_response_to_feature_flags
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.consts import VRAM_HEAVY_MODELS
-from horde_worker_regen.process_management.gpu.gpu_eligibility import JobFeatures, classify_job_features
+from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -69,8 +74,10 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     SoakAlchemyForm,
     SoakImageTemplate,
     TimedJobSource,
+    image_template_to_feature_flags,
     make_canned_job,
     make_simple_scenario,
+    representative_baseline_for_model,
 )
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     create_fake_utilities_adapter,
@@ -179,6 +186,7 @@ class HarnessStageSnapshot:
     job_stage_ages_seconds: dict[str, float]
     process_states: dict[int, str]
     process_types: dict[int, str]
+    process_devices: dict[int, int]
     process_models: dict[int, str | None]
     process_launches: dict[int, int]
     processes_reported: dict[int, bool]
@@ -504,7 +512,8 @@ class HarnessResult:
             parts.append(
                 f"deadline={stage}{subject}{age}; jobs={snapshot.job_stages}; "
                 f"processes={snapshot.process_states}; process_types={snapshot.process_types}; "
-                f"process_models={snapshot.process_models}; pop_gate={snapshot.pop_gate}; "
+                f"process_devices={snapshot.process_devices}; process_models={snapshot.process_models}; "
+                f"pop_gate={snapshot.pop_gate}; "
                 f"source={snapshot.source_progress}; aux={snapshot.aux_prefetch_summary}; "
                 f"scheduler_defer={snapshot.scheduler_defer_reason}; whole_card={snapshot.whole_card_summary}; "
                 f"models_known={snapshot.model_availability_known}; available={snapshot.available_models}; "
@@ -632,39 +641,28 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
     """Construct bridge data appropriate for the given harness configuration."""
     models_in_scenario = sorted({job.model for job in scenario if job.model is not None})
     scenario_features = [
-        classify_job_features(
-            source_processing=job.source_processing,
-            has_source_image=job.source_image is not None,
-            has_source_mask=job.source_mask is not None,
-            has_lora=bool(job.payload.loras),
-            has_ti=bool(job.payload.tis),
-            control_type=job.payload.control_type,
-            workflow=job.payload.workflow,
-            has_post_processing=bool(job.payload.post_processing),
-            is_sdxl=(
-                job.model is not None
-                and _fallback_baseline_for_harness_model(job.model)
-                == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
-            ),
+        image_job_pop_response_to_feature_flags(
+            job,
+            resolved_baseline=(representative_baseline_for_model(job.model) if job.model is not None else None),
         )
         for job in scenario
     ]
-    template_features = [
-        classify_job_features(
-            source_processing=template.source_processing,
-            has_lora=bool(template.loras),
-            has_ti=bool(template.tis),
-            control_type=template.control_type,
-            workflow=template.workflow,
-            has_post_processing=bool(template.post_processing),
-            is_sdxl=(
-                _fallback_baseline_for_harness_model(template.model)
-                == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
-            ),
+    template_features = [image_template_to_feature_flags(template) for template in config.soak_image_templates]
+    workload_features: list[ImageGenerationFeatureFlags] = [*scenario_features, *template_features]
+
+    def needs_controlnet(features: ImageGenerationFeatureFlags) -> bool:
+        return bool(
+            features.controlnets_feature_flags
+            or (features.workflows and KNOWN_IMAGE_WORKFLOWS.qr_code in features.workflows)
         )
-        for template in config.soak_image_templates
-    ]
-    workload_features: list[JobFeatures] = [*scenario_features, *template_features]
+
+    def needs_source_image(features: ImageGenerationFeatureFlags) -> bool:
+        return bool(
+            features.extra_source_images
+            or features.controlnets_feature_flags
+            or features.workflows
+            or set(features.source_processing) - {KNOWN_IMAGE_SOURCE_PROCESSING.txt2img}
+        )
 
     # Field aliases (dreamer_name, models_to_load) are required here: the bridge data
     # model populates by alias, matching the on-disk config file format.
@@ -691,25 +689,37 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         # exporting those would mix synthetic costs into the stream real measurements are read from.
         "stats_export_enabled": config.stats_export and config.process_mode == "real",
     }
-    if any(features.needs_source_image for features in workload_features):
+    if any(needs_source_image(features) for features in workload_features):
         bridge_data_fields["allow_img2img"] = True
-    if any(features.needs_painting for features in workload_features):
+    if any(
+        set(features.source_processing)
+        & {KNOWN_IMAGE_SOURCE_PROCESSING.inpainting, KNOWN_IMAGE_SOURCE_PROCESSING.outpainting}
+        for features in workload_features
+    ):
         bridge_data_fields["allow_painting"] = True
-    if any(features.needs_controlnet for features in workload_features):
+    if any(needs_controlnet(features) for features in workload_features):
         bridge_data_fields["allow_controlnet"] = True
-    if any(features.needs_extended_controlnet for features in workload_features):
+    if any(
+        features.controlnets_feature_flags
+        and set(features.controlnets_feature_flags.controlnets) & EXTENDED_CONTROL_TYPES
+        for features in workload_features
+    ):
         bridge_data_fields["extended_controlnet"] = True
-    if any(features.needs_sdxl_controlnet for features in workload_features):
+    if any(
+        (features.workflows and KNOWN_IMAGE_WORKFLOWS.qr_code in features.workflows)
+        or (needs_controlnet(features) and KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl in features.baselines)
+        for features in workload_features
+    ):
         bridge_data_fields["allow_sdxl_controlnet"] = True
     if config.alchemy_forms or config.soak_alchemy_templates:
         bridge_data_fields["alchemist"] = True
     # A workload that carries LoRA/TI references needs the worker to advertise LoRA support, or the
     # simulated pop matching (which honours the request exactly as the live API does) filters every
     # auxiliary-bearing job out of the run and the harness silently measures only the control group.
-    carries_aux_references = any(features.has_lora or features.has_ti for features in workload_features)
+    carries_aux_references = any(features.loras or features.tis for features in workload_features)
     if carries_aux_references:
         bridge_data_fields["allow_lora"] = True
-    carries_post_processing = any(features.has_post_processing for features in workload_features)
+    carries_post_processing = any(features.post_processing for features in workload_features)
     if carries_post_processing:
         bridge_data_fields["allow_post_processing"] = True
     # max_power gates the largest resolution the pop request advertises (max_pixels = power * 8 * 64 * 64),
@@ -741,21 +751,6 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         # every export is skipped when the variable is already set, so this mirrors run_worker's startup.
         bridge_data.load_env_vars()
     return bridge_data
-
-
-def _fallback_baseline_for_harness_model(model_name: str) -> KNOWN_IMAGE_GENERATION_BASELINE:
-    """Return a representative baseline for a synthetic harness model record."""
-    if model_name in {"AlbedoBase XL (SDXL)", "Juggernaut XL"}:
-        return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
-    if model_name == "Flux.1-Schnell fp8 (Compact)":
-        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
-    if model_name == "Flux.1-Schnell fp16 (Compact)":
-        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
-    if model_name == "Stable Cascade 1.0":
-        return KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade
-    if model_name in VRAM_HEAVY_MODELS:
-        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
-    return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
 
 
 def _real_image_model_reference(
@@ -811,7 +806,7 @@ def build_harness_model_reference(
             continue
         reference[job.model] = ImageGenerationModelRecord(
             name=job.model,
-            baseline=_fallback_baseline_for_harness_model(job.model),
+            baseline=representative_baseline_for_model(job.model),
             nsfw=False,
             description="e2e harness model record",
         )
@@ -1062,6 +1057,7 @@ def _capture_harness_stage_snapshot(
         },
         process_states={info.process_id: info.last_process_state.name for info in manager._process_map.values()},
         process_types={info.process_id: info.process_type.name for info in manager._process_map.values()},
+        process_devices={info.process_id: info.device_index for info in manager._process_map.values()},
         process_models={info.process_id: info.loaded_horde_model_name for info in manager._process_map.values()},
         process_launches={info.process_id: info.process_launch_identifier for info in manager._process_map.values()},
         processes_reported={info.process_id: info.has_ever_reported for info in manager._process_map.values()},

@@ -11,7 +11,7 @@ from unittest.mock import Mock
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
@@ -190,6 +190,33 @@ class TestSingleGpuNoop:
         assert scheduler._multi_gpu_routing_active is False
         job = make_job_pop_response(model="stable_diffusion")
         assert scheduler._resident_process_for_job(job) is not None
+
+    async def test_single_card_faults_exactly_ineligible_head_and_reaches_follower(self) -> None:
+        """Exact incompatibility is bounded on one card even though placement retains its legacy fast path."""
+        process_map = ProcessMap(
+            {0: make_mock_process_info(0, model_name="stable_diffusion", device_index=0)},
+        )
+        card_runtimes = make_test_card_runtimes(
+            device_indices=(0,),
+            config=_card_config(models=["stable_diffusion"], max_pixels=5_000_000),
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=card_runtimes)
+        unsupported_head = make_job_pop_response(model="stable_diffusion", workflow="future_workflow")
+        runnable_follower = make_job_pop_response(model="stable_diffusion")
+        await track_popped_job_async(scheduler._job_tracker, unsupported_head)
+        await track_popped_job_async(scheduler._job_tracker, runnable_follower)
+
+        assert await scheduler.get_next_job_and_process(information_only=False) is None
+        assert unsupported_head.id_ is not None
+        tracked_head = scheduler._job_tracker.get_tracked_job(unsupported_head.id_)
+        assert tracked_head is not None
+        assert tracked_head.stage is JobStage.PENDING_SUBMIT
+        assert tracked_head.fault_reason is not None
+        assert "workflows" in tracked_head.fault_reason
+
+        selected = await scheduler.get_next_job_and_process(information_only=False)
+        assert selected is not None
+        assert selected.next_job == runnable_follower
 
 
 def _empty_slot(process_id: int, *, device_index: int) -> Mock:

@@ -21,12 +21,16 @@ from horde_worker_regen.process_management.process_manager import SystemResource
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
+    SoakImageTemplate,
     make_alchemy_scenario,
     make_canned_job,
 )
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
 
 ScenarioFactory = Callable[[], list[ImageGenerateJobPopResponse]]
+
+_PLAIN_CARD_MODEL = "Deliberate"
+_CONTROL_CARD_MODEL = "Anything Diffusion"
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,46 @@ def _system_resources(
         per_process_overhead_mb=per_process_overhead_mb,
         marginal_process_overhead_mb=marginal_process_overhead_mb,
     )
+
+
+def _heterogeneous_card_resources() -> SystemResources:
+    """Return the two-card topology shared by the capability lifecycle canaries."""
+    return _system_resources(
+        ram_gb=32,
+        cards=((0, 8, "cuda"), (1, 12, "cuda")),
+        per_process_overhead_mb=1000,
+    )
+
+
+def _heterogeneous_card_overrides() -> dict[str, object]:
+    """Return two non-equivalent card offers with exactly one model assigned to each card."""
+    return {
+        "gpu_device_indices": [0, 1],
+        "max_threads": 1,
+        "queue_size": 1,
+        "gpu_overrides": {
+            0: {
+                "models_to_load": [_PLAIN_CARD_MODEL],
+                "allow_img2img": False,
+                "allow_controlnet": False,
+            },
+            1: {
+                "models_to_load": [_CONTROL_CARD_MODEL],
+                "allow_img2img": True,
+                "allow_controlnet": True,
+            },
+        },
+    }
+
+
+def _heterogeneous_routeable_queue() -> list[ImageGenerateJobPopResponse]:
+    """Return two jobs per card so each original child reaches its scripted second-job boundary."""
+    return [
+        make_canned_job(_PLAIN_CARD_MODEL),
+        make_canned_job(_CONTROL_CARD_MODEL, control_type="canny"),
+        make_canned_job(_PLAIN_CARD_MODEL),
+        make_canned_job(_CONTROL_CARD_MODEL, control_type="canny"),
+    ]
 
 
 def _feature_mix_scenario() -> list[ImageGenerateJobPopResponse]:
@@ -358,3 +402,79 @@ async def test_representative_worker_lifecycle_canaries(case_name: str) -> None:
 
     assert result.num_alchemy_forms_completed == case.alchemy_forms, result.failure_summary()
     assert result.num_alchemy_forms_faulted == 0, result.failure_summary()
+
+
+@pytest.mark.e2e
+async def test_heterogeneous_card_offer_and_routing_survive_spawned_worker_lifecycle() -> None:
+    """Card-scoped SDK offers feed only routeable work through a spawned multi-card worker.
+
+    The third template is deliberately a cross-card combination: its model belongs to the plain card while
+    its ControlNet requirement belongs to the other card. It has all of the global generation weight, so an
+    unsafe union offer selects it deterministically. Complete card-scoped offers exclude it and leave one
+    valid zero-weight template each; the source then normalizes that singleton and exercises both cards.
+    """
+    result = await run_harness_async(
+        HarnessConfig(
+            process_mode="fake",
+            skip_api=True,
+            soak_seconds=10.0,
+            soak_drain_timeout_seconds=30.0,
+            timeout_seconds=90.0,
+            job_delay_seconds=0.02,
+            soak_image_templates=[
+                SoakImageTemplate(model=_PLAIN_CARD_MODEL, weight=0.0),
+                SoakImageTemplate(model=_CONTROL_CARD_MODEL, control_type="canny", weight=0.0),
+                SoakImageTemplate(model=_PLAIN_CARD_MODEL, control_type="canny", weight=1.0),
+            ],
+            system_resources=_heterogeneous_card_resources(),
+            bridge_data_overrides=_heterogeneous_card_overrides(),
+        ),
+    )
+
+    assert not result.timed_out, result.failure_summary()
+    assert result.exit_reason == "completed", result.failure_summary()
+    assert result.num_jobs_faulted == 0, result.failure_summary()
+    assert result.num_jobs_submitted_faulted == 0, result.failure_summary()
+    assert result.audit_failures == [], result.failure_summary()
+    assert result.diagnostics == [], result.failure_summary()
+    assert result.metrics is not None, result.failure_summary()
+    assert result.metrics.process_crash_events == [], result.failure_summary()
+
+    records = [record for record in result.metrics.jobs if not record.is_alchemy and not record.faulted]
+    completed_models = Counter(record.model_name for record in records)
+    assert completed_models[_PLAIN_CARD_MODEL] >= 1, result.failure_summary()
+    assert completed_models[_CONTROL_CARD_MODEL] >= 1, result.failure_summary()
+    assert all(record.control_type is None for record in records if record.model_name == _PLAIN_CARD_MODEL)
+    assert all(record.control_type == "canny" for record in records if record.model_name == _CONTROL_CARD_MODEL)
+
+
+@pytest.mark.e2e
+async def test_heterogeneous_card_routing_recovers_after_spawned_children_exit() -> None:
+    """Per-card eligibility and placement remain valid after each card's original child is replaced."""
+    scenario = _heterogeneous_routeable_queue()
+    result = await run_harness_async(
+        HarnessConfig(
+            scenario=scenario,
+            process_mode="fake",
+            skip_api=True,
+            timeout_seconds=90.0,
+            job_delay_seconds=0.02,
+            inference_fault_profile=FaultProfile(crash_on_job_n=2),
+            system_resources=_heterogeneous_card_resources(),
+            bridge_data_overrides=_heterogeneous_card_overrides(),
+        ),
+    )
+
+    assert not result.timed_out, result.failure_summary()
+    assert result.exit_reason == "completed", result.failure_summary()
+    assert result.all_jobs_accounted_for, result.failure_summary()
+    assert result.num_jobs_completed == len(scenario), result.failure_summary()
+    assert result.num_jobs_faulted == 0, result.failure_summary()
+    assert result.num_jobs_submitted_faulted == 0, result.failure_summary()
+    assert result.audit_failures == [], result.failure_summary()
+    assert result.diagnostics == [], result.failure_summary()
+    assert result.metrics is not None, result.failure_summary()
+    assert result.metrics.process_crash_events, result.failure_summary()
+
+    completed_models = Counter(record.model_name for record in result.metrics.jobs if not record.faulted)
+    assert completed_models == Counter({_PLAIN_CARD_MODEL: 2, _CONTROL_CARD_MODEL: 2})

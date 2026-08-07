@@ -4,32 +4,21 @@ from typing import Protocol
 
 from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
-from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ANNOTATION_CONTROL_TYPES
+from horde_sdk.worker.dispatch.ai_horde.image.convert import (
+    AI_HORDE_EXTENDED_IMAGE_CONTROL_TYPES,
+    AI_HORDE_LEGACY_IMAGE_CONTROL_TYPES,
+)
 
 BRIDGE_CONFIG_FILENAME = "bridgeData.yaml"
 
-CLASSIC_CONTROL_TYPES = frozenset(
-    {
-        "canny",
-        "hed",
-        "depth",
-        "normal",
-        "openpose",
-        "seg",
-        "scribble",
-        "fakescribbles",
-    },
-)
+CLASSIC_CONTROL_TYPES = frozenset(control_type.value for control_type in AI_HORDE_LEGACY_IMAGE_CONTROL_TYPES)
 """The classic controlnet control types every controlnet-capable worker serves.
 
-Mirrors AI-Horde's ``LEGACY_IMAGE_CONTROL_TYPES`` in annotation spelling: the server's ``hough`` alias is
-the image-generation spelling of the ``mlsd`` line detector, and the server treats only ``hough`` (not
-``mlsd``) as classic, so ``mlsd`` is deliberately absent here and counts as extended.
+The SDK's AI Horde adapter owns this protocol vocabulary, including the distinction between the legacy
+``hough`` spelling and the extended ``mlsd`` spelling.
 """
 
-EXTENDED_CONTROL_TYPES = frozenset(
-    member.value for member in KNOWN_ANNOTATION_CONTROL_TYPES if member.value not in CLASSIC_CONTROL_TYPES
-)
+EXTENDED_CONTROL_TYPES = frozenset(control_type.value for control_type in AI_HORDE_EXTENDED_IMAGE_CONTROL_TYPES)
 """The extended controlnet control types (everything the annotators can produce beyond the classic set).
 
 A worker only advertises ``allow_extended_controlnet`` once its annotators cover this whole set, because the

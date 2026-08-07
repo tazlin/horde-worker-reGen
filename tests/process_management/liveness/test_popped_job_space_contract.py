@@ -20,19 +20,35 @@ from horde_sdk.ai_horde_api.apimodels import (
     LorasPayloadEntry,
     TIPayloadEntry,
 )
+from horde_sdk.generation_parameters.generic.consts import KNOWN_AUX_MODEL_SOURCE
+from horde_sdk.generation_parameters.image.consts import (
+    KNOWN_IMAGE_CONTROLNETS,
+    KNOWN_IMAGE_SAMPLERS,
+    KNOWN_IMAGE_SCHEDULERS,
+    KNOWN_IMAGE_SOURCE_PROCESSING,
+)
+from horde_sdk.generation_parameters.image.object_models import ControlnetFeatureFlags, ImageGenerationFeatureFlags
+from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_feature_flags_to_pop_request
 
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.gpu.gpu_eligibility import (
     CardProfile,
     JobRequirements,
     card_can_serve,
+    card_eligibility_for,
     describe_job_requirements,
+)
+from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
+    advertised_capabilities,
+    requires_card_scoped_pops,
 )
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     GeneratingJobSource,
     SoakImageTemplate,
     make_canned_job,
+    representative_baseline_for_model,
 )
-from tests.process_management.conftest import make_mock_bridge_data
+from tests.process_management.conftest import make_mock_bridge_data, make_test_card_runtimes
 
 _SD15 = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1.value
 _SDXL = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value
@@ -171,20 +187,30 @@ def _expected_requirements(case: _MaterializedPayload) -> JobRequirements:
     aux = str(row["aux"])
     width, height = row["geometry"]  # type: ignore[misc]
     baseline = row["baseline"]
+    post_processing = {
+        "none": None,
+        "single": ["GFPGAN"],
+        "chain": ["GFPGAN", "RealESRGAN_x4plus"],
+    }[str(row["post_processing"])]
     return JobRequirements(
         model="covered-model",
         baseline=baseline if isinstance(baseline, str) else None,
         weight_mb=2048.0,
-        is_sdxl=baseline == _SDXL,
-        needs_controlnet=control in {"canny", "qr_code"},
-        needs_lora=aux in {"lora", "both"},
-        needs_post_processing=row["post_processing"] != "none",
-        needs_img2img=source != "txt2img" or control != "none",
-        needs_inpainting=source in {"inpainting", "outpainting"},
+        image_features=ImageGenerationFeatureFlags(
+            baselines=[baseline or KNOWN_IMAGE_GENERATION_BASELINE.infer],
+            schedulers=[KNOWN_IMAGE_SCHEDULERS.karras],
+            samplers=[KNOWN_IMAGE_SAMPLERS.k_euler],
+            controlnets_feature_flags=(
+                ControlnetFeatureFlags(controlnets=[KNOWN_IMAGE_CONTROLNETS.canny]) if control == "canny" else None
+            ),
+            post_processing=post_processing,
+            source_processing=[KNOWN_IMAGE_SOURCE_PROCESSING(source)],
+            workflows=[control] if control in {"qr_code", "custom_workflow"} else None,
+            tis=[KNOWN_AUX_MODEL_SOURCE.HORDELING] if aux in {"ti", "both"} else None,
+            loras=[KNOWN_AUX_MODEL_SOURCE.CIVITAI] if aux in {"lora", "both"} else None,
+        ),
         needs_nsfw=bool(row["uncensored"]),
         pixels=width * height,
-        needs_sdxl_controlnet=control == "qr_code" or (baseline == _SDXL and control in {"canny", "qr_code"}),
-        has_ti=aux in {"ti", "both"},
     )
 
 
@@ -207,23 +233,35 @@ def _card(row: _Row) -> CardProfile:
     )
 
 
-def _expected_eligibility(config: _Row, requirements: JobRequirements) -> bool:
+def _expected_eligibility(config: _Row, case: _MaterializedPayload) -> bool:
     """Evaluate the public conjunction independently of the production helper."""
-    if requirements.needs_controlnet and not config["allow_controlnet"]:
+    row = case.row
+    source = str(row["source"])
+    control = str(row["control"])
+    aux = str(row["aux"])
+    width, height = row["geometry"]  # type: ignore[misc]
+
+    if row["baseline"] == "flux":
         return False
-    if requirements.needs_sdxl_controlnet and not config["allow_sdxl_controlnet"]:
+    if control == "custom_workflow":
         return False
-    if requirements.needs_lora and not config["allow_lora"]:
+    if control in {"canny", "qr_code"} and not config["allow_controlnet"]:
         return False
-    if requirements.needs_post_processing and not config["allow_post_processing"]:
+    if (control == "qr_code" or (row["baseline"] == _SDXL and control == "canny")) and not config[
+        "allow_sdxl_controlnet"
+    ]:
         return False
-    if requirements.needs_img2img and not config["allow_img2img"]:
+    if aux in {"lora", "both"} and not config["allow_lora"]:
         return False
-    if requirements.needs_inpainting and not config["allow_inpainting"]:
+    if row["post_processing"] != "none" and not config["allow_post_processing"]:
         return False
-    if requirements.needs_nsfw and not config["nsfw"]:
+    if (source != "txt2img" or control != "none") and not config["allow_img2img"]:
         return False
-    return requirements.pixels <= 64 * 128
+    if source in {"inpainting", "outpainting"} and not config["allow_inpainting"]:
+        return False
+    if row["uncensored"] and not config["nsfw"]:
+        return False
+    return width * height <= 64 * 128
 
 
 @pytest.mark.parametrize("config", _CAPABILITY_ROWS, ids=lambda row: "-".join(str(value) for value in row.values()))
@@ -238,7 +276,7 @@ def test_capability_setting_pairs_route_the_payload_covering_array(
     card = _card(config)
     for case in _MATERIALIZED_PAYLOADS:
         requirements = _expected_requirements(case)
-        assert card_can_serve(card, requirements) is _expected_eligibility(config, requirements), case.row
+        assert card_can_serve(card, requirements) is _expected_eligibility(config, case), case.row
 
 
 def _pop_request(**overrides: object) -> ImageGenerateJobPopRequest:
@@ -290,6 +328,172 @@ def test_generated_pop_source_respects_source_mode_capabilities(
             _pop_request(**{withheld_setting: False}),
         )
         assert rejected.id_ is None
+
+
+def test_generated_pop_source_keeps_textual_inversion_independent_of_lora_offer() -> None:
+    """The simulated service does not apply the LoRA-specific pop bit to textual inversions."""
+    template = SoakImageTemplate(
+        model="covered-model",
+        width=64,
+        height=64,
+        tis=[TIPayloadEntry(name="covered-ti", inject_ti="prompt")],
+    )
+
+    accepted = GeneratingJobSource([template], seed=1).next_pop_response(_pop_request(allow_lora=False))
+
+    assert accepted.id_ is not None
+    assert accepted.payload.tis
+
+
+def test_generated_pop_source_applies_sdxl_controlnet_offer_by_model_baseline() -> None:
+    """SDXL ControlNet work requires the SDXL-specific offer even without a QR workflow."""
+    template = SoakImageTemplate(
+        model="Juggernaut XL",
+        control_type="canny",
+        source_processing="img2img",
+    )
+
+    rejected = GeneratingJobSource([template], seed=1).next_pop_response(
+        _pop_request(allow_sdxl_controlnet=False, models=["Juggernaut XL"]),
+    )
+
+    assert rejected.id_ is None
+
+
+_ROUTEABILITY_TEMPLATES = (
+    SoakImageTemplate(model="Deliberate", width=64, height=64),
+    SoakImageTemplate(
+        model="Deliberate",
+        width=64,
+        height=64,
+        loras=[LorasPayloadEntry(name="route-lora")],
+    ),
+    SoakImageTemplate(
+        model="Deliberate",
+        width=64,
+        height=64,
+        post_processing=["RealESRGAN_x4plus"],
+    ),
+    SoakImageTemplate(
+        model="Juggernaut XL",
+        width=64,
+        height=64,
+        source_processing="img2img",
+        control_type="canny",
+    ),
+    SoakImageTemplate(
+        model="Deliberate",
+        width=64,
+        height=64,
+        source_processing="img2img",
+        control_type="canny",
+    ),
+    SoakImageTemplate(
+        model="Juggernaut XL",
+        width=64,
+        height=64,
+        source_processing="img2img",
+        control_type="color",
+    ),
+)
+
+
+def _routeability_cards(topology: str) -> dict[int, CardRuntime]:
+    """Return one compact heterogeneous topology for pop-to-routeability contracts."""
+    configs = [
+        make_mock_bridge_data(
+            image_models_to_load=["Deliberate"],
+            allow_controlnet=False,
+            allow_lora=False,
+            allow_post_processing=False,
+            max_power=2,
+        ),
+    ]
+    if topology in {"dual", "triple"}:
+        configs.append(
+            make_mock_bridge_data(
+                image_models_to_load=["Juggernaut XL"],
+                allow_img2img=True,
+                allow_controlnet=True,
+                allow_sdxl_controlnet=True,
+                allow_lora=False,
+                allow_post_processing=False,
+                max_power=8,
+            ),
+        )
+    if topology == "triple":
+        configs.append(
+            make_mock_bridge_data(
+                image_models_to_load=["Deliberate"],
+                allow_controlnet=False,
+                allow_lora=True,
+                allow_post_processing=True,
+                max_power=4,
+            ),
+        )
+
+    cards: dict[int, CardRuntime] = {}
+    for device_index, config in enumerate(configs):
+        config.max_pixels = int(config.max_power) * 8 * 64 * 64
+        config.nsfw = True
+        cards.update(
+            make_test_card_runtimes(
+                device_indices=(device_index,),
+                config=config,
+                total_vram_mb=8192.0 + device_index * 8192.0,
+            ),
+        )
+    return cards
+
+
+@pytest.mark.parametrize("topology", ["single", "dual", "triple"])
+@pytest.mark.parametrize(
+    "dynamic_withholding",
+    [frozenset(), frozenset({"control"}), frozenset({"post"}), frozenset({"lora"})],
+)
+def test_every_simulated_return_from_heterogeneous_offer_has_a_route(
+    topology: str,
+    dynamic_withholding: frozenset[str],
+) -> None:
+    """Cross static card offers and live narrowing without returning a job no active card can serve."""
+    cards = _routeability_cards(topology)
+    scopes = (
+        [{device_index: card} for device_index, card in cards.items()] if requires_card_scoped_pops(cards) else [cards]
+    )
+
+    returned = 0
+    for scope in scopes:
+        advertised = advertised_capabilities(scope)
+        request = apply_image_worker_feature_flags_to_pop_request(
+            ImageGenerateJobPopRequest(
+                apikey="0000000000",
+                name="routeability-worker",
+                models=sorted(advertised.models),
+                max_pixels=advertised.max_power * 8 * 64 * 64,
+            ),
+            advertised.image_worker_features,
+        ).model_copy(
+            update={
+                "allow_controlnet": "control" not in dynamic_withholding and advertised.allow_controlnet,
+                "allow_sdxl_controlnet": ("control" not in dynamic_withholding and advertised.allow_sdxl_controlnet),
+                "allow_post_processing": ("post" not in dynamic_withholding and advertised.allow_post_processing),
+                "allow_lora": "lora" not in dynamic_withholding and advertised.allow_lora,
+            },
+        )
+
+        for ordinal, template in enumerate(_ROUTEABILITY_TEMPLATES):
+            response = GeneratingJobSource([template], seed=ordinal).next_pop_response(request)
+            if response.id_ is None:
+                continue
+            returned += 1
+            baseline = representative_baseline_for_model(template.model)
+            verdict = card_eligibility_for(response, cards, baseline=baseline, weight_mb=None)
+            assert verdict.eligible_card_indices, (
+                f"{topology=} {dynamic_withholding=} {scope.keys()=} returned {template=} without a route: "
+                f"{verdict.reason_summary()}"
+            )
+
+    assert returned > 0
 
 
 def test_payload_and_capability_arrays_cover_every_declared_pair() -> None:

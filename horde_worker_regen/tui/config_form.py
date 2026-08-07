@@ -1553,9 +1553,9 @@ GPU_GLOBAL_FIELDS: list[ConfigField] = [
         "Pop balance threshold",
         FieldKind.FLOAT,
         "Multi-GPU",
-        "Local-queue imbalance fraction that switches the next job pop from the union of all cards to a "
-        "single under-fed card. 0 always targets the most starved card; 1 disables targeting. No effect "
-        "on a single-GPU worker.",
+        "Local-queue imbalance fraction that prioritizes the next job pop for one under-fed card. "
+        "Heterogeneous cards otherwise rotate complete card-scoped offers. 0 prioritizes any observed "
+        "imbalance; 1 disables imbalance prioritization. No effect on a single-GPU worker.",
         minimum=0.0,
         maximum=1.0,
         explicit_default=GPU_POP_BALANCE_THRESHOLD_DEFAULT,

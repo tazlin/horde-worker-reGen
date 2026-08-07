@@ -1475,6 +1475,40 @@ class TestHeadOfQueueNotWedgedByAffinity:
         # Only the idle resident is a legal displacement target; the live slot is untouched.
         assert live.last_control_flag != HordeControlFlag.PRELOAD_MODEL
 
+    async def test_head_room_never_uses_an_ineligible_card(self) -> None:
+        """The anti-starvation fallback overrides affinity, not the head's card compatibility."""
+        head_model = "card-zero-model"
+        card_zero_config = make_mock_bridge_data(image_models_to_load=[head_model])
+        card_one_config = make_mock_bridge_data(image_models_to_load=["card-one-model"])
+        card_runtimes = {
+            0: make_test_card_runtimes(device_indices=(0,), config=card_zero_config)[0],
+            1: make_test_card_runtimes(device_indices=(1,), config=card_one_config)[1],
+        }
+        busy_eligible = make_mock_process_info(
+            0,
+            model_name="live-model",
+            state=HordeProcessState.INFERENCE_STARTING,
+            device_index=0,
+        )
+        idle_ineligible = make_mock_process_info(
+            1,
+            model_name="card-one-model",
+            state=HordeProcessState.WAITING_FOR_JOB,
+            device_index=1,
+        )
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response(head_model))
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: busy_eligible, 1: idle_ineligible}),
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(image_models_to_load=[head_model, "card-one-model"]),
+            card_runtimes=card_runtimes,
+            max_inference=2,
+        )
+
+        assert scheduler.preload_models() is False
+        assert idle_ineligible.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
 
 class TestSpeculativeDispatchCap:
     """Tests for _max_jobs_in_progress_allowed (lease-gated speculative pre-staging)."""

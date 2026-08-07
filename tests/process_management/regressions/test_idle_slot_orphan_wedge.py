@@ -196,30 +196,32 @@ class TestWatchdogPuntsIdleShieldedOrphan:
 
 
 class TestPhantomInProgressJobWedgesDispatch:
-    """End-to-end: the phantom in-progress job blocks all dispatch until the watchdog clears it.
+    """A phantom in-progress job blocks dispatch until the watchdog clears it.
 
     The process manager shares one ``job_tracker`` and ``process_map`` between the orphan watchdog and the
-    inference scheduler, so these exercise the real interaction that produced the incident.
+    inference scheduler, so these exercise their stateful interaction.
     """
 
     async def test_phantom_in_progress_job_wedges_dispatch_until_watchdog_clears_it(self) -> None:
-        """Reconstructs the wedge and proves the watchdog fix re-opens dispatch.
+        """The watchdog releases capacity held by an orphan and re-opens dispatch.
 
         With ``max_threads=1`` the in-progress cap is 1. A phantom in-progress job (owned only by an idle
         slot) holds that single slot, so the scheduler refuses to dispatch the ready, preloaded head. Before
         the fix the watchdog cannot clear the phantom, so dispatch stays wedged; after the fix the watchdog
         punts it, the cap re-opens, and the head dispatches.
         """
-        pm = make_testable_process_manager(max_threads=1)
+        pm = make_testable_process_manager(
+            max_threads=1,
+            image_models_to_load=["WAI-NSFW-illustrious-SDXL", "AlbedoBase XL 3.1"],
+        )
 
-        # The ready head: its model is resident and preloaded on process 1, exactly the
-        # PRELOADED_MODEL-with-a-matching-pending-job state observed during the wedge.
+        # The ready head's model is resident and preloaded on process 1.
         ready_head_slot = make_mock_process_info(
             1,
             model_name="WAI-NSFW-illustrious-SDXL",
             state=HordeProcessState.PRELOADED_MODEL,
         )
-        # The slot stranded by the recovery storm: idle, but still referencing a job stuck in progress.
+        # The other slot is idle but still references a job stuck in progress.
         stranded_slot = make_mock_process_info(
             2,
             model_name="AlbedoBase XL 3.1",
@@ -266,7 +268,10 @@ class TestPhantomInProgressJobWedgesDispatch:
         process, and the queue are otherwise healthy, so a ready head is scheduled at once. It passes both
         before and after the fix, proving the wedge is caused by the un-punted phantom rather than the cap.
         """
-        pm = make_testable_process_manager(max_threads=1)
+        pm = make_testable_process_manager(
+            max_threads=1,
+            image_models_to_load=["WAI-NSFW-illustrious-SDXL"],
+        )
 
         ready_head_slot = make_mock_process_info(
             1,

@@ -8,8 +8,12 @@ max_power. Any single failure rules the card out; an unknown fact abstains rathe
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.generation_parameters.image.consts import KNOWN_IMAGE_CONTROLNETS
+from horde_sdk.generation_parameters.image.object_models import ControlnetFeatureFlags
 
 from horde_worker_regen.process_management.gpu.gpu_eligibility import (
     CardProfile,
@@ -64,25 +68,32 @@ class TestCardCanServe:
     def test_feature_not_allowed_excludes_card(self) -> None:
         """A ControlNet job is ineligible on a card that disables ControlNet."""
         profile = _profile(device_index=0, total_vram_mb=24576, served={"m"}, allow_controlnet=False)
-        # The pop payload is frozen, so build the requirements directly to flag a ControlNet need.
+        requirements = describe_job_requirements(make_job_pop_response(model="m"), None, None)
         requirements = JobRequirements(
-            model="m",
-            baseline=None,
-            weight_mb=None,
-            is_sdxl=False,
-            needs_controlnet=True,
-            needs_lora=False,
-            needs_post_processing=False,
-            needs_img2img=False,
-            needs_inpainting=False,
-            needs_nsfw=False,
-            pixels=262144,
+            model=requirements.model,
+            baseline=requirements.baseline,
+            weight_mb=requirements.weight_mb,
+            image_features=requirements.image_features.model_copy(
+                update={
+                    "controlnets_feature_flags": ControlnetFeatureFlags(
+                        controlnets=[KNOWN_IMAGE_CONTROLNETS.canny],
+                    ),
+                },
+            ),
+            needs_nsfw=requirements.needs_nsfw,
+            pixels=requirements.pixels,
         )
         assert card_can_serve(profile, requirements) is False
 
     def test_unknown_facts_abstain(self) -> None:
         """With no served set and no weight estimate, only feature/resolution can exclude (none do here)."""
         profile = _profile(device_index=0, total_vram_mb=None, served=None)
+        job = make_job_pop_response(model="m", width=512, height=512)
+        assert card_can_serve(profile, describe_job_requirements(job, None, None)) is True
+
+    def test_unknown_pixel_limit_abstains(self) -> None:
+        """An unavailable numeric limit is not interpreted as a real resolution ceiling."""
+        profile = _profile(device_index=0, total_vram_mb=24576, served={"m"}, max_pixels=Mock())
         job = make_job_pop_response(model="m", width=512, height=512)
         assert card_can_serve(profile, describe_job_requirements(job, None, None)) is True
 

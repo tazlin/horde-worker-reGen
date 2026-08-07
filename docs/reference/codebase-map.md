@@ -72,7 +72,7 @@ module paths directly.
 | `jobs/` | The unit of work: pop, submit, track, classify failures, alchemy coordination, the fixed-pool pop lanes, job data models, and source-image downloads. |
 | `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, the per-process RAM component-residency map, cache, LoRA guards/backoff, download coordination, and download scheduling. |
 | `resources/` | Runtime resource accounting: VRAM/RAM budgets, VRAM arbitration, attribution, device info, system memory, duty-cycle summaries, and run metrics. |
-| `gpu/` | Multi-GPU routing primitives: card runtime state, eligibility checks, and advertised pop-shaping capabilities. |
+| `gpu/` | Multi-GPU routing primitives: card runtime state, SDK image-feature profile adaptation and compatibility composition, local resource/policy eligibility, and safe card-scoped/combined pop shaping. |
 | `ipc/` | Message types, channels, dispatch, supervisor protocol, action ledger, and API sessions. |
 | `config/` | Live runtime config, bridge-data reload orchestration, mutable worker state, and worker identity preflight. |
 | `simulation/` | Dry-run and test-double modules that are imported by both tests and the harness. |

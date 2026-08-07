@@ -16,6 +16,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopRequest,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_feature_flags_to_pop_request
 from loguru import logger
 
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
@@ -24,6 +25,7 @@ from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_c
 from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
     AdvertisedCapabilities,
     advertised_capabilities,
+    requires_card_scoped_pops,
     under_fed_card,
 )
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
@@ -207,9 +209,8 @@ def _select_models_for_pop(
         max_inference_processes: The provisioned inference-process ceiling.
         last_pop_had_no_jobs: Whether the previous pop returned nothing (relaxes stickiness).
         model_availability: When provided, drops models not yet on disk.
-        configured_models: The candidate model set to draw from. On a multi-GPU host this is the union of
-            every card's configured models; when None it defaults to the global ``image_models_to_load``,
-            byte-identical to the single-GPU behaviour.
+        configured_models: The candidate model set in the current safe offer scope. When None it defaults
+            to the global ``image_models_to_load``, byte-identical to the legacy single-GPU behaviour.
         card_runtimes: The per-card runtime plan. On a multi-GPU host a model is held back as unservable only
             when it is unservable on *every* card that serves it (so a model fine on a big card keeps being
             advertised); when None or single-card the worker-wide streak decides, as before.
@@ -473,9 +474,9 @@ class JobPopper:
         When `model_availability` is provided, only models present on disk are advertised in
         pop requests (a missing model would otherwise be popped and then fault).
 
-        When `card_runtimes` has more than one card, the pop advertises the union of the cards'
-        capabilities (models, features, resolution, threads); a single card (or None) advertises the global
-        config exactly as before.
+        When `card_runtimes` has more than one card, equivalent card offers are safely unioned. Heterogeneous
+        offers rotate through one card at a time because the API cannot preserve correlations between models,
+        features, policy and resolution in one union. A single card (or None) advertises the global config.
 
         `whole_card_residency_active` is queried by the large-model re-entry cooldown to know whether a
         whole-card residency lease is still held; it defaults to "never held" so a worker wired without it
@@ -600,6 +601,9 @@ class JobPopper:
         self._pool_last_fixed_seat_count = 0
         self._pool_lane_this_cycle: PopLane | None = None
         self._pool_last_routed_lane: PopLane | None = None
+        # Heterogeneous card offers rotate deterministically when no queue imbalance names a more urgent card.
+        # The cursor is local scheduling state; it does not alter or duplicate any capability facts.
+        self._card_scoped_pop_cursor = 0
         self._large_model_pop_governor = LargeModelPopGovernor()
         # Edge-log anchor for the VRAM-pressure offer narrowing, so a steady narrow (or steady full) offer is
         # never re-logged pop after pop.
@@ -649,19 +653,28 @@ class JobPopper:
 
     @property
     def _multi_gpu_advertise(self) -> bool:
-        """Whether the pop advertises a union across cards (the worker drives more than one)."""
+        """Whether the worker shapes offers from more than one card runtime."""
         return len(self._card_runtimes) > 1
 
     def _advertised_capabilities(self) -> AdvertisedCapabilities | None:
-        """The union pop envelope on a multi-GPU host, or None on a single-GPU host (use the global config).
+        """Return the canonical card-profile union, or None before a card plan exists.
 
-        Returns None when the worker drives one card (or none), so the caller advertises the global config
-        exactly as before; otherwise the union of every card's capabilities (see
-        :func:`~horde_worker_regen.process_management.gpu.gpu_pop_shaping.advertised_capabilities`).
+        A single-card plan reduces to that card's effective configuration. Returning the same canonical
+        envelope for one or several cards keeps pop shaping and post-pop routing on one feature seam. See
+        :func:`~horde_worker_regen.process_management.gpu.gpu_pop_shaping.advertised_capabilities`.
         """
-        if not self._multi_gpu_advertise:
+        if not self._card_runtimes:
             return None
         return advertised_capabilities(self._card_runtimes)
+
+    def _next_card_scoped_pop(self) -> int:
+        """Return the next card in the stable fair rotation for a heterogeneous offer."""
+        card_indices = sorted(self._card_runtimes)
+        if not card_indices:
+            raise RuntimeError("A card-scoped pop requires at least one card runtime.")
+        selected = card_indices[self._card_scoped_pop_cursor % len(card_indices)]
+        self._card_scoped_pop_cursor = (self._card_scoped_pop_cursor + 1) % len(card_indices)
+        return selected
 
     def _gpu_pop_balance_threshold(self, bridge_data: reGenBridgeData) -> float:
         """The configured fraction of held work a card must be unable to serve before a pop targets it.
@@ -674,7 +687,7 @@ class JobPopper:
         return max(0.0, min(1.0, float(raw)))
 
     def _targeted_under_fed_card(self, bridge_data: reGenBridgeData) -> int | None:
-        """The under-fed card this pop should be scoped to, or None to keep union-popping.
+        """The under-fed card this pop should be scoped to, or None for the topology's normal strategy.
 
         Computes, for every held job (queued, including those already in flight), which cards could serve it,
         then asks :func:`~horde_worker_regen.process_management.gpu.gpu_pop_shaping.under_fed_card` whether one
@@ -1790,23 +1803,26 @@ class JobPopper:
 
         self._state.last_job_pop_time = time.time()
 
-        # On a multi-GPU host advertise the union of every card's capabilities so the horde returns work
-        # any card can run (the worker then routes each job to an eligible card); single-GPU advertises the
-        # global config unchanged.
+        # Equivalent cards form one safe union. Heterogeneous cards cannot: the wire shape would combine
+        # models/features/limits contributed by different cards into jobs no card necessarily serves.
         advertised = self._advertised_capabilities()
         advertised_card_runtimes = self._card_runtimes
 
         # Adaptive targeting: when the local queue is lopsided away from one card (most held work is servable
-        # only by other cards), scope THIS pop to the under-fed card's capabilities so the horde returns work
-        # it can actually run, instead of more work for the already-fed cards. Union-pop otherwise.
+        # only by other cards), scope THIS pop to the under-fed card's capabilities. When no card is under-fed,
+        # heterogeneous plans still rotate card-scoped offers; only equivalent profiles are safe to union.
         if advertised is not None:
-            under_fed = self._targeted_under_fed_card(bridge_data)
-            if under_fed is not None:
-                advertised_card_runtimes = {under_fed: self._card_runtimes[under_fed]}
+            target_card = self._targeted_under_fed_card(bridge_data)
+            target_reason = "queue imbalance"
+            if target_card is None and requires_card_scoped_pops(self._card_runtimes):
+                target_card = self._next_card_scoped_pop()
+                target_reason = "heterogeneous offer rotation"
+            if target_card is not None:
+                advertised_card_runtimes = {target_card: self._card_runtimes[target_card]}
                 advertised = advertised_capabilities(advertised_card_runtimes)
                 logger.debug(
-                    f"Adaptive pop: local queue is lopsided away from card {under_fed}; scoping this pop to "
-                    "its capabilities.",
+                    f"Card-scoped pop: selecting card {target_card} due to {target_reason}; the request carries "
+                    "only combinations that card can serve.",
                 )
 
         models = _select_models_for_pop(
@@ -1949,6 +1965,7 @@ class JobPopper:
         pop_allow_extended_controlnet = (
             bridge_data.extended_controlnet is True
             and pop_allow_controlnet
+            and (advertised is None or advertised.allow_extended_controlnet)
             and self._extended_controlnet_ready_provider()
             and server_supports_extended_controlnet()
         )
@@ -1981,6 +1998,24 @@ class JobPopper:
                 limit_max_steps=bridge_data.limit_max_steps,
                 allow_lora=pop_allow_lora,
                 amount=bridge_data.max_batch,
+            )
+            if advertised is not None:
+                job_pop_request = apply_image_worker_feature_flags_to_pop_request(
+                    job_pop_request,
+                    advertised.image_worker_features,
+                )
+            # Live readiness, storage pressure, server support and idle-fill policy may only narrow the static
+            # canonical projection. Keeping these overrides at the final boundary makes that ordering explicit.
+            job_pop_request = job_pop_request.model_copy(
+                update={
+                    "allow_img2img": pop_allow_img2img,
+                    "allow_painting": pop_allow_painting,
+                    "allow_post_processing": pop_allow_post_processing,
+                    "allow_controlnet": pop_allow_controlnet,
+                    "allow_extended_controlnet": pop_allow_extended_controlnet,
+                    "allow_sdxl_controlnet": pop_allow_sdxl_controlnet,
+                    "allow_lora": pop_allow_lora,
+                },
             )
 
             if self._dry_run_skip_api:

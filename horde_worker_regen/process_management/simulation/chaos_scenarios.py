@@ -867,7 +867,11 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
     ),
     (
         "multi-card hosts are not generated",
-        "every scenario runs one card. Card-count topology is the canary simulations' axis.",
+        "every stateful scenario runs one card. A compact pop-to-routeability contract crosses one-, two-, "
+        "and three-card topologies, heterogeneous model/feature/limit profiles, and dynamic feature "
+        "withholding without process startup. A dedicated spawned-worker canary crosses heterogeneous "
+        "card-scoped offers with server-style request matching and exact dispatch routing; a second canary "
+        "replaces inference children while both non-equivalent card routes carry accepted work.",
     ),
     (
         "runtime settings use the scheduling choices that alter this runner's state transitions",

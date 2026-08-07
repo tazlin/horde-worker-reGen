@@ -20,7 +20,10 @@ from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
-from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_card_indices_for
+from horde_worker_regen.process_management.gpu.gpu_eligibility import (
+    CardEligibilityVerdict,
+    card_eligibility_for,
+)
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
@@ -8067,7 +8070,7 @@ class InferenceScheduler:
             # back to a displacement target that spares live work and prefers an idle resident model
             # no queued job needs. This is the budget-independent counterpart to the budget-gated
             # make-room escalation in the admission pipeline.
-            available_process = self._select_head_room_process()
+            available_process = self._select_head_room_process(job)
 
         if available_process is None:
             return self._preload_outcome(
@@ -8209,16 +8212,19 @@ class InferenceScheduler:
             and process_info.last_process_state == HordeProcessState.WAITING_FOR_JOB
         )
 
-    def _select_head_room_process(self) -> HordeProcessInfo | None:
-        """Pick an idle inference process to free for a starved head-of-queue job, or None.
+    def _select_head_room_process(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+        """Pick an eligible idle process to free for a starved head-of-queue job, or None.
 
         Used when the normal preload picker found no slot because affinity (provisioned against the
         inference-process ceiling) or the queued-model guard protected every idle process. The head must
-        still make progress, so this deliberately overrides those guards. It never returns a process
-        running live work (only ``can_accept_job()`` slots, and never one whose model is in progress) and
-        prefers the cheapest displacement: an empty slot, then one holding a resident model no pending or
-        in-progress job needs, then, as a last resort, one holding a merely-queued model.
+        still make progress, so this deliberately overrides those guards. It never overrides card eligibility:
+        on a multi-card worker, a temporarily busy or restarting eligible card cannot make another card a valid
+        preload target. Among eligible slots it never returns a process running live work (only
+        ``can_accept_job()`` slots, and never one whose model is in progress) and prefers the cheapest
+        displacement: an empty slot, then one holding a resident model no pending or in-progress job needs, then,
+        as a last resort, one holding a merely-queued model.
         """
+        eligible_cards = self._eligible_card_indices(job) if self._multi_gpu_routing_active else None
         slots = tuple(
             PreloadSlotSnapshot(
                 process_id=process_info.process_id,
@@ -8227,6 +8233,7 @@ class InferenceScheduler:
             )
             for process_info in self._process_map.values()
             if process_info.process_type == HordeProcessType.INFERENCE
+            and (eligible_cards is None or process_info.device_index in eligible_cards)
         )
         chosen_id = select_head_room_process_id(
             slots,
@@ -8284,10 +8291,14 @@ class InferenceScheduler:
         weights, enable every feature it needs, and allow its resolution. An unknown fact never excludes a
         card (the eligibility primitive abstains), so this only ever narrows routing on a genuine mismatch.
         """
+        return self._card_eligibility(job).eligible_card_indices
+
+    def _card_eligibility(self, job: ImageGenerateJobPopResponse) -> CardEligibilityVerdict:
+        """Return exact per-card reasons behind the routing verdict for ``job``."""
         baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
         baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
         weight_mb = predict_job_weight_mb(job, baseline)
-        return eligible_card_indices_for(
+        return card_eligibility_for(
             job,
             self._card_runtimes,
             baseline=baseline_value,
@@ -8349,6 +8360,17 @@ class InferenceScheduler:
             job,
             is_resource_failure=True,
             retryable=False,
+            fault_reason=reason,
+        )
+
+    def _fault_ineligible_job(self, job: ImageGenerateJobPopResponse, verdict: CardEligibilityVerdict) -> None:
+        """Fault a job no configured card can execute and disclose every card's reasons."""
+        reason = f"no configured card can serve the accepted job; {verdict.reason_summary()}"
+        logger.warning(f"Faulting ineligible job {job.id_} for model {job.model}: {reason}")
+        self._job_tracker.handle_job_fault_now(
+            job,
+            retryable=False,
+            scheduling_fault=True,
             fault_reason=reason,
         )
 
@@ -8597,6 +8619,13 @@ class InferenceScheduler:
             if not information_only:
                 self._fault_unserviceable_job(next_job, unserviceable_reason)
             return None
+
+        if self._card_runtimes:
+            eligibility = self._card_eligibility(next_job)
+            if not eligibility.eligible_card_indices:
+                if not information_only:
+                    self._fault_ineligible_job(next_job, eligibility)
+                return None
 
         process_with_model = self._resident_process_for_job(next_job)
         line_skip: LineSkip | None = None

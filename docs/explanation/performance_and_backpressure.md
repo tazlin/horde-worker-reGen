@@ -1553,25 +1553,44 @@ configuration hold up under production's real mix".
 ## Multi-GPU pop shaping
 
 A worker driving several cards presents one identity and pops one job stream, so per-card capability
-differences become pop-side shaping. By default the pop advertises the **union** of every card's
-capabilities (every model any card serves, a feature/NSFW flag if any card allows it, the largest
-`max_power`, the summed thread count;
-[`advertised_capabilities`][horde_worker_regen.process_management.gpu.gpu_pop_shaping.advertised_capabilities]),
-so the horde returns work at least one card can run; the worker then routes each returned job to an
-eligible card (the same
+differences become pop-side shaping. A union of each independent field is not generally safe: it can pair a
+model from one card with a feature, NSFW policy, or resolution ceiling contributed by another card even though
+neither card supports the combined job. Heterogeneous cards therefore rotate complete **card-scoped offers**
+in stable order. Cards whose models, canonical feature profile, NSFW policy, and `max_power` are equivalent
+may safely share one combined offer and summed thread count
+([`requires_card_scoped_pops`][horde_worker_regen.process_management.gpu.gpu_pop_shaping.requires_card_scoped_pops]).
+The worker then routes each returned job to an eligible card (the same
 [`eligible_card_indices_for`][horde_worker_regen.process_management.gpu.gpu_eligibility.eligible_card_indices_for]
 that preload, dispatch, and placement share) and never dispatches a job to a card that cannot serve it.
+The head-of-queue make-room fallback may override affinity and queued-model preservation to prevent starvation,
+but it retains that eligible-card set. A busy or restarting eligible card therefore makes the head wait; it does
+not permit the scheduler to strand the head's model on an idle card that cannot execute the job.
+
+Feature compatibility is not re-derived from worker-local booleans. The SDK converts each accepted pop response to
+`ImageGenerationFeatureFlags`; each card adapts its effective config and hordelib's torch-free execution vocabularies
+to `ImageWorkerFeatureFlags`; and the SDK's directional comparator checks exact samplers, schedules, ControlNet types,
+source modes, workflows, post-processors, auxiliary sources, and baseline restrictions. The worker then composes model
+assignment, weight fit, pixel limit, and NSFW policy. Unknown forward-added feature values fail closed instead of being
+treated as supported by a broad operator opt-in. Dynamic download, utilities-lane, breaker, and queue gates still
+narrow the resulting coarse pop offer after static support is selected.
+
+The pop protocol cannot express every exact sampler, scheduler, workflow, or baseline restriction. A stale offer or
+server-side mismatch can therefore still return a job outside the canonical profile. Before preload or inference, the
+scheduler evaluates the full job against every configured card. If no card is eligible it records one terminal
+scheduling fault with per-card reasons, removes that head from runnable work, and continues to a valid follower rather
+than repeatedly trying an impossible placement.
 
 When the local queue becomes lopsided - a card cannot serve at least `gpu_pop_balance_threshold` (default
-0.5) of the held work - the next pop is instead **scoped** to that under-fed card's capabilities
+0.5) of the held work - the next pop prioritizes that under-fed card's capabilities
 ([`under_fed_card`][horde_worker_regen.process_management.gpu.gpu_pop_shaping.under_fed_card]), so the horde
-returns work the starved card can actually run rather than more for the already-fed cards.
+returns work the starved card can actually run rather than more for the already-fed cards. This changes the
+order of heterogeneous card scopes; it is not what makes their offers safe.
 
 The "locally unservable" breaker (above) is likewise **per card**: a model's over-budget fault streak is
 keyed to the card it faulted on, so a model the small card cannot run is still advertised and dispatched to a
 larger one, and the popper holds a model back only when *every* card that serves it has flagged it
-unservable. A single-GPU worker has one card, so the union is that card's config, no pop is ever targeted,
-and the streak is worker-wide - identical to before.
+unservable. A single-GPU worker has one scope, no pop is ever targeted, and the streak is worker-wide. That
+scope uses the card's canonical profile rather than a separate global-config feature path.
 
 ## See also
 

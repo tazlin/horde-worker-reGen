@@ -67,9 +67,11 @@ Overridable per card: `max_threads`, `queue_size`, `high_performance_mode`, `mod
 `whole_card_exclusive_residency`. Global-only fields (API key, downloader settings, alchemy, …) cannot be
 overridden per card and are rejected if you try.
 
-When cards advertise different capabilities, `gpu_pop_balance_threshold` (default `0.5`) controls when the
-worker stops popping the union of all cards' capabilities and instead targets the most under-fed card, so
-the horde returns work that card can actually run.
+When cards advertise different models, features, policy, or resolution ceilings, the worker rotates complete
+card-scoped offers. This preserves the relationship between those fields; separately unioning them could ask
+for a model from one card with a feature or size supported only by another. `gpu_pop_balance_threshold`
+(default `0.5`) lets local queue imbalance prioritize the most under-fed card ahead of that fair rotation.
+Cards with equivalent externally visible offers can safely share a combined request.
 
 ## Memory
 

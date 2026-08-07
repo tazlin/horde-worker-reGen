@@ -27,6 +27,7 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
 from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason, WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
@@ -50,6 +51,7 @@ from tests.process_management.conftest import (
     make_mock_job,
     make_mock_process_info,
     make_test_api_sessions,
+    make_test_card_runtimes,
     make_test_runtime_config,
     make_testable_process_manager,
     track_popped_job_async,
@@ -76,6 +78,7 @@ def _make_popper(
     vram_pressure_provider: Callable[[], bool] | None = None,
     pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
     pool_pop_outcome_sink: Callable[..., None] | None = None,
+    card_runtimes: dict[int, CardRuntime] | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -116,6 +119,7 @@ def _make_popper(
         vram_pressure_provider=vram_pressure_provider,
         pool_active_seats_provider=pool_active_seats_provider,
         pool_pop_outcome_sink=pool_pop_outcome_sink,
+        card_runtimes=card_runtimes,
     )
 
 
@@ -447,6 +451,69 @@ class TestFeatureReadinessGate:
         request = await self._pop_and_capture_request(availability, allow_controlnet=True)
 
         assert request.allow_controlnet is True
+
+
+class TestHeterogeneousCardPopRotation:
+    """Each heterogeneous offer stays within one card's routeable capability rectangle."""
+
+    async def test_successive_pops_rotate_complete_card_scoped_offers(self) -> None:
+        """Model, feature, policy, resolution, and capacity fields rotate together by card."""
+        plain_config = make_mock_bridge_data(
+            image_models_to_load=["plain-model"],
+            allow_controlnet=False,
+            allow_post_processing=False,
+            allow_lora=False,
+            max_power=2,
+            max_threads=1,
+            nsfw=False,
+        )
+        feature_config = make_mock_bridge_data(
+            image_models_to_load=["feature-model"],
+            allow_controlnet=True,
+            allow_post_processing=True,
+            allow_lora=True,
+            max_power=8,
+            max_threads=2,
+            nsfw=True,
+        )
+        card_runtimes = {
+            0: make_test_card_runtimes(
+                device_indices=(0,),
+                max_concurrent_inference=1,
+                config=plain_config,
+            )[0],
+            1: make_test_card_runtimes(
+                device_indices=(1,),
+                max_concurrent_inference=2,
+                config=feature_config,
+            )[1],
+        }
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(image_models_to_load=["plain-model", "feature-model"]),
+            card_runtimes=card_runtimes,
+        )
+
+        for _ in range(4):
+            popper._state.last_pop_no_jobs_available = False
+            await popper.api_job_pop(urgent=True)
+
+        requests = [call.args[0] for call in session.submit_request.call_args_list]
+        assert [set(request.models) for request in requests] == [
+            {"plain-model"},
+            {"feature-model"},
+            {"plain-model"},
+            {"feature-model"},
+        ]
+        assert [request.allow_controlnet for request in requests] == [False, True, False, True]
+        assert [request.allow_post_processing for request in requests] == [False, True, False, True]
+        assert [request.allow_lora for request in requests] == [False, True, False, True]
+        assert [request.nsfw for request in requests] == [False, True, False, True]
+        assert [request.max_pixels for request in requests] == [2 * 8 * 64 * 64, 8 * 8 * 64 * 64] * 2
+        assert [request.threads for request in requests] == [1, 2, 1, 2]
 
 
 _SERVER_SUPPORTS_EXTENDED_CONTROLNET = (
