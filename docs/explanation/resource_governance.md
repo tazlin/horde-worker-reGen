@@ -249,6 +249,28 @@ restoring siblings afterward) remain scheduler methods, but they read and write 
 the machine. A resident heavy head goes through the same machine-backed readiness gate as a newly-loaded
 head, so an already-resident whole-card model cannot co-sample while sibling models still occupy the card.
 
+Two refusals sit on that demand decision, and because they live on the machine's shared seam they cover both
+entry points (the preload-time decision and the dispatch-time gate for an already-resident head) identically.
+
+The first is a coherence check on the *partial* remedy. A model that is not weight-dominant can still reach
+the residency path because the live inference contexts squeeze its bounded weights off the card, and the cure
+there is stopping some of them. That claim is refused when it has nothing to act on: the budget already sizes
+at least as many co-resident contexts as are running, *and* the shortfall against the siblings-present floor
+is no larger than the charges an inference teardown cannot reclaim (the safety process's footprint, the
+service lanes' contexts, and under disaggregation the image lane's concurrent decode spike, carried on the
+forecast as its unreclaimable charge). Both conditions are required, so a genuine context over-commit on a
+card holding none of those charges keeps the residency path. Where they do hold, the deficit is made of
+commitments a teardown removes only by stopping the lanes the work depends on, and whole-card semantics (the
+pop monopoly, the retention hold, sibling eviction) would buy the head a topology the card is already in.
+Sole residency and whole-card-on-intent claims are decided before this and are never touched by it.
+
+The second is the disaggregation exemption. A disaggregation-class job runs as a UNet-only sampler that
+co-resides with the encode lane and the other samplers by design, so it never claims the device. The decision
+is made on class-eligibility rather than on the lanes' liveness, which is what keeps a transiently paused lane
+from flipping the job to its monolithic footprint and re-demanding the card. On the dispatch-time gate the
+exemption also prevents a claim raised *after* the job has been routed as a sampler, which would stop the very
+encode and decode lanes that dispatch depends on.
+
 The process target is a *measured* verdict, so it can be absent. When the forecast cannot size the card (no
 reported total VRAM, or no per-process overhead to reason about) the machine reports no target rather than
 one, and a caller leaves the live process count where it is: collapsing to sole residency there would tear

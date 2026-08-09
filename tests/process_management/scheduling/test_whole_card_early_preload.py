@@ -562,6 +562,78 @@ class TestDisaggregationClassSuppressesWholeCardDemand:
         )
         assert outcome is _WholeCardDemandOutcome.FALL_THROUGH
 
+    def _resident_head_scheduler(self, *, disaggregated: bool) -> tuple[InferenceScheduler, HordeProcessInfo]:
+        """A scheduler whose forecast demands the card for a head already resident on an idle process.
+
+        The demand is pinned rather than derived so the test isolates one question: given a residency demand,
+        does the dispatch-time path still take the card for a job that runs disaggregated?
+        """
+        scheduler, _process_map, _job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)
+        scheduler._is_disaggregation_class_eligible = lambda _job: disaggregated  # type: ignore[method-assign]
+        cast(Any, scheduler)._whole_card_ledger.residency_demanded = lambda *args, **kwargs: True
+        holder = idle[0]
+        holder.loaded_horde_model_name = _RESIDENT_SDXL
+        return scheduler, holder
+
+    def test_disagg_class_head_dispatches_without_taking_the_card_at_dispatch_time(self) -> None:
+        """A disaggregated head already resident on an idle lane samples there, claiming nothing.
+
+        The dispatch-time residency path runs after the job has been priced and routed as a sampler, so an
+        establishment here stops the encode and image lanes the job's own dispatch depends on: the head is
+        left waiting on a pipeline its own claim took down. The exemption is decided on class-eligibility, the
+        same basis the admission-time decision uses, so it holds while a lane is transiently paused.
+        """
+        scheduler, holder = self._resident_head_scheduler(disaggregated=True)
+        head = make_job_pop_response(_RESIDENT_SDXL)
+
+        assert scheduler._resident_whole_card_head_ready(head, holder) is True
+        assert scheduler.is_whole_card_residency_active() is False
+
+    def test_non_disagg_class_head_still_takes_the_card_at_dispatch_time(self) -> None:
+        """The control: with the same demand, a whole-job head does claim the card, so the exemption is the cause."""
+        scheduler, holder = self._resident_head_scheduler(disaggregated=False)
+        head = make_job_pop_response(_RESIDENT_SDXL)
+
+        scheduler._resident_whole_card_head_ready(head, holder)
+
+        assert scheduler.is_whole_card_residency_active() is True
+
+    def test_a_refused_reduction_is_disclosed_once_per_model(self) -> None:
+        """The refusal is named in the log the first time and latched thereafter, not repeated per tick.
+
+        A head that is served co-resident keeps re-asking every scheduling cycle for as long as it is at the
+        front of the queue, so a disclosure emitted per ask would bury the log for the minutes the head runs.
+        The per-model latch is what bounds it to one line, and the refusal must still be visible at all: a
+        residency that does not happen is as much of an operator fact as one that does.
+        """
+        scheduler, _process_map, _job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)
+        scheduler._is_disaggregation_class_eligible = lambda _job: False  # type: ignore[method-assign]
+        holder = idle[0]
+        holder.loaded_horde_model_name = _RESIDENT_SDXL
+        # A 16GB card whose siblings-present floor is squeezed by safety, the post-processing lane, and the
+        # image lane's decode spike, with the head's own weights fitting comfortably beside them.
+        suppressed = resource_budget.StreamForecast(
+            weights_mb=8_832.0,
+            reserve_mb=3_932.0,
+            base_reserve_mb=1_519.0,
+            free_now_mb=8_000.0,
+            free_if_alone_mb=15_030.0,
+            free_after_model_evict_mb=8_718.0,
+            total_vram_mb=16_384.0,
+            per_process_overhead_mb=1_354.0,
+            marginal_process_overhead_mb=384.0,
+            unreclaimable_charge_mb=5_928.0,
+        )
+        assert suppressed.needs_process_count_reduction is True
+        cast(Any, scheduler)._forecast_streaming = lambda *_args, **_kwargs: suppressed
+        head = make_job_pop_response(_RESIDENT_SDXL)
+
+        assert scheduler._resident_whole_card_head_ready(head, holder) is True
+        assert scheduler._resident_whole_card_head_ready(head, holder) is True
+
+        assert scheduler.is_whole_card_residency_active() is False
+        assert list(scheduler._whole_card_reduction_suppressed_notified) == [_RESIDENT_SDXL]
+
     def test_non_disagg_class_job_is_not_short_circuited(self) -> None:
         """A job that is not disaggregation-class still runs the normal whole-card demand evaluation."""
         scheduler, _process_map, _job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)

@@ -325,6 +325,15 @@ class StreamForecast:
     this bounded threshold holds them independent of both the activation estimate and the operator margin. None
     falls back to ``reserve_mb`` so a directly-constructed forecast keeps its prior single-reserve behavior."""
 
+    unreclaimable_charge_mb: float = 0.0
+    """The share of the ``free_after_model_evict_mb`` deduction that stopping idle inference siblings cannot
+    give back: the safety process's footprint, the service lanes' contexts, and the image lane's concurrent
+    decode spike.
+
+    Carried so a residency decision can be attributed after the fact. A shortfall against
+    ``free_after_model_evict_mb`` that is entirely this figure is not a sibling-context over-commit and the
+    process-count-reduction remedy cannot cure it. Zero on a directly-constructed forecast."""
+
     @property
     def known(self) -> bool:
         """Whether enough is known (weight estimate and a current measurement) to forecast at all."""
@@ -878,21 +887,31 @@ def forecast_weight_streaming(
 
     ``disaggregated`` marks a job that runs on the pipeline-disaggregation path: its sampler process holds
     only the UNet (core diffusion weights plus sampling activation), not the support weights or the VAE
-    decode spike the whole-job estimate bakes in. Both the persistent-footprint and activation-inclusive
-    charges then key on :func:`predict_job_sampler_only_vram_mb` (the ~6.6GB SDXL sampler figure that keeps
-    two samplers co-resident on a 16GB card, where the ~16GB whole-job charge collapses them to one).
+    decode spike the whole-job estimate bakes in. Its activation-inclusive peak is
+    :func:`predict_job_sampler_only_vram_mb` (the ~6.6GB SDXL sampler figure that keeps two samplers
+    co-resident on a 16GB card, where the ~16GB whole-job charge collapses them to one) while its persistent
+    charge is the core diffusion weights alone, the split described on the branch below.
     ``disaggregation_sibling_charge_mb`` is the image lane's concurrent VAE-decode spike (the caller passes
     :func:`effective_post_process_vram_quota_mb`), charged against the siblings-present achievable-free
     figure so a second sampler is not admitted into VRAM the lane's decode is about to claim.
     """
+    disaggregated_peak_mb: float | None = None
     if disaggregated:
-        # The sampler holds only the UNet: core weights plus sampling activation, with the text encoders,
-        # VAE, and decode spike running in the encode service and image lane. That combined sampler figure
-        # is the persistent footprint AND the peak here, so it drives both the weight-fit and co-resident
-        # tests without the whole-job support/decode weight that would collapse two samplers into one.
+        # The sampler holds only the UNet, with the text encoders, VAE, and decode spike running in the
+        # encode service and image lane. The sampler-only figure is core diffusion weights PLUS a
+        # resolution- and batch-scaled sampling activation delta, so it is the *peak*, not the persistent
+        # charge: what stays on the card between steps is the core weights (no support weights are held
+        # here, hence the same figure for the footprint). Pricing the peak as weights would let a
+        # high-resolution activation spike read as permanent residency and demand a sibling-process
+        # teardown that reclaims nothing the spike needs. The activation delta instead flows into
+        # ``reserve_mb`` below, so weights-plus-reserve still re-sums to the sampler-only charge and the
+        # co-residency tests keep admitting exactly two samplers on a 16GB card. When the core weight seed
+        # is unavailable the sampler charge stands in, keeping the conservative direction.
         sampler_charge_mb = predict_job_sampler_only_vram_mb(job, baseline)
-        weights_mb = sampler_charge_mb
-        footprint_mb = sampler_charge_mb
+        core_weights_mb = predict_job_weight_mb(job, baseline)
+        weights_mb = core_weights_mb if core_weights_mb is not None else sampler_charge_mb
+        footprint_mb = weights_mb
+        disaggregated_peak_mb = sampler_charge_mb
     else:
         weights_mb = predict_job_weight_mb(job, baseline)
         footprint_mb = predict_job_footprint_mb(job, baseline)
@@ -932,10 +951,9 @@ def forecast_weight_streaming(
     # moderate model (an SDXL job that merely requests a 4x upscaler) into falsely reading as weight-dominant
     # and claiming the whole card. Post-processing runs on the dedicated lane, whose resident context is
     # charged via ``num_extra_resident_contexts``.
-    # A disaggregated sampler's activation is already folded into its sampler-only charge (the peak is that
-    # charge), so the whole-job sampling peak is not read for it: doing so would re-add the support/decode
-    # activation the sampler process never holds.
-    peak_mb = weights_mb if disaggregated else predict_job_sampling_vram_mb(job, baseline)
+    # A disaggregated sampler's peak is its sampler-only charge, not the whole-job sampling figure: reading
+    # the latter would re-add the support/decode activation the sampler process never holds.
+    peak_mb = disaggregated_peak_mb if disaggregated else predict_job_sampling_vram_mb(job, baseline)
     activation_working_set_mb = 0.0
     if peak_mb is not None and weights_mb is not None:
         activation_working_set_mb = max(0.0, peak_mb - weights_mb)
@@ -962,6 +980,7 @@ def forecast_weight_streaming(
     )
     process_count = max(1, num_inference_processes)
     extra_contexts = max(0, num_extra_resident_contexts)
+    unreclaimable_charge_mb = 0.0
     if total_vram_mb is None or total_vram_mb <= 0:
         free_if_alone_mb = None
         free_after_model_evict_mb = None
@@ -992,6 +1011,10 @@ def forecast_weight_streaming(
             - max(0.0, safety_context_charge_mb)
             - lane_spike_mb,
         )
+        # Stopping idle inference siblings reclaims their contexts and nothing else, so the service lanes'
+        # contexts, safety's footprint, and the lane's decode spike are recorded separately: a shortfall made
+        # only of these is not curable by reducing the inference process count.
+        unreclaimable_charge_mb = marginal * extra_contexts + max(0.0, safety_context_charge_mb) + lane_spike_mb
     return StreamForecast(
         weights_mb=weights_mb,
         footprint_mb=footprint_mb,
@@ -1004,6 +1027,7 @@ def forecast_weight_streaming(
         per_process_overhead_mb=overhead,
         marginal_process_overhead_mb=marginal,
         wants_whole_card=wants_whole_card,
+        unreclaimable_charge_mb=unreclaimable_charge_mb,
     )
 
 

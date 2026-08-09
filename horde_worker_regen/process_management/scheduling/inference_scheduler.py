@@ -1028,6 +1028,9 @@ class InferenceScheduler:
         # One-shot log throttle, keyed by model, for the "declined a whole-card residency" notice (a teardown
         # demand the warrant gate did not trust; see _whole_card_warranted / _log_whole_card_declined).
         self._whole_card_declined_notified: dict[str, bool] = {}
+        # The same one-shot throttle for the "refused a process-count reduction" notice (a reduction with no
+        # context left to reclaim; see WholeCardResidencyMachine.residency_demanded).
+        self._whole_card_reduction_suppressed_notified: dict[str, bool] = {}
         # Per-context VRAM overhead model: owns the startup-measured per-process and marginal context costs
         # and derives the figures the streaming forecast needs (see ContextOverheadModel). The manager feeds
         # it the probe measurements via set_measured_*, and its attribution tick feeds the truthful
@@ -1332,6 +1335,7 @@ class InferenceScheduler:
             self._diagnostic_mb_bucket(forecast.marginal_process_overhead_mb),
             forecast.fits_coresident,
             forecast.needs_exclusive_residency,
+            forecast.needs_process_count_reduction,
             forecast.streams_unavoidably,
         )
         suppressed_count = self._scheduler_diagnostic_suppressed_count(f"stream_forecast:{job_id}", state_key)
@@ -1342,16 +1346,23 @@ class InferenceScheduler:
         marginal_chosen = f"{marginal.chosen_mb:.0f}" if marginal.chosen_mb is not None else "?"
         marginal_probe = f"{marginal.probe_mb:.0f}" if marginal.probe_mb is not None else "?"
         marginal_floor = f"{marginal.idle_floor_mb:.0f}" if marginal.idle_floor_mb is not None else "?"
+        # ``unreclaimable`` and ``max_resident`` are what attribute a process-count-reduction verdict: the
+        # first is the share of the after-model-evict deduction that stopping inference siblings cannot give
+        # back, the second the context count the budget says already fits. A reduction demanded while
+        # max_resident already covers the live processes is a deficit made of the unreclaimable charges.
         logger.debug(
             f"Stream forecast for {job.model}: {forecast.reason()} "
             f"[free_now={forecast.free_now_mb}, after_model_evict={forecast.free_after_model_evict_mb}, "
-            f"alone={forecast.free_if_alone_mb}, live_procs="
+            f"alone={forecast.free_if_alone_mb}, "
+            f"unreclaimable={forecast.unreclaimable_charge_mb:.0f}MB, live_procs="
             f"{self._process_map.num_loaded_inference_processes()}, "
             f"overhead/proc={self._per_process_overhead_mb():.0f}MB, "
             f"marginal/ctx={marginal_chosen}MB(src={marginal.source},probe={marginal_probe},"
             f"idle_floor={marginal_floor})] -> "
             f"coresident={forecast.fits_coresident}, "
             f"needs_exclusive={forecast.needs_exclusive_residency}, "
+            f"needs_process_count_reduction={forecast.needs_process_count_reduction}"
+            f"(max_resident={forecast.max_resident_processes()}), "
             f"streams_unavoidably={forecast.streams_unavoidably}"
             f"{self._suppressed_suffix(suppressed_count)}",
         )
@@ -1699,6 +1710,40 @@ class InferenceScheduler:
             f"{share} of the {total or 0:.0f}MB card) do not dominate the device and the per-context overhead is "
             f"unmeasured (using the conservative first-context fallback), so a teardown demand cannot be trusted. "
             f"Serving it co-resident via model eviction instead of reserving the card.</>",
+            job.model,
+        )
+
+    def _log_whole_card_reduction_suppressed(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+        *,
+        live_inference_processes: int,
+    ) -> None:
+        """Record (once per model) that a process-count-reduction claim was refused for want of a remedy.
+
+        The reduction branch asks for idle sibling *processes* to be stopped. Where the budget already sizes
+        at least as many co-resident contexts as are running, and the shortfall is within the charges no
+        inference teardown reclaims, stopping siblings buys the head nothing: the deficit is the safety
+        footprint, the service lanes' contexts, and the disaggregated image lane's decode spike, which a
+        teardown removes only by stopping the lanes the work runs on. Names the figures behind that refusal so
+        a residency that does *not* happen is as visible as one that does. Latched per model, so a head
+        re-asking every scheduling tick discloses once rather than at the tick rate.
+        """
+        if self._whole_card_reduction_suppressed_notified.get(job.model or "", False):
+            return
+        self._whole_card_reduction_suppressed_notified[job.model or ""] = True
+        weights = forecast.weights_mb or 0.0
+        floor = forecast.base_reserve_mb if forecast.base_reserve_mb is not None else forecast.reserve_mb
+        after_evict = forecast.free_after_model_evict_mb or 0.0
+        logger.opt(colors=True).info(
+            "<fg #7b7d7d>Refused a whole-card process-count reduction for {}: "
+            f"its weights (~{weights:.0f}MB) plus the {floor:.0f}MB floor exceed the {after_evict:.0f}MB "
+            f"siblings-present figure by {max(0.0, weights + floor - after_evict):.0f}MB, but "
+            f"{forecast.unreclaimable_charge_mb:.0f}MB of that figure is safety, service-lane and decode "
+            f"charges no inference teardown reclaims, and the budget already holds "
+            f"{forecast.max_resident_processes()} contexts against {live_inference_processes} live. "
+            f"Serving it co-resident instead of reserving the card.</>",
             job.model,
         )
 
@@ -2740,11 +2785,30 @@ class InferenceScheduler:
         target_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
         baseline = self._model_metadata.get_baseline(job.model)
         forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
+        live_inference_processes = self._process_map.num_loaded_inference_processes(
+            device_index=target_device_index,
+        )
         if not self._whole_card_ledger.residency_demanded(
             forecast,
             enabled=self._whole_card_residency_enabled(),
             is_head_blocker=True,
+            live_inference_process_count=live_inference_processes,
         ):
+            if forecast.needs_process_count_reduction:
+                self._log_whole_card_reduction_suppressed(
+                    job,
+                    forecast,
+                    live_inference_processes=live_inference_processes,
+                )
+            return True
+        # A disaggregation-class job never claims the device, the same contract the admission-time decision
+        # holds (see :meth:`_decide_whole_card_demand`): its sampler runs UNet-only and co-resides with the
+        # encode lane and other samplers by design. Establishing here is worse than doing so at admission,
+        # because the job has already been dispatched disaggregated: the teardown would stop the very lanes
+        # its own encode and decode run on. Decided on class-eligibility, not liveness, so the contract holds
+        # while a lane is transiently paused.
+        if self._is_disaggregation_class_eligible(job):
+            self._log_stream_forecast(job, forecast)
             return True
         if not self._whole_card_warranted(forecast):
             self._log_whole_card_declined(job, forecast)
@@ -2776,6 +2840,11 @@ class InferenceScheduler:
                 return dwell_exhausted
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
+        # Disclose the arithmetic behind a dispatch-time claim, which is otherwise established silently:
+        # without it a residency that appears between a job's admission and its dispatch carries no forecast
+        # anywhere in the log. The disclosure coalesces on its own decision key, so re-asking every tick does
+        # not repeat it.
+        self._log_stream_forecast(job, forecast)
         self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
         self._establish_whole_card_residency(
             job,
@@ -5904,12 +5973,24 @@ class InferenceScheduler:
         # because the live sibling process contexts have squeezed its bounded weights off the card though it
         # co-resides once the process count is reduced. Both are served by the same machinery: establish
         # residency, stop idle siblings down to max_resident_processes, and admit once the weights fit.
+        live_inference_processes = self._process_map.num_loaded_inference_processes(
+            device_index=target_device_index,
+        )
         whole_card_demanded = self._whole_card_ledger.residency_demanded(
             forecast,
             enabled=self._whole_card_residency_enabled(),
             is_head_blocker=is_head_blocker,
+            live_inference_process_count=live_inference_processes,
         )
         if not whole_card_demanded:
+            # Only the head could have claimed the card, so only the head's refusal is worth naming: a
+            # deeper-queue job reads the same forecast every tick and never had a claim to lose.
+            if is_head_blocker and forecast.needs_process_count_reduction:
+                self._log_whole_card_reduction_suppressed(
+                    job,
+                    forecast,
+                    live_inference_processes=live_inference_processes,
+                )
             return _WholeCardDemandOutcome.FALL_THROUGH
         if not self._whole_card_warranted(forecast):
             # The teardown demand is not trustworthy (a card-light model on a host with no measured

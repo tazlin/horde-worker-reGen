@@ -555,9 +555,120 @@ class TestWholeCardResidencyMachine:
             total_vram_mb=16_000.0,
             per_process_overhead_mb=1_000.0,
         )
-        assert machine.residency_demanded(forecast, enabled=True, is_head_blocker=True)
-        assert not machine.residency_demanded(forecast, enabled=False, is_head_blocker=True)
-        assert not machine.residency_demanded(forecast, enabled=True, is_head_blocker=False)
+        # Four live contexts against a three-context budget, so the reduction the branch proposes has
+        # something to reduce and the demand is not suppressed for want of a remedy.
+        assert machine.residency_demanded(forecast, enabled=True, is_head_blocker=True, live_inference_process_count=4)
+        assert not machine.residency_demanded(
+            forecast,
+            enabled=False,
+            is_head_blocker=True,
+            live_inference_process_count=4,
+        )
+        assert not machine.residency_demanded(
+            forecast,
+            enabled=True,
+            is_head_blocker=False,
+            live_inference_process_count=4,
+        )
+
+    def test_a_reduction_with_nothing_to_reduce_is_not_a_residency_demand(self) -> None:
+        """A process-count-reduction claim is refused when the budget already holds every live context.
+
+        The branch's whole premise is that the live inference contexts over-commit the card and stopping some
+        of them cures it. When the budget says more contexts fit than are running, the shortfall is made of
+        charges the teardown cannot reclaim, and the residency machinery (pop monopoly, retention hold,
+        sibling eviction) would only reach a topology the card is already in.
+        """
+        machine = WholeCardResidencyMachine()
+        # Moderate weights on a 16GB card whose siblings-present floor is squeezed by charges no inference
+        # teardown gives back, so the reduction branch reads True while thirteen contexts would still fit.
+        forecast = StreamForecast(
+            weights_mb=8_832.0,
+            reserve_mb=1_519.0,
+            base_reserve_mb=1_519.0,
+            free_now_mb=8_000.0,
+            free_if_alone_mb=15_030.0,
+            free_after_model_evict_mb=8_718.0,
+            total_vram_mb=16_384.0,
+            per_process_overhead_mb=1_354.0,
+            marginal_process_overhead_mb=384.0,
+            # Safety's resident weights, the post-processing lane's context, and the image lane's decode
+            # spike: the whole of the shortfall, and none of it an inference context.
+            unreclaimable_charge_mb=5_928.0,
+        )
+        assert forecast.needs_process_count_reduction is True
+        assert forecast.needs_exclusive_residency is False
+        target = forecast.max_resident_processes()
+        assert target is not None and target >= 2
+
+        assert not machine.residency_demanded(
+            forecast,
+            enabled=True,
+            is_head_blocker=True,
+            live_inference_process_count=2,
+        )
+        # Run the pool past the budget and the same forecast demands the card again: there is now a context
+        # for the reduction to take.
+        assert machine.residency_demanded(
+            forecast,
+            enabled=True,
+            is_head_blocker=True,
+            live_inference_process_count=target + 1,
+        )
+
+    def test_a_deficit_larger_than_the_unreclaimable_charges_still_demands_the_card(self) -> None:
+        """A card carrying no unreclaimable charges keeps its reduction demand, however roomy the budget reads.
+
+        The suppression rests on the deficit being attributable to charges a teardown cannot reclaim. Where
+        the forecast reports none, the live contexts are the only thing the shortfall can be made of and the
+        reduction is exactly the right remedy.
+        """
+        machine = WholeCardResidencyMachine()
+        forecast = StreamForecast(
+            weights_mb=8_832.0,
+            reserve_mb=1_519.0,
+            base_reserve_mb=1_519.0,
+            free_now_mb=8_000.0,
+            free_if_alone_mb=15_030.0,
+            free_after_model_evict_mb=8_718.0,
+            total_vram_mb=16_384.0,
+            per_process_overhead_mb=1_354.0,
+            marginal_process_overhead_mb=384.0,
+        )
+        assert forecast.needs_process_count_reduction is True
+        assert machine.residency_demanded(
+            forecast,
+            enabled=True,
+            is_head_blocker=True,
+            live_inference_process_count=2,
+        )
+
+    def test_the_suppression_never_reaches_a_weight_dominant_claim(self) -> None:
+        """A model that needs sole residency keeps the card however many contexts the budget says fit.
+
+        Sole residency is a statement about the weights, not about context arithmetic, so it is decided before
+        the reduction branch and its suppression.
+        """
+        machine = WholeCardResidencyMachine()
+        forecast = StreamForecast(
+            weights_mb=11_500.0,
+            reserve_mb=2_500.0,
+            base_reserve_mb=1_519.0,
+            free_now_mb=3_000.0,
+            free_if_alone_mb=15_030.0,
+            free_after_model_evict_mb=14_646.0,
+            total_vram_mb=16_384.0,
+            per_process_overhead_mb=1_354.0,
+            marginal_process_overhead_mb=384.0,
+            wants_whole_card=True,
+        )
+        assert forecast.needs_exclusive_residency is True
+        assert machine.residency_demanded(
+            forecast,
+            enabled=True,
+            is_head_blocker=True,
+            live_inference_process_count=1,
+        )
 
     def test_an_unsized_forecast_names_no_process_target(self) -> None:
         """A forecast that cannot size the card reports None, which is not the same statement as one.

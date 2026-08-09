@@ -1319,12 +1319,10 @@ class TestDisaggregatedCharge:
         assert whole.fits_coresident is False  # ~16GB sampling peak does not co-reside on a 16GB card
         assert disagg.fits_coresident is True  # ~6.6GB sampler-only charge does
 
-    def test_forecast_charges_sampler_only_footprint_and_weights(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """fits_alone / is_card_demanding / max_resident_processes read the sampler-only figure, not the whole job."""
-        self._stub_predictors(monkeypatch)
-        job = make_mock_job(width=1024, height=1024)
-        disagg = resource_budget.forecast_weight_streaming(
-            job,
+    def _disagg_forecast(self) -> resource_budget.StreamForecast:
+        """A single disaggregated SDXL sampler forecast on a 16GB card, against already-stubbed predictors."""
+        return resource_budget.forecast_weight_streaming(
+            make_mock_job(width=1024, height=1024),
             "stable_diffusion_xl",
             free_now_mb=15000.0,
             total_vram_mb=16375.0,
@@ -1333,6 +1331,88 @@ class TestDisaggregatedCharge:
             configured_reserve_floor_mb=0.0,
             disaggregated=True,
         )
+
+    def test_forecast_charges_core_weights_and_the_sampler_only_peak(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The persistent charge is the core diffusion weights; the sampler-only figure is the peak.
+
+        The sampler-only figure is core weights plus a resolution- and batch-scaled activation delta. Pricing
+        it as persistent weights makes a transient spike read as permanent residency, which is what turns a
+        high-resolution job into a whole-card claim on a card that was holding it comfortably. Split, the
+        delta lands in the activation-inclusive reserve where the spike belongs, and no support weights are
+        charged because the sampler process holds none.
+        """
+        self._stub_predictors(monkeypatch)
+        disagg = self._disagg_forecast()
+        assert disagg.weights_mb == self._CORE_WEIGHTS_MB
+        assert disagg.footprint_mb == self._CORE_WEIGHTS_MB
+        assert disagg.reserve_mb == pytest.approx(self._SAMPLER_ONLY_MB - self._CORE_WEIGHTS_MB)
+
+    def test_the_split_re_sums_to_the_sampler_only_charge(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Weights plus the activation-inclusive reserve still total the sampler-only figure.
+
+        The co-residency tests (``fits_coresident`` / ``_fits_peak``) key on that sum, so the split moves the
+        activation between terms without changing what a second sampler is admitted against.
+        """
+        self._stub_predictors(monkeypatch)
+        disagg = self._disagg_forecast()
+        assert disagg.weights_mb is not None
+        assert disagg.weights_mb + disagg.reserve_mb == pytest.approx(self._SAMPLER_ONLY_MB)
+
+    def test_a_high_activation_sampler_is_not_weight_dominant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sampler whose activation delta fills the card still reads as co-residable, not card-claiming.
+
+        The residency tests price what stays resident between steps. With the split, an SDXL sampler at a
+        large resolution and batch keeps its moderate core weights, so neither sole residency nor a
+        sibling-process teardown is demanded on the strength of its activation.
+        """
+        self._stub_predictors(monkeypatch)
+        # Two inference contexts, safety on the card, and the image lane's decode spike: the charges that
+        # squeeze the siblings-present figure without any of them being an inference context.
+        forecast = resource_budget.forecast_weight_streaming(
+            make_mock_job(width=1024, height=1024),
+            "stable_diffusion_xl",
+            free_now_mb=8000.0,
+            total_vram_mb=16375.0,
+            per_process_overhead_mb=1288.0,
+            num_inference_processes=2,
+            num_extra_resident_contexts=1,
+            safety_context_charge_mb=3044.0,
+            marginal_process_overhead_mb=384.0,
+            configured_reserve_floor_mb=0.0,
+            disaggregated=True,
+            disaggregation_sibling_charge_mb=2500.0,
+        )
+        assert forecast.needs_exclusive_residency is False
+        assert forecast.needs_process_count_reduction is False
+
+    def test_older_engine_fallback_keeps_the_conservative_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hordelib predating the phase split reports the whole-job figure, which stays the peak.
+
+        The predictor falls back to the whole-job sampling charge when ``vram_sampler_only_mb`` is absent, so
+        the co-residency sum is that conservative figure and an older engine keeps the behavior it had.
+        """
+        self._stub_predictors(monkeypatch)
+        monkeypatch.setattr(
+            resource_budget,
+            "predict_job_sampler_only_vram_mb",
+            lambda j, b: self._WHOLE_JOB_SAMPLING_MB,
+        )
+        disagg = self._disagg_forecast()
+        assert disagg.weights_mb is not None
+        assert disagg.weights_mb + disagg.reserve_mb == pytest.approx(self._WHOLE_JOB_SAMPLING_MB)
+        assert disagg.fits_coresident is False
+
+    def test_unestimable_core_weights_fall_back_to_the_sampler_charge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no core weight seed the sampler charge stands in, so the forecast stays priced and cautious."""
+        self._stub_predictors(monkeypatch)
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda j, b: None)
+        disagg = self._disagg_forecast()
         assert disagg.weights_mb == self._SAMPLER_ONLY_MB
         assert disagg.footprint_mb == self._SAMPLER_ONLY_MB
 
@@ -1379,12 +1459,22 @@ class TestTwoSamplersCoresidentAcceptance:
     Empirical ground truth on this box (16375MB card): two SDXL disaggregated samplers plus the image lane's
     VAE decode were measured co-resident at a 14851MB whole-card peak, i.e. two ~6158MB samplers plus a
     ~2535MB tiled-decode spike. The coresidency verdict must admit the second sampler when the *bounded*
-    decode spike is charged, and (the bug this guards) must NOT be forced to deny it by charging the lane's
-    full ~8192MB allocator-guard quota, which over-commits the card and collapses the pipeline to one sampler.
+    decode spike is charged, and must NOT be forced to deny it by charging the lane's full ~8192MB
+    allocator-guard quota, which over-commits the card and collapses the pipeline to one sampler.
+
+    Which of the two charges is used decides the verdict once the sampler's own activation is large enough
+    that the difference between them straddles it. The discrimination is therefore driven at a
+    higher-resolution sampler (SDXL at 1216 square, whose sampler-only figure is ~6674MB against ~4900MB of
+    core weights) where two samplers plus the bounded spike still fit the card with room to spare. At the
+    smallest sizes the card holds a second sampler under either charge, so the choice of charge does not
+    matter there and only a larger sampler puts it under test.
     """
 
     _TOTAL_MB = 16375.0
     _SAMPLER_ONLY_MB = 6158.0
+    _HIRES_SAMPLER_ONLY_MB = 6674.0
+    """hordelib's sampler-only figure for SDXL at 1216 square: the size at which the lane charge decides
+    whether a second sampler is admitted."""
     _DECODE_SPIKE_MB = 2535.0
     _FULL_LANE_QUOTA_MB = 8192.0
     _OVERHEAD_MB = 1288.0
@@ -1395,14 +1485,16 @@ class TestTwoSamplersCoresidentAcceptance:
         monkeypatch: pytest.MonkeyPatch,
         *,
         sibling_charge_mb: float,
+        sampler_only_mb: float,
+        edge_mb: int = 1216,
     ) -> resource_budget.StreamForecast:
         """Forecast admitting a SECOND disaggregated sampler while one sampler and the lane are already up."""
-        monkeypatch.setattr(resource_budget, "predict_job_sampler_only_vram_mb", lambda j, b: self._SAMPLER_ONLY_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampler_only_vram_mb", lambda j, b: sampler_only_mb)
         monkeypatch.setattr(resource_budget, "effective_inference_reserve_mb", lambda *a, **k: 1000.0)
         # free_now reflects the first sampler and its context already resident on the card.
-        free_now_mb = self._TOTAL_MB - self._OVERHEAD_MB - self._SAMPLER_ONLY_MB
+        free_now_mb = self._TOTAL_MB - self._OVERHEAD_MB - sampler_only_mb
         return resource_budget.forecast_weight_streaming(
-            make_mock_job(width=1024, height=1024),
+            make_mock_job(width=edge_mb, height=edge_mb),
             "stable_diffusion_xl",
             free_now_mb=free_now_mb,
             total_vram_mb=self._TOTAL_MB,
@@ -1421,14 +1513,36 @@ class TestTwoSamplersCoresidentAcceptance:
         assert peak == pytest.approx(14851.0)
         assert peak <= self._TOTAL_MB
 
+    def test_ground_truth_holds_at_the_size_the_charge_is_tested_on(self) -> None:
+        """Two of the larger samplers plus the bounded spike also fit, so admitting the second is correct.
+
+        Without this the discriminating pair below could pass by admitting a second sampler the card cannot
+        physically hold, which would make the bounded charge right for the wrong reason.
+        """
+        peak = 2 * self._HIRES_SAMPLER_ONLY_MB + self._DECODE_SPIKE_MB
+        assert peak <= self._TOTAL_MB
+
     def test_second_sampler_admitted_with_bounded_decode_spike(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Charging the bounded ~2535MB decode spike admits the second sampler co-resident (no collapse)."""
-        forecast = self._second_sampler_forecast(monkeypatch, sibling_charge_mb=self._DECODE_SPIKE_MB)
+        forecast = self._second_sampler_forecast(
+            monkeypatch,
+            sibling_charge_mb=self._DECODE_SPIKE_MB,
+            sampler_only_mb=self._HIRES_SAMPLER_ONLY_MB,
+        )
         assert forecast.fits_coresident is True
 
     def test_full_quota_charge_would_collapse_to_one_sampler(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Regression tripwire: charging the full ~8192MB lane quota instead denies the second sampler."""
-        forecast = self._second_sampler_forecast(monkeypatch, sibling_charge_mb=self._FULL_LANE_QUOTA_MB)
+        """Charging the full ~8192MB lane quota instead denies a second sampler the card physically holds.
+
+        The pair with the test above is the whole point: the same card, the same sampler, and the same
+        arithmetic reach opposite verdicts on which lane charge is used, so charging the allocator-guard
+        quota is what collapses the pipeline to one sampler.
+        """
+        forecast = self._second_sampler_forecast(
+            monkeypatch,
+            sibling_charge_mb=self._FULL_LANE_QUOTA_MB,
+            sampler_only_mb=self._HIRES_SAMPLER_ONLY_MB,
+        )
         assert forecast.fits_coresident is False
 
 

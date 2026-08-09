@@ -740,10 +740,62 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         *,
         enabled: bool,
         is_head_blocker: bool,
+        live_inference_process_count: int,
     ) -> bool:
-        """Return whether a job should enter the whole-card residency pipeline."""
-        needs_teardown = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
-        return enabled and needs_teardown and is_head_blocker
+        """Return whether a job should enter the whole-card residency pipeline.
+
+        Args:
+            forecast: The head's streaming forecast against the card it would claim.
+            enabled: Whether whole-card exclusive residency is configured on.
+            is_head_blocker: Whether this job is the head; only the head may claim the card.
+            live_inference_process_count: Inference processes currently holding a context on the card. A
+                process-count-reduction claim is priced against this, since it is what the claim proposes to
+                reduce.
+
+        Returns:
+            Whether the job enters the residency pipeline.
+        """
+        if not (enabled and is_head_blocker):
+            return False
+        if forecast.needs_exclusive_residency:
+            return True
+        if not forecast.needs_process_count_reduction:
+            return False
+        # The process-count-reduction branch claims the live inference contexts are themselves the
+        # over-commit, and its remedy is stopping some of them. Two things must both hold for that claim to
+        # be incoherent, and only then is it refused. The budget must already hold at least as many contexts
+        # as are running, so the reduction has nothing to take; and the deficit must be no larger than the
+        # charges an inference teardown cannot reclaim (safety's footprint, the service lanes' contexts, the
+        # image lane's decode spike: StreamForecast.unreclaimable_charge_mb), so it is attributable to them
+        # rather than to the contexts. Granting whole-card semantics there spends the card's pop monopoly,
+        # retention hold, and sibling eviction to reach a topology the card is already in, and the teardown
+        # then deletes the very charges the deficit was made of. Requiring both keeps a genuine context
+        # over-commit, on a card carrying no such charges, on the residency path. Weight-dominant and
+        # whole-card-on-intent claims are decided above and never reach here.
+        target = forecast.max_resident_processes()
+        if target is None or target < max(1, live_inference_process_count):
+            return True
+        return not self._deficit_is_unreclaimable(forecast)
+
+    @staticmethod
+    def _deficit_is_unreclaimable(forecast: StreamForecast) -> bool:
+        """Whether the weight shortfall against the siblings-present floor is within the unreclaimable charges.
+
+        Args:
+            forecast: The forecast whose process-count-reduction verdict is being attributed.
+
+        Returns:
+            True when the shortfall is no larger than the charges stopping inference siblings cannot give
+            back, so the reduction remedy is not what the deficit calls for. False when the forecast reports
+            no such charges (a directly-constructed forecast, or a card carrying neither safety nor a service
+            lane), which is the conservative direction: the deficit is then treated as a real context
+            over-commit.
+        """
+        if forecast.weights_mb is None or forecast.free_after_model_evict_mb is None:
+            return False
+        floor_mb = forecast.base_reserve_mb if forecast.base_reserve_mb is not None else forecast.reserve_mb
+        shortfall_mb = forecast.weights_mb + floor_mb - forecast.free_after_model_evict_mb
+        return shortfall_mb <= forecast.unreclaimable_charge_mb
 
     def target_process_count(self, forecast: StreamForecast | None) -> int | None:
         """Return the live inference-process target for a held residency, or None when it cannot be sized.

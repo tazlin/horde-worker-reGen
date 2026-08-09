@@ -56,6 +56,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -68,6 +69,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     offer_under_pop_claim,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _SAFETY_GPU_LOAD_CHARGE_MB,
     _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
@@ -146,6 +148,33 @@ _SDXL_OTHER = _ModelClass("sdxl_b", "sdxl-checkpoint-b", KNOWN_IMAGE_GENERATION_
 _FLUX = _ModelClass("flux", "Flux.1-Schnell fp8 (Compact)", KNOWN_IMAGE_GENERATION_BASELINE.flux_1, 11500.0)
 
 _MODEL_CLASSES = (_SD15, _SD15_OTHER, _SDXL, _SDXL_OTHER, _FLUX)
+
+_SAFETY_PROCESS_ID = 100
+_POST_PROCESS_LANE_ID = 200
+"""Ids for the service processes, kept well clear of the inference lane ids so pool growth (which allocates
+the next free inference id) can never collide with one."""
+
+
+@dataclass(frozen=True)
+class _JobShape:
+    """The generation size a row's jobs ask for, which is what scales sampling activation.
+
+    Resolution and batch move the activation working set by several gigabytes while leaving the resident
+    weights untouched, so the shape axis is what separates a model's persistent residency cost from its
+    transient sampling peak.
+    """
+
+    label: str
+    width: int
+    height: int
+    batch: int
+
+
+_SHAPE_SMALL = _JobShape("small", 512, 512, 1)
+_SHAPE_HIRES_BATCH = _JobShape("hires_batch", 1280, 1280, 2)
+"""A high-resolution batch: an SDXL sampler's activation-inclusive peak roughly doubles against its ~4.9 GB
+of weights, which is the regime where an activation spike can be mistaken for permanent residency."""
+
 
 _SAME_CLASS_PARTNER: dict[str, _ModelClass] = {
     _SD15.name: _SD15_OTHER,
@@ -276,6 +305,8 @@ class _DispatchWorld:
         cooldown_seconds: int = 0,
         max_hold_seconds: int = 180,
         tick_seconds: float = _TICK_SECONDS,
+        service_contexts: bool = False,
+        disaggregated: bool = False,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -297,6 +328,12 @@ class _DispatchWorld:
                 windows these rows turn on; a caller whose scenarios turn on the scheduler's short budgets
                 (the affinity line-skip window has a fifteen-second floor) passes a shorter tick, so those
                 budgets are sampled several times rather than stepped over in one advance.
+            service_contexts: Whether the safety process sits on the card and the post-processing lane holds
+                a context. Both are device commitments that stopping idle *inference* siblings cannot
+                reclaim, so they are what a card's structural floor is squeezed by without any inference
+                context being the cause.
+            disaggregated: Whether the row's jobs are disaggregation-class, so a sampler is priced for the
+                UNet it holds alone rather than for a whole job.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -315,10 +352,24 @@ class _DispatchWorld:
         self.snapshot: MeasuredVramSnapshot | None = None
         """The most recent cycle-frozen device measurement, the surface a row reads obligations back from."""
 
+        self._service_contexts = service_contexts
         processes: dict[int, HordeProcessInfo] = {}
         for lane_id in range(lane_count):
             lane = make_mock_process_info(lane_id, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
             processes[lane_id] = lane
+        if service_contexts:
+            processes[_SAFETY_PROCESS_ID] = make_mock_process_info(
+                _SAFETY_PROCESS_ID,
+                model_name=None,
+                process_type=HordeProcessType.SAFETY,
+                state=HordeProcessState.WAITING_FOR_JOB,
+            )
+            processes[_POST_PROCESS_LANE_ID] = make_mock_process_info(
+                _POST_PROCESS_LANE_ID,
+                model_name=None,
+                process_type=HordeProcessType.POST_PROCESS,
+                state=HordeProcessState.WAITING_FOR_JOB,
+            )
         self._process_map = ProcessMap(processes)
         self._model_map = HordeModelMap(root={})
         self._job_tracker = JobTracker(clock=lambda: self.now)
@@ -334,7 +385,7 @@ class _DispatchWorld:
             enable_vram_budget=enable_vram_budget,
             whole_card_exclusive_residency=whole_card_enabled,
             whole_card_residency_safety_off_gpu=False,
-            safety_on_gpu=False,
+            safety_on_gpu=service_contexts,
             vram_reserve_mb=0,
             ram_reserve_mb=8192.0,
             vram_per_process_overhead_mb=_FIRST_CONTEXT_MB,
@@ -369,6 +420,11 @@ class _DispatchWorld:
             reserve_ledger=self._reserve_ledger,
             clock=lambda: self.now,
         )
+        if disaggregated:
+            # Class-eligibility is the scheduler's own seam for "this job will run as a UNet-only sampler".
+            # Pinning it is what makes a row's jobs priced, admitted, and dispatched on the disaggregated
+            # path without standing up the orchestrator's lanes, which these rows do not vary.
+            self._scheduler._is_disaggregation_class_eligible = lambda _job: True  # type: ignore[method-assign]
         self._scheduler.set_device_free_mb_provider(lambda _device_index: self.device_free_mb())
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
@@ -381,10 +437,22 @@ class _DispatchWorld:
 
     # -- card model ---------------------------------------------------------------------------------------
 
+    def _inference_lanes(self) -> list[HordeProcessInfo]:
+        """The pool's inference lanes, which is what the row's residency and teardown bookkeeping is about."""
+        return [lane for lane in self._process_map.values() if lane.process_type == HordeProcessType.INFERENCE]
+
     def _context_charge_mb(self) -> float:
-        """The card's total context cost: the one-time runtime plus one context for every live lane."""
-        lanes = max(1, len(self._process_map))
-        return _FIRST_CONTEXT_MB + _MARGINAL_CONTEXT_MB * (lanes - 1)
+        """The card's total context cost: the one-time runtime, each further context, and safety's weights.
+
+        The safety process carries resident classifier weights on top of its context, so it is charged its
+        whole-process figure (the one the scheduler also prices it at) rather than a bare context; the
+        post-processing lane holds a context and no at-rest model, so it costs the marginal.
+        """
+        lanes = max(1, len(self._inference_lanes()))
+        charge = _FIRST_CONTEXT_MB + _MARGINAL_CONTEXT_MB * (lanes - 1)
+        if self._service_contexts:
+            charge += _SAFETY_GPU_LOAD_CHARGE_MB + _MARGINAL_CONTEXT_MB
+        return charge
 
     def device_free_mb(self) -> float:
         """The truthful device-free reading: the card total less its live contexts and its committed weights."""
@@ -608,11 +676,11 @@ class _DispatchWorld:
         restores empty lanes up to the pool's provisioned ceiling.
         """
         del device_index, pressure_shortfall_mb
-        while len(self._process_map) > target_count:
+        while len(self._inference_lanes()) > target_count:
             victim = next(
                 (
                     lane
-                    for lane in self._process_map.values()
+                    for lane in self._inference_lanes()
                     if lane.can_accept_job()
                     and lane.process_id != spared_process_id
                     and (protected_model is None or lane.loaded_horde_model_name != protected_model)
@@ -622,15 +690,15 @@ class _DispatchWorld:
             if victim is None:
                 break
             self._retire_lane(victim.process_id)
-        while len(self._process_map) < min(target_count, self._lane_ceiling):
-            lane_id = max(self._process_map, default=-1) + 1
+        while len(self._inference_lanes()) < min(target_count, self._lane_ceiling):
+            lane_id = max((lane.process_id for lane in self._inference_lanes()), default=-1) + 1
             self._process_map[lane_id] = make_mock_process_info(
                 lane_id,
                 model_name=None,
                 state=HordeProcessState.WAITING_FOR_JOB,
             )
         self._sync_reported_vram()
-        return len(self._process_map)
+        return len(self._inference_lanes())
 
     def _retire_lane(self, lane_id: int) -> None:
         """Remove a lane from the pool, releasing its context, its resident weights, and its map entry."""
@@ -885,6 +953,9 @@ class _Row:
         claim: What the row asserts about the residency's claim over the pop offer.
         cooldown_seconds: How long a drained residency is retained for a follow-on heavy job.
         max_hold_seconds: The ceiling on one residency episode, which also bounds its claim.
+        shape: The generation size the row's jobs ask for, which scales sampling activation.
+        service_contexts: Whether safety sits on the card and the post-processing lane holds a context.
+        disaggregated: Whether the row's jobs run as UNet-only samplers.
     """
 
     label: str
@@ -904,6 +975,9 @@ class _Row:
     claim: _ClaimScenario = _ClaimScenario.NONE
     cooldown_seconds: int = 0
     max_hold_seconds: int = 180
+    shape: _JobShape = _SHAPE_SMALL
+    service_contexts: bool = False
+    disaggregated: bool = False
 
 
 _PRUNED_COMBINATIONS: tuple[tuple[str, str], ...] = (
@@ -949,6 +1023,18 @@ _PRUNED_COMBINATIONS: tuple[tuple[str, str], ...] = (
         "16 GB flux cell is the one where a residency is genuinely warranted, so the four claim scenarios are "
         "driven there and the cross-product with hardware that would either never establish a residency or "
         "never need one is dropped.",
+    ),
+    (
+        "disaggregation and the high-resolution batch shape x every card, governor and event value",
+        "both exist to put a moderate-weight model's activation far above its weights while the card's "
+        "structural floor is squeezed by charges no inference teardown reclaims. That regime is the 16 GB "
+        "card with the service contexts up; a roomier card has headroom the spike never reaches and an 8 GB "
+        "card cannot serve the shape at all, so neither varies the verdict.",
+    ),
+    (
+        "service contexts x whole-card governor states and mid-sequence events",
+        "safety and the post-processing lane change what the structural floor is made of, not how a governor "
+        "brakes an establishment or how a lane death is recovered; those axes are driven without them.",
     ),
     (
         "24 GB card x SD15 head x every governor and event value",
@@ -1273,6 +1359,48 @@ def _rows() -> tuple[_Row, ...]:
             cooldown_seconds=600,
             max_hold_seconds=600,
         ),
+        # -- A disaggregated sampler beside the service contexts. --------------------------------------------
+        # The card's structural floor is squeezed by charges no inference teardown can reclaim (safety's
+        # resident weights, the post-processing lane's context, the image lane's decode spike) while the
+        # head's own model is already resident on an idle lane. The head's activation-inclusive peak nearly
+        # doubles its weights at this size, so the row is where an activation spike priced as residency would
+        # turn a dispatch into a whole-card claim over the very lanes the sampler's own encode and decode run
+        # on. The head must sample on the residency it already has.
+        _Row(
+            "sdxl_disagg_hires_resident_idle_16gb",
+            _CARD_16GB,
+            _SDXL,
+            _Residency.RESIDENT_IDLE_TARGET,
+            _QueueShape.SINGLE_HEAD,
+            shape=_SHAPE_HIRES_BATCH,
+            service_contexts=True,
+            disaggregated=True,
+        ),
+        _Row(
+            "sdxl_disagg_hires_burst_16gb",
+            _CARD_16GB,
+            _SDXL,
+            _Residency.RESIDENT_IDLE_TARGET,
+            _QueueShape.SAME_MODEL_BURST,
+            shape=_SHAPE_HIRES_BATCH,
+            service_contexts=True,
+            disaggregated=True,
+            tick_bound=8,
+            run_ticks=22,
+        ),
+        # The companion that keeps the guard honest: the same card and the same service contexts, but a
+        # genuinely weight-dominant head that still takes the device. A suppression wide enough to catch this
+        # would have traded a false claim for a model left thrashing.
+        _Row(
+            "flux_resident_idle_service_contexts_16gb",
+            _CARD_16GB,
+            _FLUX,
+            _Residency.RESIDENT_IDLE_TARGET,
+            _QueueShape.SINGLE_HEAD,
+            service_contexts=True,
+            tick_bound=10,
+            run_ticks=20,
+        ),
         _Row(
             "flux_16gb_claim_foreign_jobs_queued_first",
             _CARD_16GB,
@@ -1346,6 +1474,8 @@ async def _build_world(row: _Row) -> tuple[_DispatchWorld, list[ImageGenerateJob
         whole_card_enabled=row.whole_card_enabled,
         cooldown_seconds=row.cooldown_seconds,
         max_hold_seconds=row.max_hold_seconds,
+        service_contexts=row.service_contexts,
+        disaggregated=row.disaggregated,
     )
 
     if row.residency is _Residency.RESIDENT_IDLE_TARGET:
@@ -1362,7 +1492,13 @@ async def _build_world(row: _Row) -> tuple[_DispatchWorld, list[ImageGenerateJob
 
     jobs: list[ImageGenerateJobPopResponse] = []
     for model in _queue_models(row):
-        job = make_job_pop_response(model.name, width=512, height=512, ddim_steps=8)
+        job = make_job_pop_response(
+            model.name,
+            width=row.shape.width,
+            height=row.shape.height,
+            n_iter=row.shape.batch,
+            ddim_steps=8,
+        )
         await world.pop(job)
         jobs.append(job)
     return world, jobs
@@ -1551,6 +1687,72 @@ async def test_rate_governed_head_claims_the_card_once_the_brake_lifts(row: _Row
     )
 
 
+_DISAGGREGATED_ROWS = tuple(row for row in _ROWS if row.disaggregated)
+
+_WEIGHT_DOMINANT_CLAIM_ROWS = tuple(
+    row
+    for row in _ROWS
+    if row.head_model is _FLUX
+    and row.residency is _Residency.RESIDENT_IDLE_TARGET
+    and row.card is _CARD_16GB
+    and row.governor is _GovernorState.FRESH
+    and row.event is _MidSequenceEvent.NONE
+)
+"""Rows whose head is heavy enough that the device is genuinely its only home, reached through the
+dispatch-time residency path (its weights are already resident on an idle lane).
+
+The card must be the one with no room for a second model beside those weights: on a roomier card the same
+head co-resides by design and no claim is expected. A governed or disturbed row is excluded for the same
+reason, since each is driving a deliberate refusal or recovery of its own."""
+
+
+@pytest.mark.parametrize("row", _DISAGGREGATED_ROWS, ids=[row.label for row in _DISAGGREGATED_ROWS])
+async def test_a_disaggregated_head_is_served_without_claiming_the_card(row: _Row) -> None:
+    """A UNet-only sampler is dispatched on the residency it has, never by reserving the device.
+
+    Whole-card residency and disaggregation are mutually exclusive by construction: the sampler's own encode
+    and decode run in the lanes a residency stops, so a claim raised for one of these heads takes down the
+    pipeline serving it. The row reads the outcome positively (the head samples) and the mechanism
+    negatively (no establishment was ever charged to the card), because a head that happened to be served
+    after a claim and a restore would satisfy the first alone.
+    """
+    world, jobs = await _build_world(row)
+
+    await _drive(world, row)
+
+    assert world.dispatch_tick(jobs[0]) is not None, (
+        f"{row.label}: the disaggregated head never reached sampling. {world.state_dump()}"
+    )
+    assert not world.scheduler._whole_card_ledger.state_for(None).establishments, (
+        f"{row.label}: a disaggregated head claimed the card its own encode and decode lanes run on. "
+        f"{world.state_dump()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "row",
+    _WEIGHT_DOMINANT_CLAIM_ROWS,
+    ids=[row.label for row in _WEIGHT_DOMINANT_CLAIM_ROWS],
+)
+async def test_a_weight_dominant_resident_head_still_claims_the_card(row: _Row) -> None:
+    """A head whose weights fill the card takes the device even though its model is already resident.
+
+    The discriminating half of the residency suppression: a claim is withheld when there is no inference
+    context for it to reclaim, never because the head arrived at dispatch already resident. Without this the
+    same table would pass with whole-card residency removed entirely.
+    """
+    world, jobs = await _build_world(row)
+
+    await _drive(world, row)
+
+    assert world.dispatch_tick(jobs[0]) is not None, (
+        f"{row.label}: the whole-card head never reached sampling. {world.state_dump()}"
+    )
+    assert world.scheduler._whole_card_ledger.state_for(None).establishments, (
+        f"{row.label}: the head that needs the device to itself was never granted it. {world.state_dump()}"
+    )
+
+
 _CLAIM_ROWS = tuple(row for row in _ROWS if row.claim is not _ClaimScenario.NONE)
 
 _CLAIM_INTAKE_JOBS = 3
@@ -1685,3 +1887,6 @@ def test_the_matrix_states_its_own_coverage() -> None:
     assert driven_events == set(_MidSequenceEvent)
     assert {row.max_threads for row in _ROWS} == {1, 2}
     assert {row.claim for row in _ROWS} == set(_ClaimScenario)
+    assert {row.shape.label for row in _ROWS} == {_SHAPE_SMALL.label, _SHAPE_HIRES_BATCH.label}
+    assert {row.service_contexts for row in _ROWS} == {False, True}
+    assert {row.disaggregated for row in _ROWS} == {False, True}

@@ -1257,6 +1257,11 @@ processes. If the target is equal to or above the live pool, inference-context p
 measured shortfall, so neither path marks the job exclusive or cycles service lanes through the residency
 machinery. The reduction actuator checks the target against the current live count again before any side
 effects, preserving idempotence when a command becomes stale after an earlier tick already shrank the pool.
+The streaming forecast's own reduction branch is held to the same rule, with one addition: it is refused only
+when the shortfall is *also* within the charges an inference teardown cannot reclaim (safety's footprint, the
+service lanes' contexts, the disaggregated image lane's decode spike). That keeps a genuine context
+over-commit on a card carrying none of those charges on the residency path, while a deficit made of them
+takes ordinary admission, since the teardown would only delete the charges the deficit was made of.
 
 Both of those teardown paths (the streaming forecast's `needs_process_count_reduction` and the
 verdict-driven context reduction) are gated on the demand being **trustworthy** before the worker engages
