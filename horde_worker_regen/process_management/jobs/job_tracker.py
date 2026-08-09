@@ -250,6 +250,11 @@ class JobFaultOrigin(enum.StrEnum):
     """A fault issued by the auxiliary-prefetch pipeline, excluded from the failure pause. A job faulted because
     a LoRA or textual inversion it references could never be placed on disk was never generated for, so a fetch
     the worker cannot satisfy is not a generation verdict and must not silence intake of unrelated work."""
+    MALFORMED_POP = enum.auto()
+    """A fault issued at the pop boundary for a job the worker refuses to accept (a pop carrying no usable model
+    identity), excluded from the failure pause. Nothing was generated and no model can be blamed, so it is not a
+    generation verdict. It does still reach the fault-rate breaker, because the horde counts the returned job as
+    dropped exactly like any other fault, and a stream of them is a condition intake must back off from."""
     REMOTE_SUBMIT = enum.auto()
     """A fault the remote submit endpoint imposed, excluded from the failure pause. A generation whose result the
     worker produced but could not deliver (the endpoint stalled, force-faulted it as too slow, or its pop deadline
@@ -404,6 +409,10 @@ class TrackedJob:
     """The post-processing process id that owns the current post-processing attempt, if any."""
     post_process_launch_identifier: int | None = None
     """The process-launch identifier that owns the current post-processing attempt, if any."""
+    safety_process_id: int | None = None
+    """The safety process id that owns the current safety-check attempt, if any."""
+    safety_launch_identifier: int | None = None
+    """The process-launch identifier that owns the current safety-check attempt, if any."""
     disaggregation_declined: bool = False
     """Set when this job was pulled back out of the disaggregated pipeline to run monolithically instead.
 
@@ -1020,14 +1029,15 @@ class JobTracker:
     def was_faulted_by_non_generation_action(self, job_id: GenerationID) -> bool:
         """Return whether this job's terminal fault came from an action other than the generation flow.
 
-        True for a scheduling-recovery give-up, an auxiliary-prefetch failure, and a remote-submit fault: none is
-        a verdict on generating the work, so the submit path excludes all of them from the consecutive-failure
-        pop pause.
+        True for a scheduling-recovery give-up, an auxiliary-prefetch failure, a malformed-pop rejection, and a
+        remote-submit fault: none is a verdict on generating the work, so the submit path excludes all of them
+        from the consecutive-failure pop pause.
         """
         tracked = self._tracked_by_id(job_id)
         return tracked is not None and tracked.fault_origin in (
             JobFaultOrigin.SCHEDULING_RECOVERY,
             JobFaultOrigin.AUX_PREFETCH,
+            JobFaultOrigin.MALFORMED_POP,
             JobFaultOrigin.REMOTE_SUBMIT,
         )
 
@@ -1831,7 +1841,13 @@ class JobTracker:
         tracked.job_info = job_info
         return True
 
-    async def begin_safety_check(self, job_info: HordeJobInfo) -> None:
+    async def begin_safety_check(
+        self,
+        job_info: HordeJobInfo,
+        *,
+        process_id: int | None = None,
+        process_launch_identifier: int | None = None,
+    ) -> None:
         """Begin the safety check process for a job."""
         tracked = self._tracked_for(job_info.sdk_api_job_info)
         if tracked is None:
@@ -1839,7 +1855,25 @@ class JobTracker:
                 f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot begin its safety check",
             )
             return
-        self._set_stage(tracked, JobStage.SAFETY_CHECKING)
+        if self._set_stage(tracked, JobStage.SAFETY_CHECKING):
+            tracked.safety_process_id = process_id
+            tracked.safety_launch_identifier = process_launch_identifier
+
+    def is_current_safety_attempt(
+        self,
+        job_id: GenerationID,
+        *,
+        process_id: int,
+        process_launch_identifier: int,
+    ) -> bool:
+        """Return whether ``process_id``/``process_launch_identifier`` owns this job's current safety attempt."""
+        tracked = self._tracked_by_id(job_id)
+        return (
+            tracked is not None
+            and tracked.stage == JobStage.SAFETY_CHECKING
+            and tracked.safety_process_id == process_id
+            and tracked.safety_launch_identifier == process_launch_identifier
+        )
 
     async def abandon_pending_safety(self, job_info: HordeJobInfo) -> None:
         """Abandon a job from the pending safety check state (it remains tracked, detached)."""
@@ -1851,7 +1885,9 @@ class JobTracker:
     async def requeue_being_safety_checked(self) -> None:
         """Requeue all jobs that are currently being safety checked."""
         for tracked in self._jobs_in_stage(JobStage.SAFETY_CHECKING):
-            self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+            if self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK):
+                tracked.safety_process_id = None
+                tracked.safety_launch_identifier = None
 
     async def requeue_one_being_safety_checked(self, job_id: GenerationID) -> bool:
         """Move a single job from SAFETY_CHECKING back to PENDING_SAFETY_CHECK, so it is re-evaluated.
@@ -1865,7 +1901,11 @@ class JobTracker:
         tracked = self._tracked_by_id(job_id)
         if tracked is None or tracked.stage != JobStage.SAFETY_CHECKING:
             return False
-        return self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+        requeued = self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+        if requeued:
+            tracked.safety_process_id = None
+            tracked.safety_launch_identifier = None
+        return requeued
 
     async def take_being_safety_checked(self, job_id: GenerationID) -> HordeJobInfo | None:
         """Take a job that is currently being safety checked by its ID, detaching it."""
@@ -1873,6 +1913,8 @@ class JobTracker:
         if tracked is None or tracked.stage != JobStage.SAFETY_CHECKING:
             return None
         self._set_stage(tracked, JobStage.DETACHED)
+        tracked.safety_process_id = None
+        tracked.safety_launch_identifier = None
         return tracked.job_info
 
     async def record_source_image_fault(self, job_id: GenerationID, entry: GenMetadataEntry) -> None:
@@ -2285,6 +2327,7 @@ class JobTracker:
         recovery_requeue: bool = False,
         fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
         was_disaggregated_structural_fault: bool = False,
+        deliberate_replacement_reason: str | None = None,
     ) -> InferenceFailureResolution:
         """Resolve a faulted job: requeue it for another (possibly degraded) attempt, or fault it.
 
@@ -2298,6 +2341,9 @@ class JobTracker:
         ``was_disaggregated_structural_fault`` marks a fault that surfaced from a job's disaggregated stage
         for a non-resource-class (structural) reason, latching the job monolithic on the requeue so the retry
         does not re-route into the pipeline that just failed it structurally.
+        ``deliberate_replacement_reason`` names the parent's own reason for replacing the process (a soft
+        reset, a reclaim cycle, a pool reload), so the job is attributed to the replacement that interrupted
+        it rather than to a crash that never happened.
         """
         return self._resolve_inference_failure_impl(
             faulted_job,
@@ -2310,6 +2356,7 @@ class JobTracker:
             recovery_requeue=recovery_requeue,
             fault_origin=fault_origin,
             was_disaggregated_structural_fault=was_disaggregated_structural_fault,
+            deliberate_replacement_reason=deliberate_replacement_reason,
         )
 
     def handle_job_fault_now(
@@ -2325,6 +2372,7 @@ class JobTracker:
         recovery_requeue: bool = False,
         fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
         was_disaggregated_structural_fault: bool = False,
+        deliberate_replacement_reason: str | None = None,
     ) -> InferenceFailureResolution:
         """Synchronous fault path for sync callers (e.g. process crash handling). See :meth:`handle_job_fault`."""
         return self._resolve_inference_failure_impl(
@@ -2338,6 +2386,7 @@ class JobTracker:
             recovery_requeue=recovery_requeue,
             fault_origin=fault_origin,
             was_disaggregated_structural_fault=was_disaggregated_structural_fault,
+            deliberate_replacement_reason=deliberate_replacement_reason,
         )
 
     def _resolve_inference_failure_impl(
@@ -2353,6 +2402,7 @@ class JobTracker:
         recovery_requeue: bool = False,
         fault_origin: JobFaultOrigin = JobFaultOrigin.GENERATION,
         was_disaggregated_structural_fault: bool = False,
+        deliberate_replacement_reason: str | None = None,
     ) -> InferenceFailureResolution:
         tracked = self._tracked_for(faulted_job)
 
@@ -2366,7 +2416,18 @@ class JobTracker:
 
         tracked.inference_attempts += 1
 
-        if process_info is not None:
+        if deliberate_replacement_reason is not None:
+            # The parent replaced this slot on its own initiative, so the job lost its process rather than
+            # its process losing itself. Naming the replacement keeps the operator off a crash hunt that has
+            # no crash at its end.
+            if fault_reason is None:
+                fault_reason = f"process replaced deliberately: {deliberate_replacement_reason}"
+            if process_info is not None:
+                logger.warning(
+                    f"Job {faulted_job.id_} lost process {process_info.process_id} to a deliberate replacement "
+                    f"({deliberate_replacement_reason}); it did not crash or hang.",
+                )
+        elif process_info is not None:
             logger.error(f"Job {faulted_job.id_} faulted due to process {process_info.process_id} crashing")
 
         # Drop any disaggregation pipeline state held for this job BEFORE deciding requeue-vs-fault: a requeue
@@ -2476,8 +2537,13 @@ class JobTracker:
 
         # Announced last, so the tracker's own bookkeeping for this job is complete before any observer
         # reads it back. A generation fault is a job the horde will count as dropped, whatever produced it,
-        # which is what the worker's fault-rate breaker needs to see.
-        if fault_origin is JobFaultOrigin.GENERATION and self._terminal_fault_observer is not None:
+        # which is what the worker's fault-rate breaker needs to see. A malformed-pop rejection is handed back
+        # the same way and counted the same way by the horde, so it feeds the breaker too even though it is
+        # kept out of the generation-verdict pause.
+        if (
+            fault_origin in (JobFaultOrigin.GENERATION, JobFaultOrigin.MALFORMED_POP)
+            and self._terminal_fault_observer is not None
+        ):
             self._terminal_fault_observer(faulted_job.model)
         return InferenceFailureResolution.FAULTED
 

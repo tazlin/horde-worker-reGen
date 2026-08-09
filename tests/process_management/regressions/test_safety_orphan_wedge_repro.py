@@ -17,6 +17,9 @@ the safety process actually returned a verdict for it.
   not pass safety, and the safety-result handler is the sole writer of the ``safety_evaluated`` gate.
 * ``TestSafetyResultInvariant`` - a safety *evaluation failure* drops the images and faults the job
   rather than letting the original, uncleared image reach the submit path.
+* ``TestRetiredSafetyLaunchVerdictStillApplies`` / ``TestRetiredSafetyLaunchDropsUnownedVerdicts`` - a
+  verdict is valid for the job it checked whichever launch produced it, while a verdict for a job some
+  later launch now owns stays dropped.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_worker_regen.process_management.ipc.messages import (
     HordeImageResult,
     HordeProcessState,
+    HordeSafetyEvaluation,
     HordeSafetyResultMessage,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
@@ -68,9 +72,20 @@ def _add_idle_safety_process(pm: object, process_id: int = 10) -> None:
     pm._process_map[process_id] = safety_proc  # type: ignore[attr-defined]
 
 
-async def _strand_in_safety_checking(pm: object, job_info: HordeJobInfo) -> None:
+async def _strand_in_safety_checking(
+    pm: object,
+    job_info: HordeJobInfo,
+    *,
+    process_id: int | None = None,
+    process_launch_identifier: int | None = None,
+) -> None:
     """Register a job and move it into SAFETY_CHECKING (sent to safety, awaiting a verdict)."""
-    await move_job_to_being_safety_checked_async(pm._job_tracker, job_info)  # type: ignore[attr-defined]
+    await move_job_to_being_safety_checked_async(
+        pm._job_tracker,  # type: ignore[attr-defined]
+        job_info,
+        process_id=process_id,
+        process_launch_identifier=process_launch_identifier,
+    )
 
 
 class TestSafetyOrphanReconciler:
@@ -183,6 +198,9 @@ class TestSafetyOrphanReconciler:
         for pid in [p.process_id for p in pm._process_map.values() if p.process_type == HordeProcessType.SAFETY]:
             del pm._process_map[pid]
         pm._process_lifecycle._safety_recovery_history = [time.time()] * 100
+        # The rebuilds followed children that died: the evidence that makes them a crash loop rather than
+        # placement churn the parent asked for.
+        pm._process_lifecycle._safety_child_failure_in_streak = True
         assert pm._recovery_coordinator.is_safety_pool_unrecoverable() is True
 
         job_info = _safety_job_info()
@@ -306,58 +324,148 @@ def _deliver_one_message(pm: object, message: object) -> None:
     dispatcher._process_message_queue.get.return_value = message
 
 
-class TestRetiredSafetyLaunchStrandsInFlightJob:
-    """The trigger for the orphan wedge: replacing a safety process discards its in-flight verdict.
+_SAFETY_PROCESS_ID = 10
+"""The safety process id used by the retired-launch scenarios."""
+
+_RETIRED_LAUNCH_ID = 12
+"""The launch that was retired part-way through a check."""
+
+_CURRENT_LAUNCH_ID = 13
+"""The launch that replaced it."""
+
+
+def _retire_safety_launch(pm: object, launch_identifier: int) -> None:
+    """Retire a safety launch the way a residency-driven replacement does."""
+    safety_proc = make_mock_process_info(
+        _SAFETY_PROCESS_ID,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    safety_proc.process_launch_identifier = launch_identifier
+    pm._process_map[safety_proc.process_id] = safety_proc  # type: ignore[attr-defined]
+    pm._process_map.retire_process(  # type: ignore[attr-defined]
+        safety_proc,
+        "whole-card residency complete: restoring safety to GPU",
+    )
+
+
+def _clean_evaluation() -> HordeSafetyEvaluation:
+    """A per-image verdict that clears the image (nothing censored, nothing failed)."""
+    return HordeSafetyEvaluation(is_nsfw=False, is_csam=False, replacement_image_bytes=None)
+
+
+async def _deliver_safety_verdict(
+    pm: object,
+    job_id: object,
+    launch_identifier: int,
+    evaluations: list[HordeSafetyEvaluation],
+) -> None:
+    """Feed one safety verdict from ``launch_identifier`` through the dispatcher's real receive loop."""
+    verdict = HordeSafetyResultMessage(
+        process_id=_SAFETY_PROCESS_ID,
+        process_launch_identifier=launch_identifier,
+        info="verdict from a retired safety launch",
+        job_id=job_id,  # type: ignore[arg-type]
+        safety_evaluations=evaluations,
+    )
+    _deliver_one_message(pm, verdict)
+    await pm._message_dispatcher.receive_and_handle_process_messages()  # type: ignore[attr-defined]
+
+
+class TestRetiredSafetyLaunchVerdictStillApplies:
+    """A verdict for a job still awaiting one is valid whichever launch produced it.
 
     Whole-card residency moves the safety process off the GPU while a card-filling model holds the device,
-    then replaces it (retires the launch, starts a fresh one) when the residency lifts. A verdict produced
-    by the retired launch for a job that was mid-check is dropped at the launch-identifier guard. That guard
-    keeps a stale message from crashing the control loop, but on its own it leaves the job sitting in
-    SAFETY_CHECKING with a verdict that will never be re-delivered: only the orphan watchdog rescues it, and
-    only after its multi-second grace. When several such replacements land in quick succession the stranded
-    jobs accumulate faster than the watchdog clears them and the pipeline wedges into a soft reset.
+    then replaces it (retires the launch, starts a fresh one) when the residency lifts. The outgoing launch
+    keeps evaluating the jobs it was already given and returns real verdicts for them. Discarding those
+    leaves jobs that were fully checked sitting in SAFETY_CHECKING, drives repeated pool rebuilds, and ends
+    in a job whose images were cleared being faulted for want of a check that had in fact completed.
 
-    The contract: dropping a result from a retired launch flags the job as having a verdict that is known
-    lost (positive evidence, not the watchdog's timeout suspicion), so the next reconcile tick re-checks it
-    at once rather than only after the orphan grace elapses. The bounded requeue/escalation bookkeeping is
-    unchanged, so a job whose re-checks keep failing is still faulted rather than looping forever.
+    Validity is keyed on the job: while the retired launch still owns the job's current attempt, its verdict
+    is the one that attempt is waiting for and is applied. Everything else keeps the guard's protection, as
+    ``TestRetiredSafetyLaunchDropsUnownedVerdicts`` pins.
+    """
+
+    async def test_retired_launch_verdict_is_applied_to_the_job_awaiting_it(self) -> None:
+        """The job it checked is marked evaluated and moves to submit, with no requeue and no fault."""
+        pm = make_testable_process_manager()
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(
+            pm,
+            job_info,
+            process_id=_SAFETY_PROCESS_ID,
+            process_launch_identifier=_RETIRED_LAUNCH_ID,
+        )
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        _retire_safety_launch(pm, _RETIRED_LAUNCH_ID)
+
+        await _deliver_safety_verdict(pm, job_id, _RETIRED_LAUNCH_ID, [_clean_evaluation()])
+
+        assert job_info.safety_evaluated is True
+        assert job_info.job_image_results is not None
+        assert job_info.state != GENERATION_STATE.faulted
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+        assert job_info not in pm._job_tracker.jobs_being_safety_checked
+
+    async def test_applied_verdict_leaves_nothing_for_the_orphan_watchdog_to_recover(self) -> None:
+        """No known-lost flag and no requeue follow an applied verdict: the job was checked, not stranded."""
+        pm = make_testable_process_manager()
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(
+            pm,
+            job_info,
+            process_id=_SAFETY_PROCESS_ID,
+            process_launch_identifier=_RETIRED_LAUNCH_ID,
+        )
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        _retire_safety_launch(pm, _RETIRED_LAUNCH_ID)
+
+        await _deliver_safety_verdict(pm, job_id, _RETIRED_LAUNCH_ID, [_clean_evaluation()])
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._recovery_coordinator.safety_requeue_count == {}
+        assert pm._state.self_throttle_paused is False
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+
+
+class TestRetiredSafetyLaunchDropsUnownedVerdicts:
+    """A verdict from a launch that no longer owns the job's check stays dropped, and flags it known-lost.
+
+    Once a job has been re-dispatched to a fresh launch, a verdict from the retired one is a duplicate: the
+    live attempt owns the job's state and must not be overwritten by it. Dropping it is still positive
+    evidence that the retired launch will not deliver, so the job is re-checked on the next reconcile tick
+    rather than waiting out the orphan grace, and the bounded requeue/escalation bookkeeping is unchanged.
     """
 
     async def _strand_then_drop_retired_verdict(self, pm: object) -> HordeJobInfo:
-        """Strand a job in SAFETY_CHECKING, retire its safety launch, and deliver+drop the late verdict."""
-        retired_launch_id = 12
-        safety_proc = make_mock_process_info(
-            10,
-            model_name=None,
-            state=HordeProcessState.WAITING_FOR_JOB,
-            process_type=HordeProcessType.SAFETY,
-        )
-        safety_proc.process_launch_identifier = retired_launch_id
-        pm._process_map[safety_proc.process_id] = safety_proc  # type: ignore[attr-defined]
-
+        """Strand a job under the current launch, then deliver+drop a verdict from the retired one."""
         job_info = _safety_job_info()
-        await _strand_in_safety_checking(pm, job_info)
+        await _strand_in_safety_checking(
+            pm,
+            job_info,
+            process_id=_SAFETY_PROCESS_ID,
+            process_launch_identifier=_CURRENT_LAUNCH_ID,
+        )
         job_id = job_info.sdk_api_job_info.id_
         assert job_id is not None
         assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING  # type: ignore[attr-defined]
 
-        # Whole-card residency lifts and the safety process is restored: its launch is retired.
-        pm._process_map.retire_process(  # type: ignore[attr-defined]
-            safety_proc,
-            "whole-card residency complete: restoring safety to GPU",
-        )
-
-        # The verdict the retired launch had in flight for this job now arrives and is dropped.
-        verdict = HordeSafetyResultMessage(
-            process_id=safety_proc.process_id,
-            process_launch_identifier=retired_launch_id,
-            info="late verdict from retired safety launch",
-            job_id=job_id,
-            safety_evaluations=[],
-        )
-        _deliver_one_message(pm, verdict)
-        await pm._message_dispatcher.receive_and_handle_process_messages()  # type: ignore[attr-defined]
+        _retire_safety_launch(pm, _RETIRED_LAUNCH_ID)
+        await _deliver_safety_verdict(pm, job_id, _RETIRED_LAUNCH_ID, [])
         return job_info
+
+    async def test_unowned_verdict_never_resolves_the_live_attempt(self) -> None:
+        """The job stays in SAFETY_CHECKING under its live attempt; the stale verdict changes nothing."""
+        pm = make_testable_process_manager()
+        job_info = await self._strand_then_drop_retired_verdict(pm)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING
+        assert job_info.safety_evaluated is False
 
     async def test_dropped_retired_safety_verdict_requeues_without_waiting_out_the_grace(self) -> None:
         """A dropped retired-launch verdict re-checks its job on the next tick, not after the orphan grace."""

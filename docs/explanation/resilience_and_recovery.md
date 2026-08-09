@@ -266,6 +266,17 @@ Attributing a hang to the model does
 **not** change the slot bookkeeping: the slot really did die, so its own breaker
 still counts the replacement.
 
+A reported `PRELOADING_FAILED` does not always cost a slot. The child ends itself
+after reporting a load failure because a failure part-way through a real load leaves
+torch and the backend in an unknown state, and a fresh process is the only way back
+to a known one. Two failures are exempt, because they happen *before* the backend
+touches a weight: a blank model name, and a name the backend refuses to resolve
+because it does not know it. Neither leaves anything half-loaded, so the child
+reports the failure and stays in its main loop, ready for the next job. Without the
+exemption a per-job data error costs a full process replacement with a backend
+re-initialisation, and a repeating one becomes a churn loop; the quarantine ladder
+still terminates it, now after three load failures rather than three replacements.
+
 Crossing a threshold calls the one quarantine handler every feed site shares
 (`HordeWorkerProcessManager._on_model_quarantined`, registered via
 `set_model_quarantine_handler`), and that handler is the single downstream:
@@ -285,6 +296,53 @@ would leave nothing to advertise (a worker configured with only that model), the
 offer is sent unchanged and a warning is logged once per episode. A worker that
 advertises nothing is sent nothing, so it can never produce the work that would
 let it recover; taking the faults is a recoverable state, going silent is not.
+
+### Only a real model may be quarantined
+
+A quarantine entry is permanent for the session and takes its model off the offer,
+off preload, and off head selection. That makes the *identity* it is keyed on
+load-bearing: an entry keyed on a name no model has can never be matched by a real
+load or cleared by a real success, so it would sit in the set forever, refusing a
+model that does not exist.
+
+`record_model_incident` therefore refuses a blank (empty or whitespace-only) model
+name outright: nothing is counted, nothing is quarantined, and the refusal is
+surfaced once at `WARNING` since whatever produced the name will keep producing it.
+[`HordeModelMap.update_entry`][horde_worker_regen.process_management.models.horde_model_map.HordeModelMap.update_entry]
+refuses one the same way, so the load-state map cannot report a residency for a
+model that does not exist either. The site that reported the failure still handles
+it; only the per-model bookkeeping declines to name a culprit it does not have.
+
+## Pop-boundary validation
+
+A pop response can arrive naming no model at all. Such a job is unservable by
+construction: there is no checkpoint to preload and no card to route it to. Left to
+flow through the worker it becomes the empty string as a model *identity*, and every
+model-keyed mechanism downstream then treats that string as a model: the scheduler
+preloads it, the child's preload fails on it, and the per-model incident counter
+counts the failures against it until it is quarantined as if it were a checkpoint.
+
+`JobPopper` rejects it at the boundary instead. A popped job whose model name is
+absent or blank is never placed in the pending-inference queue: it is registered and
+immediately faulted terminally with `JobFaultOrigin.MALFORMED_POP`, so the horde
+reissues it at once rather than waiting out its ttl, and the log line names the
+condition as a malformed pop rather than a model failure. The rejection happens
+before source media is fetched and before auxiliary prefetch is triggered, since
+neither can lead anywhere for a job that is already being handed back.
+
+The fault is deliberately routed to two different places:
+
+- It is **excluded** from the consecutive-failure pop pause, along with the other
+  non-generation origins. Nothing was generated, so it says nothing about whether
+  this worker can generate.
+- It **is** counted by the [terminal-fault-rate breaker](#the-terminal-fault-rate-breaker).
+  The horde counts the returned job as dropped like any other fault, so a steady
+  stream of malformed pops earns the worker forced maintenance whether or not the
+  worker faulted them politely. Backing intake off is the correct response.
+
+Each pop request also logs the model set it advertised at `DEBUG`, which is what
+makes an empty name attributable after the fact: without it, a blank name the worker
+advertised and a blank name the horde answered with look identical in a capture.
 
 ## Stranded in-progress jobs
 
@@ -719,14 +777,20 @@ not from the session faulted counter. That counter only moves when a faulted
 result is submitted, so a breaker reading it would learn of a burst well after
 the horde had already counted the drops.
 
-Only faults whose [`JobFaultOrigin`][horde_worker_regen.process_management.jobs.job_tracker.JobFaultOrigin]
-is `GENERATION` are counted, matching the exclusions the consecutive-failure pause
-already applies. A scheduling-recovery fault, an auxiliary-prefetch give-up, and a
-remote-submit failure are each a verdict on something other than the worker's
-ability to generate, so none may pause intake of unrelated work; a retryable
-failure that requeues dropped nothing at all. The shutdown drain is excluded too:
-it faults the remaining backlog deliberately, and a worker on its way out accepts
-nothing either way.
+Faults whose [`JobFaultOrigin`][horde_worker_regen.process_management.jobs.job_tracker.JobFaultOrigin]
+is `GENERATION` or `MALFORMED_POP` are counted. A scheduling-recovery fault, an
+auxiliary-prefetch give-up, and a remote-submit failure are each a verdict on
+something other than the worker's ability to generate, so none may pause intake of
+unrelated work; a retryable failure that requeues dropped nothing at all. The
+shutdown drain is excluded too: it faults the remaining backlog deliberately, and a
+worker on its way out accepts nothing either way.
+
+`MALFORMED_POP` is the one origin counted here that the consecutive-failure pause
+still excludes. It marks a job the popper handed straight back because the pop
+carried no usable model name (see [Pop-boundary validation](#pop-boundary-validation)).
+Nothing was generated, so it is no verdict on generating; but the horde counts the
+returned job as dropped exactly like any other fault, and a stream of them is
+precisely the raw rate this breaker exists to notice.
 
 The policy is fixed in module constants (no configuration keys):
 `TERMINAL_FAULT_BREAKER_THRESHOLD` (3) faults within

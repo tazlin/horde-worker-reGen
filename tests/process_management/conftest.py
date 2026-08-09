@@ -205,10 +205,24 @@ async def queue_job_for_submit_async(job_tracker: JobTracker, job_info: object) 
     await job_tracker.queue_for_submit(job_info)  # type: ignore[arg-type]
 
 
-async def move_job_to_being_safety_checked_async(job_tracker: JobTracker, job_info: object) -> None:
-    """Move a job into the being-safety-checked collection via JobTracker."""
+async def move_job_to_being_safety_checked_async(
+    job_tracker: JobTracker,
+    job_info: object,
+    *,
+    process_id: int | None = None,
+    process_launch_identifier: int | None = None,
+) -> None:
+    """Move a job into the being-safety-checked collection via JobTracker.
+
+    ``process_id``/``process_launch_identifier`` record which safety launch owns the check, as the
+    orchestrator does when it dispatches one.
+    """
     await queue_job_for_safety_async(job_tracker, job_info)
-    await job_tracker.begin_safety_check(job_info)  # type: ignore[arg-type]
+    await job_tracker.begin_safety_check(  # type: ignore[arg-type]
+        job_info,
+        process_id=process_id,
+        process_launch_identifier=process_launch_identifier,
+    )
 
 
 async def add_job_fault_async(job_tracker: JobTracker, job_id: object, fault_entry: object) -> None:

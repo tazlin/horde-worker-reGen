@@ -875,6 +875,17 @@ A re-trip inside this period doubles the cooldown (a condition the first pause d
 longer one); a worker that goes this long without tripping has demonstrated the condition passed, so the
 next trip starts from the base cooldown rather than inheriting an old escalation."""
 
+BUDGET_DEPENDENT_FLAGS: tuple[str, ...] = (
+    "whole_card_exclusive_residency",
+    "whole_card_residency_safety_off_gpu",
+    "overbudget_exclusive_mode",
+)
+"""Config flags whose behaviour exists only while the measured VRAM/RAM budget is active.
+
+Each governs a placement decision the budget's arithmetic drives, so with ``enable_vram_budget`` false none of
+them is ever consulted. Listed here so the startup disclosure can name the ones an operator explicitly turned
+on, which is otherwise a silent no-op with no diagnosable symptom."""
+
 SERVER_MAINTENANCE_CLEAR_BACKOFF_SECONDS = (600.0, 1800.0, 3600.0)
 """Delays between successive attempts to clear horde-forced maintenance, measured from when it engaged.
 
@@ -2738,6 +2749,7 @@ class HordeWorkerProcessManager:
                 "against multiple inference processes over-committing the GPU. Not recommended on a "
                 "shared or consumer GPU.",
             )
+            self._log_inert_budget_dependent_flags()
             return
 
         primary_device = self._device_map.root.get(0)
@@ -2750,6 +2762,38 @@ class HordeWorkerProcessManager:
             "dispatch are gated on measured free VRAM/RAM, and idle resident models are evicted under "
             "pressure to prevent out-of-memory crashes.",
         )
+
+    def _log_inert_budget_dependent_flags(self) -> None:
+        """Name the features an operator switched on that the disabled budget silently makes inert.
+
+        Every one of these is gated on the measured VRAM/RAM budget being active, so with the budget off they
+        do nothing at all. An operator who deliberately enabled one and sees no sign of it would otherwise have
+        no way to connect the two settings; the remedy (turn the budget back on) is only obvious once the
+        dependency is stated. Only flags the operator set explicitly are named, so a default-on flag nobody
+        asked for does not produce a warning about a feature they never wanted.
+        """
+        inert = [
+            name
+            for name in BUDGET_DEPENDENT_FLAGS
+            if getattr(self.bridge_data, name, None) is True and self._is_config_field_explicit(name)
+        ]
+        if not inert:
+            return
+        logger.warning(
+            f"These settings are inert while enable_vram_budget is false: {', '.join(inert)}. Each is gated on "
+            "the measured VRAM/RAM budget, so it has no effect until the budget is enabled.",
+        )
+
+    def _is_config_field_explicit(self, field_name: str) -> bool:
+        """Whether the operator set this config field themselves rather than inheriting its default.
+
+        Read tolerantly: a partially-mocked config (used in tests) exposes no real ``model_fields_set``, and an
+        unreadable set means nothing can be shown to be explicit, so nothing is disclosed.
+        """
+        fields_set = getattr(self.bridge_data, "model_fields_set", None)
+        if not isinstance(fields_set, (set, frozenset)):
+            return False
+        return field_name in fields_set
 
     async def unload_models_from_vram(
         self,

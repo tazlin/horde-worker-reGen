@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from loguru import logger
-from pydantic import RootModel
+from pydantic import PrivateAttr, RootModel
 
 from horde_worker_regen.process_management.ipc.messages import ModelInfo, ModelLoadState
 
 
 class HordeModelMap(RootModel[dict[str, ModelInfo]]):
     """A mapping of horde model names to `ModelInfo` objects. Contains some helper methods."""
+
+    _blank_identity_warned: bool = PrivateAttr(default=False)
+    """Whether the refusal to key an entry on a blank model name has already been surfaced."""
 
     def update_entry(
         self,
@@ -19,6 +22,11 @@ class HordeModelMap(RootModel[dict[str, ModelInfo]]):
         process_id: int | None = None,
     ) -> None:
         """Update the entry for the given model name. If the model does not exist, it will be created.
+
+        A blank (empty or whitespace-only) name is refused without mutating the map. Such a name identifies no
+        model, so an entry keyed on it can never be matched by a real load or cleared by a real unload; it would
+        persist as a residency this map reports for a model that does not exist. The refusal is surfaced once,
+        since the condition repeats for as long as whatever produced the name keeps producing it.
 
         Args:
             horde_model_name (str): The (horde) name of the model to update.
@@ -30,6 +38,15 @@ class HordeModelMap(RootModel[dict[str, ModelInfo]]):
             ValueError: If the process_id is None and the model does not exist.
             ValueError: If the load_state is None and the model does not exist.
         """
+        if not horde_model_name or not horde_model_name.strip():
+            if not self._blank_identity_warned:
+                self._blank_identity_warned = True
+                logger.warning(
+                    f"Refusing to record a model load state against a blank model name (got "
+                    f"{horde_model_name!r}, process {process_id}); the model map is left unchanged.",
+                )
+            return
+
         if horde_model_name not in self.root:
             if process_id is None:
                 raise ValueError("process_id must be provided when adding a new model to the map")

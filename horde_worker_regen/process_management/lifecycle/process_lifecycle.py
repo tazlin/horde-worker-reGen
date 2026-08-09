@@ -462,10 +462,12 @@ class ProcessLifecycleManager:
     _safety_intentional_window_rebuilds: int
     _safety_next_start_allowed_at: float
     _last_safety_child_ever_reported: bool | None
+    _safety_child_failure_in_streak: bool
     _model_incident_history: dict[str, list[ModelIncident]]
     _quarantined_models: set[str]
     _recent_load_failure_by_process: dict[int, tuple[str, float]]
     _on_model_quarantined: Callable[[str], None] | None
+    _blank_model_identity_warned: bool
 
     def __init__(
         self,
@@ -705,10 +707,16 @@ class ProcessLifecycleManager:
         # safety child has been reaped. Carried for the futility diagnostic, since the process info is gone
         # from the map by the time the rebuild completes.
         self._last_safety_child_ever_reported = None
+        # Whether any safety child has failed on its own account (died, or was reaped for outstaying a state)
+        # since the pool last reached readiness. Rebuilds the parent asked for (a whole-card pause/restore, a
+        # supervised rebuild) end their child deliberately and leave this clear, which is what separates
+        # placement churn from a pool that cannot keep a child alive.
+        self._safety_child_failure_in_streak = False
         self._model_incident_history = {}
         self._quarantined_models = set()
         self._recent_load_failure_by_process = {}
         self._on_model_quarantined = None
+        self._blank_model_identity_warned = False
         self._pending_gpu_starts: dict[tuple[HordeProcessType, int], _PendingGpuStart] = {}
         self._pending_gpu_start_last_free_mb_by_device: dict[int, float] = {}
         self._pending_gpu_start_last_progress_at_by_device: dict[int, float] = {}
@@ -3044,6 +3052,7 @@ class ProcessLifecycleManager:
             )
         if process_info.process_type == HordeProcessType.SAFETY:
             self._last_safety_child_ever_reported = process_info.has_ever_reported
+            self._safety_child_failure_in_streak = True
             self._initiate_safety_replacement()
             self._replace_all_safety_process()
         elif process_info.process_type == HordeProcessType.POST_PROCESS:
@@ -3143,10 +3152,19 @@ class ProcessLifecycleManager:
                 ipc_evidence = "the last child reported to the parent before dying (it got past its own startup)"
             else:
                 ipc_evidence = "the last child never reported to the parent (it died before its message loop)"
+            if self._safety_child_failure_in_streak:
+                verdict = (
+                    "Treating the pool as unable to start: safety sits on every job's path, so recovery "
+                    "escalates rather than respawning it indefinitely."
+                )
+            else:
+                verdict = (
+                    "Not treating the pool as unable to start: no child died or had to be reaped across "
+                    "these rebuilds, so they are parent-initiated placement churn rather than a failing pool."
+                )
             logger.critical(
                 f"The safety pool has been rebuilt {self._safety_consecutive_start_failures} consecutive times "
-                f"without one reaching readiness; {ipc_evidence}. Treating the pool as unable to start: safety "
-                "sits on every job's path, so recovery escalates rather than respawning it indefinitely.",
+                f"without one reaching readiness; {ipc_evidence}. {verdict}",
             )
 
     def _safety_respawn_backoff_seconds(self) -> float:
@@ -3174,6 +3192,7 @@ class ProcessLifecycleManager:
         self._safety_intentional_window_rebuilds = 0
         self._safety_consecutive_start_failures = 0
         self._safety_next_start_allowed_at = 0.0
+        self._safety_child_failure_in_streak = False
 
     def _record_safety_recovery(self) -> None:
         """Record that the safety pool was just rebuilt, pruning the history to the crash-loop window."""
@@ -3205,6 +3224,19 @@ class ProcessLifecycleManager:
         the pool cannot initialise at all, whatever its spacing.
         """
         return self._safety_consecutive_start_failures >= SAFETY_CRASH_LOOP_MAX_START_FAILURES
+
+    @property
+    def safety_pool_failure_evidence_seen(self) -> bool:
+        """Whether a safety child has failed on its own account since the pool last reached readiness.
+
+        The rebuild counters cannot tell a failing pool from placement churn on their own: a pause/restore
+        cycle ends its child on the parent's own request, and enough of those in a row look identical to a pool
+        that cannot keep a child alive. A child that died, or that had to be reaped for outstaying a state, is
+        the evidence that distinguishes them; both count, since a child wedged in its own startup never exits
+        and would otherwise leave a real failure loop invisible. A consumer that escalates on the crash-loop
+        verdict requires this before acting on it.
+        """
+        return self._safety_child_failure_in_streak
 
     def _release_held_primitives(self, process_info: HordeProcessInfo) -> None:
         """Release every shared primitive a replaced inference child might still be holding.
@@ -3299,6 +3331,20 @@ class ProcessLifecycleManager:
         Returns:
             Whether the model is quarantined after this incident.
         """
+        if not model_name or not model_name.strip():
+            # There is no model here to hold responsible, so counting the incident would build a quarantine
+            # against an identity no job can name and no load can clear. Once in the quarantine set it would
+            # also come off the pop offer and be refused at preload forever. Refuse it outright; the failure is
+            # still handled by whatever site reported it. Surfaced once, since the condition repeats.
+            if not self._blank_model_identity_warned:
+                self._blank_model_identity_warned = True
+                logger.warning(
+                    f"Ignoring a {kind.value} incident reported against a blank model name (got "
+                    f"{model_name!r}, job {job_id}); a blank name identifies no model, so nothing is counted "
+                    "and nothing can be quarantined for it.",
+                )
+            return False
+
         now = time.time()
         if reported_by_process_id is not None:
             self._recent_load_failure_by_process[reported_by_process_id] = (model_name, now)
@@ -3481,6 +3527,7 @@ class ProcessLifecycleManager:
         self._safety_consecutive_start_failures = 0
         self._safety_intentional_window_rebuilds = 0
         self._safety_next_start_allowed_at = 0.0
+        self._safety_child_failure_in_streak = False
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         self._replace_all_safety_process()
@@ -3518,6 +3565,21 @@ class ProcessLifecycleManager:
         except Exception as e:
             logger.debug(f"OOM-kill check failed: {type(e).__name__} {e}")
             return False
+
+    @staticmethod
+    def _deliberate_replacement_reason(
+        *,
+        intentional_reclaim: bool,
+        intentional_reason: str | None,
+    ) -> str | None:
+        """Name the parent's own reason for replacing a slot, or None when the slot crashed or hung.
+
+        The single definition of what makes a replacement deliberate, so the job faulted by one is attributed
+        with the same reason the replacement itself is logged and ledgered under.
+        """
+        if intentional_reclaim:
+            return "idle process cycled to reclaim RAM"
+        return intentional_reason
 
     def _replace_inference_process(
         self,
@@ -3627,6 +3689,10 @@ class ProcessLifecycleManager:
                 is_resource_failure=resource_fault_reason is not None,
                 fault_reason=fault_reason,
                 recovery_requeue=recovery_requeue,
+                deliberate_replacement_reason=self._deliberate_replacement_reason(
+                    intentional_reclaim=intentional_reclaim,
+                    intentional_reason=intentional_reason,
+                ),
             )
 
         if intentional_reclaim or intentional_reason is not None:
@@ -3636,15 +3702,17 @@ class ProcessLifecycleManager:
             # Either way this skips the recovery diagnostics, the process_recoveries count, and the
             # crash-loop / start-failure breakers entirely, so a deliberate replacement is never mistaken
             # for (or accumulated toward) a crash.
+            reason = self._deliberate_replacement_reason(
+                intentional_reclaim=intentional_reclaim,
+                intentional_reason=intentional_reason,
+            )
+            assert reason is not None
             if intentional_reclaim:
-                reason = "idle process cycled to reclaim RAM"
                 logger.info(
                     f"Cycling idle process {process_info.process_id} to reclaim "
                     f"{process_info.ram_usage_bytes} bytes of unreleased RAM.",
                 )
             else:
-                assert intentional_reason is not None
-                reason = intentional_reason
                 logger.info(
                     f"Replacing process {process_info.process_id} ({reason}); deliberate, not a crash or hang.",
                 )
@@ -3875,6 +3943,10 @@ class ProcessLifecycleManager:
             )
             if process_info.process_type == HordeProcessType.SAFETY:
                 self._log_recovery_diagnostics(process_info, error_message)
+                # A child the parent had to reap for outstaying a state failed on its own account, exactly as
+                # one that died does. Recording that keeps a child wedged in its own startup (which never
+                # exits, so the reap path never sees it) reaching the futility verdict.
+                self._safety_child_failure_in_streak = True
                 # Arm the replacement before driving it: `_replace_all_safety_process` no-ops unless the
                 # flag is set, so omitting this (the historical bug) made the safety branch a silent no-op.
                 self._initiate_safety_replacement()

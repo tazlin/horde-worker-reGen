@@ -131,6 +131,7 @@ class SafetyOrchestrator:
                 ),
             )
 
+        dispatched_to = safety_process
         safety_process = self._process_map.get_safety_process()
         if not safety_message_sent_succeeded:
             if safety_process is None:
@@ -146,4 +147,11 @@ class SafetyOrchestrator:
             self._process_lifecycle.safety_processes_should_be_replaced = True
             await self._job_tracker.requeue_being_safety_checked()
         else:
-            await self._job_tracker.begin_safety_check(completed_job_info)
+            # Record which launch is evaluating this job. A verdict that arrives after the launch has been
+            # retired is still this job's verdict, and the dispatcher needs the ownership to tell that apart
+            # from a stale message for a job some later launch is already re-checking.
+            await self._job_tracker.begin_safety_check(
+                completed_job_info,
+                process_id=dispatched_to.process_id,
+                process_launch_identifier=dispatched_to.process_launch_identifier,
+            )

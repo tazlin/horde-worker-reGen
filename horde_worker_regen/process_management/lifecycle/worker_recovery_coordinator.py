@@ -376,8 +376,16 @@ class WorkerRecoveryCoordinator:
         start-failure streak. The streak is what covers a deterministic failure whose full cold start spaces
         its rebuilds wider than the window can accumulate, so a pool that never initialises is classified
         however slowly it fails rather than being respawned for the life of the worker.
+
+        Both signals count rebuilds, and a rebuild the parent asked for (a whole-card pause/restore cycle, a
+        supervised rebuild) counts the same as one a failing child forced. This verdict drops a job's images
+        and faults it, so it additionally requires a safety child that failed on its own account: without one
+        the rebuilds are placement churn, and the jobs the outgoing launch was checking are still owed their
+        verdicts.
         """
         if self._safety_starts_backing_off():
+            return False
+        if not self._process_lifecycle.safety_pool_failure_evidence_seen:
             return False
         pool_broken = self._process_lifecycle.safety_pool_failing or self._process_lifecycle.safety_pool_start_failing
         return pool_broken and not self.is_safety_pool_ready()

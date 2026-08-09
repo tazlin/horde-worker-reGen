@@ -170,6 +170,24 @@ def sampler_truncation_report(truncation: SamplerTruncationRecord | None) -> Sam
     )
 
 
+_MODEL_UNAVAILABLE_MARKER = "is not available"
+"""Substring identifying the backend's refusal to resolve a model name it does not know.
+
+Deliberately narrow. The backend raises this while resolving the requested name against the model manager,
+before it opens or maps a single weight file, which is what makes the failure safe to survive: the process
+holds no half-initialised state afterwards. Every other preload failure keeps ending the process, because a
+failure part-way through a real load leaves torch and the backend in an unknown condition."""
+
+
+def _is_model_unavailable_error(error: BaseException) -> bool:
+    """Whether a preload failure is the backend rejecting the requested model name as unknown.
+
+    Matched on the exception type and message rather than a dedicated exception class because the backend
+    raises a plain ``ValueError`` here. Substring-based so it cannot itself raise on a surprising message.
+    """
+    return isinstance(error, ValueError) and _MODEL_UNAVAILABLE_MARKER in str(error)
+
+
 class HordeInferenceProcess(HordeProcess):
     """Represents an inference process, which generates images."""
 
@@ -677,6 +695,22 @@ class HordeInferenceProcess(HordeProcess):
         """
         logger.debug(f"Currently active model is {self._active_model_name}. Requested model is {horde_model_name}")
 
+        if not horde_model_name or not horde_model_name.strip():
+            # A blank name is a bad argument, not a sick process: nothing has been touched, so the backend and
+            # torch are exactly as they were. Report it as a load failure (the parent already handles that,
+            # faulting the job for reissue) and stay in the loop, rather than letting the exception escape the
+            # control-message handler and end an otherwise healthy slot over one unservable job.
+            logger.error(
+                f"Refusing to preload a blank model name (got {horde_model_name!r}) for job "
+                f"{job_info.id_}; reporting a load failure and staying available.",
+            )
+            self.on_horde_model_state_change(
+                process_state=HordeProcessState.PRELOADING_FAILED,
+                horde_model_name=horde_model_name,
+                horde_model_state=ModelLoadState.FAILED,
+            )
+            return
+
         if self._active_model_name == horde_model_name:
             return
 
@@ -726,6 +760,12 @@ class HordeInferenceProcess(HordeProcess):
                         horde_model_name=horde_model_name,
                         horde_model_state=ModelLoadState.FAILED,
                     )
+                    if _is_model_unavailable_error(preload_error):
+                        # The backend rejected the name before touching any weights, so nothing loaded and
+                        # nothing is half-loaded. The failure is already reported; ending the process here
+                        # would turn one unservable job into a full slot replacement with a backend re-init,
+                        # and a repeating cause into a churn loop. Stay in the loop for the next job.
+                        return
                     raise
 
         logger.info(f"Preloaded model {horde_model_name}")

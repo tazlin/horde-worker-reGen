@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import random
 import time
 from asyncio import CancelledError
@@ -31,7 +32,7 @@ from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
-from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
 from horde_worker_regen.process_management.jobs.large_model_pop_governor import (
     LargeModelGovernorStatus,
     LargeModelPopGovernor,
@@ -320,7 +321,19 @@ def _select_models_for_pop(
 
     if bridge_data.custom_models is not None and len(bridge_data.custom_models) > 0:
         logger.debug("Custom models are enabled, adding them to the list of models to pop")
-        custom_model_names = {model["name"] for model in bridge_data.custom_models}
+        # Custom model entries are free-form operator YAML and are the one offer source that does not pass
+        # through the model reference's known-name filter, so an entry with a missing or blank `name` would put
+        # an unloadable identity straight into the advertised set. Such an entry is already skipped when the
+        # custom model file is written, so dropping it here keeps the offer consistent with what can be loaded.
+        custom_model_names = set()
+        for model in bridge_data.custom_models:
+            name = model.get("name")
+            if not isinstance(name, str) or not name.strip():
+                logger.warning(
+                    f"Custom model entry {model} has no usable name; it will not be advertised in pop requests.",
+                )
+                continue
+            custom_model_names.add(name)
         models.update(custom_model_names)
 
     if len(models) == 0:
@@ -339,6 +352,26 @@ def _select_models_for_pop(
         return None
 
     return models
+
+
+_ADVERTISED_MODELS_LOG_LIMIT = 12
+"""Model count above which the per-pop advertised-offer line is summarised rather than listed in full."""
+
+
+def _describe_advertised_models(models: set[str]) -> str:
+    """Render the advertised model set for the per-pop log line.
+
+    A short offer is listed in full. A long one is summarised as its size, a stable digest of the whole set,
+    and a sample, which keeps the line readable on a wide worker while still letting two pops be compared and
+    an unexpected entry (a blank name among them) be spotted. Names are quoted so a blank or whitespace-only
+    entry is visible rather than rendering as nothing.
+    """
+    ordered = sorted(models)
+    if len(ordered) <= _ADVERTISED_MODELS_LOG_LIMIT:
+        return f"{len(ordered)} {[repr(name) for name in ordered]}"
+    digest = hashlib.sha256("\n".join(ordered).encode("utf-8")).hexdigest()[:12]
+    sample = [repr(name) for name in ordered[:_ADVERTISED_MODELS_LOG_LIMIT]]
+    return f"{len(ordered)} (sha256:{digest}) sample={sample}"
 
 
 _MAX_IDLE_FILL_RUNG = 3
@@ -1636,6 +1669,33 @@ class JobPopper:
 
         return job_pop_response
 
+    async def _reject_malformed_pop(self, job_pop_response: ImageGenerateJobPopResponse) -> bool:
+        """Hand a pop back to the horde when it carries no usable model identity; return whether it was rejected.
+
+        A pop whose model name is absent or blank names nothing this worker (or any worker) can load. Accepted,
+        it would be preloaded as a literal empty identity, fault the slot it is dispatched to, and then be
+        counted against that empty string as if it were a model, poisoning the per-model incident and quarantine
+        state with an identity no job can ever satisfy. The job is therefore faulted terminally at the boundary
+        so the horde reissues it immediately, and the fault is attributed to the malformed pop rather than to a
+        model, keeping it out of the per-model breakers.
+        """
+        model = job_pop_response.model
+        if model is not None and model.strip():
+            return False
+
+        await self._job_tracker.record_popped_job(job_pop_response)
+        self._job_tracker.handle_job_fault_now(
+            job_pop_response,
+            retryable=False,
+            fault_reason="malformed pop: no model name",
+            fault_origin=JobFaultOrigin.MALFORMED_POP,
+        )
+        logger.error(
+            f"Popped job {job_pop_response.id_} carries no model name (got {model!r}); returning it to the horde "
+            "for reissue without queueing it. This is a malformed pop response, not a model failure.",
+        )
+        return True
+
     async def _enqueue_popped_job(
         self,
         job_pop_response: ImageGenerateJobPopResponse,
@@ -1976,6 +2036,10 @@ class JobPopper:
         # from a held one.
         self._note_pop_gate(None)
 
+        # The exact offer that goes out, so a later capture can tell an empty model name this worker advertised
+        # apart from one the horde answered with. Without it the two are indistinguishable after the fact.
+        logger.debug(f"Advertising models in pop request: {_describe_advertised_models(models)}")
+
         try:
             job_pop_request = ImageGenerateJobPopRequest(
                 apikey=bridge_data.api_key,
@@ -2130,6 +2194,12 @@ class JobPopper:
             job_pop_response.id_,
             job_pop_response.model,
         )
+
+        # Checked before any preparation work: a job with no model identity can never be dispatched, so
+        # downloading its source media (and prefetching its auxiliaries) would only spend the worker's time on
+        # a job that is about to be handed straight back.
+        if job_pop_response.id_ is not None and await self._reject_malformed_pop(job_pop_response):
+            return
 
         job_pop_response = self._apply_sdk_workarounds(job_pop_response)
         try:

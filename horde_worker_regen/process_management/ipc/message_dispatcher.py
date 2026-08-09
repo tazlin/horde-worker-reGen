@@ -94,6 +94,7 @@ class _RetiredLaunchMessageAction(enum.Enum):
     NOT_RETIRED = enum.auto()
     IGNORE = enum.auto()
     ACCEPT_POST_PROCESS_RESULT = enum.auto()
+    ACCEPT_SAFETY_RESULT = enum.auto()
 
 
 _INFERENCE_ACTIVE_STATES = frozenset(
@@ -529,6 +530,14 @@ class MessageDispatcher:
                     f"Retired-launch classifier accepted an unexpected message type: {type(message).__name__}",
                 )
             return
+        if retired_launch_action is _RetiredLaunchMessageAction.ACCEPT_SAFETY_RESULT:
+            if isinstance(message, HordeSafetyResultMessage):
+                await self._handle_safety_result(message)
+            else:
+                logger.error(
+                    f"Retired-launch classifier accepted an unexpected message type: {type(message).__name__}",
+                )
+            return
 
         if message.process_id not in self._process_map:
             # A late IPC message from a process the map no longer knows. This is expected after an
@@ -824,16 +833,28 @@ class MessageDispatcher:
                 )
                 return _RetiredLaunchMessageAction.ACCEPT_POST_PROCESS_RESULT
 
+            if isinstance(message, HordeSafetyResultMessage) and self._should_accept_retired_safety_result(
+                message,
+                retired_launch,
+            ):
+                logger.info(
+                    f"Accepting safety verdict from retired safety process {message.process_id} launch "
+                    f"{message.process_launch_identifier} for job {message.job_id}; the job is still awaiting "
+                    "the verdict this launch produced.",
+                )
+                return _RetiredLaunchMessageAction.ACCEPT_SAFETY_RESULT
+
             logger.warning(
                 f"Ignoring result message from retired {retired_launch.process_type.name.lower()} process "
                 f"{message.process_id} launch {message.process_launch_identifier} "
                 f"({retired_launch.reason}): {type(message).__name__}",
             )
-            # A safety verdict dropped here is the only signal that the job it was checking will never get a
-            # verdict from that launch; flag it so the recovery coordinator re-checks it at once instead of
-            # leaving it stranded in SAFETY_CHECKING until the orphan watchdog's grace elapses. Replacing the
-            # safety process is routine (whole-card residency moves it off and back onto the GPU), so without
-            # this several such drops can pile up faster than the watchdog clears them and wedge the pipeline.
+            # A safety verdict dropped here belonged to a launch that no longer owns the job's check, so it is
+            # the only signal that this launch will not deliver one; flag it so the recovery coordinator
+            # re-checks the job at once instead of leaving it stranded in SAFETY_CHECKING until the orphan
+            # watchdog's grace elapses. Replacing the safety process is routine (whole-card residency moves it
+            # off and back onto the GPU), so without this such drops can pile up faster than the watchdog
+            # clears them and wedge the pipeline.
             if isinstance(message, HordeSafetyResultMessage):
                 self._safety_verdicts_known_lost.add(message.job_id)
             if isinstance(message, HordePostProcessResultMessage):
@@ -867,6 +888,28 @@ class MessageDispatcher:
         if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
             return False
         return self._job_tracker.is_current_post_processing_attempt(
+            message.job_id,
+            process_id=message.process_id,
+            process_launch_identifier=message.process_launch_identifier,
+        )
+
+    def _should_accept_retired_safety_result(
+        self,
+        message: HordeSafetyResultMessage,
+        retired_launch: RetiredProcessLaunch,
+    ) -> bool:
+        """Return whether a retired safety launch still owns the verdict the job is waiting for.
+
+        A safety verdict is keyed on the job, not on the launch generation: a launch retired mid-check (the
+        safety process is moved off and back onto the GPU as a routine placement change) still evaluates and
+        returns the jobs it was given, and that verdict is the only one those jobs will ever get. Ownership
+        is what keeps the retired-launch guard's protection intact for everything else: a job already
+        resolved, or one a later launch is re-checking, no longer matches, so a stale or duplicate verdict
+        cannot overwrite state the current attempt owns.
+        """
+        if retired_launch.process_type is not HordeProcessType.SAFETY:
+            return False
+        return self._job_tracker.is_current_safety_attempt(
             message.job_id,
             process_id=message.process_id,
             process_launch_identifier=message.process_launch_identifier,

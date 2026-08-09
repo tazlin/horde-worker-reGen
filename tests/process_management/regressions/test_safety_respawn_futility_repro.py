@@ -74,6 +74,12 @@ _GATE_HELD_SECONDS = 3600.0
 _BRIEF_GATE_HELD_SECONDS = 30.0
 """A gate hold short enough that no threshold should treat it as a wedge."""
 
+_STARTUP_HANG_TIMEOUT_SECONDS = 60.0
+"""The startup timeout a wedged safety child is judged against."""
+
+_STARTUP_HANG_SECONDS = _STARTUP_HANG_TIMEOUT_SECONDS * 10
+"""How long a wedged safety child has sat in its startup state: far past any plausible timeout."""
+
 
 class _AdvanceableTime:
     """Stand-in for the ``time`` module whose ``time()`` the test can advance.
@@ -148,6 +154,35 @@ def _crash_safety_during_startup(lifecycle: ProcessLifecycleManager) -> None:
     crashed = _crashed_starting_safety_process()
     lifecycle._process_map[SAFETY_PROCESS_ID] = crashed
     assert lifecycle._reap_if_crashed(crashed) is True
+    _drive_rebuild_to_completion(lifecycle)
+
+
+def _hang_safety_during_startup(lifecycle: ProcessLifecycleManager) -> None:
+    """Run one full cycle of a live safety child wedged in its own startup being timed out and rebuilt.
+
+    The child never exits, so the crash reaper never sees it; the state-duration timeout is the only thing
+    that replaces it.
+    """
+    hung = make_mock_process_info(
+        SAFETY_PROCESS_ID,
+        model_name=None,
+        state=HordeProcessState.PROCESS_STARTING,
+        process_type=HordeProcessType.SAFETY,
+    )
+    stale = time.time() - _STARTUP_HANG_SECONDS
+    hung.last_received_timestamp = stale
+    hung.last_heartbeat_timestamp = stale
+    hung.last_process_state_started_at = stale
+    lifecycle._process_map[SAFETY_PROCESS_ID] = hung
+    assert (
+        lifecycle._check_and_replace_process(
+            hung,
+            _STARTUP_HANG_TIMEOUT_SECONDS,
+            HordeProcessState.PROCESS_STARTING,
+            "seems to be stuck starting",
+        )
+        is True
+    )
     _drive_rebuild_to_completion(lifecycle)
 
 
@@ -357,6 +392,109 @@ class TestSafetyRespawnFutility:
 
         _crash_safety_during_startup(lifecycle)
         assert lifecycle.safety_pool_failing is True
+
+
+class TestCrashLoopVerdictNeedsACrash:
+    """The unrecoverable verdict drops a job's images, so it requires evidence a child actually died.
+
+    A whole-card pause/restore cycle ends the safety child on the parent's own request and rebuilds it. Enough
+    of those in a row are indistinguishable from a crash loop by rebuild count alone, and reading them as one
+    faults jobs whose safety checks the outgoing launch had in fact completed.
+    """
+
+    def test_parent_initiated_restart_cycles_are_not_an_unrecoverable_pool(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rebuilds past every threshold, with no child reaped, are not an unrecoverable pool."""
+        pm = make_testable_process_manager(safety_on_gpu=True)
+        lifecycle = pm._process_lifecycle
+        coordinator = pm._recovery_coordinator
+        _stub_safety_start(lifecycle, monkeypatch)
+
+        fake_time = _AdvanceableTime()
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.lifecycle.process_lifecycle.time",
+            fake_time,
+        )
+
+        assert lifecycle.pause_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
+        for _ in range(_FUTILE_RESPAWN_COUNT):
+            _drive_rebuild_to_completion(lifecycle)
+            fake_time.advance(_BACKOFF_CLEARING_RESPAWN_SECONDS)
+            lifecycle._initiate_safety_replacement()
+
+        assert lifecycle.safety_pool_failure_evidence_seen is False
+        assert lifecycle.safety_pool_start_failing is True
+        assert coordinator.is_safety_pool_ready() is False
+        assert coordinator.is_safety_pool_unrecoverable() is False, (
+            "restart cycles the parent asked for were counted as a crash loop, so jobs the outgoing launch "
+            "was still checking would be faulted for a pool that never crashed"
+        )
+
+    def test_a_reaped_child_restores_the_unrecoverable_verdict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Once a safety child actually dies, the same rebuild streak reads as unrecoverable again."""
+        pm = make_testable_process_manager()
+        lifecycle = pm._process_lifecycle
+        coordinator = pm._recovery_coordinator
+        _stub_safety_start(lifecycle, monkeypatch)
+
+        fake_time = _AdvanceableTime()
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.lifecycle.process_lifecycle.time",
+            fake_time,
+        )
+
+        for _ in range(_FUTILE_RESPAWN_COUNT):
+            _crash_safety_during_startup(lifecycle)
+            fake_time.advance(_SLOW_RESPAWN_SECONDS)
+
+        assert lifecycle.safety_pool_failure_evidence_seen is True
+        assert coordinator.is_safety_pool_unrecoverable() is True
+
+    def test_children_wedged_in_startup_still_reach_the_unrecoverable_verdict(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A child that hangs in its startup never exits, so the timeout reap is the only failure evidence.
+
+        Requiring a child that *died* would exempt the whole hung-start class (a child wedged in accelerator
+        init, say) from the futility verdict and respawn it for the life of the worker.
+        """
+        pm = make_testable_process_manager()
+        lifecycle = pm._process_lifecycle
+        coordinator = pm._recovery_coordinator
+        _stub_safety_start(lifecycle, monkeypatch)
+
+        fake_time = _AdvanceableTime()
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.lifecycle.process_lifecycle.time",
+            fake_time,
+        )
+
+        for _ in range(_FUTILE_RESPAWN_COUNT):
+            _hang_safety_during_startup(lifecycle)
+            fake_time.advance(_BACKOFF_CLEARING_RESPAWN_SECONDS)
+
+        assert lifecycle.safety_pool_failure_evidence_seen is True
+        assert coordinator.is_safety_pool_ready() is False
+        assert coordinator.is_safety_pool_unrecoverable() is True, (
+            f"{_FUTILE_RESPAWN_COUNT} safety children were reaped for never finishing their startup and the "
+            "pool was still classified recoverable, so the worker would respawn it indefinitely"
+        )
+
+    def test_readiness_clears_the_crash_evidence_with_the_streak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pool that comes up starts a fresh streak, so old deaths do not condemn later rebuilds."""
+        pm = make_testable_process_manager()
+        lifecycle = pm._process_lifecycle
+        _stub_safety_start(lifecycle, monkeypatch)
+
+        _crash_safety_during_startup(lifecycle)
+        assert lifecycle.safety_pool_failure_evidence_seen is True
+
+        _safety_child_reaches_readiness(lifecycle)
+
+        assert lifecycle.safety_pool_failure_evidence_seen is False
 
 
 class TestHeldPopGateBackstop:

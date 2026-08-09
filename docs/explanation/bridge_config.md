@@ -217,7 +217,7 @@ for how it works.
 
 | Field                | Default | Effect                                                                                                                                                                  |
 | -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enable_vram_budget` | `true`  | Gate preload and dispatch materialisation (including leased-child clearance) on measured free VRAM/RAM, and evict idle resident models under pressure. `false` restores availability-only placement while retaining readiness, co-residency, and other non-budget safety gates (not recommended on a shared/consumer GPU). |
+| `enable_vram_budget` | `true`  | Gate preload and dispatch materialisation (including leased-child clearance) on measured free VRAM/RAM, and evict idle resident models under pressure. `false` restores availability-only placement while retaining readiness, co-residency, and other non-budget safety gates (not recommended on a shared/consumer GPU). It also makes every budget-dependent feature inert; see below. |
 | `vram_reserve_mb`    | `2048`  | Co-residency safety margin: free VRAM (MB) kept in reserve on top of a job's estimated peak while a model samples *beside* others. Covers transient spikes such as tiled VAE decode and sizes how many models co-reside and how deep a whole-card teardown goes. It is *not* a hard load-feasibility floor: whether a model's weights can load at all is governed by ComfyUI's own streaming threshold (`minimum_inference_memory`), so a large checkpoint whose weights fit the drained card (e.g. an ~11.5 GB Flux on 16 GB) still loads via whole-card residency even when this margin exceeds the leftover headroom. Larger trades co-resident throughput for safety.                |
 | `ram_reserve_mb`     | `4096`  | Available system RAM (MB) kept in reserve so resident-in-RAM models do not force the OS to page to disk.                                                               |
 | `ram_pressure_pause_percent` | `85.0` | Absolute whole-host RAM danger floor, evaluated every scheduling tick. At/above this usage percentage the worker degrades (refuses new model loads, sheds idle resident processes, recycles an over-ceiling process, pauses pops) until RAM recovers, rather than loading weights through an out-of-RAM host and being OS OOM-killed. The default leaves ~15% free because a resident process can allocate several GB in a single step. |
@@ -227,6 +227,15 @@ for how it works.
 | `post_processing_fault_breaker_enabled` | `true` | Disable post-processing on this worker after repeated post-processing over-commit faults, so it stops feeding the horde's forced-maintenance spiral (see below). |
 | `post_processing_fault_threshold` | `4` | The breaker trips when *more than* this many post-processing over-commit faults occur within the window (tolerates 4, trips on the 5th). |
 | `post_processing_fault_window_seconds` | `1800` | Rolling window (seconds) over which `post_processing_fault_threshold` is counted. |
+
+`enable_vram_budget: false` disables more than the budget itself. Several placement
+features are driven by the budget's arithmetic and are simply never consulted while
+it is off: `whole_card_exclusive_residency`,
+`whole_card_residency_safety_off_gpu`, and `overbudget_exclusive_mode`. Setting one
+of them to `true` alongside a disabled budget does nothing, with no symptom to
+notice. The worker therefore names any of them the operator set explicitly in a
+startup warning, so the dependency is visible rather than inferred; the remedy is to
+enable the budget.
 
 The `ram_pressure_*` floor is distinct from `ram_reserve_mb`: the reserve is a
 *marginal* per-job admission check, while the pressure floor is the *absolute*
