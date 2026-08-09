@@ -50,7 +50,7 @@ def _run_sessions(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps([session_to_dict(s) for s in selected], indent=2))
     else:
-        print(render_sessions(selected, root=bundle.root))
+        print(render_sessions(selected, root=bundle.root, stitch=bundle.rotation_stitch))
     return 0
 
 

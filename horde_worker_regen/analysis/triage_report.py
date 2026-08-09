@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from .bundle import RotationStitch
 from .correlate import TimelineEntry
 from .detectors import Finding, Severity
 from .sessions import WorkerSession
@@ -76,12 +77,19 @@ def session_to_dict(session: WorkerSession) -> dict[str, object]:
     }
 
 
-def render_sessions(sessions: list[WorkerSession], *, root: Path) -> str:
-    """A compact per-session listing: span, version, end-reason, and peak recoveries."""
+def render_sessions(sessions: list[WorkerSession], *, root: Path, stitch: RotationStitch | None = None) -> str:
+    """A compact per-session listing: span, version, end-reason, and peak recoveries.
+
+    ``stitch`` names the rotated predecessors folded into the parse, so a span that covers more than the
+    targeted file says which archives it came from.
+    """
     if not sessions:
         return f"No worker sessions found in {root}."
 
-    lines = [f"{len(sessions)} worker session(s) in {root}", ""]
+    lines = [f"{len(sessions)} worker session(s) in {root}"]
+    if stitch is not None:
+        lines.append(f"Rotation: {stitch.describe()}")
+    lines.append("")
     for session in sessions:
         span, duration = _fmt_session_span(session)
         version = session.version or "?"

@@ -19,12 +19,13 @@ import tempfile
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEvent
 
 from . import ledger_ingest
-from .log_ingest import LogRecord, read_records
+from .log_ingest import LogRecord, read_records, read_time_range
 
 # Role-classifying patterns over a *base* name (rotation timestamp and .zip/.gz suffix already stripped).
 _ORCHESTRATOR_RE = re.compile(r"^bridge\.log$")
@@ -36,6 +37,13 @@ _STDERR_RE = re.compile(r"^stderr_(?P<pid>\d+)\.log$")
 
 # A rotated archive carries a timestamp segment before ".log", e.g. "bridge.2026-06-22_00-55-59.log".
 _ROTATION_TS_RE = re.compile(r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?(?=\.log$)")
+
+ROTATION_ABUT_SECONDS = 120.0
+"""How large a gap between a rotation's last line and the next file's first may be and still be one run.
+
+A size-triggered rotation hands off within a line, so the true gap is milliseconds; the allowance covers a
+slow compression or a quiet worker that logged nothing across the handover. It is deliberately far shorter
+than the gap between two worker launches, which is what the chain must not swallow."""
 
 
 def _base_name(path: Path) -> str:
@@ -53,6 +61,31 @@ def _base_name(path: Path) -> str:
 
 
 @dataclass
+class RotationStitch:
+    """Which rotated predecessors of the targeted log were folded into the parse, and which were not.
+
+    A rotation that is read silently widens every span and count the report derives, and one that is
+    skipped silently narrows them; either way the numbers stop being attributable to a named set of files.
+    This is that set, so a session's span can always be traced back to what was actually read.
+    """
+
+    included: list[Path] = field(default_factory=list)
+    excluded: list[Path] = field(default_factory=list)
+
+    def describe(self) -> str:
+        """A one-line disclosure naming the rotations read and, when any were left out, the first skipped."""
+        included = ", ".join(path.name for path in self.included) or "none"
+        text = f"stitched {len(self.included)} rotated predecessor(s): {included}"
+        if self.excluded:
+            first = self.excluded[0].name
+            text += (
+                f"; excluded {len(self.excluded)} older rotation(s) from {first} back, whose ranges do not "
+                "abut this run"
+            )
+        return text
+
+
+@dataclass
 class LogBundle:
     """A worker run's log files, grouped by role and queryable for records by process slot."""
 
@@ -61,6 +94,8 @@ class LogBundle:
     child_loop_paths: dict[int, list[Path]] = field(default_factory=dict)
     startup_paths: dict[int, list[Path]] = field(default_factory=dict)
     stderr_paths: dict[int, list[Path]] = field(default_factory=dict)
+    rotation_stitch: RotationStitch | None = None
+    """Which rotated predecessors this bundle folded in, or None when no rotation was in play."""
     record_reader: Callable[..., list[LogRecord]] | None = field(default=None, repr=False, compare=False)
     """Reader used to parse the grouped paths; None uses the default whole-file :func:`read_records`. A live
     watch passes an incremental reader here so re-parses touch only each file's appended tail."""
@@ -100,6 +135,8 @@ class LogBundle:
         if path.is_file():
             bundle = cls(root=path.parent, record_reader=record_reader)
             bundle._classify(path, active_only=active_only)
+            if not active_only:
+                bundle._stitch_rotated_predecessors(path)
             return bundle
         return cls._from_directory(
             path,
@@ -126,7 +163,55 @@ class LogBundle:
         for candidate in candidates:
             if candidate.is_file():
                 bundle._classify(candidate, active_only=active_only)
+        if not active_only:
+            bundle._note_orchestrator_rotations()
         return bundle
+
+    def _note_orchestrator_rotations(self) -> None:
+        """Record the orchestrator rotations a directory scan already picked up, so the span is accountable.
+
+        A directory target reads every rotation it finds, which is the right default for forensics but
+        leaves the report's span resting on files the reader never sees named. Nothing is excluded here.
+        """
+        rotations = [path for path in self.orchestrator_paths if _is_rotation(path)]
+        if rotations:
+            self.rotation_stitch = RotationStitch(included=_sorted_rotations(rotations))
+
+    def _stitch_rotated_predecessors(self, target: Path) -> None:
+        """Fold the rotated predecessors of ``target``'s own run into the bundle, newest chain first.
+
+        A parent log rotates by size mid-run, so a capture that names only the active file begins partway
+        through the run and undercounts everything measured over it. Walking back from the active file and
+        keeping each rotation whose last line abuts the next file's first restores the run; the walk stops
+        at the first rotation that does not abut, because that is a different launch and folding it in would
+        merge two runs into one. Both the kept and the skipped archives are recorded on
+        :attr:`rotation_stitch`.
+        """
+        if _is_rotation(target):
+            # The operator named one archive: give them that archive, not the run it was cut from.
+            return
+        base = _base_name(target)
+        candidates = _sorted_rotations(
+            [
+                sibling
+                for sibling in target.parent.glob("*")
+                if sibling.is_file() and sibling != target and _is_rotation(sibling) and _base_name(sibling) == base
+            ],
+        )
+        if not candidates:
+            return
+
+        stitch = RotationStitch()
+        earliest_start, _ = read_time_range(target)
+        for index, candidate in enumerate(reversed(candidates)):
+            first, last = read_time_range(candidate)
+            if not _abuts(last, earliest_start):
+                stitch.excluded = list(reversed(candidates[: len(candidates) - index]))
+                break
+            stitch.included.insert(0, candidate)
+            self._classify(candidate)
+            earliest_start = first if first is not None else earliest_start
+        self.rotation_stitch = stitch
 
     def _read(self, *paths: Path) -> list[LogRecord]:
         """Parse ``paths`` through the configured reader (defaulting to the whole-file :func:`read_records`)."""
@@ -202,6 +287,38 @@ class LogBundle:
         if self._ledger_cache is None:
             self._ledger_cache = ledger_ingest.load_ledger_for(self.root)
         return self._ledger_cache
+
+
+def _uncompressed_name(path: Path) -> str:
+    """The filename with any compression suffix removed, so a rotation reads the same zipped or not."""
+    name = path.name
+    for suffix in (".zip", ".gz"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _is_rotation(path: Path) -> bool:
+    """Whether a path is a rotated archive rather than an active log (``bridge.<ts>.log`` with or without .zip)."""
+    return _ROTATION_TS_RE.search(_uncompressed_name(path)) is not None
+
+
+def _rotation_stamp(path: Path) -> str:
+    """The rotation timestamp segment of an archive's name, which sorts chronologically as text."""
+    match = _ROTATION_TS_RE.search(_uncompressed_name(path))
+    return match.group(0) if match is not None else ""
+
+
+def _sorted_rotations(paths: list[Path]) -> list[Path]:
+    """Rotations ordered oldest first, by the timestamp loguru stamps into the archive name."""
+    return sorted(paths, key=lambda path: (_rotation_stamp(path), path.name))
+
+
+def _abuts(earlier_end: datetime | None, later_start: datetime | None) -> bool:
+    """Whether a rotation ending at ``earlier_end`` hands directly over to a file starting at ``later_start``."""
+    if earlier_end is None or later_start is None:
+        return False
+    return abs((later_start - earlier_end).total_seconds()) <= ROTATION_ABUT_SECONDS
 
 
 def _looks_like_rotation(path: Path) -> bool:

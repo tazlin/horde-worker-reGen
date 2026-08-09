@@ -19,11 +19,11 @@ import enum
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
-from .correlate import SessionContext, find_child_crash
+from .correlate import RecoveryDiagnostic, SessionContext, find_child_crash
 from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS
 from .log_ingest import LogRecord
 from .sessions import SessionEndReason
@@ -41,6 +41,43 @@ _OOM_RE = OOM_TEXT_RE
 # outer "Pipeline failed to run ... produced no results" wrapper is identical across unrelated root causes.
 _FAULT_MODEL_RE = re.compile(r"Model: (?P<model>.+?)\. Error:")
 _FAULTED_ON_PROCESS_RE = re.compile(r"faulted on process (?P<pid>\d+)")
+# The same slot-side fault, keyed on the job it names. Producer:
+# ``message_dispatcher._handle_faulted_inference_result``.
+_FAULTED_ON_PROCESS_JOB_RE = re.compile(r"Job (?P<job>[0-9a-fA-F-]{8,}) faulted on process (?P<pid>\d+)")
+# The terminal per-job fault the worker reports to the horde. Producer:
+# ``job_submitter.submit_single_generation``. This is the surface the horde's own faulted counter follows,
+# so it is what a census must agree with; the slot-side line above is the same job seen earlier.
+_FAULT_REPORTED_RE = re.compile(r"(?P<job>[0-9a-fA-F-]{8,}) faulted\. Reported fault to the horde\.")
+# The pop line that binds a job id to the model it was popped for. Producer: ``job_popper.api_job_pop``.
+_POPPED_JOB_RE = re.compile(r"Popped job (?P<job>\S+) .*?\(model: (?P<model>.+?), batch:")
+# The safety watchdog faulting a named job it could not check. Producer:
+# ``worker_recovery_coordinator`` (the id-anchored form of :data:`_SAFETY_UNRECOVERABLE_RE`).
+_SAFETY_UNRECOVERABLE_JOB_RE = re.compile(r"Job (?P<job>\S+) could not be safety-checked")
+# The retry suffix on a slot-side fault. Producer: the same dispatcher handler, which words a bounded
+# retry as "requeued for another attempt" (or a degraded, isolated one). An attempt that came back for a
+# retry is not a job the horde lost, so a census that counts it over-reports what the session dropped.
+_FAULT_REQUEUED_RE = re.compile(r"requeued for (?:a degraded, isolated|another) attempt")
+# A disaggregated pipeline stage faulting a named job. Producer:
+# ``inference_process._run_sample_stage``, which runs only on the disaggregated path, so the phrase is
+# specific to it rather than to monolithic inference.
+_STAGE_FAULT_RE = re.compile(r"(?P<stage>\w[\w -]*) stage faulted for job (?P<job>\S+?):")
+# The model-reference read that failed under an in-flight sample, and the cache-staleness lines that
+# attribute it. Producers: ``horde_model_reference`` (raised into the stage fault above) and the replica
+# backend's ``needs_refresh`` disclosure.
+_MODEL_REFERENCE_UNREADABLE_RE = re.compile(
+    r"Model reference for category (?P<category>\S+) not found or could not be parsed",
+)
+_MODEL_REFERENCE_STALE_RE = re.compile(r"needs refresh|cache is stale")
+# The worker's most severe liveness signal: the local queue full and motionless. Producer:
+# ``process_manager._full_queue_frozen_line``, logged at ERROR on a repeat clock.
+_POP_LIVENESS_FROZEN_RE = re.compile(r"Pop liveness: the local job queue has been full and not draining")
+_POP_LIVENESS_FROZEN_FIELDS_RE = re.compile(
+    r"Pop liveness: the local job queue has been full and not draining for (?P<seconds>\d+)s "
+    r"\((?P<waiting>\d+) accepted job\(s\) waiting, head model '(?P<model>[^']*)'\)",
+)
+# The whole-card residency governor's ENTER parenthetical names the model holding the card. Producer:
+# ``PopGovernorRegistry`` via the scheduler's residency spell.
+_RESIDENCY_GOVERNOR_MODEL_RE = re.compile(r"Pop governor ENTER: whole_card_residency \((?P<model>.+?) holds the card")
 # The CUDA allocator's own accounting from an OOM message: how little was free, and the sibling processes
 # co-resident on the card. Several siblings each holding GiB with almost nothing free is the over-admission
 # fingerprint (many models sharing one card), distinct from a single model that simply will not fit.
@@ -125,6 +162,68 @@ _WHOLE_CARD_NONHEAD_RE = re.compile(r"whole-card residency is held for non-head 
 # card a model whose weights are a small fraction of total VRAM co-resides, so a teardown demand for it usually
 # means the per-context overhead was over-counted). The phrase is the worker's establish-announce line.
 _WHOLE_CARD_ESTABLISH_RE = re.compile(r"Whole-card residency: reserving the device for")
+# The same line's own figures. Producer: ``inference_scheduler._establish_whole_card_residency``, whose
+# f-string words the counts as "(inference processes {current} -> {after} of {max}, target {target})"; the
+# residency snapshot appended after it carries ``device_free_vram=<N>MB`` (:data:`_DEVICE_FREE_VRAM_RE`).
+# Reading them is what separates a reservation that reduced the pool from one whose target was already met.
+_WHOLE_CARD_ESTABLISH_FIELDS_RE = re.compile(
+    r"Whole-card residency: reserving the device for (?P<model>.+?) \(inference processes "
+    r"(?P<current>\d+) -> (?P<after>\d+) of (?P<total>\d+), target (?P<target>\d+)\)",
+)
+# The establishment-time forecast the dispatch path discloses. Producer:
+# ``inference_scheduler._log_stream_forecast``. The bracketed measurement block and the trailing decision
+# flags have grown fields over time, so each figure is matched independently and simply stays absent in an
+# older capture rather than failing the whole parse.
+_STREAM_FORECAST_RE = re.compile(r"Stream forecast for (?P<model>.+?): ")
+_FORECAST_MARGINAL_RE = re.compile(r"marginal/ctx=(?P<marginal>[\d?]+)MB\(src=(?P<source>\w+)")
+_FORECAST_UNRECLAIMABLE_RE = re.compile(r"unreclaimable=(?P<unreclaimable>[\d.]+)MB")
+_FORECAST_REDUCTION_RE = re.compile(r"needs_process_count_reduction=(?P<reduction>True|False)")
+# A pop that arrived with no model name, and the two worker generations' treatment of it. The older
+# generation had no boundary check, so the blank identity travelled: it was preloaded as a literal empty
+# name (``inference_scheduler._send_preload``), ended the slot it was sent to (the recovery reason from
+# ``process_lifecycle``), was then counted and quarantined as if it were a model
+# (``record_model_incident``), after which every later job for it was refused
+# (``_attempt_preload_for_job``). Each of those lines carries the empty name verbatim, which is what makes
+# the blank identity recognizable at all.
+_EMPTY_MODEL_POP_RE = re.compile(r"Popped job (?P<job>\S+) .*\(model: , ")
+_BLANK_PRELOAD_RE = re.compile(r"Preloading model {2}on process (?P<pid>\d+)")
+_BLANK_MODEL_QUARANTINE_RE = re.compile(r"Model {2}caused (?P<count>\d+) (?P<kind>\w+) incident\(s\)")
+_BLANK_QUARANTINE_SKIP_RE = re.compile(r"Skipping preload of quarantined model ;")
+# The newer generation contains the same input at the boundary and never lets it reach a slot. Producers:
+# ``job_popper._reject_malformed_pop``, ``inference_process._preload_model``, and
+# ``process_lifecycle.record_model_incident``. A capture carrying these instead of the cascade above shows
+# the containment working, so the count is a rate rather than a fault.
+_MALFORMED_POP_REJECTED_RE = re.compile(
+    r"Popped job (?P<job>\S+) carries no model name \(got .*?\); returning it to the horde",
+)
+_BLANK_PRELOAD_REFUSED_RE = re.compile(r"Refusing to preload a blank model name")
+_BLANK_INCIDENT_REFUSED_RE = re.compile(r"incident reported against a blank model name")
+# A slot replaced because loading a model ended it, naming the model. Producer: ``process_lifecycle``'s
+# recovery reason. The name is captured (and may be empty) so repeated deaths can be grouped by model: a
+# checkpoint that kills every slot it touches is a loop no per-slot breaker catches.
+# Greedy to the reason's closing paren: model names carry their own parentheses ("AlbedoBase XL (SDXL)"),
+# which a non-greedy match truncates at the first one.
+_LOAD_FAILURE_MODEL_RE = re.compile(r"inference process replaced \(failed to load model (?P<model>.*)\)$")
+# The horde rejecting a pop, quoting its own message. Producer:
+# ``job_popper._handle_pop_error_response``. The message is what distinguishes an operator-fixable
+# rejection (an account limit) from a transient server fault, and it is otherwise never surfaced.
+_POP_API_ERROR_RE = re.compile(r"Failed to pop job \(API Error\): message='(?P<message>[^']*)'")
+_POP_API_ERROR_CODE_RE = re.compile(r"rc='(?P<code>[^']*)'")
+# The parent's own safety-placement actuator, and the consequence of using it. Producers:
+# ``process_lifecycle.pause_safety_on_gpu`` / ``restore_safety_on_gpu`` (which name the initiating
+# subsystem rather than a fixed phrase) and ``message_dispatcher._classify_retired_launch_message``. A
+# verdict dropped because its launch was retired is the mechanism by which a placement cycle strands a job,
+# so the pair together is an attribution rather than a guess.
+_SAFETY_PLACEMENT_CYCLE_RE = re.compile(
+    r"(?P<owner>[\w -]+): (?:moving the safety process off-GPU|restoring the safety process to the GPU)",
+)
+_RETIRED_SAFETY_RESULT_RE = re.compile(r"Ignoring result message from retired safety process")
+# A child that died installing or repairing the shared ComfyUI environment rather than importing the
+# inference stack. Concurrent cold starts clone into one environment directory, and a half-written clone
+# leaves the tree in a state a later checkout refuses; the fix is the directory, never the torch install.
+_GIT_ENVIRONMENT_FAILURE_RE = re.compile(
+    r"GitCommandError|git clone .* failed|Untracked working tree file|unable to checkout working tree",
+)
 # The worker declining to reserve the card for a model whose teardown demand it does not trust (a card-light
 # model on a host with no measured per-context cost). Surfaced as the positive counterpart: it confirms the
 # trust gate is actively preventing reservation churn rather than the churn simply being absent.
@@ -154,9 +253,17 @@ _STUCK_STEP_RE = re.compile(r"stuck on a non-advancing sampling step|stuck-step 
 _POST_PROCESSING_STALL_RE = re.compile(r"seems to be stuck post processing")
 _DEDICATED_POST_PROCESS_RE = re.compile(
     r"(?:last_process_state=HordeProcessState\.(?:INFERENCE_POST_PROCESSING|POST_PROCESSING)\b|"
-    r"^Post-processing (?:job|for job|finished for job) \S+)",
+    r"Post-processing (?:job|for job|finished for job) [0-9a-fA-F]{8})",
     re.IGNORECASE,
 )
+"""Proof that the dedicated post-processing lane actually ran a job.
+
+The lane's stage transition and its result both reach the parent through the message dispatcher, which
+prefixes them with its own ``Received <Message> from process N:`` wrapper, so a marker anchored to the
+start of the message matched only the completion summary and missed every job that was still running.
+Requiring a job id instead of a position keeps the marker off the prose that merely mentions
+post-processing (per-lane RAM accounting, the model downloader's category tag), which names no job and
+proves no lane activity."""
 # The routine device-wide free-VRAM readout hordelib emits on *every* log_free_ram call. Its
 # "reclaimable torch cache" note is present on almost all of them, so matching that note counted the whole
 # session's readouts as warnings; the leading "Free VRAM: N MB" value is the only signal of an actually low
@@ -327,19 +434,33 @@ def detect_crash_on_start_loop(context: SessionContext) -> list[Finding]:
     # Lift the actual exception from each affected slot's child startup log (the cross-process join).
     exceptions: dict[str, int] = {}
     evidence: list[str] = []
+    crash_texts: list[str] = []
     for process_id in sorted({r.process_id for r in crashing}):
         first = next(r for r in crashing if r.process_id == process_id)
         crash = find_child_crash(context.bundle, process_id, first.timestamp, os_pid=first.os_pid)
         if crash is not None:
             exceptions[crash.exception] = exceptions.get(crash.exception, 0) + 1
             evidence.append(f"slot {process_id}: {_evidence(crash.record).split('  ', 1)[1]} -> {crash.exception}")
+            crash_texts.append(crash.record.full_text)
 
     cause = max(exceptions, key=lambda exc: exceptions[exc]) if exceptions else None
+    git_failure = any(_GIT_ENVIRONMENT_FAILURE_RE.search(text) for text in crash_texts)
     verdict = (
         f"{len(crashing)} inference start(s) across {len({r.process_id for r in crashing})} slot(s) crashed before "
         "reaching readiness"
     )
-    if cause is not None:
+    if cause is not None and git_failure:
+        verdict += f"; the child raised `{cause}` while preparing the shared ComfyUI environment."
+        remediation = (
+            "The child died installing or repairing the shared ComfyUI environment, not importing the "
+            "inference stack, so nothing about this worker's Python packages is implicated. Several children "
+            "cold-starting at once clone custom nodes into the same environment directory; a clone "
+            "interrupted partway leaves files a later checkout will not overwrite, and every child after it "
+            "fails the same way. Clear the environment directory named in the failure and let one start "
+            "rebuild it. Newer hordelib serialises this preparation and repairs a half-written tree itself, "
+            "so an upgrade prevents the recurrence."
+        )
+    elif cause is not None:
         verdict += f"; the child raised `{cause}`."
         remediation = (
             f"The inference subprocess fails during hordelib/ComfyUI init with `{cause}`. Fix that "
@@ -1235,6 +1356,30 @@ def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
     ]
 
 
+def _asserted_safety_chain(*, cycle_count: int, owners: list[str], retired_count: int) -> str:
+    """State the parent-ordered safety cycle as the cause, from the actuator lines that record it.
+
+    The generic wording offers a menu (a crash, a residency cycle, a dropped message) because usually
+    nothing in the log says which. When the parent's own pause/restore lines are present they name the
+    subsystem that ordered the move, and a verdict dropped on a retired launch is the exact mechanism that
+    turns such a move into a stranded job, so the two together are an attribution rather than a candidate.
+    """
+    parts: list[str] = []
+    if cycle_count:
+        who = _clause_join(owners) if owners else "the parent"
+        parts.append(
+            f"{who} moved the safety process off and back onto the GPU {cycle_count} time(s) this session",
+        )
+    if retired_count:
+        parts.append(
+            f"{retired_count} verdict(s) arrived from a launch that move had already retired and were dropped",
+        )
+    return (
+        "This was not an unexplained safety crash: " + _clause_join(parts) + ". Each replacement invalidates "
+        "the launch that owns the in-flight checks, so the jobs waiting on them have no verdict to receive."
+    )
+
+
 def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
     """The safety stage stranding jobs whose verdict never returned (a forced-maintenance cause).
 
@@ -1274,18 +1419,44 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
         detail_bits.append(f"{len(backpressure)} pop-throttle(s) on backlog")
     detail = "; ".join(detail_bits)
 
+    placement_cycles = _matching(records, _SAFETY_PLACEMENT_CYCLE_RE)
+    retired_drops = _matching(records, _RETIRED_SAFETY_RESULT_RE)
+    owners = _distinct_ordered(
+        [m.group("owner").strip() for r in placement_cycles if (m := _SAFETY_PLACEMENT_CYCLE_RE.search(r.message))],
+    )
+
     if escalated:
         verdict = (
             f"The safety stage stranded jobs whose verdict never returned ({detail}). The worker faulted the "
             "unservable ones with no image and soft-paused pops, but those faults count as dropped jobs and can "
-            "draw horde-forced maintenance. A lost safety verdict (a cycled/replaced safety process, or a dropped "
-            "result message) is the root cause."
+            "draw horde-forced maintenance. "
         )
-        remediation = (
-            "Stabilise the safety process: with safety_on_gpu set, frequent whole-card residency cycling or "
-            "unload_models_from_vram_often can churn it; check the bridge_safety_*.log for crashes. The worker "
-            "re-checks and (only as a last resort) faults with no image, so no unchecked image is ever submitted."
-        )
+        if placement_cycles or retired_drops:
+            # The parent's own actuator is in the log, so the chain is readable end to end and there is no
+            # reason to hand back a list of candidate causes.
+            verdict += _asserted_safety_chain(
+                cycle_count=len(placement_cycles),
+                owners=owners,
+                retired_count=len(retired_drops),
+            )
+            remediation = (
+                "The cycle is the worker's own, so the fix is upstream of safety: stop the subsystem named "
+                "above from moving safety off the GPU as often as it does, or make it hand the in-flight "
+                "checks over rather than retiring the launch that owns them. A verdict dropped on a retired "
+                "launch is unrecoverable for that job by construction, so reducing the cycling rate is what "
+                "reduces the drops."
+            )
+        else:
+            verdict += (
+                "A lost safety verdict (a cycled/replaced safety process, or a dropped result message) is the "
+                "root cause."
+            )
+            remediation = (
+                "Stabilise the safety process: with safety_on_gpu set, frequent whole-card residency cycling or "
+                "unload_models_from_vram_often can churn it; check the bridge_safety_*.log for crashes. The worker "
+                "re-checks and (only as a last resort) faults with no image, so no unchecked image is ever "
+                "submitted."
+            )
     else:
         verdict = (
             f"The safety stage backed up or briefly lost a verdict ({detail}); the worker recovered (re-check) or "
@@ -1296,7 +1467,15 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
             "backlog does not grow; no action is needed for an isolated occurrence."
         )
 
-    evidence = unrecoverable[:1] + soft_pauses[:1] + lost_results[:1] + requeues[:1] + backpressure[:1]
+    evidence = (
+        placement_cycles[:1]
+        + retired_drops[:1]
+        + unrecoverable[:1]
+        + soft_pauses[:1]
+        + lost_results[:1]
+        + requeues[:1]
+        + backpressure[:1]
+    )
     return [
         Finding(
             id="safety_stage_stall",
@@ -1396,6 +1575,126 @@ def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> l
     ]
 
 
+@dataclass(frozen=True)
+class _WholeCardClaim:
+    """One reservation's own arithmetic, as the establish line states it."""
+
+    model: str
+    current: int
+    after: int
+    total: int
+    target: int
+    free_mb: int | None
+
+    @property
+    def demands_no_reduction(self) -> bool:
+        """Whether the claim's target was already satisfied by the live process count.
+
+        A residency is granted to make room by stopping siblings. A target at or above the live count asks
+        for no sibling to stop, so the reservation reserves the card and returns nothing: the deficit that
+        justified it cannot be closed by the action it authorized.
+        """
+        return self.target >= self.current
+
+    @property
+    def counts_text(self) -> str:
+        """The claim's process-count arithmetic as the establish line words it."""
+        return f"{self.current} -> {self.after} of {self.total}, target {self.target}"
+
+
+def _whole_card_claims(records: list[LogRecord]) -> list[_WholeCardClaim]:
+    """Parse the figures out of each whole-card establish line, skipping any that state none."""
+    claims: list[_WholeCardClaim] = []
+    for record in records:
+        fields = _WHOLE_CARD_ESTABLISH_FIELDS_RE.search(record.message)
+        if fields is None:
+            continue
+        free = _DEVICE_FREE_VRAM_RE.search(record.message)
+        claims.append(
+            _WholeCardClaim(
+                model=fields.group("model"),
+                current=int(fields.group("current")),
+                after=int(fields.group("after")),
+                total=int(fields.group("total")),
+                target=int(fields.group("target")),
+                free_mb=int(free.group(1)) if free is not None else None,
+            ),
+        )
+    return claims
+
+
+def _claim_figures_text(claims: list[_WholeCardClaim], *, count: int) -> str:
+    """The process-count and free-VRAM figures the reservations carried, or a note that they carried none."""
+    if not claims:
+        return f"None of the {count} reservation(s) stated its process-count arithmetic."
+    counts = _distinct_ordered([claim.counts_text for claim in claims])
+    text = f"Its stated arithmetic across {len(claims)} reservation(s): {_clause_join(counts)}."
+    frees = [claim.free_mb for claim in claims if claim.free_mb is not None]
+    if frees:
+        text += (
+            f" Device free VRAM at reservation ranged {min(frees)}-{max(frees)}MB."
+            if min(frees) != max(frees)
+            else f" Device free VRAM at reservation was {frees[0]}MB."
+        )
+    return text
+
+
+@dataclass(frozen=True)
+class _StreamForecast:
+    """The establishment-time forecast disclosure: what the scheduler priced the claim against."""
+
+    model: str
+    marginal_mb: float | None
+    marginal_source: str | None
+    unreclaimable_mb: float | None
+    needs_reduction: bool | None
+
+    @property
+    def marginal_is_seeded(self) -> bool:
+        """Whether the per-additional-context cost came from the seeded constant (nothing measurable)."""
+        return self.marginal_source is not None and self.marginal_source.startswith("seed")
+
+    def describe(self) -> str:
+        """The cause figures, worded so the marginal's provenance is visible rather than assumed."""
+        parts: list[str] = []
+        if self.marginal_mb is not None and self.marginal_source is not None:
+            provenance = "seeded, not measured" if self.marginal_is_seeded else f"measured from {self.marginal_source}"
+            parts.append(f"per-context marginal {self.marginal_mb:.0f}MB ({provenance})")
+        elif self.marginal_source is not None:
+            parts.append(f"per-context marginal unavailable (src={self.marginal_source})")
+        if self.unreclaimable_mb is not None:
+            parts.append(f"{self.unreclaimable_mb:.0f}MB charged as unreclaimable")
+        if self.needs_reduction is not None:
+            parts.append(f"needs_process_count_reduction={self.needs_reduction}")
+        if not parts:
+            return ""
+        return f"The forecast for {self.model} priced it with {_clause_join(parts)}."
+
+
+def _last_stream_forecast(records: list[LogRecord]) -> _StreamForecast | None:
+    """The most recent stream-forecast disclosure in the session, or None when the capture carries none.
+
+    Older captures predate the ``unreclaimable`` and ``needs_process_count_reduction`` fields, so each is
+    parsed independently and stays None when absent rather than disqualifying the whole disclosure.
+    """
+    for record in reversed(records):
+        header = _STREAM_FORECAST_RE.search(record.message)
+        if header is None:
+            continue
+        marginal = _FORECAST_MARGINAL_RE.search(record.message)
+        unreclaimable = _FORECAST_UNRECLAIMABLE_RE.search(record.message)
+        reduction = _FORECAST_REDUCTION_RE.search(record.message)
+        chosen = marginal.group("marginal") if marginal is not None else None
+        return _StreamForecast(
+            model=header.group("model"),
+            marginal_mb=float(chosen) if chosen is not None and chosen.isdigit() else None,
+            marginal_source=marginal.group("source") if marginal is not None else None,
+            unreclaimable_mb=float(unreclaimable.group("unreclaimable")) if unreclaimable is not None else None,
+            needs_reduction=reduction.group("reduction") == "True" if reduction is not None else None,
+        )
+    return None
+
+
 def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
     """The whole card was reserved repeatedly in a session: reservation churn, not a deliberate hold.
 
@@ -1415,22 +1714,44 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
     dropped = _total_dropped_jobs(context.session.records)
     declined = _matching(context.session.records, _WHOLE_CARD_DECLINED_RE)
     escalated = bool(soft_resets) or dropped > 0
+
+    claims = _whole_card_claims(establishes)
+    forecast = _last_stream_forecast(context.session.records)
+    incoherent = [claim for claim in claims if claim.demands_no_reduction]
+    all_incoherent = bool(claims) and len(incoherent) == len(claims)
+    unmeasured_marginal = forecast is not None and forecast.marginal_is_seeded
+
+    headline = (
+        (
+            f"Every one of the {len(claims)} reservation(s) that stated its arithmetic demanded no reduction: "
+            f"the target process count was at or above the live count (e.g. {incoherent[0].counts_text}), so the "
+            "claim reserved the card without the teardown it was granted for. The claim is structurally "
+            "incoherent, not merely over-eager. "
+        )
+        if all_incoherent
+        else (
+            f"The whole card was reserved {len(establishes)} time(s) this session, each time reducing the live "
+            "process count and cycling safety off the GPU, then restoring them. Sustained reservation churn is "
+            "the signature of a model being given the card that does not need it; on a high-VRAM card a model "
+            "whose weights are a small fraction of total VRAM co-resides, so a teardown demand for it usually "
+            "means the per-context overhead was over-counted"
+            + (" (an unmeasured marginal). " if unmeasured_marginal else ". ")
+        )
+    )
     return [
         Finding(
             id="whole_card_residency_churn",
-            severity=Severity.CRITICAL if escalated else Severity.WARNING,
+            severity=Severity.CRITICAL if escalated or all_incoherent else Severity.WARNING,
             title="Whole-card residency reserved and restored repeatedly (reservation churn)",
             verdict=(
-                f"The whole card was reserved {len(establishes)} time(s) this session, each time reducing the "
-                "live process count and cycling safety off the GPU, then restoring them. Sustained reservation "
-                "churn is the signature of a model being given the card that does not need it; on a high-VRAM "
-                "card a model whose weights are a small fraction of total VRAM co-resides, so a teardown demand "
-                "for it usually means the per-context overhead was over-counted (an unmeasured marginal). "
+                headline
+                + _claim_figures_text(claims, count=len(establishes))
+                + (f" {forecast.describe()}" if forecast is not None else "")
                 + (
-                    f"It escalated: the recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and "
+                    f" It escalated: the recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and "
                     f"faulted {dropped} backlog job(s)."
                     if escalated
-                    else "It did not escalate to a soft reset here, but the reload + safety cycling caps throughput."
+                    else " It did not escalate to a soft reset here, but the reload + safety cycling caps throughput."
                 )
                 + (
                     f" The trust gate declined {len(declined)} further reservation(s), so it is actively damping "
@@ -1439,17 +1760,55 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
                     else ""
                 )
             ),
-            remediation=(
-                "Confirm the reserved models are genuinely card-filling. If they are not (a small-weight model "
-                "on a large card), make sure the per-additional-context VRAM cost is measured (the probe's "
-                "second-context delta or a clean all-idle baseline), so the structural free-VRAM floor is not "
-                "the one-time runtime cost multiplied by the process count. A correctly measured marginal lets "
-                "such a model co-reside instead of reserving the card."
+            remediation=_churn_remediation(
+                all_incoherent=all_incoherent,
+                unmeasured_marginal=unmeasured_marginal,
+                forecast=forecast,
             ),
             evidence=[_evidence(r) for r in (establishes[:2] + soft_resets[:1])],
             see_also="scheduler_starvation_wedge",
         ),
     ]
+
+
+def _churn_remediation(
+    *,
+    all_incoherent: bool,
+    unmeasured_marginal: bool,
+    forecast: _StreamForecast | None,
+) -> str:
+    """The fix keyed to what the parsed figures actually show, rather than to one assumed cause.
+
+    Blaming an unmeasured per-additional-context marginal is only true when the forecast says the marginal
+    is seeded (nothing measurable); with a probe or idle-floor source it is measured, and asserting
+    otherwise sends an operator after a number that is already correct.
+    """
+    if all_incoherent:
+        return (
+            "The target process count is at or above the live count, so the reservation cannot free anything "
+            "by tearing siblings down: fix the target the forecast derives before tuning any VRAM figure. "
+            "Check how the residency target is computed against the live process count, and whether the "
+            "deficit driving it is made of charges a teardown cannot return"
+            + (
+                f" (the forecast attributes {forecast.unreclaimable_mb:.0f}MB as unreclaimable)."
+                if forecast is not None and forecast.unreclaimable_mb is not None
+                else "."
+            )
+        )
+    if unmeasured_marginal:
+        return (
+            "The forecast is pricing additional contexts from a seeded constant, so nothing was measured. "
+            "Get the per-additional-context VRAM cost measured (the probe's second-context delta or a clean "
+            "all-idle baseline), so the structural free-VRAM floor is not the one-time runtime cost "
+            "multiplied by the process count. A correctly measured marginal lets a small-weight model "
+            "co-reside instead of reserving the card."
+        )
+    return (
+        "The per-additional-context cost is measured, so the reservations are not the unmeasured-marginal "
+        "case: confirm the reserved models are genuinely card-filling for this card, and check what the "
+        "forecast charges as unreclaimable, since that deduction is what a teardown cannot give back and so "
+        "is what keeps demanding the card."
+    )
 
 
 @dataclass(frozen=True)
@@ -1855,6 +2214,545 @@ def detect_pop_governor_dominance(context: SessionContext) -> list[Finding]:
     ]
 
 
+@dataclass(frozen=True)
+class _FaultedJob:
+    """One job the worker reported faulted, with the cause read off the lines around it."""
+
+    job_id: str
+    record: LogRecord
+    model: str | None
+    cause: str
+
+    def describe(self) -> str:
+        """A census line: when, which job, which model, and what caused it."""
+        ts = self.record.timestamp.strftime("%H:%M:%S") if self.record.timestamp else "--:--:--"
+        return f"{ts}  {self.job_id[:8]}  {self.model or 'unknown model'}  [{self.cause}]"
+
+
+_MODEL_REFERENCE_STALE_WINDOW_SECONDS = 60.0
+"""How near a model-reference fault a cache-staleness reading has to be to be evidence about it.
+
+The staleness disclosure fires on every category file the backend re-checks, so it is present throughout
+a session; only the readings bracketing the fault attribute it to a refresh in flight."""
+
+
+_GIVE_UP_ATTRIBUTION_SECONDS = 30.0
+"""How long after a give-up backstop a fault report is still that backstop's doing.
+
+The backstop faults its jobs and the submitter reports each one in the same burst, so the window only has
+to cover the submits themselves; wider, and an unrelated later fault would be misattributed to it."""
+
+
+def _faulted_job_models(records: list[LogRecord]) -> dict[str, str]:
+    """Map job id to the model it was popped for, from the pop lines that state both."""
+    models: dict[str, str] = {}
+    for record in records:
+        popped = _POPPED_JOB_RE.search(record.message)
+        if popped is not None:
+            models[popped.group("job")] = popped.group("model")
+    return models
+
+
+def _classify_fault(
+    job_id: str,
+    record: LogRecord,
+    *,
+    id_anchored: dict[str, str],
+    give_up_times: list[datetime],
+) -> str:
+    """Name the cause of one fault, preferring evidence that names the job over evidence that only co-occurs."""
+    anchored = id_anchored.get(job_id)
+    if anchored is not None:
+        return anchored
+    timestamp = record.timestamp
+    if timestamp is not None and any(
+        0 <= (timestamp - given_up).total_seconds() <= _GIVE_UP_ATTRIBUTION_SECONDS for given_up in give_up_times
+    ):
+        return "give-up backstop"
+    return "other"
+
+
+def _faulted_jobs(context: SessionContext) -> list[_FaultedJob]:
+    """Every job faulted this session, deduplicated across the two surfaces that report a fault.
+
+    A job can be seen faulting on the slot that ran it and again as the terminal report to the horde; both
+    name the same job, so the census keys on the job id and counts it once.
+    """
+    parent = context.session.records
+    child = _child_records_in_session(context)
+    models = _faulted_job_models(parent)
+    give_up_times = [record.timestamp for record in _matching(parent, _GIVE_UP_RE) if record.timestamp is not None]
+
+    id_anchored: dict[str, str] = {}
+    for record in parent:
+        # A job popped with no model name is unservable before anything touches it, whichever generation
+        # of the worker handled it, so it is never a model or a device failure however it faults later.
+        malformed = _EMPTY_MODEL_POP_RE.search(record.message) or _MALFORMED_POP_REJECTED_RE.search(record.message)
+        if malformed is not None:
+            id_anchored[malformed.group("job")] = "malformed pop (no model name)"
+    for record in child + parent:
+        stage = _STAGE_FAULT_RE.search(record.message)
+        if stage is not None:
+            id_anchored.setdefault(stage.group("job"), "disaggregation stage fault")
+        safety = _SAFETY_UNRECOVERABLE_JOB_RE.search(record.message)
+        if safety is not None:
+            id_anchored[safety.group("job")] = "safety-unrecoverable"
+
+    faults: dict[str, _FaultedJob] = {}
+    for record in parent:
+        slot_fault = _FAULTED_ON_PROCESS_JOB_RE.search(record.message)
+        requeued = slot_fault is not None and _FAULT_REQUEUED_RE.search(record.message) is not None
+        if slot_fault is not None:
+            job_id = slot_fault.group("job")
+            model = _FAULT_MODEL_RE.search(record.message)
+            if not requeued:
+                id_anchored.setdefault(job_id, "process fault")
+            if model is not None:
+                models.setdefault(job_id, model.group("model"))
+        reported = _FAULT_REPORTED_RE.search(record.message)
+        if reported is None and requeued:
+            # An attempt that was handed back for a retry has not cost the horde a job; only the attempt
+            # that exhausts the retry policy, or the terminal report, is a faulted job.
+            continue
+        job_id = reported.group("job") if reported is not None else (slot_fault and slot_fault.group("job"))
+        if job_id is None:
+            continue
+        # The terminal report is the authoritative record of a fault, so it supersedes the slot-side one.
+        if job_id in faults and reported is None:
+            continue
+        faults[job_id] = _FaultedJob(
+            job_id=job_id,
+            record=record,
+            model=models.get(job_id),
+            cause=_classify_fault(job_id, record, id_anchored=id_anchored, give_up_times=give_up_times),
+        )
+    return sorted(faults.values(), key=lambda fault: _window_key(fault.record))
+
+
+def detect_faulted_job_census(context: SessionContext) -> list[Finding]:
+    """Every job faulted this session, enumerated with its model and a cause.
+
+    A faulted job is work the horde reissues and counts against the worker, yet each fault otherwise shows
+    up only as an aside inside whichever detector recognized its cause, and jobs faulted for a cause no
+    detector covers show up nowhere. A flat census answers "how much did this session drop, and to what"
+    directly, and the per-cause counts say which of the drop mechanisms actually fired.
+    """
+    faults = _faulted_jobs(context)
+    if not faults:
+        return []
+    counts: dict[str, int] = {}
+    for fault in faults:
+        counts[fault.cause] = counts.get(fault.cause, 0) + 1
+    breakdown = _clause_join([f"{count} {cause}" for cause, count in sorted(counts.items(), key=lambda kv: -kv[1])])
+    models = _distinct_ordered([fault.model for fault in faults if fault.model is not None])
+    return [
+        Finding(
+            id="faulted_job_census",
+            severity=Severity.WARNING,
+            title="Jobs faulted this session",
+            verdict=(
+                f"{len(faults)} job(s) faulted this session, by cause: {breakdown}."
+                + (f" Across model(s): {_clause_join(models)}." if models else "")
+            ),
+            remediation=(
+                "Faulted jobs are reissued by the horde and counted against this worker; a sustained rate "
+                "drives forced maintenance. Take the largest cause first: a give-up backstop count means the "
+                "scheduler wedged and the recovery path drained the backlog rather than serving it, a "
+                "safety-unrecoverable count means results were produced but could not be checked, and a "
+                "process-fault count points at the slot that ran them."
+            ),
+            evidence=[fault.describe() for fault in faults[:8]],
+            see_also="scheduler_starvation_wedge",
+        ),
+    ]
+
+
+def _open_governor_at(records: list[LogRecord], moment: datetime, name: str) -> LogRecord | None:
+    """The ENTER record of governor ``name``'s spell if it was still open at ``moment``, else None."""
+    opened: LogRecord | None = None
+    for record in records:
+        if record.timestamp is None or record.timestamp > moment:
+            break
+        enter = GOVERNOR_ENTER_RE.search(record.message)
+        if enter is not None and enter.group("name") == name:
+            opened = record
+            continue
+        closed = GOVERNOR_EXIT_RE.search(record.message)
+        if closed is not None and closed.group("name") == name:
+            opened = None
+    return opened
+
+
+def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
+    """The local job queue was full and stopped moving: the worker accepted work and served none of it.
+
+    Every other stall signal describes a part of the pipeline holding back; this one says the whole of it
+    stopped. The queue being full legitimately holds pops back, so a frozen full queue is indistinguishable
+    from a healthy worker at its configured depth on the pop side alone, and the worker only separates them
+    by movement: nothing dispatched and nothing completed for the whole span. That makes it the most severe
+    liveness signal the worker emits, and the one whose absence from a report is most misleading.
+    """
+    frozen = _matching(context.session.records, _POP_LIVENESS_FROZEN_RE)
+    if not frozen:
+        return []
+    worst = 0
+    heads: list[str] = []
+    for record in frozen:
+        fields = _POP_LIVENESS_FROZEN_FIELDS_RE.search(record.message)
+        if fields is None:
+            continue
+        worst = max(worst, int(fields.group("seconds")))
+        heads.append(fields.group("model"))
+    holders = [
+        _open_governor_at(context.session.records, record.timestamp, "whole_card_residency")
+        for record in frozen
+        if record.timestamp is not None
+    ]
+    residency_held = any(holder is not None for holder in holders)
+    held_models = _distinct_ordered(
+        [
+            model.group("model")
+            for holder in holders
+            if holder is not None and (model := _RESIDENCY_GOVERNOR_MODEL_RE.search(holder.message)) is not None
+        ],
+    )
+    return [
+        Finding(
+            id="pop_liveness_full_queue",
+            severity=Severity.CRITICAL,
+            title="Local job queue full and not draining (the worker served nothing)",
+            verdict=(
+                f"The local queue was reported full and motionless {len(frozen)} time(s), for as long as "
+                f"{worst}s with nothing dispatched and nothing completed"
+                + (f", head model {_clause_join(_distinct_ordered(heads))}" if heads else "")
+                + ". Accepted work sat while the worker asked the horde for none, so this is total stall, not "
+                "backpressure."
+                + (
+                    " A whole-card residency governor spell was open across the freeze, so the card was "
+                    "reserved for one model while the head waited for another"
+                    + (f" ({_clause_join(held_models)})." if held_models else ".")
+                    if residency_held
+                    else ""
+                )
+            ),
+            remediation=(
+                "Find what the head was waiting for over that span: the disclosure names the scheduler's own "
+                "block reason where it has one. A residency held for a non-head model is the usual holder, and "
+                "it must release or downgrade rather than outlast the queue. Until then the accepted jobs age "
+                "toward their deadline and are faulted, which the horde counts against this worker."
+            ),
+            evidence=[_evidence(record) for record in frozen[:3]],
+            see_also="whole_card_residency_churn",
+        ),
+    ]
+
+
+def detect_model_reference_sample_fault(context: SessionContext) -> list[Finding]:
+    """A sample stage faulted because the model reference was unreadable while the job was in flight.
+
+    The reference is loaded once and refreshed in the background when its cached category files change on
+    disk. A refresh that lands mid-sample leaves the child asking for a category the cache is rewriting, and
+    the job faults on a data-availability error that has nothing to do with the model, the card, or the
+    prompt. It reads as a generic stage fault, so it needs its own signature to be attributable at all.
+    """
+    # The fault lands in a slot log and the staleness disclosures can come from either side, so both are
+    # merged into one time-ordered stream before any windowing.
+    records = sorted(_child_records_in_session(context) + context.session.records, key=_window_key)
+    faults = [
+        record
+        for record in records
+        if _STAGE_FAULT_RE.search(record.message) and _MODEL_REFERENCE_UNREADABLE_RE.search(record.message)
+    ]
+    if not faults:
+        return []
+    # The staleness disclosure is routine and constant across a session, so only the readings that bracket
+    # a fault say anything about it; counting them all would put a five-figure number next to one fault.
+    stale = [
+        record
+        for fault in faults
+        if fault.timestamp is not None
+        for record in _records_in_window(
+            records,
+            fault.timestamp - timedelta(seconds=_MODEL_REFERENCE_STALE_WINDOW_SECONDS),
+            fault.timestamp + timedelta(seconds=_MODEL_REFERENCE_STALE_WINDOW_SECONDS),
+        )
+        if _MODEL_REFERENCE_STALE_RE.search(record.message)
+    ]
+    categories = _distinct_ordered(
+        [m.group("category") for record in faults if (m := _MODEL_REFERENCE_UNREADABLE_RE.search(record.message))],
+    )
+    jobs = _distinct_ordered([m.group("job") for record in faults if (m := _STAGE_FAULT_RE.search(record.message))])
+    return [
+        Finding(
+            id="model_reference_sample_fault",
+            severity=Severity.WARNING,
+            title="Sample stage faulted on an unreadable model reference",
+            verdict=(
+                f"{len(faults)} sample stage(s) faulted because the {_clause_join(categories)} model reference "
+                f"could not be read, affecting job(s) {_clause_join([job[:8] for job in jobs[:4]])}. The attempt "
+                "was lost to a data-availability error, not to anything about the model or the device (a retry "
+                "can still save the job, at the cost of the work already done)."
+                + (
+                    f" {len(stale)} cache-staleness line(s) sit alongside them, so a reference refresh was in "
+                    "flight while the sample ran."
+                    if stale
+                    else ""
+                )
+            ),
+            remediation=(
+                "The model-reference cache refresh is racing an in-flight sample: the child re-reads a category "
+                "while the cache is rewriting it. Hold the reference the job was admitted with for the life of "
+                "the job (or make the refresh atomic from a reader's point of view) so a background refresh "
+                "cannot fault work already running. Check the horde_model_reference cache path for the affected "
+                "category and confirm it is readable and not being rewritten by a second process."
+            ),
+            evidence=[_evidence(record) for record in faults[:3]],
+            see_also="faulted_job_census",
+        ),
+    ]
+
+
+def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
+    """A pop that named no model, and how far into the worker it travelled.
+
+    An empty model name identifies nothing any worker can load, so the job is unservable whatever happens
+    to it. What decides the cost is where it is stopped. Without a boundary check the blank identity is
+    dispatched like any other model: it is preloaded, ends the slot it is sent to, and is then counted as a
+    model in its own right until it crosses the quarantine threshold, after which every later job for it is
+    refused too. The pool churn and the poisoned quarantine both follow from one malformed response, which
+    is why this needs naming as a single cause rather than as a recovery storm of unknown origin.
+
+    Both worker generations are recognized, because the containment changes the reading entirely: with the
+    boundary check in place the same input costs one reissued job and nothing else, so the count is a rate
+    to watch rather than a fault to fix.
+    """
+    records = context.session.records
+    empty_pops = _matching(records, _EMPTY_MODEL_POP_RE)
+    blank_preloads = _matching(records, _BLANK_PRELOAD_RE)
+    blank_quarantines = _matching(records, _BLANK_MODEL_QUARANTINE_RE)
+    quarantine_skips = _matching(records, _BLANK_QUARANTINE_SKIP_RE)
+    blank_deaths = [
+        recovery
+        for recovery in context.recoveries
+        if (match := _LOAD_FAILURE_MODEL_RE.search(recovery.reason)) is not None and not match.group("model").strip()
+    ]
+
+    rejected = _matching(records, _MALFORMED_POP_REJECTED_RE)
+    refused_preloads = _matching(records, _BLANK_PRELOAD_REFUSED_RE) + _matching(
+        _child_records_in_session(context),
+        _BLANK_PRELOAD_REFUSED_RE,
+    )
+    refused_incidents = _matching(records, _BLANK_INCIDENT_REFUSED_RE)
+
+    uncontained = bool(blank_preloads or blank_deaths or blank_quarantines or quarantine_skips)
+    if not uncontained and not (rejected or refused_preloads or refused_incidents):
+        return []
+
+    if uncontained:
+        verdict = (
+            f"{len(empty_pops)} pop(s) arrived with no model name and were queued as if the empty name were a "
+            f"model: it was preloaded {len(blank_preloads)} time(s) and cost {len(blank_deaths)} child "
+            "death(s), each one a slot ending on a load it could never complete."
+        )
+        if blank_quarantines or quarantine_skips:
+            verdict += (
+                f" The empty name then crossed the per-model incident threshold and was quarantined "
+                f"{len(blank_quarantines)} time(s), after which {len(quarantine_skips)} further job(s) were "
+                "refused against it. The quarantine set is holding an identity no job can ever satisfy and no "
+                "load can ever clear."
+            )
+        remediation = (
+            "Nothing about the models on this host is at fault: the worker accepted a malformed pop response "
+            "and spent the pool on it. Upgrade the worker; newer versions contain and fault these at the pop "
+            "boundary, handing the job straight back for reissue without preloading it, without ending a "
+            "slot, and without counting it against any model. Until then the pool churn and the poisoned "
+            "quarantine will recur for every such pop."
+        )
+        severity = Severity.CRITICAL
+        evidence = (
+            empty_pops[:1] + blank_preloads[:1] + blank_quarantines[:1] + quarantine_skips[:1],
+            [r.record for r in blank_deaths[:1]],
+        )
+        evidence_lines = [_evidence(r) for r in evidence[0]] + [_evidence(r) for r in evidence[1]]
+    else:
+        verdict = (
+            f"{len(rejected)} malformed pop(s) carrying no model name were rejected at the pop boundary and "
+            "handed back for reissue, so the cascade is contained: nothing was preloaded and no slot was "
+            "spent on them."
+        )
+        if refused_preloads:
+            verdict += (
+                f" A blank preload still reached a child {len(refused_preloads)} time(s), which refused it and "
+                "stayed available rather than ending."
+            )
+        if refused_incidents:
+            verdict += (
+                f" {len(refused_incidents)} incident(s) reported against the blank name were refused, keeping "
+                "it out of the quarantine set."
+            )
+        remediation = (
+            "No worker-side fix is needed; the containment is doing its job. The rate is the thing to watch: "
+            "each rejection is a job this worker was offered and could not serve, so a sustained rate is lost "
+            "throughput and is worth raising with the horde as malformed pop responses."
+        )
+        severity = Severity.WARNING
+        evidence_lines = [_evidence(r) for r in (rejected[:2] + refused_preloads[:1] + refused_incidents[:1])]
+
+    return [
+        Finding(
+            id="empty_model_pop_cascade",
+            severity=severity,
+            title="Pops with no model name",
+            verdict=verdict,
+            remediation=remediation,
+            evidence=evidence_lines,
+            see_also="preload_kills_child_loop",
+        ),
+    ]
+
+
+_PRELOAD_KILL_LOOP_THRESHOLD = 3
+"""Slot deaths attributed to loading one model before it is a loop rather than a coincidence.
+
+Matches the worker's own per-model incident threshold: at this count the worker itself concludes the model
+is at fault and quarantines it, so a report that stayed quieter would be less informed than the worker."""
+
+
+def detect_preload_kills_child_loop(context: SessionContext) -> list[Finding]:
+    """One model that ends every slot it is preloaded onto, across the session.
+
+    Slot deaths are ordinarily read per slot, and a model re-dispatched round-robin therefore looks like
+    unrelated churn across a healthy-looking pool. Grouping the deaths by the model named in each
+    replacement is what makes the pattern visible: the constant is the checkpoint, not the slot. The blank
+    identity produces the same shape for a different reason and has its own finding, so it is excluded here
+    rather than reported twice.
+    """
+    by_model: dict[str, list[RecoveryDiagnostic]] = {}
+    for recovery in context.recoveries:
+        match = _LOAD_FAILURE_MODEL_RE.search(recovery.reason)
+        if match is None:
+            continue
+        model = match.group("model").strip()
+        if not model:
+            continue
+        by_model.setdefault(model, []).append(recovery)
+
+    looping = sorted(
+        ((model, deaths) for model, deaths in by_model.items() if len(deaths) >= _PRELOAD_KILL_LOOP_THRESHOLD),
+        key=lambda item: -len(item[1]),
+    )
+    if not looping:
+        return []
+
+    model, deaths = looping[0]
+    slots = sorted({recovery.process_id for recovery in deaths})
+    others = [f"{name} x{len(rest)}" for name, rest in looping[1:]]
+    return [
+        Finding(
+            id="preload_kills_child_loop",
+            severity=Severity.CRITICAL,
+            title="A model ends every slot it is loaded onto",
+            verdict=(
+                f"Loading {model} ended the inference child {len(deaths)} time(s) across slot(s) "
+                f"{_clause_join([str(slot) for slot in slots])}. The failing element is the model, not any one "
+                "slot: it is re-dispatched to a fresh slot each time, so no per-slot breaker sees a pattern "
+                "while the pool is rebuilt around it." + (f" Also seen for {_clause_join(others)}." if others else "")
+            ),
+            remediation=(
+                f"Take {model} out of the served model set and re-download it; a checkpoint that ends the "
+                "process during load is normally truncated or corrupt on disk, which a size or hash check "
+                "against the model reference will show. If the file verifies, the load path cannot host it on "
+                "this build and the model still has to come out of rotation until that is resolved. Each "
+                "attempt costs a child and the jobs that child was holding."
+            ),
+            evidence=[_evidence(recovery.record) for recovery in deaths[:3]],
+            see_also="empty_model_pop_cascade",
+        ),
+    ]
+
+
+_POP_API_ERROR_DOMINANCE_THRESHOLD = 5
+"""Identical pop rejections before the message is worth naming rather than counting as API noise."""
+_POP_API_ERROR_DOMINANCE_SHARE = 0.6
+"""The share of a session's pop errors one message must hold to be called the cause of the intake loss."""
+# Rejections the horde will keep sending until the operator changes something. Everything else (rate
+# limits, gateway and server faults) clears without intervention, and telling an operator to act on those
+# sends them looking for a fault on their own machine that is not there.
+_OPERATOR_FIXABLE_POP_ERRORS = re.compile(
+    r"untrusted users can only have|maintenance mode|invalid api key|wrong credentials|"
+    r"worker .*is not allowed|account .*suspend",
+    re.IGNORECASE,
+)
+
+
+def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
+    """One pop rejection repeating long enough to be the reason the worker had no work.
+
+    A worker that is being refused work looks, from every internal signal, like a worker with nothing to
+    do: the queue is empty, the governors report the intake pause they applied in response, and no stage
+    ever misbehaves. The horde says why in the rejection itself, and that message is the only place the
+    reason exists. Repeated verbatim it is a standing condition rather than a blip, and whether an operator
+    can do anything about it is decided entirely by what it says.
+    """
+    errors = _matching(context.session.records, _POP_API_ERROR_RE)
+    if len(errors) < _POP_API_ERROR_DOMINANCE_THRESHOLD:
+        return []
+
+    by_message: dict[str, list[LogRecord]] = {}
+    for record in errors:
+        match = _POP_API_ERROR_RE.search(record.message)
+        if match is not None:
+            by_message.setdefault(match.group("message"), []).append(record)
+    if not by_message:
+        return []
+
+    message, occurrences = max(by_message.items(), key=lambda item: len(item[1]))
+    if len(occurrences) < _POP_API_ERROR_DOMINANCE_THRESHOLD:
+        return []
+    if len(occurrences) / len(errors) < _POP_API_ERROR_DOMINANCE_SHARE:
+        return []
+
+    code_match = _POP_API_ERROR_CODE_RE.search(occurrences[0].message)
+    code = code_match.group("code") if code_match is not None else None
+    first, last = occurrences[0].timestamp, occurrences[-1].timestamp
+    span = (last - first).total_seconds() if first is not None and last is not None else None
+    span_text = f" over {span / 60:.0f} minute(s)" if span is not None and span >= 60 else ""
+    operator_fixable = bool(_OPERATOR_FIXABLE_POP_ERRORS.search(message))
+    others = len(by_message) - 1
+
+    return [
+        Finding(
+            id="pop_api_error_dominance",
+            severity=Severity.WARNING,
+            title="The horde repeatedly refused this worker's pops",
+            verdict=(
+                f"The horde rejected {len(occurrences)} pop(s){span_text} with the same message: "
+                f'"{message}"'
+                + (f" (rc={code})." if code else ".")
+                + " While that stands the worker is not being offered work, so an idle worker and a quiet job "
+                "stream are the expected consequence rather than a local fault."
+                + (f" {others} other pop error message(s) also occurred." if others > 0 else "")
+            ),
+            remediation=(
+                (
+                    "This rejection will not clear on its own: it is a condition on the account or the worker "
+                    "registration, not a server fault, so the worker will keep being refused until it is "
+                    "changed. Act on what the message says (worker count or naming against the account, the "
+                    "API key, or a maintenance flag), then confirm pops resume."
+                )
+                if operator_fixable
+                else (
+                    "This reads as a transient server-side or rate-limit rejection, which normally clears "
+                    "without intervention; the worker already backs off and retries. If it persists across "
+                    "restarts, check the horde's status before changing anything locally."
+                )
+            ),
+            evidence=[_evidence(record) for record in (occurrences[:1] + occurrences[-1:])],
+            see_also="pop_governor_dominance",
+        ),
+    ]
+
+
 def detect_session_summary(context: SessionContext) -> list[Finding]:
     """An always-present rollup: how the session ended and its recovery/fault headline numbers."""
     session = context.session
@@ -1871,6 +2769,13 @@ def detect_session_summary(context: SessionContext) -> list[Finding]:
                 f"{session.peak_process_recoveries}; {len(context.recoveries)} recovery diagnostic(s); "
                 f"version v{session.version or '?'}, {session.num_models or '?'} models, "
                 f"{session.max_threads or '?'} thread(s)."
+                # A parent log rotates by size mid-run, so which archives were read decides the span every
+                # figure above is measured over. Naming them keeps that attributable.
+                + (
+                    f" Rotation: {context.bundle.rotation_stitch.describe()}."
+                    if context.bundle.rotation_stitch is not None
+                    else ""
+                )
             ),
             remediation="",
         ),
@@ -1879,6 +2784,8 @@ def detect_session_summary(context: SessionContext) -> list[Finding]:
 
 DETECTORS: list[Detector] = [
     detect_crash_on_start_loop,
+    detect_empty_model_pop_cascade,
+    detect_preload_kills_child_loop,
     detect_doomed_pool_no_giveup,
     detect_gave_up_clean,
     detect_forced_maintenance,
@@ -1891,10 +2798,14 @@ DETECTORS: list[Detector] = [
     detect_whole_card_residency_churn,
     detect_whole_card_pop_claim_monopoly,
     detect_whole_card_pop_claim_episodes,
+    detect_pop_liveness_full_queue,
     detect_head_dispatch_stall,
     detect_residency_reconciliation_holds,
+    detect_faulted_job_census,
+    detect_model_reference_sample_fault,
     detect_consecutive_failure_pause,
     detect_pop_governor_dominance,
+    detect_pop_api_error_dominance,
     detect_stuck_inference_step,
     detect_post_processing_vram_stall,
     detect_post_processing_deferral_starvation,

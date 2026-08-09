@@ -653,13 +653,141 @@ def _dispatch_stall(ts: str, *, reason: str, model: str = "AlbedoBase XL (SDXL)"
     )
 
 
-def _whole_card_reserve(ts: str, *, model: str = "AlbedoBase XL (SDXL)") -> str:
-    """inference_scheduler._establish_whole_card_residency: the worker reserving the device for a model."""
+def _whole_card_reserve(
+    ts: str,
+    *,
+    model: str = "AlbedoBase XL (SDXL)",
+    current: int = 4,
+    after: int = 3,
+    total: int = 4,
+    target: int = 3,
+    free_mb: int = 9443,
+) -> str:
+    """inference_scheduler._establish_whole_card_residency: the worker reserving the device for a model.
+
+    The process-count figures and the residency snapshot's ``device_free_vram`` are what say whether the
+    claim reduced anything, so they are parameterized rather than baked into the fixture.
+    """
     return (
         f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_establish_whole_card_residency:1043 - "
-        f"Whole-card residency: reserving the device for {model} (inference processes 4 -> 3 of 4, target 3) and "
-        "moving safety off-GPU. Its weights + activations need the whole ~24GB card; co-resident siblings/safety "
-        "would force the driver to stream activations to host RAM and run several times slower."
+        f"Whole-card residency: reserving the device for {model} (inference processes {current} -> {after} of "
+        f"{total}, target {target}) and moving safety off-GPU. Its weights + activations need the whole ~24GB "
+        "card; co-resident siblings/safety would force the driver to stream activations to host RAM and run "
+        f"several times slower. slots=[#1:{model}[WAITING_FOR_JOB]] device_free_vram={free_mb}MB"
+    )
+
+
+def _stream_forecast(
+    ts: str,
+    *,
+    model: str = "AlbedoBase XL (SDXL)",
+    marginal_mb: int = 276,
+    source: str = "probe",
+    unreclaimable_mb: int = 1450,
+    needs_reduction: bool = True,
+) -> str:
+    """inference_scheduler._log_stream_forecast: the establishment-time arithmetic behind a claim."""
+    return (
+        f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.scheduling.inference_scheduler:_log_stream_forecast:1345 - "
+        f"Stream forecast for {model}: weights ~9158 MB + 1519 MB reserve do not fit 8679 MB free: exclusive "
+        f"[free_now=8679.0, after_model_evict=10129.0, alone=16100.0, unreclaimable={unreclaimable_mb}MB, "
+        f"live_procs=2, overhead/proc=275MB, marginal/ctx={marginal_mb}MB(src={source},probe=276,"
+        f"idle_floor=143)] -> coresident=False, needs_exclusive=True, "
+        f"needs_process_count_reduction={needs_reduction}(max_resident=2), streams_unavoidably=False"
+    )
+
+
+def _fault_report(ts: str, *, job_id: str, popped: float = 419.31) -> str:
+    """job_submitter.submit_single_generation: the terminal per-job fault reported to the horde."""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.jobs.job_submitter:submit_single_generation:449 - "
+        f"{job_id} faulted. Reported fault to the horde. Job popped {popped} seconds ago and took 0.00 to generate."
+    )
+
+
+def _popped_job(ts: str, *, job_id: str, model: str = "AlbedoBase XL (SDXL)") -> str:
+    """job_popper.api_job_pop: the pop line that binds a job id to the model it was popped for."""
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.jobs.job_popper:api_job_pop:2122 - "
+        f"Popped job {job_id} (38 eMPS) (model: {model}, batch: 2, loras: False, post_processing: False)"
+    )
+
+
+def _faulted_on_process(
+    ts: str,
+    *,
+    job_id: str,
+    slot: int = 3,
+    model: str = "AlbedoBase XL (SDXL)",
+    error: str = "sampler (KSampler): RuntimeError: boom",
+    requeued: bool = False,
+) -> str:
+    """message_dispatcher._handle_faulted_inference_result: a job faulted on the slot that ran it.
+
+    ``requeued`` produces the bounded-retry wording, which is the same line for an attempt the tracker
+    handed back rather than a job the worker lost.
+    """
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_faulted_inference_result:892 - "
+        f"Job {job_id} faulted on process {slot} (RuntimeError: Pipeline failed to run - declared output "
+        f"node(s) ['output_image'] produced no results. Model: {model}. Error: {error}"
+        + ("); requeued for another attempt." if requeued else "")
+    )
+
+
+def _sample_stage_fault(
+    ts: str,
+    *,
+    job_id: str,
+    error: str = "Model reference for category image_generation not found or could not be parsed.",
+) -> str:
+    """inference_process._run_sample_stage: the disaggregated sample stage faulting a job (child log)."""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.workers.inference_process:_run_sample_stage:1206 - "
+        f"Sample stage faulted for job {job_id}: {error}"
+    )
+
+
+def _model_reference_stale(ts: str, *, filename: str = "stable_diffusion.json") -> str:
+    """horde_model_reference replica backend: a cached category file going stale under an in-flight job."""
+    return (
+        f"2026-06-25 {ts} | DEBUG    | horde_model_reference.backends.replica_backend_base:needs_refresh:332 - "
+        f"File {filename} mtime changed, needs refresh; the cache is stale"
+    )
+
+
+def _residency_governor_enter(ts: str, *, model: str = "WAI-NSFW-illustrious-SDXL") -> str:
+    """PopGovernorRegistry: the whole-card residency spell opening (the hold's ENTER boundary)."""
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.scheduling.pop_governor_registry:_default_log:200 - "
+        f"Pop governor ENTER: whole_card_residency ({model} holds the card (establishing)); expected ~45s"
+    )
+
+
+def _residency_governor_exit(ts: str) -> str:
+    """PopGovernorRegistry: the whole-card residency spell closing (the hold's EXIT boundary)."""
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.scheduling.pop_governor_registry:_default_log:200 - "
+        "Pop governor EXIT: whole_card_residency after 04m00s (1x this session, 04m00s total)"
+    )
+
+
+def _full_queue_frozen(
+    ts: str,
+    *,
+    frozen_seconds: int = 120,
+    waiting: int = 4,
+    model: str = "Nova Anime XL",
+    blocker: str | None = None,
+) -> str:
+    """process_manager._full_queue_frozen_line: the local queue full and motionless (the total-stall signal)."""
+    blocker_text = f" The scheduler names the block as: {blocker}." if blocker else ""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.process_manager:_check_full_queue_liveness:5181 - "
+        f"Pop liveness: the local job queue has been full and not draining for {frozen_seconds}s "
+        f"({waiting} accepted job(s) waiting, head model '{model}'), with nothing dispatched and nothing "
+        "completed in that time. A full queue holds pops back legitimately only while it moves, so the worker "
+        f"is serving nothing.{blocker_text}"
     )
 
 
@@ -892,6 +1020,263 @@ class TestWholeCardResidencyChurn:
         """One deliberate reservation is normal and must not fire (only sustained cycling does)."""
         findings = _diagnose(tmp_path, self._bridge(_whole_card_reserve("07:54:50.000")))
         assert "whole_card_residency_churn" not in findings
+
+    def test_the_claims_own_figures_are_reported(self, tmp_path: Path) -> None:
+        """The finding quotes the process-count arithmetic and free-VRAM the reservation line carries."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _whole_card_reserve("07:54:50.000", current=4, after=3, target=3, free_mb=9443),
+                _whole_card_reserve("07:55:45.000", current=4, after=3, target=3, free_mb=10500),
+                _whole_card_reserve("07:57:46.000", current=4, after=3, target=3, free_mb=11000),
+            ),
+        )
+        verdict = findings["whole_card_residency_churn"].verdict
+        assert "4 -> 3" in verdict, "the live/after process counts must be reported"
+        assert "9443" in verdict and "11000" in verdict, "the device_free_vram range must be reported"
+
+    def test_a_target_at_or_above_the_live_count_is_the_headline(self, tmp_path: Path) -> None:
+        """A claim whose target never reduced the pool is structurally incoherent, and leads the verdict."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _whole_card_reserve("07:54:50.000", current=2, after=2, total=2, target=21),
+                _whole_card_reserve("07:55:45.000", current=2, after=2, total=2, target=21),
+                _whole_card_reserve("07:57:46.000", current=2, after=2, total=2, target=21),
+            ),
+        )
+        finding = findings["whole_card_residency_churn"]
+        assert finding.verdict.startswith("Every one of the 3 reservation(s)"), finding.verdict
+        assert "demanded no reduction" in finding.verdict
+        assert "target 21" in finding.verdict
+        assert "unmeasured marginal" not in finding.remediation, (
+            "an incoherent claim must not be blamed on an unmeasured per-context marginal"
+        )
+        assert "target" in finding.remediation
+
+    def test_a_measured_marginal_suppresses_the_unmeasured_remediation(self, tmp_path: Path) -> None:
+        """With ``src=probe`` in the forecast, the per-context marginal is measured, so that fix is wrong."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _stream_forecast("07:54:49.000", source="probe", marginal_mb=276),
+                _whole_card_reserve("07:54:50.000"),
+                _whole_card_reserve("07:55:45.000"),
+                _whole_card_reserve("07:57:46.000"),
+            ),
+        )
+        finding = findings["whole_card_residency_churn"]
+        assert "unmeasured marginal" not in finding.verdict
+        assert "measured" in finding.remediation
+        assert "276MB" in finding.verdict, "the measured marginal must be quoted"
+        assert "1450" in finding.verdict, "the unreclaimable charge behind the reduction must be quoted"
+
+    def test_a_seeded_marginal_keeps_the_unmeasured_remediation(self, tmp_path: Path) -> None:
+        """Only a seeded source means nothing was measured, which is when that remediation is true."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _stream_forecast("07:54:49.000", source="seeded"),
+                _whole_card_reserve("07:54:50.000"),
+                _whole_card_reserve("07:55:45.000"),
+                _whole_card_reserve("07:57:46.000"),
+            ),
+        )
+        assert "measured" in findings["whole_card_residency_churn"].remediation
+        assert "unmeasured" in findings["whole_card_residency_churn"].verdict
+
+
+_GIVEN_UP_JOB = "34ce8495-7820-4af5-9723-b411698ff27f"
+_SLOT_FAULT_JOB = "597d4471-b223-4383-b874-86c6a1549594"
+_SAFETY_FAULT_JOB = "ebc711be-20b4-4dac-bdab-5b005fdf6c11"
+_STAGE_FAULT_JOB = "3217e6c9-30f3-4520-a810-672132a362cc"
+
+
+class TestFaultedJobCensus:
+    """Every job the worker reported faulted, with the cause read off the lines around it."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_no_faults_produces_no_finding(self, tmp_path: Path) -> None:
+        """A clean session must not carry a census."""
+        assert "faulted_job_census" not in _diagnose(tmp_path, self._bridge())
+
+    def test_every_faulted_job_is_enumerated_with_its_model(self, tmp_path: Path) -> None:
+        """Each fault is one census entry, named by job id and the model it was popped for."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _popped_job("07:51:00.000", job_id=_GIVEN_UP_JOB, model="WAI-NSFW-illustrious-SDXL"),
+                _give_up("07:58:00.000", jobs=3),
+                _fault_report("07:58:00.500", job_id=_GIVEN_UP_JOB),
+            ),
+        )
+        finding = findings["faulted_job_census"]
+        assert "1 job(s) faulted" in finding.verdict
+        assert any(_GIVEN_UP_JOB[:8] in line for line in finding.evidence)
+        assert any("WAI-NSFW-illustrious-SDXL" in line for line in finding.evidence)
+
+    def test_causes_are_classified_and_counted(self, tmp_path: Path) -> None:
+        """The distinct causes and their counts are the census's headline breakdown."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _give_up("07:58:00.000", jobs=3),
+                _fault_report("07:58:00.500", job_id=_GIVEN_UP_JOB),
+                _safety_unrecoverable("07:59:00.000", job_id=_SAFETY_FAULT_JOB),
+                _fault_report("07:59:01.000", job_id=_SAFETY_FAULT_JOB),
+                _faulted_on_process("08:00:00.000", job_id=_SLOT_FAULT_JOB),
+                _fault_report("08:01:01.000", job_id=_STAGE_FAULT_JOB),
+            ),
+            {"bridge_5.log": _sample_stage_fault("08:01:00.000", job_id=_STAGE_FAULT_JOB)},
+        )
+        finding = findings["faulted_job_census"]
+        assert "4 job(s) faulted" in finding.verdict
+        for cause in ("give-up backstop", "safety-unrecoverable", "disaggregation stage fault", "process fault"):
+            assert cause in finding.verdict, f"{cause} missing from {finding.verdict}"
+
+    def test_a_malformed_pop_is_attributed_not_left_unexplained(self, tmp_path: Path) -> None:
+        """A job popped with no model name is unservable at the boundary, so it is named, not bucketed."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _empty_model_pop("07:51:00.000", job_id=_GIVEN_UP_JOB),
+                _fault_report("07:51:05.000", job_id=_GIVEN_UP_JOB),
+            ),
+        )
+        finding = findings["faulted_job_census"]
+        assert "malformed pop (no model name)" in finding.verdict
+        assert "other" not in finding.verdict
+
+    def test_a_requeued_attempt_is_not_a_faulted_job(self, tmp_path: Path) -> None:
+        """A slot fault handed back for a retry did not cost the horde a job, so it is not in the census."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _faulted_on_process("08:00:00.000", job_id=_SLOT_FAULT_JOB, requeued=True),
+                _fault_report("08:01:00.000", job_id=_GIVEN_UP_JOB),
+            ),
+        )
+        finding = findings["faulted_job_census"]
+        assert "1 job(s) faulted" in finding.verdict
+        assert all(_SLOT_FAULT_JOB[:8] not in line for line in finding.evidence)
+
+    def test_a_job_is_counted_once_across_both_fault_surfaces(self, tmp_path: Path) -> None:
+        """A slot fault that is later reported to the horde is one faulted job, not two."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _faulted_on_process("08:00:00.000", job_id=_SLOT_FAULT_JOB),
+                _fault_report("08:00:02.000", job_id=_SLOT_FAULT_JOB),
+            ),
+        )
+        assert "1 job(s) faulted" in findings["faulted_job_census"].verdict
+
+
+class TestPopLivenessFullQueue:
+    """The worker's most complete stall: a full local queue that stopped moving entirely."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_a_frozen_full_queue_is_high_severity(self, tmp_path: Path) -> None:
+        """One frozen-queue disclosure is enough: nothing was dispatched and nothing completed."""
+        findings = _diagnose(tmp_path, self._bridge(_full_queue_frozen("07:52:00.000")))
+        finding = findings["pop_liveness_full_queue"]
+        assert finding.severity is Severity.CRITICAL
+        assert "Nova Anime XL" in finding.verdict
+        assert "120s" in finding.verdict
+
+    def test_a_concurrent_residency_hold_is_named(self, tmp_path: Path) -> None:
+        """A whole-card residency governor spell open across the freeze is the correlation that explains it."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _residency_governor_enter("07:51:00.000"),
+                _full_queue_frozen("07:52:00.000", blocker=_DISPATCH_NONHEAD_REASON),
+                _residency_governor_exit("07:55:00.000"),
+            ),
+        )
+        verdict = findings["pop_liveness_full_queue"].verdict
+        assert "whole-card residency" in verdict, "the residency holding the card over the freeze must be named"
+
+    def test_no_open_residency_spell_is_not_correlated(self, tmp_path: Path) -> None:
+        """A spell that closed before the freeze is not what is holding the queue, so it is not claimed to be."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _residency_governor_enter("07:50:10.000"),
+                _residency_governor_exit("07:50:40.000"),
+                _full_queue_frozen("07:52:00.000"),
+            ),
+        )
+        assert "whole-card residency" not in findings["pop_liveness_full_queue"].verdict
+
+    def test_a_healthy_session_does_not_fire(self, tmp_path: Path) -> None:
+        """No frozen-queue disclosure, no finding."""
+        assert "pop_liveness_full_queue" not in _diagnose(tmp_path, self._bridge())
+
+
+class TestModelReferenceSampleFault:
+    """A model-reference cache refresh landing under an in-flight sample stage."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_the_child_fault_signature_fires(self, tmp_path: Path) -> None:
+        """The fault is in a slot log, so the detector must read the child records, not just the parent."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge("2026-06-25 07:59:00.000 | INFO | x:y:1 - working"),
+            {"bridge_5.log": _sample_stage_fault("07:55:00.000", job_id=_STAGE_FAULT_JOB)},
+        )
+        finding = findings["model_reference_sample_fault"]
+        assert finding.severity is Severity.WARNING
+        assert _STAGE_FAULT_JOB[:8] in finding.verdict or any(
+            _STAGE_FAULT_JOB[:8] in line for line in finding.evidence
+        )
+        assert "model-reference cache refresh" in finding.remediation.lower()
+
+    def test_a_concurrent_stale_cache_is_reported(self, tmp_path: Path) -> None:
+        """The staleness lines around the fault are what attribute it to a refresh, so they are counted."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge("2026-06-25 07:59:00.000 | INFO | x:y:1 - working"),
+            {
+                "bridge_5.log": "\n".join(
+                    [
+                        _model_reference_stale("07:54:59.000"),
+                        _sample_stage_fault("07:55:00.000", job_id=_STAGE_FAULT_JOB),
+                    ],
+                ),
+            },
+        )
+        assert "stale" in findings["model_reference_sample_fault"].verdict
+
+    def test_an_unrelated_stage_fault_does_not_fire(self, tmp_path: Path) -> None:
+        """Only the model-reference signature counts; other sample-stage faults have their own causes."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge("2026-06-25 07:59:00.000 | INFO | x:y:1 - working"),
+            {
+                "bridge_5.log": _sample_stage_fault(
+                    "07:55:00.000",
+                    job_id=_STAGE_FAULT_JOB,
+                    error="model_loader (HordeCheckpointLoader): ValueError: too many values to unpack",
+                ),
+            },
+        )
+        assert "model_reference_sample_fault" not in findings
 
 
 class TestWholeCardPopClaim:
@@ -1423,3 +1808,386 @@ class TestSessionWindowBisect:
         ]
         for start, end in windows:
             assert _records_in_window(records, start, end) == self._naive(records, start, end), (start, end)
+
+
+def _empty_model_pop(ts: str, *, job_id: str = "ac0df470-17fd-4916-9ae2-56bb3f998caf") -> str:
+    """job_popper.api_job_pop: a pop whose model field arrived empty (the older, uncontained form)."""
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.jobs.job_popper:api_job_pop:2122 - "
+        f"Popped job {job_id} (14 eMPS) (model: , batch: 1, loras: False, post_processing: False)"
+    )
+
+
+def _blank_preload(ts: str, *, slot: int = 4) -> str:
+    """inference_scheduler._send_preload: the blank identity being sent to a slot as if it were a model."""
+    return (
+        f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.scheduling.inference_scheduler:_send_preload:5713 - "
+        f"Preloading model  on process {slot}"
+    )
+
+
+def _load_failure_recovery(ts: str, *, slot: int = 4, model: str = "") -> str:
+    """process_lifecycle: a slot replaced because the model it was told to load ended the process."""
+    return _recovery(
+        ts,
+        slot,
+        reason=f"inference process replaced (failed to load model {model})",
+        last_state="PROCESS_ENDED",
+    ).replace("2026-06-24", "2026-06-25")
+
+
+def _blank_model_quarantine(ts: str) -> str:
+    """process_lifecycle.record_model_incident: the blank identity crossing the quarantine threshold."""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:record_model_incident:3318 - "
+        "Model  caused 3 load_failure incident(s) within 600s; quarantining it (its jobs will be reissued, it "
+        "will not be preloaded, and it will not be advertised in pops) to stop it churning the inference pool."
+    )
+
+
+def _blank_quarantine_skip(ts: str) -> str:
+    """inference_scheduler._attempt_preload_for_job: a job refused because the blank identity is quarantined."""
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_attempt_preload_for_job:7981 - "
+        "Skipping preload of quarantined model ; faulting its job for reissue."
+    )
+
+
+def _malformed_pop_rejected(ts: str, *, job_id: str = "ac0df470-17fd-4916-9ae2-56bb3f998caf") -> str:
+    """job_popper._reject_malformed_pop: the contained form, handing a model-less pop straight back."""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.jobs.job_popper:_reject_malformed_pop:1693 - "
+        f"Popped job {job_id} carries no model name (got ''); returning it to the horde for reissue without "
+        "queueing it. This is a malformed pop response, not a model failure."
+    )
+
+
+def _blank_preload_refused(ts: str, *, job_id: str = "ac0df470-17fd-4916-9ae2-56bb3f998caf") -> str:
+    """inference_process._preload_model: the child refusing a blank name instead of ending itself."""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.workers.inference_process:_preload_model:705 - "
+        f"Refusing to preload a blank model name (got '') for job {job_id}; reporting a load failure and "
+        "staying available."
+    )
+
+
+_ACCOUNT_LIMIT_POP_ERROR = "To avoid abuse, untrusted users can only have up to 3 distinct workers."
+
+
+def _pop_api_error(ts: str, *, message: str = _ACCOUNT_LIMIT_POP_ERROR, code: str = "TooManyWorkers") -> str:
+    """job_popper._handle_pop_error_response: the horde rejecting a pop, quoting its own message."""
+    return (
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.jobs.job_popper:_handle_pop_error_response:1593 - "
+        f"Failed to pop job (API Error): message='{message}' object_data=None rc='{code}'"
+    )
+
+
+def _safety_placement_cycle(ts: str, *, owner: str = "Reclaim ladder", restoring: bool = False) -> str:
+    """process_lifecycle.pause_safety_on_gpu / restore_safety_on_gpu: the parent moving safety off/on the GPU."""
+    action = (
+        "restoring the safety process to the GPU."
+        if restoring
+        else "moving the safety process off-GPU to free its VRAM context."
+    )
+    function = "restore_safety_on_gpu:2913" if restoring else "pause_safety_on_gpu:2878"
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.lifecycle.process_lifecycle:{function} - "
+        f"{owner}: {action}"
+    )
+
+
+def _retired_safety_result(ts: str, *, slot: int = 0, launch: int = 13) -> str:
+    """message_dispatcher._classify_retired_launch_message: a verdict dropped because its launch was retired."""
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.ipc.message_dispatcher:_classify_retired_launch_message:813 - "
+        f"Ignoring result message from retired safety process {slot} launch {launch} "
+        "(safety process replacement): HordeSafetyResultMessage"
+    )
+
+
+_GIT_ENV_TRACEBACK = (
+    "2026-06-25 18:29:26.000 | CRITICAL | inference_5:startup - worker child crashed before its log was ready:\n"
+    "Traceback (most recent call last):\n"
+    '  File "installer.py", line 46, in _run_git\n'
+    "    raise GitCommandError(message)\n"
+    "hordelib.installation.installer.GitCommandError: git clone https://example.invalid/ComfyQR ComfyQR "
+    "failed in /data/comfyui_env/ComfyUI/custom_nodes: Cloning into 'ComfyQR'...\n"
+    "error: Untracked working tree file '.github/workflows/publish.yml' would be overwritten by merge.\n"
+    "fatal: unable to checkout working tree\n"
+    "warning: Clone succeeded, but checkout failed.\n"
+)
+"""A startup crash whose cause is a contended shared environment directory, not a broken torch install."""
+
+
+class TestEmptyModelPopCascade:
+    """A pop carrying no model name, and what each worker generation does with it."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_the_uncontained_cascade_is_reported(self, tmp_path: Path) -> None:
+        """On an older capture the blank identity reaches preload, kills slots, and poisons the quarantine."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _empty_model_pop("07:51:00.000"),
+                _empty_model_pop("07:51:10.000"),
+                _blank_preload("07:51:20.000"),
+                _load_failure_recovery("07:51:25.000", slot=4),
+                _blank_preload("07:51:30.000", slot=5),
+                _load_failure_recovery("07:51:35.000", slot=5),
+                _blank_model_quarantine("07:51:40.000"),
+                _blank_quarantine_skip("07:52:00.000"),
+            ),
+        )
+        finding = findings["empty_model_pop_cascade"]
+        assert finding.severity is Severity.CRITICAL
+        assert "2 pop(s)" in finding.verdict
+        assert "2 child death(s)" in finding.verdict
+        assert "quarantin" in finding.verdict
+        assert "upgrade" in finding.remediation.lower()
+
+    def test_the_contained_form_is_reported_with_its_rate(self, tmp_path: Path) -> None:
+        """On a newer capture the same input is rejected at the boundary, and only the rate matters."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _malformed_pop_rejected("07:51:00.000"),
+                _malformed_pop_rejected("07:51:10.000"),
+                _blank_preload_refused("07:51:20.000"),
+            ),
+        )
+        finding = findings["empty_model_pop_cascade"]
+        assert finding.severity is Severity.WARNING
+        assert "contained" in finding.verdict
+        assert "2 malformed pop(s)" in finding.verdict
+        assert "upgrade" not in finding.remediation.lower()
+
+    def test_a_clean_session_does_not_fire(self, tmp_path: Path) -> None:
+        """No blank identity anywhere means no finding."""
+        assert "empty_model_pop_cascade" not in _diagnose(tmp_path, self._bridge())
+
+
+class TestPreloadKillsChildLoop:
+    """A named model that ends the slot it is preloaded onto, over and over."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_repeated_deaths_on_one_model_fire(self, tmp_path: Path) -> None:
+        """Three slot replacements attributed to loading the same model is a loop, whatever the model is."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _load_failure_recovery("07:51:00.000", slot=3, model="AlbedoBase XL (SDXL)"),
+                _load_failure_recovery("07:52:00.000", slot=4, model="AlbedoBase XL (SDXL)"),
+                _load_failure_recovery("07:53:00.000", slot=5, model="AlbedoBase XL (SDXL)"),
+            ),
+        )
+        finding = findings["preload_kills_child_loop"]
+        assert "AlbedoBase XL (SDXL)" in finding.verdict
+        assert "3" in finding.verdict
+
+    def test_deaths_spread_across_models_do_not_fire(self, tmp_path: Path) -> None:
+        """One death each for three models is pool churn, not a poisoned checkpoint."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _load_failure_recovery("07:51:00.000", slot=3, model="A"),
+                _load_failure_recovery("07:52:00.000", slot=4, model="B"),
+                _load_failure_recovery("07:53:00.000", slot=5, model="C"),
+            ),
+        )
+        assert "preload_kills_child_loop" not in findings
+
+    def test_the_blank_identity_is_left_to_its_own_detector(self, tmp_path: Path) -> None:
+        """A blank name is the malformed-pop cascade, which says more; it must not be reported twice."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _empty_model_pop("07:50:30.000"),
+                _load_failure_recovery("07:51:00.000", slot=3),
+                _load_failure_recovery("07:52:00.000", slot=4),
+                _load_failure_recovery("07:53:00.000", slot=5),
+            ),
+        )
+        assert "preload_kills_child_loop" not in findings
+        assert "empty_model_pop_cascade" in findings
+
+
+class TestPopApiErrorDominance:
+    """One pop rejection repeating for a long stretch: the horde's own words are the diagnosis."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    @staticmethod
+    def _storm(message: str | None = None, *, code: str = "TooManyWorkers", count: int = 12) -> list[str]:
+        """A run of identical pop rejections spread over several minutes."""
+        kwargs = {"code": code} if message is None else {"message": message, "code": code}
+        return [_pop_api_error(f"07:5{1 + i // 6}:{(i * 10) % 60:02d}.000", **kwargs) for i in range(count)]
+
+    def test_a_dominant_message_is_quoted_verbatim(self, tmp_path: Path) -> None:
+        """The finding names the message the horde sent, its count, and how long it persisted."""
+        findings = _diagnose(tmp_path, self._bridge(*self._storm()))
+        finding = findings["pop_api_error_dominance"]
+        assert _ACCOUNT_LIMIT_POP_ERROR in finding.verdict
+        assert "12" in finding.verdict
+
+    def test_an_operator_fixable_message_says_so(self, tmp_path: Path) -> None:
+        """An account-limit rejection will not clear on its own, so the remediation must not say to wait."""
+        findings = _diagnose(tmp_path, self._bridge(*self._storm()))
+        assert "will not clear on its own" in findings["pop_api_error_dominance"].remediation
+
+    def test_a_transient_message_is_keyed_differently(self, tmp_path: Path) -> None:
+        """A server-side error is expected to clear, so it gets the transient remediation."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(*self._storm("Internal Server Error", code="ServerError")),
+        )
+        remediation = findings["pop_api_error_dominance"].remediation
+        assert "will not clear on its own" not in remediation
+        assert "transient" in remediation
+
+    def test_a_handful_of_errors_does_not_fire(self, tmp_path: Path) -> None:
+        """Occasional pop errors are ordinary API noise."""
+        assert "pop_api_error_dominance" not in _diagnose(tmp_path, self._bridge(_pop_api_error("07:51:00.000")))
+
+
+class TestSafetyStallActuatorNarration:
+    """When the log says who cycled safety, the finding must say so instead of listing candidates."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_a_parent_ordered_cycle_is_asserted(self, tmp_path: Path) -> None:
+        """The pause/restore pair plus the dropped verdicts are the chain, so they are stated as the cause."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _safety_placement_cycle("07:51:00.000"),
+                _retired_safety_result("07:51:30.000"),
+                _safety_unrecoverable("07:52:00.000"),
+                _safety_placement_cycle("07:52:30.000", restoring=True),
+            ),
+        )
+        finding = findings["safety_stage_stall"]
+        assert "Reclaim ladder" in finding.verdict
+        assert "retired" in finding.verdict
+        assert "check the bridge_safety_*.log for crashes" not in finding.remediation
+        assert any("off-GPU" in line for line in finding.evidence)
+
+    def test_without_the_markers_the_candidate_list_remains(self, tmp_path: Path) -> None:
+        """With no actuator evidence the finding must not invent one; the candidate causes stay."""
+        findings = _diagnose(tmp_path, self._bridge(_safety_unrecoverable("07:52:00.000")))
+        finding = findings["safety_stage_stall"]
+        assert "Reclaim ladder" not in finding.verdict
+        assert "bridge_safety_*.log" in finding.remediation
+
+
+class TestCrashOnStartGuidance:
+    """The remediation must follow the failure text, not offer a fixed environment fix."""
+
+    @staticmethod
+    def _bridge() -> str:
+        return "\n".join(
+            [
+                f"2026-06-25 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                "2026-06-25 18:29:31.000 | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:_log_recovery_diagnostics:367 - "
+                "Recovery diagnostics for process 5 (os_pid=1005, launch=5): reason='inference process replaced "
+                "(crashed or hung)'; last_state=PROCESS_STARTING; exitcode=1; last_heartbeat_type=OTHER; "
+                "since_last_heartbeat=8.0s; since_last_message=8.0s; last_job=None; recent_actions=[]",
+                "2026-06-25 18:29:40.000 | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:_log_recovery_diagnostics:367 - "
+                "Recovery diagnostics for process 5 (os_pid=1005, launch=6): reason='inference process replaced "
+                "(crashed or hung)'; last_state=PROCESS_STARTING; exitcode=1; last_heartbeat_type=OTHER; "
+                "since_last_heartbeat=8.0s; since_last_message=8.0s; last_job=None; recent_actions=[]",
+            ],
+        )
+
+    def test_a_git_failure_points_at_the_shared_environment(self, tmp_path: Path) -> None:
+        """A clone/checkout failure is a contended shared ComfyUI environment, not a torch problem."""
+        findings = _diagnose(tmp_path, self._bridge(), {"bridge_inference_5_startup.log": _GIT_ENV_TRACEBACK})
+        remediation = findings["crash_on_start_loop"].remediation
+        assert "environment directory" in remediation
+        assert "torch" not in remediation.lower()
+
+    def test_an_import_failure_keeps_the_torch_guidance(self, tmp_path: Path) -> None:
+        """A CUDA import failure is exactly what the torch/CUDA reinstall advice is for."""
+        bridge = "\n".join(
+            [
+                f"2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _recovery("18:29:31.000", 1, reason="inference process replaced (crashed or hung)"),
+                _recovery("18:29:40.000", 1, reason="inference process replaced (crashed or hung)"),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge, {"bridge_inference_1_startup.log": _TRACEBACK})
+        assert "torch" in findings["crash_on_start_loop"].remediation.lower()
+
+
+class TestDedicatedPostProcessMarkers:
+    """The dedicated-lane activity markers, as the parent actually relays them."""
+
+    _JOB = "a8c1023b-2420-4bc2-bd36-2dd0adc45826"
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def _relayed_state_change(self, ts: str) -> str:
+        """message_dispatcher: the lane's stage transition, relayed with the dispatcher's own prefix."""
+        return (
+            f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.ipc.message_dispatcher:_dispatch_buffered_message:590 - "
+            f"Received HordeProcessStateChangeMessage from process 1: Post-processing job {self._JOB}"
+        )
+
+    @staticmethod
+    def _below_reserve(ts: str) -> str:
+        """hordelib.comfy_horde.log_free_ram: the throttled below-inference-reserve streaming warning."""
+        return (
+            f"2026-06-25 {ts} | WARNING  | hordelib.comfy_horde:log_free_ram:655 - "
+            "Free VRAM 11 MB is below the 1219 MB inference reserve: sampling activations will stream from "
+            "host RAM and run several times slower (ComfyUI reports no offload, so the GPU driver's "
+            "system-memory fallback is the likely cause)."
+        )
+
+    def test_a_relayed_stage_marker_counts_as_lane_activity(self, tmp_path: Path) -> None:
+        """The parent prefixes the relayed message, so anchoring at the start of it saw no lane at all."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                self._relayed_state_change("07:51:00.000"),
+                "2026-06-25 07:51:30.000 | INFO | x:y:1 - still working",
+            ),
+            {"bridge_1.log": self._below_reserve("07:51:05.000")},
+            # The child reading has to fall inside the session, which ends at the last parent record.
+        )
+        assert "post_processing_vram_stall" in findings
+
+    def test_prose_mentioning_post_processing_is_not_lane_activity(self, tmp_path: Path) -> None:
+        """RAM accounting and download lines name post-processing without any lane running."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                "2026-06-25 07:51:00.000 | INFO | x:y:1 -   Worker: 6.1 GB total (inference 4.0 GB | "
+                "post-processing 1.2 GB | safety 0.6 GB | orchestrator 300 MB)",
+                "2026-06-25 07:51:02.000 | INFO | x:y:1 -   Now: GFPGAN [post-processing (GFPGAN)] -> /models/gfpgan",
+                "2026-06-25 07:51:30.000 | INFO | x:y:1 - still working",
+            ),
+            {"bridge_1.log": self._below_reserve("07:51:05.000")},
+            # The child reading has to fall inside the session, which ends at the last parent record.
+        )
+        assert "post_processing_vram_stall" not in findings

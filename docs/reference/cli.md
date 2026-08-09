@@ -320,8 +320,31 @@ an operator sent you.
 select a session and `--json` for machine-readable output; `timeline` also takes `--process N`,
 `--grep RE`, and `--child` (include verbose child-loop records). Each detector recognizes one incident
 class (an inference pool crashing on start, a recovery storm that never gives up, GPU OOM, the swallowed
-"no images produced" OOM, an orphaned-job storm) and emits the child's exception as the root cause where
-it can. See [Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
+"no images produced" OOM, an orphaned-job storm, a local queue that filled and stopped moving, a
+model-reference read that faulted a running sample, a pop that named no model, a model that ends every
+slot it is loaded onto, and the horde repeatedly refusing this worker's pops) and emits the child's
+exception as the root cause where it can. Every session also carries a census of the jobs it faulted,
+with each one's model and cause. See
+[Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
+
+Findings quote the worker's own words wherever the log carries them, and only fall back to listing
+candidate causes when it does not: a pop rejection is reported with the horde's verbatim message and
+keyed to whether an operator can act on it, a safety stall names the subsystem whose pause/restore lines
+cycled the safety process, and a start-up crash reads the child's failure text before suggesting a fix
+(a git clone/checkout failure points at the shared ComfyUI environment directory, not at torch).
+
+### Rotated logs are stitched back into their run
+
+The parent log rotates at a size cap mid-run, so the active `bridge.log` usually holds only the tail of
+the run in it. Naming a directory reads every rotation it finds; naming a single log file walks back
+through the rotated predecessors in the same directory and folds in each one whose range hands directly
+over to the next, stopping at the first that does not (that is a different launch). Zipped rotations are
+read in place, without unpacking anything next to the logs.
+
+Either way the report says what it read: `sessions` prints a `Rotation:` line and the session-summary
+finding carries the same disclosure, naming the archives that were included and, when the walk stopped,
+the older ones that were left out. A session whose launch line is still missing is reported as starting
+*at or before* its first surviving line, with the span and duration marked as bounds.
 
 The dashboard exposes the same `diagnose` analysis without a shell: the **Diagnostics** tab
 runs the detectors over `logs/` and renders the ranked findings, with a selector to pick which worker

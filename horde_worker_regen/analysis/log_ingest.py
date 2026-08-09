@@ -206,6 +206,25 @@ def parse_lines(
     return records
 
 
+def read_time_range(path: Path) -> tuple[datetime | None, datetime | None]:
+    """Return the first and last parseable timestamps in a log source, or ``(None, None)`` for neither.
+
+    Scans the source without building :class:`LogRecord` objects, which is what makes it affordable to
+    ask the question of a whole rotation history: deciding whether an archive belongs to the run under
+    analysis needs only its span, and the answer is "no" for most of them.
+    """
+    first: datetime | None = None
+    last: datetime | None = None
+    for line in _read_physical_lines(path):
+        timestamp = parse_ts(line)
+        if timestamp is None:
+            continue
+        if first is None:
+            first = timestamp
+        last = timestamp
+    return first, last
+
+
 def read_records(*paths: Path) -> list[LogRecord]:
     """Read and parse one or more log sources, returned in stable timestamp order.
 

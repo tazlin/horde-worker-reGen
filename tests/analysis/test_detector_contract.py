@@ -31,17 +31,25 @@ from tests.analysis.test_detectors import (
     _DISPATCH_WHOLE_CARD_REASON,
     _STARTUP,
     _TRACEBACK,
+    _blank_model_quarantine,
+    _blank_preload,
     _consecutive_pause,
     _diagnose,
     _dispatch_stall,
+    _empty_model_pop,
+    _fault_report,
     _force_admit,
+    _full_queue_frozen,
     _give_up,
+    _load_failure_recovery,
     _maintenance_pop,
+    _pop_api_error,
     _pop_claim_engaged,
     _pop_claim_released,
     _recovery,
     _safety_lost_result,
     _safety_requeue,
+    _sample_stage_fault,
     _server_slow_abort,
     _soft_reset,
     _whole_card_reserve,
@@ -329,6 +337,46 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_orphan_wedge": Contract(
         bridge=_bridge(*(_orphan_punt(f"12:0{i}:00.000", job_id=f"job{i}") for i in range(6))),
+        severity=Severity.WARNING,
+    ),
+    "detect_empty_model_pop_cascade": Contract(
+        bridge=_bridge(
+            _empty_model_pop("18:30:00.000"),
+            _blank_preload("18:30:05.000"),
+            _blank_model_quarantine("18:30:20.000"),
+        ),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_preload_kills_child_loop": Contract(
+        bridge=_bridge(
+            _load_failure_recovery("18:30:00.000", slot=3, model="AlbedoBase XL (SDXL)"),
+            _load_failure_recovery("18:31:00.000", slot=4, model="AlbedoBase XL (SDXL)"),
+            _load_failure_recovery("18:32:00.000", slot=5, model="AlbedoBase XL (SDXL)"),
+        ),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_pop_api_error_dominance": Contract(
+        bridge=_bridge(*(_pop_api_error(f"18:3{i}:00.000") for i in range(6))),
+        severity=Severity.WARNING,
+    ),
+    "detect_faulted_job_census": Contract(
+        bridge=_bridge(_fault_report("18:31:00.000", job_id="34ce8495-7820-4af5-9723-b411698ff27f")),
+        severity=Severity.WARNING,
+    ),
+    "detect_pop_liveness_full_queue": Contract(
+        bridge=_bridge(_full_queue_frozen("18:31:00.000")),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_model_reference_sample_fault": Contract(
+        # The parent line only widens the session window to cover the child's fault (child records are
+        # windowed to the session they belong to).
+        bridge=_bridge("2026-06-25 18:35:00.000 | INFO | x:y:1 - working"),
+        child_logs={
+            "bridge_5.log": _sample_stage_fault(
+                "18:31:00.000",
+                job_id="3217e6c9-30f3-4520-a810-672132a362cc",
+            ),
+        },
         severity=Severity.WARNING,
     ),
     "detect_session_summary": Contract(
