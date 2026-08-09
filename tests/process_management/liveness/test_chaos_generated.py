@@ -40,8 +40,10 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import m
 from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     CORE_SEEDS,
     DISCLOSED_BOUNDS,
+    DISPATCH_RESIDENCY_SEEDS,
     SEED_ENV_VAR,
     SWEEP_SEEDS,
+    ChaosActivationShape,
     ChaosArrival,
     ChaosAuxKind,
     ChaosControlKind,
@@ -56,11 +58,15 @@ from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     ChaosQueueShape,
     ChaosSamplerProfile,
     ChaosScenario,
+    ChaosServiceTopology,
+    ChaosSiblingResidency,
     ChaosSourceMode,
+    foreign_sibling_model,
     generate_scenarios,
     parse_seed_spec,
 )
 from tests.process_management.liveness.test_bounded_dispatch_matrix import (
+    _MARGINAL_CONTEXT_MB,
     _MODEL_CLASSES,
     _CardClass,
     _DispatchWorld,
@@ -80,6 +86,7 @@ def _seeds(default: tuple[int, ...]) -> tuple[int, ...]:
 
 _CORE_SCENARIOS = generate_scenarios(_seeds(CORE_SEEDS))
 _SWEEP_SCENARIOS = generate_scenarios(_seeds(SWEEP_SEEDS))
+_DISPATCH_RESIDENCY_SCENARIOS = generate_scenarios(_seeds(DISPATCH_RESIDENCY_SEEDS))
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -249,16 +256,27 @@ class _ChaosRun:
             moderate_performance_mode=scenario.performance is ChaosPerformance.MODERATE,
             unload_models_from_vram_often=scenario.unload_models_from_vram_often,
             tick_seconds=_CHAOS_TICK_SECONDS,
+            service_contexts=scenario.service_topology is ChaosServiceTopology.SERVICE_CONTEXTS,
+            disaggregated=scenario.disaggregation_class,
         )
         self.jobs: list[ImageGenerateJobPopResponse] = []
         self.event_receipts: list[_EventReceipt] = []
         self._fired_events: set[ChaosEvent] = set()
         self.oldest_waiting_age_seconds = 0.0
         """The largest age any job reached while still waiting for inference, over the whole run."""
+        if scenario.probe_measured_marginal:
+            # Fed through the production seam, at the marginal the world itself charges, so the scheduler's
+            # forecast and the modelled card agree about what a sibling context costs. Left unset otherwise,
+            # which is the unmeasured host the rest of the space has always modelled.
+            self.world.scheduler.set_measured_marginal_overhead_mb(_MARGINAL_CONTEXT_MB)
+        self.incoherent_claims: list[str] = []
+        """Whole-card residencies granted to reduce a process count the card was already at or below."""
+        self._establishments_seen = 0
         self._seed_initial_residency()
 
     def _seed_initial_residency(self) -> None:
         """Materialise the scenario's explicit starting card state before any job arrives."""
+        self._seed_sibling_residency()
         residency = self.scenario.initial_residency
         if residency is ChaosInitialResidency.EMPTY:
             return
@@ -276,15 +294,64 @@ class _ChaosRun:
         )
         self.world.seed_resident(0, foreign, in_vram=True)
 
+    def _seed_sibling_residency(self) -> None:
+        """Give a second lane an idle resident model no queued job wants.
+
+        The card then starts with more than one live inference context carrying weights, which is the state a
+        process-count-reduction claim proposes to reduce. Seeded on the second lane so it sits beside, rather
+        than on top of, whatever the head's own starting state puts on the first.
+        """
+        sibling = foreign_sibling_model(self.scenario)
+        if sibling is None:
+            return
+        self.world.seed_resident(1, _model_class(sibling), in_vram=True)
+
     async def drive(self) -> None:
         """Pop the queue on its arrival schedule, fire its disturbances, and run out its ticks."""
         await self._release_due_jobs()
         self._fire_due_events()
         for _ in range(_run_ticks(self.scenario)):
+            live_inference_processes = self.world.scheduler._process_map.num_loaded_inference_processes()
             await self.world.step()
+            self._observe_whole_card_claims(live_inference_processes)
             await self._release_due_jobs()
             self._fire_due_events()
             self._observe_waiting_ages()
+
+    def _observe_whole_card_claims(self, live_inference_processes: int) -> None:
+        """Record any residency granted this tick that proposed a reduction the card had nothing to give.
+
+        A process-count-reduction claim says the live inference contexts are themselves the over-commit and
+        that stopping some of them is the remedy. A grant whose own target is at or above the count of
+        contexts that were running when it was made proposes no reduction at all: it spends the card's pop
+        monopoly, its retention hold, and its sibling eviction to reach the topology the card is already in,
+        and the teardown then deletes the charges the deficit was actually made of.
+
+        Read from the ledger's own establishment record and the grant forecast it kept, so nothing about this
+        observation depends on the scenario going on to wedge.
+
+        Two kinds of grant are outside it. An exclusive-residency grant is a statement about weights that
+        cannot share the card at all, decided before any context arithmetic. And a card running a single
+        inference context has no sibling to stop whatever the target says, so a grant there is spending the
+        residency's other actuations (sibling model eviction, the service pauses) rather than proposing a
+        reduction; the incoherence this looks for is a grant that claims live contexts are the over-commit
+        while leaving every one of them standing.
+        """
+        ledger = self.world.scheduler._whole_card_ledger
+        state = ledger.state_for(None)
+        if len(state.establishments) == self._establishments_seen:
+            return
+        self._establishments_seen = len(state.establishments)
+        forecast = state.forecast
+        if forecast is None or forecast.needs_exclusive_residency or live_inference_processes < 2:
+            return
+        target = ledger.effective_target(state)
+        if target is None or target < live_inference_processes:
+            return
+        self.incoherent_claims.append(
+            f"tick {self.world.tick}: {state.model} was granted the card to reduce it to {target} inference "
+            f"processes while {live_inference_processes} were running",
+        )
 
     async def _release_due_jobs(self) -> None:
         """Pop every job whose arrival tick has come, in queue order (arrival is monotonic in the index)."""
@@ -371,6 +438,11 @@ async def _assert_scenario_is_served(scenario: ChaosScenario) -> None:
         "one or more requested disturbances never found their required state and changed nothing",
     )
 
+    assert not run.incoherent_claims, run.message(
+        "a whole-card residency was granted to reduce a process count the card was already at or below:\n    "
+        + "\n    ".join(run.incoherent_claims),
+    )
+
     for index, job in enumerate(run.jobs):
         assert job.id_ is not None
         assert not run.world.job_tracker.was_faulted_by_scheduling_recovery(job.id_), run.message(
@@ -417,6 +489,52 @@ async def test_generated_scenario_is_served_end_to_end(scenario: ChaosScenario) 
 async def test_swept_scenario_is_served_end_to_end(scenario: ChaosScenario) -> None:
     """The same property over the wide committed seed range, run as a pre-release gate and nightly."""
     await _assert_scenario_is_served(scenario)
+
+
+@pytest.mark.chaos_sweep
+@pytest.mark.parametrize(
+    "scenario",
+    _DISPATCH_RESIDENCY_SCENARIOS,
+    ids=[scenario.label for scenario in _DISPATCH_RESIDENCY_SCENARIOS],
+)
+async def test_dispatch_residency_scenario_is_served_end_to_end(scenario: ChaosScenario) -> None:
+    """The same property over the window selected for the dispatch-time residency decision.
+
+    The wide sweep reaches this neighbourhood only as often as its independent axes happen to coincide. This
+    window is selected for it, so the decision a head already resident on an idle lane forces is judged on
+    every run of the band rather than on whichever seeds drew it.
+    """
+    await _assert_scenario_is_served(scenario)
+
+
+def test_the_dispatch_residency_window_reaches_the_decision_it_selects_for() -> None:
+    """The selected window really constructs the state the dispatch-time decision needs.
+
+    Selection is by predicate over generated scenarios, so a draw-order or eligibility change could quietly
+    leave the window running scenarios that never reach the decision at all. Holding its composition here is
+    what stops the band from passing as coverage it no longer provides.
+    """
+    if os.environ.get(SEED_ENV_VAR):
+        pytest.skip(f"{SEED_ENV_VAR} overrides the committed window, so its composition is the caller's to choose")
+
+    scenarios = _DISPATCH_RESIDENCY_SCENARIOS
+    assert all(scenario.head_resident_at_dispatch for scenario in scenarios)
+    assert all(scenario.whole_card_enabled and scenario.enable_vram_budget for scenario in scenarios)
+    assert {scenario.service_topology for scenario in scenarios} == set(ChaosServiceTopology)
+    assert {scenario.activation_shape for scenario in scenarios} == set(ChaosActivationShape)
+    assert {scenario.sibling_residency for scenario in scenarios} == set(ChaosSiblingResidency)
+    assert {scenario.disaggregation_class for scenario in scenarios} == {False, True}
+    squeezed = [
+        scenario
+        for scenario in scenarios
+        if scenario.service_topology is ChaosServiceTopology.SERVICE_CONTEXTS
+        and scenario.activation_shape is ChaosActivationShape.HIRES_BATCH
+    ]
+    assert squeezed, "the window contains no hires-class head on a card carrying the service tenants' charges"
+    assert any(not scenario.disaggregation_class for scenario in squeezed), (
+        "every squeezed scenario in the window is disaggregation-class, so none of them reaches the whole-card "
+        "decision the exemption is decided after"
+    )
 
 
 def test_the_core_slice_spans_the_generated_axes() -> None:
@@ -564,6 +682,39 @@ def test_the_committed_sweep_crosses_every_payload_pair_and_queue_context() -> N
             missing.append(f"{first}={first_value!r} + {second}={second_value!r}")
 
     assert not missing, "the generated job corpus lost payload/context pair coverage:\n  " + "\n  ".join(missing)
+
+
+def test_the_committed_sweep_reaches_the_dispatch_time_axes() -> None:
+    """Every dispatch-time axis value is executed by the wide sweep, beside the selected window.
+
+    These axes are held by value presence rather than by the unconditional pairwise coverage above, because
+    each is admitted only where the card prices the queue as servable under it: the service tenants' charges
+    leave nothing for a sampler on the smallest card, so pairs like an 8 GB card carrying them do not exist
+    to be covered. What the sweep must still show is that none of them has quietly stopped being generated.
+    """
+    if os.environ.get(SEED_ENV_VAR):
+        pytest.skip(f"{SEED_ENV_VAR} overrides the committed sweep, so its coverage is the caller's to choose")
+
+    assert {scenario.service_topology for scenario in _SWEEP_SCENARIOS} == set(ChaosServiceTopology)
+    assert {scenario.activation_shape for scenario in _SWEEP_SCENARIOS} == set(ChaosActivationShape)
+    assert {scenario.sibling_residency for scenario in _SWEEP_SCENARIOS} == set(ChaosSiblingResidency)
+    assert {scenario.disaggregation_class for scenario in _SWEEP_SCENARIOS} == {False, True}
+    assert any(
+        scenario.head_resident_at_dispatch and scenario.sibling_residency is ChaosSiblingResidency.FOREIGN_IDLE_IN_VRAM
+        for scenario in _SWEEP_SCENARIOS
+    ), "the sweep never puts a resident head beside a sibling holding weights of its own"
+    assert any(
+        scenario.disaggregation_class and scenario.head_resident_at_dispatch for scenario in _SWEEP_SCENARIOS
+    ), "the sweep never dispatches a disaggregation-class head that arrived at dispatch already resident"
+    hires_jobs = [
+        job
+        for scenario in _SWEEP_SCENARIOS
+        if scenario.activation_shape is ChaosActivationShape.HIRES_BATCH
+        for job in scenario.jobs
+    ]
+    assert any(job.pixels * job.n_iter > 1024 * 1024 for job in hires_jobs), (
+        "no generated hires-class scenario asks for more sampling activation than a single square megapixel"
+    )
 
 
 def test_generated_payload_descriptions_reach_the_sdk_jobs_unchanged() -> None:

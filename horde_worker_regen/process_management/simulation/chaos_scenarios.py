@@ -32,9 +32,14 @@ module generates, without requiring live model-reference state.
 
 from __future__ import annotations
 
+import base64
 import enum
+import functools
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry, TIPayloadEntry
 
 from horde_worker_regen.bridge_data.data_model import cap_queue_size
 from horde_worker_regen.process_management.process_manager import (
@@ -43,6 +48,10 @@ from horde_worker_regen.process_management.process_manager import (
     cap_card_processes_to_vram_fit,
     resolve_card_concurrency,
 )
+from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
+from horde_worker_regen.process_management.scheduling.inference_scheduler import _SAFETY_GPU_LOAD_CHARGE_MB
+from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
+from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 
 SEED_ENV_VAR = "HORDE_CHAOS_SEEDS"
 """Environment override for which seeds a sweep runs.
@@ -90,6 +99,11 @@ class ChaosModel:
             card cannot serve, so every generated head has a positive outcome to assert.
         weight_rank: The model's weight class as an order (light 0, mid 1, whole-card 2), which is what the
             heavy-head queue shape picks its head by.
+        baseline: The reference baseline the burden estimator prices this class from, so a generated job's
+            activation cost is the one the worker would compute for it rather than a figure kept here.
+        resident_weights_mb: What one resident copy costs the card, matching the weight seed the scheduling
+            runner's modelled card charges, so a scenario's own fit arithmetic and the runner's derived free
+            VRAM agree about what a co-resident sibling holds.
     """
 
     label: str
@@ -97,17 +111,45 @@ class ChaosModel:
     harness_name: str
     min_card_vram_mb: int
     weight_rank: int
+    baseline: KNOWN_IMAGE_GENERATION_BASELINE
+    resident_weights_mb: float
 
 
-MODEL_LIGHT_A = ChaosModel("light_a", "sd15-checkpoint", "Deliberate", 0, 0)
-MODEL_LIGHT_B = ChaosModel("light_b", "sd15-checkpoint-b", "Anything Diffusion", 0, 0)
-MODEL_MID = ChaosModel("mid", "sdxl-checkpoint", "Juggernaut XL", 0, 1)
+MODEL_LIGHT_A = ChaosModel(
+    "light_a",
+    "sd15-checkpoint",
+    "Deliberate",
+    0,
+    0,
+    KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+    3200.0,
+)
+MODEL_LIGHT_B = ChaosModel(
+    "light_b",
+    "sd15-checkpoint-b",
+    "Anything Diffusion",
+    0,
+    0,
+    KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+    3200.0,
+)
+MODEL_MID = ChaosModel(
+    "mid",
+    "sdxl-checkpoint",
+    "Juggernaut XL",
+    0,
+    1,
+    KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+    4900.0,
+)
 MODEL_HEAVY = ChaosModel(
     "heavy",
     "Flux.1-Schnell fp8 (Compact)",
     "Flux.1-Schnell fp8 (Compact)",
     16384,
     2,
+    KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+    11500.0,
 )
 """The whole-card class: heavy enough to take the exclusive-residency path on a card that can hold it."""
 
@@ -209,6 +251,39 @@ class ChaosSamplerProfile(enum.StrEnum):
     EULER_NORMAL = "euler_normal"
     DPM_KARRAS = "dpm_karras"
     LCM_SIMPLE = "lcm_simple"
+
+
+class ChaosActivationShape(enum.StrEnum):
+    """How large a sampling activation the scenario's geometries ask for.
+
+    Resolution and batch move the sampling working set by gigabytes while the resident weights stay put, so
+    this axis is what separates a model's persistent residency cost from its transient peak. It is the regime
+    where an activation spike can be read as a demand for permanent exclusive residency.
+    """
+
+    NOMINAL = "nominal"
+    """Geometries from the ordinary generated vocabulary."""
+    HIRES_BATCH = "hires_batch"
+    """High-resolution, batched geometries, taken as far as the card prices as servable."""
+
+
+class ChaosSiblingResidency(enum.StrEnum):
+    """What a sibling lane holds when the scenario starts, beside whatever the head's own state is."""
+
+    NONE = "none"
+    FOREIGN_IDLE_IN_VRAM = "foreign_idle_in_vram"
+    """A second lane holds a model no queued job wants, idle and resident, so the card starts with more than
+    one live inference context carrying weights: the state a process-count-reduction claim proposes to
+    reduce."""
+
+
+class ChaosServiceTopology(enum.StrEnum):
+    """Which non-inference tenants hold a context on the card."""
+
+    BARE = "bare"
+    SERVICE_CONTEXTS = "service_contexts"
+    """Safety sits on the card and the service lane holds a context. Neither is reclaimable by stopping
+    inference siblings, so the card's structural floor is squeezed by charges no teardown can give back."""
 
 
 @dataclass(frozen=True)
@@ -316,6 +391,15 @@ class ChaosScenario:
         demand_shape: How sampling demand changes across the queue.
         initial_residency: Card residency before the first arrival.
         events: The disturbance schedule, ordered by job ordinal.
+        sibling_residency: What a second lane holds beside the head's own starting state.
+        service_topology: Which non-inference tenants hold a context on the card.
+        activation_shape: How large a sampling activation the scenario's geometries ask for.
+        disaggregation_class: Whether the scenario's jobs run as UNet-only samplers, so the whole-card
+            decision meets a job whose own encode and decode lanes a claim would stop.
+        probe_measured_marginal: Whether the host's startup probe measured the per-additional-context VRAM
+            cost. Without that measurement a card-light head's teardown demand is declined as an
+            over-counted-context phantom, so the process-count-reduction decision is unreachable however the
+            card is arranged.
     """
 
     seed: int
@@ -332,6 +416,11 @@ class ChaosScenario:
     whole_card_enabled: bool = True
     performance: ChaosPerformance = ChaosPerformance.NORMAL
     unload_models_from_vram_often: bool = False
+    sibling_residency: ChaosSiblingResidency = ChaosSiblingResidency.NONE
+    service_topology: ChaosServiceTopology = ChaosServiceTopology.BARE
+    activation_shape: ChaosActivationShape = ChaosActivationShape.NOMINAL
+    disaggregation_class: bool = False
+    probe_measured_marginal: bool = False
 
     @property
     def job_count(self) -> int:
@@ -369,11 +458,21 @@ class ChaosScenario:
         return sum(1 for model in self.models if model is MODEL_HEAVY)
 
     @property
+    def head_resident_at_dispatch(self) -> bool:
+        """Whether the head's model starts resident in VRAM, so dispatch meets it already loaded.
+
+        The dispatch-time whole-card decision is only reachable for such a head: one whose weights a lane
+        already holds when it is chosen to sample, rather than one admitted through a preload.
+        """
+        return self.initial_residency is ChaosInitialResidency.HEAD_IN_VRAM
+
+    @property
     def label(self) -> str:
         """A stable, readable identity for the scenario (used as the parametrized test id)."""
         return (
             f"seed{self.seed}-{self.card.label}-{self.shape.value}-{self.demand_shape.value}-"
-            f"{self.topology.label}-n{self.job_count}"
+            f"{self.topology.label}-n{self.job_count}-{self.activation_shape.value}-"
+            f"{self.service_topology.value}"
         )
 
     def world_events(self) -> tuple[ChaosEvent, ...]:
@@ -396,9 +495,12 @@ class ChaosScenario:
             f"seed={self.seed} card={self.card.label} shape={self.shape.value} queue=[{queue}] "
             f"arrival={self.arrival.value}(burst={self.burst_size}) threads={self.max_threads} "
             f"lanes={self.lanes} queue_size={self.queue_size} demand={self.demand_shape.value} "
-            f"residency={self.initial_residency.value} vram_budget={self.enable_vram_budget} "
+            f"residency={self.initial_residency.value} sibling={self.sibling_residency.value} "
+            f"vram_budget={self.enable_vram_budget} "
             f"whole_card={self.whole_card_enabled} performance={self.performance.value} "
             f"unload_often={self.unload_models_from_vram_often} "
+            f"activation={self.activation_shape.value} services={self.service_topology.value} "
+            f"disaggregated={self.disaggregation_class} marginal_measured={self.probe_measured_marginal} "
             f"events=[{events}]"
         )
 
@@ -464,6 +566,139 @@ the demand stops being recoverable by that route.
 
 Entries are absent for every combination the card serves unconditionally.
 """
+
+
+_HIRES_JOB_SIZES: tuple[tuple[int, int, int], ...] = (
+    (1024, 1024, 8),
+    (1280, 1280, 8),
+    (1536, 1536, 8),
+)
+"""Hires-class geometries, largest last. Each is offered at a batch of at least two, so the activation term
+grows by both of the multipliers that move it while the requested weights stay identical. Which of them a
+scenario takes is decided by pricing, never by a table: see :func:`hires_upgrade`."""
+
+_HIRES_BATCH = 2
+"""The smallest batch that makes a hires geometry's activation delta a multiple rather than a single frame."""
+
+_RESERVE_ALLOWANCE_MB = 1024.0
+"""Kept clear of a scenario's own fit arithmetic, above the tenants it can enumerate.
+
+A card's inference reserve floor, the allocator's own slack, and the transient a load takes on its way to
+residency are all charged by the worker and are not derivable from a scenario description. Reserving a fixed
+allowance for them keeps the axes below from constructing a card state that prices as servable here and is
+refused by the running worker, which would turn an axis into a false red."""
+
+
+@functools.lru_cache(maxsize=512)
+def _priced_sampling_peak_mb(
+    baseline: KNOWN_IMAGE_GENERATION_BASELINE,
+    width: int,
+    height: int,
+    n_iter: int,
+    *,
+    hires_fix: bool,
+    has_source_image: bool,
+    has_control: bool,
+    has_lora: bool,
+    has_ti: bool,
+) -> float | None:
+    """Return the worker's own predicted sampling-phase peak (MB) for one generated job description.
+
+    Priced through :func:`predict_job_sampling_vram_mb`, the same seam preload admission and the residency
+    forecast read, so a generated geometry's activation cost is whatever the worker would charge it rather
+    than a number maintained here. Post-processing is deliberately absent from the priced job: that peak runs
+    after sampling on the already-loaded model and is excluded from this figure by construction.
+
+    Returns:
+        The predicted peak, or None when no estimate could be produced.
+    """
+    job = make_canned_job(
+        "sd15-checkpoint",
+        width=width,
+        height=height,
+        ddim_steps=8,
+        n_iter=n_iter,
+        hires_fix=hires_fix,
+        control_type="canny" if has_control else None,
+        source_image_base64=(base64.b64encode(make_dummy_png_bytes()).decode() if has_source_image else None),
+        loras=[LorasPayloadEntry(name="priced-lora")] if has_lora else None,
+        tis=[TIPayloadEntry(name="priced-ti", inject_ti="prompt")] if has_ti else None,
+    )
+    return predict_job_sampling_vram_mb(job, baseline)
+
+
+def priced_sampling_peak_mb(job: ChaosJob) -> float | None:
+    """Return the predicted sampling-phase peak (MB) for a generated job, or None when it cannot be priced."""
+    return _priced_sampling_peak_mb(
+        job.model.baseline,
+        job.width,
+        job.height,
+        job.n_iter,
+        hires_fix=job.hires_fix,
+        has_source_image=job.source_mode is not ChaosSourceMode.TXT2IMG,
+        has_control=job.control_kind is not ChaosControlKind.NONE,
+        has_lora=job.aux_kind in {ChaosAuxKind.LORA, ChaosAuxKind.BOTH},
+        has_ti=job.aux_kind in {ChaosAuxKind.TEXTUAL_INVERSION, ChaosAuxKind.BOTH},
+    )
+
+
+def sampling_headroom_mb(
+    card: ChaosCard,
+    *,
+    lanes: int,
+    service_contexts: bool,
+    foreign_resident_mb: float,
+) -> float:
+    """Return the VRAM one sampling peak has to fit into, given everything else the card is holding.
+
+    The card's total less the contexts its topology provisions, less the service tenants' charges when they
+    are present, less the weights a foreign resident sibling holds, less the reserve allowance.
+
+    Every provisioned lane is charged, even though the scheduling loop may reduce them under pressure.
+    Counting on that reduction is what would let a tightening axis construct a card whose head is servable
+    only if the pool collapses far enough, and a head that is not servable at the topology it was configured
+    with is outside this space by its first disclosed bound, not a wedge for it to find.
+    """
+    charge = card.per_process_overhead_mb + card.marginal_process_overhead_mb * max(0, lanes - 1)
+    if service_contexts:
+        charge += _SAFETY_GPU_LOAD_CHARGE_MB + card.marginal_process_overhead_mb
+    return card.total_vram_mb - charge - foreign_resident_mb - _RESERVE_ALLOWANCE_MB
+
+
+def _all_jobs_priced_to_fit(jobs: tuple[ChaosJob, ...], headroom_mb: float) -> bool:
+    """Whether every job's priced sampling peak is known and fits ``headroom_mb``.
+
+    An unpriceable job answers False: an axis that tightens the card is only taken where the tightening can
+    be shown to leave the queue servable, so the absence of a price is not treated as room.
+    """
+    for job in jobs:
+        peak_mb = priced_sampling_peak_mb(job)
+        if peak_mb is None or peak_mb > headroom_mb:
+            return False
+    return True
+
+
+def hires_upgrade(job: ChaosJob, headroom_mb: float) -> ChaosJob:
+    """Return ``job`` at the largest hires-class geometry that prices inside ``headroom_mb``.
+
+    The whole-card class keeps its geometry: its weights already fill the card by themselves, so growing its
+    activation says nothing new about the activation-versus-residency distinction this axis exists to vary,
+    and the class's payload vocabulary excludes the batching this upgrade applies.
+
+    Returns:
+        The upgraded job, or the job unchanged when no hires geometry is priced as servable.
+    """
+    if job.model is MODEL_HEAVY:
+        return job
+    batch = max(job.n_iter, _HIRES_BATCH)
+    for width, height, steps in reversed(_HIRES_JOB_SIZES):
+        if width * height * batch <= job.pixels * job.n_iter:
+            continue
+        candidate = replace(job, width=width, height=height, steps=steps, n_iter=batch)
+        peak_mb = priced_sampling_peak_mb(candidate)
+        if peak_mb is not None and peak_mb <= headroom_mb:
+            return candidate
+    return job
 
 
 def servable_pixels(card: ChaosCard, model: ChaosModel) -> int:
@@ -647,6 +882,23 @@ def _draw_events(rng: random.Random, *, job_count: int) -> tuple[ChaosEvent, ...
     return tuple(ChaosEvent(kind=kind, at_job_ordinal=ordinal) for ordinal, kind in zip(ordinals, kinds, strict=True))
 
 
+def _foreign_sibling_model(models: tuple[ChaosModel, ...]) -> ChaosModel | None:
+    """Return the model an idle sibling lane holds beside the queue, or None when none is left over.
+
+    Light by class, so the sibling's weights are a co-resident charge on every card rather than a second
+    demand for the card, and foreign to the queue, so nothing the scenario serves is riding on it: the
+    residency it represents is purely a live context the card is holding for other work.
+    """
+    return next((model for model in LIGHT_MODELS if model not in models), None)
+
+
+def foreign_sibling_model(scenario: ChaosScenario) -> ChaosModel | None:
+    """Return the model a runner seeds onto the scenario's idle sibling lane, or None when it seeds none."""
+    if scenario.sibling_residency is ChaosSiblingResidency.NONE:
+        return None
+    return _foreign_sibling_model(scenario.models)
+
+
 def _generate_scenario(
     seed: int,
     *,
@@ -716,6 +968,82 @@ def _generate_scenario(
                 card=card if full_worker else None,
             )
 
+    # The dispatch-time axes are drawn from their own seed-derived streams rather than from the sequence
+    # above, so adding them leaves every previously generated seed denoting the scenario it always did. Each
+    # is then admitted only where the card prices the queue as still servable under it, which is what keeps
+    # one uniform positive verdict over a space whose card state these axes deliberately tighten.
+    sibling_residency = ChaosSiblingResidency.NONE
+    service_topology = ChaosServiceTopology.BARE
+    activation_shape = ChaosActivationShape.NOMINAL
+    disaggregation_class = False
+    probe_measured_marginal = False
+    if not full_worker:
+        foreign = _foreign_sibling_model(models)
+        if (
+            topology.lanes >= 2
+            and foreign is not None
+            and random.Random(f"{seed}:sibling-residency").choice((False, True))
+        ):
+            sibling_residency = ChaosSiblingResidency.FOREIGN_IDLE_IN_VRAM
+        foreign_resident_mb = (
+            foreign.resident_weights_mb
+            if foreign is not None and sibling_residency is not ChaosSiblingResidency.NONE
+            else 0.0
+        )
+        if random.Random(f"{seed}:service-topology").choice((False, True)) and _all_jobs_priced_to_fit(
+            jobs,
+            sampling_headroom_mb(
+                card,
+                lanes=topology.lanes,
+                service_contexts=True,
+                foreign_resident_mb=foreign_resident_mb,
+            ),
+        ):
+            service_topology = ChaosServiceTopology.SERVICE_CONTEXTS
+        if random.Random(f"{seed}:activation-shape").choice((False, True)):
+            headroom_mb = sampling_headroom_mb(
+                card,
+                lanes=topology.lanes,
+                service_contexts=service_topology is ChaosServiceTopology.SERVICE_CONTEXTS,
+                foreign_resident_mb=foreign_resident_mb,
+            )
+            upgraded = tuple(hires_upgrade(job, headroom_mb) for job in jobs)
+            if upgraded != jobs:
+                jobs = upgraded
+                activation_shape = ChaosActivationShape.HIRES_BATCH
+        # Disaggregation is a class the whole-card class is never eligible for, and a scenario's jobs are
+        # eligible together or not at all: the runner pins class-eligibility, not a per-job property.
+        if MODEL_HEAVY not in models and random.Random(f"{seed}:disaggregation-class").choice((False, True)):
+            disaggregation_class = True
+        # A head already resident on an idle lane is the only state from which the dispatch-time whole-card
+        # decision is reachable, and a free draw reaches it in a quarter of scenarios. Half the empty-card
+        # draws are converted to it where the card carries more than one lane and has also been tightened,
+        # which is what makes the neighbourhood dense enough to generate over. Every other starting state is
+        # drawn exactly as often as before, as is every empty card on which the decision would have nothing
+        # to discriminate: a single-lane pool has no context for a reduction to take, and an untightened card
+        # is not the state a claim is contested on. The single-lane boundary and the untightened card are
+        # still reached wherever the residency draw lands on a resident head by itself.
+        tightened = (
+            sibling_residency is not ChaosSiblingResidency.NONE
+            or service_topology is not ChaosServiceTopology.BARE
+            or activation_shape is not ChaosActivationShape.NOMINAL
+        )
+        if (
+            initial_residency is ChaosInitialResidency.EMPTY
+            and tightened
+            and topology.lanes >= 2
+            and random.Random(f"{seed}:dispatch-residency").choice((False, True))
+        ):
+            initial_residency = ChaosInitialResidency.HEAD_IN_VRAM
+        # The probe measurement is a host property, not a scheduling choice, and it is a precondition of the
+        # decision this neighbourhood exists to reach rather than an axis to vary inside it: a card-light
+        # head's teardown demand is declined outright where the marginal was never measured. It is therefore
+        # fixed to measured exactly where the neighbourhood is constructed, and left as the unmeasured
+        # fallback everywhere else, so no scenario outside the neighbourhood changes meaning.
+        probe_measured_marginal = (
+            initial_residency is ChaosInitialResidency.HEAD_IN_VRAM and tightened and topology.lanes >= 2
+        )
+
     return ChaosScenario(
         seed=seed,
         card=card,
@@ -731,6 +1059,11 @@ def _generate_scenario(
         whole_card_enabled=random.Random(f"{seed}:runtime-whole-card").choice((False, True)),
         performance=random.Random(f"{seed}:runtime-performance").choice(list(ChaosPerformance)),
         unload_models_from_vram_often=random.Random(f"{seed}:runtime-unload").choice((False, True)),
+        sibling_residency=sibling_residency,
+        service_topology=service_topology,
+        activation_shape=activation_shape,
+        disaggregation_class=disaggregation_class,
+        probe_measured_marginal=probe_measured_marginal,
     )
 
 
@@ -810,6 +1143,63 @@ Chosen (not drawn) so the slice spans the axes rather than whatever a contiguous
 between them these seeds cover all cards, queue and demand shapes, topology boundaries, initial residency
 states, arrivals, event kinds, and event counts. ``test_the_core_slice_spans_the_generated_axes`` holds that
 coverage, so a draw-order change that collapses the slice fails loudly instead of quietly narrowing it.
+"""
+
+DISPATCH_RESIDENCY_SEEDS: tuple[int, ...] = (
+    2050,
+    2056,
+    2065,
+    2073,
+    2116,
+    2132,
+    2167,
+    2189,
+    2199,
+    2205,
+    2221,
+    2252,
+    2264,
+    2274,
+    2288,
+    2297,
+    2325,
+    2329,
+    2354,
+    2367,
+    2421,
+    2432,
+    2464,
+    2465,
+    2531,
+    2563,
+    2568,
+    2594,
+    2605,
+    2613,
+    2623,
+    2701,
+    2783,
+    2799,
+    2833,
+    2886,
+    2988,
+    3004,
+    3011,
+    3050,
+)
+"""A band selected for the dispatch-time whole-card decision rather than drawn as a contiguous range.
+
+The decision is only reachable for a head whose weights a lane already holds when it is chosen to sample, on
+a worker with VRAM budgeting and whole-card residency both on, and it discriminates only where something has
+tightened the card. Those conditions coincide in a few per cent of a free draw, so a contiguous sweep judges
+the neighbourhood a handful of times however wide it is.
+
+This band is the first forty seeds at or above 2000 whose generated scenario satisfies all of: the head
+starts resident in VRAM, whole-card residency is on, VRAM budgeting is on, and at least one of the service
+tenants, a hires-class geometry, or an idle sibling holding foreign weights is present. The band's
+composition (all three tightenings present, with and without disaggregation-class eligibility) is asserted by
+the suite, so a draw-order or eligibility change that empties it fails loudly rather than running forty
+scenarios that no longer reach the decision.
 """
 
 SWEEP_SEEDS: tuple[int, ...] = tuple(range(1000, 1250))
@@ -892,6 +1282,54 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "the full-worker tier limits requested sampling concurrency to one or two",
         "its lane count is still resolved by the real manager and checked against the scenario, but larger "
         "thread boundaries stay in the fake-clock tier to avoid spawning dozens of processes per row.",
+    ),
+    (
+        "the dispatch-time axes are generated at the scheduling-loop tier only",
+        "a head already resident on an idle lane, an idle sibling holding foreign weights, and the service "
+        "tenants' card charges are all states a runner seeds onto a modelled card before the queue arrives. "
+        "The full-worker tier's card state is whatever its real children reach, and its service placement is "
+        "a process-topology choice its committed rows hold fixed, so it generates these axes at their inert "
+        "values.",
+    ),
+    (
+        "disaggregation is expressible at the scheduling-loop tier only, and never beside the whole-card class",
+        "the scheduling runner pins the scheduler's own class-eligibility seam, which is what makes a job "
+        "priced, admitted, and dispatched UNet-only without standing up the orchestrator's encode and decode "
+        "lanes. The full-worker tier would have to run those lanes for real, so it generates the axis off "
+        "rather than faking eligibility over children that sample whole jobs. A queue carrying the whole-card "
+        "class is excluded because that class is not disaggregation-eligible in the first place.",
+    ),
+    (
+        "a tightening axis is admitted only where the queue still prices as servable under it",
+        "the service tenants' charges, a foreign sibling's weights, and a hires-class geometry each take room "
+        "off the card. Each is taken only when every queued job's predicted sampling peak (priced through the "
+        "worker's own estimator) still fits what is left, so the space keeps one uniform positive verdict "
+        "instead of generating heads it has quietly made unservable. The peak is priced from geometry, batch, "
+        "and the activation-bearing payload features; a fixed allowance stands in for the reserve floors and "
+        "load transients a scenario description cannot enumerate.",
+    ),
+    (
+        "the host's per-additional-context measurement is fixed, not varied",
+        "it is a precondition of the dispatch-time decision rather than a choice inside it: where the probe "
+        "measured nothing, a card-light head's teardown demand is declined outright as an over-counted-context "
+        "phantom and the process-count-reduction path is unreachable however the card is arranged. Scenarios "
+        "that construct the dispatch-time neighbourhood are generated on a host that measured it; every other "
+        "scenario keeps the unmeasured fallback the space has always modelled.",
+    ),
+    (
+        "the reduction branch is reached, but its refusal is not discriminated by outcome here",
+        "a refusal only changes what happens on a card squeezed enough that a moderate head's weights miss the "
+        "siblings-present floor while the budget still says more contexts fit. That combination needs a pool "
+        "provisioned past what the card can carry beside the service tenants, and such a head is not servable "
+        "at its configured topology at all, which is this space's first bound rather than a wedge inside it. "
+        "The generated scenarios reach the branch and the disaggregation-class exemption is what withholds "
+        "the claim there; the refusal itself is pinned by the ledger's own contract tests.",
+    ),
+    (
+        "hires-class geometry is generated for the light and mid classes only",
+        "the whole-card class's weights fill the card on their own, so growing its activation says nothing "
+        "further about the activation-versus-residency distinction the axis exists to vary, and that class's "
+        "payload vocabulary excludes the batching the upgrade applies.",
     ),
     (
         "hang, crash-on-start, and preload-stall faults are outside the generated space",
