@@ -15,11 +15,11 @@ from dataclasses import dataclass
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 from horde_worker_regen.tui.formatters import human_bytes
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class DownloadSelection:
     include_aux: bool
 
 
-class DownloadPickerModal(ModalScreen["DownloadSelection | None"]):
+class DownloadPickerModal(ResponsiveModalScreen["DownloadSelection | None"]):
     """Choose models to download (defaulted to the config's missing set); dismiss with the selection or None."""
 
     DEFAULT_CSS = """

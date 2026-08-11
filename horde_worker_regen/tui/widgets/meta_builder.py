@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
 
 from horde_worker_regen.tui.model_catalog import (
@@ -14,9 +13,10 @@ from horde_worker_regen.tui.model_catalog import (
     MetaKind,
     build_meta_instruction,
 )
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 
-class MetaBuilderModal(ModalScreen[str | None]):
+class MetaBuilderModal(ResponsiveModalScreen[str | None]):
     """Compose one meta instruction; dismisses with the instruction string or None if cancelled."""
 
     DEFAULT_CSS = """
@@ -25,6 +25,7 @@ class MetaBuilderModal(ModalScreen[str | None]):
     }
     MetaBuilderModal #meta-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         max-height: 90%;
         border: thick $accent;

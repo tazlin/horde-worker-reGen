@@ -288,6 +288,7 @@ These are options for the `horde-worker` program itself. The wrapper-script flag
 | `--config PATH` | Path to the `bridgeData.yaml` the config editor reads and writes (default `bridgeData.yaml`). |
 | `--no-auto-restart` | Do not relaunch the worker if it crashes. |
 | `--attach [HOST:PORT]` | Attach to a running worker host instead of owning the worker; the worker survives this session closing. With no value, attaches to `127.0.0.1:7717`. |
+| `--remote-exposed` | Treat this session as reachable from other machines, withholding the credential fields from the config editor. Set for you by the web launcher when it binds a non-loopback address; you would not normally pass it by hand. |
 | `--directml N` | Select a DirectML device index. DirectML is currently unavailable (see [Run on AMD ROCm](run-on-amd-rocm.md)), so this flag has no working backend at present. |
 
 When it owns the worker, the dashboard relaunches it automatically if it crashes (bounded by a restart
@@ -300,14 +301,87 @@ during a graceful exit escalates to an immediate process-tree kill.
 ## Serve the dashboard over the web yourself
 
 Because it is a Textual app, the same UI can be served over the web. The launcher does this for you in
-the default (browser) mode. To bind the dashboard to your LAN, pass `--host`:
+the default (browser) mode, binding `127.0.0.1:8000` so only this machine can reach it. To reach the
+dashboard from another machine, bind an address other than loopback:
 
 ```bash
-./horde-worker.sh --host 0.0.0.0
+./horde-worker.sh --host 0.0.0.0 --port 8000
 ```
 
-The served dashboard is unauthenticated, so only do this on a trusted network. Run the serve command
-on the worker host; it serves that host's worker.
+The address and port come from the first of these that is set, so pick whichever suits you:
+
+| Source | Example |
+|--------|---------|
+| The launcher flags | `--host 0.0.0.0 --port 8080` |
+| Environment variables | `HORDE_WORKER_WEB_HOST=0.0.0.0`, `HORDE_WORKER_WEB_PORT=8080` |
+| `bridgeData.yaml` | `dashboard_web_host: 0.0.0.0`, `dashboard_web_port: 8080` |
+
+The `bridgeData.yaml` keys are also on the Config tab's **Dashboard** page (at the Advanced experience
+level or above), so the binding survives between launches without a flag. They are read by the
+dashboard launcher, not by the worker, and take effect the next time you start the dashboard.
+
+Run this on the machine the worker runs on: it serves that machine's worker.
+
+### What a network-bound dashboard exposes
+
+**There is no authentication and no encryption.** Anyone who can reach the port can start and stop your
+worker, change every setting, and read your worker's logs. Only bind the network on a network you
+trust, and never expose the port to the internet.
+
+When the bind is not loopback, the dashboard withholds the **API key** and **Civitai token** fields
+from the config editor, so a visitor can neither read nor replace your credentials. That is the only
+protection it adds. It does not cover:
+
+- The keys themselves, which stay in `bridgeData.yaml` on the worker machine.
+- Anything already written to the logs, which the Logs tab shows in full.
+- The **Getting started** page's key fields on a worker that is not yet configured. They are masked as
+  you type but are not withheld, because withholding them would block first-run setup.
+
+The launcher prints this same summary when it binds a non-loopback address, so the exposure is never
+silent.
+
+## Use the dashboard from a phone
+
+The web dashboard works on a phone or tablet browser: bind the network as above, then open
+`http://<worker-machine>:<dashboard-port>` on the device (8000 unless you configured another port).
+Three things adapt automatically.
+
+The page sizes the terminal's text so the dashboard gets enough columns to lay itself out, rather than
+rendering a desktop-width page scaled down to nothing. It will not automatically shrink below 10px.
+Append `?fontsize=N` to the URL to override it (`?fontsize=14` for larger text and fewer columns,
+`?fontsize=8` only if you deliberately prefer more columns to readability).
+
+The dashboard is drawn into a terminal canvas, so the browser cannot tell a painted tab from
+a painted text field. On touch devices the terminal's hidden keyboard input is therefore disabled
+by default: tapping tabs and buttons does not summon the software keyboard. Tap the 48-pixel keyboard
+button near the lower-right edge when you intend to type into the currently selected dashboard field;
+tap it again to return to navigation-only taps.
+
+The dashboard itself has a layout for screens narrower than the 80-column terminal floor. Cards lose
+their side padding and borders, buttons and form rows stack instead of sitting side by side, primary
+action buttons and tabs gain taller touch targets, tab labels shorten, fixed-width dialogs clamp to the
+viewport, and tables shed columns down to the ones that identify each row.
+The terminal follows the browser's *visual* viewport rather than legacy `100vh`, so the bottom remains
+reachable as the address bar expands or collapses and while the software keyboard is open. Swipe
+vertically anywhere in the terminal to scroll; you do not need to catch Textual's narrow scrollbar.
+When the keyboard reduces the viewport, the dashboard scrolls the focused field back above its top edge
+so the value being edited remains visible. The keyboard button stays low on the right but leaves a clear
+footer-sized lane beneath it rather than covering **Palette**.
+
+Swipe sideways directly over the main or Config tab strip to scroll that strip left or right. The gesture
+locks to its dominant axis after a short movement, so a mostly vertical drag continues to scroll the page
+and a mostly horizontal drag uses Textual's native horizontal tab scrolling.
+
+On phones, the Config page uses one page-level scroller. Its action bar, status summaries, and sub-tab
+strip therefore move out of the way as you scroll through fields instead of remaining pinned and
+consuming most of the reduced viewport. Desktop Config keeps its existing fixed controls and independently
+scrolling field panel.
+
+Two rough edges worth knowing:
+
+- Benchmark **History** scrolls sideways rather than shedding columns.
+- Typing requires enabling the keyboard button first, and modifier shortcuts (including `Ctrl+P` for
+  the command palette) remain awkward with a phone's software keyboard.
 
 ## How it works
 
@@ -316,7 +390,8 @@ duplex pipe, with no on-disk state file. The worker pushes compact state snapsho
 commands (pause/resume, maintenance, restart). State publishing never blocks the worker's control
 loop, so a slow or closed UI can never stall job processing. In browser mode a separate host process
 owns the worker and the served dashboard attaches to it over a socket, which is why closing the tab
-leaves the worker running.
+leaves the worker running. Uptime, cumulative totals, and the worker-owned trend-history backfill therefore
+continue across browser sessions; only a real worker restart begins a new session.
 
 See also: [Frontend and durable state](../explanation/frontend_and_state.md) for the supervisor
 channel, served/attached modes, and persisted state; [Architecture](../explanation/architecture.md);

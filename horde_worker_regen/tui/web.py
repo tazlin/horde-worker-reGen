@@ -8,9 +8,13 @@ This is the default launch path for non-technical users. It does two things:
    host rather than own a worker. Closing a browser tab therefore leaves the worker running; closing this
    launcher stops the worker cleanly.
 
-Network exposure is conservative: the web server binds ``127.0.0.1`` by default. Binding the LAN is a
-deliberate power-user action via ``--host`` / ``HORDE_WORKER_WEB_HOST`` and exposes an unauthenticated
-dashboard, so it must be opted into. (The worker host always binds loopback.)
+Network exposure is conservative: the web server binds ``127.0.0.1`` by default. Binding the network is
+a deliberate power-user action, taken via ``--host``, ``HORDE_WORKER_WEB_HOST``, or ``dashboard_web_host``
+in the bridge data (in that order of precedence), and it exposes an unauthenticated dashboard. Doing so
+tells each dashboard session to withhold the credential fields from its config editor and prints what
+that does not cover. (The worker host always binds loopback.)
+
+The served page is also fitted for a phone browser: see :func:`_inject_mobile_fit`.
 """
 
 from __future__ import annotations
@@ -25,15 +29,28 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from string import Template
+from typing import TYPE_CHECKING
 
+from ruamel.yaml.error import YAMLError
+
+from horde_worker_regen.tui import config_form
 from horde_worker_regen.tui import socket_protocol as sp
+
+if TYPE_CHECKING:
+    from textual_serve.server import Server
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 HOST_ENV_VAR = "HORDE_WORKER_WEB_HOST"
 PORT_ENV_VAR = "HORDE_WORKER_WEB_PORT"
 HOST_PORT_ENV_VAR = "HORDE_WORKER_HOST_PORT"
+
+CONFIG_HOST_KEY = "dashboard_web_host"
+CONFIG_PORT_KEY = "dashboard_web_port"
+"""bridgeData.yaml keys holding the bind address, the lowest-priority source after the flag and env var."""
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _HOST_SHUTDOWN_TIMEOUT_SECONDS = 120.0
@@ -67,14 +84,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--host",
         type=str,
         default=None,
-        help=f"Address to bind the web server (default {DEFAULT_HOST}; ${HOST_ENV_VAR} overrides). "
+        help=f"Address to bind the web server (default {DEFAULT_HOST}; ${HOST_ENV_VAR} then "
+        f"{CONFIG_HOST_KEY} in bridgeData.yaml are the fallbacks). "
         "Use 0.0.0.0 to expose on the LAN (unauthenticated; opt-in).",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help=f"Web server port (default {DEFAULT_PORT}; ${PORT_ENV_VAR} overrides).",
+        help=f"Web server port (default {DEFAULT_PORT}; ${PORT_ENV_VAR} then {CONFIG_PORT_KEY} in "
+        "bridgeData.yaml are the fallbacks).",
     )
     parser.add_argument(
         "--host-port",
@@ -112,17 +131,47 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _resolve_host(arg_host: str | None) -> str:
-    """Resolve the web bind host from the flag, then the environment, then the safe default."""
-    return arg_host or os.getenv(HOST_ENV_VAR) or DEFAULT_HOST
+def _resolve_host(arg_host: str | None, config: Mapping[str, object]) -> str:
+    """Resolve the web bind host from the flag, then the environment, then the config, then the default."""
+    configured_host = config.get(CONFIG_HOST_KEY)
+    return arg_host or os.getenv(HOST_ENV_VAR) or (str(configured_host) if configured_host else DEFAULT_HOST)
 
 
-def _resolve_port(arg_port: int | None) -> int:
-    """Resolve the web port from the flag, then the environment, then the default."""
+def _resolve_port(arg_port: int | None, config: Mapping[str, object]) -> int:
+    """Resolve the web port from the flag, then the environment, then the config, then the default."""
     if arg_port is not None:
         return arg_port
     env_port = os.getenv(PORT_ENV_VAR)
-    return int(env_port) if env_port else DEFAULT_PORT
+    if env_port:
+        return int(env_port)
+    configured_port = config.get(CONFIG_PORT_KEY)
+    if configured_port is None:
+        return DEFAULT_PORT
+    try:
+        return int(str(configured_port))
+    except ValueError:
+        # The launcher reads the YAML directly rather than through reGenBridgeData, so a bad value here
+        # has had no schema to bounce off. Saying so and carrying on beats refusing to open a dashboard.
+        print(
+            f"Ignoring {CONFIG_PORT_KEY}={configured_port!r} in the config: not a port number. Using {DEFAULT_PORT}.",
+            file=sys.stderr,
+        )
+        return DEFAULT_PORT
+
+
+def _load_dashboard_config(config_path: str | None) -> Mapping[str, object]:
+    """Read the bridge data YAML for the dashboard's own settings, returning empty on any read failure.
+
+    Uses the config editor's light ruamel loader rather than ``reGenBridgeData`` so the launcher stays
+    free of the SDK import chain. Only the dashboard keys are consulted; the worker validates the rest.
+    """
+    path = Path(config_path) if config_path else config_form.DEFAULT_CONFIG_PATH
+    try:
+        loaded = config_form.load_config(path)
+    except (OSError, YAMLError) as read_error:
+        print(f"Could not read {path} for dashboard settings ({read_error}); using defaults.", file=sys.stderr)
+        return {}
+    return loaded if isinstance(loaded, Mapping) else {}
 
 
 def _resolve_host_port(arg_host_port: int | None) -> int:
@@ -133,7 +182,12 @@ def _resolve_host_port(arg_host_port: int | None) -> int:
     return int(env_port) if env_port else sp.DEFAULT_HOST_PORT
 
 
-def _build_served_command(args: argparse.Namespace, host_port: int) -> str:
+def _is_loopback(host: str) -> bool:
+    """Whether binding *host* keeps the dashboard reachable only from this machine."""
+    return host in _LOOPBACK_HOSTS
+
+
+def _build_served_command(args: argparse.Namespace, host_port: int, *, remote_exposed: bool) -> str:
     """Compose the per-session dashboard command, which attaches to the worker host.
 
     The TUI is invoked via ``python -m`` rather than the ``horde-worker`` console script because
@@ -141,6 +195,15 @@ def _build_served_command(args: argparse.Namespace, host_port: int) -> str:
     bare names against the current directory before PATH. The web server runs from the repo root, whose
     ``horde-worker.cmd`` launcher would otherwise shadow the console script and re-invoke the *web*
     server. Module invocation cannot be shadowed and mirrors how the worker host is spawned.
+
+    Args:
+        args: The parsed launcher arguments, for the worker options the dashboard needs.
+        host_port: Port of the worker host this dashboard session attaches to.
+        remote_exposed: Whether the web server binds an address other than loopback, which the
+            dashboard needs to know so it can withhold the credential fields from the config editor.
+
+    Returns:
+        The shell command textual-serve runs for each browser session.
     """
     parts = [
         f'"{sys.executable}"',
@@ -151,7 +214,392 @@ def _build_served_command(args: argparse.Namespace, host_port: int) -> str:
     ]
     if args.config:
         parts.append(f'--config "{args.config}"')
+    if remote_exposed:
+        parts.append("--remote-exposed")
     return " ".join(parts)
+
+
+MOBILE_TARGET_COLUMNS = 72
+"""Columns the served terminal aims for on a narrow viewport.
+
+Set by what the dashboard's phone width band needs: the whole tab strip fits at its compact labels, and
+the tables keep their essential columns rather than shedding to the identity ones. Any wider and the
+text starts getting too small to read on a phone-sized screen. The minimum font-size floor takes
+precedence on very narrow phones; their compact strip is sized to fit the resulting smaller column count.
+"""
+
+_MONOSPACE_CELL_WIDTH_RATIO = 0.6
+"""Cell width as a fraction of font size for the served page's monospace font, used to size the font."""
+
+_MOBILE_MIN_FONT_SIZE_PX = 10
+_MOBILE_MAX_FONT_SIZE_PX = 16
+"""Bounds on the fitted font size. The maximum is textual-serve's own default, which makes the fitting
+script a no-op on a desktop viewport: only a viewport too narrow to reach the target column count at
+that size gets anything smaller. Ten pixels is a legibility/tap-target floor; very narrow phones get
+fewer columns and rely on the phone layout's shedding rather than shrinking the controls to 8px."""
+
+_NARROW_VIEWPORT_PX = 700
+"""Viewport width below which the served page's fixed-width session dialog is allowed to reflow."""
+
+_HEAD_CLOSE_TAG = "</head>"
+_BODY_CLOSE_TAG = "</body>"
+
+_MOBILE_HEAD_TEMPLATE = Template(
+    """<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  @media (max-width: ${narrow_viewport_px}px) {
+    html, body { width: 100%; height: 100%; overflow: hidden; }
+    .intro { width: 100%; height: auto; padding: 1rem; box-sizing: border-box; }
+    .textual-terminal {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100dvh;
+      box-sizing: border-box;
+      touch-action: none;
+      overscroll-behavior: none;
+    }
+    .xterm .xterm-viewport { scrollbar-width: none; }
+    .xterm .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; }
+    #mobile-keyboard-toggle {
+      position: absolute;
+      z-index: 10000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 48px;
+      height: 48px;
+      margin: 0;
+      padding: 0;
+      border: 2px solid #c792ea;
+      border-radius: 12px;
+      background: #1e1e2e;
+      color: white;
+      font: 24px sans-serif;
+      opacity: 0.9;
+    }
+    #mobile-keyboard-toggle.-enabled { background: #6c3baa; }
+    @media (pointer: coarse) {
+      #mobile-keyboard-toggle { display: flex; }
+    }
+  }
+</style>
+""",
+)
+"""Injected into the served page's head.
+
+Without the viewport tag a phone lays the page out at a notional desktop width and scales the result
+down, which renders the terminal too small to read. The dialog rule follows from the tag: the page's
+session dialog is a fixed 640px, which overflows a phone once the layout viewport is the real one.
+"""
+
+_MOBILE_FIT_SCRIPT_TEMPLATE = Template(
+    """<script>
+  (function () {
+    var terminal = document.querySelector(".textual-terminal");
+    if (!terminal) {
+      return;
+    }
+    if (!new URLSearchParams(window.location.search).has("fontsize")) {
+      var fitted = Math.round(window.innerWidth / (${target_columns} * ${cell_width_ratio}));
+      var fontSize = Math.max(${min_font_size}, Math.min(${max_font_size}, fitted));
+      terminal.dataset.fontSize = String(fontSize);
+    }
+
+    // 100vh includes browser chrome on several mobile browsers. Size the terminal to the visual
+    // viewport instead, refitting xterm whenever the address bar or software keyboard changes it.
+    var visualViewport = window.visualViewport;
+    var viewportFrame = null;
+    function fitVisibleViewport() {
+      if (viewportFrame !== null) {
+        cancelAnimationFrame(viewportFrame);
+      }
+      viewportFrame = requestAnimationFrame(function () {
+        viewportFrame = null;
+        var width = Math.floor(visualViewport ? visualViewport.width : window.innerWidth);
+        var height = Math.floor(visualViewport ? visualViewport.height : window.innerHeight);
+        terminal.style.left = Math.floor(visualViewport ? visualViewport.offsetLeft : 0) + "px";
+        terminal.style.top = Math.floor(visualViewport ? visualViewport.offsetTop : 0) + "px";
+        terminal.style.width = width + "px";
+        terminal.style.height = height + "px";
+        if (typeof window.onresize === "function") {
+          window.onresize();
+        }
+      });
+    }
+    fitVisibleViewport();
+    window.addEventListener("load", fitVisibleViewport);
+    window.addEventListener("orientationchange", fitVisibleViewport);
+    if (visualViewport) {
+      visualViewport.addEventListener("resize", fitVisibleViewport);
+      visualViewport.addEventListener("scroll", fitVisibleViewport);
+    }
+
+    // Every Textual widget is painted into xterm's canvas. xterm focuses one hidden textarea for all
+    // terminal keyboard input, so a phone cannot distinguish a painted tab from a painted form field
+    // and normally opens its keyboard for both. Keep that transport textarea non-editable until the
+    // operator explicitly asks for typing with this real, browser-level button.
+    var coarsePointer = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+    var keyboardEnabled = false;
+    var keyboardButton = null;
+    function positionKeyboardButton() {
+      if (!keyboardButton) {
+        return;
+      }
+      var viewportWidth = visualViewport ? visualViewport.width : window.innerWidth;
+      var viewportHeight = visualViewport ? visualViewport.height : window.innerHeight;
+      var viewportLeft = visualViewport ? visualViewport.offsetLeft : 0;
+      var viewportTop = visualViewport ? visualViewport.offsetTop : 0;
+      keyboardButton.style.left = Math.max(8, viewportLeft + viewportWidth - 56) + "px";
+      // Stay low and on the right, but leave a footer-sized lane beneath the button for Textual's
+      // bottom-right Palette affordance. It follows the reduced visual viewport while typing.
+      keyboardButton.style.top = Math.max(8, viewportTop + viewportHeight - 88) + "px";
+    }
+    function configureKeyboardTransport() {
+      if (!coarsePointer) {
+        return;
+      }
+      var textarea = terminal.querySelector(".xterm-helper-textarea");
+      if (!textarea) {
+        return;
+      }
+      textarea.readOnly = !keyboardEnabled;
+      textarea.inputMode = keyboardEnabled ? "text" : "none";
+      textarea.setAttribute("aria-hidden", keyboardEnabled ? "false" : "true");
+      if (keyboardEnabled) {
+        textarea.focus({ preventScroll: true });
+      } else {
+        textarea.blur();
+      }
+    }
+    if (coarsePointer) {
+      keyboardButton = document.createElement("button");
+      keyboardButton.id = "mobile-keyboard-toggle";
+      keyboardButton.type = "button";
+      keyboardButton.textContent = "\u2328";
+      keyboardButton.setAttribute("aria-label", "Enable dashboard keyboard");
+      keyboardButton.setAttribute("aria-pressed", "false");
+      keyboardButton.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        keyboardEnabled = !keyboardEnabled;
+        keyboardButton.classList.toggle("-enabled", keyboardEnabled);
+        keyboardButton.setAttribute("aria-pressed", String(keyboardEnabled));
+        keyboardButton.setAttribute(
+          "aria-label",
+          keyboardEnabled ? "Disable dashboard keyboard" : "Enable dashboard keyboard"
+        );
+        configureKeyboardTransport();
+      });
+      document.body.appendChild(keyboardButton);
+      positionKeyboardButton();
+      window.addEventListener("load", configureKeyboardTransport);
+      var terminalObserver = new MutationObserver(configureKeyboardTransport);
+      terminalObserver.observe(terminal, { childList: true, subtree: true });
+      if (visualViewport) {
+        visualViewport.addEventListener("resize", positionKeyboardButton);
+        visualViewport.addEventListener("scroll", positionKeyboardButton);
+      }
+      window.addEventListener("orientationchange", positionKeyboardButton);
+    }
+
+    // xterm.js disables its own touch scrolling while an application (Textual) has mouse reporting
+    // enabled. Convert a one-finger drag anywhere on the terminal into the same wheel events Textual
+    // already understands, so a phone user never has to catch the one-cell in-app scrollbar.
+    var lastTouchX = null;
+    var lastTouchY = null;
+    var touchStartX = null;
+    var touchStartY = null;
+    var touchAxis = null;
+    terminal.addEventListener("touchstart", function (event) {
+      if (event.touches.length !== 1) {
+        lastTouchX = lastTouchY = touchStartX = touchStartY = touchAxis = null;
+        return;
+      }
+      var touch = event.touches[0];
+      lastTouchX = touchStartX = touch.clientX;
+      lastTouchY = touchStartY = touch.clientY;
+      touchAxis = null;
+    }, { passive: true });
+    terminal.addEventListener("touchmove", function (event) {
+      if (lastTouchX === null || lastTouchY === null || event.touches.length !== 1) {
+        lastTouchX = lastTouchY = touchStartX = touchStartY = touchAxis = null;
+        return;
+      }
+      var touch = event.touches[0];
+      var deltaX = lastTouchX - touch.clientX;
+      var deltaY = lastTouchY - touch.clientY;
+      if (touchAxis === null && touchStartX !== null && touchStartY !== null) {
+        var totalX = Math.abs(touch.clientX - touchStartX);
+        var totalY = Math.abs(touch.clientY - touchStartY);
+        if (Math.max(totalX, totalY) < 8) {
+          return;
+        }
+        touchAxis = totalX > totalY * 1.2 ? "horizontal" : "vertical";
+      }
+      lastTouchX = touch.clientX;
+      lastTouchY = touch.clientY;
+      var wheelDelta = touchAxis === "horizontal" ? deltaX : deltaY;
+      if (Math.abs(wheelDelta) < 1) {
+        return;
+      }
+      var target = document.elementFromPoint(touch.clientX, touch.clientY) || terminal;
+      target.dispatchEvent(new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        clientX: touch.clientX,
+        clientY: touch.clientY,
+        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+        // xterm's mouse protocol has no horizontal wheel packet. Textual maps Ctrl+vertical-wheel to
+        // horizontal scrolling, and—unlike Shift—xterm does not discard Ctrl-wheel before constructing
+        // its mouse packet. A sideways drag can therefore reach either Tabs strip without hard-coded
+        // pixel bands or synthetic key presses.
+        deltaY: wheelDelta,
+        ctrlKey: touchAxis === "horizontal"
+      }));
+      event.preventDefault();
+    }, { passive: false });
+    function clearTouchGesture() {
+      lastTouchX = lastTouchY = touchStartX = touchStartY = touchAxis = null;
+    }
+    terminal.addEventListener("touchend", clearTouchGesture, { passive: true });
+    terminal.addEventListener("touchcancel", clearTouchGesture, { passive: true });
+  })();
+</script>
+""",
+)
+"""Injected at the end of the served page's body.
+
+The viewport tag alone would leave a phone with roughly 40 columns at the default font size, so the two
+injections only work as a pair. This sizes the font to reach ``MOBILE_TARGET_COLUMNS`` instead, writing
+the attribute the page's own script reads when it constructs the terminal under ``window.onload``. An
+explicit ``?fontsize=`` in the URL always wins.
+"""
+
+
+def _inject_mobile_fit(html: str) -> str:
+    """Return *html* with the mobile viewport handling added, or unchanged if its markers are absent.
+
+    Args:
+        html: The served page's markup.
+
+    Returns:
+        The markup with the head and body injections applied. Markup missing either closing tag is
+        returned as-is, so a change to textual-serve's template degrades to the desktop behaviour
+        rather than breaking the dashboard.
+    """
+    if _HEAD_CLOSE_TAG not in html or _BODY_CLOSE_TAG not in html:
+        return html
+    head_addition = _MOBILE_HEAD_TEMPLATE.substitute(narrow_viewport_px=_NARROW_VIEWPORT_PX)
+    body_addition = _MOBILE_FIT_SCRIPT_TEMPLATE.substitute(
+        target_columns=MOBILE_TARGET_COLUMNS,
+        cell_width_ratio=_MONOSPACE_CELL_WIDTH_RATIO,
+        min_font_size=_MOBILE_MIN_FONT_SIZE_PX,
+        max_font_size=_MOBILE_MAX_FONT_SIZE_PX,
+    )
+    html = html.replace(_HEAD_CLOSE_TAG, f"{head_addition}{_HEAD_CLOSE_TAG}", 1)
+    return html.replace(_BODY_CLOSE_TAG, f"{body_addition}{_BODY_CLOSE_TAG}", 1)
+
+
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]"})  # noqa: S104 - matched, not bound
+"""Bind addresses that mean "every interface" and so are not an address any client can connect back to."""
+
+
+def _rewrite_page_origin(html: str, *, served_origin: str, client_origin: str) -> str:
+    """Return *html* with textual-serve's own origin swapped for the one the browser connected to.
+
+    Every URL on the served page (the session websocket above all) is built from the server's
+    ``public_url``, which defaults to the bind address. Bind every interface and that becomes
+    ``http://0.0.0.0:<port>``, which no client can route to: the page loads, its websocket never opens,
+    and the browser sits on the splash screen forever. The browser already knows the address that
+    reached this server, so the page is rewritten per request to use it.
+
+    Args:
+        html: The served page's markup.
+        served_origin: The server's own ``public_url``, e.g. ``http://0.0.0.0:8000``.
+        client_origin: Scheme and host the request arrived on, e.g. ``http://192.168.1.7:8000``.
+
+    Returns:
+        The markup with both the HTTP and the websocket form of ``served_origin`` replaced.
+    """
+    if served_origin == client_origin:
+        return html
+    websocket_scheme = "wss" if served_origin.startswith("https") else "ws"
+    client_websocket_scheme = "wss" if client_origin.startswith("https") else "ws"
+    served_websocket_origin = f"{websocket_scheme}:{served_origin.split(':', 1)[1]}"
+    client_websocket_origin = f"{client_websocket_scheme}:{client_origin.split(':', 1)[1]}"
+    return html.replace(served_websocket_origin, client_websocket_origin).replace(served_origin, client_origin)
+
+
+def _build_server(command: str, *, host: str, port: int, title: str) -> Server:
+    """Create the textual-serve server, extended so the served page reaches back and fits a phone.
+
+    ``textual_serve`` pulls in aiohttp and jinja2, which the headless terminal fallback never needs, so
+    the import stays deferred to here. Subclassing is how textual-serve expects a server to be extended:
+    ``_make_app`` is its application factory.
+
+    Args:
+        command: The per-session dashboard command textual-serve runs.
+        host: Address to bind.
+        port: Port to bind.
+        title: Name shown for the served application.
+
+    Returns:
+        An unstarted server; call ``serve()`` on it.
+    """
+    from aiohttp import web as aiohttp_web
+    from aiohttp.typedefs import Handler
+    from textual_serve.server import Server as TextualServeServer
+
+    class MobileFriendlyServer(TextualServeServer):
+        """A textual-serve server whose page addresses the client's own origin and fits a phone screen."""
+
+        async def _make_app(self) -> aiohttp_web.Application:
+            """Build the aiohttp application, adding the page rewrite to it."""
+            app = await super()._make_app()
+            app.middlewares.append(self._rewrite_page_middleware)
+            return app
+
+        @aiohttp_web.middleware
+        async def _rewrite_page_middleware(
+            self,
+            request: aiohttp_web.Request,
+            handler: Handler,
+        ) -> aiohttp_web.StreamResponse:
+            """Point the served page at the client's own origin, and fit it to a phone viewport."""
+            response = await handler(request)
+            if not isinstance(response, aiohttp_web.Response) or response.content_type != "text/html":
+                return response
+            if not response.text:
+                return response
+            html = response.text
+            # Only a wildcard bind produces an origin the client cannot route to. An explicit address is
+            # left alone so a deliberate public_url (say, behind a reverse proxy) is never second-guessed.
+            if host in WILDCARD_HOSTS:
+                html = _rewrite_page_origin(
+                    html,
+                    served_origin=self.public_url,
+                    client_origin=f"{request.scheme}://{request.host}",
+                )
+            response.text = _inject_mobile_fit(html)
+            return response
+
+    return MobileFriendlyServer(command, host=host, port=port, title=title)
+
+
+def _print_remote_exposure_warning(host: str, port: int) -> None:
+    """Print what binding a non-loopback address does, and what withholding the secrets does not cover."""
+    print(
+        f"\nServing the dashboard on {host}:{port}, reachable from other machines.\n"
+        "  There is no authentication and no encryption. Anyone who can reach this port can start and\n"
+        "  stop the worker, change every setting, and read the worker's logs.\n"
+        "  The API key and Civitai token fields are withheld from the config editor, so they cannot be\n"
+        "  read or replaced from the dashboard. The keys themselves stay in bridgeData.yaml on this\n"
+        "  machine, and anything logged remains visible on the Logs tab.\n"
+        "  Only do this on a network you trust.\n",
+        file=sys.stderr,
+    )
 
 
 def _is_graphical_environment() -> bool:
@@ -193,7 +641,16 @@ def _host_running(address: tuple[str, int]) -> bool:
         return False
 
 
-def _spawn_host(host_port: int, args: argparse.Namespace) -> subprocess.Popen[bytes]:
+def _announce_dashboard_port(address: tuple[str, int], web_port: int) -> None:
+    """Update an already-running host's tray URL to this launcher's resolved web port."""
+    try:
+        with socket.create_connection(address, timeout=2.0) as sock:
+            sp.send_frame(sock, sp.dashboard_port_message(web_port))
+    except OSError as announce_error:
+        print(f"Could not update the worker host's dashboard port ({announce_error}).", file=sys.stderr)
+
+
+def _spawn_host(host_port: int, web_port: int, args: argparse.Namespace) -> subprocess.Popen[bytes]:
     """Launch the worker host as a child process, forwarding the worker options."""
     command = [
         sys.executable,
@@ -203,6 +660,8 @@ def _spawn_host(host_port: int, args: argparse.Namespace) -> subprocess.Popen[by
         str(host_port),
         "--process-mode",
         args.process_mode,
+        "--dashboard-port",
+        str(web_port),
     ]
     if args.load_config_from_env_vars:
         command.append("-e")
@@ -449,7 +908,7 @@ def _open_dashboard(url: str, *, app_window: bool) -> None:
 
 def _schedule_dashboard_open(host: str, port: int, *, app_window: bool) -> None:
     """Open the dashboard shortly after the server starts (loopback only)."""
-    if host not in _LOOPBACK_HOSTS:
+    if not _is_loopback(host):
         return
     url = f"http://{host}:{port}"
     threading.Timer(1.5, lambda: _open_dashboard(url, app_window=app_window)).start()
@@ -464,14 +923,16 @@ def main(argv: list[str] | None = None) -> None:
         control_address = ("127.0.0.1", _resolve_host_port(args.host_port))
         raise SystemExit(_print_host_status(control_address) if args.status else _request_host_stop(control_address))
 
-    web_host = _resolve_host(args.host)
-    web_port = _resolve_port(args.port)
+    dashboard_config = _load_dashboard_config(args.config)
+    web_host = _resolve_host(args.host, dashboard_config)
+    web_port = _resolve_port(args.port, dashboard_config)
+    remote_exposed = not _is_loopback(web_host)
 
     # A loopback-only web dashboard is useless on a machine with no browser, so on a headless box fall
     # back to the in-terminal TUI (or, with no terminal either, point the user at the right mode).
     # Binding the LAN (--host) or suppressing the auto-open (--no-browser) is explicit "serve anyway"
     # intent (e.g. for a remote browser), so it skips the fallback.
-    forced_serve = args.no_browser or web_host not in _LOOPBACK_HOSTS
+    forced_serve = args.no_browser or remote_exposed
     if not _is_graphical_environment() and not forced_serve:
         if sys.stdout.isatty():
             print("No graphical display detected; opening the in-terminal dashboard instead of a browser.")
@@ -485,12 +946,15 @@ def main(argv: list[str] | None = None) -> None:
         )
         raise SystemExit(1)
 
-    from textual_serve.server import Server
+    if remote_exposed:
+        _print_remote_exposure_warning(web_host, web_port)
 
     host_port = _resolve_host_port(args.host_port)
     host_address = ("127.0.0.1", host_port)
 
-    host_process = None if _host_running(host_address) else _spawn_host(host_port, args)
+    host_process = None if _host_running(host_address) else _spawn_host(host_port, web_port, args)
+    if host_process is None:
+        _announce_dashboard_port(host_address, web_port)
 
     if not args.no_browser:
         _schedule_dashboard_open(web_host, web_port, app_window=not args.browser)
@@ -509,7 +973,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     watcher.start()
 
-    server = Server(_build_served_command(args, host_port), host=web_host, port=web_port, title="AI Horde Worker")
+    server = _build_server(
+        _build_served_command(args, host_port, remote_exposed=remote_exposed),
+        host=web_host,
+        port=web_port,
+        title="AI Horde Worker",
+    )
     try:
         server.serve()
     finally:

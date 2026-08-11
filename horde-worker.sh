@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   (default)    web dashboard in your browser (a pop-up window).
 #   --terminal   the in-terminal Textual UI (console, no browser).
 #   --headless   no UI: run the worker in the foreground, printing to this console.
-# Power users can bind the LAN with: ./horde-worker.sh --host 0.0.0.0  (unauthenticated; opt-in)
+# Power users can bind the network with: ./horde-worker.sh --host 0.0.0.0 --port 8000
+# (unauthenticated; opt-in). dashboard_web_host / dashboard_web_port in bridgeData.yaml set it for good.
 if [ "$1" = "--web" ]; then
     shift
     exec "$SCRIPT_DIR/runtime.sh" launch web "$@"

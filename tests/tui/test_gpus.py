@@ -118,12 +118,21 @@ def test_gpus_details_shows_residency_and_unservable() -> None:
 
 def test_card_columns_shed_on_a_narrow_terminal() -> None:
     """A narrow width keeps the essentials (GPU/VRAM/Contexts) and sheds the NORMAL throughput columns."""
+    table = GpusView()._render_table(_snapshot([_card(0)]), detailed=False, available_width=60)
+    out = _render(table, width=200)
+
+    assert "VRAM" in out  # essential, fits at this width
+    assert "it/s" not in out  # NORMAL, shed at this width
+    assert "Residency" not in out  # DETAILS, never shown without the details intent
+
+
+def test_card_columns_shed_to_the_card_itself_on_a_phone() -> None:
+    """Below the terminal floor even the essentials shed, leaving the column that names the card."""
     table = GpusView()._render_table(_snapshot([_card(0)]), detailed=False, available_width=40)
     out = _render(table, width=200)
 
-    assert "VRAM" in out  # essential, always shown
-    assert "it/s" not in out  # NORMAL, shed at this width
-    assert "Residency" not in out  # DETAILS, never shown without the details intent
+    assert "RTX 4090" in out  # CRITICAL: without it the rows cannot be told apart
+    assert "VRAM" not in out  # ESSENTIAL, and its 22-cell bar does not fit a phone
 
 
 def test_thin_aggregate_line_summarizes_the_fleet() -> None:

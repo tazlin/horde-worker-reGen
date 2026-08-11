@@ -21,7 +21,6 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
 
 from horde_worker_regen.benchmark.capabilities.report_render import render_markdown
@@ -32,11 +31,12 @@ from horde_worker_regen.benchmark.history import (
     list_runs,
     load_report,
 )
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 _RESULTS_ROOT = Path("benchmark_results")
 
 
-class BenchmarkHistoryModal(ModalScreen[None]):
+class BenchmarkHistoryModal(ResponsiveModalScreen[None]):
     """Browse past benchmark runs: view any run's report, or diff it against the previous run."""
 
     DEFAULT_CSS = """

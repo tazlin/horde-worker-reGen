@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from horde_worker_regen.tui.model_catalog import friendly_baseline
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 CUSTOM_MODEL_BASELINES: tuple[str, ...] = (
     "stable_diffusion_1",
@@ -30,7 +30,7 @@ class CustomModelBuilderResult:
     add_to_models_to_load: bool
 
 
-class CustomModelBuilderModal(ModalScreen[CustomModelBuilderResult | None]):
+class CustomModelBuilderModal(ResponsiveModalScreen[CustomModelBuilderResult | None]):
     """Build one custom model entry from labelled fields."""
 
     DEFAULT_CSS = """

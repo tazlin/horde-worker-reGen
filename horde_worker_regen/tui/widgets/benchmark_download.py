@@ -23,7 +23,6 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 from horde_worker_regen.benchmark.download_progress import (
@@ -31,6 +30,7 @@ from horde_worker_regen.benchmark.download_progress import (
     DownloadModelRow,
     decode_download_events,
 )
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -68,7 +68,7 @@ def _gb(num_bytes: int | None) -> str:
     return f"{num_bytes / 1024**3:.1f} GB"
 
 
-class BenchmarkDownloadModal(ModalScreen[bool]):
+class BenchmarkDownloadModal(ResponsiveModalScreen[bool]):
     """Show exactly which models a benchmark needs (size, on-disk, destination), then request the missing ones.
 
     Confirming delegates the missing models to the worker's download orchestration rather than downloading

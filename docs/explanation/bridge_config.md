@@ -516,6 +516,24 @@ or a nested folder is never touched.
 
 As with logs, the retention limits are independent; set both to `0` to keep stats indefinitely.
 
+### Dashboard bind address
+
+Two keys are read by the dashboard launcher (`horde-worker-web`) rather than by the worker. They live
+here so the address survives between launches and is editable from the Config tab's **Dashboard** page,
+and each is overridden by the matching flag and environment variable
+(`--host` / `$HORDE_WORKER_WEB_HOST`, `--port` / `$HORDE_WORKER_WEB_PORT`).
+
+| Field                 | Default     | Effect                                                                    |
+| --------------------- | ----------- | ------------------------------------------------------------------------- |
+| `dashboard_web_host`  | `127.0.0.1` | Address the browser dashboard binds. Loopback keeps it on this machine.   |
+| `dashboard_web_port`  | `8000`      | Port the browser dashboard binds.                                          |
+
+Setting the host to anything but loopback serves an **unauthenticated** dashboard: anyone who can reach
+the port can start and stop the worker, change this configuration, and read the worker's logs. The
+launcher warns on startup and withholds the credential fields from the config editor, which is the only
+protection it adds. See
+[What a network-bound dashboard exposes](../how-to/use-the-dashboard.md#what-a-network-bound-dashboard-exposes).
+
 ## Configuration flow at a glance
 
 ```

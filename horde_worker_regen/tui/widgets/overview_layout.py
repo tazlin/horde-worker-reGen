@@ -18,8 +18,9 @@ from dataclasses import dataclass
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Checkbox, Footer, Label, Static
+
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ def valid_hidden_keys(keys: object) -> set[str]:
     return {key for key in keys if key in _ELEMENTS_BY_KEY}
 
 
-class OverviewLayoutModal(ModalScreen[frozenset[str] | None]):
+class OverviewLayoutModal(ResponsiveModalScreen[frozenset[str] | None]):
     """Toggle which Overview panels are hidden; dismisses with the chosen hidden-key set (or None).
 
     A checked box means *hidden*. Escape saves and closes (there is no separate cancel: the operator is

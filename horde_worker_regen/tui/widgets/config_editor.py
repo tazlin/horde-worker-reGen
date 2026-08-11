@@ -13,7 +13,6 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -54,6 +53,7 @@ from horde_worker_regen.tui.config_form import (
 )
 from horde_worker_regen.tui.config_presets import BUILT_IN_PRESETS, ConfigPreset, PresetChange, diff_preset
 from horde_worker_regen.tui.config_validation import ConfigValidationSeverity, validate_config_interlocks
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 from horde_worker_regen.tui.widgets.custom_model_builder import CustomModelBuilderModal, CustomModelBuilderResult
 from horde_worker_regen.tui.widgets.experience import DashboardPreferencesView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
@@ -65,6 +65,9 @@ if TYPE_CHECKING:
 
 _FIELD_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 _MODELS_SECTION = "Models"
+# The dashboard's own settings. Composed onto the appearance page rather than bundled into a
+# CONFIG_SUBTABS entry, because that page is the one never withheld by experience level.
+_DASHBOARD_SECTION = "Dashboard"
 # The section whose fields drive the (non-obvious) inference-process count; a live preview is appended here.
 _THROUGHPUT_SECTION = "Throughput"
 _PROCESS_PREVIEW_ID = "config-process-preview"
@@ -74,8 +77,12 @@ _PROCESS_PREVIEW_ID = "config-process-preview"
 _GPU_SUBTAB_LABEL = "Per-GPU"
 _GPU_SUBTAB_ID = "cfgtab-per-gpu"
 
-# Which sub-tab a section lives on, so a validation error can name (and jump to) the right page.
-_SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections}
+# Which sub-tab a section lives on, so a validation error can name (and jump to) the right page. The
+# Dashboard section is composed onto the appearance page directly, so it is mapped here by hand; being
+# in this mapping is also what makes a section's fields part of ``_RENDERED_FIELDS`` below.
+_SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections} | {
+    _DASHBOARD_SECTION: _DASHBOARD_SECTION
+}
 _ADVANCED_SECTIONS: set[str] = {
     section for label, sections in CONFIG_SUBTABS if label == "Advanced" for section in sections
 }
@@ -116,7 +123,7 @@ def _subtab_id(label: str) -> str:
     return f"cfgtab-{slug.strip('-')}"
 
 
-_DASHBOARD_SUBTAB_LABEL = "Dashboard"
+_DASHBOARD_SUBTAB_LABEL = _DASHBOARD_SECTION
 DASHBOARD_SUBTAB_ID = _subtab_id(_DASHBOARD_SUBTAB_LABEL)
 """The appearance page. Always offered, at every level and every density: it is the way back."""
 
@@ -159,7 +166,7 @@ class ConfigLeaveChoice(enum.StrEnum):
     """Navigate away and stop warning for the rest of this session."""
 
 
-class ConfigLeaveModal(ModalScreen[ConfigLeaveChoice]):
+class ConfigLeaveModal(ResponsiveModalScreen[ConfigLeaveChoice]):
     """Warns that the Config tab has unsaved edits before the user navigates away."""
 
     DEFAULT_CSS = """
@@ -168,6 +175,7 @@ class ConfigLeaveModal(ModalScreen[ConfigLeaveChoice]):
     }
     ConfigLeaveModal #config-leave-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         padding: 1 2;
         border: thick $warning;
@@ -221,7 +229,7 @@ class ConfigLeaveModal(ModalScreen[ConfigLeaveChoice]):
             self.dismiss(choice)
 
 
-class ConfigPresetModal(ModalScreen[dict[str, object] | None]):
+class ConfigPresetModal(ResponsiveModalScreen[dict[str, object] | None]):
     """Preview one built-in preset and let the operator opt out per setting."""
 
     DEFAULT_CSS = """
@@ -568,6 +576,10 @@ class ConfigEditorView(Vertical):
                 VerticalScroll(classes="config-subtab-scroll"),
             ):
                 yield DashboardPreferencesView(self._experience_level, self._display_density, self._theme_name)
+                # The bind address the browser dashboard uses is a dashboard setting rather than a worker
+                # one, so it belongs on this page next to the other appearance/behaviour preferences. It
+                # lives in bridgeData.yaml (not the app state) so it is editable and reviewable as text.
+                yield from self._compose_section(_DASHBOARD_SECTION)
             for label, sections in CONFIG_SUBTABS:
                 with TabPane(label, id=_subtab_id(label)), VerticalScroll(classes="config-subtab-scroll"):
                     for section in sections:
@@ -712,6 +724,10 @@ class ConfigEditorView(Vertical):
         # form rather than being dropped from the config on the next write.
         if field.risk_level and field.risk_level != _NORMAL_RISK_LEVEL:
             control.add_class(f"field-{field.risk_level}")
+        # Credentials are tagged so the stylesheet can withhold them from a dashboard served off
+        # loopback, where anyone who can reach the port could otherwise replace the worker's API key.
+        if field.secret:
+            control.add_class("field-secret")
         return control
 
     def on_mount(self) -> None:

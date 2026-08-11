@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
-from textual.widgets import Static, TabbedContent
+from textual.widgets import Button, Input, Static, TabbedContent
 
 from horde_worker_regen.app_state import (
     AppStateStore,
@@ -18,8 +18,11 @@ from horde_worker_regen.app_state import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
-from horde_worker_regen.tui.app import HordeWorkerTUI
+from horde_worker_regen.tui.app import _COMPACT_TAB_LABELS, REMOTE_EXPOSED_CLASS, HordeWorkerTUI
+from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
 from horde_worker_regen.tui.health import WorkerPhase, derive
+from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
+from horde_worker_regen.tui.widgets.onboarding import WorkerStartModal
 from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 from tests.tui._fake_supervisor import FakeSupervisor
@@ -36,6 +39,43 @@ _LIVE_PHASES = {
     WorkerPhase.PAUSED,
     WorkerPhase.DISCONNECTED,
 }
+
+
+def test_attached_launch_flow_waits_for_the_hosts_first_status() -> None:
+    """Pre-status STOPPED defaults must not trigger the start/download/stay-stopped modal."""
+    attached = object.__new__(AttachedWorkerSupervisor)
+    attached._lifecycle_resolved = False
+    assert HordeWorkerTUI._attached_lifecycle_pending(attached)
+
+    attached._lifecycle_resolved = True
+    assert not HordeWorkerTUI._attached_lifecycle_pending(attached)
+
+
+def test_title_uses_the_worker_session_start_instead_of_the_frontend_attach_time(tmp_path: Path) -> None:
+    """Reopening a browser keeps the worker's elapsed session clock."""
+    app, _, supervisor = _overview_app(tmp_path)
+    supervisor.latest_snapshot = WorkerStateSnapshot(
+        session_start_time=time.time() - 3665,
+        config=WorkerConfigSummary(dreamer_name="Clock", worker_version="0"),
+    )
+
+    assert "[01:01:05]" in app._build_title()
+
+
+async def test_phone_start_modal_fits_and_has_touch_sized_buttons(tmp_path: Path) -> None:
+    """The first-launch dialog must neither overflow a phone nor leave one-row tap targets."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    app = HordeWorkerTUI(FakeSupervisor(), config_path=tmp_path / "bridgeData.yaml", app_state_store=store)
+
+    async with app.run_test(size=(55, 40)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, WorkerStartModal)
+        assert app.screen.has_class("-phone"), app.screen.classes
+        dialog = app.screen.query_one("#worker-start-dialog")
+        button = app.screen.query_one("#worker-start-now", Button)
+        assert dialog.size.width <= 53
+        assert button.outer_size.height >= 4
 
 
 @pytest.mark.e2e
@@ -436,7 +476,7 @@ async def test_customize_modal_saves_selection(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("width", "expect_cols2", "expect_cols3"),
-    [(80, False, False), (120, True, False), (200, True, True)],
+    [(55, False, False), (80, False, False), (120, True, False), (200, True, True)],
 )
 async def test_overview_column_classes_track_width(
     tmp_path: Path, width: int, expect_cols2: bool, expect_cols3: bool
@@ -449,6 +489,106 @@ async def test_overview_column_classes_track_width(
         overview = app.query_one(OverviewView)
         assert overview.has_class("-cols-2") is expect_cols2
         assert overview.has_class("-cols-3") is expect_cols3
+
+
+@pytest.mark.parametrize(
+    ("width", "expected_class"),
+    [(55, "-phone"), (80, "-narrow"), (120, "-normal"), (200, "-wide")],
+)
+async def test_screen_carries_one_width_band_class(tmp_path: Path, width: int, expected_class: str) -> None:
+    """Textual stamps exactly one width band, so the phone band replaces (not joins) the narrow one."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(width, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        bands = {"-phone", "-narrow", "-normal", "-wide"} & set(app.screen.classes)
+        assert bands == {expected_class}
+
+
+async def test_phone_width_compacts_the_tab_strip_and_restores_it(tmp_path: Path) -> None:
+    """The eleven tabs get truncated labels below the terminal floor, so the whole strip stays tappable."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(55, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        tabs = app.query_one("#main-tabs", TabbedContent)
+        assert tabs.get_tab("tab-benchmark").label_text == "Bmk"
+        # The compact strip has to fit the width a phone browser is served at, including the two cells
+        # of padding Textual gives every tab.
+        strip_width = sum(len(label) + 2 for label in _COMPACT_TAB_LABELS.values())
+        minimum_phone_columns = int(320 / (10 * 0.6))
+        assert strip_width <= minimum_phone_columns
+
+        await pilot.resize_terminal(120, 40)
+        await pilot.pause()
+        assert tabs.get_tab("tab-benchmark").label_text == "Benchmark"
+
+
+async def test_phone_config_scrolls_its_preamble_away_with_the_fields(tmp_path: Path) -> None:
+    """Config actions and summaries must not remain pinned above the phone's only field scroller."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(55, 40)) as pilot:
+        app.query_one("#main-tabs", TabbedContent).active = "tab-config"
+        await pilot.pause()
+        config = app.query_one(ConfigEditorView)
+
+        assert str(config.styles.overflow_y) == "auto"
+        assert config.virtual_size.height > config.size.height
+        config.scroll_end(animate=False)
+        await pilot.pause()
+        assert config.scroll_y > 0
+
+
+async def test_phone_resize_reveals_the_focused_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A keyboard-height resize asks Textual to expose the focused control in the reduced viewport."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(55, 40)) as pilot:
+        app.query_one("#main-tabs", TabbedContent).active = "tab-config"
+        await pilot.pause()
+        field = app.query_one("#cfg-dreamer_name", Input)
+        field.focus()
+        calls: list[bool] = []
+        monkeypatch.setattr(field, "scroll_visible", lambda *, animate: calls.append(animate))
+
+        await pilot.resize_terminal(55, 20)
+        await pilot.pause()
+
+        assert calls == [False]
+
+
+async def test_credentials_are_withheld_only_from_a_network_exposed_session(tmp_path: Path) -> None:
+    """A dashboard served off loopback hides the API key field; a loopback one still offers it."""
+    for remote_exposed, expect_visible in ((False, True), (True, False)):
+        app, _, _ = _overview_app(tmp_path)
+        app._remote_exposed = remote_exposed
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._tick()
+            await pilot.pause()
+            assert app.screen.has_class(REMOTE_EXPOSED_CLASS) is remote_exposed
+            api_key_field = app.query_one("#cfg-api_key", Input).parent
+            assert api_key_field is not None
+            assert api_key_field.parent is not None
+            # The group carries the tag; the withheld state is the whole field group vanishing.
+            assert api_key_field.parent.has_class("field-secret")
+            assert api_key_field.parent.display is expect_visible
+
+
+async def test_a_withheld_credential_keeps_its_value_for_the_next_save(tmp_path: Path) -> None:
+    """Withholding is presentational: the loaded key stays in the widget, so a save cannot blank it."""
+    config_path = tmp_path / "bridgeData.yaml"
+    config_path.write_text("api_key: super-secret-key\n", encoding="utf-8")
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    store.set_experience_level(ExperienceLevel.ADVANCED)
+    app = HordeWorkerTUI(
+        FakeSupervisor(alive=True),
+        config_path=config_path,
+        app_state_store=store,
+        remote_exposed=True,
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app.query_one("#cfg-api_key", Input).value == "super-secret-key"
 
 
 async def test_trends_panel_gets_a_wide_band_when_multicolumn(tmp_path: Path) -> None:

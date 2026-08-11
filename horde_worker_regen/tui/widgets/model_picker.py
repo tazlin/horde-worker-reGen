@@ -10,18 +10,18 @@ from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.text import Text
 from textual import events, on
-from textual.app import ComposeResult
+from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Label, Select, Static
 from textual.widgets.data_table import ColumnKey
 
 from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
 from horde_worker_regen.tui.formatters import human_bytes
 from horde_worker_regen.tui.model_catalog import ModelInfo, friendly_baseline
+from horde_worker_regen.tui.responsive import PHONE_BAND_MAX_WIDTH, ResponsiveModalScreen
 from horde_worker_regen.tui.widgets.confirm_modal import ConfirmModal
 
 if TYPE_CHECKING:
@@ -42,6 +42,39 @@ _COLUMNS: tuple[tuple[str, int], ...] = (
     ("Disk", 10),
     ("Flags", 12),
 )
+
+_PHONE_COLUMN_WIDTHS: tuple[int, ...] = (8, 22, 9, 8, 6, 8)
+"""Column widths used below the terminal floor, in the same order as ``_COLUMNS``.
+
+A ``DataTable`` has no column shedding, so a phone-width picker would otherwise open scrolled to a Mark
+column and a model name cut off mid-word. The columns are narrowed rather than removed because their
+positions are addressed by index throughout this module; the later ones still scroll off, but the mark
+and the model name (the two a choice is actually made from) fit without scrolling.
+
+Chosen once, when the columns are created. Textual offers no supported way to re-apply a column width
+after the fact, so a picker left open across a resize keeps the widths it opened with; reopening it
+picks up the new ones.
+"""
+
+
+def _column_headers() -> tuple[str, ...]:
+    """The picker table's column headers, in table order."""
+    return tuple(header for header, _width in _COLUMNS)
+
+
+def _column_widths(app: App[object]) -> tuple[int, ...]:
+    """The picker table's column widths for the app's current width band, in table order.
+
+    Args:
+        app: The running app, whose width decides whether the phone widths apply.
+
+    Returns:
+        One width per column, narrowed below the terminal floor.
+    """
+    if app.size.width < PHONE_BAND_MAX_WIDTH:
+        return _PHONE_COLUMN_WIDTHS
+    return tuple(width for _header, width in _COLUMNS)
+
 
 _DISK_ALL = ""
 _DISK_ON = "on"
@@ -86,7 +119,7 @@ class _PickerTable(DataTable):
             self.post_message(self.RowToggled(row))
 
 
-class ModelPickerModal(ModalScreen[ModelPickerResult | list[str] | None]):
+class ModelPickerModal(ResponsiveModalScreen[ModelPickerResult | list[str] | None]):
     """Browse and mark image models to add/remove; dismisses with the chosen edits or None."""
 
     BINDINGS = [
@@ -230,7 +263,10 @@ class ModelPickerModal(ModalScreen[ModelPickerResult | list[str] | None]):
     def on_mount(self) -> None:
         """Set up the table columns and load the model reference off the UI thread."""
         table = self.query_one("#picker-table", DataTable)
-        self._col_keys = [table.add_column(header, width=width) for header, width in _COLUMNS]
+        self._col_keys = [
+            table.add_column(header, width=width)
+            for header, width in zip(_column_headers(), _column_widths(self.app), strict=True)
+        ]
         self.run_worker(self._load_models, thread=True, exclusive=True)
 
     def _load_models(self, *, force: bool = False) -> None:

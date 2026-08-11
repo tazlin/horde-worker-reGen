@@ -571,6 +571,7 @@ class SimpleHomeView(VerticalScroll):
         self._kudos_history: deque[tuple[float, float, float]] = deque(maxlen=_TREND_MAX_SAMPLES)
         self._completed_history: deque[tuple[float, int]] = deque(maxlen=_TREND_MAX_SAMPLES)
         self._trend_epoch: float | None = None
+        self._backfilled_session_start: float | None = None
         self._last_sample_at = 0.0
         self._ticker: deque[str] = deque(maxlen=_TICKER_LINES)
         # Insertion-ordered so the oldest identifier can be evicted; a plain set would grow for the life
@@ -660,6 +661,7 @@ class SimpleHomeView(VerticalScroll):
         """
         if snapshot is None:
             return
+        self._restore_worker_trends(snapshot)
         # Monotonic: this measures an elapsed gap, and a wall-clock step would either stall the trend or
         # flood it with samples. The sample itself is stamped with the worker's own wall clock, which is
         # what the trend window is expressed in.
@@ -669,9 +671,36 @@ class SimpleHomeView(VerticalScroll):
         self._last_sample_at = now
         stamp = snapshot.timestamp or time.time()
         if self._trend_epoch is None:
-            self._trend_epoch = stamp
-        self._kudos_history.append((stamp, float(snapshot.kudos_this_session or 0.0), snapshot.eligible_seconds_total))
-        self._completed_history.append((stamp, snapshot.num_jobs_submitted))
+            self._trend_epoch = snapshot.session_start_time or stamp
+        if not self._completed_history or stamp > self._completed_history[-1][0]:
+            self._kudos_history.append(
+                (stamp, float(snapshot.kudos_this_session or 0.0), snapshot.eligible_seconds_total)
+            )
+            self._completed_history.append((stamp, snapshot.num_jobs_submitted))
+
+    def _restore_worker_trends(self, snapshot: WorkerStateSnapshot) -> None:
+        """Restore Home's pace charts from worker-owned samples after a browser reconnect."""
+        session_start = snapshot.session_start_time
+        if not session_start or session_start == self._backfilled_session_start:
+            return
+        self._kudos_history.clear()
+        self._completed_history.clear()
+        self._ticker.clear()
+        self._seen_job_ids.clear()
+        self._trend_epoch = session_start
+        self._backfilled_session_start = session_start
+
+        backfill = snapshot.stats_history_backfill
+        if backfill is None:
+            return
+        samples_by_timestamp = {
+            sample.timestamp: sample for sample in (*backfill.all_session_samples, *backfill.recent_samples)
+        }
+        for sample in sorted(samples_by_timestamp.values(), key=lambda item: item.timestamp):
+            self._kudos_history.append(
+                (sample.timestamp, float(sample.kudos_this_session or 0.0), sample.eligible_seconds_total)
+            )
+            self._completed_history.append((sample.timestamp, sample.jobs_submitted))
 
     def _completed_series(self) -> list[float]:
         """Return per-bucket completed-request deltas across the charted window."""

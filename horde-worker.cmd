@@ -6,7 +6,8 @@ REM Three peer launch options:
 REM   (default)    web dashboard in your browser (a pop-up window).
 REM   --terminal   the in-terminal Textual UI (console, no browser).
 REM   --headless   no UI: run the worker in the foreground, printing to this console.
-REM Power users can bind the LAN with: horde-worker.cmd --host 0.0.0.0  (unauthenticated; opt-in).
+REM Power users can bind the network with: horde-worker.cmd --host 0.0.0.0 --port 8000
+REM (unauthenticated; opt-in). dashboard_web_host / dashboard_web_port in bridgeData.yaml set it for good.
 REM The branches goto labels (not parenthesized blocks) so the rest-of-line capture and %errorlevel%
 REM are read at run time, not parse time. REST holds every argument after the leading mode flag.
 if /I "%~1"=="--web" goto :mode_web

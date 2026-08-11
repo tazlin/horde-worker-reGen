@@ -13,10 +13,10 @@ import enum
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 from horde_worker_regen.app_state import BenchmarkAvailability, OnboardingChoice
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 
 class WorkerStartChoice(enum.StrEnum):
@@ -32,7 +32,7 @@ class WorkerStartChoice(enum.StrEnum):
     """Leave the worker stopped; the user can start it later (F3)."""
 
 
-class WorkerStartModal(ModalScreen[WorkerStartChoice]):
+class WorkerStartModal(ResponsiveModalScreen[WorkerStartChoice]):
     """A first-run modal asking whether to start the worker (it does real GPU work)."""
 
     DEFAULT_CSS = """
@@ -41,6 +41,7 @@ class WorkerStartModal(ModalScreen[WorkerStartChoice]):
     }
     WorkerStartModal #worker-start-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         padding: 1 2;
         border: thick $accent;
@@ -88,7 +89,7 @@ class WorkerStartModal(ModalScreen[WorkerStartChoice]):
             self.dismiss(choice)
 
 
-class BenchmarkOnboardingModal(ModalScreen[OnboardingChoice]):
+class BenchmarkOnboardingModal(ResponsiveModalScreen[OnboardingChoice]):
     """A modal offering to run a benchmark on first launch (or after a version bump)."""
 
     DEFAULT_CSS = """
@@ -97,6 +98,7 @@ class BenchmarkOnboardingModal(ModalScreen[OnboardingChoice]):
     }
     BenchmarkOnboardingModal #onboarding-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         padding: 1 2;
         border: thick $accent;

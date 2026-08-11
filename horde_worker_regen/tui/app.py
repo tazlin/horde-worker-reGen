@@ -21,11 +21,12 @@ from typing import TYPE_CHECKING, Any, override
 
 from loguru import logger
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.screen import ModalScreen, Screen
+from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane
 
 from horde_worker_regen import __version__
@@ -61,6 +62,7 @@ from horde_worker_regen.tui.design import register_horde_themes
 from horde_worker_regen.tui.formatters import configure_fidelity, format_percent
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
+from horde_worker_regen.tui.responsive import PHONE_BAND_MAX_WIDTH, ResponsiveModalScreen
 from horde_worker_regen.tui.update_check import UpdateInfo, check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
 from horde_worker_regen.tui.widgets.config_editor import (
@@ -130,6 +132,36 @@ _BENCHMARK_DRAIN_POLL_SECONDS = 0.5
 _DESTINATION_ID_PREFIX = "tab-"
 """Identifier prefix marking a top-level destination, as opposed to a nested sub-tab."""
 
+REMOTE_EXPOSED_CLASS = "-remote-exposed"
+"""Screen class marking a session anyone on the network can reach, which withholds the credentials."""
+
+PHONE_CLASS = "-phone"
+"""Screen class for the width band below the terminal floor, which is what a phone browser gets."""
+
+
+_COMPACT_TAB_LABELS: dict[str, str] = {
+    "tab-overview": "Ovr",
+    "tab-stats": "St",
+    "tab-control": "Ctl",
+    "tab-gpus": "GPU",
+    "tab-live": "Live",
+    "tab-downloads": "DL",
+    "tab-logs": "Log",
+    "tab-config": "Cfg",
+    "tab-insights": "In",
+    "tab-diagnostics": "Dx",
+    "tab-benchmark": "Bmk",
+}
+"""Tab labels used in the phone width band, where the full ones do not fit.
+
+The strip has no shedding logic of its own: eleven full labels need around 97 columns, so on a phone the
+tabs past the first few scroll out of reach, and reaching them by tap is the only navigation a phone
+reliably has. These are truncations of the real names rather than different words, so the tab a reader
+learned from the documentation is still the tab they tap. Their total (including the two cells of
+padding Textual gives each tab) must stay within the roughly 53 columns a 320px viewport gets at the
+served page's 10px readability floor.
+"""
+
 _CONFIG_TAB_ID = "tab-config"
 _DOWNLOADS_TAB_ID = "tab-downloads"
 _LIVE_TAB_ID = "tab-live"
@@ -140,7 +172,7 @@ def _no_inference_contexts(snapshot: WorkerStateSnapshot) -> bool:
     return not any(process.process_type == "INFERENCE" and process.is_alive for process in snapshot.processes)
 
 
-class WebQuitWarningModal(ModalScreen[bool]):
+class WebQuitWarningModal(ResponsiveModalScreen[bool]):
     """Warn the user that closing this browser tab leaves the worker running in the background."""
 
     DEFAULT_CSS = """
@@ -149,6 +181,7 @@ class WebQuitWarningModal(ModalScreen[bool]):
     }
     WebQuitWarningModal #web-quit-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         padding: 1 2;
         border: thick $warning;
@@ -196,7 +229,7 @@ class WebQuitWarningModal(ModalScreen[bool]):
             self.dismiss(False)
 
 
-class BenchmarkOverWorkerModal(ModalScreen[bool]):
+class BenchmarkOverWorkerModal(ResponsiveModalScreen[bool]):
     """Confirm handing the GPU to a benchmark while the worker is serving jobs.
 
     The benchmark needs the GPU to itself. Rather than tear the worker down, the app drains its queue (letting
@@ -210,6 +243,7 @@ class BenchmarkOverWorkerModal(ModalScreen[bool]):
     }
     BenchmarkOverWorkerModal #bench-over-worker-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         padding: 1 2;
         border: thick $warning;
@@ -269,7 +303,7 @@ class BenchmarkOverWorkerModal(ModalScreen[bool]):
             self.dismiss(False)
 
 
-class BenchmarkActionConfirmModal(ModalScreen[bool]):
+class BenchmarkActionConfirmModal(ResponsiveModalScreen[bool]):
     """Confirm an action that would interfere with an in-progress benchmark download, with a plain explanation.
 
     A reusable yes/no for the benchmark↔download coordination guards (running before the models finish, or
@@ -283,6 +317,7 @@ class BenchmarkActionConfirmModal(ModalScreen[bool]):
     }
     BenchmarkActionConfirmModal #bench-confirm-dialog {
         width: 72;
+        max-width: 95%;
         height: auto;
         padding: 1 2;
         border: thick $warning;
@@ -333,13 +368,29 @@ class HordeWorkerTUI(App[None]):
     """The Horde design system projection. Layout rules that depend on runtime intent stay in ``CSS``
     below; this file carries the shared surfaces (hero, card, muted) and the level/density policy."""
 
-    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-normal"), (150, "-wide")]
+    HORIZONTAL_BREAKPOINTS = [
+        (0, PHONE_CLASS),
+        (PHONE_BAND_MAX_WIDTH, "-narrow"),
+        (100, "-normal"),
+        (150, "-wide"),
+    ]
     """Width bands Textual stamps onto the Screen as classes, mirroring the table column tiers.
 
     These drive only *layout* rules in the CSS below (e.g. reclaiming side padding on a cramped terminal).
     Panel show/hide stays in Python because it depends on the F6 view intent, which CSS cannot see; and an
     inline ``display`` set per tick from Python would in any case win over a CSS ``display`` rule. The
     within-table column shedding that actually fixes the wide tables is done in ``responsive.py``.
+
+    ``-narrow`` starts at the 80-column floor, so a terminal at that floor keeps exactly the rules it had
+    before the phone band existed. ``-phone`` covers what a phone browser gets (roughly 40 to 70 columns),
+    which is below anything a terminal is expected to run at.
+
+    Textual applies at most **one** class per dimension, so ``-phone`` replaces ``-narrow`` rather than
+    adding to it: every rule that should hold for both has to name both.
+
+    There is deliberately no vertical band. Height is not what a phone is short of: served at the font
+    size a narrow viewport picks, a phone gives dozens of rows in either orientation, and a band low
+    enough to catch one would also catch the 80x24 terminal floor and change a layout that is fine.
     """
 
     CSS = """
@@ -357,19 +408,19 @@ class HordeWorkerTUI(App[None]):
         padding: 1 1;
     }
     /* On a cramped terminal, drop the horizontal padding so the tables get those columns back. */
-    Screen.-narrow OverviewView,
-    Screen.-narrow StatsView,
-    Screen.-narrow GpusView,
-    Screen.-narrow LiveView,
-    Screen.-narrow InsightsView,
-    Screen.-narrow ConfigEditorView,
-    Screen.-narrow LogsView,
-    Screen.-narrow BenchmarkView,
-    Screen.-narrow DownloadsView,
-    Screen.-narrow ControlView,
-    Screen.-narrow SimpleHomeView,
-    Screen.-narrow SimpleActivityView,
-    Screen.-narrow SimpleModelStatusView {
+    Screen.-narrow OverviewView, Screen.-phone OverviewView,
+    Screen.-narrow StatsView, Screen.-phone StatsView,
+    Screen.-narrow GpusView, Screen.-phone GpusView,
+    Screen.-narrow LiveView, Screen.-phone LiveView,
+    Screen.-narrow InsightsView, Screen.-phone InsightsView,
+    Screen.-narrow ConfigEditorView, Screen.-phone ConfigEditorView,
+    Screen.-narrow LogsView, Screen.-phone LogsView,
+    Screen.-narrow BenchmarkView, Screen.-phone BenchmarkView,
+    Screen.-narrow DownloadsView, Screen.-phone DownloadsView,
+    Screen.-narrow ControlView, Screen.-phone ControlView,
+    Screen.-narrow SimpleHomeView, Screen.-phone SimpleHomeView,
+    Screen.-narrow SimpleActivityView, Screen.-phone SimpleActivityView,
+    Screen.-narrow SimpleModelStatusView, Screen.-phone SimpleModelStatusView {
         padding: 1 0;
     }
     #overview-worker, #overview-processes {
@@ -402,6 +453,7 @@ class HordeWorkerTUI(App[None]):
         config_path: Path = DEFAULT_CONFIG_PATH,
         app_state_store: AppStateStore | None = None,
         load_config_from_env_vars: bool = False,
+        remote_exposed: bool = False,
     ) -> None:
         """Store the (unstarted) supervisor, config path, and durable state store."""
         super().__init__()
@@ -410,6 +462,13 @@ class HordeWorkerTUI(App[None]):
         self._config_path = config_path
         self._app_state_store = app_state_store if app_state_store is not None else AppStateStore()
         self._load_config_from_env_vars = load_config_from_env_vars
+        # Set when this session is served on an address other than loopback, so anyone on the network can
+        # reach it. Stamped onto the Screen so the stylesheet can withhold the credential fields.
+        self._remote_exposed = remote_exposed
+        # The tab strip's full labels, captured before the first swap to the compact ones so the swap can
+        # be undone when the window widens again.
+        self._full_tab_labels: dict[str, str] = {}
+        self._tab_labels_are_compact = False
         self._frame = 0
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
@@ -563,7 +622,11 @@ class HordeWorkerTUI(App[None]):
         return encoding.lower().replace("-", "") not in ("utf8", "utf8sig")
 
     def _build_title(self) -> str:
-        elapsed = int(time.monotonic() - self._start_time)
+        snapshot = self._supervisor.latest_snapshot
+        if snapshot is not None and snapshot.session_start_time:
+            elapsed = int(max(0.0, time.time() - snapshot.session_start_time))
+        else:
+            elapsed = int(time.monotonic() - self._start_time)
         h, remainder = divmod(elapsed, 3600)
         m, s = divmod(remainder, 60)
         clock = f"{h:02d}:{m:02d}:{s:02d}"
@@ -599,6 +662,10 @@ class HordeWorkerTUI(App[None]):
         if not testing:
             self.set_interval(UPDATE_CHECK_INTERVAL_SECONDS, self._periodic_update_check)
         self._warm_model_catalog()
+        # Fixed for the life of the session (the bind address cannot change under a running server), so it
+        # is stamped once here rather than re-evaluated with the level and density classes.
+        if self._remote_exposed:
+            self.screen.add_class(REMOTE_EXPOSED_CLASS)
         self._apply_experience_level(self._experience_level)
         # An installation that predates the levels answers the notice before anything else, so the choice
         # is made against an untouched dashboard rather than behind a start prompt.
@@ -618,13 +685,26 @@ class HordeWorkerTUI(App[None]):
 
     def _resume_launch_flow(self) -> None:
         """Run first-run setup or the usual start/onboarding prompts."""
+        if self._attached_lifecycle_pending(self._supervisor):
+            # The attach reader starts in the background. Its STOPPED defaults are placeholders until the
+            # host sends the first status; acting on them flashes a start/download/stay-stopped modal over
+            # an already-running worker. Re-check without issuing any lifecycle intent.
+            self.set_timer(0.1, self._resume_launch_flow)
+            return
         if self._should_show_getting_started():
             self._open_getting_started()
+        elif self._supervisor.is_alive():
+            self._maybe_prompt_onboarding()
         elif self._should_auto_start():
             self._supervisor.start()
             self._maybe_prompt_onboarding()
         else:
             self._prompt_worker_start()
+
+    @staticmethod
+    def _attached_lifecycle_pending(supervisor: SupervisorLike) -> bool:
+        """Whether an attached supervisor still holds its pre-status placeholder lifecycle."""
+        return isinstance(supervisor, AttachedWorkerSupervisor) and not supervisor.lifecycle_resolved
 
     def _warm_model_catalog(self) -> None:
         """Pre-load the image-model catalog in the background so views open instantly (best-effort).
@@ -1394,6 +1474,43 @@ class HordeWorkerTUI(App[None]):
             with contextlib.suppress(ValueError):
                 found.append((tabs.get_tab(pane.id).label_text, pane.id))
         return found
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Match the tab strip's labels to the new width band.
+
+        Reads the width off the event rather than ``self.size``, which still holds the old value while
+        this handler runs and would leave the strip a resize behind. On a phone, a height reduction is
+        commonly the software keyboard opening; Textual preserves focus but does not automatically move
+        the focused field above the new bottom edge, so expose it again after the resized layout settles.
+        """
+        self._apply_tab_labels(compact=event.size.width < PHONE_BAND_MAX_WIDTH)
+        if event.size.width < PHONE_BAND_MAX_WIDTH:
+            self.call_after_refresh(self._scroll_focused_widget_visible)
+
+    def _scroll_focused_widget_visible(self) -> None:
+        """Bring the focused control into the phone viewport after browser chrome changes its height."""
+        focused = self.focused
+        if focused is not None:
+            focused.scroll_visible(animate=False)
+
+    def _apply_tab_labels(self, *, compact: bool) -> None:
+        """Show the compact or the full tab labels, doing nothing when they are already the wanted set.
+
+        Args:
+            compact: Whether to show the truncated labels that fit a phone-width strip.
+        """
+        if compact == self._tab_labels_are_compact and self._full_tab_labels:
+            return
+        try:
+            tabs = self.query_one("#main-tabs", TabbedContent)
+        except NoMatches:
+            return
+        for pane_id, compact_label in _COMPACT_TAB_LABELS.items():
+            with contextlib.suppress(ValueError):
+                tab = tabs.get_tab(pane_id)
+                self._full_tab_labels.setdefault(pane_id, tab.label_text)
+                tab.label = compact_label if compact else self._full_tab_labels[pane_id]
+        self._tab_labels_are_compact = compact
 
     def _apply_experience_level(self, level: ExperienceLevel) -> None:
         """Apply ``level`` to the screen classes, the footer indicator, and the views that vary by level.
@@ -2274,6 +2391,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         f"{sp.DEFAULT_HOST_PORT}; pass host:port to target another. The worker survives this session "
         "closing.",
     )
+    parser.add_argument(
+        "--remote-exposed",
+        action="store_true",
+        help="Treat this session as reachable from other machines (set by the web launcher when it binds "
+        "an address other than loopback). Withholds the credential fields from the config editor.",
+    )
     return parser.parse_args(argv)
 
 
@@ -2336,6 +2459,7 @@ def _run_app(args: argparse.Namespace) -> None:
         supervisor,
         config_path=args.config,
         load_config_from_env_vars=args.load_config_from_env_vars,
+        remote_exposed=args.remote_exposed,
     )
     try:
         app.run()

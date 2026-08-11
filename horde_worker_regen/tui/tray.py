@@ -70,7 +70,7 @@ def open_dashboard(web_port: int = 8000) -> None:
         webbrowser.open(url)
         return
     try:
-        subprocess.Popen([sys.executable, "-m", "horde_worker_regen.tui.web"])
+        subprocess.Popen([sys.executable, "-m", "horde_worker_regen.tui.web", "--port", str(web_port)])
     except OSError:
         logger.opt(exception=True).warning("Could not launch the web dashboard from the tray.")
 

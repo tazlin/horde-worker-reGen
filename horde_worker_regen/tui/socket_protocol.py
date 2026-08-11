@@ -41,6 +41,7 @@ MSG_SNAPSHOT = "snapshot"
 MSG_STATUS = "status"
 MSG_COMMAND = "command"
 MSG_LIFECYCLE = "lifecycle"
+MSG_DASHBOARD_PORT = "dashboard_port"
 MSG_HOST_SHUTDOWN = "host_shutdown"
 """The host is tearing down (tray exit, a stop request, or a crash unwind).
 
@@ -163,6 +164,11 @@ def command_message(command: SupervisorControlMessage) -> dict[str, Any]:
 def lifecycle_message(action: str) -> dict[str, Any]:
     """Wrap a process-level lifecycle request (start/stop/restart the worker)."""
     return {"type": MSG_LIFECYCLE, "action": action}
+
+
+def dashboard_port_message(port: int) -> dict[str, Any]:
+    """Tell a persistent host which web port its tray action should currently open."""
+    return {"type": MSG_DASHBOARD_PORT, "port": port}
 
 
 def host_shutdown_message(reason: str = "") -> dict[str, Any]:

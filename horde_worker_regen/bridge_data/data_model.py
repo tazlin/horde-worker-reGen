@@ -900,6 +900,21 @@ class reGenBridgeData(CombinedHordeBridgeData):
     is about to write to), so prior-session exports occupy far less disk before the age-out and size-cap
     run over them. Only recognized stats files are touched, via an atomic temp-then-replace compression."""
 
+    dashboard_web_host: str = Field(default="127.0.0.1")
+    """Address the browser dashboard's web server binds, when it is launched without ``--host``.
+
+    Read by the dashboard launcher (``horde-worker-web``), never by the worker itself; it lives here so
+    the address survives between launches and is editable from the config editor. Loopback keeps the
+    dashboard reachable only from this machine. Any other address (``0.0.0.0`` binds every interface)
+    serves an **unauthenticated** dashboard to anyone who can route to the port: they can start and stop
+    the worker, edit this configuration, and read the worker's logs. The launcher withholds the secret
+    fields from the config editor in that case and prints what that does not cover."""
+
+    dashboard_web_port: int = Field(default=8000, ge=1, le=65535)
+    """Port the browser dashboard's web server binds, when it is launched without ``--port``.
+
+    Read by the dashboard launcher rather than the worker, as with ``dashboard_web_host``."""
+
     dreamer: bool = Field(default=True)
     """If true, this worker pops and processes image-generation jobs (the dreamer role).
 

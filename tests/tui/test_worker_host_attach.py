@@ -44,6 +44,31 @@ def _free_port() -> int:
     return port
 
 
+def test_tray_open_uses_the_dashboard_port_assigned_by_the_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persistent host remembers the resolved web port even though it outlives the launcher."""
+    opened: list[int] = []
+    monkeypatch.setattr("horde_worker_regen.tui.worker_host.tray_module.open_dashboard", opened.append)
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE)
+    host = WorkerHost(supervisor, host="127.0.0.1", port=0, dashboard_port=8123)
+
+    host._open_dashboard()
+
+    assert opened == [8123]
+
+
+def test_running_host_accepts_a_replacement_dashboard_port() -> None:
+    """A surviving host follows a later web launcher's port instead of retaining a stale tray URL."""
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE)
+    host = WorkerHost(supervisor, host="127.0.0.1", port=0, dashboard_port=8000)
+
+    host._enqueue_request(sp.dashboard_port_message(8123))
+    host._drain_requests()
+
+    assert host._dashboard_port == 8123
+
+
 def test_attach_status_frame_populates_liveness() -> None:
     """A running status frame carries the host's loop liveness; stopped/restarting frames clear it.
 

@@ -15,10 +15,10 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Rule, Select, Static
 
 from horde_worker_regen.app_state import DisplayDensity, ExperienceLevel
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
 _LEVEL_BUTTON_IDS: dict[ExperienceLevel, str] = {
     ExperienceLevel.SIMPLE: "experience-simple",
@@ -185,7 +185,7 @@ class DashboardPreferencesView(Vertical):
             self.post_message(self.ThemeChanged(str(event.value)))
 
 
-class ExperienceIntroductionModal(ModalScreen[ExperienceLevel | None]):
+class ExperienceIntroductionModal(ResponsiveModalScreen[ExperienceLevel | None]):
     """One-time notice that the dashboard now opens in Simple.
 
     Shown only to an installation whose durable state predates the experience levels. Its purpose is to
@@ -247,7 +247,7 @@ class ExperienceIntroductionModal(ModalScreen[ExperienceLevel | None]):
             self.dismiss(ExperienceLevel.SIMPLE)
 
 
-class DeveloperWarningModal(ModalScreen[bool]):
+class DeveloperWarningModal(ResponsiveModalScreen[bool]):
     """Confirm the first entry into the Developer level."""
 
     DEFAULT_CSS = """
@@ -303,7 +303,7 @@ class DeveloperWarningModal(ModalScreen[bool]):
             self.dismiss(False)
 
 
-class HelpModal(ModalScreen[None]):
+class HelpModal(ResponsiveModalScreen[None]):
     """Explain the dashboard at the level currently in effect."""
 
     DEFAULT_CSS = """

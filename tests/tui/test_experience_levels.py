@@ -26,6 +26,8 @@ from horde_worker_regen.app_state import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RecentJobRecord,
+    StatsHistoryBackfill,
+    StatsSample,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -711,6 +713,27 @@ def test_the_home_trend_charts_pace_rather_than_the_running_total() -> None:
     assert sum(kudos[:12]) == pytest.approx(1000.0)
     assert completed[12:] == [0.0] * 12, "a stall reads as zero, not as the plateau it reached"
     assert kudos[12:] == [0.0] * 12
+
+
+def test_home_restores_worker_owned_trends_after_a_frontend_reconnect() -> None:
+    """Home's pace charts retain the running worker's history when the browser session is replaced."""
+    home = SimpleHomeView()
+    snapshot = WorkerStateSnapshot(
+        session_start_time=100.0,
+        config=WorkerConfigSummary(dreamer_name="Test", worker_version="0"),
+        stats_history_backfill=StatsHistoryBackfill(
+            recent_samples=[
+                StatsSample(timestamp=110.0, jobs_submitted=2, kudos_this_session=5.0),
+                StatsSample(timestamp=120.0, jobs_submitted=4, kudos_this_session=11.0),
+            ]
+        ),
+    )
+
+    home._restore_worker_trends(snapshot)
+
+    assert list(home._completed_history) == [(110.0, 2), (120.0, 4)]
+    assert [sample[:2] for sample in home._kudos_history] == [(110.0, 5.0), (120.0, 11.0)]
+    assert home._trend_epoch == 100.0
 
 
 def test_the_ticker_says_which_model_earned_what() -> None:

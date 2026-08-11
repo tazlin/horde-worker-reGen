@@ -101,6 +101,14 @@ Screen.level-advanced .field-dangerous {
     display: none;
 }
 
+/* A dashboard served on an address other than loopback is reachable, unauthenticated, by anyone on the
+   network, who could otherwise read or replace the worker's credentials. Withholding them in CSS (as
+   above) keeps the loaded values intact, so a save from such a session still writes the real key back
+   rather than blanking it. */
+Screen.-remote-exposed .field-secret {
+    display: none;
+}
+
 Screen.density-compact .horde-card {
     padding: 0 1;
     margin-bottom: 0;
@@ -113,23 +121,93 @@ Screen.density-compact .horde-hero {
 
 /* At the 80x24 floor a full box border costs two rows per card, which is more than the layout can
    afford. A single left edge keeps each card visually separate for one column and no rows at all;
-   dropping the border outright ran the hero and every card together into one wall of text. */
-Screen.-narrow .horde-hero,
-Screen.-narrow .horde-card {
+   dropping the border outright ran the hero and every card together into one wall of text.
+   Textual stamps one width class at a time, so the phone band has to be named alongside the narrow
+   one everywhere the rule holds for both. */
+Screen.-narrow .horde-hero, Screen.-phone .horde-hero,
+Screen.-narrow .horde-card, Screen.-phone .horde-card {
     padding: 0 1;
     margin-bottom: 0;
     border: none;
 }
 
-Screen.-narrow .horde-hero {
+Screen.-narrow .horde-hero, Screen.-phone .horde-hero {
     border-left: thick $primary;
 }
 
-Screen.-narrow .horde-card {
+Screen.-narrow .horde-card, Screen.-phone .horde-card {
     border-left: solid $horde-edge;
 }
 
 Screen.-narrow #level-indicator {
     min-width: 6;
     padding: 0;
+}
+
+/* Below the terminal floor, which is what a phone browser gets. Anything laid out side by side has to
+   stack: an action row of two buttons already exceeds the width, and a label beside its input leaves
+   the input too narrow to read what has been typed into it. */
+Screen.-phone .horde-actions {
+    layout: vertical;
+}
+
+Screen.-phone Button {
+    height: 4;
+}
+
+Screen.-phone .horde-actions Button {
+    width: 100%;
+    height: 5;
+    margin-right: 0;
+}
+
+/* At the fitted 10px phone font this gives every primary destination a roughly 40px-high target.
+   Keeping the target tall matters more than conserving one terminal row: phone pages scroll, but a
+   one-row tab is too easy to miss with a finger. */
+Screen.-phone Tabs,
+Screen.-phone Tab {
+    height: 4;
+}
+
+Screen.-phone Tab {
+    content-align: center middle;
+}
+
+Screen.-phone .config-row {
+    layout: vertical;
+    height: auto;
+}
+
+/* On a phone, the whole Config page owns vertical scrolling. Keeping the actions and summaries outside
+   the sub-tab's scroll container pins a large preamble above every field; once the software keyboard
+   reduces the row count, that preamble can consume most of the usable screen. */
+Screen.-phone ConfigEditorView {
+    overflow-y: auto;
+}
+
+Screen.-phone ConfigEditorView #config-actions {
+    layout: vertical;
+    height: auto;
+}
+
+Screen.-phone ConfigEditorView #config-actions Button {
+    width: 100%;
+    margin-right: 0;
+}
+
+Screen.-phone ConfigEditorView #config-actions-spacer,
+Screen.-phone ConfigEditorView #config-actions-separator {
+    display: none;
+}
+
+Screen.-phone ConfigEditorView #config-subtabs,
+Screen.-phone ConfigEditorView .config-subtab-scroll {
+    height: auto;
+    overflow-y: hidden;
+}
+
+/* The level is named on the Config page and in the command palette, so the footer keeps the whole row
+   for the shortcuts, which have nowhere else to appear. */
+Screen.-phone #level-indicator {
+    display: none;
 }

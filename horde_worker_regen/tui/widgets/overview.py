@@ -277,6 +277,7 @@ class OverviewView(Vertical):
         self._trend_epoch = time.time()
         self._trend_notice: str | None = None
         self._trend_session_start: float | None = None
+        self._backfilled_session_start: float | None = None
         self._update_info: UpdateInfo | None = None
 
     def set_trend_window(self, window: OverviewTrendWindow) -> None:
@@ -546,6 +547,7 @@ class OverviewView(Vertical):
 
     def _record_trends(self, snapshot: WorkerStateSnapshot) -> None:
         """Append one timestamped sample of GPU-duty, kudos/hr, and the cumulative job counter."""
+        self._restore_worker_trends(snapshot)
         sample = snapshot.latest_stats_sample
         now = sample.timestamp if sample is not None else (snapshot.timestamp or time.time())
         self._trend_session_start = snapshot.session_start_time or self._trend_session_start
@@ -554,12 +556,48 @@ class OverviewView(Vertical):
         eligible_seconds = sample.eligible_seconds_total if sample is not None else snapshot.eligible_seconds_total
         jobs_submitted = sample.jobs_submitted if sample is not None else snapshot.num_jobs_submitted
         forms_submitted = sample.alchemy_total_submitted if sample is not None else snapshot.alchemy_total_submitted
-        if gpu_duty is not None:
+        if gpu_duty is not None and (not self._gpu_duty_history or now > self._gpu_duty_history[-1][0]):
             self._gpu_duty_history.append((now, gpu_duty))
-        if kudos_total is not None:
+        if kudos_total is not None and (not self._kudos_history or now > self._kudos_history[-1][0]):
             self._kudos_history.append((now, kudos_total, eligible_seconds))
-        self._jobs_history.append((now, jobs_submitted))
-        self._forms_history.append((now, forms_submitted))
+        if not self._jobs_history or now > self._jobs_history[-1][0]:
+            self._jobs_history.append((now, jobs_submitted))
+            self._forms_history.append((now, forms_submitted))
+
+    def _restore_worker_trends(self, snapshot: WorkerStateSnapshot) -> None:
+        """Hydrate this frontend's charts from worker-owned history once per worker incarnation.
+
+        Browser sessions are disposable, but the worker host and worker process are not. The snapshot
+        already carries recent exact samples and a decimated all-session series specifically for
+        reconnecting frontends; consuming it here keeps closing a tab from resetting the visible session.
+        A changed session start identifies a genuinely new worker and clears the old incarnation first.
+        """
+        session_start = snapshot.session_start_time
+        if not session_start or session_start == self._backfilled_session_start:
+            return
+        self._gpu_duty_history.clear()
+        self._kudos_history.clear()
+        self._jobs_history.clear()
+        self._forms_history.clear()
+        self._trend_session_start = session_start
+        self._trend_epoch = session_start
+        self._backfilled_session_start = session_start
+
+        backfill = snapshot.stats_history_backfill
+        if backfill is None:
+            return
+        samples_by_timestamp = {
+            sample.timestamp: sample for sample in (*backfill.all_session_samples, *backfill.recent_samples)
+        }
+        for sample in sorted(samples_by_timestamp.values(), key=lambda item: item.timestamp):
+            if sample.gpu_duty_percent is not None:
+                self._gpu_duty_history.append((sample.timestamp, sample.gpu_duty_percent))
+            if sample.kudos_this_session is not None:
+                self._kudos_history.append(
+                    (sample.timestamp, sample.kudos_this_session, sample.eligible_seconds_total)
+                )
+            self._jobs_history.append((sample.timestamp, sample.jobs_submitted))
+            self._forms_history.append((sample.timestamp, sample.alchemy_total_submitted))
 
     def _windowed_float_series(self, samples: deque[tuple[float, float]]) -> list[float]:
         """Return fixed buckets spanning the active trend window and epoch."""
@@ -2253,8 +2291,8 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
 
 
 _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
-    ColumnSpec("Stage", DensityTier.ESSENTIAL, OverviewView._work_stage_cell, width=9, no_wrap=True),
-    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Stage", DensityTier.CRITICAL, OverviewView._work_stage_cell, width=9, no_wrap=True),
+    ColumnSpec("Job", DensityTier.CRITICAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
     ColumnSpec("Order", DensityTier.NORMAL, lambda e: _queue_order_cell(e.queue_order), width=6, no_wrap=True),
     ColumnSpec("Model", DensityTier.ESSENTIAL, OverviewView._work_model_cell, min_width=18, no_wrap=True),
     ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, width=12, no_wrap=True),
@@ -2284,9 +2322,9 @@ _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
 """The work-ledger columns, tagged by the density tier at which each appears."""
 
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
-    ColumnSpec("ID", DensityTier.ESSENTIAL, lambda r: str(r.process.process_id), justify="right", width=3),
+    ColumnSpec("ID", DensityTier.CRITICAL, lambda r: str(r.process.process_id), justify="right", width=3),
     ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: _process_type_label(r.process.process_type), width=9),
-    ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=18, no_wrap=True),
+    ColumnSpec("State", DensityTier.CRITICAL, OverviewView._process_state_cell, width=18, no_wrap=True),
     ColumnSpec("GPU", DensityTier.NORMAL, lambda r: str(r.process.device_index), justify="right", width=4),
     ColumnSpec(
         "Resident model",
@@ -2364,9 +2402,9 @@ def _entry_size(entry: JobQueueEntry) -> str:
 
 
 _QUEUE_COLUMNS: list[ColumnSpec[JobQueueEntry]] = [
-    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Job", DensityTier.CRITICAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
     ColumnSpec("Order", DensityTier.ESSENTIAL, lambda e: _queue_order_cell(e.queue_order), width=6, no_wrap=True),
-    ColumnSpec("Model", DensityTier.ESSENTIAL, lambda e: shorten(e.model, 28), min_width=20, no_wrap=True),
+    ColumnSpec("Model", DensityTier.CRITICAL, lambda e: shorten(e.model, 28), min_width=20, no_wrap=True),
     ColumnSpec("Baseline", DensityTier.NORMAL, lambda e: short_baseline(e.baseline), width=8, no_wrap=True),
     ColumnSpec("Size", DensityTier.NORMAL, _entry_size, justify="right", width=10),
     ColumnSpec("Features", DensityTier.WIDE, _entry_features, min_width=10),
@@ -2399,12 +2437,12 @@ def _recent_kudos(job: RecentJobRecord) -> Text:
 _RECENT_COLUMNS: list[ColumnSpec[RecentJobRecord]] = [
     ColumnSpec(
         "",
-        DensityTier.ESSENTIAL,
+        DensityTier.CRITICAL,
         lambda j: Text("✗", style="red") if j.faulted else Text("✓", style="green"),
         width=2,
     ),
     ColumnSpec("Job", DensityTier.ESSENTIAL, lambda j: job_id_text(j.job_id), width=8, no_wrap=True),
-    ColumnSpec("Model / type", DensityTier.ESSENTIAL, OverviewView._recent_model_cell, min_width=18, no_wrap=True),
+    ColumnSpec("Model / type", DensityTier.CRITICAL, OverviewView._recent_model_cell, min_width=18, no_wrap=True),
     ColumnSpec("Baseline", DensityTier.NORMAL, lambda j: short_baseline(j.baseline), width=8, no_wrap=True),
     ColumnSpec("Size", DensityTier.NORMAL, _recent_size, justify="right", width=10),
     ColumnSpec(

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
+from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 
-class ConfirmModal(ModalScreen[bool]):
+
+class ConfirmModal(ResponsiveModalScreen[bool]):
     """Ask the operator to confirm or cancel a destructive action."""
 
     DEFAULT_CSS = """

@@ -145,4 +145,15 @@ def test_open_dashboard_spawns_launcher_when_none_running(monkeypatch: pytest.Mo
     monkeypatch.setattr(tray.subprocess, "Popen", lambda command, *a, **k: spawned.append(command))
 
     tray.open_dashboard(8000)
-    assert spawned and spawned[0][1:] == ["-m", "horde_worker_regen.tui.web"]
+    assert spawned and spawned[0][1:] == ["-m", "horde_worker_regen.tui.web", "--port", "8000"]
+
+
+def test_open_dashboard_preserves_a_non_default_port_when_spawning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tray must relaunch the dashboard on the same resolved port instead of falling back to 8000."""
+    monkeypatch.setattr(tray, "_web_server_running", lambda port, host="127.0.0.1": False)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(tray.subprocess, "Popen", lambda command, *a, **k: spawned.append(command))
+
+    tray.open_dashboard(8123)
+
+    assert spawned and spawned[0][-2:] == ["--port", "8123"]

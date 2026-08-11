@@ -159,6 +159,7 @@ class ConfigField:
 
 # Section order is the display order within each subtab.
 SECTIONS = (
+    "Dashboard",
     "Connection",
     "Identity",
     "Roles",
@@ -270,6 +271,30 @@ SECTION_GUIDANCE: dict[str, str] = {
 
 # Curated against bridgeData_template.yaml key names (note: dreamer_name, allow_painting, cache_home).
 CONFIG_FIELDS: list[ConfigField] = [
+    # Dashboard
+    ConfigField(
+        "dashboard_web_host",
+        "Web dashboard address",
+        FieldKind.STR,
+        "Dashboard",
+        "Address the browser dashboard binds when launched without --host. 127.0.0.1 keeps it on this "
+        "machine; 0.0.0.0 serves it to your whole network, unauthenticated. Applies the next time the "
+        "dashboard is launched.",
+        explicit_default="127.0.0.1",
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "dashboard_web_port",
+        "Web dashboard port",
+        FieldKind.INT,
+        "Dashboard",
+        "Port the browser dashboard binds when launched without --port. Applies the next time the "
+        "dashboard is launched.",
+        minimum=1,
+        maximum=65535,
+        explicit_default=8000,
+        risk_level="advanced",
+    ),
     # Connection
     ConfigField(
         "api_key",

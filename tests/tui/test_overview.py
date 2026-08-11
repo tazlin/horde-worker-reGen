@@ -19,6 +19,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RamGovernanceSnapshot,
     RecentJobRecord,
     SchedulingGovernanceSnapshot,
+    StatsHistoryBackfill,
+    StatsSample,
     SystemMemorySnapshot,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
@@ -74,6 +76,36 @@ def test_compact_readiness_line_omits_fully_disabled_features() -> None:
     )
     assert OverviewView()._feature_readiness_line(summary) is None
     assert OverviewView()._feature_readiness_line(None) is None
+
+
+def test_overview_restores_worker_owned_trends_after_a_frontend_reconnect() -> None:
+    """A fresh browser session starts with the worker's history instead of a warming-up chart."""
+    view = OverviewView()
+    snapshot = WorkerStateSnapshot(
+        session_start_time=100.0,
+        config=WorkerConfigSummary(dreamer_name="Test", worker_version="0"),
+        stats_history_backfill=StatsHistoryBackfill(
+            all_session_samples=[
+                StatsSample(timestamp=110.0, jobs_submitted=2, kudos_this_session=5.0, eligible_seconds_total=10.0)
+            ],
+            recent_samples=[
+                StatsSample(
+                    timestamp=120.0,
+                    jobs_submitted=4,
+                    kudos_this_session=11.0,
+                    eligible_seconds_total=20.0,
+                    gpu_duty_percent=75.0,
+                )
+            ],
+        ),
+    )
+
+    view._restore_worker_trends(snapshot)
+
+    assert list(view._jobs_history) == [(110.0, 2), (120.0, 4)]
+    assert list(view._kudos_history)[-1] == (120.0, 11.0, 20.0)
+    assert list(view._gpu_duty_history) == [(120.0, 75.0)]
+    assert view._trend_epoch == 100.0
 
 
 def _busy_process() -> ProcessSnapshot:

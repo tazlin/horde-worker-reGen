@@ -49,6 +49,7 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `--config PATH` | `bridgeData.yaml` the config editor reads and writes (default `bridgeData.yaml`). |
 | `--no-auto-restart` | Do not relaunch the worker if it crashes. |
 | `--attach [HOST:PORT]` | Attach to a running worker host instead of owning the worker; the worker survives this session closing. With no value, attaches to `127.0.0.1:7717`. |
+| `--remote-exposed` | Withhold the credential fields from the config editor. Set by the web launcher when it binds a non-loopback address; not normally passed by hand. |
 | `--directml N` | DirectML device index. DirectML is currently unavailable, so this has no working backend. |
 
 The launcher-only flags `--terminal` (in-terminal UI), `--headless` (no UI; runs the foreground worker
@@ -66,10 +67,18 @@ carries two control commands that act on an already-running host and exit withou
 | `--status` | Report whether a worker host is running here and whether its worker is working, then exit (non-zero when nothing is running). |
 | `--stop` | Ask a running host to drain in-flight jobs and stop the worker and host cleanly, then exit. |
 | `--host-port N` | Worker-host socket port the commands target (default `7717`; `$HORDE_WORKER_HOST_PORT` overrides). |
-| `--host HOST`, `--port N` | Bind address/port of the web server itself (default `127.0.0.1:8000`). |
+| `--host HOST`, `--port N` | Bind address/port of the web server itself. Each falls back to `$HORDE_WORKER_WEB_HOST` / `$HORDE_WORKER_WEB_PORT`, then `dashboard_web_host` / `dashboard_web_port` in `bridgeData.yaml`, then `127.0.0.1:8000`. |
+
+Binding anything but loopback serves an **unauthenticated** dashboard: anyone who can reach the port can
+start and stop the worker, change every setting, and read its logs. The launcher prints that warning and
+tells each dashboard session to withhold the API key and Civitai token fields, which is the only
+protection it adds. See
+[What a network-bound dashboard exposes](../how-to/use-the-dashboard.md#what-a-network-bound-dashboard-exposes).
 
 On Windows the worker host also shows a **system-tray icon** while it runs, with *Open dashboard* and
-*Stop worker & exit* actions, so a detached or orphaned worker stays visible and stoppable. See
+*Stop worker & exit* actions. The host remembers the launcher's resolved web port, so *Open dashboard*
+does not assume 8000 when `--port`, the environment, or bridge data selected another one. A detached
+or orphaned worker therefore stays visible and stoppable. See
 [Use the dashboard](../how-to/use-the-dashboard.md#closing-and-reattaching).
 
 ## `horde-duty-report`

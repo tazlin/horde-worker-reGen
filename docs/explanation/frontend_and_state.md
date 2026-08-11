@@ -77,7 +77,10 @@ inside `WorkerRunMetrics`, so the Stats tab does not recompute those tables from
 frame. Alchemy forms remain in run metrics but are excluded from the image model/baseline tables.
 
 Reconnects receive a `StatsHistoryBackfill`: exact recent samples for the largest finite trend window plus a
-decimated all-session series. Consumers still bucket and render locally. Finite trend windows are interpreted
+decimated all-session series. Both the operator Overview and the Simple Home hydrate their client-side
+pace/trend buffers from that backfill once per worker incarnation, so closing and reopening a browser does
+not restart the graphs' apparent session. A changed worker `session_start_time`, rather than a new frontend
+process, is what clears them. Consumers still bucket and render locally. Finite trend windows are interpreted
 as fixed spans from `now - window` to `now`; empty early buckets render as no activity, which keeps a 5m or
 60m graph visually spanning the selected duration even while the worker is warming up. Changing the selected
 window is only a view change over retained history; it does not move the trend epoch. `All` spans from the
@@ -129,6 +132,12 @@ this same supervisor transition; socket
 clients merely enqueue the intent on the host's single owner thread and present
 `STOPPING` locally until the host reports a status of its own.
 
+An attached client also treats the interval before the host's first status frame as unresolved, not
+stopped. Its constructor's stopped-looking values are only placeholders. The launch flow waits through
+that short interval, then skips the worker-start choice modal when the authoritative status says the
+worker is already running. The title clock likewise uses the snapshot's worker `session_start_time`
+once available, so it measures the contribution session rather than the age of the current browser tab.
+
 ### The wedge backstop and its budgeted forgiveness
 
 An exit-only supervisor never relaunches a worker that does not exit, so the
@@ -168,8 +177,71 @@ In served mode (`tui/web.py`, the default for non-technical users) a single
 `WorkerHost` owns one worker independently of any browser session, so closing a
 browser tab detaches the client but **leaves the worker running**. Network
 exposure is conservative: the web server and the worker host both bind
-`127.0.0.1` by default; binding the LAN is a deliberate power-user action
-(`--host` / `HORDE_WORKER_WEB_HOST`) that exposes an unauthenticated dashboard.
+`127.0.0.1` by default. The worker host is loopback-only always; the web server's
+address is a deliberate power-user choice, resolved from `--host` / `--port`, then
+`HORDE_WORKER_WEB_HOST` / `HORDE_WORKER_WEB_PORT`, then `dashboard_web_host` /
+`dashboard_web_port` in the bridge data. The launcher reads those two keys through
+`config_form.load_config` rather than `reGenBridgeData`, keeping the SDK import chain
+out of a process that may only ever run the terminal fallback.
+
+The resolved web port is also forwarded to a newly spawned `WorkerHost`. The host retains it for its
+Windows tray action, so **Open dashboard** probes and, when needed, relaunches the server on the configured
+or command-line port rather than assuming 8000.
+
+Binding anything but loopback exposes an unauthenticated dashboard, which the launcher
+both prints a warning about and reflects into each session: `_build_served_command`
+appends `--remote-exposed`, and the app stamps that as a Screen class so the stylesheet
+withholds the fields tagged `secret` in the config catalog. Withholding happens in CSS,
+matching how the experience levels gate their fields, so the widget stays mounted with
+its loaded value and a save from such a session writes the real key back instead of
+blanking it. The measure is narrow on purpose: it stops a visitor reading or replacing
+the credentials, and nothing else about an unauthenticated control surface.
+
+That middleware also repairs the page's own addressing. textual-serve builds every URL it
+emits (the session websocket above all) from its `public_url`, which defaults to the bind
+address, so binding every interface yields the literal `http://0.0.0.0:<port>`. No client can
+route to that: the page loads, its websocket never opens, and the browser sits on the splash
+screen indefinitely. `_rewrite_page_origin` therefore swaps that origin, per request, for the
+scheme and host the request actually arrived on. It runs only for a wildcard bind, so an
+explicitly addressed server (or a deliberate `public_url` behind a reverse proxy) is left alone.
+
+The served page is also fitted for a phone. `_build_server` subclasses textual-serve's
+`Server` to add an aiohttp middleware that injects a `width=device-width` viewport tag,
+a script sizing the terminal font toward `MOBILE_TARGET_COLUMNS` (with a 10px readability
+floor), visual-viewport sizing, and touch handling. The viewport and font fitting only work
+as a pair: without the tag a phone lays the page out at a notional desktop width and
+scales it down to nothing, and with the tag alone the default 16px cell leaves roughly
+40 columns. xterm.js disables its native touch scroll while Textual mouse reporting is
+active, so the injected handler translates a one-finger vertical drag anywhere over the
+terminal into wheel events Textual already understands. It also suppresses the irrelevant
+xterm scrollback bar; users no longer have to target either narrow right-edge scrollbar.
+The injection is marker-based and passes unrecognised markup through, so an
+upstream template change degrades to desktop behaviour rather than breaking the page.
+`?fontsize=` remains the manual override.
+
+All Textual controls are terminal cells painted into xterm.js's canvas, not browser form controls.
+xterm.js routes every key through one hidden textarea and focuses that textarea when the terminal is
+tapped; on a phone that normally opens the software keyboard even when the painted control was a tab.
+The served page makes that textarea read-only with `inputmode=none` on coarse-pointer devices and adds
+a real 48-pixel browser button to opt into typing. The button re-enables and focuses the transport
+textarea without changing Textual's currently focused widget. It floats low on the right edge while
+reserving a footer-sized lane for **Palette**, and follows the reduced visual viewport while the keyboard
+is open.
+
+Mobile browser chrome makes CSS `100vh` unreliable: it can describe space behind the address or toolbar.
+The injection tracks `window.visualViewport`, gives the terminal its current pixel dimensions, and asks
+xterm to refit when the viewport resizes or moves. This keeps the final rows inside the visible area as
+browser chrome or the software keyboard changes height. A phone-width Textual resize also schedules
+`scroll_visible()` for the focused widget after layout, because preserving focus alone does not bring an
+input above the keyboard's new top edge. Config additionally changes from a pinned preamble plus nested
+field scroller to one page-level phone scroller; its actions, summaries, and sub-tab strip can all leave
+the reduced viewport while the operator reads or edits later fields.
+
+The same touch handler axis-locks a drag once it clears a small movement threshold. Vertical movement
+continues to emit ordinary wheel packets for the active page. Horizontal movement emits `Ctrl`+wheel at
+the touched coordinates; Textual maps that to native horizontal scrolling. (`Shift` would be the usual
+desktop convention, but xterm discards Shift-wheel before encoding an application-mouse packet.) Both
+the main `Tabs` and Config's nested `Tabs` therefore respond without hard-coded screen regions.
 
 The host's lifetime is decoupled from the launcher that started it. `tui/web.py`
 spawns a host only when one is not already listening, and on a *clean* exit it
@@ -183,7 +255,9 @@ status frame and `LIFECYCLE_SHUTDOWN` the host already speaks), and, on Windows,
 **system-tray icon** the host itself shows (`tui/tray.py`). The tray lives on the
 host rather than the launcher precisely because the host is what survives, so an
 orphaned worker surfaces as a visible icon with *Open dashboard* and *Stop*
-actions instead of an invisible process. The tray is best-effort and
+actions instead of an invisible process. The launcher passes the resolved web port when it starts a
+host and sends a `dashboard_port` frame when it reuses a surviving host, so *Open dashboard* follows
+port changes without restarting the worker. The tray is best-effort and
 import-guarded (`pystray`/`Pillow`, Windows-only), so its absence never affects
 the worker.
 

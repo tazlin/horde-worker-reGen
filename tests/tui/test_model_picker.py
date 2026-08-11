@@ -14,7 +14,13 @@ from textual.screen import Screen
 from textual.widgets import Button, Checkbox, DataTable, Input, Select
 
 from horde_worker_regen.tui.model_catalog import ModelInfo
-from horde_worker_regen.tui.widgets.model_picker import _MARKER_COL, ModelPickerModal, ModelPickerResult
+from horde_worker_regen.tui.widgets.model_picker import (
+    _MARKER_COL,
+    _NAME_WIDTH,
+    _PHONE_COLUMN_WIDTHS,
+    ModelPickerModal,
+    ModelPickerResult,
+)
 
 _MODELS = [
     ModelInfo(
@@ -381,3 +387,25 @@ async def test_model_picker_clear_marks_requires_confirmation(monkeypatch: pytes
         await pilot.click("#confirm-yes")
         await pilot.pause()
         assert not modal._has_marks()
+
+
+@pytest.mark.parametrize(
+    ("terminal_width", "expected_model_column_width"),
+    [(60, _PHONE_COLUMN_WIDTHS[1]), (130, _NAME_WIDTH)],
+)
+async def test_picker_columns_fit_the_width_band_it_opens_at(
+    terminal_width: int, expected_model_column_width: int
+) -> None:
+    """A DataTable cannot shed columns, so the picker narrows them when it opens on a phone."""
+    app = _PickerHost()
+    async with app.run_test(size=(terminal_width, 44)) as pilot:
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelPickerModal)
+        table = modal.query_one("#picker-table", DataTable)
+        widths = [column.width for column in table.columns.values()]
+
+        assert widths[1] == expected_model_column_width
+        # The mark and the model name are what a choice is made from, so they must be reachable
+        # without scrolling the table sideways inside a dialog that is itself only 90% of the screen.
+        assert sum(widths[:2]) < terminal_width

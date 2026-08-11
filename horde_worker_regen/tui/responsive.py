@@ -5,10 +5,10 @@ truncates cells instead, which is what turns a wide table into mush on an 80-col
 shedding has to happen here, in Python, before the columns are added.
 
 Each table declares its columns as :class:`ColumnSpec`s tagged with a :class:`DensityTier`. At render time
-:func:`select_columns` keeps the essentials and then admits each higher tier only while the running width
-budget still fits the available space, so a narrow terminal sheds the least-important columns first and a
-wide terminal shows everything. The budget is derived from the columns' own declared widths, so it stays
-honest as columns are added or retimed rather than relying on hand-tuned width thresholds.
+:func:`select_columns` keeps the row-identity columns and then admits each higher tier only while the
+running width budget still fits the available space, so a narrow terminal sheds the least-important
+columns first and a wide terminal shows everything. The budget is derived from the columns' own declared
+widths, so it stays honest as columns are added or retimed rather than relying on hand-tuned thresholds.
 """
 
 from __future__ import annotations
@@ -20,6 +20,26 @@ from typing import Literal
 
 from rich.table import Table
 from rich.text import Text
+from textual.screen import ModalScreen
+
+PHONE_BAND_MAX_WIDTH = 80
+"""Widths below this are the phone band: narrower than the 80-column terminal floor the layout targets.
+
+Lives here rather than beside the app's breakpoints so the widgets that size themselves in Python can
+share it without importing the app module they are imported by.
+"""
+
+
+class ResponsiveModalScreen[ResultType](ModalScreen[ResultType]):
+    """Modal screen that receives the same phone-width marker as the app's default screen.
+
+    Textual resolves breakpoints from the active Screen class. A pushed ModalScreen therefore does not
+    inherit the App's breakpoint list; without this base, phone rules silently stop applying precisely
+    while a dialog is open.
+    """
+
+    HORIZONTAL_BREAKPOINTS = [(0, "-phone"), (PHONE_BAND_MAX_WIDTH, "-normal")]
+
 
 Cell = str | Text
 """What a column's render callable returns: a plain string or a styled Rich ``Text``."""
@@ -34,22 +54,30 @@ class DensityTier(enum.IntEnum):
     width budget and the F6 intent ceiling lean on.
     """
 
-    ESSENTIAL = 0
-    """Shown at every width: the few columns that answer "what is this slot doing right now"."""
-    NORMAL = 1
+    CRITICAL = 0
+    """Shown at every width: the smallest set that keeps a row identifiable and worth reading.
+
+    A phone browser is narrower than any terminal the layout was drawn for, and the essentials alone
+    outgrew it. This is the floor beneath them, and shedding into it is the last resort: a table below
+    this tier would carry rows that cannot be told apart, which is worse than no table.
+    """
+    ESSENTIAL = 1
+    """The columns that answer "what is this slot doing right now"; the first thing shed on a phone."""
+    NORMAL = 2
     """The everyday columns; admitted once the terminal is wide enough to carry them."""
-    WIDE = 2
+    WIDE = 3
     """The enriched columns that complete the picture on a roomy terminal."""
-    DETAILS = 3
+    DETAILS = 4
     """Diagnostic columns the F6 details view requests, shown only when both intent and width allow."""
 
 
 _ASCENDING_OPTIONAL_TIERS: tuple[DensityTier, ...] = (
+    DensityTier.ESSENTIAL,
     DensityTier.NORMAL,
     DensityTier.WIDE,
     DensityTier.DETAILS,
 )
-"""The tiers admitted on top of ESSENTIAL, in the order the width budget considers them."""
+"""The tiers admitted on top of CRITICAL, in the order the width budget considers them."""
 
 
 @dataclass(frozen=True)
@@ -126,15 +154,15 @@ def select_columns[T](
     """Pick the columns to draw: everything ``ceiling`` permits, clamped to what ``available_width`` fits.
 
     ``available_width`` of None disables shedding (used before the widget has been laid out, and by tests
-    that render at a fixed console width): every permitted column is returned. Otherwise the essentials
-    are always kept and each higher tier is admitted only while the whole set still fits the width, so the
-    least-important columns shed first.
+    that render at a fixed console width): every permitted column is returned. Otherwise the row-identity
+    columns are always kept and each higher tier is admitted only while the whole set still fits the
+    width, so the least-important columns shed first.
     """
     permitted = [spec for spec in specs if spec.tier <= ceiling]
     if available_width is None:
         return ColumnLayout(columns=list(permitted), hidden_count=0, needed_width=None)
 
-    fitted = DensityTier.ESSENTIAL
+    fitted = DensityTier.CRITICAL
     for tier in _ASCENDING_OPTIONAL_TIERS:
         if tier > ceiling:
             break

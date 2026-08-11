@@ -115,6 +115,14 @@ stats_purge_max_age_days: 30
 stats_purge_max_total_gb: 5
 stats_autozip_enabled: true
 
+# Where the browser dashboard's web server binds, when horde-worker-web is launched without --host /
+# --port. Read by the dashboard launcher, not by the worker. Loopback keeps the dashboard reachable only
+# from this machine; any other address (0.0.0.0 binds every interface) serves an UNAUTHENTICATED
+# dashboard to anyone who can route to the port, who can then start and stop the worker, edit this file
+# through the config editor, and read the worker's logs. Only bind the network on a trusted one.
+# dashboard_web_host: 127.0.0.1
+# dashboard_web_port: 8000
+
 #######################################
 ## Dreamer (Stable Diffusion Worker) ##
 #######################################

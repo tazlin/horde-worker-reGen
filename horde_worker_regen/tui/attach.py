@@ -200,6 +200,12 @@ class AttachedWorkerSupervisor:
         self._restart_attempts = 0
         self._stall_stats = SupervisorStallStats.quiet()
         self._worker_running = False
+        self._lifecycle_resolved = False
+        """Whether this connection has received the host's first authoritative status frame.
+
+        A connected socket alone is not enough: between connect and the first broadcast the constructor's
+        STOPPED defaults are placeholders, not evidence that the host's worker is actually stopped.
+        """
         self._stop_requested = False
         """Whether this session has asked the host to stop the worker and is still awaiting its verdict.
 
@@ -246,6 +252,11 @@ class AttachedWorkerSupervisor:
     def connected(self) -> bool:
         """Whether the client currently has a live socket to the host."""
         return self._socket is not None
+
+    @property
+    def lifecycle_resolved(self) -> bool:
+        """Whether the host has reported the worker lifecycle on the current connection."""
+        return self._lifecycle_resolved
 
     def is_alive(self) -> bool:
         """Whether the host reports its worker process as running."""
@@ -467,6 +478,7 @@ class AttachedWorkerSupervisor:
 
     def _mark_disconnected(self) -> None:
         """Reflect a lost/absent host connection as a stopped, not-running worker."""
+        self._lifecycle_resolved = False
         self._status = SupervisorStatus.STOPPED
         self._worker_running = False
         self._stop_requested = False
@@ -498,6 +510,7 @@ class AttachedWorkerSupervisor:
 
     def _apply_status(self, message: dict[str, object]) -> None:
         """Apply a status frame's fields (status / restart count / running / mode / host stall counters)."""
+        self._lifecycle_resolved = True
         status_value = message.get("status")
         if isinstance(status_value, str):
             with contextlib.suppress(ValueError):

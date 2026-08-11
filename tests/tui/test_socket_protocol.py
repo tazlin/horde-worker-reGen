@@ -67,6 +67,11 @@ def test_command_roundtrip() -> None:
         right.close()
 
 
+def test_dashboard_port_message() -> None:
+    """The launcher can update a persistent host's tray URL without restarting its worker."""
+    assert sp.dashboard_port_message(8123) == {"type": sp.MSG_DASHBOARD_PORT, "port": 8123}
+
+
 def test_recv_frame_returns_none_on_clean_close() -> None:
     """recv_frame yields None (not an error) when the peer closes the connection."""
     left, right = socket.socketpair()

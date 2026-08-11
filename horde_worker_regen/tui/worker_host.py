@@ -57,12 +57,14 @@ class WorkerHost:
         *,
         host: str = sp.DEFAULT_HOST_ADDRESS,
         port: int = sp.DEFAULT_HOST_PORT,
+        dashboard_port: int = 8000,
         control_interval: float = 0.25,
     ) -> None:
         """Store the (unstarted) supervisor and the address to bind; does not bind until :meth:`serve_forever`."""
         self._supervisor = supervisor
         self._host = host
         self._port = port
+        self._dashboard_port = dashboard_port
         self._control_interval = control_interval
 
         self._server_socket: socket.socket | None = None
@@ -128,9 +130,8 @@ class WorkerHost:
         return f"Worker {running} ({self._supervisor.mode.value})"
 
     def _open_dashboard(self) -> None:
-        """Open the dashboard against this host, honouring a non-default web port from the environment."""
-        port_env = os.getenv("HORDE_WORKER_WEB_PORT")
-        tray_module.open_dashboard(int(port_env) if port_env else 8000)
+        """Open the dashboard on the resolved port the launcher assigned to this host."""
+        tray_module.open_dashboard(self._dashboard_port)
 
     # endregion
 
@@ -190,6 +191,10 @@ class WorkerHost:
             action = message.get("action")
             if isinstance(action, str):
                 self._requests.put(("lifecycle", action))
+        elif message_type == sp.MSG_DASHBOARD_PORT:
+            port = message.get("port")
+            if isinstance(port, int) and 1 <= port <= 65535:
+                self._requests.put(("dashboard_port", port))
 
     def _drop_client(self, client: socket.socket) -> None:
         """Remove a client from the broadcast set and close its socket (idempotent)."""
@@ -221,6 +226,8 @@ class WorkerHost:
                 self._supervisor.send_command(payload)
             elif kind == "lifecycle" and isinstance(payload, str):
                 self._apply_lifecycle(payload)
+            elif kind == "dashboard_port" and isinstance(payload, int):
+                self._dashboard_port = payload
 
     def _apply_lifecycle(self, action: str) -> None:
         """Start, stop, or restart the worker process in response to a client request.
@@ -323,6 +330,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--host", type=str, default=sp.DEFAULT_HOST_ADDRESS, help="Address to bind.")
     parser.add_argument("--port", type=int, default=sp.DEFAULT_HOST_PORT, help="Port to bind.")
     parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8000,
+        help="Resolved browser-dashboard port used by the tray's Open dashboard action.",
+    )
+    parser.add_argument(
         "--process-mode",
         choices=[mode.value for mode in WorkerProcessMode],
         default=WorkerProcessMode.REAL.value,
@@ -369,7 +382,7 @@ def main(argv: list[str] | None = None) -> None:
         auto_restart=not args.no_auto_restart,
         owned_registry=owned_registry,
     )
-    host = WorkerHost(supervisor, host=args.host, port=args.port)
+    host = WorkerHost(supervisor, host=args.host, port=args.port, dashboard_port=args.dashboard_port)
     try:
         host.serve_forever()
     except KeyboardInterrupt:

@@ -141,7 +141,7 @@ def _faults_cell(row: _CardRow) -> Text:
 
 
 _CARD_COLUMNS: list[ColumnSpec[_CardRow]] = [
-    ColumnSpec("GPU", DensityTier.ESSENTIAL, _gpu_cell, min_width=10, no_wrap=True),
+    ColumnSpec("GPU", DensityTier.CRITICAL, _gpu_cell, min_width=10, no_wrap=True),
     ColumnSpec("VRAM", DensityTier.ESSENTIAL, _vram_cell, min_width=22, no_wrap=True),
     ColumnSpec("Contexts", DensityTier.ESSENTIAL, _contexts_cell, justify="right", width=10, no_wrap=True),
     ColumnSpec("it/s", DensityTier.NORMAL, _its_cell, justify="right", width=9),
