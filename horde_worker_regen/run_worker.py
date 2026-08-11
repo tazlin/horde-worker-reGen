@@ -1,24 +1,34 @@
 """The main entry point for the reGen worker."""
 
-import sys
-
-if sys.platform == "win32":
-    import asyncio
-
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 import argparse
 import contextlib
 import dataclasses
 import io
 import multiprocessing
 import os
+import sys
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from typing import override
 
 import regex as re
 from loguru import logger
+
+
+def _configure_worker_event_loop_policy() -> None:
+    """Select the Windows loop needed by worker networking, without mutating importing frontends.
+
+    Some worker HTTP dependencies require a selector loop on Windows. The worker module is also imported
+    for the pure-data :class:`WorkerLaunchOptions` type by the TUI, worker host, and native web adapter.
+    Applying the policy at module import poisoned textual-serve's parent loop, whose per-browser terminal
+    sessions require Windows subprocess transports and therefore the default proactor implementation.
+    Keep the compatibility choice scoped to the process that is actually about to run the worker.
+    """
+    if sys.platform != "win32":
+        return
+    import asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def main(
@@ -31,6 +41,8 @@ def main(
     supervisor_connection: Connection | None = None,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
+    _configure_worker_event_loop_policy()
+
     from horde_worker_regen.process_management.fd_limits import raise_open_file_soft_limit
 
     # Harden the whole process tree against descriptor leaks before any child is spawned: children inherit
