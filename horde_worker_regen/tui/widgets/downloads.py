@@ -165,7 +165,7 @@ class DownloadsView(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         """Lay out the controls row, phase banner, disk-plan panel, current download, queue, failures."""
-        with Horizontal(id="downloads-controls"):
+        with Horizontal(id="downloads-controls", classes="responsive-toolbar"):
             yield Button("Pause downloads", id="downloads-pause")
             yield Input(placeholder="rate limit KB/s (0 = off)", id="downloads-rate", type="integer")
             yield Button("Apply limit", id="downloads-rate-apply")

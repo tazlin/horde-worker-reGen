@@ -60,6 +60,7 @@ from horde_worker_regen.tui.health import (
     summarize_skips,
 )
 from horde_worker_regen.tui.responsive import (
+    PHONE_BAND_MAX_WIDTH,
     ColumnSpec,
     DensityTier,
     add_columns,
@@ -405,6 +406,7 @@ class OverviewView(Vertical):
         # The laid-out content width drives column shedding. It is 0 before the first layout pass, where
         # None disables shedding so the first frame renders fully.
         width = self.content_size.width or None
+        phone = 0 < self.size.width < PHONE_BAND_MAX_WIDTH
 
         effective_hidden = frozenset() if reveal_hidden else hidden_keys
         hidden_nodes = {element.node_id for element in OVERVIEW_ELEMENTS if element.key in effective_hidden}
@@ -481,13 +483,16 @@ class OverviewView(Vertical):
             return
 
         if show["#overview-hero"]:
-            self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
+            self.query_one("#overview-hero", Static).update(
+                self._render_hero(report, snapshot, frame, compact=phone),
+            )
         if show["#overview-health"]:
             self.query_one("#overview-health", Static).update(
                 self._render_health(
                     report,
                     snapshot.feature_readiness if snapshot is not None else None,
                     models_loaded=len(snapshot.active_models) if snapshot is not None else None,
+                    compact=phone,
                 ),
             )
         if snapshot is None:
@@ -506,11 +511,15 @@ class OverviewView(Vertical):
         if show["#overview-queue"]:
             self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot, available_width=width))
         if show["#overview-gpus"]:
-            self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
+            self.query_one("#overview-gpus", Static).update(
+                self._render_gpus_strip(snapshot, detailed=detailed, compact=phone),
+            )
         if show["#overview-trends"]:
-            self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
+            self.query_one("#overview-trends", Static).update(self._render_trends(snapshot, compact=phone))
         if show["#overview-pipeline"]:
-            self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
+            self.query_one("#overview-pipeline", Static).update(
+                self._render_pipeline_strip(snapshot, compact=phone),
+            )
         if show["#overview-work"]:
             self.query_one("#overview-work", Static).update(
                 self._render_work_ledger(
@@ -525,17 +534,23 @@ class OverviewView(Vertical):
                 self._render_process_table(snapshot, detailed=detailed, available_width=width),
             )
         if show["#overview-worker"]:
-            self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
+            self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot, compact=phone))
         if show["#overview-alchemy"]:
-            self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
+            self.query_one("#overview-alchemy", Static).update(
+                self._render_alchemy_panel(snapshot, compact=phone),
+            )
         if show["#overview-recent"]:
             self.query_one("#overview-recent", Static).update(
                 self._render_recent_jobs(snapshot, available_width=width)
             )
         if show["#overview-residency"] and residency is not None:
-            self.query_one("#overview-residency", Static).update(self._render_residency_panel(residency))
+            self.query_one("#overview-residency", Static).update(
+                self._render_residency_panel(residency, compact=phone),
+            )
         if show["#overview-model-pool"] and model_pool is not None:
-            self.query_one("#overview-model-pool", Static).update(self._render_model_pool_panel(model_pool))
+            self.query_one("#overview-model-pool", Static).update(
+                self._render_model_pool_panel(model_pool, compact=phone),
+            )
 
     def _maybe_record_trends(self, snapshot: WorkerStateSnapshot) -> None:
         """Record a trend sample at most once per :data:`_TREND_SAMPLE_INTERVAL` of wall-clock time."""
@@ -645,8 +660,17 @@ class OverviewView(Vertical):
         )
         return Panel(line, title="Update available", title_align="left", border_style="yellow", padding=(0, 1))
 
-    def _render_hero(self, report: HealthReport, snapshot: WorkerStateSnapshot | None, frame: int) -> Panel:
+    def _render_hero(
+        self,
+        report: HealthReport,
+        snapshot: WorkerStateSnapshot | None,
+        frame: int,
+        *,
+        compact: bool = False,
+    ) -> Panel:
         """Render the headline status panel."""
+        if compact:
+            return self._render_phone_hero(report, snapshot, frame)
         title = Text.assemble(
             self._hero_glyph(report, frame),
             ("  ", ""),
@@ -677,6 +701,82 @@ class OverviewView(Vertical):
                         style="yellow",
                     )
                 )
+            if snapshot.whole_card_residency.active:
+                body.append(self._residency_banner(snapshot.whole_card_residency))
+            for message in snapshot.api_messages[:3]:
+                body.append(Text.assemble(("✉ ", "cyan"), (message, "italic cyan")))
+
+        border = "red" if report.severity is HealthStatus.ERROR else report.severity.colour
+        return Panel(Group(*body), title=title, title_align="left", border_style=border, padding=(0, 1))
+
+    def _render_phone_hero(
+        self,
+        report: HealthReport,
+        snapshot: WorkerStateSnapshot | None,
+        frame: int,
+    ) -> Panel:
+        """Render the phone headline as short, independently wrapping facts instead of desktop prose rows."""
+        title = Text.assemble(
+            self._hero_glyph(report, frame),
+            ("  ", ""),
+            (report.phase.value.upper(), f"bold {report.severity.colour}"),
+        )
+        body: list[Text] = [Text(report.headline, style="bold"), Text(report.detail, style="grey70")]
+        if snapshot is not None:
+            if self._is_alchemist_only(snapshot):
+                body.append(self._alchemist_only_identity_line(snapshot))
+                completed = snapshot.alchemy_total_submitted
+                faulted = snapshot.alchemy_total_faulted
+                work_label = "forms"
+                active = snapshot.alchemy_forms_in_flight
+                queued = snapshot.alchemy_forms_pending
+            else:
+                completed = snapshot.num_jobs_submitted
+                faulted = snapshot.num_jobs_faulted
+                work_label = "jobs"
+                active = snapshot.jobs_in_progress
+                queued = snapshot.jobs_pending_inference
+            kudos = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+            body.append(
+                Text.assemble(
+                    (f"{completed:,}", "bold"),
+                    (f" {work_label} done", "grey50"),
+                    ("  ·  ", "grey37"),
+                    (f"{faulted:,}", "red" if faulted else "grey70"),
+                    (" faulted", "grey50"),
+                ),
+            )
+            body.append(Text.assemble((kudos, "bold cyan"), (" kudos/hr", "grey50")))
+            body.append(
+                Text.assemble(
+                    ("Active ", "grey50"),
+                    (str(active), "bold"),
+                    ("  ·  queued ", "grey50"),
+                    (str(queued), "bold"),
+                ),
+            )
+            age = time.time() - snapshot.timestamp if snapshot.timestamp else None
+            last_pop = (
+                f"{human_duration(snapshot.seconds_since_last_pop)} ago"
+                if snapshot.seconds_since_last_pop is not None
+                else "never"
+            )
+            body.append(
+                Text.assemble(
+                    ("Last pop ", "grey50"),
+                    (last_pop, "grey70"),
+                    ("  ·  updated ", "grey50"),
+                    (f"{human_duration(age)} ago", "grey70"),
+                ),
+            )
+            for line in (self._memory_line(snapshot), self._download_line(snapshot)):
+                if line is not None:
+                    body.append(line)
+            why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
+            if why_no_work:
+                body.append(Text.assemble(("No work: ", "yellow"), (why_no_work, "italic yellow")))
+            if snapshot.lora_pops_blocked_by_downloads:
+                body.append(Text("LoRA pops paused for downloads.", style="yellow"))
             if snapshot.whole_card_residency.active:
                 body.append(self._residency_banner(snapshot.whole_card_residency))
             for message in snapshot.api_messages[:3]:
@@ -877,28 +977,42 @@ class OverviewView(Vertical):
         return f"Whole-card residency: {' + '.join(clauses)} for {model} (intentional)"
 
     @staticmethod
-    def _render_residency_panel(residency: WholeCardResidencyStatus) -> Panel:
+    def _render_residency_panel(residency: WholeCardResidencyStatus, *, compact: bool = False) -> Panel:
         """Render the whole-card residency posture and, when active, the live forecast numbers.
 
         A details-only panel: the operationally-relevant config, plus while a residency is held the hard
         VRAM figures behind the decision (weights, the per-step reserve, the free achievable alone) that
         are a hair too technical for the normal view.
         """
-        grid = Table.grid(padding=(0, 2))
+        grid = Table.grid(padding=(0, 1 if compact else 2))
         grid.add_column(justify="right", style="bold cyan", no_wrap=True)
         grid.add_column()
-        grid.add_column(justify="right", style="bold cyan", no_wrap=True)
-        grid.add_column()
+        if not compact:
+            grid.add_column(justify="right", style="bold cyan", no_wrap=True)
+            grid.add_column()
 
-        grid.add_row(
+        def add_pair(
+            left_label: str,
+            left_value: RenderableType,
+            right_label: str,
+            right_value: RenderableType,
+        ) -> None:
+            if compact:
+                grid.add_row(left_label, left_value)
+                if right_label:
+                    grid.add_row(right_label, right_value)
+            else:
+                grid.add_row(left_label, left_value, right_label, right_value)
+
+        add_pair(
             "Enabled",
             "yes" if residency.enabled else "no",
             "Safety off-GPU",
             "yes" if residency.safety_off_gpu_enabled else "no",
         )
         overhead = human_mb(residency.per_process_overhead_mb) if residency.per_process_overhead_mb else "auto"
-        grid.add_row("Cooldown", f"{residency.cooldown_seconds}s", "Per-process overhead", overhead)
-        grid.add_row(
+        add_pair("Cooldown", f"{residency.cooldown_seconds}s", "Per-process overhead", overhead)
+        add_pair(
             "Total VRAM",
             human_mb(residency.total_vram_mb) if residency.total_vram_mb else "-",
             "",
@@ -906,20 +1020,20 @@ class OverviewView(Vertical):
         )
 
         if residency.active:
-            grid.add_row(
+            add_pair(
                 "Phase",
                 Text(residency.phase or "-", style="#f0beff"),
                 "Model",
                 residency.model or "-",
             )
-            grid.add_row(
+            add_pair(
                 "Processes",
                 f"{residency.processes_now} / {residency.processes_target} (of {residency.processes_max})",
                 "Safety paused",
                 "yes" if residency.safety_paused else "no",
             )
-            grid.add_row("Weights", human_mb(residency.weights_mb), "Step reserve", human_mb(residency.reserve_mb))
-            grid.add_row(
+            add_pair("Weights", human_mb(residency.weights_mb), "Step reserve", human_mb(residency.reserve_mb))
+            add_pair(
                 "Free at load",
                 human_mb(residency.free_now_mb),
                 "Free if alone",
@@ -931,12 +1045,12 @@ class OverviewView(Vertical):
                 if residency.cooldown_remaining_seconds is not None
                 else "-"
             )
-            grid.add_row("Max co-resident", max_resident, "Restores in", cooldown_left)
+            add_pair("Max co-resident", max_resident, "Restores in", cooldown_left)
 
         # The claim is what the worker is asking the horde for, which changes what arrives rather than only
         # what runs, so it is shown whether or not a residency reads as active right now.
         if residency.pop_claim_model is not None:
-            grid.add_row(
+            add_pair(
                 "Pop claim",
                 Text(residency.pop_claim_model, style="#f0beff"),
                 "Claim ends in",
@@ -945,7 +1059,7 @@ class OverviewView(Vertical):
                 else "-",
             )
         elif residency.pop_claim_release is not None:
-            grid.add_row(
+            add_pair(
                 "Pop claim",
                 Text("released", style="grey62"),
                 "Because",
@@ -970,37 +1084,45 @@ class OverviewView(Vertical):
         )
 
     @staticmethod
-    def _render_model_pool_panel(pool: ModelPoolSnapshot) -> Panel:
+    def _render_model_pool_panel(pool: ModelPoolSnapshot, *, compact: bool = False) -> Panel:
         """Render a compact fixed model pool panel with residency and pop-match evidence.
 
         Shares the Insights seats-table vocabulary (Model pool, seats, fixed/free lane, bench) so an operator
         reads the two surfaces as one feature. The caller hides the panel entirely when the pool is disabled;
         fixed-lane match and resident-hit counts are added only after a fixed-lane pop has been tallied.
         """
-        seats_line = Text()
+        seat_lines: list[Text] = []
         visible_seats = [seat for seat in pool.seats if seat.model is not None or seat.pending_model is not None]
         if not visible_seats:
+            seats_line = Text()
             seats_line.append("no seated models yet", style="grey50")
+            seat_lines.append(seats_line)
         else:
             for index, seat in enumerate(visible_seats):
-                if index:
+                if compact or index == 0:
+                    seat_line = Text()
+                    seat_lines.append(seat_line)
+                    seats_line = seat_line
+                else:
                     seats_line.append("   ")
+                    seat_line = seats_line
                 glyph, glyph_style = _POOL_SOURCE_GLYPHS.get(seat.source or "", ((seat.source or "?")[:1], "grey70"))
                 downloading = seat.pending_model is not None or seat.state == "PENDING_DOWNLOAD"
-                seats_line.append(seat.model or seat.pending_model or "-", style="grey70")
+                seat_line.append(seat.model or seat.pending_model or "-", style="grey70")
                 if seat.model is not None and seat.pending_model is not None:
-                    seats_line.append(f" -> {seat.pending_model}", style="yellow")
-                seats_line.append(" ")
-                seats_line.append(glyph, style=glyph_style)
-                seats_line.append("  ")
+                    seat_line.append(f" -> {seat.pending_model}", style="yellow")
+                seat_line.append(" ")
+                seat_line.append(glyph, style=glyph_style)
+                seat_line.append("  ")
                 if downloading:
-                    seats_line.append("downloading", style="yellow")
+                    seat_line.append("downloading", style="yellow")
                 elif seat.readiness == "RESIDENT":
                     devices = ",".join(str(index) for index in seat.resident_device_indices)
                     suffix = f" gpu {devices}" if devices else ""
-                    seats_line.append(f"resident{suffix}", style="green")
+                    seat_line.append(f"resident{suffix}", style="green")
                 else:
-                    seats_line.append("cold seat", style="grey62")
+                    seat_line.append("cold seat", style="grey62")
+            seats_line = seat_lines[0]
 
         status_line = Text.assemble(
             ("lane ", "grey50"),
@@ -1019,8 +1141,28 @@ class OverviewView(Vertical):
             status_line.append("   ·   bench ", style="grey50")
             status_line.append(str(len(pool.bench)), style="grey70")
 
+        body: RenderableType = Group(*seat_lines, status_line)
+        if compact:
+            status_lines = [
+                Text.assemble(("lane ", "grey50"), (pool.current_lane or "-", "bold")),
+                Text.assemble(("last fixed offer ", "grey50"), (str(pool.last_fixed_seat_count), "grey70")),
+            ]
+            if pool.fixed_pops > 0:
+                rate = pool.fixed_fulfilled / pool.fixed_pops * 100
+                status_lines.append(
+                    Text.assemble(
+                        ("fixed matches ", "grey50"),
+                        (f"{pool.fixed_fulfilled}/{pool.fixed_pops} ({rate:.0f}%)", "grey70"),
+                        ("  ·  resident ", "grey50"),
+                        (f"{pool.fixed_resident_hits}/{pool.fixed_fulfilled}", "grey70"),
+                    ),
+                )
+            if pool.bench:
+                status_lines.append(Text.assemble(("bench ", "grey50"), (str(len(pool.bench)), "grey70")))
+            body = Group(*seat_lines, *status_lines)
+
         return Panel(
-            Group(seats_line, status_line),
+            body,
             title="Model pool",
             title_align="left",
             border_style="green",
@@ -1199,27 +1341,45 @@ class OverviewView(Vertical):
         feature_readiness: FeatureReadinessSummary | None = None,
         *,
         models_loaded: int | None = None,
+        compact: bool = False,
     ) -> Panel:
         """Render the health checklist, with a compact feature-readiness line when any feature is engaged.
 
         The loaded-model count rides the panel title as an at-a-glance figure rather than a checklist row,
         since it is a plain count with no pass/warn/fail character of its own.
         """
-        table = Table.grid(padding=(0, 2))
+        table = Table.grid(padding=(0, 1 if compact else 2))
         table.add_column(width=2)
-        table.add_column(style="bold", no_wrap=True)
-        table.add_column()
+        if compact:
+            table.add_column()
+        else:
+            table.add_column(style="bold", no_wrap=True)
+            table.add_column()
         if not report.checks:
-            table.add_row("", Text("-", style="grey50"), "no checks while the worker is not running")
+            if compact:
+                table.add_row("", Text("- no checks while the worker is not running", style="grey50"))
+            else:
+                table.add_row("", Text("-", style="grey50"), "no checks while the worker is not running")
         for check in report.checks:
-            table.add_row(
-                Text(check.status.glyph, style=check.status.colour),
-                Text(check.name, style=check.status.colour),
-                Text(check.detail, style="grey70"),
-            )
+            if compact:
+                detail = Text(check.name, style=f"bold {check.status.colour}")
+                detail.append(" — ", style="grey50")
+                detail.append(check.detail, style="grey70")
+                table.add_row(Text(check.status.glyph, style=check.status.colour), detail)
+            else:
+                table.add_row(
+                    Text(check.status.glyph, style=check.status.colour),
+                    Text(check.name, style=check.status.colour),
+                    Text(check.detail, style="grey70"),
+                )
         features_line = self._feature_readiness_line(feature_readiness)
         if features_line is not None:
-            table.add_row(Text("⊟", style="grey62"), Text("Features", style="bold"), features_line)
+            if compact:
+                feature_detail = Text("Features — ", style="bold")
+                feature_detail.append_text(features_line)
+                table.add_row(Text("⊟", style="grey62"), feature_detail)
+            else:
+                table.add_row(Text("⊟", style="grey62"), Text("Features", style="bold"), features_line)
         title = "Health"
         if models_loaded is not None:
             title += f" · {models_loaded} models" if models_loaded else " · no models"
@@ -1260,7 +1420,7 @@ class OverviewView(Vertical):
             line.append(verb, style=self._COMPACT_READINESS_STYLE.get(feature.state, "grey62"))
         return line
 
-    def _render_worker_table(self, snapshot: WorkerStateSnapshot) -> Table:
+    def _render_worker_table(self, snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Table:
         """Build a key/value table of worker identity and configuration."""
         config = snapshot.config
         uptime = human_duration(time.time() - snapshot.session_start_time) if snapshot.session_start_time else "-"
@@ -1273,27 +1433,36 @@ class OverviewView(Vertical):
         elif config.extra_slow_worker:
             performance_mode = "extra slow"
 
-        table = Table.grid(padding=(0, 2))
+        table = Table.grid(padding=(0, 1 if compact else 2))
         table.add_column(justify="right", style="bold cyan", no_wrap=True)
         table.add_column()
-        table.add_column(justify="right", style="bold cyan", no_wrap=True)
-        table.add_column()
+        if not compact:
+            table.add_column(justify="right", style="bold cyan", no_wrap=True)
+            table.add_column()
+
+        def add_pair(
+            left_label: str,
+            left_value: RenderableType,
+            right_label: str,
+            right_value: RenderableType,
+        ) -> None:
+            if compact:
+                table.add_row(left_label, left_value)
+                if right_label:
+                    table.add_row(right_label, right_value)
+            else:
+                table.add_row(left_label, left_value, right_label, right_value)
 
         if self._is_alchemist_only(snapshot):
-            table.add_row("Alchemist", config.alchemist_name or "-", "Version", f"v{config.worker_version}")
+            add_pair("Alchemist", config.alchemist_name or "-", "Version", f"v{config.worker_version}")
         else:
-            table.add_row("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
-        table.add_row("Horde user", config.horde_username or "-", "Uptime", uptime)
-        table.add_row("Models", str(config.num_models), "Custom models", "yes" if config.custom_models else "no")
-        table.add_row("Threads", str(config.max_threads), "Queue size", str(config.queue_size))
-        table.add_row("Max power", str(config.max_power), "Max batch", str(config.max_batch))
-        table.add_row("Performance", performance_mode, "Safety on GPU", "yes" if config.safety_on_gpu else "no")
-        table.add_row(
-            "Allows",
-            self._allow_summary(snapshot),
-            "",
-            "",
-        )
+            add_pair("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
+        add_pair("Horde user", config.horde_username or "-", "Uptime", uptime)
+        add_pair("Models", str(config.num_models), "Custom models", "yes" if config.custom_models else "no")
+        add_pair("Threads", str(config.max_threads), "Queue size", str(config.queue_size))
+        add_pair("Max power", str(config.max_power), "Max batch", str(config.max_batch))
+        add_pair("Performance", performance_mode, "Safety on GPU", "yes" if config.safety_on_gpu else "no")
+        add_pair("Allows", self._allow_summary(snapshot), "", "")
 
         # Context-sensitive: call out a CPU / alchemist-only install (image generation disabled). A GPU
         # install is the default and adds no row, keeping the usual dashboard unchanged.
@@ -1301,7 +1470,7 @@ class OverviewView(Vertical):
 
         compute_label = compute_mode_display_label()
         if compute_label is not None:
-            table.add_row("Compute", compute_label, "", "")
+            add_pair("Compute", compute_label, "", "")
         return table
 
     @staticmethod
@@ -1371,18 +1540,19 @@ class OverviewView(Vertical):
         return ", ".join(flags) if flags else "none"
 
     @staticmethod
-    def _render_alchemy_panel(snapshot: WorkerStateSnapshot) -> Panel:
+    def _render_alchemy_panel(snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Panel:
         """Render the alchemy configuration and runtime state panel."""
         config = snapshot.config
 
-        table = Table.grid(padding=(0, 2))
+        table = Table.grid(padding=(0, 1 if compact else 2))
         table.add_column(justify="right", style="bold cyan", no_wrap=True)
         table.add_column()
-        table.add_column(justify="right", style="bold cyan", no_wrap=True)
-        table.add_column()
+        if not compact:
+            table.add_column(justify="right", style="bold cyan", no_wrap=True)
+            table.add_column()
 
         if not config.alchemist:
-            table.add_row("Status", Text("disabled", style="grey50"), "", "")
+            table.add_row("Status", Text("disabled", style="grey50"), *(() if compact else ("", "")))
             return Panel(table, title="Alchemy", title_align="left", border_style="grey37", padding=(0, 1))
 
         mode_parts = []
@@ -1416,8 +1586,17 @@ class OverviewView(Vertical):
             (" faulted", "grey50"),
         )
 
-        table.add_row("Mode", mode_text, "Forms", forms_text)
-        table.add_row("Runtime", runtime_text, "", "")
+        if compact:
+            table.add_row("Mode", mode_text)
+            table.add_row("Forms", forms_text)
+            table.add_row("Pending", Text(str(snapshot.alchemy_forms_pending), style=active_colour))
+            table.add_row("In flight", Text(str(snapshot.alchemy_forms_in_flight), style=active_colour))
+            table.add_row("Submitting", str(snapshot.alchemy_forms_awaiting_submit))
+            table.add_row("Done", str(snapshot.alchemy_total_submitted))
+            table.add_row("Faulted", Text(str(snapshot.alchemy_total_faulted), style=faulted_colour))
+        else:
+            table.add_row("Mode", mode_text, "Forms", forms_text)
+            table.add_row("Runtime", runtime_text, "", "")
 
         border = "green" if total_active > 0 else ("yellow" if not config.alchemy_concurrent else "grey37")
         return Panel(table, title="Alchemy", title_align="left", border_style=border, padding=(0, 1))
@@ -1607,7 +1786,7 @@ class OverviewView(Vertical):
             bar = "·"
         return Text.assemble((f"{label} ", "bold"), (bar + " ", colour), (str(count), f"bold {colour}"))
 
-    def _render_pipeline_strip(self, snapshot: WorkerStateSnapshot) -> Panel:
+    def _render_pipeline_strip(self, snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Panel:
         """Render the job lifecycle as a labelled flow: what is queued, in-flight, and finishing.
 
         The first stages are live in-flight queues (they scale together against the busiest stage);
@@ -1626,39 +1805,28 @@ class OverviewView(Vertical):
         arrow = Text(" ▶ ", style="grey50")
         rows: list[Text] = []
 
+        def pipeline_row(stages: list[tuple[str, int]], stage_peak: int, submitted: int) -> None:
+            if compact:
+                rows.extend(self._stage_segment(label, count, stage_peak) for label, count in stages)
+                rows.append(Text(f"✓ {submitted:,} submitted", style="grey62"))
+                return
+            line = Text()
+            for index, (label, count) in enumerate(stages):
+                if index:
+                    line.append_text(arrow)
+                line.append_text(self._stage_segment(label, count, stage_peak))
+            line.append("    ")
+            line.append(f"✓ {submitted:,} submitted", style="grey62")
+            rows.append(line)
+
         # An alchemist-only worker pops no image jobs, so its image lifecycle row is permanently empty;
         # the alchemy flow becomes the primary (and only) pipeline content instead.
         if not alchemist_only:
+            stages = [("Queue", queue), ("Inference", inference)]
             if snapshot.config.allow_post_processing or post_processing:
-                rows.append(
-                    Text.assemble(
-                        self._stage_segment("Queue", queue, peak),
-                        arrow,
-                        self._stage_segment("Inference", inference, peak),
-                        arrow,
-                        self._stage_segment("Post-proc", post_processing, peak),
-                        arrow,
-                        self._stage_segment("Safety", safety, peak),
-                        arrow,
-                        self._stage_segment("Submit", submit, peak),
-                        ("    ", ""),
-                        (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
-                    )
-                )
-            else:
-                rows.append(
-                    Text.assemble(
-                        self._stage_segment("Queue", queue, peak),
-                        arrow,
-                        self._stage_segment("Inference", inference, peak),
-                        arrow,
-                        self._stage_segment("Safety", safety, peak),
-                        arrow,
-                        self._stage_segment("Submit", submit, peak),
-                        ("    ", ""),
-                        (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
-                    )
-                )
+                stages.append(("Post-proc", post_processing))
+            stages.extend((("Safety", safety), ("Submit", submit)))
+            pipeline_row(stages, peak, snapshot.num_jobs_submitted)
 
         alchemy_active = (
             snapshot.alchemy_forms_pending + snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_awaiting_submit
@@ -1670,16 +1838,14 @@ class OverviewView(Vertical):
                 snapshot.alchemy_forms_awaiting_submit,
                 1,
             )
-            rows.append(
-                Text.assemble(
-                    self._stage_segment("Alchemy pending", snapshot.alchemy_forms_pending, alch_peak),
-                    arrow,
-                    self._stage_segment("active", snapshot.alchemy_forms_in_flight, alch_peak),
-                    arrow,
-                    self._stage_segment("submit", snapshot.alchemy_forms_awaiting_submit, alch_peak),
-                    ("    ", ""),
-                    (f"✓ {snapshot.alchemy_total_submitted:,} submitted", "grey62"),
-                ),
+            pipeline_row(
+                [
+                    ("Alchemy pending", snapshot.alchemy_forms_pending),
+                    ("Active", snapshot.alchemy_forms_in_flight),
+                    ("Submit", snapshot.alchemy_forms_awaiting_submit),
+                ],
+                alch_peak,
+                snapshot.alchemy_total_submitted,
             )
 
         if not rows:
@@ -1771,18 +1937,19 @@ class OverviewView(Vertical):
         text.append(f" {card.free_vram_mb / 1024:.1f}/{card.total_vram_mb / 1024:.1f}G", style="")
         return text
 
-    def _render_gpus_strip(self, snapshot: WorkerStateSnapshot, *, detailed: bool) -> Panel:
+    def _render_gpus_strip(self, snapshot: WorkerStateSnapshot, *, detailed: bool, compact: bool = False) -> Panel:
         """Render the per-card strip: one compact row per card, with residency/fault detail in details mode.
 
         The single collapsed card on a single-GPU host is intentional (presentational consistency). In
         details mode each row also names the whole-card residency it holds and flags any models gone
         locally unservable on it, so a pressured or quarantining card stands out without leaving the tab.
         """
-        grid = Table.grid(padding=(0, 2))
+        grid = Table.grid(padding=(0, 1 if compact else 2))
         grid.add_column(style="bold", no_wrap=True)
-        grid.add_column(no_wrap=True)
-        grid.add_column(justify="right", no_wrap=True)
-        grid.add_column(no_wrap=True)
+        grid.add_column()
+        if not compact:
+            grid.add_column(justify="right", no_wrap=True)
+            grid.add_column(no_wrap=True)
         for card in snapshot.per_card:
             tail = Text(f"{card.busy_contexts} job{'s' if card.busy_contexts != 1 else ''}", style="green")
             if detailed:
@@ -1792,12 +1959,19 @@ class OverviewView(Vertical):
                     )
                 if card.unservable_models:
                     tail.append_text(Text(f"  ⚠ {len(card.unservable_models)} unservable", style="bold red"))
-            grid.add_row(
-                gpu_label(card.device_index, card.device_name, card.kind),
-                self._gpus_strip_vram(card),
-                f"{card.loaded_contexts}/{card.target_process_count} ctx",
-                tail,
-            )
+            if compact:
+                details = Text()
+                details.append_text(self._gpus_strip_vram(card))
+                details.append(f"  {card.loaded_contexts}/{card.target_process_count} ctx  ", style="grey62")
+                details.append_text(tail)
+                grid.add_row(gpu_label(card.device_index, card.device_name, card.kind), details)
+            else:
+                grid.add_row(
+                    gpu_label(card.device_index, card.device_name, card.kind),
+                    self._gpus_strip_vram(card),
+                    f"{card.loaded_contexts}/{card.target_process_count} ctx",
+                    tail,
+                )
         # Card count and mean duty ride the title so utilization reads at a glance, and a multi-GPU host is
         # obvious even before the rows are scanned.
         card_count = len(snapshot.per_card)
@@ -1806,7 +1980,7 @@ class OverviewView(Vertical):
             title += f" · {format_percent(snapshot.gpu_utilization_mean_percent)} duty"
         return Panel(grid, title=title, title_align="left", border_style="grey37", padding=(0, 1))
 
-    def _render_trends(self, snapshot: WorkerStateSnapshot) -> Panel:
+    def _render_trends(self, snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Panel:
         """Render recent kudos/hr, jobs/hr, and GPU-duty trends: a value, direction, and sparkline.
 
         Replaces the old momentum gauge, whose self-scaled sparklines carried neither a reference
@@ -1820,17 +1994,34 @@ class OverviewView(Vertical):
         rate, jobs_deltas = self._jobs_per_hour()
         jobs_deltas = jobs_deltas[-_TREND_SPARK_WIDTH:]
 
-        grid = Table.grid(padding=(0, 2))
+        grid = Table.grid(padding=(0, 1 if compact else 2))
         grid.add_column(justify="right", style="bold cyan", no_wrap=True)
-        grid.add_column(justify="right", no_wrap=True)
-        grid.add_column(no_wrap=True)
-        grid.add_column(no_wrap=True)
-        grid.add_column(style="grey50", no_wrap=True)
+        grid.add_column()
+        if not compact:
+            grid.add_column(no_wrap=True)
+            grid.add_column(no_wrap=True)
+            grid.add_column(style="grey50", no_wrap=True)
+
+        def add_trend(label: RenderableType, value: RenderableType, arrow_value: Text, graph: Text, tail: str) -> None:
+            if compact:
+                summary = Text()
+                if isinstance(value, Text):
+                    summary.append_text(value)
+                else:
+                    summary.append(str(value))
+                summary.append("  ")
+                summary.append_text(arrow_value)
+                if tail:
+                    summary.append(f"  {tail}", style="grey50")
+                grid.add_row(label, summary)
+                grid.add_row("", graph)
+            else:
+                grid.add_row(label, value, arrow_value, graph, tail)
 
         kudos_now = "-" if kudos_rate is None else f"{kudos_rate:,.0f}"
         kudos_total = snapshot.kudos_this_session
         kudos_tail = f"{kudos_total:,.0f} kudos" if kudos_total else ""
-        grid.add_row(
+        add_trend(
             "Kudos/hr",
             kudos_now,
             self._trend_arrow(kudos_deltas),
@@ -1839,7 +2030,7 @@ class OverviewView(Vertical):
         )
 
         jobs_now = "-" if rate is None else f"{rate:,.0f}"
-        grid.add_row(
+        add_trend(
             "Jobs/hr",
             jobs_now,
             self._trend_arrow(jobs_deltas),
@@ -1851,7 +2042,7 @@ class OverviewView(Vertical):
         if snapshot.config.alchemist:
             forms_rate, forms_deltas = self._forms_per_hour()
             forms_deltas = forms_deltas[-_TREND_SPARK_WIDTH:]
-            grid.add_row(
+            add_trend(
                 "Forms/hr",
                 "-" if forms_rate is None else f"{forms_rate:,.0f}",
                 self._trend_arrow(forms_deltas),
@@ -1874,7 +2065,7 @@ class OverviewView(Vertical):
                 (format_percent(snapshot.gpu_utilization_mean_percent), "dark_orange"),
                 (" (!)", "bold dark_orange"),
             )
-        grid.add_row(
+        add_trend(
             Text("GPU duty", style=duty_style),
             duty_value,
             duty_bar,
@@ -1905,9 +2096,9 @@ class OverviewView(Vertical):
 
         return Panel(
             body,
-            title="Trends",
+            title=f"Trends · {window}" if compact else "Trends",
             title_align="left",
-            subtitle=Text(window, style="grey50"),
+            subtitle=None if compact else Text(window, style="grey50"),
             subtitle_align="right",
             border_style="dark_orange" if duty_low else "grey37",
             padding=(0, 1),

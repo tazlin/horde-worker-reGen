@@ -57,7 +57,7 @@ class ControlView(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         """Lay out the action row and current control-state summary."""
-        with Horizontal(id="control-actions"):
+        with Horizontal(id="control-actions", classes="responsive-toolbar"):
             yield Button("Start worker", id="control-start-stop", variant="primary")
             yield Button("Pause worker", id="control-pause")
             yield Button("Auto-start: off", id="control-autostart")

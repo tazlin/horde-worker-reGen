@@ -155,6 +155,47 @@ Screen.-phone Button {
     height: 4;
 }
 
+Screen.-phone Input,
+Screen.-phone Select {
+    height: 4;
+}
+
+Screen.-phone CollapsibleTitle,
+Screen.-phone SelectionList > .option-list--option {
+    padding: 1;
+}
+
+/* Action rows sized for a desktop must not silently paint controls beyond a phone viewport. The
+   marker is shared by every tab-level toolbar so new actions inherit the same safe stacking rule. */
+Screen.-phone .responsive-toolbar {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: 4;
+    grid-gutter: 0 1;
+    height: auto;
+    padding: 0;
+}
+
+Screen.-phone .responsive-toolbar > Button,
+Screen.-phone .responsive-toolbar > Input,
+Screen.-phone .responsive-toolbar > Select,
+Screen.-phone .responsive-toolbar > Label {
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+}
+
+Screen.-phone .responsive-toolbar > Label {
+    height: 4;
+    content-align: left middle;
+}
+
+Screen.-phone .responsive-toolbar > Rule,
+Screen.-phone .responsive-toolbar > #diag-controls-spacer {
+    display: none;
+}
+
 Screen.-phone .horde-actions Button {
     width: 100%;
     height: 5;
@@ -178,11 +219,44 @@ Screen.-phone .config-row {
     height: auto;
 }
 
+Screen.-phone DashboardPreferencesView .experience-row,
+Screen.-phone DashboardPreferencesView .experience-choice,
+Screen.-phone BenchmarkView .adv-row {
+    layout: vertical;
+    height: auto;
+}
+
+Screen.-phone DashboardPreferencesView .experience-row Button,
+Screen.-phone DashboardPreferencesView .experience-choice Label,
+Screen.-phone DashboardPreferencesView .experience-choice Select,
+Screen.-phone BenchmarkView .adv-row .adv-label,
+Screen.-phone BenchmarkView .adv-row .adv-input,
+Screen.-phone BenchmarkView .adv-row .adv-help {
+    width: 100%;
+}
+
+Screen.-phone DashboardPreferencesView .experience-choice Label,
+Screen.-phone BenchmarkView .adv-row .adv-label,
+Screen.-phone BenchmarkView .adv-row .adv-help {
+    height: auto;
+}
+
 /* On a phone, the whole Config page owns vertical scrolling. Keeping the actions and summaries outside
    the sub-tab's scroll container pins a large preamble above every field; once the software keyboard
    reduces the row count, that preamble can consume most of the usable screen. */
 Screen.-phone ConfigEditorView {
     overflow-y: auto;
+}
+
+/* The desktop keeps the Overview hero above its body scroller. On a phone that sticky block consumes too
+   much of the viewport, so the page becomes the sole scroller and the hero can leave with its content. */
+Screen.-phone OverviewView {
+    overflow-y: auto;
+}
+
+Screen.-phone OverviewView #overview-body {
+    height: auto;
+    overflow-y: hidden;
 }
 
 Screen.-phone ConfigEditorView #config-actions {
@@ -210,4 +284,43 @@ Screen.-phone ConfigEditorView .config-subtab-scroll {
    for the shortcuts, which have nowhere else to appear. */
 Screen.-phone #level-indicator {
     display: none;
+}
+
+/* The title/clock header duplicates information already available in the phone status line and consumes
+   scarce vertical space even before the software keyboard opens. Desktop keeps the full header. */
+Screen.-phone Header {
+    display: none;
+}
+
+/* Phone shortcuts live in the browser dock and command palette. The terminal Footer's truncated key hints
+   and Palette affordance cost a row and are harder to tap than their browser-native replacement. */
+Screen.-phone Footer,
+Screen.-phone #footer-bar {
+    display: none;
+}
+
+/* The software keyboard and landscape orientation can leave fewer than 28 terminal rows. Let modal bodies
+   themselves scroll so their final field and dismissal actions remain reachable. */
+
+Screen.-phone.-short Tabs,
+Screen.-phone.-short Tab {
+    height: 3;
+}
+
+Screen.-short > Vertical {
+    height: auto;
+    max-height: 100%;
+    overflow-y: auto;
+}
+
+Screen.-short .dialog-buttons,
+Screen.-short #confirm-actions {
+    layout: vertical;
+    height: auto;
+}
+
+Screen.-short .dialog-buttons Button,
+Screen.-short #confirm-actions Button {
+    width: 100%;
+    margin: 0 0 1 0;
 }

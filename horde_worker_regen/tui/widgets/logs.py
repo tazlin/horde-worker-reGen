@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -15,6 +16,7 @@ from textual.widgets import Button, Input, RichLog, Select, Static
 
 from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.tui.log_tailer import LOG_DIR, BridgeLog, LogFollower, discover_bridge_logs_grouped
+from horde_worker_regen.tui.responsive import PHONE_BAND_MAX_WIDTH
 
 _LEVEL_RANK: dict[str, int] = {
     "TRACE": 5,
@@ -121,7 +123,7 @@ class LogsView(Vertical):
 
     def compose(self) -> ComposeResult:
         """Lay out the process/history/level/search controls and the log output."""
-        with Horizontal(id="log-controls"):
+        with Horizontal(id="log-controls", classes="responsive-toolbar"):
             yield Select((), prompt="waiting for logs…", id="log-process", allow_blank=True)
             yield Select((("current", "current"),), value="current", id="log-history", allow_blank=True)
             yield Select(
@@ -142,6 +144,16 @@ class LogsView(Vertical):
         self.query_one("#log-scroll-hint", Static).display = False
         self._refresh(select_first=True)
         self.set_interval(0.5, self._poll)
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Wrap log lines at phone width, re-priming so already-visible lines use the new presentation."""
+        log = self.query_one("#log-output", RichLog)
+        wrap = event.size.width < PHONE_BAND_MAX_WIDTH
+        if log.wrap == wrap:
+            return
+        log.wrap = wrap
+        log.min_width = 1 if wrap else 78
+        self._reprime()
 
     def _refresh(self, *, select_first: bool) -> None:
         """Re-scan the logs directory, refreshing the process/history selectors only when they change."""

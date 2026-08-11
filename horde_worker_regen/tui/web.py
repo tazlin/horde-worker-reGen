@@ -20,6 +20,7 @@ The served page is also fitted for a phone browser: see :func:`_inject_mobile_fi
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import os
 import shutil
@@ -32,15 +33,31 @@ import webbrowser
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from string import Template
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
+import psutil
 from ruamel.yaml.error import YAMLError
 
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import kill_process_tree
 from horde_worker_regen.tui import config_form
 from horde_worker_regen.tui import socket_protocol as sp
+from horde_worker_regen.tui.job_object import WorkerJobObject
 
 if TYPE_CHECKING:
-    from textual_serve.server import Server
+    from aiohttp.web import Application
+
+
+class _DashboardServer(Protocol):
+    """The shutdown surface added to the textual-serve server used by this launcher."""
+
+    def serve(self, debug: bool = False) -> None: ...
+
+    def request_threadsafe_exit(self) -> None: ...
+
+    def wait_stopped(self, timeout: float) -> bool: ...
+
+    async def _make_app(self) -> Application: ...
+
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -72,6 +89,64 @@ _HOST_WATCH_STOP_JOIN_SECONDS = 5.0
 Generous over the watcher's own connect timeout and stop-poll interval, so a deliberate launcher unwind
 joins the watcher rather than leaving it as a daemon that could later fire its process-killing leash.
 """
+
+_DASHBOARD_SHUTDOWN_GRACE_SECONDS = 10.0
+"""How long host-driven shutdown gives textual-serve to close its sessions before the precise reap fallback."""
+
+_DASHBOARD_SESSION_KILL_GRACE_SECONDS = 2.0
+"""Per-session terminate grace before the precise reap fallback escalates to a kill."""
+
+_PROCESS_CREATE_TIME_TOLERANCE_SECONDS = 1.0
+"""PID-reuse guard tolerance for dashboard session process identities."""
+
+
+class _DashboardSessionProcesses:
+    """Track only the Textual session shells this launcher owns.
+
+    Browser processes are deliberately never registered. On Windows each session shell is also assigned to
+    a kill-on-close Job Object, while the identity-checked in-memory set provides the bounded normal-shutdown
+    fallback on every platform.
+    """
+
+    def __init__(self) -> None:
+        self._identities: dict[int, float] = {}
+        self._lock = threading.Lock()
+        self._job = WorkerJobObject()
+
+    def register(self, pid: int | None) -> None:
+        """Record a freshly spawned session shell and bind it to the Windows launcher-lifetime job."""
+        if pid is None:
+            return
+        try:
+            create_time = psutil.Process(pid).create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        with self._lock:
+            self._identities[pid] = create_time
+        self._job.assign(pid)
+
+    def forget(self, pid: int | None) -> None:
+        """Forget a session shell after textual-serve has observed its clean exit."""
+        if pid is None:
+            return
+        with self._lock:
+            self._identities.pop(pid, None)
+
+    def terminate_all(self) -> list[int]:
+        """Terminate every still-matching session tree, never any other launcher descendant."""
+        with self._lock:
+            identities = dict(self._identities)
+        terminated: list[int] = []
+        for pid, create_time in identities.items():
+            try:
+                process = psutil.Process(pid)
+                if abs(process.create_time() - create_time) > _PROCESS_CREATE_TIME_TOLERANCE_SECONDS:
+                    continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            kill_process_tree(pid, grace_seconds=_DASHBOARD_SESSION_KILL_GRACE_SECONDS)
+            terminated.append(pid)
+        return terminated
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -219,23 +294,22 @@ def _build_served_command(args: argparse.Namespace, host_port: int, *, remote_ex
     return " ".join(parts)
 
 
-MOBILE_TARGET_COLUMNS = 72
+MOBILE_TARGET_COLUMNS = 52
 """Columns the served terminal aims for on a narrow viewport.
 
-Set by what the dashboard's phone width band needs: the whole tab strip fits at its compact labels, and
-the tables keep their essential columns rather than shedding to the identity ones. Any wider and the
-text starts getting too small to read on a phone-sized screen. The minimum font-size floor takes
-precedence on very narrow phones; their compact strip is sized to fit the resulting smaller column count.
+This is a readability-first compromise: compact tab labels may leave a small overflow that teaches the
+sideways gesture, while tables shed to their identity columns rather than shrinking the text further. The
+minimum font-size floor takes precedence on very narrow phones.
 """
 
 _MONOSPACE_CELL_WIDTH_RATIO = 0.6
 """Cell width as a fraction of font size for the served page's monospace font, used to size the font."""
 
-_MOBILE_MIN_FONT_SIZE_PX = 10
+_MOBILE_MIN_FONT_SIZE_PX = 12
 _MOBILE_MAX_FONT_SIZE_PX = 16
 """Bounds on the fitted font size. The maximum is textual-serve's own default, which makes the fitting
 script a no-op on a desktop viewport: only a viewport too narrow to reach the target column count at
-that size gets anything smaller. Ten pixels is a legibility/tap-target floor; very narrow phones get
+that size gets anything smaller. Twelve pixels is the legibility floor; very narrow phones get
 fewer columns and rely on the phone layout's shedding rather than shrinking the controls to 8px."""
 
 _NARROW_VIEWPORT_PX = 700
@@ -257,15 +331,25 @@ _MOBILE_HEAD_TEMPLATE = Template(
       width: 100%;
       height: 100dvh;
       box-sizing: border-box;
-      touch-action: none;
+      touch-action: pinch-zoom;
       overscroll-behavior: none;
     }
     .xterm .xterm-viewport { scrollbar-width: none; }
     .xterm .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; }
-    #mobile-keyboard-toggle {
+    #mobile-controls-dock {
       position: absolute;
       z-index: 10000;
       display: none;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      height: 52px;
+      padding: 2px 8px;
+      box-sizing: border-box;
+      background: #0c181f;
+    }
+    #mobile-controls-dock button {
+      display: flex;
       align-items: center;
       justify-content: center;
       width: 48px;
@@ -279,9 +363,16 @@ _MOBILE_HEAD_TEMPLATE = Template(
       font: 24px sans-serif;
       opacity: 0.9;
     }
+    #mobile-tabs-toggle,
+    #mobile-palette-button {
+      width: 48px;
+      padding: 0;
+      font-size: 24px;
+    }
+    #mobile-tabs-toggle.-enabled { background: #6c3baa; }
     #mobile-keyboard-toggle.-enabled { background: #6c3baa; }
     @media (pointer: coarse) {
-      #mobile-keyboard-toggle { display: flex; }
+      #mobile-controls-dock { display: flex; }
     }
   }
 </style>
@@ -310,6 +401,10 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
     // 100vh includes browser chrome on several mobile browsers. Size the terminal to the visual
     // viewport instead, refitting xterm whenever the address bar or software keyboard changes it.
     var visualViewport = window.visualViewport;
+    var coarsePointer = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+    var mobileControlsEnabled = coarsePointer && window.innerWidth <= ${narrow_viewport_px};
+    var keyboardRailHeight = mobileControlsEnabled ? 52 : 0;
+    var mobileDock = null;
     var viewportFrame = null;
     function fitVisibleViewport() {
       if (viewportFrame !== null) {
@@ -322,7 +417,8 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
         terminal.style.left = Math.floor(visualViewport ? visualViewport.offsetLeft : 0) + "px";
         terminal.style.top = Math.floor(visualViewport ? visualViewport.offsetTop : 0) + "px";
         terminal.style.width = width + "px";
-        terminal.style.height = height + "px";
+        terminal.style.height = Math.max(1, height - keyboardRailHeight) + "px";
+        positionMobileDock();
         if (typeof window.onresize === "function") {
           window.onresize();
         }
@@ -340,24 +436,44 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
     // terminal keyboard input, so a phone cannot distinguish a painted tab from a painted form field
     // and normally opens its keyboard for both. Keep that transport textarea non-editable until the
     // operator explicitly asks for typing with this real, browser-level button.
-    var coarsePointer = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
     var keyboardEnabled = false;
     var keyboardButton = null;
-    function positionKeyboardButton() {
-      if (!keyboardButton) {
+    var paletteButton = null;
+    var tabsButton = null;
+    var mainTabsVisible = true;
+    function positionMobileDock() {
+      if (!mobileDock) {
         return;
       }
       var viewportWidth = visualViewport ? visualViewport.width : window.innerWidth;
       var viewportHeight = visualViewport ? visualViewport.height : window.innerHeight;
       var viewportLeft = visualViewport ? visualViewport.offsetLeft : 0;
       var viewportTop = visualViewport ? visualViewport.offsetTop : 0;
-      keyboardButton.style.left = Math.max(8, viewportLeft + viewportWidth - 56) + "px";
-      // Stay low and on the right, but leave a footer-sized lane beneath the button for Textual's
-      // bottom-right Palette affordance. It follows the reduced visual viewport while typing.
-      keyboardButton.style.top = Math.max(8, viewportTop + viewportHeight - 88) + "px";
+      mobileDock.style.left = Math.floor(viewportLeft) + "px";
+      mobileDock.style.top = Math.max(0, Math.floor(viewportTop + viewportHeight - keyboardRailHeight)) + "px";
+      mobileDock.style.width = Math.floor(viewportWidth) + "px";
+    }
+    function dispatchTerminalKey(key, code, keyCode, modifiers) {
+      var textarea = terminal.querySelector(".xterm-helper-textarea");
+      if (!textarea) {
+        return;
+      }
+      ["keydown", "keyup"].forEach(function (type) {
+        textarea.dispatchEvent(new KeyboardEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          key: key,
+          code: code,
+          keyCode: keyCode,
+          which: keyCode,
+          ctrlKey: Boolean(modifiers.ctrl),
+          altKey: Boolean(modifiers.alt),
+          shiftKey: Boolean(modifiers.shift)
+        }));
+      });
     }
     function configureKeyboardTransport() {
-      if (!coarsePointer) {
+      if (!mobileControlsEnabled) {
         return;
       }
       var textarea = terminal.querySelector(".xterm-helper-textarea");
@@ -373,7 +489,42 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
         textarea.blur();
       }
     }
-    if (coarsePointer) {
+    if (mobileControlsEnabled) {
+      mobileDock = document.createElement("div");
+      mobileDock.id = "mobile-controls-dock";
+      paletteButton = document.createElement("button");
+      paletteButton.id = "mobile-palette-button";
+      paletteButton.type = "button";
+      paletteButton.textContent = "\u2630";
+      paletteButton.title = "Open dashboard command palette";
+      paletteButton.setAttribute("aria-label", "Open dashboard command palette");
+      paletteButton.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        dispatchTerminalKey("ArrowDown", "ArrowDown", 40, { ctrl: true, alt: true, shift: true });
+      });
+      tabsButton = document.createElement("button");
+      tabsButton.id = "mobile-tabs-toggle";
+      tabsButton.type = "button";
+      tabsButton.textContent = "\u25b4";
+      tabsButton.classList.add("-enabled");
+      tabsButton.title = "Hide main dashboard tabs";
+      tabsButton.setAttribute("aria-label", "Hide main dashboard tabs");
+      tabsButton.setAttribute("aria-pressed", "true");
+      tabsButton.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        mainTabsVisible = !mainTabsVisible;
+        tabsButton.textContent = mainTabsVisible ? "\u25b4" : "\u25be";
+        tabsButton.classList.toggle("-enabled", mainTabsVisible);
+        tabsButton.setAttribute("aria-pressed", String(mainTabsVisible));
+        tabsButton.setAttribute(
+          "aria-label",
+          mainTabsVisible ? "Hide main dashboard tabs" : "Show main dashboard tabs"
+        );
+        tabsButton.title = mainTabsVisible ? "Hide main dashboard tabs" : "Show main dashboard tabs";
+        dispatchTerminalKey("ArrowUp", "ArrowUp", 38, { ctrl: true, alt: true, shift: true });
+      });
       keyboardButton = document.createElement("button");
       keyboardButton.id = "mobile-keyboard-toggle";
       keyboardButton.type = "button";
@@ -392,16 +543,19 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
         );
         configureKeyboardTransport();
       });
-      document.body.appendChild(keyboardButton);
-      positionKeyboardButton();
+      mobileDock.appendChild(paletteButton);
+      mobileDock.appendChild(tabsButton);
+      mobileDock.appendChild(keyboardButton);
+      document.body.appendChild(mobileDock);
+      positionMobileDock();
       window.addEventListener("load", configureKeyboardTransport);
       var terminalObserver = new MutationObserver(configureKeyboardTransport);
       terminalObserver.observe(terminal, { childList: true, subtree: true });
       if (visualViewport) {
-        visualViewport.addEventListener("resize", positionKeyboardButton);
-        visualViewport.addEventListener("scroll", positionKeyboardButton);
+        visualViewport.addEventListener("resize", positionMobileDock);
+        visualViewport.addEventListener("scroll", positionMobileDock);
       }
-      window.addEventListener("orientationchange", positionKeyboardButton);
+      window.addEventListener("orientationchange", positionMobileDock);
     }
 
     // xterm.js disables its own touch scrolling while an application (Textual) has mouse reporting
@@ -412,9 +566,30 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
     var touchStartX = null;
     var touchStartY = null;
     var touchAxis = null;
+    var touchWheelRemainder = 0;
+    var horizontalSwipeSent = false;
+    function moveTouchedTab(direction) {
+      // Use an application-only modified-arrow binding, carried by xterm's normal input route. This does
+      // not synthesize a click, depend on current focus, or activate the tab under the finger before moving.
+      // The main strip always lives in the first six terminal rows; a swipe lower down is the Config strip.
+      var screen = terminal.querySelector(".xterm-screen");
+      var measure = terminal.querySelector(".xterm-char-measure-element");
+      var screenTop = screen ? screen.getBoundingClientRect().top : terminal.getBoundingClientRect().top;
+      var cellHeight = measure ? measure.getBoundingClientRect().height : 0;
+      if (cellHeight <= 0) {
+        cellHeight = parseFloat(terminal.dataset.fontSize || "16");
+      }
+      var terminalRow = Math.floor((touchStartY - screenTop) / cellHeight);
+      var configStrip = terminalRow >= 6;
+      var key = direction > 0 ? "ArrowRight" : "ArrowLeft";
+      var keyCode = direction > 0 ? 39 : 37;
+      dispatchTerminalKey(key, key, keyCode, { ctrl: true, alt: true, shift: configStrip });
+    }
     terminal.addEventListener("touchstart", function (event) {
       if (event.touches.length !== 1) {
         lastTouchX = lastTouchY = touchStartX = touchStartY = touchAxis = null;
+        touchWheelRemainder = 0;
+        horizontalSwipeSent = false;
         return;
       }
       var touch = event.touches[0];
@@ -441,7 +616,22 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
       lastTouchX = touch.clientX;
       lastTouchY = touch.clientY;
       var wheelDelta = touchAxis === "horizontal" ? deltaX : deltaY;
-      if (Math.abs(wheelDelta) < 1) {
+      if (touchAxis === "horizontal" && horizontalSwipeSent) {
+        event.preventDefault();
+        return;
+      }
+      touchWheelRemainder += wheelDelta;
+      // xterm consumes wheel input in terminal-row units. Sending every 1-2 pixel touch movement made
+      // a drag look active to the browser while often producing no mouse packet for Textual at all.
+      var wheelSteps = Math.trunc(touchWheelRemainder / 12);
+      if (wheelSteps === 0) {
+        return;
+      }
+      touchWheelRemainder -= wheelSteps * 12;
+      horizontalSwipeSent = touchAxis === "horizontal";
+      if (horizontalSwipeSent) {
+        moveTouchedTab(wheelSteps);
+        event.preventDefault();
         return;
       }
       var target = document.elementFromPoint(touch.clientX, touch.clientY) || terminal;
@@ -450,18 +640,16 @@ _MOBILE_FIT_SCRIPT_TEMPLATE = Template(
         cancelable: true,
         clientX: touch.clientX,
         clientY: touch.clientY,
-        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-        // xterm's mouse protocol has no horizontal wheel packet. Textual maps Ctrl+vertical-wheel to
-        // horizontal scrolling, and—unlike Shift—xterm does not discard Ctrl-wheel before constructing
-        // its mouse packet. A sideways drag can therefore reach either Tabs strip without hard-coded
-        // pixel bands or synthetic key presses.
-        deltaY: wheelDelta,
-        ctrlKey: touchAxis === "horizontal"
+        deltaMode: WheelEvent.DOM_DELTA_LINE,
+        deltaY: wheelSteps,
+        ctrlKey: false
       }));
       event.preventDefault();
     }, { passive: false });
     function clearTouchGesture() {
       lastTouchX = lastTouchY = touchStartX = touchStartY = touchAxis = null;
+      touchWheelRemainder = 0;
+      horizontalSwipeSent = false;
     }
     terminal.addEventListener("touchend", clearTouchGesture, { passive: true });
     terminal.addEventListener("touchcancel", clearTouchGesture, { passive: true });
@@ -497,6 +685,7 @@ def _inject_mobile_fit(html: str) -> str:
         cell_width_ratio=_MONOSPACE_CELL_WIDTH_RATIO,
         min_font_size=_MOBILE_MIN_FONT_SIZE_PX,
         max_font_size=_MOBILE_MAX_FONT_SIZE_PX,
+        narrow_viewport_px=_NARROW_VIEWPORT_PX,
     )
     html = html.replace(_HEAD_CLOSE_TAG, f"{head_addition}{_HEAD_CLOSE_TAG}", 1)
     return html.replace(_BODY_CLOSE_TAG, f"{body_addition}{_BODY_CLOSE_TAG}", 1)
@@ -532,7 +721,15 @@ def _rewrite_page_origin(html: str, *, served_origin: str, client_origin: str) -
     return html.replace(served_websocket_origin, client_websocket_origin).replace(served_origin, client_origin)
 
 
-def _build_server(command: str, *, host: str, port: int, title: str) -> Server:
+def _build_server(
+    command: str,
+    *,
+    host: str,
+    port: int,
+    title: str,
+    host_address: tuple[str, int],
+    session_processes: _DashboardSessionProcesses,
+) -> _DashboardServer:
     """Create the textual-serve server, extended so the served page reaches back and fits a phone.
 
     ``textual_serve`` pulls in aiohttp and jinja2, which the headless terminal fallback never needs, so
@@ -544,20 +741,111 @@ def _build_server(command: str, *, host: str, port: int, title: str) -> Server:
         host: Address to bind.
         port: Port to bind.
         title: Name shown for the served application.
+        host_address: Loopback address of the persistent worker host used by the native companion page.
+        session_processes: Exact process ownership tracker for per-browser Textual sessions.
 
     Returns:
         An unstarted server; call ``serve()`` on it.
     """
     from aiohttp import web as aiohttp_web
     from aiohttp.typedefs import Handler
+    from textual_serve.app_service import AppService
     from textual_serve.server import Server as TextualServeServer
+    from textual_serve.server import to_int
+
+    from horde_worker_regen.tui.native_dashboard import NativeDashboardWeb
+
+    native_dashboard = NativeDashboardWeb(host_address)
+
+    class TrackedAppService(AppService):
+        """A Textual session whose shell is recorded for precise bounded teardown."""
+
+        async def _open_app_process(self, width: int = 80, height: int = 24) -> asyncio.subprocess.Process:
+            """Start the session shell and register only that owned process, never the browser."""
+            process = await super()._open_app_process(width, height)
+            session_processes.register(process.pid)
+            return process
+
+        async def stop(self) -> None:
+            """Stop the session and forget it only after the process has actually exited."""
+            try:
+                await super().stop()
+            finally:
+                process = self._process
+                if process is not None and process.returncode is not None:
+                    session_processes.forget(process.pid)
 
     class MobileFriendlyServer(TextualServeServer):
         """A textual-serve server whose page addresses the client's own origin and fits a phone screen."""
 
+        def __init__(self, command: str, *, host: str, port: int, title: str) -> None:
+            super().__init__(command, host=host, port=port, title=title)
+            self._serve_loop: asyncio.AbstractEventLoop | None = None
+            self._exit_requested = threading.Event()
+            self._serve_stopped = threading.Event()
+
+        def serve(self, debug: bool = False) -> None:
+            """Serve until stopped, publishing the loop so the host watcher can request a safe exit."""
+            if self._exit_requested.is_set():
+                self._serve_stopped.set()
+                return
+            try:
+                self._serve_loop = asyncio.get_event_loop()
+            except RuntimeError:
+                self._serve_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._serve_loop)
+            if self._exit_requested.is_set():
+                self._serve_stopped.set()
+                return
+            try:
+                super().serve(debug)
+            finally:
+                self._serve_stopped.set()
+
+        def request_threadsafe_exit(self) -> None:
+            """Ask aiohttp to unwind on its owning loop; safe before or during :meth:`serve`."""
+            self._exit_requested.set()
+            loop = self._serve_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self.request_exit)
+
+        def wait_stopped(self, timeout: float) -> bool:
+            """Wait up to ``timeout`` seconds for :meth:`serve` to return."""
+            return self._serve_stopped.wait(timeout)
+
+        async def handle_websocket(self, request: aiohttp_web.Request) -> aiohttp_web.WebSocketResponse:
+            """Handle one browser session using the ownership-tracked Textual app service."""
+            websocket = aiohttp_web.WebSocketResponse(heartbeat=15)
+            width = to_int(request.query.get("width", "80"), 80)
+            height = to_int(request.query.get("height", "24"), 24)
+            app_service: TrackedAppService | None = None
+            try:
+                await websocket.prepare(request)
+
+                async def close_websocket() -> None:
+                    await websocket.close()
+
+                app_service = TrackedAppService(
+                    self.command,
+                    write_bytes=websocket.send_bytes,
+                    write_str=websocket.send_str,
+                    close=close_websocket,
+                    download_manager=self.download_manager,
+                    debug=self.debug,
+                )
+                await app_service.start(width, height)
+                await self._process_messages(websocket, app_service)
+            except asyncio.CancelledError:
+                await websocket.close()
+            finally:
+                if app_service is not None:
+                    await app_service.stop()
+            return websocket
+
         async def _make_app(self) -> aiohttp_web.Application:
             """Build the aiohttp application, adding the page rewrite to it."""
             app = await super()._make_app()
+            native_dashboard.register(app)
             app.middlewares.append(self._rewrite_page_middleware)
             return app
 
@@ -569,6 +857,8 @@ def _build_server(command: str, *, host: str, port: int, title: str) -> Server:
         ) -> aiohttp_web.StreamResponse:
             """Point the served page at the client's own origin, and fit it to a phone viewport."""
             response = await handler(request)
+            if request.path != "/":
+                return response
             if not isinstance(response, aiohttp_web.Response) or response.content_type != "text/html":
                 return response
             if not response.text:
@@ -731,11 +1021,11 @@ def _watch_host_liveness(
     the attached case. A clean socket close is the authoritative signal; an explicit ``host_shutdown``
     frame, when present, just lets the caller log the host's exit with intent.
 
-    ``on_host_gone`` is the launcher's process-killing leash (it hard-exits), so it must fire only for a host
-    that genuinely went away, never for a launcher that is unwinding on purpose. A set ``stop_event`` means
-    the latter: the watcher then returns without firing the leash. Binding the watcher to that event is what
-    keeps it from outliving its launcher as a daemon that later kills the process (e.g. once ``serve()``
-    returns, including in tests that exercise :func:`main` with a non-blocking server).
+    ``on_host_gone`` is the launcher's shutdown leash, so it must fire only for a host that genuinely went
+    away, never for a launcher that is unwinding on purpose. A set ``stop_event`` means the latter: the watcher
+    then returns without firing the leash. Binding the watcher to that event is what keeps it from outliving
+    its launcher as a daemon that later stops an unrelated lifecycle (e.g. once ``serve()`` returns, including
+    in tests that exercise :func:`main` with a non-blocking server).
     """
     sock = _await_host_socket(address, grace_seconds=grace_seconds, stop_event=stop_event)
     if sock is not None:
@@ -756,37 +1046,32 @@ def _watch_host_liveness(
     on_host_gone()
 
 
-def _terminate_session_subprocesses() -> None:
-    """Terminate the per-session TUI subprocesses this launcher spawned, so none orphan when it exits.
+def _wind_down_launcher(
+    server: _DashboardServer,
+    session_processes: _DashboardSessionProcesses,
+    *,
+    graceful_timeout: float = _DASHBOARD_SHUTDOWN_GRACE_SECONDS,
+) -> None:
+    """Close the launcher without touching browser processes, with a bounded session-only reap fallback.
 
-    ``textual-serve`` runs a fresh TUI subprocess (a shell, on Windows) per browser session as a child of
-    this launcher. Exiting the launcher without reaping them would leave the exact kind of stray console
-    this whole mechanism exists to prevent.
-    """
-    try:
-        import psutil
-    except ImportError:
-        return
-    with contextlib.suppress(Exception):
-        children = psutil.Process().children(recursive=True)
-        for child in children:
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                child.terminate()
-        _gone, alive = psutil.wait_procs(children, timeout=5.0)
-        for child in alive:
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                child.kill()
-
-
-def _wind_down_launcher() -> None:
-    """Close this launcher because its host is gone: reap session subprocesses, then exit immediately.
-
-    ``textual-serve``'s blocking ``serve()`` has no thread-safe stop, so once the host (which owns
-    everything of value) has exited there is nothing here worth a graceful unwind: reap the session
-    children and exit hard. ``os._exit`` is deliberate, mirroring the codebase's other force-stop paths.
+    The normal path asks aiohttp/textual-serve to close its WebSockets. Textual-serve then sends each TUI
+    session its quit message and waits for it. If that cooperative path wedges, only the registered session
+    shell trees are terminated; browsers were never registered and cannot be selected by this fallback.
     """
     print("Worker host has exited; closing the dashboard launcher.", file=sys.stderr)
-    _terminate_session_subprocesses()
+    server.request_threadsafe_exit()
+    if server.wait_stopped(graceful_timeout):
+        return
+    terminated = session_processes.terminate_all()
+    if terminated:
+        print(
+            f"Dashboard sessions did not exit within {graceful_timeout:.1f}s; terminated session roots {terminated}.",
+            file=sys.stderr,
+        )
+    if server.wait_stopped(_DASHBOARD_SESSION_KILL_GRACE_SECONDS):
+        return
+    # The exact owned session trees have already been reaped. A final hard exit cannot affect a browser,
+    # because browser processes are outside the session registry and Windows session Job Object.
     os._exit(0)
 
 
@@ -959,26 +1244,30 @@ def main(argv: list[str] | None = None) -> None:
     if not args.no_browser:
         _schedule_dashboard_open(web_host, web_port, app_window=not args.browser)
 
+    session_processes = _DashboardSessionProcesses()
+    server = _build_server(
+        _build_served_command(args, host_port, remote_exposed=remote_exposed),
+        host=web_host,
+        port=web_port,
+        title="AI Horde Worker",
+        host_address=host_address,
+        session_processes=session_processes,
+    )
+
     # Follow the host to the grave: if it exits on its own (notably the tray's "Stop worker && exit"),
-    # this launcher must not linger as an orphaned console serving a dead host. The watcher's leash hard-exits
-    # the process, so it is bound to this launcher's lifetime: once serve() returns the launcher is unwinding
-    # on its own terms, so the watcher is stopped first and never lingers as a daemon that could later fire.
+    # this launcher must not linger as an orphaned console serving a dead host. The watcher requests a normal
+    # server unwind and owns a bounded, session-only reap fallback, so it is bound to this launcher's lifetime:
+    # once serve() returns the launcher is unwinding on its own terms and the watcher must not fire later.
     watch_stop = threading.Event()
     watcher = threading.Thread(
         target=_watch_host_liveness,
-        args=(host_address, _wind_down_launcher),
+        args=(host_address, lambda: _wind_down_launcher(server, session_processes)),
         kwargs={"stop_event": watch_stop},
         name="host-liveness-watch",
         daemon=True,
     )
     watcher.start()
 
-    server = _build_server(
-        _build_served_command(args, host_port, remote_exposed=remote_exposed),
-        host=web_host,
-        port=web_port,
-        title="AI Horde Worker",
-    )
     try:
         server.serve()
     finally:

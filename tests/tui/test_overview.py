@@ -5,6 +5,7 @@ from __future__ import annotations
 from rich.console import Console
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CardSnapshot,
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
@@ -705,6 +706,75 @@ def test_trends_panel_shows_value_direction_and_window() -> None:
     text = _render(view._render_trends(snapshot))
     assert "Kudos/hr" in text and "Jobs/hr" in text and "GPU duty" in text
     assert "42 done" in text
+
+
+def test_phone_trends_preserve_each_value_and_graph_without_squeezing_columns() -> None:
+    """Phone trends stack summaries over graphs instead of dividing 44 columns into five slivers."""
+    view = OverviewView()
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        gpu_utilization_mean_percent=70.0,
+        gpu_utilization_busy_fraction=0.7,
+        num_jobs_submitted=42,
+        kudos_this_session=1234.0,
+    )
+    for timestamp, jobs, kudos, duty in (
+        (100.0, 1, 10.0, 40.0),
+        (110.0, 2, 20.0, 50.0),
+        (120.0, 4, 40.0, 70.0),
+        (130.0, 7, 70.0, 80.0),
+    ):
+        snapshot.timestamp = timestamp
+        snapshot.num_jobs_submitted = jobs
+        snapshot.kudos_this_session = kudos
+        snapshot.gpu_utilization_mean_percent = duty
+        view._record_trends(snapshot)
+
+    text = _render(view._render_trends(snapshot, compact=True), width=44)
+
+    assert "Trends · 15m" in text
+    assert all(label in text for label in ("Kudos/hr", "Jobs/hr", "GPU duty", "7 done"))
+    assert max(map(len, text.splitlines())) <= 44
+
+
+def test_phone_operational_panels_use_wrapping_rows() -> None:
+    """Phone GPU, worker, pipeline, and residency facts survive at the served client's target width."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(
+            dreamer_name="A deliberately long worker name",
+            worker_version="12.0.0",
+            allow_post_processing=True,
+        ),
+        jobs_pending_inference=3,
+        jobs_in_progress=1,
+        jobs_pending_post_processing=2,
+        jobs_pending_submit=1,
+        num_jobs_submitted=42,
+        per_card=[
+            CardSnapshot(
+                device_index=0,
+                device_name="NVIDIA GeForce RTX 4090",
+                total_vram_mb=24_000,
+                free_vram_mb=8_000,
+                loaded_contexts=2,
+                target_process_count=3,
+                busy_contexts=1,
+            )
+        ],
+    )
+    view = OverviewView()
+    rendered = "\n".join(
+        _render(panel, width=44)
+        for panel in (
+            view._render_pipeline_strip(snapshot, compact=True),
+            view._render_gpus_strip(snapshot, detailed=False, compact=True),
+            view._render_worker_table(snapshot, compact=True),
+            view._render_residency_panel(_active_residency(), compact=True),
+        )
+    )
+
+    assert all(label in rendered for label in ("Post-proc", "RTX 4090", "Uptime", "Free if alone"))
+    assert max(map(len, rendered.splitlines())) <= 44
 
 
 def test_compact_bar_summarizes_worker_in_one_line() -> None:

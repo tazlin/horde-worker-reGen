@@ -156,7 +156,7 @@ class DiagnosticsView(Vertical):
     def compose(self) -> ComposeResult:
         """Lay out the session selector, the run button, a status line, and the scrollable results."""
         yield Static(id="diag-maintenance-clock")
-        with Horizontal(id="diag-controls"):
+        with Horizontal(id="diag-controls", classes="responsive-toolbar"):
             yield Label("Scope", classes="diag-cap")
             yield Select(
                 ((label, key) for key, label in _SCOPE_LABELS.items()),

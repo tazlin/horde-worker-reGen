@@ -7,7 +7,8 @@ import time
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, Input, Static, TabbedContent
+from textual.command import CommandPalette
+from textual.widgets import Button, Input, Static, TabbedContent, Tabs
 
 from horde_worker_regen.app_state import (
     AppStateStore,
@@ -506,9 +507,9 @@ async def test_screen_carries_one_width_band_class(tmp_path: Path, width: int, e
 
 
 async def test_phone_width_compacts_the_tab_strip_and_restores_it(tmp_path: Path) -> None:
-    """The eleven tabs get truncated labels below the terminal floor, so the whole strip stays tappable."""
+    """Compact labels limit phone overflow while leaving a scrollable sliver as a swipe affordance."""
     app, _, _ = _overview_app(tmp_path)
-    async with app.run_test(size=(55, 40)) as pilot:
+    async with app.run_test(size=(44, 40)) as pilot:
         app._tick()
         await pilot.pause()
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -516,12 +517,56 @@ async def test_phone_width_compacts_the_tab_strip_and_restores_it(tmp_path: Path
         # The compact strip has to fit the width a phone browser is served at, including the two cells
         # of padding Textual gives every tab.
         strip_width = sum(len(label) + 2 for label in _COMPACT_TAB_LABELS.values())
-        minimum_phone_columns = int(320 / (10 * 0.6))
-        assert strip_width <= minimum_phone_columns
+        minimum_phone_columns = int(320 / (12 * 0.6))
+        assert strip_width > minimum_phone_columns
+        assert strip_width - minimum_phone_columns <= 8
+        strip = tabs.query_one(Tabs)
+        scrolling_strip = strip.query_one("#tabs-scroll")
+        assert scrolling_strip.virtual_size.width > scrolling_strip.size.width
+
+        await pilot.press("alt+ctrl+right")
+        await pilot.pause()
+        assert tabs.active == "tab-stats"
+        await pilot.press("alt+ctrl+left")
+        await pilot.pause()
+        assert tabs.active == "tab-overview"
+
+        tabs.active = "tab-config"
+        await pilot.pause()
+        subtabs = app.query_one("#config-subtabs", TabbedContent)
+        original_subtab = subtabs.active
+        await pilot.press("alt+ctrl+shift+right")
+        await pilot.pause()
+        assert subtabs.active != original_subtab
 
         await pilot.resize_terminal(120, 40)
         await pilot.pause()
         assert tabs.get_tab("tab-benchmark").label_text == "Benchmark"
+
+
+async def test_phone_dock_command_hides_and_restores_main_tabs(tmp_path: Path) -> None:
+    """The browser dock's private key reclaims the tab strip without changing the active destination."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(44, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        tabs = app.query_one("#main-tabs", TabbedContent)
+        strip = tabs.query_one(Tabs)
+        tabs.active = "tab-stats"
+
+        await pilot.press("alt+ctrl+shift+up")
+        await pilot.pause()
+        assert strip.display is False
+        assert tabs.active == "tab-stats"
+
+        await pilot.press("alt+ctrl+shift+up")
+        await pilot.pause()
+        assert strip.display is True
+        assert tabs.active == "tab-stats"
+
+        await pilot.press("alt+ctrl+shift+down")
+        await pilot.pause()
+        assert isinstance(app.screen, CommandPalette)
 
 
 async def test_phone_config_scrolls_its_preamble_away_with_the_fields(tmp_path: Path) -> None:
@@ -539,6 +584,29 @@ async def test_phone_config_scrolls_its_preamble_away_with_the_fields(tmp_path: 
         assert config.scroll_y > 0
 
 
+async def test_phone_toolbars_keep_every_control_inside_the_viewport(tmp_path: Path) -> None:
+    """Desktop-width action rows reflow instead of leaving their later controls untappable off-screen."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(44, 40)) as pilot:
+        tabs = app.query_one("#main-tabs", TabbedContent)
+        toolbar_tabs = {
+            "tab-control": "#control-actions",
+            "tab-downloads": "#downloads-controls",
+            "tab-logs": "#log-controls",
+            "tab-diagnostics": "#diag-controls",
+            "tab-benchmark": "#benchmark-actions",
+        }
+        for tab_id, toolbar_id in toolbar_tabs.items():
+            tabs.active = tab_id
+            await pilot.pause()
+            toolbar = app.query_one(toolbar_id)
+            assert toolbar.size.height <= 16
+            for child in toolbar.children:
+                if child.display:
+                    assert child.region.x >= toolbar.content_region.x, (toolbar_id, child.id)
+                    assert child.region.right <= toolbar.content_region.right, (toolbar_id, child.id)
+
+
 async def test_phone_resize_reveals_the_focused_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A keyboard-height resize asks Textual to expose the focused control in the reduced viewport."""
     app, _, _ = _overview_app(tmp_path)
@@ -548,12 +616,41 @@ async def test_phone_resize_reveals_the_focused_field(tmp_path: Path, monkeypatc
         field = app.query_one("#cfg-dreamer_name", Input)
         field.focus()
         calls: list[bool] = []
-        monkeypatch.setattr(field, "scroll_visible", lambda *, animate: calls.append(animate))
+        monkeypatch.setattr(field, "scroll_visible", lambda *, animate, top: calls.append(animate or not top))
 
         await pilot.resize_terminal(55, 20)
         await pilot.pause()
 
         assert calls == [False]
+
+
+async def test_phone_reclaims_header_chrome(tmp_path: Path) -> None:
+    """Every phone viewport hides redundant title and terminal shortcut chrome."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(55, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+
+        assert app.screen.has_class("-phone")
+        assert app.query_one("Header").display is False
+        assert app.query_one("#footer-bar").display is False
+
+
+async def test_phone_overview_scrolls_hero_away_with_the_page(tmp_path: Path) -> None:
+    """The hero is ordinary phone content, not a sticky block above an undersized nested scroller."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(44, 24)) as pilot:
+        app._tick()
+        await pilot.pause()
+        overview = app.query_one(OverviewView)
+        body = overview.query_one("#overview-body")
+
+        assert str(overview.styles.overflow_y) == "auto"
+        assert str(body.styles.overflow_y) == "hidden"
+        assert overview.virtual_size.height > overview.size.height
+        overview.scroll_end(animate=False)
+        await pilot.pause()
+        assert overview.scroll_y > 0
 
 
 async def test_credentials_are_withheld_only_from_a_network_exposed_session(tmp_path: Path) -> None:

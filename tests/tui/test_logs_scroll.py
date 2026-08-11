@@ -33,6 +33,21 @@ def _batch(prefix: str, count: int) -> list[str]:
     return [f"2026-06-20 00:00:00 | INFO | {prefix} {i}" for i in range(count)]
 
 
+async def test_logs_wrap_at_phone_width_and_restore_desktop_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phone logs use RichLog's native wrapping instead of requiring precise horizontal scrolling."""
+    monkeypatch.setattr("horde_worker_regen.tui.widgets.logs.discover_bridge_logs_grouped", dict)
+    app = _LogsHost()
+    async with app.run_test(size=(55, 30)) as pilot:
+        log = app.query_one("#log-output", RichLog)
+        assert log.wrap is True
+        assert log.min_width == 1
+
+        await pilot.resize_terminal(120, 30)
+        await pilot.pause()
+        assert log.wrap is False
+        assert log.min_width == 78
+
+
 @pytest.mark.e2e
 async def test_logs_pause_autoscroll_when_scrolled_up_and_resume_on_jump(monkeypatch: pytest.MonkeyPatch) -> None:
     """While scrolled up, new lines neither yank the view nor are lost; End jumps back and resumes."""

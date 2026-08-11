@@ -85,7 +85,7 @@ module paths directly.
 | `analysis/`                   | Log/session/support-bundle analysis and triage tools             |
 | `bridge_data/`                | Loading and validating `bridgeData.yaml` into `reGenBridgeData` |
 | `bridge_data/disagg_model_selection.py` | Pure ranking for the `disagg_optimized N` model rule: shared-VAE cluster (via `derive_canonical_registry` over merged record/sidecar hashes) then popularity |
-| `tui/`                        | Textual dashboard, web dashboard, config form, and worker host/launcher |
+| `tui/`                        | Textual dashboard, config form, worker host/launcher, and `native_dashboard.py`'s minimal semantic web overview and supervisor adapter |
 | `models/`                     | Worker-side model reference and metadata helpers                |
 | `reporting/`                  | Status reporting and run statistics                             |
 | `utils/`                      | Image, job, system, accelerator-probe, quota, and diagnostics helpers |

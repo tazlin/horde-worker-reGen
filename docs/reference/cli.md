@@ -59,8 +59,10 @@ graphical display, the launcher falls back to the in-terminal UI automatically.
 
 ## `horde-worker-web` (served dashboard / host control)
 
-Serves the browser dashboard, spawning a background worker host if one is not already running. It also
-carries two control commands that act on an already-running host and exit without starting anything:
+Serves the browser dashboard, spawning a background worker host if one is not already running. The root URL
+serves the complete terminal dashboard; `/native` serves a dependency-free responsive overview with selected
+live/session stats and start, graceful-stop, pause/resume, and Horde-maintenance controls. The command also
+carries two control options that act on an already-running host and exit without starting anything:
 
 | Flag | Meaning |
 |------|---------|

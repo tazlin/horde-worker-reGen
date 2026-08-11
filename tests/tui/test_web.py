@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 import textual_serve.server
+from textual import events
+from textual._xterm_parser import XTermParser
 
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui import web
@@ -119,17 +121,54 @@ def test_mobile_fit_injects_viewport_and_font_sizing_into_the_served_page() -> N
     assert rewritten.index("dataset.fontSize") < rewritten.index("</body>")
     assert "touchmove" in rewritten
     assert 'new WheelEvent("wheel"' in rewritten
-    assert "touch-action: none" in rewritten
+    assert "touch-action: pinch-zoom" in rewritten
     assert "100dvh" in rewritten
     assert "window.visualViewport" in rewritten
-    assert 'terminal.style.height = height + "px"' in rewritten
+    assert "height - keyboardRailHeight" in rewritten
+    assert "mobileControlsEnabled = coarsePointer && window.innerWidth <= 700" in rewritten
+    assert 'mobileDock.id = "mobile-controls-dock"' in rewritten
+    assert 'paletteButton.id = "mobile-palette-button"' in rewritten
+    assert 'paletteButton.textContent = "☰"' in rewritten
+    assert 'dispatchTerminalKey("ArrowDown", "ArrowDown", 40' in rewritten
+    assert 'tabsButton.id = "mobile-tabs-toggle"' in rewritten
+    assert 'tabsButton.textContent = "▴"' in rewritten
+    assert 'mainTabsVisible ? "▴" : "▾"' in rewritten
+    assert 'tabsButton.classList.toggle("-enabled", mainTabsVisible)' in rewritten
     assert 'keyboardButton.id = "mobile-keyboard-toggle"' in rewritten
-    assert "viewportTop + viewportHeight - 88" in rewritten
+    assert "viewportTop + viewportHeight - keyboardRailHeight" in rewritten
+    assert 'dispatchTerminalKey("ArrowUp", "ArrowUp", 38' in rewritten
     assert 'textarea.inputMode = keyboardEnabled ? "text" : "none"' in rewritten
     assert "textarea.readOnly = !keyboardEnabled" in rewritten
     assert 'touchAxis = totalX > totalY * 1.2 ? "horizontal" : "vertical"' in rewritten
-    assert 'ctrlKey: touchAxis === "horizontal"' in rewritten
+    assert "touchWheelRemainder / 12" in rewritten
+    assert 'horizontalSwipeSent = touchAxis === "horizontal"' in rewritten
+    assert "deltaMode: WheelEvent.DOM_DELTA_LINE" in rewritten
+    assert 'var key = direction > 0 ? "ArrowRight" : "ArrowLeft"' in rewritten
+    assert "textarea.dispatchEvent(new KeyboardEvent(type" in rewritten
+    assert "moveTouchedTab(wheelSteps)" in rewritten
+    assert "var configStrip = terminalRow >= 6" in rewritten
+    assert "shift: configStrip" in rewritten
+    assert "ctrlKey: false" in rewritten
     assert 'shiftKey: touchAxis === "horizontal"' not in rewritten
+
+
+@pytest.mark.parametrize(
+    ("sequence", "key"),
+    [
+        ("\x1b[1;7D", "alt+ctrl+left"),
+        ("\x1b[1;7C", "alt+ctrl+right"),
+        ("\x1b[1;8D", "alt+ctrl+shift+left"),
+        ("\x1b[1;8C", "alt+ctrl+shift+right"),
+        ("\x1b[1;8A", "alt+ctrl+shift+up"),
+        ("\x1b[1;8B", "alt+ctrl+shift+down"),
+    ],
+)
+def test_swipe_modified_arrows_match_textual_binding_names(sequence: str, key: str) -> None:
+    """The escape sequences emitted by bundled xterm parse to the app's hidden swipe bindings."""
+    messages = list(XTermParser().feed(sequence))
+    assert [(message.key, message.character) for message in messages if isinstance(message, events.Key)] == [
+        (key, None)
+    ]
 
 
 def test_wildcard_bind_page_addresses_the_client_own_origin() -> None:
@@ -164,10 +203,163 @@ def test_mobile_fit_leaves_unrecognised_markup_alone() -> None:
     assert web._inject_mobile_fit("<p>not the page</p>") == "<p>not the page</p>"
 
 
+async def test_server_registers_native_companion_routes() -> None:
+    """The basic HTML client shares the launcher without replacing textual-serve's default route."""
+    server = web._build_server(
+        "ignored-test-command",
+        host="127.0.0.1",
+        port=8000,
+        title="Test",
+        host_address=("127.0.0.1", 7717),
+        session_processes=web._DashboardSessionProcesses(),
+    )
+    app = await server._make_app()
+    paths = {resource.canonical for resource in app.router.resources()}
+
+    assert "/" in paths
+    assert "/ws" in paths
+    assert "/native" in paths
+    assert "/native/api/state" in paths
+    assert "/native/api/action" in paths
+
+
 def test_app_window_is_the_default_browser_is_opt_in() -> None:
     """The borderless app window is the default; --browser opts back into a normal tab."""
     assert web._parse_args([]).browser is False
     assert web._parse_args(["--browser"]).browser is True
+
+
+def test_session_reaper_targets_only_registered_session_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bounded fallback cannot rediscover and kill a browser merely because it is a launcher child."""
+    assigned: list[int] = []
+    killed: list[tuple[int, float]] = []
+
+    class _FakeJob:
+        def assign(self, pid: int | None) -> bool:
+            if pid is not None:
+                assigned.append(pid)
+            return True
+
+    class _FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def create_time(self) -> float:
+            return {101: 10.0, 202: 20.0}[self.pid]
+
+    monkeypatch.setattr(web, "WorkerJobObject", _FakeJob)
+    monkeypatch.setattr(web.psutil, "Process", _FakeProcess)
+    monkeypatch.setattr(
+        web,
+        "kill_process_tree",
+        lambda pid, *, grace_seconds: killed.append((pid, grace_seconds)),
+    )
+
+    sessions = web._DashboardSessionProcesses()
+    sessions.register(101)
+    # PID 202 represents the browser. It may be a real launcher descendant, but it was not created by
+    # textual-serve and is therefore intentionally absent from the ownership registry.
+    assert sessions.terminate_all() == [101]
+    assert assigned == [101]
+    assert killed == [(101, web._DASHBOARD_SESSION_KILL_GRACE_SECONDS)]
+
+
+def test_session_reaper_rejects_a_reused_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session PID now owned by a different process is left untouched."""
+    create_time = 10.0
+    killed: list[int] = []
+
+    class _FakeJob:
+        def assign(self, pid: int | None) -> bool:
+            return True
+
+    class _FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def create_time(self) -> float:
+            return create_time
+
+    monkeypatch.setattr(web, "WorkerJobObject", _FakeJob)
+    monkeypatch.setattr(web.psutil, "Process", _FakeProcess)
+    monkeypatch.setattr(web, "kill_process_tree", lambda pid, *, grace_seconds: killed.append(pid))
+    sessions = web._DashboardSessionProcesses()
+    sessions.register(101)
+    create_time = 99.0
+
+    assert sessions.terminate_all() == []
+    assert killed == []
+
+
+def test_launcher_wind_down_prefers_graceful_server_exit() -> None:
+    """A responsive server closes its WebSockets and sessions without invoking the reap fallback."""
+    calls: list[str] = []
+
+    class _Server:
+        def request_threadsafe_exit(self) -> None:
+            calls.append("request")
+
+        def wait_stopped(self, timeout: float) -> bool:
+            calls.append(f"wait:{timeout}")
+            return True
+
+    class _Sessions:
+        def terminate_all(self) -> list[int]:
+            calls.append("terminate")
+            return []
+
+    web._wind_down_launcher(_Server(), _Sessions(), graceful_timeout=0.25)  # type: ignore[arg-type]
+
+    assert calls == ["request", "wait:0.25"]
+
+
+def test_launcher_wind_down_reaps_owned_sessions_after_timeout() -> None:
+    """A wedged Textual session is precisely reaped and cannot remain orphaned indefinitely."""
+    calls: list[str] = []
+    stopped = iter((False, True))
+
+    class _Server:
+        def request_threadsafe_exit(self) -> None:
+            calls.append("request")
+
+        def wait_stopped(self, timeout: float) -> bool:
+            calls.append(f"wait:{timeout}")
+            return next(stopped)
+
+    class _Sessions:
+        def terminate_all(self) -> list[int]:
+            calls.append("terminate")
+            return [101]
+
+    web._wind_down_launcher(_Server(), _Sessions(), graceful_timeout=0.25)  # type: ignore[arg-type]
+
+    assert calls == [
+        "request",
+        "wait:0.25",
+        "terminate",
+        f"wait:{web._DASHBOARD_SESSION_KILL_GRACE_SECONDS}",
+    ]
+
+
+def test_launcher_wind_down_has_a_final_bound_after_session_reap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a server that stays wedged after its sessions die cannot linger indefinitely."""
+    exit_codes: list[int] = []
+
+    class _Server:
+        def request_threadsafe_exit(self) -> None:
+            pass
+
+        def wait_stopped(self, timeout: float) -> bool:
+            return False
+
+    class _Sessions:
+        def terminate_all(self) -> list[int]:
+            return [101]
+
+    monkeypatch.setattr(web.os, "_exit", exit_codes.append)
+    web._wind_down_launcher(_Server(), _Sessions(), graceful_timeout=0.0)  # type: ignore[arg-type]
+
+    assert exit_codes == [0]
 
 
 def test_chromium_app_command_none_when_no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,7 +467,7 @@ def test_main_serves_anyway_when_lan_bound(monkeypatch: pytest.MonkeyPatch) -> N
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
 
-        def serve(self) -> None:
+        def serve(self, debug: bool = False) -> None:
             served.append("served")
 
     import textual_serve.server
@@ -293,12 +485,12 @@ def _host_watcher_alive() -> bool:
 
 
 def test_main_stops_host_watcher_so_its_leash_cannot_kill_the_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When ``serve()`` returns, ``main`` must stop the liveness watcher so its hard-exit leash never fires late.
+    """When ``serve()`` returns, ``main`` must stop the liveness watcher so its shutdown leash never fires late.
 
-    The watcher is a daemon whose on-host-gone callback hard-exits the whole process. Left running after the
-    launcher unwinds (a non-blocking ``serve()``, as here and under any test exercising ``main``), it would
-    later conclude the absent host is gone and ``os._exit`` an unrelated, still-running process. Binding it to
-    the launcher's lifetime must both stop the thread and suppress the leash on a deliberate unwind.
+    Left running after the launcher unwinds (a non-blocking ``serve()``, as here and under any test exercising
+    ``main``), the daemon watcher could later conclude the absent host is gone and act on an unrelated,
+    still-running lifecycle. Binding it to the launcher's lifetime must both stop the thread and suppress the
+    leash on a deliberate unwind.
     """
     monkeypatch.setattr(web, "_is_graphical_environment", lambda: True)
     # No host is spawned and nothing listens on the port, so without the lifetime binding the watcher would
@@ -314,7 +506,7 @@ def test_main_stops_host_watcher_so_its_leash_cannot_kill_the_process(monkeypatc
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
 
-        def serve(self) -> None:
+        def serve(self, debug: bool = False) -> None:
             pass
 
     import textual_serve.server
@@ -331,4 +523,4 @@ def test_main_stops_host_watcher_so_its_leash_cannot_kill_the_process(monkeypatc
     assert not _host_watcher_alive(), (
         "the host-liveness watcher outlived the launcher; it could later kill the process"
     )
-    assert not wound_down.is_set(), "the launcher's hard-exit leash fired during a deliberate unwind"
+    assert not wound_down.is_set(), "the launcher's shutdown leash fired during a deliberate unwind"

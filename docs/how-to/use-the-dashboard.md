@@ -268,7 +268,9 @@ even after the browser and the launcher window are gone. Its menu offers:
 - **Open dashboard**: reopen the browser dashboard attached to this worker (reusing a running web
   server if there is one).
 - **Stop worker & exit**: drain in-flight jobs, then stop the worker and host cleanly. A still-running
-  launcher window notices the host going away and closes itself too, so nothing is left lingering.
+  launcher notices the host going away and closes its own dashboard sessions too. It does not terminate
+  the browser process, so other windows and tabs in the user's normal browser remain open. A bounded,
+  session-only fallback prevents a stuck dashboard TUI subprocess from being left behind.
 
 The line at the top of the menu shows whether the worker is currently running. The icon is the simplest
 way to find and stop an orphaned worker after a hard-closed launcher window; the `--stop` command above
@@ -340,37 +342,81 @@ protection it adds. It does not cover:
 The launcher prints this same summary when it binds a non-loopback address, so the exposure is never
 silent.
 
+## Use the basic native overview
+
+Open `http://<worker-machine>:<dashboard-port>/native` for a lightweight, browser-native status page. It
+uses ordinary responsive HTML rather than the terminal canvas, so it is the practical quick-check surface
+on a phone. It shows worker identity and uptime, lifecycle and maintenance state, pipeline depth, session
+job/kudos totals, GPU duty, active models, recent Horde messages, active-job stage and progress, compact
+per-process liveness/model/VRAM/heartbeat state, and alchemy totals when enabled. The **At a glance** sentence
+prioritizes the condition most likely to explain what the worker is doing now.
+
+The available controls are intentionally limited: start, graceful stop, local pause/resume, and Horde
+maintenance on/off. **Pause** stops this worker from accepting new work locally; **Horde maintenance**
+changes the worker's advertised maintenance state at the Horde. They are independent controls. Use the
+**Full terminal dashboard** link for configuration, downloads, logs, diagnostics, and detailed process or
+job views.
+
+Choose **Glance view** to keep lifecycle controls, four headline metrics, the pipeline, active jobs, and all
+process states in one viewport. On a phone it behaves like a compact application rather than a long page:
+the page itself does not scroll, metrics form a 2×2 dashboard, and the pipeline stays on one row. Active jobs
+and processes use compact two- or three-line cards, switching to a two-column matrix as the inventory grows.
+The page divides the remaining height according to each panel's actual row count, keeping every entry visible
+instead of putting state behind another swipe or nested scroller. Safe-area padding accounts for notches and
+home indicators. The preference is remembered in that browser;
+bookmark `/native?view=glance` to request it directly on a dedicated device or home-screen shortcut.
+
+The page polls the same persistent worker host used by the full browser dashboard, so closing or refreshing
+it does not restart the worker or reset worker-owned session statistics. It has no separate daemon or build
+step. The native overview intentionally omits config, credentials, logs, and full snapshot internals, but it
+is not an authentication boundary: its controls are unauthenticated, and the complete dashboard remains at
+`/` on the same port. Apply the same trusted-network restriction described above.
+
 ## Use the dashboard from a phone
 
 The web dashboard works on a phone or tablet browser: bind the network as above, then open
 `http://<worker-machine>:<dashboard-port>` on the device (8000 unless you configured another port).
+For a conventional mobile overview and the core lifecycle controls, prefer the
+[`/native` companion](#use-the-basic-native-overview); use the terminal view when you need its full operator
+surface.
 Three things adapt automatically.
 
 The page sizes the terminal's text so the dashboard gets enough columns to lay itself out, rather than
-rendering a desktop-width page scaled down to nothing. It will not automatically shrink below 10px.
+rendering a desktop-width page scaled down to nothing. It targets about 52 terminal columns and will not
+automatically shrink below 12px.
 Append `?fontsize=N` to the URL to override it (`?fontsize=14` for larger text and fewer columns,
 `?fontsize=8` only if you deliberately prefer more columns to readability).
 
 The dashboard is drawn into a terminal canvas, so the browser cannot tell a painted tab from
 a painted text field. On touch devices the terminal's hidden keyboard input is therefore disabled
-by default: tapping tabs and buttons does not summon the software keyboard. Tap the 48-pixel keyboard
-button near the lower-right edge when you intend to type into the currently selected dashboard field;
+by default: tapping tabs and buttons does not summon the software keyboard. Tap the keyboard button in
+the bottom browser dock when you intend to type into the currently selected dashboard field;
 tap it again to return to navigation-only taps.
 
 The dashboard itself has a layout for screens narrower than the 80-column terminal floor. Cards lose
-their side padding and borders, buttons and form rows stack instead of sitting side by side, primary
+their side padding and borders, desktop action bars become two-column touch grids, form rows stack instead
+of sitting side by side, primary
 action buttons and tabs gain taller touch targets, tab labels shorten, fixed-width dialogs clamp to the
-viewport, and tables shed columns down to the ones that identify each row.
+viewport, Logs wrap long lines, and tables shed columns down to the ones that identify each row.
 The terminal follows the browser's *visual* viewport rather than legacy `100vh`, so the bottom remains
-reachable as the address bar expands or collapses and while the software keyboard is open. Swipe
+reachable as the address bar expands or collapses and while the software keyboard is open. The decorative
+title/clock header is omitted on phones. Overview's headline scrolls with the rest of that page, and its
+dense trend, pipeline, GPU, worker, alchemy, health, and residency grids become stacked readable facts
+while the desktop layouts remain unchanged. Swipe
 vertically anywhere in the terminal to scroll; you do not need to catch Textual's narrow scrollbar.
-When the keyboard reduces the viewport, the dashboard scrolls the focused field back above its top edge
-so the value being edited remains visible. The keyboard button stays low on the right but leaves a clear
-footer-sized lane beneath it rather than covering **Palette**.
+When the keyboard substantially reduces the viewport, the dashboard scrolls the focused field to the top
+of its remaining scroller so the value being edited remains visible; short dialogs scroll instead of
+clipping their final actions. A 52-pixel browser dock below the terminal holds three controls: the hamburger
+button (`☰`) opens the command palette, the up/down triangle hides or restores the main tab strip without
+changing the current page, and the keyboard button enables typing. The terminal shortcut Footer and its
+built-in affordances are hidden on phones; the dock replaces the useful palette entry point without covering
+content or toast notifications.
 
-Swipe sideways directly over the main or Config tab strip to scroll that strip left or right. The gesture
+Swipe sideways directly over the main or Config tab strip to move to the adjacent tab; Textual reveals
+the newly active tab in its strip. The gesture
 locks to its dominant axis after a short movement, so a mostly vertical drag continues to scroll the page
-and a mostly horizontal drag uses Textual's native horizontal tab scrolling.
+and one mostly horizontal drag produces one focus-independent tab change through the terminal's keyboard
+input path. Start the gesture on the relevant strip. Two-finger pinch zoom remains available.
 
 On phones, the Config page uses one page-level scroller. Its action bar, status summaries, and sub-tab
 strip therefore move out of the way as you scroll through fields instead of remaining pinned and

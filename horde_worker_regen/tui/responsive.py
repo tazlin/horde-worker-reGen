@@ -29,6 +29,9 @@ Lives here rather than beside the app's breakpoints so the widgets that size the
 share it without importing the app module they are imported by.
 """
 
+SHORT_BAND_MAX_HEIGHT = 28
+"""Heights below this receive short-viewport rules (notably a phone with its keyboard open)."""
+
 
 class ResponsiveModalScreen[ResultType](ModalScreen[ResultType]):
     """Modal screen that receives the same phone-width marker as the app's default screen.
@@ -39,6 +42,7 @@ class ResponsiveModalScreen[ResultType](ModalScreen[ResultType]):
     """
 
     HORIZONTAL_BREAKPOINTS = [(0, "-phone"), (PHONE_BAND_MAX_WIDTH, "-normal")]
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (SHORT_BAND_MAX_HEIGHT, "-normal-height")]
 
 
 Cell = str | Text

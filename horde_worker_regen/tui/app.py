@@ -26,8 +26,9 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
+from textual.geometry import Size
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane
+from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane, Tabs
 
 from horde_worker_regen import __version__
 from horde_worker_regen.app_state import (
@@ -62,7 +63,11 @@ from horde_worker_regen.tui.design import register_horde_themes
 from horde_worker_regen.tui.formatters import configure_fidelity, format_percent
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
-from horde_worker_regen.tui.responsive import PHONE_BAND_MAX_WIDTH, ResponsiveModalScreen
+from horde_worker_regen.tui.responsive import (
+    PHONE_BAND_MAX_WIDTH,
+    SHORT_BAND_MAX_HEIGHT,
+    ResponsiveModalScreen,
+)
 from horde_worker_regen.tui.update_check import UpdateInfo, check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
 from horde_worker_regen.tui.widgets.config_editor import (
@@ -374,6 +379,7 @@ class HordeWorkerTUI(App[None]):
         (100, "-normal"),
         (150, "-wide"),
     ]
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (SHORT_BAND_MAX_HEIGHT, "-normal-height")]
     """Width bands Textual stamps onto the Screen as classes, mirroring the table column tiers.
 
     These drive only *layout* rules in the CSS below (e.g. reclaiming side padding on a cramped terminal).
@@ -388,9 +394,9 @@ class HordeWorkerTUI(App[None]):
     Textual applies at most **one** class per dimension, so ``-phone`` replaces ``-narrow`` rather than
     adding to it: every rule that should hold for both has to name both.
 
-    There is deliberately no vertical band. Height is not what a phone is short of: served at the font
-    size a narrow viewport picks, a phone gives dozens of rows in either orientation, and a band low
-    enough to catch one would also catch the 80x24 terminal floor and change a layout that is fine.
+    The vertical band is deliberately independent. It catches landscape phones and the reduced visual
+    viewport produced by a software keyboard; CSS combines it with ``-phone`` so an ordinary 80x24
+    terminal keeps its established chrome.
     """
 
     CSS = """
@@ -444,6 +450,12 @@ class HordeWorkerTUI(App[None]):
         ("m", "toggle_server_maintenance", "Maintenance (horde)"),
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
+        Binding("alt+ctrl+left", "swipe_main_previous", "", show=False, priority=True),
+        Binding("alt+ctrl+right", "swipe_main_next", "", show=False, priority=True),
+        Binding("alt+ctrl+shift+left", "swipe_config_previous", "", show=False, priority=True),
+        Binding("alt+ctrl+shift+right", "swipe_config_next", "", show=False, priority=True),
+        Binding("alt+ctrl+shift+up", "toggle_main_tabs", "", show=False, priority=True),
+        Binding("alt+ctrl+shift+down", "command_palette", "", show=False, priority=True),
     ]
 
     def __init__(
@@ -469,6 +481,7 @@ class HordeWorkerTUI(App[None]):
         # be undone when the window widens again.
         self._full_tab_labels: dict[str, str] = {}
         self._tab_labels_are_compact = False
+        self._last_phone_size: Size | None = None
         self._frame = 0
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
@@ -1479,19 +1492,58 @@ class HordeWorkerTUI(App[None]):
         """Match the tab strip's labels to the new width band.
 
         Reads the width off the event rather than ``self.size``, which still holds the old value while
-        this handler runs and would leave the strip a resize behind. On a phone, a height reduction is
-        commonly the software keyboard opening; Textual preserves focus but does not automatically move
+        this handler runs and would leave the strip a resize behind. On a phone, a material height reduction
+        is commonly the software keyboard opening; Textual preserves focus but does not automatically move
         the focused field above the new bottom edge, so expose it again after the resized layout settles.
         """
         self._apply_tab_labels(compact=event.size.width < PHONE_BAND_MAX_WIDTH)
-        if event.size.width < PHONE_BAND_MAX_WIDTH:
+        is_phone = event.size.width < PHONE_BAND_MAX_WIDTH
+        previous = self._last_phone_size
+        keyboard_sized_drop = previous is not None and previous.height - event.size.height >= 6
+        self._last_phone_size = event.size if is_phone else None
+        if is_phone and keyboard_sized_drop:
             self.call_after_refresh(self._scroll_focused_widget_visible)
+
+    def action_swipe_main_previous(self) -> None:
+        """Move the main tab strip left for the served client's focus-independent swipe command."""
+        self._cycle_served_tabs("#main-tabs", direction=-1)
+
+    def action_swipe_main_next(self) -> None:
+        """Move the main tab strip right for the served client's focus-independent swipe command."""
+        self._cycle_served_tabs("#main-tabs", direction=1)
+
+    def action_swipe_config_previous(self) -> None:
+        """Move Config's nested tab strip left for the served client's swipe command."""
+        self._cycle_served_tabs("#config-subtabs", direction=-1)
+
+    def action_swipe_config_next(self) -> None:
+        """Move Config's nested tab strip right for the served client's swipe command."""
+        self._cycle_served_tabs("#config-subtabs", direction=1)
+
+    def action_toggle_main_tabs(self) -> None:
+        """Hide or restore the main strip from the served phone client's bottom dock."""
+        try:
+            tabs = self.screen.query_one("#main-tabs", TabbedContent).query_one(Tabs)
+        except NoMatches:
+            return
+        tabs.display = not tabs.display
+
+    def _cycle_served_tabs(self, tabbed_content_id: str, *, direction: int) -> None:
+        """Cycle a named strip only when it belongs to the active screen (never through a modal)."""
+        try:
+            tabs = self.screen.query_one(tabbed_content_id, TabbedContent).query_one(Tabs)
+        except NoMatches:
+            return
+        if direction > 0:
+            tabs.action_next_tab()
+        else:
+            tabs.action_previous_tab()
 
     def _scroll_focused_widget_visible(self) -> None:
         """Bring the focused control into the phone viewport after browser chrome changes its height."""
         focused = self.focused
         if focused is not None:
-            focused.scroll_visible(animate=False)
+            focused.scroll_visible(animate=False, top=True)
 
     def _apply_tab_labels(self, *, compact: bool) -> None:
         """Show the compact or the full tab labels, doing nothing when they are already the wanted set.

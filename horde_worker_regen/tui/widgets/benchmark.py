@@ -337,7 +337,7 @@ class BenchmarkView(VerticalScroll):
         """
         yield Static(id="benchmark-stepper")
         yield Static(id="benchmark-waiting-banner")
-        with Horizontal(id="benchmark-actions"):
+        with Horizontal(id="benchmark-actions", classes="responsive-toolbar"):
             yield Button("Preview plan", id="benchmark-preview", variant="primary")
             yield Button("Download models", id="benchmark-download", variant="default")
             yield Button("Run benchmark", id="benchmark-run", variant="success")

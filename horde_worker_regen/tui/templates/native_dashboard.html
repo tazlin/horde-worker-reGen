@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Horde Worker Overview</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #091116;
+      --panel: #111d24;
+      --panel-2: #17262f;
+      --edge: #2b414d;
+      --text: #eef6f8;
+      --muted: #9bb0ba;
+      --cyan: #68d9e8;
+      --purple: #c792ea;
+      --green: #70d799;
+      --yellow: #efc66d;
+      --red: #ff7b88;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top right, #172737 0, var(--bg) 38rem);
+      color: var(--text);
+      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1080px, 100%); margin: 0 auto; padding: 22px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    .header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+    h1 { margin: 0; font-size: clamp(1.35rem, 4vw, 2rem); letter-spacing: -.025em; }
+    h2 { margin: 0 0 12px; font-size: .78rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+    p { margin: 0; }
+    a { color: var(--cyan); }
+    .eyebrow { color: var(--purple); font-size: .75rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+    .subline { margin-top: 5px; color: var(--muted); }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 6px 11px;
+      border: 1px solid var(--edge);
+      border-radius: 999px;
+      background: rgba(17, 29, 36, .88);
+      white-space: nowrap;
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px #9bb0ba22; }
+    .status.running .dot { background: var(--green); box-shadow: 0 0 0 3px #70d79922; }
+    .status.starting .dot, .status.stopping .dot, .status.restarting .dot { background: var(--yellow); }
+    .status.disconnected .dot, .status.crashed .dot { background: var(--red); }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+    button {
+      min-height: 44px;
+      padding: 9px 15px;
+      border: 1px solid var(--edge);
+      border-radius: 9px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--cyan); }
+    button:focus-visible { outline: 3px solid #68d9e855; outline-offset: 2px; }
+    button:disabled { cursor: wait; opacity: .5; }
+    button.primary { background: #254657; border-color: #3f7289; }
+    button.warn { background: #493b24; border-color: #755f37; }
+    button.quiet { min-height: 34px; padding: 6px 11px; background: transparent; color: var(--muted); }
+    .notice { min-height: 24px; margin: -7px 0 13px; color: var(--muted); }
+    .notice.error { color: var(--red); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .card, section {
+      border: 1px solid var(--edge);
+      border-radius: 13px;
+      background: rgba(17, 29, 36, .92);
+      box-shadow: 0 12px 35px #0003;
+    }
+    .card { min-height: 112px; padding: 15px; }
+    .label { color: var(--muted); font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; }
+    .value { margin-top: 7px; font-size: clamp(1.45rem, 5vw, 2rem); font-weight: 760; letter-spacing: -.035em; }
+    .detail { margin-top: 3px; color: var(--muted); font-size: .86rem; }
+    .body-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 12px; margin-top: 12px; }
+    section { padding: 16px; }
+    .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 18px; }
+    .fact { min-width: 0; }
+    .fact b { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+    .pipeline { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
+    .stage { padding: 10px 7px; border-radius: 9px; background: var(--panel-2); text-align: center; }
+    .stage b { display: block; font-size: 1.25rem; color: var(--cyan); }
+    .stage span { color: var(--muted); font-size: .72rem; text-transform: uppercase; }
+    .wide { grid-column: 1 / -1; }
+    .models { display: flex; flex-wrap: wrap; gap: 7px; }
+    .chip { max-width: 100%; padding: 5px 9px; border-radius: 999px; background: #263743; overflow-wrap: anywhere; }
+    .messages { margin: 0; padding-left: 20px; color: var(--yellow); }
+    .messages:empty::after { content: "No current API messages."; color: var(--muted); }
+    .maintenance-on { color: var(--yellow); }
+    .insight { color: var(--text); font-size: 1rem; }
+    .insight.attention { color: var(--yellow); }
+    .row-list { display: grid; gap: 7px; }
+    .state-row {
+      display: grid;
+      grid-template-columns: minmax(74px, auto) minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 49px;
+      padding: 8px 10px;
+      border-radius: 9px;
+      background: var(--panel-2);
+    }
+    .state-row.offline { border-left: 3px solid var(--red); }
+    .row-main { min-width: 0; }
+    .row-main b, .row-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-main small, .row-meta { color: var(--muted); font-size: .76rem; }
+    .row-meta { text-align: right; white-space: nowrap; }
+    .state-label { color: var(--cyan); font-size: .72rem; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+    progress { width: 100%; height: 6px; margin-top: 5px; border: 0; accent-color: var(--cyan); }
+    .empty { color: var(--muted); padding: 7px 0; }
+    footer { display: flex; justify-content: space-between; gap: 15px; margin-top: 16px; color: var(--muted); font-size: .82rem; }
+    [hidden] { display: none !important; }
+    body.glance main { width: min(1440px, 100%); padding: 10px 14px; }
+    body.glance header { margin-bottom: 8px; }
+    body.glance .controls { margin-bottom: 7px; }
+    body.glance .notice { min-height: 18px; margin: -2px 0 5px; font-size: .78rem; }
+    body.glance .grid { gap: 8px; }
+    body.glance .card { min-height: 72px; padding: 9px 12px; }
+    body.glance .card .value { margin-top: 1px; font-size: 1.45rem; }
+    body.glance .body-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+    body.glance section { padding: 10px; }
+    body.glance section.wide { grid-column: 1 / -1; }
+    body.glance .secondary, body.glance footer { display: none; }
+    body.glance .row-list { max-height: 31dvh; overflow: auto; scrollbar-width: thin; }
+    body.glance .state-row { min-height: 40px; padding: 5px 8px; }
+    body.glance .pipeline { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+    body.glance .stage { padding: 7px 3px; }
+    @media (max-width: 760px) {
+      main { padding: 15px; }
+      header { align-items: stretch; flex-direction: column; }
+      .header-actions { justify-content: space-between; }
+      .status { align-self: flex-start; }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .body-grid { grid-template-columns: 1fr; }
+      .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls button { flex: 1 1 calc(50% - 10px); }
+      footer { flex-direction: column; }
+      body.glance .body-grid { grid-template-columns: 1fr; }
+      body.glance section.wide { grid-column: auto; }
+      body.glance .row-list { max-height: none; overflow: visible; }
+    }
+    @media (max-width: 420px) {
+      .grid, .facts { grid-template-columns: 1fr; }
+      .controls { display: grid; grid-template-columns: 1fr; }
+      .controls button { width: 100%; }
+    }
+    @media (max-width: 760px) {
+      body.glance {
+        height: 100svh;
+        height: 100dvh;
+        min-height: 0;
+        overflow: hidden;
+        overscroll-behavior: none;
+        background:
+          radial-gradient(circle at 85% 0, #1c3a4b 0, transparent 34%),
+          linear-gradient(160deg, #091116 0, #0d1820 100%);
+      }
+      body.glance main {
+        display: grid;
+        grid-template-rows: auto auto auto minmax(0, 1fr);
+        gap: 7px;
+        width: 100%;
+        height: 100%;
+        padding: max(8px, env(safe-area-inset-top)) max(9px, env(safe-area-inset-right))
+          max(8px, env(safe-area-inset-bottom)) max(9px, env(safe-area-inset-left));
+        overflow: hidden;
+      }
+      body.glance header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        margin: 0;
+      }
+      body.glance .eyebrow, body.glance #identity, body.glance .identity-separator { display: none; }
+      body.glance h1 {
+        overflow: hidden;
+        font-size: 1.06rem;
+        line-height: 1.15;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body.glance .subline { margin-top: 2px; font-size: .72rem; }
+      body.glance .header-actions { gap: 5px; }
+      body.glance .status { min-height: 32px; padding: 4px 8px; font-size: .72rem; }
+      body.glance .status .dot { width: 7px; height: 7px; }
+      body.glance button.quiet { min-height: 32px; padding: 4px 8px; font-size: .72rem; }
+      body.glance .controls {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+        margin: 0;
+      }
+      body.glance .controls button {
+        width: auto;
+        min-width: 0;
+        min-height: 38px;
+        padding: 5px 4px;
+        overflow: hidden;
+        font-size: clamp(.66rem, 2.8vw, .76rem);
+        line-height: 1.08;
+        text-overflow: ellipsis;
+      }
+      body.glance .notice { display: none; }
+      body.glance .notice:not(:empty) {
+        display: block;
+        position: fixed;
+        z-index: 10;
+        right: 10px;
+        bottom: max(10px, env(safe-area-inset-bottom));
+        left: 10px;
+        min-height: 0;
+        margin: 0;
+        padding: 8px 11px;
+        border: 1px solid var(--edge);
+        border-radius: 9px;
+        background: #13232dec;
+        box-shadow: 0 8px 30px #0009;
+      }
+      body.glance .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+      }
+      body.glance .card {
+        min-height: 58px;
+        padding: 7px 10px;
+        border-radius: 10px;
+        background: linear-gradient(145deg, #142630, #101c23);
+        box-shadow: inset 0 2px 0 #68d9e826;
+      }
+      body.glance .card .label { font-size: .62rem; }
+      body.glance .card .value { margin-top: 0; font-size: 1.24rem; line-height: 1.05; }
+      body.glance .card .detail {
+        margin-top: 1px;
+        overflow: hidden;
+        font-size: .66rem;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body.glance .body-grid {
+        display: grid;
+        grid-template-rows:
+          auto auto
+          minmax(0, var(--jobs-share, 1fr))
+          minmax(0, var(--process-share, 1fr));
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px;
+        min-height: 0;
+        margin: 0;
+        overflow: hidden;
+      }
+      body.glance section, body.glance section.wide {
+        grid-column: auto;
+        min-width: 0;
+        min-height: 0;
+        padding: 7px 9px;
+        overflow: hidden;
+        border-radius: 10px;
+        box-shadow: none;
+      }
+      body.glance h2 { margin-bottom: 4px; font-size: .62rem; }
+      body.glance .core-insight { border-left: 3px solid var(--purple); }
+      body.glance .insight {
+        display: -webkit-box;
+        overflow: hidden;
+        font-size: .76rem;
+        line-height: 1.2;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+      }
+      body.glance .core-pipeline .pipeline { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; }
+      body.glance .stage { min-width: 0; padding: 3px 1px; border-radius: 6px; }
+      body.glance .stage b { font-size: .92rem; line-height: 1.1; }
+      body.glance .stage span { font-size: .51rem; letter-spacing: -.015em; }
+      body.glance .jobs-panel, body.glance .process-panel { display: flex; flex-direction: column; }
+      body.glance .row-list {
+        display: grid;
+        grid-template-columns: repeat(var(--entry-columns, 1), minmax(0, 1fr));
+        grid-template-rows: repeat(var(--entry-rows, 1), minmax(0, 1fr));
+        flex: 1;
+        gap: 4px;
+        max-height: none;
+        min-height: 0;
+        overflow: hidden;
+      }
+      body.glance .state-row {
+        grid-template:
+          "state meta" auto
+          "main main" minmax(0, 1fr) /
+          minmax(0, 1fr) auto;
+        gap: 2px 5px;
+        width: auto;
+        min-height: 0;
+        height: 100%;
+        padding: 5px 7px;
+        overflow: hidden;
+      }
+      body.glance .state-label { grid-area: state; font-size: .56rem; line-height: 1; }
+      body.glance .row-main {
+        display: grid;
+        grid-area: main;
+        grid-template-rows: auto auto auto;
+        align-content: center;
+        align-self: stretch;
+        min-height: 0;
+        overflow: hidden;
+      }
+      body.glance .row-main b { font-size: .67rem; line-height: 1.05; }
+      body.glance .row-main small, body.glance .row-meta { font-size: .53rem; line-height: 1.05; }
+      body.glance .row-meta { grid-area: meta; line-height: 1; }
+      body.glance progress { height: 3px; margin-top: 2px; }
+      body.glance .empty { align-self: center; justify-self: start; padding: 0; font-size: .72rem; }
+      body.glance .row-list.dense { gap: 3px; }
+      body.glance .row-list.dense .state-row { padding: 3px 5px; }
+      body.glance .row-list.dense .row-main b { font-size: .6rem; }
+      body.glance .row-list.dense .row-main small,
+      body.glance .row-list.dense .row-meta,
+      body.glance .row-list.dense .state-label { font-size: .47rem; }
+    }
+    @media (max-width: 760px) and (max-height: 700px) {
+      body.glance main { gap: 5px; padding-top: max(5px, env(safe-area-inset-top)); }
+      body.glance .subline { display: none; }
+      body.glance .controls button { min-height: 34px; }
+      body.glance .card { min-height: 49px; padding-block: 5px; }
+      body.glance .card .value { font-size: 1.08rem; }
+      body.glance .body-grid { gap: 4px; }
+      body.glance section, body.glance section.wide { padding-block: 5px; }
+      body.glance .core-insight h2 { display: none; }
+      body.glance .insight { -webkit-line-clamp: 1; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="eyebrow">AI Horde Worker</div>
+        <h1 id="worker-name">Worker overview</h1>
+        <p class="subline"><span id="identity">Waiting for a worker snapshot…</span><span class="identity-separator"> · </span><span id="uptime">—</span></p>
+      </div>
+      <div class="header-actions">
+        <button class="quiet" id="view-toggle" aria-pressed="false">Glance view</button>
+        <div class="status disconnected" id="status-pill"><span class="dot"></span><strong id="status">Connecting</strong></div>
+      </div>
+    </header>
+
+    <div class="controls" aria-label="Worker controls">
+      <button class="primary" id="lifecycle-button" disabled>Start worker</button>
+      <button id="pause-button" disabled>Pause locally</button>
+      <button class="warn" id="maintenance-button" disabled>Horde maintenance on</button>
+    </div>
+    <p class="notice" id="action-notice" aria-live="polite"></p>
+
+    <div class="grid" aria-label="Headline statistics">
+      <article class="card"><div class="label">Active / queued</div><div class="value"><span id="active">0</span> / <span id="queued">0</span></div><div class="detail">image jobs</div></article>
+      <article class="card"><div class="label">Completed</div><div class="value" id="submitted">0</div><div class="detail"><span id="faulted">0</span> faulted</div></article>
+      <article class="card"><div class="label">Kudos / hour</div><div class="value" id="kudos-rate">—</div><div class="detail"><span id="kudos-session">—</span> this session</div></article>
+      <article class="card"><div class="label">GPU duty</div><div class="value" id="gpu-duty">—</div><div class="detail" id="freshness">No snapshot</div></article>
+    </div>
+
+    <div class="body-grid" id="dashboard-body">
+      <section class="wide core-insight">
+        <h2>At a glance</h2>
+        <p class="insight" id="insight">Connecting to the worker host…</p>
+      </section>
+      <section class="core-pipeline">
+        <h2>Pipeline</h2>
+        <div class="pipeline">
+          <div class="stage"><b id="pipe-queue">0</b><span>Queue</span></div>
+          <div class="stage"><b id="pipe-active">0</b><span>Inference</span></div>
+          <div class="stage"><b id="pipe-post">0</b><span>Post</span></div>
+          <div class="stage"><b id="pipe-safety">0</b><span>Safety</span></div>
+          <div class="stage"><b id="pipe-submit">0</b><span>Submit</span></div>
+        </div>
+      </section>
+      <section class="secondary">
+        <h2>Session</h2>
+        <div class="facts">
+          <div class="fact"><span class="label">Popped</span><b id="jobs-popped">0</b></div>
+          <div class="fact"><span class="label">Slowdowns</span><b id="slowdowns">0</b></div>
+          <div class="fact"><span class="label">Recoveries</span><b id="recoveries">0</b></div>
+          <div class="fact"><span class="label">No-work time</span><b id="no-work">0s</b></div>
+          <div class="fact"><span class="label">Local pause</span><b id="local-pause">Off</b></div>
+          <div class="fact"><span class="label">Horde maintenance</span><b id="horde-maintenance">Off</b></div>
+        </div>
+      </section>
+      <section class="jobs-panel">
+        <h2>Active work · <span id="active-job-count">0</span></h2>
+        <div class="row-list" id="active-jobs"><p class="empty">No active jobs.</p></div>
+      </section>
+      <section class="process-panel">
+        <h2>Processes · <span id="process-count">0/0 alive</span></h2>
+        <div class="row-list" id="processes"><p class="empty">Waiting for process state.</p></div>
+      </section>
+      <section class="secondary" id="alchemy-section" hidden>
+        <h2>Alchemy</h2>
+        <div class="facts">
+          <div class="fact"><span class="label">Pending</span><b id="alchemy-pending">0</b></div>
+          <div class="fact"><span class="label">Active</span><b id="alchemy-active">0</b></div>
+          <div class="fact"><span class="label">Submitting</span><b id="alchemy-submitting">0</b></div>
+          <div class="fact"><span class="label">Completed / faulted</span><b><span id="alchemy-done">0</span> / <span id="alchemy-faulted">0</span></b></div>
+        </div>
+      </section>
+      <section class="secondary">
+        <h2>Active models</h2>
+        <div class="models" id="models"><span class="detail">No active models.</span></div>
+      </section>
+      <section class="wide secondary">
+        <h2>Horde messages</h2>
+        <ul class="messages" id="messages"></ul>
+      </section>
+    </div>
+
+    <footer><span>Basic native protocol view · updates every second</span><a href="/">Open full terminal dashboard</a></footer>
+  </main>
+  <script>
+    (() => {
+      const byId = id => document.getElementById(id);
+      const number = new Intl.NumberFormat();
+      let current = null;
+      let polling = false;
+      let pendingAction = null;
+      let pendingSince = 0;
+
+      const setText = (id, value) => { byId(id).textContent = value; };
+      const formatNumber = value => value === null || value === undefined ? "—" : number.format(Math.round(value));
+      const formatDuration = seconds => {
+        if (!Number.isFinite(seconds) || seconds < 0) return "—";
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor(seconds % 86400 / 3600);
+        const minutes = Math.floor(seconds % 3600 / 60);
+        if (days) return `${days}d ${hours}h`;
+        if (hours) return `${hours}h ${minutes}m`;
+        if (minutes) return `${minutes}m`;
+        return `${Math.floor(seconds)}s`;
+      };
+      const humanState = value => (value || "unknown").replaceAll("_", " ").toLowerCase();
+      const shortId = value => value ? value.slice(0, 8) : "—";
+      const addProgress = (parent, percent) => {
+        if (percent === null || percent === undefined) return;
+        const progress = document.createElement("progress");
+        progress.max = 100;
+        progress.value = percent;
+        progress.setAttribute("aria-label", `${Math.round(percent)}% complete`);
+        parent.appendChild(progress);
+      };
+      const emptyRow = (container, message) => {
+        const empty = document.createElement("p");
+        empty.className = "empty";
+        empty.textContent = message;
+        container.appendChild(empty);
+      };
+      const configureEntryGrid = (container, count, shareProperty) => {
+        const columns = count > 1 ? 2 : 1;
+        const rows = Math.max(1, Math.ceil(count / columns));
+        container.style.setProperty("--entry-columns", String(columns));
+        container.style.setProperty("--entry-rows", String(rows));
+        container.classList.toggle("dense", rows > 3);
+        byId("dashboard-body").style.setProperty(shareProperty, `${count ? rows : .65}fr`);
+      };
+      const setGlance = enabled => {
+        document.body.classList.toggle("glance", enabled);
+        const toggle = byId("view-toggle");
+        toggle.textContent = enabled ? "Full view" : "Glance view";
+        toggle.setAttribute("aria-pressed", String(enabled));
+        try { localStorage.setItem("horde-native-glance", enabled ? "1" : "0"); } catch (_) { /* optional */ }
+      };
+      const renderInsight = state => {
+        const insight = byId("insight");
+        const offline = Math.max(0, state.processes_total - state.processes_alive);
+        let summary;
+        let attention = false;
+        if (!state.connected || !state.lifecycle_resolved) {
+          summary = "The dashboard is reconnecting to the worker host.";
+          attention = true;
+        } else if (!state.worker_running) {
+          summary = "The worker is stopped and is not accepting work.";
+        } else if (state.self_throttle_paused) {
+          summary = "The worker paused itself after repeated resource or job faults.";
+          attention = true;
+        } else if (state.local_paused || state.horde_maintenance) {
+          const holds = [state.local_paused ? "local pause" : null, state.horde_maintenance ? "Horde maintenance" : null].filter(Boolean);
+          summary = `New work is held by ${holds.join(" and ")}.`;
+          attention = true;
+        } else if (state.effective_maintenance) {
+          summary = "The worker reports an effective maintenance hold; check the full dashboard for its source.";
+          attention = true;
+        } else if (offline) {
+          summary = `${offline} worker process${offline === 1 ? " is" : "es are"} offline.`;
+          attention = true;
+        } else if (state.active_jobs.length) {
+          const stages = new Map();
+          state.active_jobs.forEach(job => stages.set(job.stage, (stages.get(job.stage) || 0) + 1));
+          const busiest = [...stages.entries()].sort((a, b) => b[1] - a[1])[0];
+          summary = `${state.active_jobs.length} active job${state.active_jobs.length === 1 ? "" : "s"}; most work is ${humanState(busiest[0])}.`;
+        } else if (state.jobs_queued) {
+          summary = `${state.jobs_queued} queued job${state.jobs_queued === 1 ? " is" : "s are"} waiting for an inference slot.`;
+        } else {
+          summary = "Healthy and waiting for a community request.";
+        }
+        const processFact = state.processes_total
+          ? `${state.processes_alive}/${state.processes_total} processes alive · ${state.processes_busy} busy`
+          : "process inventory pending";
+        insight.textContent = `${summary} ${processFact}.`;
+        insight.className = `insight${attention ? " attention" : ""}`;
+      };
+      const renderJobs = state => {
+        const jobs = byId("active-jobs");
+        jobs.replaceChildren();
+        configureEntryGrid(jobs, state.active_jobs.length, "--jobs-share");
+        setText("active-job-count", formatNumber(state.active_jobs.length));
+        if (!state.active_jobs.length) {
+          emptyRow(jobs, state.jobs_queued ? "Jobs are queued but none is executing yet." : "No active jobs.");
+          return;
+        }
+        state.active_jobs.forEach(job => {
+          const row = document.createElement("div");
+          row.className = "state-row";
+          const stage = document.createElement("span");
+          stage.className = "state-label";
+          stage.textContent = humanState(job.stage);
+          const main = document.createElement("div");
+          main.className = "row-main";
+          const name = document.createElement("b");
+          name.textContent = job.model || "Image request";
+          name.title = name.textContent;
+          const detail = document.createElement("small");
+          detail.textContent = `job ${shortId(job.job_id)}${job.process_id === null ? "" : ` · process ${job.process_id}`}`;
+          main.append(name, detail);
+          addProgress(main, job.progress_percent);
+          const meta = document.createElement("span");
+          meta.className = "row-meta";
+          const progress = job.progress_percent === null
+            ? (job.stage === "queued" ? "waiting" : "working")
+            : `${Math.round(job.progress_percent)}%`;
+          const speed = job.iterations_per_second ? ` · ${job.iterations_per_second.toFixed(1)} it/s` : "";
+          meta.textContent = `${progress}${speed}`;
+          row.append(stage, main, meta);
+          jobs.appendChild(row);
+        });
+      };
+      const renderProcesses = state => {
+        const processes = byId("processes");
+        processes.replaceChildren();
+        configureEntryGrid(processes, state.process_states.length, "--process-share");
+        setText("process-count", `${state.processes_alive}/${state.processes_total} alive`);
+        if (!state.process_states.length) {
+          emptyRow(processes, "Waiting for process state.");
+          return;
+        }
+        state.process_states.forEach(process => {
+          const row = document.createElement("div");
+          row.className = `state-row${process.alive ? "" : " offline"}`;
+          const kind = document.createElement("span");
+          kind.className = "state-label";
+          kind.textContent = `${humanState(process.process_type)} ${process.process_id}`;
+          const main = document.createElement("div");
+          main.className = "row-main";
+          const stateLabel = document.createElement("b");
+          stateLabel.textContent = process.alive ? humanState(process.state) : "offline";
+          const detail = document.createElement("small");
+          detail.textContent = process.model || (process.busy ? `job ${shortId(process.current_job_id)}` : "No model resident");
+          detail.title = detail.textContent;
+          main.append(stateLabel, detail);
+          addProgress(main, process.progress_percent);
+          const meta = document.createElement("span");
+          meta.className = "row-meta";
+          const vram = process.vram_total_mb ? `${(process.vram_used_mb / 1024).toFixed(1)}/${(process.vram_total_mb / 1024).toFixed(0)} GB` : `${formatNumber(process.vram_used_mb)} MB`;
+          const heartbeat = process.heartbeat_age_seconds === null ? "" : ` · ${Math.round(process.heartbeat_age_seconds)}s`;
+          meta.textContent = `GPU ${process.device_index} · ${vram}${heartbeat}`;
+          row.append(kind, main, meta);
+          processes.appendChild(row);
+        });
+      };
+      const actionSatisfied = state => {
+        if (!pendingAction) return true;
+        if (pendingAction === "start") return state.worker_running || state.lifecycle === "starting";
+        if (pendingAction === "stop") return !state.worker_running || ["stopping", "stopped"].includes(state.lifecycle);
+        if (pendingAction === "pause") return state.local_paused;
+        if (pendingAction === "resume") return !state.local_paused;
+        if (pendingAction === "maintenance_on") return state.horde_maintenance;
+        if (pendingAction === "maintenance_off") return !state.horde_maintenance;
+        return true;
+      };
+
+      function render(state) {
+        current = state;
+        if (pendingAction && (actionSatisfied(state) || Date.now() - pendingSince > 20000)) pendingAction = null;
+        const connected = state.connected && state.lifecycle_resolved;
+        const lifecycle = connected ? state.lifecycle : "disconnected";
+        const pill = byId("status-pill");
+        pill.className = `status ${lifecycle}`;
+        setText("status", lifecycle.replaceAll("_", " "));
+        setText("worker-name", state.worker_name || "Worker overview");
+        setText("identity", state.worker_version ? `v${state.worker_version}${state.horde_username ? ` · ${state.horde_username}` : ""}` : "Waiting for a worker snapshot…");
+        setText("uptime", state.session_start_time ? `up ${formatDuration(state.server_time - state.session_start_time)}` : "not running");
+        setText("active", formatNumber(state.jobs_active));
+        setText("queued", formatNumber(state.jobs_queued));
+        setText("submitted", formatNumber(state.jobs_submitted));
+        setText("faulted", formatNumber(state.jobs_faulted));
+        setText("kudos-rate", formatNumber(state.kudos_per_hour));
+        setText("kudos-session", formatNumber(state.kudos_this_session));
+        setText("gpu-duty", state.gpu_duty_percent === null ? "—" : `${Math.round(state.gpu_duty_percent)}%`);
+        setText("freshness", state.snapshot_timestamp ? `updated ${formatDuration(state.server_time - state.snapshot_timestamp)} ago` : "No snapshot");
+        setText("pipe-queue", formatNumber(state.jobs_queued));
+        setText("pipe-active", formatNumber(state.jobs_active));
+        setText("pipe-post", formatNumber(state.jobs_post_processing));
+        setText("pipe-safety", formatNumber(state.jobs_safety));
+        setText("pipe-submit", formatNumber(state.jobs_submitting));
+        setText("jobs-popped", formatNumber(state.jobs_popped));
+        setText("slowdowns", formatNumber(state.job_slowdowns));
+        setText("recoveries", formatNumber(state.process_recoveries));
+        setText("no-work", formatDuration(state.no_jobs_seconds));
+        setText("local-pause", state.local_paused ? "On" : "Off");
+        setText("horde-maintenance", state.horde_maintenance ? "On" : "Off");
+        byId("local-pause").className = state.local_paused ? "maintenance-on" : "";
+        byId("horde-maintenance").className = state.horde_maintenance ? "maintenance-on" : "";
+
+        const lifecycleButton = byId("lifecycle-button");
+        lifecycleButton.textContent = state.worker_running ? (state.lifecycle === "stopping" ? "Stopping…" : "Stop worker") : "Start worker";
+        lifecycleButton.dataset.action = state.worker_running ? "stop" : "start";
+        const pauseButton = byId("pause-button");
+        pauseButton.textContent = state.local_paused ? "Resume locally" : "Pause locally";
+        pauseButton.dataset.action = state.local_paused ? "resume" : "pause";
+        const maintenanceButton = byId("maintenance-button");
+        maintenanceButton.textContent = state.horde_maintenance ? "Horde maintenance off" : "Horde maintenance on";
+        maintenanceButton.dataset.action = state.horde_maintenance ? "maintenance_off" : "maintenance_on";
+        lifecycleButton.disabled = !state.connected || Boolean(pendingAction) || state.lifecycle === "stopping";
+        pauseButton.disabled = !connected || !state.worker_running || Boolean(pendingAction);
+        maintenanceButton.disabled = !connected || !state.worker_running || Boolean(pendingAction);
+
+        state.active_jobs = state.active_jobs || [];
+        state.process_states = state.process_states || [];
+        renderInsight(state);
+        renderJobs(state);
+        renderProcesses(state);
+
+        const alchemyTotal = state.alchemy_pending + state.alchemy_active + state.alchemy_submitting + state.alchemy_submitted + state.alchemy_faulted;
+        byId("alchemy-section").hidden = alchemyTotal === 0;
+        setText("alchemy-pending", formatNumber(state.alchemy_pending));
+        setText("alchemy-active", formatNumber(state.alchemy_active));
+        setText("alchemy-submitting", formatNumber(state.alchemy_submitting));
+        setText("alchemy-done", formatNumber(state.alchemy_submitted));
+        setText("alchemy-faulted", formatNumber(state.alchemy_faulted));
+
+        const models = byId("models");
+        models.replaceChildren();
+        if (!state.active_models.length) {
+          const empty = document.createElement("span");
+          empty.className = "detail";
+          empty.textContent = "No active models.";
+          models.appendChild(empty);
+        } else {
+          state.active_models.forEach(model => {
+            const chip = document.createElement("span");
+            chip.className = "chip";
+            chip.textContent = model;
+            models.appendChild(chip);
+          });
+        }
+        const messages = byId("messages");
+        messages.replaceChildren();
+        state.api_messages.forEach(message => {
+          const item = document.createElement("li");
+          item.textContent = message;
+          messages.appendChild(item);
+        });
+      }
+
+      async function poll() {
+        if (polling) return;
+        polling = true;
+        try {
+          const response = await fetch("/native/api/state", { cache: "no-store" });
+          if (!response.ok) throw new Error(`State request failed (${response.status})`);
+          render(await response.json());
+          byId("action-notice").className = "notice";
+        } catch (error) {
+          byId("status-pill").className = "status disconnected";
+          setText("status", "disconnected");
+          const notice = byId("action-notice");
+          notice.textContent = error.message;
+          notice.className = "notice error";
+        } finally {
+          polling = false;
+        }
+      }
+
+      async function perform(action) {
+        if (!action || pendingAction) return;
+        pendingAction = action;
+        pendingSince = Date.now();
+        document.querySelectorAll("button").forEach(button => { button.disabled = true; });
+        const notice = byId("action-notice");
+        notice.className = "notice";
+        notice.textContent = "Sending request…";
+        try {
+          const response = await fetch("/native/api/action", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action })
+          });
+          const result = await response.json();
+          notice.textContent = result.message || "Request sent.";
+          if (!response.ok) throw new Error(result.message || `Action failed (${response.status})`);
+        } catch (error) {
+          pendingAction = null;
+          notice.textContent = error.message;
+          notice.className = "notice error";
+        }
+        await poll();
+      }
+
+      ["lifecycle-button", "pause-button", "maintenance-button"].forEach(id => {
+        byId(id).addEventListener("click", event => perform(event.currentTarget.dataset.action));
+      });
+      byId("view-toggle").addEventListener("click", () => setGlance(!document.body.classList.contains("glance")));
+      let savedGlance = false;
+      try { savedGlance = localStorage.getItem("horde-native-glance") === "1"; } catch (_) { /* optional */ }
+      if (new URLSearchParams(location.search).get("view") === "glance") savedGlance = true;
+      setGlance(savedGlance);
+      poll();
+      setInterval(poll, 1000);
+    })();
+  </script>
+</body>
+</html>

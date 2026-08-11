@@ -4,6 +4,7 @@
     - [Two ways to run the worker](#two-ways-to-run-the-worker)
     - [The supervisor channel](#the-supervisor-channel)
     - [Terminal, served, and attached modes](#terminal-served-and-attached-modes)
+    - [The native overview companion](#the-native-overview-companion)
     - [Worker-owned stats history](#worker-owned-stats-history)
     - [The Getting started page](#the-getting-started-page)
     - [Worker identity preflight](#worker-identity-preflight)
@@ -205,14 +206,57 @@ screen indefinitely. `_rewrite_page_origin` therefore swaps that origin, per req
 scheme and host the request actually arrived on. It runs only for a wildcard bind, so an
 explicitly addressed server (or a deliberate `public_url` behind a reverse proxy) is left alone.
 
+### The native overview companion
+
+The served dashboard also exposes `/native`, a deliberately small semantic HTML companion to the full
+terminal dashboard at `/`. It is not a second configuration UI. It shows a narrow projection of worker
+identity, lifecycle, pipeline depth, session totals, kudos, GPU duty, active models, alchemy totals, recent
+Horde messages, active work-ledger progress, and a compact process inventory. The process projection carries
+only state, liveness, current model/job, sampling progress, speed, VRAM, and heartbeat freshness. The page
+offers only start, graceful stop, local pause/resume, and explicit Horde maintenance on/off actions. Local
+pause and Horde maintenance remain separate controls because they are different supervisor states; the
+client never guesses which one to change from the aggregate maintenance indicator.
+
+`tui/native_dashboard.py` owns the adapter and page routes. The aiohttp server creates one
+`AttachedWorkerSupervisor` for the adapter's lifetime, rather than one connection per poll or browser tab.
+Browsers poll `GET /native/api/state` for the projected JSON state and send strict JSON actions to
+`POST /native/api/action`; they never connect to the length-prefixed localhost supervisor socket or receive
+the full `SupervisorSnapshot`. Closing the native page has no effect on the worker, and stopping the web
+server merely detaches this observer. The implementation is one packaged HTML file with plain CSS and
+JavaScript, so it adds no browser framework, asset pipeline, or duplicated component system.
+
+The page's persisted **Glance view** is also only presentation: it uses the same response and DOM, removes
+secondary session/model/message panels, and compacts the headline, pipeline, active-work, and process panels
+into one visual viewport. On a phone it becomes a fixed dynamic-viewport application shell: compact app bar,
+three-control dock, 2×2 metric grid, five-stage pipeline, and compact multi-line cards for every active job
+and process. Each live panel uses one column for a single entry and a two-column matrix for larger inventories.
+JavaScript publishes each matrix's row count as a CSS variable, and the remaining viewport height is divided
+between the job and process panels in proportion to those rows. The document and live panels do not scroll,
+so every entry stays visible simultaneously. Safe-area insets keep the shell clear of notches and home
+indicators, and a short-height rule sheds ornamental text before shrinking the live data. A short derived
+sentence calls out the most actionable current posture
+(disconnect, maintenance, self-throttle, an offline process, queued work, or the busiest active stage)
+without creating a second health-rule engine.
+
+The native endpoints have the same network boundary as the served terminal. They expose less information
+and fewer controls, but they add no authentication: anyone who can reach a non-loopback bind can still use
+their lifecycle and maintenance actions, while `/` on that same port remains the complete operator surface.
+
+On Windows the two process roles deliberately retain different asyncio capabilities. The served parent uses
+Python's default proactor loop because textual-serve launches one terminal subprocess per browser session.
+The worker's historical selector-loop compatibility setting is applied only when `run_worker.main()`
+actually begins in the worker process. Merely importing `WorkerLaunchOptions`, the attach supervisor, or the
+native adapter must not change the parent process's global loop policy; a selector loop cannot create the
+subprocess transport textual-serve needs.
+
 The served page is also fitted for a phone. `_build_server` subclasses textual-serve's
 `Server` to add an aiohttp middleware that injects a `width=device-width` viewport tag,
-a script sizing the terminal font toward `MOBILE_TARGET_COLUMNS` (with a 10px readability
+a script sizing the terminal font toward `MOBILE_TARGET_COLUMNS` (52 columns, with a 12px readability
 floor), visual-viewport sizing, and touch handling. The viewport and font fitting only work
 as a pair: without the tag a phone lays the page out at a notional desktop width and
 scales it down to nothing, and with the tag alone the default 16px cell leaves roughly
-40 columns. xterm.js disables its native touch scroll while Textual mouse reporting is
-active, so the injected handler translates a one-finger vertical drag anywhere over the
+40 columns. The page still permits native two-finger pinch zoom. xterm.js disables its native touch scroll
+while Textual mouse reporting is active, so the injected handler translates a one-finger vertical drag anywhere over the
 terminal into wheel events Textual already understands. It also suppresses the irrelevant
 xterm scrollback bar; users no longer have to target either narrow right-edge scrollbar.
 The injection is marker-based and passes unrecognised markup through, so an
@@ -224,24 +268,49 @@ xterm.js routes every key through one hidden textarea and focuses that textarea 
 tapped; on a phone that normally opens the software keyboard even when the painted control was a tab.
 The served page makes that textarea read-only with `inputmode=none` on coarse-pointer devices and adds
 a real 48-pixel browser button to opt into typing. The button re-enables and focuses the transport
-textarea without changing Textual's currently focused widget. It floats low on the right edge while
-reserving a footer-sized lane for **Palette**, and follows the reduced visual viewport while the keyboard
-is open.
+textarea without changing Textual's currently focused widget. On coarse pointers the page reserves a
+52-pixel browser dock below the terminal, so its controls cannot cover content or toast notifications. A
+hamburger button (`☰`) opens Textual's command palette, while a separate up/down triangle collapses or
+restores the main tab strip without changing its active destination. Both send private application commands
+through xterm. The terminal Footer and its cramped built-in affordances are hidden throughout the phone band;
+the dock is the browser-native palette entry point. Both dock and terminal follow the reduced visual
+viewport while the keyboard is open.
 
 Mobile browser chrome makes CSS `100vh` unreliable: it can describe space behind the address or toolbar.
 The injection tracks `window.visualViewport`, gives the terminal its current pixel dimensions, and asks
 xterm to refit when the viewport resizes or moves. This keeps the final rows inside the visible area as
-browser chrome or the software keyboard changes height. A phone-width Textual resize also schedules
-`scroll_visible()` for the focused widget after layout, because preserving focus alone does not bring an
-input above the keyboard's new top edge. Config additionally changes from a pinned preamble plus nested
+browser chrome or the software keyboard changes height. A keyboard-sized height reduction also schedules
+`scroll_visible(top=True)` for the focused widget after layout, because preserving focus alone does not
+bring an input above the keyboard's new top edge; ordinary browser-chrome movements do not repeatedly
+snap the page back to its focused control. Every phone viewport hides the redundant title/clock header; a
+phone viewport below 28 rows additionally reduces the tab height. Modal bodies become vertically scrollable
+at the same breakpoint. Config additionally
+changes from a pinned preamble plus nested
 field scroller to one page-level phone scroller; its actions, summaries, and sub-tab strip can all leave
 the reduced viewport while the operator reads or edits later fields.
 
-The same touch handler axis-locks a drag once it clears a small movement threshold. Vertical movement
-continues to emit ordinary wheel packets for the active page. Horizontal movement emits `Ctrl`+wheel at
-the touched coordinates; Textual maps that to native horizontal scrolling. (`Shift` would be the usual
-desktop convention, but xterm discards Shift-wheel before encoding an application-mouse packet.) Both
-the main `Tabs` and Config's nested `Tabs` therefore respond without hard-coded screen regions.
+The same touch handler axis-locks a drag once it clears a small movement threshold and accumulates pixel
+movement into terminal-line wheel steps rather than sending sub-row deltas that xterm may discard.
+Vertical movement continues to emit ordinary wheel packets for the active page. Textual's `Tabs`
+deliberately hides its internal overflow, so Ctrl-wheel cannot move that strip reliably through xterm.
+A horizontal gesture instead sends an application-only modified ArrowLeft or ArrowRight through xterm's
+normal hidden-textarea keyboard path. The first six terminal rows select the fixed main strip; a lower
+gesture selects Config's nested strip. Priority App bindings invoke the named `Tabs` widget's supported
+previous/next action without changing focus or first clicking the tab under the finger. Textual activates
+and reveals exactly one adjacent tab per gesture; a modal screen has neither target and ignores the command.
+No private Textual tab internals are involved.
+
+Phone action toolbars use a shared two-column grid rather than retaining desktop-sized rows or stacking
+every action into a single tall column. Inputs, selects, buttons, and tabs receive four-row touch targets;
+selection-list rows and collapsible headings receive extra padding. Config preference controls and Benchmark's
+advanced rows stack when their labels need the full width. Logs use `RichLog`'s native wrapping below the
+phone breakpoint and restore unwrapped lines at desktop width.
+
+Overview uses responsive renderers rather than relying only on Rich to squeeze desktop grids. Its hero is
+part of the phone page's single vertical scroller instead of remaining pinned above a nested body scroller.
+Health checks wrap their name and explanation together; GPU, worker, alchemy, and residency facts collapse
+from four columns to two; pipeline stages stack; and each trend places its summary over a full-width
+sparkline. The existing multi-column grids and sticky hero remain unchanged at desktop widths.
 
 The host's lifetime is decoupled from the launcher that started it. `tui/web.py`
 spawns a host only when one is not already listening, and on a *clean* exit it
@@ -269,8 +338,15 @@ a dead host as exactly the kind of invisible orphaned console this whole design
 fights. So the launcher holds a **liveness leash**: a background thread keeps a
 connection to the host's control socket and, the moment that socket drops (a clean
 close, an explicit `host_shutdown` farewell frame, or a reset), winds the launcher
-down. It first reaps the per-session TUI subprocesses `textual-serve` spawned so
-none of *them* orphan, then exits. The socket is the authoritative signal,
+down. The normal path schedules `textual-serve`'s graceful exit on its owning
+asyncio loop; aiohttp closes the session WebSockets and each `AppService` asks its
+TUI subprocess to quit. That cooperative drain is bounded. Every TUI session shell
+is explicitly registered when `textual-serve` spawns it, and on Windows it is also
+assigned to a launcher-owned kill-on-close Job Object. If graceful shutdown wedges,
+the launcher identity-checks and terminates only those registered session trees,
+then hard-exits after one final bound. Browser processes are never registered, so
+the fallback cannot close the user's other browser windows even when the dashboard
+launcher originally opened that browser. The socket is the authoritative signal,
 immune to the pid-reuse hazard a pid-file leash would carry, and it works whether
 this launcher spawned the host or merely attached to a pre-existing one.
 
