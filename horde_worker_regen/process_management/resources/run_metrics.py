@@ -12,7 +12,7 @@ from __future__ import annotations
 import enum
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -611,6 +611,28 @@ class RunMetricsSnapshot(BaseModel):
     """Count of reclaim rungs that freed less than half their promised device memory within the verification
     window this run: each named its tenant in a warning and recorded a calibration event. Calibration
     visibility only."""
+    safety_rungs_refused: int = 0
+    """Count of times the reclaim ladder reached the safety-off-GPU rung and declined to spend it because the
+    previous safety cycle was still inside its cooldown. Each is an episode that wanted the deepest rung and
+    was made to resolve without it, which is what the dwell trades a slower reclaim for. Calibration
+    visibility only."""
+    retention_grants_issued: int = 0
+    """Count of dispatches granted VRAM retention this run: their model's weights were left on the card for a
+    same-model successor instead of being evicted at end of job. Calibration visibility only."""
+    retention_grant_denials: dict[str, int] = Field(default_factory=dict)
+    """Count of refused retention grants this run, keyed by the gate that refused (no repeat evidence on the
+    slot, governor state, static fit, and the rest). Separates a worker whose traffic retention cannot help
+    from one whose card will not carry what it could. Calibration visibility only."""
+    retention_reuses: int = 0
+    """Count of dispatches this run that landed on a slot already retaining that job's model: one per job
+    served without a host-to-device weight upload, which is what retention buys. Calibration visibility only."""
+    retention_evicted_unused: int = 0
+    """Count of retained copies given back this run without any successor having reused them. Read against
+    :attr:`retention_reuses`, which it partitions retention episodes with: a run where this dominates is
+    paying for holds its traffic never came back for. Calibration visibility only."""
+    retention_revokes: int = 0
+    """Count of retained copies the sustained-pressure sweep took back this run because the holding slot's
+    recent dispatches no longer predicted a same-model successor. Calibration visibility only."""
     per_step_floor_triggers: int = 0
     """Count of times the per-step floor tripped this run: a sampling slot ran two consecutive steps each at
     or above the floor multiple of its expected per-step time while its card was at PRESSURE or SATURATED,
@@ -1279,6 +1301,12 @@ class WorkerRunMetrics:
         ladder_rungs_issued: int = 0,
         ladder_verified_frees_mb: float = 0.0,
         ladder_verification_shortfalls: int = 0,
+        safety_rungs_refused: int = 0,
+        retention_grants_issued: int = 0,
+        retention_grant_denials: Mapping[str, int] | None = None,
+        retention_reuses: int = 0,
+        retention_evicted_unused: int = 0,
+        retention_revokes: int = 0,
         per_step_floor_triggers: int = 0,
         dispatch_reconciliation_holds: int = 0,
         dispatch_reconciliation_conflicts: int = 0,
@@ -1323,6 +1351,12 @@ class WorkerRunMetrics:
             ladder_rungs_issued=ladder_rungs_issued,
             ladder_verified_frees_mb=ladder_verified_frees_mb,
             ladder_verification_shortfalls=ladder_verification_shortfalls,
+            safety_rungs_refused=safety_rungs_refused,
+            retention_grants_issued=retention_grants_issued,
+            retention_grant_denials=dict(retention_grant_denials or {}),
+            retention_reuses=retention_reuses,
+            retention_evicted_unused=retention_evicted_unused,
+            retention_revokes=retention_revokes,
             per_step_floor_triggers=per_step_floor_triggers,
             dispatch_reconciliation_holds=dispatch_reconciliation_holds,
             dispatch_reconciliation_conflicts=dispatch_reconciliation_conflicts,

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import functools
+
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
+    _SAFETY_RUNG_COOLDOWN_SECONDS,
     CacheReleaseTarget,
     IdleResidentModel,
     LadderCandidates,
@@ -154,6 +157,15 @@ def _pause_rung(kind: ReclaimRungKind, promised: float = 500.0) -> ReclaimRung:
     return ReclaimRung(kind=kind, device_index=0, promised_freed_mb=promised, tenant_label=kind.value)
 
 
+def _budget_for(rung: ReclaimRung) -> float:
+    """The progress-free seconds the engine gives ``rung``, so a test states its clock in the engine's terms.
+
+    Read from the engine rather than restated, because the budget is derived from the rung's promise: a test
+    that hard-coded seconds would be asserting one card's arithmetic instead of the rule.
+    """
+    return VerifiedReclaimLadder._verification_budget_for(rung)
+
+
 class TestVerifiedReclaimLadderEngine:
     """The engine issues one rung per tick, verifies realized frees, escalates on shortfall, flags exhaustion."""
 
@@ -174,24 +186,121 @@ class TestVerifiedReclaimLadderEngine:
         assert engine.verification_shortfalls == 0
         assert actuator.calls == [("unload", 1), ("unload", 2)]
 
-    def test_shortfall_after_two_samples_records_calibration_and_escalates(self) -> None:
-        """A rung that never yields half its promise escalates after two samples, logging a calibration event."""
+    def test_a_rung_that_realizes_nothing_for_its_budget_records_calibration_and_escalates(self) -> None:
+        """A rung that never yields half its promise escalates once its budget runs out, logging calibration."""
         engine = VerifiedReclaimLadder()
         actuator = _FakeActuator()
         ladder = _ladder(_unload_rung(1, 2000.0), _unload_rung(2, 500.0))
+        budget = _budget_for(ladder[0])
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
-        # First verification sample: realized 100 << 1000 (half of 2000); still within the window, waits.
-        engine.on_tick(0, saturated=True, device_free_mb=200.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        # A sample inside the budget: realized 30 << 1000 (half of 2000), and too small to count as progress,
+        # but the rung has not had its time yet, so the engine waits rather than escalating.
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=130.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget / 2.0,
+        )
         assert engine.rungs_issued == 1
         assert actuator.calls == [("unload", 1)]
 
-        # Second verification sample: still short. Shortfall recorded, calibration event, rung 2 escalated.
-        engine.on_tick(0, saturated=True, device_free_mb=250.0, actuator=actuator, ladder_builder=lambda: ladder)
+        # Past the budget with nothing further realized: shortfall recorded, calibration event, rung 2 escalated.
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=150.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget + 1.0,
+        )
         assert engine.verification_shortfalls == 1
-        assert actuator.calibration_events == [(ReclaimRungKind.UNLOAD_IDLE_MODEL, 2000.0, 150.0)]
+        assert actuator.calibration_events == [(ReclaimRungKind.UNLOAD_IDLE_MODEL, 2000.0, 50.0)]
         assert engine.rungs_issued == 2
         assert actuator.calls == [("unload", 1), ("unload", 2)]
+
+    def test_a_rung_still_realizing_free_keeps_its_budget(self) -> None:
+        """A release that keeps arriving is never graded short, however long it takes to reach its promise.
+
+        The budget is a ceiling on going nowhere, not a deadline: an actuation the driver is still servicing
+        shows a rising device-free figure, and each new high restarts the clock. Grading it on elapsed time
+        alone would escalate past exactly the rungs that are working, which is what a large release looks like
+        on a control loop that samples faster than the hardware frees.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_unload_rung(1, 4000.0), _unload_rung(2, 500.0))
+        budget = _budget_for(ladder[0])
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=0.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        # Free climbs a few hundred megabytes at a time, well past the budget in elapsed seconds and still short
+        # of half the promise. Every sample is a new high, so the rung keeps its clock.
+        for step in range(1, 9):
+            engine.on_tick(
+                0,
+                saturated=True,
+                device_free_mb=200.0 * step,
+                actuator=actuator,
+                ladder_builder=lambda: ladder,
+                now=budget * step,
+            )
+        assert actuator.calls == [("unload", 1)]
+        assert engine.verification_shortfalls == 0
+
+        # The release completes: the rung verifies on its own merits rather than on the clock.
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=2500.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget * 9,
+        )
+        assert actuator.calls == [("unload", 1), ("unload", 2)]
+        assert engine.verification_shortfalls == 0
+
+    def test_the_verification_budget_scales_with_the_promised_release(self) -> None:
+        """A rung promising more gigabytes is given proportionally longer, so no card size is privileged.
+
+        A WDDM release settles at a rate set by how much is being returned, so a fixed budget is only ever right
+        for the card it was measured on: generous for a small model's release and short enough for a large one
+        that a working give-back is graded a failure. Both rungs here land at a pace proportional to their size
+        and both must verify.
+        """
+        small = _unload_rung(1, 2048.0)
+        large = _unload_rung(2, 12288.0)
+        assert _budget_for(large) > _budget_for(small), (
+            "a six-times-larger release is given no more time than a small one, so the budget is a constant "
+            "sized for whichever card it was measured on"
+        )
+
+        for rung in (small, large):
+            engine = VerifiedReclaimLadder()
+            actuator = _FakeActuator()
+            ladder = _ladder(rung, _unload_rung(9, 500.0))
+            # The release arrives in one block, at a delay proportional to its size and shorter than the budget
+            # the promise earns it.
+            landing_at = _budget_for(rung) * 0.75
+            builder = functools.partial(_ladder, *ladder)
+            engine.on_tick(0, saturated=True, device_free_mb=0.0, actuator=actuator, ladder_builder=builder, now=0.0)
+            engine.on_tick(
+                0,
+                saturated=True,
+                device_free_mb=rung.promised_freed_mb,
+                actuator=actuator,
+                ladder_builder=builder,
+                now=landing_at,
+            )
+            assert engine.verification_shortfalls == 0, (
+                f"a release of {rung.promised_freed_mb:.0f}MB landing in {landing_at:.0f}s was graded short"
+            )
+            assert engine.verified_frees_mb == rung.promised_freed_mb
 
     def test_exhausted_ladder_while_saturated_marks_unresolved(self) -> None:
         """Once every rung has run and the card is still SATURATED, the episode is flagged unresolved."""
@@ -210,9 +319,26 @@ class TestVerifiedReclaimLadderEngine:
         engine = VerifiedReclaimLadder()
         actuator = _FakeActuator()
         ladder = _ladder(_unload_rung(1, 1000.0))
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
-        engine.on_tick(0, saturated=True, device_free_mb=120.0, actuator=actuator, ladder_builder=lambda: ladder)
-        engine.on_tick(0, saturated=True, device_free_mb=130.0, actuator=actuator, ladder_builder=lambda: ladder)
+        budget = _budget_for(ladder[0])
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=120.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget / 2.0,
+        )
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=130.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget + 1.0,
+        )
         assert engine.is_saturation_unresolved(0) is True
 
         engine.on_tick(
@@ -256,18 +382,35 @@ class TestVerifiedReclaimLadderEngine:
         engine = VerifiedReclaimLadder()
         actuator = _FakeActuator()
         ladder = _ladder(_unload_rung(1, 0.0), _unload_rung(2, 1000.0))
+        budget = _budget_for(ladder[0])
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
         assert actuator.calls == [("unload", 1)]
 
-        # First sample: the unverifiable rung is held, not certified, and nothing is credited.
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        # A sample inside the budget: the unverifiable rung is held, not certified, and nothing is credited.
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=100.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget / 2.0,
+        )
         assert actuator.calls == [("unload", 1)]
         assert engine.verified_frees_mb == 0.0
 
-        # Its full window served, it resolves so the engine escalates, still crediting nothing and counting no
+        # Its full budget served, it resolves so the engine escalates, still crediting nothing and counting no
         # shortfall against a promise that was never a measurement.
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=100.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=budget + 1.0,
+        )
         assert actuator.calls == [("unload", 1), ("unload", 2)]
         assert engine.verified_frees_mb == 0.0
         assert engine.verification_shortfalls == 0
@@ -277,25 +420,49 @@ class TestVerifiedReclaimLadderEngine:
 class TestReclaimLadderVerifiedRestore:
     """Lane-pause rungs the engine issues are restored (LIFO) when the card returns HEALTHY, safety excepted."""
 
-    def test_teardown_rung_gets_a_longer_verification_window(self) -> None:
-        """A lane pause is given three samples (not two) to free its promise before it counts as short.
+    def test_teardown_rung_gets_a_longer_verification_budget(self) -> None:
+        """A lane pause is given longer than an in-process rung of the same promise before it counts as short.
 
-        Its memory returns only once the lane process has exited, which takes longer than one governor sample,
-        so the extra sample keeps the engine from escalating past a pause that is still tearing down.
+        Its memory returns only once the lane process has exited, so it pays a whole process teardown before
+        its first megabyte arrives; grading it on what an in-process release needs escalates past a pause that
+        is still tearing down.
         """
         engine = VerifiedReclaimLadder()
         actuator = _FakeActuator()
-        ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE, 5000.0), _unload_rung(2, 500.0))
+        pause = _pause_rung(ReclaimRungKind.PAUSE_PP_LANE, 5000.0)
+        ladder = _ladder(pause, _unload_rung(2, 500.0))
+        teardown_budget = _budget_for(pause)
+        assert teardown_budget > _budget_for(_unload_rung(1, pause.promised_freed_mb)), (
+            "a teardown rung is given no more time than an in-process rung returning the same memory, so the "
+            "process exit it pays for is unaccounted"
+        )
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
         assert actuator.calls == [("pp", None)]
-        # Sample 1 and sample 2 are both short, but a teardown rung's window is three samples, so it holds.
-        engine.on_tick(0, saturated=True, device_free_mb=150.0, actuator=actuator, ladder_builder=lambda: ladder)
-        engine.on_tick(0, saturated=True, device_free_mb=160.0, actuator=actuator, ladder_builder=lambda: ladder)
+        # Samples inside the teardown budget are short and too small to count as progress, but the pause holds:
+        # an in-process rung of the same promise would already have been escalated past by the second of them.
+        for elapsed, free_mb in ((teardown_budget / 3.0, 120.0), (teardown_budget * 2.0 / 3.0, 130.0)):
+            engine.on_tick(
+                0,
+                saturated=True,
+                device_free_mb=free_mb,
+                actuator=actuator,
+                ladder_builder=lambda: ladder,
+                now=elapsed,
+            )
         assert engine.rungs_issued == 1
         assert engine.verification_shortfalls == 0
-        # Sample 3 is still short: only now does it escalate, issuing the next rung.
-        engine.on_tick(0, saturated=True, device_free_mb=170.0, actuator=actuator, ladder_builder=lambda: ladder)
+        # Past the budget and still short: only now does it escalate, issuing the next rung.
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=140.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=teardown_budget + 1.0,
+        )
         assert engine.verification_shortfalls == 1
         assert engine.rungs_issued == 2
         assert actuator.calls == [("pp", None), ("unload", 2)]
@@ -573,3 +740,60 @@ class TestRefusedRestoresStayOwed:
         )
         assert engine.episode_holds_paused_lane(0) is False
         assert actuator.calls == [("vae", None), ("restore_vae", None), ("restore_vae", None)]
+
+
+class TestSafetyRungCooldown:
+    """The deepest rung is a whole process cycle, so a card may spend it only once per dwell."""
+
+    def test_a_second_safety_rung_inside_the_dwell_is_skipped_like_an_inactive_one(self) -> None:
+        """A card that saturates again soon after cycling safety is not allowed to cycle it a second time.
+
+        The rung ends and rebuilds the safety process, and the placement policy restores it once the card fits
+        it again, so spending it every episode is a process cycle per episode for relief the previous cycle had
+        already failed to hold. Refused, it behaves exactly as a rung whose target has gone away: the engine
+        moves on within the tick, and an episode with nothing left is unresolved rather than relieved.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        safety = _pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0)
+        ladder = _ladder(safety)
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        assert actuator.calls == [("safety", None)]
+
+        # The card recovers and crosses the cliff again a minute later: the fresh episode builds the rung, and
+        # the engine declines to spend it.
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple, now=30.0
+        )
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=60.0
+        )
+        assert actuator.calls == [("safety", None)]
+        assert engine.safety_rungs_refused == 1
+        assert engine.is_saturation_unresolved(0) is True
+
+    def test_the_safety_rung_is_available_again_once_the_dwell_has_passed(self) -> None:
+        """Past the dwell the rung is spendable again, so the cooldown paces the cycle rather than removing it."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0))
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple, now=30.0
+        )
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=100.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=_SAFETY_RUNG_COOLDOWN_SECONDS + 1.0,
+        )
+        assert actuator.calls == [("safety", None), ("safety", None)]
+        assert engine.safety_rungs_refused == 0

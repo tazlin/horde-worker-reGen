@@ -200,7 +200,10 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     TailOverlapDenialReason,
     format_tail_overlap_tally,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    InferenceScheduler,
+    format_staging_defer_tally,
+)
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot, ModelDemandPoller
 from horde_worker_regen.process_management.scheduling.model_pool import (
     ModelPool,
@@ -1762,6 +1765,7 @@ class HordeWorkerProcessManager:
             estimate_sampling_peak_mb=self._inference_scheduler.estimate_disaggregated_sampling_peak_mb,
             estimate_decode_spike_mb=self._inference_scheduler.estimate_disaggregated_decode_spike_mb,
             observe_sampling_peak=self._inference_scheduler.observe_disaggregated_sampling_peak,
+            measured_device_free_mb=self._inference_scheduler.measured_device_free_mb,
         )
         self._disaggregation_orchestrator.set_vram_arbiter(self._vram_arbiter)
         self._message_dispatcher.set_stage_result_handler(self._disaggregation_orchestrator.handle_stage_result)
@@ -5714,6 +5718,14 @@ class HordeWorkerProcessManager:
             ladder_rungs_issued=self._reclaim_ladder.rungs_issued,
             ladder_verified_frees_mb=self._reclaim_ladder.verified_frees_mb,
             ladder_verification_shortfalls=self._reclaim_ladder.verification_shortfalls,
+            safety_rungs_refused=self._reclaim_ladder.safety_rungs_refused,
+            retention_grants_issued=self._inference_scheduler.retention_grants_issued,
+            retention_grant_denials={
+                reason.value: count for reason, count in self._inference_scheduler.retention_grant_denials.items()
+            },
+            retention_reuses=self._inference_scheduler.retention_reuses,
+            retention_evicted_unused=self._inference_scheduler.retention_evicted_unused,
+            retention_revokes=self._inference_scheduler.retention_revokes,
             per_step_floor_triggers=self._per_step_floor_triggers,
             dispatch_reconciliation_holds=self._inference_scheduler.latest_dispatch_reconciliation_holds(),
             dispatch_reconciliation_conflicts=self._inference_scheduler.latest_dispatch_reconciliation_conflicts(),
@@ -5893,6 +5905,18 @@ class HordeWorkerProcessManager:
         tail_overlap = self._format_tail_overlap_tally()
         if tail_overlap:
             explanation_parts.append(tail_overlap)
+        staging_defers = format_staging_defer_tally(self._inference_scheduler.staging_defer_counts)
+        if staging_defers:
+            explanation_parts.append(staging_defers)
+        # Reported beside the churn figures because it is the same quantity from the other side: each reorder is
+        # a job served on weights that were already on the card, where the queue's own order would have evicted
+        # them. One per job seated, so it reads against the window's completions.
+        affinity_reorders = self._inference_scheduler.retention_affinity_reorders
+        if affinity_reorders:
+            explanation_parts.append(f"retained-copy reorders: {affinity_reorders}")
+        retention_tally = self._format_retention_tally()
+        if retention_tally:
+            explanation_parts.append(retention_tally)
         explanation = "; ".join(explanation_parts) if explanation_parts else "no per-job attribution yet"
 
         context = (
@@ -5909,6 +5933,32 @@ class HordeWorkerProcessManager:
             logger.info(message)
         else:
             logger.warning(message)
+
+    def _format_retention_tally(self) -> str | None:
+        """The session's VRAM retention outcome for the duty-cycle line, or None before any grant was decided.
+
+        Session-cumulative like the reorder figure beside it, and stated as what the grants were worth rather
+        than how many were issued: a count of holds says nothing without the reuses that justify them and the
+        unused evictions that are their cost. The leading denial reason is carried too, because on a worker
+        granting little that is the whole explanation, and it distinguishes traffic retention cannot help from
+        a card that will not carry what it could.
+        """
+        scheduler = self._inference_scheduler
+        denials = scheduler.retention_grant_denials
+        issued = scheduler.retention_grants_issued
+        if not issued and not denials:
+            return None
+        parts = [
+            f"{issued} granted",
+            f"{scheduler.retention_reuses} reused",
+            f"{scheduler.retention_evicted_unused} unused",
+        ]
+        if scheduler.retention_revokes:
+            parts.append(f"{scheduler.retention_revokes} revoked under pressure")
+        if denials:
+            reason, count = max(denials.items(), key=lambda item: item[1])
+            parts.append(f"{sum(denials.values())} denied (mostly {reason.value}: {count})")
+        return "retention: " + ", ".join(parts)
 
     def _format_slot_duty_window(self) -> str | None:
         """The slot-duty attribution for the window since the previous duty-cycle log line, or None.

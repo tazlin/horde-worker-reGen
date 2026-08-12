@@ -13,13 +13,24 @@ so there are never two mechanisms independently evicting against the same card. 
   actively-sampling process is never a rung: it is the one process the driver did not demote, and tearing it
   down would trade a slow job for a faulted one.
 
-- It verifies. Freeing on WDDM is externally checkable: NVML device-used drops within a couple of seconds of
-  a real release. After issuing a rung the engine watches the next one or two governor samples and compares
-  the realized device-free gain against the rung's promised figure (the tenant's footprint / reclaimable
-  reservation). A rung that yields less than half of what it promised is logged against the tenant it named,
-  recorded as a calibration event, and the engine escalates to the next rung rather than trusting the
-  estimate. When the whole ladder is exhausted and the card is still SATURATED, the episode is marked
-  unresolved: nothing the worker can give back relieved the card, which is the signal a later kill rung reads.
+- It verifies. Freeing on WDDM is externally checkable: NVML device-used drops once a real release lands.
+  After issuing a rung the engine watches the following governor samples and compares the realized device-free
+  gain against the rung's promised figure (the tenant's footprint / reclaimable reservation). A rung that
+  yields less than half of what it promised *and shows no further progress for its whole time budget* is
+  logged against the tenant it named, recorded as a calibration event, and the engine escalates to the next
+  rung rather than trusting the estimate. When the whole ladder is exhausted and the card is still SATURATED,
+  the episode is marked unresolved: nothing the worker can give back relieved the card, which is the signal a
+  later kill rung reads.
+
+Verification is budgeted in wall-clock seconds rather than in samples because no rung frees synchronously.
+Every rung is an asynchronous actuation: an unload is an IPC the child services between allocations, and a
+multi-gigabyte WDDM release lands seconds after the parent sent it; a lane pause or a safety move returns its
+memory only once the OS has torn the process down. Counting samples grades a working release as a failure
+whenever the control loop ticks faster than the driver frees, which escalates the whole ladder in the seconds
+before the rung that was already working takes effect. Each budget is a fixed latency allowance plus a term
+scaled by the megabytes the rung promised, so the same judgement holds on an 8GB card and a 24GB one rather
+than being tuned to whichever card it was measured on. Observed progress extends the budget, so a release still
+arriving keeps its rung, and a rung that has moved nothing for its full budget is a genuine shortfall.
 
 The engine is driven from the parent's single-threaded control loop, one call per governor tick per card, and
 holds all cross-tick verification state per device. It touches no process state itself: a
@@ -30,6 +41,7 @@ and reports a calibration shortfall, exactly as the arbiter describes actuations
 from __future__ import annotations
 
 import enum
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -42,24 +54,53 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramActuator,
 )
 
-_VERIFICATION_SAMPLES = 2
-"""Governor samples a rung's realized free is given to reach the promised figure before it counts as short.
+_VERIFICATION_BASE_SECONDS = 4.0
+"""Fixed part of an in-process/IPC rung's progress-free budget: the latency before any memory can come back.
 
-A real WDDM release shows up in NVML device-used within a couple of seconds (one to two governor ticks), so a
-rung that has not yielded its promised memory after this many samples has demonstrably not worked and the
-engine escalates. Fewer would misjudge a release still settling; more would leave the card over the cliff
-longer than necessary. Applies to the in-process reclaim rungs (model unload, cache release), which free their
-memory synchronously as the actuator returns."""
+Applies to the rungs actuated through a child's control pipe (model unload, allocator-cache release). Those are
+asynchronous: the parent sends the command, the child picks it up between its own allocations, and only then
+does the driver begin returning memory. This covers that round trip; the size-dependent part below covers the
+release itself."""
 
-_TEARDOWN_VERIFICATION_SAMPLES = 3
-"""Verification window for rungs that free memory by ending a whole process (a lane pause, safety off-GPU).
+_VERIFICATION_SECONDS_PER_GB = 1.5
+"""Seconds of progress-free budget an in-process/IPC rung earns per gigabyte it promised to return.
 
-A process's device memory does not return to the driver until the OS has torn the process down, which takes
-longer than one governor sample: a lane pause has been measured returning ~0MB of its promised context one
-sample after it was issued, then the full figure a sample or two later. Giving these teardown-class rungs one
-extra sample over the in-process rungs keeps the engine from falsely grading a working pause as short and
-escalating past it while its process is still exiting. Still bounded so a genuinely stuck teardown escalates
-within a few seconds."""
+A WDDM release is not an instant bookkeeping change: the driver hands the block back at a rate set by how much
+is being released and by the host it runs on, so an 11GB checkpoint settles materially later than a 3GB one and
+the same release settles later on a slower machine. A budget scaled by the promise therefore means the same
+thing on an 8GB card and a 24GB one, where any fixed figure would be tuned to whichever card it was measured
+on: generous on the small one, and short enough on the large one to misjudge exactly the multi-gigabyte
+releases that matter most. Deliberately several times the pace a healthy release actually achieves, since the
+cost of waiting is one more sample over the cliff while the cost of escalating early is the rest of the
+ladder."""
+
+_TEARDOWN_VERIFICATION_BASE_SECONDS = 12.0
+"""Fixed part of a teardown rung's progress-free budget (a lane pause, safety off-GPU).
+
+A process's device memory does not return to the driver until the OS has torn the process down, so these rungs
+pay a full process exit before their first megabyte arrives. Larger than :data:`_VERIFICATION_BASE_SECONDS` by
+that exit, which is a whole-process cost rather than a per-byte one."""
+
+_TEARDOWN_VERIFICATION_SECONDS_PER_GB = _VERIFICATION_SECONDS_PER_GB
+"""Per-gigabyte part of a teardown rung's budget: once the process is gone the release scales as any other."""
+
+_VERIFICATION_PROGRESS_MB = 64.0
+"""Realized free (MB) beyond a rung's previous high-water mark that counts as the rung still working.
+
+Device-free is a shared figure that a settling allocator or a foreign app moves by tens of megabytes either
+way, so the threshold sits above that noise: only a genuine new high extends the rung's budget. Measured
+against the rung's own high-water rather than the previous sample, so a reading that oscillates cannot extend
+the budget indefinitely; the total extension a rung can earn is bounded by the memory the card can return."""
+
+_SAFETY_RUNG_COOLDOWN_SECONDS = 300.0
+"""Minimum gap between two safety-off-GPU actuations on one card.
+
+Moving safety off the GPU ends and rebuilds the safety process, and the placement policy brings it back once
+the card fits it again, so the rung and its restore together are a full process cycle that stalls result
+submission for as long as the rebuild takes. Without a dwell, every pressure episode buys another cycle and a
+card under recurring pressure spends its session rebuilding safety instead of submitting. A rung refused for
+this cooldown is skipped exactly as an inactive rung is: the engine moves to whatever relief is left, and an
+episode with nothing left is unresolved rather than relieved by a cycle that would not have held."""
 
 _VERIFICATION_YIELD_FRACTION = 0.5
 """Fraction of a rung's promised free the realized device-free gain must reach to count as verified.
@@ -102,7 +143,7 @@ issued the pause therefore owns the restore for exactly these rungs, unwinding t
 paused for ends. Safety is excluded on purpose: it is restored by the placement policy, not by a rung issuer."""
 
 _TEARDOWN_RUNG_KINDS = LANE_PAUSE_RUNG_KINDS | frozenset({ReclaimRungKind.SAFETY_OFF_GPU})
-"""Rung kinds whose memory is freed by a process exiting, so they get the longer verification window."""
+"""Rung kinds whose memory is freed by a process exiting, so they get the longer verification budget."""
 
 
 @dataclass(frozen=True)
@@ -395,11 +436,16 @@ def unwind_restore_obligation(obligation: RestoreObligation, actuator: ReclaimLa
 
 @dataclass
 class _PendingVerification:
-    """A rung awaiting verification: its promise, the device-free baseline at issue, and samples waited."""
+    """A rung awaiting verification: its promise, the device-free baseline at issue, and its progress clock."""
 
     rung: ReclaimRung
     baseline_free_mb: float
+    progress_at: float
+    """When the rung last realized new free (its issue time until it does), the instant its budget runs from."""
+    best_realized_mb: float = 0.0
+    """The highest realized free this rung has reached, so an oscillating reading cannot extend its budget."""
     samples_waited: int = 0
+    """How many governor samples the rung has been graded over, for the shortfall notice."""
 
 
 @dataclass
@@ -439,7 +485,7 @@ class VerifiedReclaimLadder:
     """The parent-side, single-owner engine that runs and verifies the reclaim ladder per card.
 
     Driven once per governor tick per card via :meth:`on_tick`. It issues at most one rung per tick, then
-    watches the next one or two ticks' device-free readings to verify the freed memory before escalating. All
+    watches the following ticks' device-free readings for the rung's verification budget before escalating. All
     per-device episode state lives here; the engine performs no process actions itself. The run-wide counters
     (:attr:`rungs_issued`, :attr:`verified_frees_mb`, :attr:`verification_shortfalls`) are calibration
     visibility; :meth:`is_saturation_unresolved` reports whether a card's current episode exhausted the ladder
@@ -451,7 +497,10 @@ class VerifiedReclaimLadder:
         self.rungs_issued = 0
         self.verified_frees_mb = 0.0
         self.verification_shortfalls = 0
+        self.safety_rungs_refused = 0
+        """Safety rungs skipped because the card's previous safety actuation is still inside its cooldown."""
         self._episodes: dict[int | None, _Episode] = {}
+        self._safety_actuated_at: dict[int | None, float] = {}
 
     def on_tick(
         self,
@@ -463,13 +512,14 @@ class VerifiedReclaimLadder:
         actuator: ReclaimLadderActuator,
         ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
         context_restore_ready: bool = True,
+        now: float | None = None,
     ) -> None:
         """Advance the reclaim episode for one card by one governor sample.
 
-        When the card is SATURATED, a pending rung is verified first (crediting a realized free or, after the
-        rung's verification window of short samples, logging the shortfall and escalating), then the next rung
-        is issued if the ladder is not exhausted. An exhausted ladder on a still-SATURATED card marks the
-        episode unresolved.
+        When the card is SATURATED, a pending rung is verified first (crediting a realized free or, once the
+        rung has spent its whole verification budget without realizing further free, logging the shortfall and
+        escalating), then the next rung is issued if the ladder is not exhausted. An exhausted ladder on a
+        still-SATURATED card marks the episode unresolved.
 
         When the card is not SATURATED the episode is winding down, but the engine holds it (issuing no further
         rungs) until the card returns fully HEALTHY, then unwinds: it undoes every restore obligation it took
@@ -500,7 +550,13 @@ class VerifiedReclaimLadder:
                 context, re-inflates the footprint, and buys the next reduction, which is a cold start per
                 cycle for no net change. The caller supplies the dwell and the evidence that the demand the
                 reduction was made for has cleared; lane rungs are unaffected.
+            now: The monotonic-scale instant of this sample, which every verification budget and the safety
+                rung's cooldown are measured on. Defaults to :func:`time.monotonic`; a caller that drives the
+                control loop on its own clock passes that clock so the budgets are measured on the same
+                timeline as everything else it gates.
         """
+        if now is None:
+            now = time.monotonic()
         if not saturated:
             if healthy:
                 for key in (device_index, None):
@@ -530,10 +586,10 @@ class VerifiedReclaimLadder:
         if episode.ladder is None:
             episode.ladder = tuple(ladder_builder())
 
-        if episode.pending is not None and not self._verify(episode, device_free_mb, actuator):
+        if episode.pending is not None and not self._verify(episode, device_free_mb, actuator, now):
             return
 
-        self._issue_next(episode, device_free_mb, actuator)
+        self._issue_next(episode, device_free_mb, actuator, device_index=device_index, now=now)
 
     def record_context_reduction(self, device_index: int | None) -> None:
         """Record that a card's live inference-context count was reduced under admission pressure.
@@ -619,23 +675,27 @@ class VerifiedReclaimLadder:
         episode: _Episode,
         device_free_mb: float,
         actuator: ReclaimLadderActuator,
+        now: float,
     ) -> bool:
         """Verify the pending rung against realized device-free; return True once it resolves (freed or short).
 
         A rung resolves as verified the moment realized free reaches :data:`_VERIFICATION_YIELD_FRACTION` of
-        its promise (crediting the realized gain), or as a shortfall once it has been given its verification
-        window of samples without doing so (logging, recording a calibration event, and letting the caller
-        escalate). The window is :data:`_TEARDOWN_VERIFICATION_SAMPLES` for teardown-class rungs (a lane pause
-        or safety off-GPU, whose memory only returns once the process has exited) and :data:`_VERIFICATION_SAMPLES`
-        otherwise. While it is still within its verification window it returns False so the engine waits another
-        tick rather than issuing the next rung.
+        its promise (crediting the realized gain), or as a shortfall once its whole verification budget has
+        passed without it realizing further free (logging, recording a calibration event, and letting the
+        caller escalate). The budget is :data:`_TEARDOWN_VERIFICATION_BUDGET_SECONDS` for teardown-class rungs
+        (a lane pause or safety off-GPU, whose memory only returns once the process has exited) and
+        :data:`_VERIFICATION_BUDGET_SECONDS` otherwise, and it runs from the last sample that realized a new
+        high-water of free rather than from the issue: a release still arriving keeps its rung, so a working
+        multi-gigabyte give-back is never graded short for landing more slowly than the control loop samples.
+        While the rung is still inside its budget this returns False so the engine waits another tick rather
+        than issuing the next rung.
 
         A rung whose promise is not a positive figure (the tenant's reservation was never reported, so it was
         priced at zero) is *unverifiable* rather than verified: the yield-fraction test would reduce to
         "realized at least nothing" and certify the first sample of a rung that freed nothing at all, sprinting
-        the engine down the whole ladder on a rung it never graded. Such a rung serves its full sample window,
-        credits nothing to :attr:`verified_frees_mb`, and resolves without being counted either verified or
-        short, so the engine escalates on an honest absence of evidence.
+        the engine down the whole ladder on a rung it never graded. Such a rung serves its full budget, credits
+        nothing to :attr:`verified_frees_mb`, and resolves without being counted either verified or short, so
+        the engine escalates on an honest absence of evidence.
         """
         pending = episode.pending
         assert pending is not None
@@ -643,8 +703,13 @@ class VerifiedReclaimLadder:
         realized_mb = device_free_mb - pending.baseline_free_mb
         promised_mb = pending.rung.promised_freed_mb
 
+        if realized_mb >= pending.best_realized_mb + _VERIFICATION_PROGRESS_MB:
+            pending.best_realized_mb = realized_mb
+            pending.progress_at = now
+        within_budget = (now - pending.progress_at) < self._verification_budget_for(pending.rung)
+
         if promised_mb <= 0.0:
-            if pending.samples_waited < self._verification_window_for(pending.rung.kind):
+            if within_budget:
                 return False
             logger.debug(
                 f"Reclaim rung {pending.rung.kind.value} on {pending.rung.tenant_label} "
@@ -659,12 +724,14 @@ class VerifiedReclaimLadder:
             episode.pending = None
             return True
 
-        if pending.samples_waited >= self._verification_window_for(pending.rung.kind):
+        if not within_budget:
             self.verification_shortfalls += 1
             logger.warning(
                 f"Reclaim rung {pending.rung.kind.value} on {pending.rung.tenant_label} "
                 f"(device {pending.rung.device_index}) freed only ~{max(0.0, realized_mb):.0f}MB of a "
-                f"promised ~{promised_mb:.0f}MB after {pending.samples_waited} samples; escalating.",
+                f"promised ~{promised_mb:.0f}MB, and has realized nothing further for "
+                f"{self._verification_budget_for(pending.rung):.0f}s over {pending.samples_waited} "
+                "samples; escalating.",
             )
             actuator.record_calibration_event(pending.rung, promised_mb=promised_mb, realized_mb=realized_mb)
             episode.pending = None
@@ -677,31 +744,73 @@ class VerifiedReclaimLadder:
         episode: _Episode,
         device_free_mb: float,
         actuator: ReclaimLadderActuator,
+        *,
+        device_index: int | None,
+        now: float,
     ) -> None:
         """Issue the next rung that actually acts, or mark the episode unresolved when the ladder is exhausted.
 
         A rung whose target has already gone away (the actuator returns False) frees nothing to verify, so the
         engine advances to the next rung in the same tick rather than opening a verification window on a no-op.
-        The first rung that acts opens a fresh verification window and stops the tick.
+        A safety rung still inside :data:`_SAFETY_RUNG_COOLDOWN_SECONDS` of the card's previous safety
+        actuation is skipped the same way: cycling safety again this soon rebuilds the process for relief the
+        last cycle already failed to hold. The first rung that acts opens a fresh verification budget and stops
+        the tick.
         """
         ladder = episode.ladder or ()
         while episode.next_index < len(ladder):
             rung = ladder[episode.next_index]
             episode.next_index += 1
+            if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU and self._safety_rung_in_cooldown(device_index, now):
+                continue
             if execute_reclaim_rung(rung, actuator):
                 self.rungs_issued += 1
+                if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU:
+                    self._safety_actuated_at[device_index] = now
                 if rung.kind in LANE_PAUSE_RUNG_KINDS:
                     # Only a lane pause that actually acted is the engine's to restore later; record it so the
                     # episode-end unwind restarts exactly the lanes this engine stopped.
                     episode.restore_obligations.append(rung)
-                episode.pending = _PendingVerification(rung=rung, baseline_free_mb=device_free_mb)
+                episode.pending = _PendingVerification(
+                    rung=rung,
+                    baseline_free_mb=device_free_mb,
+                    progress_at=now,
+                )
                 return
         episode.unresolved = True
 
+    def _safety_rung_in_cooldown(self, device_index: int | None, now: float) -> bool:
+        """Whether ``device_index``'s last safety actuation is recent enough to refuse another one.
+
+        Counted once per refusal so the cost of the dwell is visible; the ladder advances past a refused rung
+        within the tick, so this cannot repeat per sample while an episode is running.
+        """
+        actuated_at = self._safety_actuated_at.get(device_index)
+        if actuated_at is None or (now - actuated_at) >= _SAFETY_RUNG_COOLDOWN_SECONDS:
+            return False
+        self.safety_rungs_refused += 1
+        logger.debug(
+            f"Reclaim ladder: refusing the safety-off-GPU rung on device {device_index}; the previous safety "
+            f"actuation was {now - actuated_at:.0f}s ago, inside the {_SAFETY_RUNG_COOLDOWN_SECONDS:.0f}s "
+            "dwell that keeps a card under recurring pressure from spending its session rebuilding safety.",
+        )
+        return True
+
     @staticmethod
-    def _verification_window_for(kind: ReclaimRungKind) -> int:
-        """Samples a rung of this kind is given to realize its promise before it counts as short."""
-        return _TEARDOWN_VERIFICATION_SAMPLES if kind in _TEARDOWN_RUNG_KINDS else _VERIFICATION_SAMPLES
+    def _verification_budget_for(rung: ReclaimRung) -> float:
+        """Seconds without realized free this rung is given before it counts as short.
+
+        A fixed part for the latency before any memory can arrive (a control-pipe round trip, or a whole
+        process exit for a teardown rung) plus a part scaled by the megabytes the rung promised, because a
+        release settles at a rate set by its own size and by the host. Scaling it is what keeps the same
+        judgement honest across the card sizes operators actually run: a constant sized for one of them
+        misjudges a working large release on the others.
+        """
+        teardown = rung.kind in _TEARDOWN_RUNG_KINDS
+        base_seconds = _TEARDOWN_VERIFICATION_BASE_SECONDS if teardown else _VERIFICATION_BASE_SECONDS
+        seconds_per_gb = _TEARDOWN_VERIFICATION_SECONDS_PER_GB if teardown else _VERIFICATION_SECONDS_PER_GB
+        promised_gb = max(0.0, rung.promised_freed_mb) / 1024.0
+        return base_seconds + seconds_per_gb * promised_gb
 
     @staticmethod
     def _unwind_restore_obligations(
