@@ -65,7 +65,7 @@ from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     generate_scenarios,
     parse_seed_spec,
 )
-from tests.process_management.liveness.test_bounded_dispatch_matrix import (
+from tests.process_management.liveness._dispatch_world import (
     _MARGINAL_CONTEXT_MB,
     _MODEL_CLASSES,
     _CardClass,
