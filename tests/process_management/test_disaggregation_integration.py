@@ -249,6 +249,51 @@ async def test_genuine_img2img_registers_at_source_latent_stage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_granted_disaggregated_dispatch_stamps_a_component_grant_on_its_sampler() -> None:
+    """The scheduler's retention verdict is stamped on the pinned sampler, marked as the UNet it covers.
+
+    The sample stage's completion is synthesized by the parent from the image lane's decode, so this record is
+    the only thing that can tell the pipeline whether the sampler was asked to keep its weights, and the
+    component mark is what stops the residency being priced as a whole checkpoint.
+    """
+    pm, inference = _make_manager_with_roles()
+    job = _make_source_job(source_processing="txt2img", source_image=None)
+    await pm._job_tracker.record_popped_job(job)
+
+    routed = await pm._inference_scheduler._dispatch_disaggregated(
+        job,
+        inference,
+        keep_model_resident_after=True,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+
+    assert routed is True
+    assert inference.retention_granted_model == job.model
+    assert inference.retention_granted_component_only is True
+
+
+@pytest.mark.asyncio
+async def test_an_ungranted_disaggregated_dispatch_stamps_no_grant() -> None:
+    """A denied verdict leaves the sampler holding no grant, so its stage evicts as every other job does."""
+    pm, inference = _make_manager_with_roles()
+    job = _make_source_job(source_processing="txt2img", source_image=None)
+    await pm._job_tracker.record_popped_job(job)
+
+    routed = await pm._inference_scheduler._dispatch_disaggregated(
+        job,
+        inference,
+        keep_model_resident_after=False,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+
+    assert routed is True
+    assert inference.retention_granted_model is None
+    assert inference.retention_granted_component_only is False
+
+
+@pytest.mark.asyncio
 async def test_mislabeled_img2img_flows_txt2img_dag_end_to_end() -> None:
     """A pop mislabeled img2img (no source) flows the txt2img DAG: encode -> sample -> decode -> safety.
 

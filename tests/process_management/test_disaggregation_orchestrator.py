@@ -53,6 +53,10 @@ class _FakeProcess:
     id-reusing replacement is modelled by swapping in a fake with the same ``process_id`` but a new launch.
     ``busy`` models the device-state the liveness escalation corroborates against: a running sampler reports
     busy (the default), an idle/finished one reports not-busy.
+
+    The retention half of the real process contract is modelled too, because the orchestrator both reads a
+    sampler's grant (to tell the sample stage whether to keep its UNet) and resolves it when the stage ends.
+    ``device_index`` is the card the dispatch reads a device figure for.
     """
 
     def __init__(
@@ -61,20 +65,46 @@ class _FakeProcess:
         *,
         process_launch_identifier: int = 0,
         busy: bool = True,
+        device_index: int = 0,
     ) -> None:
         self.process_id = process_id
         self.process_launch_identifier = process_launch_identifier
         self.busy = busy
+        self.device_index = device_index
         self.sent: list[object] = []
         # Read by the sample-completion observation seam (the pinned sampler's latest reported peak). None here
         # leaves nothing to observe, matching an off-GPU or not-yet-reported sampler.
         self.process_peak_reserved_mb: int | None = None
+        self.retention_granted_model: str | None = None
+        self.retention_granted_component_only: bool = False
+        self.retained_resident_model: str | None = None
+        self.retained_resident_component_only: bool = False
+        self.owned_job: object | None = None
+        self.retired_jobs: list[object] = []
 
     def is_process_busy(self) -> bool:
         return self.busy
 
     def safe_send_message(self, message: object) -> bool:
         self.sent.append(message)
+        return True
+
+    def current_inference_job(self) -> object | None:
+        return self.owned_job
+
+    def note_retention_grant(self, model: str | None, *, component_only: bool = False) -> None:
+        self.retention_granted_model = model
+        self.retention_granted_component_only = component_only and model is not None
+
+    def settle_retention_after_job(self) -> None:
+        self.retained_resident_model = self.retention_granted_model
+        self.retained_resident_component_only = self.retention_granted_component_only
+        self.retention_granted_model = None
+        self.retention_granted_component_only = False
+
+    def retire_inference_ownership(self, job: object) -> bool:
+        self.retired_jobs.append(job)
+        self.owned_job = None
         return True
 
 
@@ -143,6 +173,7 @@ def _make_harness(
     estimate_sampling_peak_mb: object = None,
     estimate_decode_spike_mb: object = None,
     sampling_headroom_mb: float | None = None,
+    measured_device_free_mb: object = None,
 ) -> SimpleNamespace:
     """Build an orchestrator wired to fake role processes plus reservation/early-release recorders.
 
@@ -186,6 +217,9 @@ def _make_harness(
         reroute_monolithic=rerouted.append,
         estimate_sampling_peak_mb=peak_callable,  # type: ignore[arg-type]
         estimate_decode_spike_mb=decode_callable,  # type: ignore[arg-type]
+        measured_device_free_mb=(
+            measured_device_free_mb if measured_device_free_mb is not None else (lambda _device_index: None)
+        ),  # type: ignore[arg-type]
         clock=lambda: virtual_now[0],
     )
     if sampling_headroom_mb is not None:
@@ -1470,3 +1504,225 @@ async def test_release_job_drops_a_held_truncation() -> None:
     h.orchestrator.release_job(job_id)
 
     assert str(job_id) not in h.orchestrator._jobs
+
+
+# -- the sampler's retention grant -----------------------------------------------------------------
+
+
+def _grant(h: SimpleNamespace, job: HordeJobInfo, *, model: str = "SDXL 1.0") -> None:
+    """Stamp the scheduler's granted verdict on the pinned sampler, as the dispatch seam does."""
+    h.sampler.note_retention_grant(model, component_only=True)
+    h.sampler.owned_job = job.sdk_api_job_info
+
+
+@pytest.mark.asyncio
+async def test_a_granted_sample_stage_is_dispatched_with_the_retention_flag() -> None:
+    """The grant on the sampler lane rides its sample dispatch, which is the only thing the child honours."""
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    assert h.sampler.sent[-1].keep_model_resident_after is True
+
+
+@pytest.mark.asyncio
+async def test_an_ungranted_sample_stage_asks_for_no_retention() -> None:
+    """With no grant the stage runs the ordinary end-of-run eviction: the flag stays off."""
+    h = _make_harness()
+    job = _job()
+
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    assert h.sampler.sent[-1].keep_model_resident_after is False
+
+
+@pytest.mark.asyncio
+async def test_a_sample_dispatch_carries_the_parents_device_reading() -> None:
+    """The sampler is told what the card really holds, as a monolithic dispatch's child is."""
+    h = _make_harness(measured_device_free_mb=lambda _device_index: 3210.0)
+    job = _job()
+
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    assert h.sampler.sent[-1].device_free_mb == 3210.0
+
+
+@pytest.mark.asyncio
+async def test_a_granted_sampler_is_recorded_as_retaining_its_unet_when_its_stage_ends() -> None:
+    """The grant settles on the sampler at the end of its stage, marked as the component residency it is.
+
+    The end of sampling is when the record becomes true: from then the sampler's device holds the job's UNet,
+    and the decode that follows runs on the image lane. Marked component-only because that is all the slot
+    holds; pricing it as a whole checkpoint would charge the card for support weights no process is holding.
+    """
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    await h.orchestrator.handle_stage_result(_sample_ok(job.sdk_api_job_info.id_, _SAMPLER_PID))
+
+    assert h.sampler.retained_resident_model == "SDXL 1.0"
+    assert h.sampler.retained_resident_component_only is True
+    assert h.sampler.retention_granted_model is None
+
+
+@pytest.mark.asyncio
+async def test_an_ungranted_sampler_is_recorded_as_retaining_nothing() -> None:
+    """An ungranted stage ends with the child's evictor returning the card, so the slot holds nothing."""
+    h = _make_harness()
+    job = _job()
+    h.sampler.owned_job = job.sdk_api_job_info
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    await h.orchestrator.handle_stage_result(_sample_ok(job.sdk_api_job_info.id_, _SAMPLER_PID))
+
+    assert h.sampler.retained_resident_model is None
+
+
+@pytest.mark.asyncio
+async def test_the_sampler_ownership_is_retired_when_its_stage_ends() -> None:
+    """The slot owns nothing once sampling is done, so the orphan watchdog stops crediting it the job.
+
+    Ownership is taken at admission so the watchdog credits the slot across the encode-and-sample window. The
+    parent-synthesized completion retires ownership on the decode lane, never here, so left standing this
+    record makes a finished job read as owned until the slot's next dispatch overwrites it.
+    """
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    await h.orchestrator.handle_stage_result(_sample_ok(job.sdk_api_job_info.id_, _SAMPLER_PID))
+
+    assert h.sampler.retired_jobs == [job.sdk_api_job_info]
+    assert h.sampler.current_inference_job() is None
+
+
+@pytest.mark.asyncio
+async def test_a_slot_already_running_another_job_keeps_its_own_grant() -> None:
+    """A sample result for a slot that has moved on resolves nothing: the newer job's grant is not settled.
+
+    The pin is released the moment sampling ends, so the slot can be dispatched again before this result is
+    handled. Settling then would resolve the *next* job's grant early, recording a residency for weights that
+    job has not finished with.
+    """
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+    later_job = _job()
+    h.sampler.owned_job = later_job.sdk_api_job_info
+    h.sampler.note_retention_grant("SDXL 1.0", component_only=True)
+
+    await h.orchestrator.handle_stage_result(_sample_ok(job.sdk_api_job_info.id_, _SAMPLER_PID))
+
+    assert h.sampler.retained_resident_model is None, "the later job's grant must not settle early"
+    assert h.sampler.retention_granted_model == "SDXL 1.0", "the later job's grant must still be in flight"
+    assert h.sampler.retired_jobs == []
+
+
+@pytest.mark.asyncio
+async def test_a_faulted_sample_discards_the_grant_it_never_earned() -> None:
+    """A stage that faulted leaves the slot recorded as holding nothing, whatever it was granted.
+
+    A fault may have torn the child down or left the card in an unknown state, so the grant cannot be trusted
+    to describe the device. Under-recording costs at most a reload; over-recording is a residency the parent
+    charges and routes to that does not exist.
+    """
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    await h.orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=_SAMPLER_PID,
+            process_launch_identifier=0,
+            info="",
+            results=[
+                SampleSliceResult(
+                    job_id=job.sdk_api_job_info.id_,  # type: ignore[arg-type]
+                    latent_bytes=None,
+                    state=GENERATION_STATE.faulted,
+                ),
+            ],
+            fault_is_resource_class=False,
+        ),
+    )
+
+    assert h.sampler.retained_resident_model is None
+    assert h.sampler.retention_granted_model is None, "an unsettled grant must not outlive its job"
+    assert len(h.completed) == 1
+    assert h.completed[0][2] == GENERATION_STATE.faulted
+
+
+@pytest.mark.asyncio
+async def test_discarding_a_faulted_grant_leaves_an_earlier_residency_standing() -> None:
+    """Only the in-flight grant is discarded: weights the slot really holds from an earlier job stay recorded.
+
+    Those weights are on the device whatever this job did, and forgetting them would let a later load be
+    priced as though the card were free of them.
+    """
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    h.sampler.retained_resident_model = "earlier_model"
+    h.sampler.retained_resident_component_only = False
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    await h.orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=_SAMPLER_PID,
+            process_launch_identifier=0,
+            info="",
+            results=[
+                SampleSliceResult(
+                    job_id=job.sdk_api_job_info.id_,  # type: ignore[arg-type]
+                    latent_bytes=None,
+                    state=GENERATION_STATE.faulted,
+                ),
+            ],
+            fault_is_resource_class=False,
+        ),
+    )
+
+    assert h.sampler.retained_resident_model == "earlier_model"
+    assert h.sampler.retention_granted_model is None
+
+
+@pytest.mark.asyncio
+async def test_an_encode_fault_before_sampling_discards_the_grant() -> None:
+    """A job that never reached its sampler leaves no grant behind for a later completion to settle."""
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.tick()
+
+    await h.orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.sdk_api_job_info.id_,
+            positive_conditioning_bytes=None,
+            negative_conditioning_bytes=None,
+            state=GENERATION_STATE.faulted,
+            fault_is_resource_class=False,
+        ),
+    )
+
+    assert h.sampler.retention_granted_model is None
+    assert h.sampler.retained_resident_model is None

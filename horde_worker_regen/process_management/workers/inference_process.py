@@ -1042,6 +1042,7 @@ class HordeInferenceProcess(HordeProcess):
         *,
         keep_model_resident: bool = False,
         premade_control_map_bytes: bytes | None = None,
+        device_free_truth_mb: float | None = None,
     ) -> list[ResultingImageReturn] | None:
         """Start an inference job in the HordeLib instance.
 
@@ -1055,6 +1056,11 @@ class HordeInferenceProcess(HordeProcess):
                 image-utilities lane annotated ahead of dispatch, injected into the job's controlnet
                 parameters so hordelib runs the ``none`` preprocessor over it. None for a job with no
                 pre-annotated control map. Defaults to None.
+            device_free_truth_mb (float | None, optional): The parent's device-level free VRAM (MB) at
+                dispatch, which clamps the free view this process's shortfall-based freeing is computed
+                against; the process-local view overstates the card under WDDM, so an unclamped shortfall
+                under-frees and the card's real free figure craters. None leaves the executor on its own
+                view. Defaults to None.
 
         Returns:
             list[Image] | None: The generated images, or None if inference failed.
@@ -1106,6 +1112,7 @@ class HordeInferenceProcess(HordeProcess):
                             job_info,
                             keep_model_resident=keep_model_resident,
                             premade_control_map_bytes=premade_control_map_bytes,
+                            device_free_truth_mb=device_free_truth_mb,
                         )
         except Exception as e:
             # Keep a reason for the faulted result: the main process logs it and classifies a
@@ -1140,6 +1147,7 @@ class HordeInferenceProcess(HordeProcess):
         *,
         keep_model_resident: bool,
         premade_control_map_bytes: bytes | None = None,
+        device_free_truth_mb: float | None = None,
     ) -> list[ResultingImageReturn]:
         """Run a job through hordelib's typed generation path.
 
@@ -1152,6 +1160,10 @@ class HordeInferenceProcess(HordeProcess):
         When ``premade_control_map_bytes`` is set, the image-utilities lane already annotated this job's
         ControlNet control map, so it is injected into the converted parameters before generation and the
         in-graph preprocessor runs ``none`` over it rather than re-deriving the annotation here.
+
+        ``device_free_truth_mb`` is the parent's device-level free reading, passed on so the executor's
+        shortfall arithmetic is clamped by it: this process sees only its own allocations, so its free view
+        runs ahead of the card and an unclamped shortfall frees less than the load actually needs.
         """
         from horde_sdk.worker.dispatch.ai_horde.image.convert import (
             convert_image_job_pop_response_to_parameters,
@@ -1180,6 +1192,7 @@ class HordeInferenceProcess(HordeProcess):
             pipeline=AUTO_PIPELINE,
             progress_callback=self.progress_callback,
             defer_vram_unload=keep_model_resident,
+            device_free_truth_mb=device_free_truth_mb,
         )
 
         for single_result in results:
@@ -1229,6 +1242,8 @@ class HordeInferenceProcess(HordeProcess):
                         negative_conditioning_bytes=job_slice.negative_conditioning_bytes,
                         source_latent_bytes=job_slice.source_latent_bytes,
                         progress_callback=self._emit_sample_stage_progress,
+                        defer_vram_unload=message.keep_model_resident_after,
+                        device_free_truth_mb=message.device_free_mb,
                     )
                     latent_bytes = sample_result.latent_bytes
                     truncation = read_sampler_truncation(sample_result)
@@ -1574,6 +1589,7 @@ class HordeInferenceProcess(HordeProcess):
                     message.sdk_api_job_info,
                     keep_model_resident=message.keep_model_resident_after,
                     premade_control_map_bytes=message.premade_control_map_bytes,
+                    device_free_truth_mb=message.device_free_mb,
                 )
 
                 if results is None or len(results) == 0:

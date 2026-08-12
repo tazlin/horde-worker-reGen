@@ -832,6 +832,14 @@ class HordeInferenceControlMessage(HordeControlModelMessage):
     (the dominant non-sampling cost on small jobs) is skipped. Defaults to False, preserving the
     aggressive per-job eviction that keeps sibling GPU instances from over-committing."""
 
+    device_free_mb: float | None = None
+    """The parent's NVML device-level free VRAM (MB) measured at dispatch.
+
+    The child forwards it to hordelib so shortfall-based freeing acts against device truth rather than the
+    process-local view, which overstates free memory under WDDM: a child that believes it has room frees
+    nothing, allocates anyway, and the card's real free figure craters. None when the parent has taken no
+    device reading yet, which leaves the child on its own view exactly as before."""
+
     skipped_aux_models: list[AuxModelRef] = Field(default_factory=list)
     """Auxiliary files this job references that were terminally rejected from ad-hoc download and so will
     never be on disk. The inference child tolerates their absence at its read-only dispatch presence-check
@@ -1169,6 +1177,24 @@ class HordeSampleControlMessage(HordeControlMessage, HordeStageModelMixin):
     control_flag: HordeControlFlag = HordeControlFlag.START_SAMPLE
     slices: list[SampleSliceSpec]
     """The per-job sample inputs; v1 sends exactly one."""
+
+    keep_model_resident_after: bool = False
+    """Keep this stage's UNet resident in VRAM after the run instead of evicting it.
+
+    A sampler runs the same end-of-run eviction the monolithic path does, so without this grant it returns
+    the card after every sample stage and the next same-model sample re-uploads weights the device was
+    holding moments earlier. Set by the scheduler from the same retention verdict a monolithic dispatch
+    carries, and priced against the component (UNet-only) footprint a disaggregated sampler actually holds.
+    Defaults to False, preserving the aggressive per-stage eviction."""
+
+    device_free_mb: float | None = None
+    """The parent's NVML device-level free VRAM (MB) measured when this stage was dispatched.
+
+    Forwarded to hordelib so the sampler's shortfall-based freeing acts against device truth rather than the
+    process-local view, which overstates free memory under WDDM. This stage loads the UNet and carries the
+    job's whole sampling activation, so it is the stage that reaches the card hardest. None when the parent
+    has taken no device reading yet, which leaves the child on its own view."""
+
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
 

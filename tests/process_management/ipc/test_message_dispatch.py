@@ -661,6 +661,46 @@ class TestHandleInferenceResult:
 
         assert job_info.time_to_generate == 7.5
 
+    async def test_a_synthetic_completion_leaves_the_samplers_residency_alone(self) -> None:
+        """A disaggregated completion is handled on the decode lane and does not disturb what the sampler holds.
+
+        The synthetic result's ``process_id`` is the image lane that decoded the job, which is what its
+        timestamps and ownership retirement belong to. The sampler's residency was settled when its own stage
+        ended, so this must neither clear it nor move it onto the decode lane, which holds no diffusion weights
+        at all.
+        """
+        decode_lane = make_mock_process_info(0)
+        decode_lane.process_launch_identifier = 0
+        sampler = make_mock_process_info(1, model_name="stable_diffusion")
+        sampler.process_launch_identifier = 0
+        sampler.retained_resident_model = "stable_diffusion"
+        sampler.retained_resident_component_only = True
+        process_map = ProcessMap({0: decode_lane, 1: sampler})
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response(model="stable_diffusion")
+        await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+
+        message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
+
+        msg = Mock(spec=HordeInferenceResultMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.sdk_api_job_info = job
+        msg.time_elapsed = 7.5
+        msg.info = "done"
+        msg.state = Mock()
+        msg.state.__eq__ = lambda self, other: False  # pyrefly: ignore - not testing state handling here
+        msg.job_image_results = [Mock()]
+        msg.faults_count = 0
+
+        await message_dispatcher.handle_synthetic_inference_result(msg)
+
+        assert sampler.retained_resident_model == "stable_diffusion"
+        assert sampler.retained_resident_component_only is True
+        assert decode_lane.retained_resident_model is None
+
     async def test_faulted_inference_result_moves_to_pending_submit(self) -> None:
         """If an inference result is faulted, it should be moved to pending submit."""
         from horde_sdk.ai_horde_api import GENERATION_STATE

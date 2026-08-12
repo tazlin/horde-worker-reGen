@@ -214,6 +214,12 @@ class _DisaggJobState:
     retired/crashed/replaced, so the next dispatch re-resolves to whichever live process now holds the model.
     The launch identifier distinguishes the pinned process from an id-reusing cold replacement that never held
     the preloaded model."""
+    sampler_process_id: int | None = None
+    """The process the sample stage was last dispatched to, kept past the pin's release.
+
+    :attr:`pinned_sampler` is cleared the moment sampling ends (the slot returns to the pool for the overlap
+    win), so it cannot name the slot whose device now holds this job's UNet. This does, which is what lets a
+    terminating job discard a retention grant its sampler never earned."""
     first_stalled_at: float | None = None
     """When the job first had no role process for its next stage; anchors the patience window."""
     gate_deferred_since: float | None = None
@@ -283,6 +289,7 @@ class DisaggregationOrchestrator:
         estimate_sampling_peak_mb: Callable[[HordeJobInfo], float | None] = lambda _job_info: None,
         estimate_decode_spike_mb: Callable[[HordeJobInfo], float | None] = lambda _job_info: None,
         observe_sampling_peak: Callable[[HordeJobInfo, float], None] = lambda _job_info, _peak_mb: None,
+        measured_device_free_mb: Callable[[int | None], float | None] = lambda _device_index: None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Wire the orchestrator to its role-process finders and completion hand-off.
@@ -331,6 +338,10 @@ class DisaggregationOrchestrator:
                 (MB) when its sample stage completes successfully, so the learned-footprint store records the
                 disaggregated sampling peak the monolithic observation seam cannot attribute. A no-op by default
                 (standalone tests) and never called with a non-positive peak.
+            measured_device_free_mb: Returns the parent's measured device-level free VRAM (MB) for a card, or
+                None when unread. Put on a sample dispatch so the sampler clamps its own free view with it, the
+                same reading a monolithic dispatch carries; a sampler loads the UNet and holds the job's whole
+                sampling activation, so it is the stage whose shortfall arithmetic most needs device truth.
             clock: Monotonic clock (overridable for the load simulator's virtual time).
         """
         self._find_encode_service = find_encode_service
@@ -349,6 +360,7 @@ class DisaggregationOrchestrator:
         self._estimate_sampling_peak_mb = estimate_sampling_peak_mb
         self._estimate_decode_spike_mb = estimate_decode_spike_mb
         self._observe_sampling_peak = observe_sampling_peak
+        self._measured_device_free_mb = measured_device_free_mb
         self._clock = clock
         self._jobs: dict[str, _DisaggJobState] = {}
         # The concurrent-sampling admission ledger: each in-flight sample stage's estimated activation peak
@@ -872,8 +884,14 @@ class DisaggregationOrchestrator:
                 else f"Disaggregation: deferring sample for {self._key(state.job_info)} until headroom frees",
             )
             return _DispatchOutcome.GATE_DEFERRED
+        # The sampler's retention grant is the record the scheduler stamped on this lane when it routed the
+        # job here; a stage dispatched without it runs the same end-of-run eviction any other job does, and the
+        # next same-model sample re-uploads the UNet the device was holding.
+        keep_model_resident_after = sampler.retention_granted_model == identity.horde_model_name
         message = HordeSampleControlMessage(
             **identity.model_dump(),
+            keep_model_resident_after=keep_model_resident_after,
+            device_free_mb=self._measured_device_free_mb(sampler.device_index),
             slices=[
                 SampleSliceSpec(
                     job_id=state.job_info.sdk_api_job_info.id_,
@@ -886,6 +904,7 @@ class DisaggregationOrchestrator:
         )
         if not self._send(sampler, message, state):
             return _DispatchOutcome.NO_ROLE
+        state.sampler_process_id = sampler.process_id
         # Admitted: book its peak into the ledger so the next sampler is gated against the room this one takes.
         # A missing estimate books 0.0 (its presence still makes the ledger non-empty, so the gate arbitrates
         # subsequent samplings, but it reserves no headroom, per "never wedge on a missing estimate").
@@ -1133,6 +1152,7 @@ class DisaggregationOrchestrator:
             # rather than at sample dispatch (would double-book the running slot) or at completion (would
             # forfeit the overlap).
             self._release_pin(state)
+            self._settle_sampler_retention(state, sampler_process)
             self._on_sampling_complete(state.job_info)
             # The sampler's retained activation pool is NOT released here: an unconditional post-stage
             # release forces a gc pause plus a full pool rebuild on the next slice for every job, which
@@ -1144,6 +1164,66 @@ class DisaggregationOrchestrator:
             # sampling it actually delivered rather than an earlier attempt's.
             state.sampler_truncation = result.sampler_truncation
             state.stage = DisaggJobStage.AWAITING_LATENT_DECODE
+
+    def _settle_sampler_retention(
+        self,
+        state: _DisaggJobState,
+        sampler_process: HordeProcessInfo | None,
+    ) -> None:
+        """Resolve the sampler's retention grant and retire its ownership, its stage having finished.
+
+        Settled here, on the sample result, rather than at the job's completion. The end of the sample stage is
+        the physical event the record describes: from that instant the sampler's device either holds the job's
+        UNet (the grant rode its dispatch) or does not (it did not), and the decode that follows runs on the
+        image lane and cannot change it. Settling at completion instead would leave the parent blind to those
+        weights for the whole decode window, which is exactly a window the scheduler may preload in, and would
+        make a decode fault clear a residency the sampler really does hold.
+
+        The ownership record is retired here for the same reason. It is taken at admission so the orphaned-job
+        watchdog credits the slot across the encode-and-sample window; once sampling has ended the slot owns
+        nothing (the job's remaining work is the image lane's, which the held-job set covers), and the
+        parent-synthesized completion retires ownership on the decode lane, never here. Left standing, it makes
+        a finished job read as owned until the slot's next dispatch overwrites it.
+
+        Both acts carry the completion path's guard: a slot that has since been dispatched another job is not
+        this job's sampler any more, and must not have that newer job's grant or ownership resolved early.
+        """
+        if sampler_process is None:
+            return
+        owned_job = sampler_process.current_inference_job()
+        job = state.job_info.sdk_api_job_info
+        if owned_job is not None and owned_job.id_ != job.id_:
+            return
+        sampler_process.settle_retention_after_job()
+        sampler_process.retire_inference_ownership(job)
+
+    def _discard_unsettled_sampler_grant(self, state: _DisaggJobState) -> None:
+        """Drop a retention grant whose sample stage never delivered, leaving any real residency alone.
+
+        A job that faults (or is re-routed) before or during sampling leaves its sampler holding a grant that
+        was never settled. Nothing prices an unsettled grant, but the next completion on that slot would settle
+        it, recording a residency for a model that slot never sampled. Only the in-flight grant is discarded:
+        weights the slot legitimately retains from an earlier job are still on its device and stay recorded.
+
+        The slot is the one the sample stage was dispatched to, or the pinned sampler when the job faulted
+        before reaching its sampler at all: the grant is stamped at admission, so a job that never sampled has
+        still left one behind.
+
+        A no-op on the success path, where the grant is already settled, and on a slot that has moved on to
+        another job, whose own grant this must not touch.
+        """
+        process_id = state.sampler_process_id
+        if process_id is None and state.pinned_sampler is not None:
+            process_id = state.pinned_sampler[0]
+        if process_id is None:
+            return
+        sampler_process = self._find_process_by_id(process_id)
+        if sampler_process is None:
+            return
+        owned_job = sampler_process.current_inference_job()
+        if owned_job is not None and owned_job.id_ != state.job_info.sdk_api_job_info.id_:
+            return
+        sampler_process.note_retention_grant(None)
 
     def _on_vae_decode_result(self, message: HordeVaeDecodeResultMessage) -> None:
         state = self._lookup(message.job_id)
@@ -1247,6 +1327,10 @@ class DisaggregationOrchestrator:
         disclosure = sampler_truncation_disclosure(state.sampler_truncation)
         for image in images:
             image.generation_faults = image.generation_faults + disclosure
+        # Any retention grant the sampler never earned is discarded, so a later completion on that slot cannot
+        # settle this job's grant into a residency the device does not hold. Ordered ahead of the pin release,
+        # which is what would otherwise erase the last record of which slot the grant was stamped on.
+        self._discard_unsettled_sampler_grant(state)
         # Any still-held pin is released so a fault before/during sampling never leaks its sampler as booked.
         self._release_pin(state)
         # And any in-flight sampling peak is freed so a fault mid-sampling never leaks its device headroom.
