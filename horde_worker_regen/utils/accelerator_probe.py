@@ -152,13 +152,14 @@ try:
     # the forecast multiplies by (process count - 1) for free_after_model_evict, instead of charging the whole
     # one-time-inclusive overhead per process. Best-effort: any failure leaves it 0 and the worker falls back.
     _marginal_mb = 0
+    _marginal_note = "not attempted"
     _holder = None
     try:
         _holder = subprocess.Popen(
             [sys.executable, "-c", {_HOLDER_SOURCE!r}],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
         )
         _ready = {{"ok": False}}
@@ -177,14 +178,36 @@ try:
         _waiter = threading.Thread(target=_await_ready, daemon=True)
         _waiter.start()
         _waiter.join(timeout=90)  # bound a hung holder so it never costs the basic device inventory
-        if _ready["ok"]:
-            _marginal_mb = max(0, _device_used_mb() - _overhead_mb)
-    except BaseException:
+        if not _ready["ok"]:
+            _marginal_note = "holder never signalled ready (timeout or early exit)"
+        else:
+            # Take the delta on the NVML basis, not the torch one. torch's device-free reading is
+            # per-process on Windows WDDM, so it cannot see the holder's context at all and the
+            # subtraction is structurally zero there; NVML queries the driver and is device-wide on
+            # every platform. Falls back to the torch pair only where NVML is unavailable, which is
+            # the reading that at least works on the platforms where it is device-wide.
+            _after_nvml_mb = _nvml_used_mb()
+            if _after_nvml_mb is not None and _context_nvml_mb is not None:
+                _marginal_mb = max(0, _after_nvml_mb - _context_nvml_mb)
+                _marginal_note = f"nvml delta {{_after_nvml_mb}}-{{_context_nvml_mb}}"
+            else:
+                _marginal_mb = max(0, _device_used_mb() - _overhead_mb)
+                _marginal_note = "torch delta (nvml unavailable); per-process on WDDM, may read 0"
+            if _marginal_mb == 0:
+                _marginal_note += "; measured zero"
+    except BaseException as _marginal_exc:
         _marginal_mb = 0
+        _marginal_note = "raised: " + repr(_marginal_exc)
     finally:
         if _holder is not None:
             try:
                 _holder.kill()
+                # Drain both pipes after killing. stderr is a pipe so a holder failure is reportable
+                # rather than discarded, and an undrained pipe can block the writer once its buffer
+                # fills, which would turn a noisy holder into the hang the ready-timeout exists to bound.
+                _, _holder_err = _holder.communicate(timeout=10)
+                if _holder_err and _marginal_mb == 0:
+                    _marginal_note += " | holder stderr: " + _holder_err.strip().replace("\\n", " ")[-300:]
             except BaseException:
                 pass
 
@@ -197,6 +220,7 @@ try:
             "context_device_used_mb": _context_used_mb,
             "device_baseline_mb": _baseline_mb,
             "marginal_overhead_mb": _marginal_mb,
+            "marginal_note": _marginal_note,
         }}
         for a in _accelerators
     ]
@@ -238,6 +262,13 @@ class ProbedAccelerator(BaseModel):
     0 when it could not be measured (single-context backends, probe failure), where the worker seeds a
     conservative per-additional-context constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``)
     rather than re-charging the first-context ``runtime_overhead_mb`` against every context."""
+    marginal_note: str = ""
+    """Why :attr:`marginal_overhead_mb` reads what it does, for diagnosis when it reads 0.
+
+    A zero marginal is indistinguishable at the value alone between a genuine measurement, a holder that
+    never started, a raised exception, and a platform where the reading cannot see a sibling process at
+    all. This carries which of those happened, including the holder's stderr where one failed, so the
+    seeded fallback is a visible decision rather than a silent one. Empty for probes that predate it."""
 
 
 def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_mb: int | None) -> int:
@@ -293,6 +324,22 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
         try:
             raw_entries = json.loads(line[len(_RESULT_PREFIX) :])
             accelerators = [ProbedAccelerator.model_validate(entry) for entry in raw_entries]
+            # Reported once per probe, at info when the marginal is unmeasured. An unmeasured marginal is
+            # not a detail: the forecast then prices every additional context from a seeded constant for
+            # the whole session, which sizes free-after-model-evict and so the residency and process-count
+            # decisions built on it. Left at debug when a real figure landed.
+            for accelerator in accelerators:
+                if accelerator.marginal_overhead_mb > 0:
+                    logger.debug(
+                        f"Accelerator {accelerator.index} marginal context cost: "
+                        f"{accelerator.marginal_overhead_mb}MB ({accelerator.marginal_note})",
+                    )
+                else:
+                    logger.info(
+                        f"Accelerator {accelerator.index} marginal context cost unmeasured; the stream "
+                        f"forecast will price additional contexts from its seeded constant. "
+                        f"Reason: {accelerator.marginal_note or 'unreported'}",
+                    )
             # The child reports the raw before/after pair; the first-context overhead is derived here. An entry
             # carrying no post-context reading (a serialisation that predates the pair) keeps whatever
             # ``runtime_overhead_mb`` it already had rather than being zeroed.

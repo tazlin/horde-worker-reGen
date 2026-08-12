@@ -360,10 +360,20 @@ class StreamForecast:
         it per additional context double-counts the baseline and over-states the contexts' combined cost.
         ``per_process_overhead_mb`` is charged once per device (it sizes ``free_if_alone``); every additional
         context is priced by this marginal.
+
+        The seed is capped at the measured first-context overhead when there is one. An additional bare
+        context cannot cost more than the first, which carries the same context plus the one-time runtime
+        and the device baseline, so a seed above it is incoherent and prices headroom that exists away.
+        The cap matters because the seed is not always transient: where the marginal probe cannot measure
+        a sibling process (a per-process device reading, as on Windows WDDM) nothing ever displaces it, so
+        an uncapped seed becomes a permanent overcharge multiplied by every additional context.
         """
         marginal = self.marginal_process_overhead_mb
         if marginal is not None and marginal > 0:
             return marginal
+        per_process = self.per_process_overhead_mb
+        if per_process is not None and per_process > 0:
+            return min(_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB, float(per_process))
         return _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
 
     def _fits(self, free_mb: float | None, reserve_mb: float) -> bool:
@@ -971,13 +981,17 @@ def forecast_weight_streaming(
     # with the conservative per-additional-context constant rather than the full first-context overhead: the
     # latter re-charges the one-time runtime and the device baseline against every extra context, a phantom
     # multi-GB shortfall. ``overhead`` is still charged once (it sizes free_if_alone below).
-    marginal = (
-        _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
-        if marginal_process_overhead_mb is None or marginal_process_overhead_mb <= 0
-        else float(
-            marginal_process_overhead_mb,
+    if marginal_process_overhead_mb is None or marginal_process_overhead_mb <= 0:
+        # Capped at the measured first-context overhead where there is one: an additional bare context
+        # cannot cost more than the first, which carries the same context plus the one-time runtime. See
+        # StreamForecast._effective_marginal_overhead_mb for why an uncapped seed can become permanent.
+        marginal = (
+            min(_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB, overhead)
+            if overhead > 0
+            else _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
         )
-    )
+    else:
+        marginal = float(marginal_process_overhead_mb)
     process_count = max(1, num_inference_processes)
     extra_contexts = max(0, num_extra_resident_contexts)
     unreclaimable_charge_mb = 0.0
