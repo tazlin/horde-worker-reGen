@@ -52,11 +52,29 @@ async def test_warm_session_runs_probes_without_per_check_rampup(
         }
         assert launch_ids_before, "expected a warm inference process before running probes"
 
+        base_queue_size = session.manager.bridge_data.queue_size
+
         for probe in probes:
             result = await run_capability_probe_async(probe, process_mode="fake", warm_session=session)
             if result.timing is not None:
                 record_probe_timing(f"{probe.capability.slug} (warm)", result.timing.summary())
             assert result.verdict is CapabilityVerdict.PROVEN, "; ".join(result.reasons)
+
+            # A probe runs under its own configuration, not the session's or the previous probe's: what
+            # it declares is live while it runs, and what it does not declare is back at the base.
+            expected_queue_size = probe.bridge_data_overrides.get("queue_size", base_queue_size)
+            assert session.manager.bridge_data.queue_size == expected_queue_size, (
+                f"{probe.capability.slug} ran under queue_size="
+                f"{session.manager.bridge_data.queue_size}, not its own {expected_queue_size}"
+            )
+
+        # Re-run the first probe last: it declares no overrides, so it must come back to the session base
+        # rather than inherit the settings the probes in between raised.
+        rerun = await run_capability_probe_async(probes[0], process_mode="fake", warm_session=session)
+        assert rerun.verdict is CapabilityVerdict.PROVEN, "; ".join(rerun.reasons)
+        assert session.manager.bridge_data.queue_size == base_queue_size, (
+            "an override-free probe inherited a previous probe's queue_size instead of the session base"
+        )
 
         launch_ids_after = {
             p.process_launch_identifier for p in session.manager._process_map.get_inference_processes()

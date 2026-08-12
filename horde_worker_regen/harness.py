@@ -28,7 +28,7 @@ import multiprocessing
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -637,6 +637,19 @@ class JobLifecycleAuditor:
         return failures
 
 
+def _normalized_bridge_overrides(overrides: Mapping[str, object]) -> dict[str, object]:
+    """Translate a level's bridge-data overrides into the field names the config model actually carries.
+
+    Levels are written in the vocabulary of the capability they exercise, which does not always match
+    the config field: ``allow_inpainting`` is the capability, ``allow_painting`` is the setting. Shared
+    by the cold and warm paths so a level means the same thing whichever one runs it.
+    """
+    normalized = dict(overrides)
+    if "allow_inpainting" in normalized:
+        normalized.setdefault("allow_painting", normalized.pop("allow_inpainting"))
+    return normalized
+
+
 def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerateJobPopResponse]) -> reGenBridgeData:
     """Construct bridge data appropriate for the given harness configuration."""
     models_in_scenario = sorted({job.model for job in scenario if job.model is not None})
@@ -738,10 +751,7 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         startup_budget = max(_REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS, int(config.timeout_seconds))
         bridge_data_fields["preload_timeout"] = startup_budget
         bridge_data_fields["process_timeout"] = startup_budget
-    bridge_data_overrides = dict(config.bridge_data_overrides)
-    if "allow_inpainting" in bridge_data_overrides:
-        bridge_data_overrides.setdefault("allow_painting", bridge_data_overrides.pop("allow_inpainting"))
-    bridge_data_fields.update(bridge_data_overrides)
+    bridge_data_fields.update(_normalized_bridge_overrides(config.bridge_data_overrides))
     bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
     # Prevent the manager from watching/reloading a bridge data file from disk.
     bridge_data._loaded_from_env_vars = True
@@ -1303,6 +1313,31 @@ def _cleanup_stale_abort_file() -> None:
         os.remove(abort_path)
 
 
+def _apply_production_worker_env(process_mode: HarnessProcessMode) -> None:
+    """Give a real-mode harness run the same model-surface environment a production worker boots with.
+
+    A production worker applies :func:`apply_beta_model_env_defaults` from its config load, which opts
+    the image-generation, esrgan and gfpgan categories into the PRIMARY's pending (beta) queue. The
+    harness builds its bridge data directly and never goes through that config load, so without this a
+    real-mode run boots a narrower model surface than the worker it exists to measure: beta-only
+    checkpoints and post-processors would be absent from the children and any probe offering them would
+    fault. Reusing the production function rather than restating its values means a change to the
+    worker's default posture reaches the harness automatically.
+
+    Setdefault semantics are preserved, so an explicit environment override (including opting out with
+    an empty category list) still wins. Only real mode is touched: fake and dry-run children load no
+    weights, and reading the pending queue would put a network round-trip in a deliberately offline path.
+    """
+    if process_mode != "real":
+        return
+    try:
+        from horde_worker_regen.load_env_vars import apply_beta_model_env_defaults
+
+        apply_beta_model_env_defaults()
+    except Exception as e:  # noqa: BLE001 - env parity is best-effort; never block a run
+        logger.warning(f"Could not apply the production model-surface env to this run: {type(e).__name__}: {e}")
+
+
 async def _emit_progress_periodically(
     manager: HordeWorkerProcessManager,
     *,
@@ -1329,6 +1364,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
     from horde_worker_regen.telemetry import configure_telemetry
 
     configure_telemetry()
+    _apply_production_worker_env(config.process_mode)
 
     # Remove any stale .abort sentinel before starting, so a previous crashed/
     # aborted run doesn't cause an immediate spurious abort.
@@ -1688,13 +1724,18 @@ def _warm_model_reference(
     return reference
 
 
-def _build_warm_bridge_data(
+def _warm_bridge_data_fields(
     *,
     model_names: list[str],
     process_mode: HarnessProcessMode,
     max_threads_ceiling: int,
-) -> reGenBridgeData:
-    """Construct bridge data for a warm session covering every level's models."""
+) -> dict[str, object]:
+    """The warm session's base bridge-data fields, covering every level's models.
+
+    Returned as a field mapping (rather than only the built model) so a per-level delta can be layered
+    on top and rebuilt from the same base, which is what keeps one level's overrides from leaking into
+    the next: every delta is applied to this, never to the previous level's result.
+    """
     fields: dict[str, object] = {
         "api_key": "0000000000",
         "dreamer_name": "warm-benchmark-worker",
@@ -1720,9 +1761,27 @@ def _build_warm_bridge_data(
         # be torn down by the production startup timers before it finishes coming up.
         fields["preload_timeout"] = _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS
         fields["process_timeout"] = _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS
+    return fields
+
+
+def _build_warm_bridge_data(fields: dict[str, object]) -> reGenBridgeData:
+    """Build warm-session bridge data from *fields*, pinned to the env-var (never file-reloaded) form.
+
+    ``_loaded_from_env_vars`` keeps the config file watcher from replacing a harness-owned config with
+    whatever ``bridgeData.yaml`` happens to hold on the box running the benchmark.
+    """
     bridge_data = reGenBridgeData(**fields)  # type: ignore[arg-type]
     bridge_data._loaded_from_env_vars = True
     return bridge_data
+
+
+_WARM_SESSION_OWNED_BRIDGE_FIELDS: frozenset[str] = frozenset({"models_to_load"})
+"""Bridge-data fields a per-level delta may not set on a warm session, because the session owns them.
+
+The warm worker's model set is established at boot and its checkpoints are resident; a level that
+declares a narrower ``models_to_load`` (the alchemy levels name only their tier's model, because the
+cold path would otherwise derive an empty list from an image-job-less scenario) would evict the rest and
+make the next level cold-load them back. The session's superset already covers every level."""
 
 
 _WARMUP_DRAIN_TIMEOUT_SECONDS = 300.0
@@ -1774,6 +1833,12 @@ class WarmHarnessSession:
         self._horde_model_reference_manager = horde_model_reference_manager
         self._manager: HordeWorkerProcessManager | None = None
         self._loop_task: asyncio.Task[None] | None = None
+        self._base_bridge_fields = _warm_bridge_data_fields(
+            model_names=self._model_names,
+            process_mode=self._process_mode,
+            max_threads_ceiling=self._max_threads_ceiling,
+        )
+        self._applied_bridge_overrides: dict[str, object] = {}
 
     @property
     def manager(self) -> HordeWorkerProcessManager:
@@ -1783,16 +1848,28 @@ class WarmHarnessSession:
         return self._manager
 
     def _build_manager(self) -> HordeWorkerProcessManager:
+        system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
         entry_points: ProcessEntryPoints | None = None
         if self._process_mode == "fake":
+            assert system_resources is not None
+            # The fake reports the injected card capacity, without which it reports a total of zero and the
+            # parent derives no device-free reading at all: VRAM admission is then indeterminate on every
+            # tick and defers every preload forever, so no model becomes resident and no level drains.
+            # Mirrors build_harness_process_manager; a partial of a module-level function stays picklable
+            # under spawn.
             entry_points = ProcessEntryPoints(
-                inference_entry_point=start_fake_inference_process,
+                inference_entry_point=functools.partial(
+                    start_fake_inference_process,
+                    sim_total_vram_mb_by_device={
+                        device_index: device.total_memory / (1024 * 1024)
+                        for device_index, device in system_resources.device_map.root.items()
+                    },
+                ),
                 safety_entry_point=start_fake_safety_process,
                 post_process_entry_point=start_fake_post_process_process,
                 vae_lane_entry_point=start_fake_vae_lane_process,
                 utilities_adapter_factory=create_fake_utilities_adapter,
             )
-        system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
         # Inject a minimal reference covering every level's models in all modes (mirrors
         # build_harness_process_manager); the real model load on disk uses hordelib's own reference.
         reference = _warm_model_reference(
@@ -1802,11 +1879,7 @@ class WarmHarnessSession:
         )
         return HordeWorkerProcessManager(
             ctx=multiprocessing.get_context("spawn"),
-            bridge_data=_build_warm_bridge_data(
-                model_names=self._model_names,
-                process_mode=self._process_mode,
-                max_threads_ceiling=self._max_threads_ceiling,
-            ),
+            bridge_data=_build_warm_bridge_data(dict(self._base_bridge_fields)),
             horde_model_reference_manager=self._horde_model_reference_manager,
             system_resources=system_resources,
             skip_api_init=True,
@@ -1824,6 +1897,7 @@ class WarmHarnessSession:
         from horde_worker_regen.telemetry import configure_telemetry
 
         configure_telemetry()
+        _apply_production_worker_env(self._process_mode)
         _cleanup_stale_abort_file()
 
         self._manager = self._build_manager()
@@ -1897,6 +1971,36 @@ class WarmHarnessSession:
             f"Process states: {_summarize_worker_processes(manager)}",
         )
 
+    def apply_bridge_data_overrides(self, overrides: Mapping[str, object]) -> None:
+        """Set the worker's live config to the session base plus *overrides*, replacing any previous delta.
+
+        A level does not just run a different scenario, it runs it under a different configuration: the
+        controlnet levels need ``allow_controlnet``, the post-processing levels ``allow_post_processing``,
+        the alchemy levels their ``alchemy_*`` settings. A warm worker shared across levels would
+        otherwise run every one of them under whatever the first level wanted, so what a level proves
+        would not be the configuration named in its result.
+
+        The delta goes through the worker's own config-reload entry point, the same one the file watcher
+        and the supervisor's reload command use, so it re-derives exactly the dependent state a live
+        config change does and nothing has to know that a benchmark rather than an operator asked. It is
+        always layered on the session base rather than on the current config, so a level that does not
+        mention a field gets the base value back instead of inheriting the previous level's.
+
+        Fields the session owns (:data:`_WARM_SESSION_OWNED_BRIDGE_FIELDS`) are dropped from the delta.
+        """
+        manager = self.manager
+        delta = {
+            key: value
+            for key, value in _normalized_bridge_overrides(overrides).items()
+            if key not in _WARM_SESSION_OWNED_BRIDGE_FIELDS
+        }
+        if delta == self._applied_bridge_overrides:
+            return
+
+        manager._apply_reloaded_bridge_data(_build_warm_bridge_data({**self._base_bridge_fields, **delta}))
+        self._applied_bridge_overrides = delta
+        logger.info(f"Warm worker: applied level bridge-data overrides {delta or '{}'} over the session base.")
+
     async def aclose(self) -> None:
         """Gracefully shut the worker down and await its main loop."""
         if self._manager is not None and not self._manager._state.shutting_down:
@@ -1968,9 +2072,14 @@ class WarmHarnessSession:
         threads: int = 1,
         timeout_seconds: float = 120.0,
         warmup: bool = False,
+        bridge_data_overrides: Mapping[str, object] | None = None,
         on_progress: Callable[[RunMetricsSnapshot, float], None] | None = None,
     ) -> HarnessResult:
         """Run one fixed-scenario level on the warm worker and report its outcome.
+
+        ``bridge_data_overrides`` is the level's configuration delta, applied over the session base
+        before anything else runs (see :meth:`apply_bridge_data_overrides`) and replaced by the next
+        level's.
 
         Completion is tracked by the delta in the job tracker's cumulative counters (the tracker is
         not reset between levels), so this returns once the level's own jobs and alchemy forms are
@@ -1997,6 +2106,9 @@ class WarmHarnessSession:
         num_jobs_expected = len(scenario_jobs)
         num_forms_expected = len(alchemy_forms or [])
 
+        # Before the concurrency call, which is the authority on the live cap: a config reload re-derives
+        # the effective cap from the new max_threads, so applying the delta afterwards would undo it.
+        self.apply_bridge_data_overrides(bridge_data_overrides or {})
         manager._apply_set_concurrency(target_threads=threads, target_processes=None)
 
         # Stream live metrics for the whole call (warmup included) so the TUI/console live card advances

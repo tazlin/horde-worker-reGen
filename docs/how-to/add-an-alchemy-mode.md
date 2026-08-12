@@ -215,6 +215,13 @@ with no restart. The long-standing upscalers are in every server's enum and are 
    large). This is the go-live switch; deploy it last.
 5. Tests in `tests/test_alchemy_models.py` (offered when the server advertises it, withheld otherwise).
 
+Steps 1 and 2 are also what the benchmark keys on: its post-processing and graph-alchemy sweeps offer
+the intersection of the SDK's names and what the local model reference resolves, and that reference view
+includes the pending queue for the beta-opted categories. So a model that is in `KNOWN_UPSCALERS` and in
+the pending queue is swept from then on, before the server go-live in step 4 — the benchmark drives
+canned forms and so is not subject to the server's offer gate. One that is named but has no record in
+either source is left out of the sweep rather than faulting it.
+
 ## Adding a face-restoration model (not a new form)
 
 Face-fixing is already a form (`post-process`), so adding a face restorer is the same shape as adding an

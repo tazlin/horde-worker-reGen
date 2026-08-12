@@ -89,6 +89,10 @@ async def run_capability_probe_async(
     otherwise, and always for a soak, it runs in its own harness via
     :meth:`HarnessConfig.from_scenario`. ``baseline`` is the tier's reference it/s for the criteria
     comparison; ``total_vram_mb`` sizes the VRAM-headroom check.
+
+    Either way the probe's ``bridge_data_overrides`` govern the run, so a warm result proves the same
+    configuration a cold one does: the cold path builds a worker from them, the warm path applies them to
+    the running worker as a live config change.
     """
     from horde_worker_regen.harness import HarnessConfig, run_harness_async
 
@@ -100,6 +104,7 @@ async def run_capability_probe_async(
             threads=_max_threads(probe),
             timeout_seconds=probe.timeout_seconds,
             warmup=probe.capability.kind in _WARMUP_KINDS,
+            bridge_data_overrides=dict(probe.bridge_data_overrides),
             on_progress=on_progress,
         )
     else:

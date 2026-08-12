@@ -12,8 +12,9 @@ The matrix is grounded in what the worker and hordelib can actually do:
   type maps to an SD1.5 weight. The SDXL "controlnet" capability is really the **QR-code workflow**
   (``KNOWN_CONTROLNET_WORKFLOWS``), gated by ``allow_sdxl_controlnet``, so it lives on its own
   ``qr_code`` axis that runs on both SD1.5 and SDXL rather than a mislabeled SDXL controlnet level.
-- **Post-processing** is exercised across every known upscaler and face-fixer (drawn from the SDK
-  enums, not hardcoded), at representative resolutions up to a VRAM-derived maximum.
+- **Post-processing** is exercised across every upscaler and face-fixer this install can serve: the SDK
+  enums (not a hardcoded list) narrowed to the names the local model reference can load, at
+  representative resolutions up to a VRAM-derived maximum.
 - **Alchemy** runs on two independent lanes: the CLIP lane (caption/interrogation/NSFW, on the safety
   process) and the graph lane (upscalers/face-fixers/strip-background, on the inference processes),
   each its own axis, plus a concurrent-with-image-jobs rung.
@@ -25,6 +26,7 @@ The matrix is grounded in what the worker and hordelib can actually do:
 
 from __future__ import annotations
 
+import functools
 from typing import Protocol
 
 from horde_sdk.generation_parameters.alchemy.consts import (
@@ -33,6 +35,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
     KNOWN_MISC_POST_PROCESSORS,
     KNOWN_UPSCALERS,
 )
+from loguru import logger
 from pydantic import BaseModel, Field
 
 from horde_worker_regen.benchmark.criteria import LevelCriteria
@@ -120,11 +123,63 @@ _QR_CODE_WORKFLOW = "qr_code"
 """The hordelib workflow name for the QR-code controlnet (the real SDXL controlnet capability)."""
 
 
+@functools.lru_cache(maxsize=4)
+def _servable_post_processors(candidates: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the *candidates* the installed model reference can load, in the order given.
+
+    The SDK enums name every upscaler and face-fixer the AI Horde API accepts, which is a superset of what
+    any given model reference ships. A form with no record cannot load: the worker faults it instead of
+    skipping it, so what is offered is the intersection of what the API names and what the local reference
+    can load. A reference that cannot be read at all falls open to the full candidate list, so a reference
+    problem never silently empties a sweep.
+
+    The reference view spans the canonical on-disk categories plus, when the operator opted them into beta,
+    the PRIMARY's pending queue, so a beta-only upscaler is offered exactly when a child could load it. The
+    two sources are counted separately in the notice: a sweep that only holds because beta is reachable
+    reads differently from one the canonical reference supports on its own.
+
+    Cached because the reference does not change during a run, which also keeps the notice to one line.
+    """
+    try:
+        from horde_worker_regen.benchmark.requirements import (
+            beta_post_processor_names,
+            post_processor_names_in_reference,
+        )
+
+        available = post_processor_names_in_reference()
+        beta_names = beta_post_processor_names()
+    except Exception as e:  # noqa: BLE001 - availability is best-effort; fail open to the full list
+        logger.debug(f"Could not read the post-processor references; offering every API-known form: {e}")
+        return candidates
+
+    if available is None:
+        return candidates
+
+    offered = tuple(name for name in candidates if name in available)
+    from_beta = [name for name in offered if name in beta_names]
+    skipped = [name for name in candidates if name not in available]
+    if skipped or from_beta:
+        message = (
+            f"Offering {len(offered)} of {len(candidates)} post-processors "
+            f"({len(offered) - len(from_beta)} canonical, {len(from_beta)} beta/pending)."
+        )
+        if from_beta:
+            message += f" Beta: {', '.join(from_beta)}."
+        if skipped:
+            message += f" No model-reference record: {', '.join(skipped)}."
+        logger.info(message)
+    return offered
+
+
 def _image_post_processor_names() -> list[str]:
-    """Return every image post-processor name (upscalers + face-fixers), minus backend-default sentinels."""
+    """Return the image post-processors (upscalers + face-fixers) this install can serve.
+
+    Drops the backend-default sentinels, then narrows the SDK's API-wide list to what the local model
+    reference can load (see :func:`_servable_post_processors`).
+    """
     upscalers = [member.value for member in KNOWN_UPSCALERS if member is not KNOWN_UPSCALERS.BACKEND_DEFAULT]
     facefixers = [member.value for member in KNOWN_FACEFIXERS if member is not KNOWN_FACEFIXERS.BACKEND_DEFAULT]
-    return upscalers + facefixers
+    return list(_servable_post_processors(tuple(upscalers + facefixers)))
 
 
 def _clip_alchemy_form_names() -> list[str]:
@@ -133,7 +188,12 @@ def _clip_alchemy_form_names() -> list[str]:
 
 
 def _graph_alchemy_form_names(*, include_strip_background: bool) -> list[str]:
-    """Return the graph-lane alchemy forms (every upscaler + face-fixer, plus strip-background if available)."""
+    """Return the graph-lane alchemy forms: the servable upscalers + face-fixers, plus strip-background.
+
+    Both halves are gated on what this install can actually run: the weighted forms on the model reference,
+    strip-background on its package (``include_strip_background``). An unservable form offered here would
+    fault rather than skip, and the alchemy probes admit no faults.
+    """
     forms = _image_post_processor_names()
     if include_strip_background:
         forms += [member.value for member in KNOWN_MISC_POST_PROCESSORS]

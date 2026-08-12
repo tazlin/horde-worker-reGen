@@ -5,9 +5,13 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from loguru import logger
+
+if TYPE_CHECKING:
+    from horde_worker_regen.benchmark.report import MachineInfo
 
 # Mark the process as running under test before any HordeWorkerProcessManager can be constructed. Its
 # startup otherwise reaps orphaned child pids recorded in the shared .horde_worker_regen/owned_pids.json
@@ -34,6 +38,20 @@ def record_probe_timing() -> Callable[[str, str], None]:
         _PROBE_TIMINGS.append((slug, summary))
 
     return _record
+
+
+@pytest.fixture(scope="session")
+def gpu_machine_info() -> "MachineInfo":
+    """The host's detected hardware, probed once for the whole session.
+
+    Device enumeration runs out-of-process so its caller stays torch-free, which makes it a subprocess
+    spawn plus a torch import per call. The answer cannot change during a run, so every GPU test shares
+    one reading rather than re-paying that per probe. Deliberately a fixture and not a memo on
+    ``SystemResources.detect``: production must keep re-reading the machine it runs on.
+    """
+    from horde_worker_regen.benchmark.capabilities.executor import detect_machine_info
+
+    return detect_machine_info(probe_devices=True)
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:

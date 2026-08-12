@@ -163,6 +163,12 @@ the worker boot and model load are paid once for the whole run rather than once 
 See [GPU duty cycle](../explanation/duty-cycle.md#per-probe-timing-warmup-versus-inference) for why an
 isolated cold probe reads as mostly startup.)
 
+Sharing a worker does not mean sharing a configuration. Each probe's bridge-data settings (its
+`allow_controlnet` / `allow_post_processing` / `alchemy_*` values) are applied to the running worker as a
+live config change before it runs, over the session's base rather than over the previous probe's, and are
+replaced before the next one. So a probe proves the configuration named in its result, and a value it
+never mentions is the session default rather than whatever an earlier probe left behind.
+
 A **capability** is a `(tier, kind, magnitude)` triple, e.g. "SD1.5 can run batch size 4". Each probe's
 verdict is `PROVEN`, `DISPROVEN`, `SKIPPED` (a prerequisite was unproven or the machine cannot host it),
 or `CRASHED`. A probe runs only when every capability it `requires` is already proven, so "a tier
@@ -201,7 +207,13 @@ horde-benchmark run --only sd15-controlnet --no-validate
 The catalog is grounded in what hordelib actually supports: classic **controlnet**
 (canny/depth/openpose preprocessors) is probed on SD1.5 only, while the **qr_code** workflow (the real
 SDXL controlnet capability, gated by `allow_sdxl_controlnet`) is probed on SD1.5 and SDXL.
-Post-processing sweeps every known upscaler and face-fixer at 512², 1024², and a VRAM-derived maximum.
+Post-processing sweeps every upscaler and face-fixer this install can serve at 512², 1024², and a
+VRAM-derived maximum. "Can serve" is the intersection of what the SDK names and what the local model
+reference resolves, spanning both sources a worker resolves a post-processor through: the canonical
+on-disk reference and, for the categories the worker opts into beta, the PRIMARY's pending queue. The
+run's log names how many of each the sweep offered, so a sweep that only holds because the pending queue
+was reachable reads differently from one the canonical reference supports on its own. A form with no
+record in either would fault rather than skip, so it is left out.
 Alchemy is probed on both lanes independently, the CLIP lane (caption/interrogation/NSFW, on the safety
 process) and the graph lane (upscalers/face-fixers/strip-background, on the inference processes), plus a
 concurrent-with-image probe. Heavy tiers (`flux`/`qwen`/`zimage`) are opt-in and self-skip when the

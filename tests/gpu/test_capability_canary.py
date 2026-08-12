@@ -21,7 +21,6 @@ import pytest
 
 from horde_worker_regen.benchmark.capabilities.capability import CapabilityKind, CapabilityVerdict
 from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions, build_capability_catalog
-from horde_worker_regen.benchmark.capabilities.executor import detect_machine_info
 from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
 from horde_worker_regen.benchmark.capabilities.probe_runner import run_capability_probe_async
 from horde_worker_regen.benchmark.enums import BenchTier
@@ -34,6 +33,8 @@ from horde_worker_regen.harness import WarmHarnessSession
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from horde_worker_regen.benchmark.report import MachineInfo
 
 
 def _canary_probe() -> CapabilityProbe:
@@ -50,10 +51,13 @@ def _canary_probe() -> CapabilityProbe:
 
 
 @pytest.mark.gpu
-async def test_capability_canary_warm_reuse(record_probe_timing: Callable[[str, str], None]) -> None:
+async def test_capability_canary_warm_reuse(
+    gpu_machine_info: MachineInfo,
+    record_probe_timing: Callable[[str, str], None],
+) -> None:
     """The baseline check runs twice on one warm worker without respawning it; the boot is paid once."""
     probe = _canary_probe()
-    machine = detect_machine_info(probe_devices=True)
+    machine = gpu_machine_info
     skip_reason = requirement_skip_reason(
         compute_probe_requirements(probe),
         machine=machine,

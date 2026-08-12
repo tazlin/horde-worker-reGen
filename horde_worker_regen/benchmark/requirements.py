@@ -190,6 +190,91 @@ def _offline_category_reference(category: str) -> Mapping[str, GenericModelRecor
         return None
 
 
+def beta_post_processor_names() -> frozenset[str]:
+    """Post-processor names the PRIMARY's pending (beta) queue serves for the opted-in categories.
+
+    Beta post-processors (the modern upscalers and face restorers) live only in the pending queue, so the
+    canonical on-disk reference cannot see them however recent it is. This reads the same pending source
+    the inference children resolve them through, so what the benchmark offers matches what a child can
+    load.
+
+    **The opt-in belongs to the caller, and this never creates one.** Which categories are in beta is
+    read out of the environment and nothing here writes it, so the fetch happens only in a process that
+    already declared beta: a real worker (from its config load) or a real-mode benchmark
+    (``ensure_worker_env``, which runs before the catalog is built). A fake or dry-run run, and a CI box
+    with no worker config, therefore never reach the network here and get the canonical-only view, where
+    a beta-only form is skipped rather than offered. That is the correct degraded answer for a run that
+    boots no real children: it could not load one of those weights anyway.
+
+    Reading the categories back out of the environment rather than restating them also means an
+    operator's override (including opting out with an empty list) and any future change to the worker's
+    default posture both reach this gate unaltered.
+
+    Unlike the canonical read this is a network call, and unlike the canonical reference it is not
+    something the parent pre-writes to disk: the pending queue has no on-disk form. It is bounded by the
+    provider's own timeout and retries and fails open to an empty set, so an unreachable PRIMARY or a
+    missing key leaves the canonical picture untouched.
+
+    Returns an empty set when beta is not opted into or cannot be read; never None (absence of beta is a
+    fact, not an unknown).
+    """
+    try:
+        from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+        from hordelib.beta_models import beta_model_categories, build_pending_provider
+
+        opted_in = beta_model_categories() & {
+            MODEL_REFERENCE_CATEGORY(category) for category in _POST_PROCESSOR_CATEGORIES
+        }
+        if not opted_in:
+            return frozenset()
+
+        # Catalog construction is a foreground path, and beta is additive: an unreachable PRIMARY
+        # should cost seconds, not the provider's full production retry budget, before degrading to
+        # the canonical-only view.
+        provider = build_pending_provider(timeout_seconds=5.0, retry_max_attempts=1)
+        if provider is None:
+            return frozenset()
+
+        names: set[str] = set()
+        for category in sorted(opted_in, key=lambda value: value.value):
+            names.update(provider.fetch_category(category) or {})
+        return frozenset(names)
+    except Exception as e:  # noqa: BLE001 - beta is best-effort; fail open to the canonical picture
+        logger.debug(f"Could not read the beta (pending) post-processor references: {e}")
+        return frozenset()
+
+
+def post_processor_names_in_reference() -> frozenset[str] | None:
+    """Every post-processor this install can load, or None when none of the reference could be read.
+
+    A weighted post-processor's form name *is* its record name in one of the esrgan/gfpgan/codeformer
+    references, so membership across those three answers whether the worker can serve it. The AI Horde API
+    names more upscalers and face-fixers than a given reference ships, and a form with no record cannot
+    load, so callers offering forms use this to keep to the intersection.
+
+    The view spans both sources a child resolves a post-processor through: the canonical on-disk reference
+    and, when the operator opted the category into beta, the PRIMARY's pending queue
+    (:func:`beta_post_processor_names`). Without that opt-in the beta half is empty and the answer is the
+    canonical one.
+
+    None means "unreadable" (every canonical category failed to load) as distinct from an empty set, so a
+    caller can fall open instead of concluding that nothing is servable. Weightless forms
+    (``strip_background``, whose weights the library fetches lazily) have no record here and are gated on
+    their package instead.
+    """
+    names: set[str] = set()
+    readable = False
+    for category in _POST_PROCESSOR_CATEGORIES:
+        reference = _offline_category_reference(category)
+        if reference is None:
+            continue
+        readable = True
+        names.update(reference)
+    if not readable:
+        return None
+    return frozenset(names | beta_post_processor_names())
+
+
 def _feature_model_file(
     record_name: str,
     reference: Mapping[str, GenericModelRecord],
@@ -694,6 +779,7 @@ def _tier_is_beta(tier: str) -> bool:
 __all__ = [
     "LevelRequirements",
     "MissingModel",
+    "beta_post_processor_names",
     "civitai_token_available",
     "compute_level_requirements",
     "compute_probe_requirements",
@@ -701,5 +787,6 @@ __all__ = [
     "controlnet_installed",
     "model_present_on_disk",
     "models_disk_plan",
+    "post_processor_names_in_reference",
     "requirement_skip_reason",
 ]
