@@ -491,7 +491,10 @@ encode working set (`_STAGING_ENCODE_VRAM_MB`, the text-encoder plus conditionin
 supported family), because its weights have not loaded yet. So `_max_jobs_in_progress_allowed` admits a spare
 process to stage ahead whenever measured free net of the reserve covers that encode charge, rather than
 gating on a flat multi-GB device-free floor that mid-sampling rarely cleared (which stranded the spare
-process idle through nearly every sampling window despite queued work). The dispatch reservation books only
+process idle through nearly every sampling window despite queued work). When it does hold the cap at the
+sampling-slot count it records why (no device reading yet, or free net of the reserve short of the encode
+charge), logging the reason on its edge and tallying the shares onto the duty-cycle summary line, so spare
+processes sitting idle beside a queue name the measurement that kept them there. The dispatch reservation books only
 the encode charge while staged; siblings staging ahead therefore never reserve the head's
 full-materialisation room. Second, the full-price fit-or-evict moves to **clearance**: before clearing a
 child the scheduler prices its job's full weights-plus-activation peak against measured device truth through
@@ -567,12 +570,21 @@ non-sampling time on small jobs and shows up as the `vram_transfer` loss in the
 The scheduler suppresses that eviction for one dispatch under a governed live gate. Because eviction is now
 both on-demand and *proven* (the [device-free governor](vram_arbiter.md) reads the truthful NVML device-free
 figure, and the verified reclaim ladder takes residents back rung by rung with each free confirmed at the
-device level), retention no longer has to be preemptively stingy. It grants when both hold:
+device level), retention no longer has to be preemptively stingy about *fit*. What it does have to be
+stingy about is *evidence*: a copy nothing comes back for occupies the card, prices every later grant's
+static fit against itself, and is handed back having saved nothing, and on a wide model offer that is most
+copies. It grants when all three hold:
 
 - **Card healthy**: the device-free governor's committed state for the card is `HEALTHY`. A `PRESSURE` or
   `SATURATED` card is one the ladder is or may soon be reclaiming from, so it is handed no new resident. This
   reads the one figure a WDDM driver cannot misreport under demand-paging (NVML device-free), so it holds
   precisely in the regime where measured free VRAM lies.
+- **Repeat evidence on the slot**: the dispatched model appears among that slot's previous three
+  dispatches. Retention only ever pays off through a same-model successor on the same slot, so a slot whose
+  recent traffic has never repeated this model is being asked to hold weights on no prediction at all. This
+  adapts to whatever the operator offers rather than encoding an assumed mix: a pool-locked slot supplies the
+  evidence on every dispatch after its first, while a slot rotating more models than the window holds earns
+  close to nothing. The one cost is warmup, since a slot's first dispatch has no history behind it.
 - **Static fit**: the card's reported *total* VRAM (a constant the driver cannot misreport under pressure)
   must absorb the job's sampling peak plus the measurement noise buffer and any committed reserves, after
   charging the sibling CUDA contexts (at their truthful per-context marginal) and the job's own
@@ -591,14 +603,19 @@ Nor is sole residency required: a second idle resident is safe because it is a f
 verified reclaim ladder, so retention may keep weights warm even while a sibling holds its own resident
 model.
 
-No queue lookahead gates the grant. The pop cycle refills the queue immediately *after* a dispatch drains
-it, so at the dispatch instant a same-model successor is almost never visible in the pending set even
-when one arrives milliseconds later; conditioning retention on seeing one makes it structurally
-unreachable. Reclaim is instead just-in-time, by the parties that can actually see the demand: a cross-model
-preload that no longer fits because idle retained residents hold the card defers while the ladder evicts
-them (the head-of-queue reclaim targets the idle resident, newest-idle-first), and the under-pressure
-reclaim overrides retention outright. An unused hold therefore costs only the interval until the next
-dispatch. The sweep spares the resident copy of a model still in the queue lookahead, but only when the card
+The evidence is **trailing**, never a queue lookahead, and that distinction is why the gate can exist at all.
+The pop cycle refills the queue immediately *after* a dispatch drains it, so at the dispatch instant a
+same-model successor is almost never visible in the pending set even when one arrives milliseconds later; a
+gate reading the queue would refuse a pool-locked worker every grant and make retention structurally
+unreachable. What the slot has already been asked to run is under no such timing.
+
+Reclaim of a hold that does go unused is just-in-time, by the parties that can actually see the demand: a
+cross-model preload that no longer fits because idle retained residents hold the card defers while the ladder
+evicts them (the head-of-queue reclaim targets the idle resident, newest-idle-first), and the under-pressure
+reclaim overrides retention outright. A card that simply stays off `HEALTHY` sweeps holds nothing has come
+back for within the falsification horizon, without waiting for either
+([the revoke sweep](vram_arbiter.md#a-hold-nothing-comes-back-for-is-revoked-under-sustained-pressure)). An
+unused hold therefore costs only the interval until the next dispatch. The sweep spares the resident copy of a model still in the queue lookahead, but only when the card
 can statically afford that copy alongside the head-of-queue job's sampling peak; on a card where they cannot
 coexist, keeping the copy warm would force silent driver demand-paging during sampling, which costs far more
 than the one reload the protection saves.
@@ -720,11 +737,33 @@ already held by the idle process that should serve the pending head; that action
 instead of changing it. Ordinary device-pressure reclaim does not apply this blanket pending-demand protection,
 because it may need to evict queued lookahead to make room for the actual head.
 
-It **verifies**. A real release shows up in NVML device-used within a sample or two, so after issuing a rung
-the engine watches the next one or two governor samples and compares the realized device-free gain against
-the rung's promised figure (the tenant's measured reservation). A rung that yields less than half its promise
-is logged against the tenant it named, recorded as a calibration event, and the engine escalates to the next
-rung rather than trusting the estimate. One rung is issued per tick; a rung whose target has already gone
+It **verifies**. After issuing a rung the engine compares the realized device-free gain against the rung's
+promised figure (the tenant's measured reservation) on every following governor sample. A rung that yields
+half its promise is verified; a rung that has realized nothing further for its whole **verification budget** is
+logged against the tenant it named, recorded as a calibration event, and the engine escalates to the next rung
+rather than trusting the estimate.
+
+The budget is wall-clock rather than a sample count, because no rung frees synchronously: an unload is an IPC
+the child services between its own allocations and the driver then returns the block over the following
+seconds, and a lane or safety pause returns nothing until the OS has torn its process down. Counting samples
+grades a working multi-gigabyte release as a failure whenever the control loop ticks faster than the driver
+frees, which walks the whole ladder down to moving safety off the card inside the window the first rung's
+memory was going to arrive in. Each budget is a fixed latency allowance (larger for the teardown rungs, which
+pay a process exit first) plus a term scaled by the megabytes the rung promised, so the same judgement holds on
+an 8GB card and a 24GB one instead of being tuned to whichever card it was measured on. Observed progress
+extends it: a new high-water of realized free restarts the clock, so a release still arriving keeps its rung
+and only a rung that has genuinely moved nothing runs out.
+
+The **safety-off-GPU rung carries a dwell**. It ends the safety process and the placement policy rebuilds it
+once the card fits again, so the rung and its restore together are a process cycle that stalls result
+submission; a card under recurring pressure that spends it every episode rebuilds safety for relief the
+previous cycle already failed to hold. Inside the cooldown of a card's previous safety actuation the rung is
+refused and skipped exactly as an inactive rung is, and an episode with nothing else left is unresolved rather
+than relieved by a cycle that would not have held. Its restore is earned symmetrically: a `RECLAIM_LADDER`
+safety pause is only undone after the same sustained-fit streak the runtime placement policy requires, counted
+from the pause itself, since the headroom that makes the instantaneous gates pass is the pause's own relief.
+
+One rung is issued per tick; a rung whose target has already gone
 away frees nothing and is skipped immediately. When the whole ladder is exhausted and the card is still
 SATURATED, the episode is marked **unresolved**: nothing the worker can give back relieved the card, the
 signal a later, harder rung reads. The rung count, cumulative verified frees, and shortfall count are

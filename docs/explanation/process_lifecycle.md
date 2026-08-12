@@ -275,6 +275,14 @@ scheduler and the lifecycle manager:
 6. When the model reaches `LOADED_IN_VRAM` or `IN_USE`, it's eligible for
    inference dispatch.
 
+Residency is recorded twice: on the slot (`HordeProcessInfo.loaded_horde_model_name`) and in the
+model-keyed `HordeModelMap`. Loading a slot over rewrites the first, so the scheduler reconciles the
+second on every preload pass (`_expire_stale_model_map_entries`): an entry naming a slot that now holds
+a different model describes weights nothing holds and is expired. This matters for liveness rather than
+tidiness, because the preload pass counts that map in its already-loaded set; a surviving entry makes the
+displaced model's pending job look served, so it is never staged again and its job can wedge behind a
+dispatch hold held for it.
+
 Model **unloading** works in reverse: the scheduler picks models to evict based
 on an LRU-informed heuristic, sends `UNLOAD_MODELS_FROM_VRAM` /
 `UNLOAD_MODELS_FROM_RAM`, and the child acknowledges with state-change messages.

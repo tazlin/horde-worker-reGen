@@ -43,6 +43,8 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
+    StagingDeferReason,
+    format_staging_defer_tally,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -1558,6 +1560,54 @@ class TestSpeculativeDispatchCap:
         )
         assert scheduler._max_jobs_in_progress_allowed() == 2
 
+    def test_a_deferral_names_the_measurement_that_held_it(self) -> None:
+        """Each held cap is tallied under the measurement that held it, so idle spare processes are explicable."""
+        short_of_headroom = _make_inference_scheduler(
+            process_map=self._vram_process_map(1000),
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        short_of_headroom._max_jobs_in_progress_allowed()
+        assert dict(short_of_headroom.staging_defer_counts) == {StagingDeferReason.ENCODE_HEADROOM_SHORT: 1}
+
+        unread = _make_inference_scheduler(
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        unread._max_jobs_in_progress_allowed()
+        assert dict(unread.staging_defer_counts) == {StagingDeferReason.MEASUREMENT_UNREAD: 1}
+
+    def test_an_admitted_cap_is_not_tallied(self) -> None:
+        """A cap that admitted pre-staging records nothing, so the tally counts refusals only."""
+        scheduler = _make_inference_scheduler(
+            process_map=self._vram_process_map(12000),
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        scheduler._max_jobs_in_progress_allowed()
+        assert dict(scheduler.staging_defer_counts) == {}
+
+
+class TestFormatStagingDeferTally:
+    """Tests for the staging-deferral fragment the duty-cycle summary line carries."""
+
+    def test_no_deferrals_reports_nothing(self) -> None:
+        """A worker that never held staging back adds no fragment to the duty line."""
+        assert format_staging_defer_tally({}) is None
+        assert format_staging_defer_tally({StagingDeferReason.ENCODE_HEADROOM_SHORT: 0}) is None
+
+    def test_shares_are_reported_largest_first(self) -> None:
+        """The total and each measurement's share of it are reported, so the binding one reads first."""
+        assert format_staging_defer_tally(
+            {
+                StagingDeferReason.MEASUREMENT_UNREAD: 1,
+                StagingDeferReason.ENCODE_HEADROOM_SHORT: 3,
+            },
+        ) == ("staging deferred: 4 (headroom 75%, unread 25%)")
+
 
 class TestGetSingleJobEffectiveMegapixelsteps:
     """Tests for get_single_job_effective_megapixelsteps."""
@@ -2286,3 +2336,258 @@ class TestRetentionAffinityDispatch:
         assert selected.next_job.id_ == other_job.id_
         assert selected.process_with_model.process_id == 3
         assert selected.line_skip is not None
+
+
+class TestRetentionPlacementProtection:
+    """Where a cold head's model may be loaded, when a queued job is served by weights a slot retains.
+
+    The preload pass walks the queue in placement order, so the cold head's load target is whichever slot is
+    free. That is routinely a slot retaining a model still in the queue, and loading over it evicts weights the
+    queue was about to be served from at no cost. What spares that copy is the placement order alone: the job
+    the retainer can already serve is moved ahead of the head, so the head's load targets some other lane and
+    the two run alongside each other.
+
+    Nothing is ever withheld for it. The reorder is admitted only as a free win, which needs the head to be
+    loading anyway and its load to have a lane other than the retainer to go to; where it has not, the head
+    keeps strict priority and its load takes the retained copy's lane. A head's deadline is never asked to fund
+    a reuse win, because the server-side ttl it is racing is not observable from here.
+    """
+
+    _HEAD_MODEL = "cold_head_model"
+    _RETAINED_MODEL = "retained_model"
+    _RUNNING_MODEL = "running_model"
+
+    async def _worker(
+        self,
+        *,
+        spare_lane: bool,
+        cap_spent: bool,
+        reserve_retainer: bool = False,
+        retain: bool = True,
+    ) -> tuple[InferenceScheduler, dict[int, HordeProcessInfo], JobTracker]:
+        """A cold head behind a job whose model lane 1 retains, with the cap and the pool as asked.
+
+        Lane 1 holds the retained copy and is idle. Lane 2 is a busy sampler whose in-progress job spends the
+        single sampling slot when ``cap_spent``, which is the state a serial worker is in for the whole of
+        every sampling window. Lane 3 is the spare the head's load may be redirected onto when there is one.
+        """
+        retainer = make_mock_process_info(1, model_name=self._RETAINED_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        if retain:
+            retainer.retained_resident_model = self._RETAINED_MODEL
+        processes = {1: retainer}
+        job_tracker = JobTracker()
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(self._RETAINED_MODEL, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=1)
+
+        if cap_spent:
+            runner = make_mock_process_info(
+                2,
+                model_name=self._RUNNING_MODEL,
+                state=HordeProcessState.INFERENCE_STARTING,
+            )
+            processes[2] = runner
+            horde_model_map.update_entry(self._RUNNING_MODEL, load_state=ModelLoadState.IN_USE, process_id=2)
+        if spare_lane:
+            processes[3] = make_mock_process_info(3, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+
+        process_map = ProcessMap(processes)
+        if reserve_retainer:
+            process_map.reserve_for_disaggregation(1)
+
+        head = await track_popped_job_async(job_tracker, make_job_pop_response(self._HEAD_MODEL))
+        await track_popped_job_async(job_tracker, make_job_pop_response(self._RETAINED_MODEL))
+        if cap_spent:
+            running = await track_popped_job_async(job_tracker, make_job_pop_response(self._RUNNING_MODEL))
+            await job_tracker.mark_inference_started(running)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            max_concurrent=1,
+            max_inference=len(processes),
+        )
+        assert job_tracker.jobs_pending_inference[0] is head, "the cold head must be the queue head"
+        return scheduler, processes, job_tracker
+
+    async def test_a_cold_head_is_loaded_onto_the_spare_lane_not_over_the_retained_copy(self) -> None:
+        """With a spare lane the head's load is redirected onto it, leaving the retained copy standing."""
+        scheduler, processes, _tracker = await self._worker(spare_lane=True, cap_spent=True)
+
+        assert scheduler.preload_models() is True
+        assert processes[3].last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert processes[1].last_control_flag != HordeControlFlag.PRELOAD_MODEL
+        assert processes[1].retained_resident_model == self._RETAINED_MODEL
+
+    async def test_with_no_spare_lane_the_head_loads_over_the_retained_copy(self) -> None:
+        """The retaining lane being the only idle one is loaded over: the head is not made to wait for reuse.
+
+        Withholding the load here would buy an upload back by making the head wait for a whole other job to
+        sample and finish. The head is racing a ttl this worker cannot see, so the queue drains in its own
+        order and the retained copy is spent on the head that needs the lane.
+        """
+        scheduler, processes, _tracker = await self._worker(spare_lane=False, cap_spent=True)
+
+        assert scheduler.pending_inference_in_placement_order()[0].model == self._HEAD_MODEL, (
+            "the head keeps its position: nothing may be seated ahead of it when its own load has nowhere else"
+        )
+        assert scheduler.preload_models() is True
+        assert processes[1].last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+    async def test_a_candidate_whose_head_has_no_other_load_target_is_vetoed(self) -> None:
+        """Candidacy turns on the head's load having somewhere else to go, and is recorded when it has not.
+
+        The two halves of the free-win test, read against the same queue: with the retaining lane the only one
+        the head's load could take, promoting a job ahead of that head would delay it, so nothing is named and
+        the veto is counted. Give the pool one more idle lane and the same queue names the retainer, because
+        now the head's load and the promoted job's sampling can run at once.
+        """
+        scheduler, _processes, tracker = await self._worker(spare_lane=False, cap_spent=True)
+        head = tracker.jobs_pending_inference[0]
+
+        assert len(tracker.jobs_in_progress) == 1, "precondition: the single sampling slot is spent"
+        assert scheduler._retention_affinity_candidates(head) == []
+        assert scheduler._retention_reorder_pareto_vetoes == 1
+
+        with_spare, _spare_processes, spare_tracker = await self._worker(spare_lane=True, cap_spent=True)
+        spare_head = spare_tracker.jobs_pending_inference[0]
+
+        candidates = with_spare._retention_affinity_candidates(spare_head)
+
+        assert [process.process_id for _job, process in candidates] == [1]
+        assert with_spare._retention_reorder_pareto_vetoes == 0
+
+    async def test_a_disaggregation_pinned_retainer_defers_the_head_until_the_pin_lifts(self) -> None:
+        """A pinned lane is live work even while it idles between stages: the head waits for it, boundedly.
+
+        A disaggregating worker pins a lane from the moment a job is registered on it until its sampling ends,
+        and the lane reports an accepting state for much of that while it waits for its conditioning. Those
+        weights are still located as a residency (that is what ``include_reserved`` is for), but the lane is
+        no preload target: loading over it would evict the weights the pinned job's sample stage is about to
+        use, faulting or reloading work the card is already committed to. With the pinned lane the only idle
+        slot, the head therefore defers; the pin's release is bounded by the pinned job's own lifetime, and
+        the head proceeds the cycle the reservation lifts.
+        """
+        scheduler, processes, tracker = await self._worker(
+            spare_lane=False,
+            cap_spent=True,
+            reserve_retainer=True,
+        )
+
+        assert scheduler._retention_affinity_candidates(tracker.jobs_pending_inference[0]) == []
+        assert scheduler.preload_models() is False, (
+            "the only idle lane is pinned as an in-flight disaggregated job's sampler, so the head must defer "
+            "rather than preload over the weights that job's sample stage is about to use"
+        )
+
+        scheduler._process_map.release_disaggregation_reservation(processes[1].process_id)
+        assert scheduler.preload_models() is True, (
+            "the head's deferral is bounded by the pin: the cycle the reservation lifts, its preload proceeds"
+        )
+
+    async def test_a_pinned_retainer_is_never_named_as_a_dispatch_destination(self) -> None:
+        """A pinned lane's weights are found as a residency and never seated on: dispatch goes to a free lane.
+
+        The two queries take opposite views of a pin on purpose. Holding weights is a residency question a pin
+        does not change, so the reorder can promote the job the pinned lane retains; seating a job is a
+        dispatch question the pin settles outright, so that promoted job is not dispatchable and the head's own
+        load runs instead, onto the spare lane, and the dispatch that follows lands there.
+        """
+        scheduler, processes, tracker = await self._worker(
+            spare_lane=True,
+            cap_spent=False,
+            reserve_retainer=True,
+        )
+        process_map = scheduler._process_map
+
+        assert process_map.get_process_by_horde_model_name(self._RETAINED_MODEL) is None, (
+            "a pinned lane must not be offered as the process holding a model, or dispatch may seat a job on a "
+            "sampler already booked for another job"
+        )
+        assert process_map.get_process_by_horde_model_name(self._RETAINED_MODEL, include_reserved=True) is not None
+        assert [
+            process.process_id
+            for _job, process in scheduler._retention_affinity_candidates(
+                tracker.jobs_pending_inference[0],
+            )
+        ] == [1]
+
+        assert scheduler.preload_models() is True
+        assert processes[3].last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert processes[1].last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.process_with_model.process_id == 3
+
+    async def test_a_free_unpinned_retainer_takes_the_dispatch_before_anything_is_preloaded(self) -> None:
+        """With headroom and no pin, the promoted job is dispatched onto the retainer and no load is staged.
+
+        The placement order is what carries this: the promoted job becomes the pass's head, that head is
+        dispatchable on the lane already holding its weights, and dispatch beats staging whenever it is
+        available, so the cycle goes to the dispatch instead of to a speculative load.
+        """
+        scheduler, processes, tracker = await self._worker(spare_lane=True, cap_spent=False)
+
+        assert [job.model for job in scheduler.pending_inference_in_placement_order()] == [
+            self._RETAINED_MODEL,
+            self._HEAD_MODEL,
+        ]
+        assert scheduler.preload_models() is False
+        assert all(process.last_control_flag != HordeControlFlag.PRELOAD_MODEL for process in processes.values())
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.next_job.model == self._RETAINED_MODEL
+        assert selected.process_with_model.process_id == 1
+        assert tracker.jobs_pending_inference[0].model == self._HEAD_MODEL, (
+            "the queue's own order is untouched: only the placement view moved the retained job ahead"
+        )
+
+    async def test_nothing_is_protected_where_no_slot_retains_anything(self) -> None:
+        """A slot that merely names the model holds no weights, so it is an ordinary target."""
+        scheduler, processes, tracker = await self._worker(spare_lane=False, cap_spent=True, retain=False)
+
+        assert scheduler._retention_affinity_candidates(tracker.jobs_pending_inference[0]) == []
+        assert scheduler.preload_models() is True
+        assert processes[1].last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+    async def test_the_protection_ends_when_the_head_ages_past_its_ttl_fraction(self) -> None:
+        """Bounded by age: a head past the anti-starvation fraction of its ttl loads over the retained copy.
+
+        The ttl is the worker's most recent horde-supplied one, which is what the age override measures
+        against, so this is the bound a live worker's protection ends on.
+        """
+        scheduler, processes, tracker = await self._worker(spare_lane=False, cap_spent=True)
+        scheduler._state.recent_job_ttl = 60.0
+        head = tracker.jobs_pending_inference[0]
+        assert head.id_ is not None
+        tracked = tracker.get_tracked_job(head.id_)
+        assert tracked is not None
+        tracked.time_popped = scheduler._clock() - 10_000.0
+
+        assert scheduler._head_aged_past_anti_starvation(head) is True
+        assert scheduler._retention_affinity_candidates(head) == []
+        assert scheduler.preload_models() is True
+        assert processes[1].last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+    async def test_the_protection_ends_when_the_heads_skip_ceiling_is_reached(self) -> None:
+        """Bounded by count: a head already passed to its skip ceiling protects nothing further.
+
+        The same ceiling the resident-model bypass spends, read rather than advanced here, so a head that has
+        been passed its allowance of times stops being a reason to withhold a load.
+        """
+        scheduler, processes, tracker = await self._worker(spare_lane=False, cap_spent=True)
+        head = tracker.jobs_pending_inference[0]
+        assert head.id_ is not None
+        scheduler._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head.id_),
+            first_skip_time=scheduler._clock(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+
+        assert scheduler._retention_affinity_candidates(head) == []
+        assert scheduler.preload_models() is True
+        assert processes[1].last_control_flag == HordeControlFlag.PRELOAD_MODEL

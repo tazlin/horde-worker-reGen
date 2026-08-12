@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.fd_limits import (
 )
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
+    HordeControlFlag,
     HordeHeartbeatType,
     HordeProcessState,
 )
@@ -618,8 +619,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         The LIFO ranking key for the reclaim ladder. Called on a VRAM-materializing event (a model reported
         LOADED_IN_VRAM, a GPU process spawned), so the reclaim engine can reclaim the most-recently-
         materialized tenant first.
+
+        A slot reporting weights back in VRAM has also outlived any unload the parent sent it: the command was
+        served (or superseded by this load), so the outstanding-unload flag is retired here. Left standing it
+        would make the slot permanently ineligible for reclaim, since both the ladder's candidate set and the
+        unload actuator read that flag as an unload already in flight.
         """
-        self[process_id].vram_materialized_monotonic = time.monotonic()
+        process_info = self[process_id]
+        process_info.vram_materialized_monotonic = time.monotonic()
+        if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+            process_info.last_control_flag = None
 
     def on_model_ram_clear(
         self,

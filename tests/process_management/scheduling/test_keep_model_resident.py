@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceControlMessage,
@@ -67,19 +69,34 @@ def _budget_on_scheduler(
     horde_model_map: HordeModelMap | None = None,
     legacy_comfy_vram_unload: bool = False,
 ) -> InferenceScheduler:
-    """A scheduler with the VRAM budget active and the governor unsampled (defaults to HEALTHY)."""
+    """A scheduler with the VRAM budget active, the governor unsampled (HEALTHY), and repeat evidence seeded.
+
+    Retention is also gated on the dispatched model having repeated in the slot's trailing dispatches, which
+    every test here would otherwise fail at before reaching the gate it is about. Seeding that evidence for
+    both models on both slots is what keeps each test a statement about its own gate; the evidence gate itself
+    is exercised by the tests that build a scheduler with an unseeded slot.
+    """
     bridge_data = make_mock_bridge_data(
         enable_vram_budget=True,
         vram_reserve_mb=2048,
         ram_reserve_mb=4096,
         legacy_comfy_vram_unload=legacy_comfy_vram_unload,
     )
-    return _make_inference_scheduler(
+    scheduler = _make_inference_scheduler(
         job_tracker=job_tracker,
         bridge_data=bridge_data,
         process_map=process_map if process_map is not None else ProcessMap({_PROCESS_ID: _dispatch_process()}),
         horde_model_map=horde_model_map,
     )
+    for process_id in (_PROCESS_ID, _SIBLING_PROCESS_ID):
+        for model in (_MODEL, _OTHER_MODEL):
+            _seed_repeat_evidence(scheduler, process_id, model)
+    return scheduler
+
+
+def _seed_repeat_evidence(scheduler: InferenceScheduler, process_id: int, model: str) -> None:
+    """Record a prior dispatch of ``model`` on ``process_id``, the evidence a retention grant is gated on."""
+    scheduler._record_slot_dispatch(process_id, model)
 
 
 def _map_with_model_on_process(
@@ -585,7 +602,7 @@ def _record_retention_reasons(scheduler: InferenceScheduler) -> list[str]:
     """Capture the reason text of every retention verdict the scheduler emits."""
     reasons: list[str] = []
 
-    def capture(model, process_with_model, *, granted, reason):  # noqa: ANN001, ANN202
+    def capture(model, process_with_model, *, granted, reason, denial_reason=None):  # noqa: ANN001, ANN202
         reasons.append(reason)
 
     scheduler._log_retention_decision = capture  # type: ignore[method-assign]
@@ -911,3 +928,150 @@ def test_inference_control_message_defaults_to_eviction() -> None:
     )
 
     assert message.keep_model_resident_after is False
+
+
+def test_inference_control_message_carries_no_device_reading_by_default() -> None:
+    """A dispatch built without a device reading leaves the child on its own free view, as before."""
+    message = HordeInferenceControlMessage(
+        control_flag=HordeControlFlag.START_INFERENCE,
+        horde_model_name=_MODEL,
+        sdk_api_job_info=make_job_pop_response(model=_MODEL),
+    )
+
+    assert message.device_free_mb is None
+
+
+_SDXL_UNET_RESIDUAL_BYTES = 5 * 1024 * 1024 * 1024
+"""An SDXL-class UNet residual (~5GB), the tensor bytes a disaggregated sampler's checkpoint leaves it holding."""
+
+
+class _Sidecar:
+    """A component-identity sidecar stand-in: only its residual tensor bytes are read by the charge."""
+
+    def __init__(self, residual_tensor_bytes: int) -> None:
+        self.residual_tensor_bytes = residual_tensor_bytes
+
+
+async def test_a_component_only_retained_resident_is_charged_its_unet_alone(monkeypatch) -> None:  # noqa: ANN001
+    """A disaggregated sampler's residency is priced at its UNet, so a grant the whole checkpoint denies fits.
+
+    The same geometry the whole-checkpoint charge denies (see the sibling-charge test above: 16375 less the
+    2030 sibling context and 6800 of retained weights leaves 7545MB against an 8258MB peak). A disaggregated
+    sampler holds only the core diffusion weights, its text encoders having run in the encode service and its
+    VAE in the image lane, so charging it the whole checkpoint prices support weights no process is holding and
+    collapses exactly the co-residency disaggregation exists to buy.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    sibling.retained_resident_model = _OTHER_MODEL
+    sibling.retained_resident_component_only = True
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+    # Patched to the whole-checkpoint figure the aggregated path would charge, so a component residency reading
+    # it at all is a visible failure rather than an arithmetic coincidence.
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_read_component_sidecar",
+        lambda _self, _model: _Sidecar(_SDXL_UNET_RESIDUAL_BYTES),
+    )
+    scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+        return_value=Mock(fits=False, predicted_mb=8258.0, reserve_mb=4096.0),
+    )
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    # 16375 - 2030 (sibling context) - 5120 (its retained UNet) leaves 9225MB, over the 8258 peak.
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_a_component_only_resident_charge_reads_the_unet_residual(monkeypatch) -> None:  # noqa: ANN001
+    """The figure charged is the sidecar's floored UNet residual, not the model's full resident footprint."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    sibling.retained_resident_model = _OTHER_MODEL
+    sibling.retained_resident_component_only = True
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_read_component_sidecar",
+        lambda _self, _model: _Sidecar(_SDXL_UNET_RESIDUAL_BYTES),
+    )
+
+    charges_mb = scheduler._retained_resident_charges_mb(
+        dispatched,
+        _MODEL,
+        process_with_model=scheduler._process_map[_PROCESS_ID],
+        device_index=None,
+    )
+
+    assert charges_mb == pytest.approx(5120.0)
+
+
+async def test_an_unpriceable_component_resident_denies_the_grant(monkeypatch) -> None:  # noqa: ANN001
+    """A component residency whose sidecar cannot be read denies, rather than falling back to the checkpoint.
+
+    The fallback would be the over-charge the component figure exists to remove, and an unpriceable tenant is
+    handled the way an unpriceable sibling context is: deny the grant rather than wave it through at zero.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    sibling.retained_resident_model = _OTHER_MODEL
+    sibling.retained_resident_component_only = True
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    monkeypatch.setattr(InferenceScheduler, "_read_component_sidecar", lambda _self, _model: None)
+    scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+        return_value=Mock(fits=False, predicted_mb=1000.0, reserve_mb=4096.0),
+    )
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+async def test_a_whole_job_retained_resident_still_charges_the_full_footprint(monkeypatch) -> None:  # noqa: ANN001
+    """A monolithic residency is unaffected: it holds the whole checkpoint and is charged for it.
+
+    The component figure is keyed to what the slot actually holds, so a slot that ran a whole job keeps the
+    aggregated charge even on a worker that also disaggregates.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    sibling.retained_resident_model = _OTHER_MODEL
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_read_component_sidecar",
+        lambda _self, _model: _Sidecar(_SDXL_UNET_RESIDUAL_BYTES),
+    )
+
+    charges_mb = scheduler._retained_resident_charges_mb(
+        dispatched,
+        _MODEL,
+        process_with_model=scheduler._process_map[_PROCESS_ID],
+        device_index=None,
+    )
+
+    assert charges_mb == pytest.approx(6800.0)

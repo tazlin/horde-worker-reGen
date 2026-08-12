@@ -215,7 +215,7 @@ def test_native_page_is_dependency_free_and_links_to_the_full_dashboard() -> Non
     assert "horde-native-glance" in html
     assert "height: 100dvh" in html
     assert 'style.setProperty("--entry-columns"' in html
-    assert 'style.setProperty(shareProperty' in html
+    assert "style.setProperty(shareProperty" in html
     assert "scroll-snap-type" not in html
     assert 'get("view") === "glance"' in html
     assert "react" not in html.lower()

@@ -207,6 +207,15 @@ class HordeProcessInfo:
     Stamped at dispatch from the scheduler's retention verdict and resolved into
     :attr:`retained_resident_model` when the job's result arrives. The completion path cannot see the
     dispatch decision, so this is the record that carries it across the job."""
+    retained_resident_since: float | None
+    """When this slot's current retention episode began holding idle, on the scheduler's clock, else None.
+
+    A retention is a prediction that a same-model successor is about to arrive on this slot. Time without one
+    is what falsifies that prediction, so the age of the hold is the term the under-pressure revoke reads: the
+    history that issued the grant cannot say anything new about it, because a live grant's own dispatch is what
+    that history contains. Stamped by the scheduler rather than at the settle, since the scheduler owns the
+    clock every other retention window is measured on; cleared whenever the episode ends, so a reuse starts a
+    fresh one rather than inheriting the previous hold's age."""
     retained_resident_model: str | None
     """Model whose weights this slot holds on the device between jobs, or None when it holds none.
 
@@ -214,6 +223,15 @@ class HordeProcessInfo:
     slot's retained weights against the card total (weights held across jobs are as real a tenant as a
     sampling peak), and a dispatch for a different model returns them to the card before the new weights
     load. Cleared by every parent-side eviction actuation and when the slot dies."""
+    retention_granted_component_only: bool
+    """Whether the in-flight grant covers only the job's UNet, as a disaggregated sampler stage's does."""
+    retained_resident_component_only: bool
+    """Whether what this slot retains is a UNet alone rather than a whole checkpoint.
+
+    A disaggregated sampler holds only the core diffusion weights: its text encoders and VAE ran in the
+    encode service and the image lane. Pricing such a residency at the whole checkpoint would charge the card
+    for support weights no process is holding, and the charge is what decides later grants and dispatch holds,
+    so the distinction has to survive the job boundary alongside the model name."""
 
     ram_usage_bytes: int
     """The amount of RAM used by this process."""
@@ -381,6 +399,9 @@ class HordeProcessInfo:
         self.current_job_per_step_floor_tripped = False
         self.retention_granted_model = None
         self.retained_resident_model = None
+        self.retained_resident_since = None
+        self.retention_granted_component_only = False
+        self.retained_resident_component_only = False
 
         self.ram_usage_bytes = 0
         self.vram_usage_mb = 0
@@ -495,15 +516,21 @@ class HordeProcessInfo:
         self.preload_job_intent = None
         self.inference_ownership = None
 
-    def note_retention_grant(self, model: str | None) -> None:
+    def note_retention_grant(self, model: str | None, *, component_only: bool = False) -> None:
         """Record which model (if any) the dispatching job's retention verdict covers on this slot.
 
         The scheduler denies every grant while the legacy comfy unload regime is configured, because under
         that regime the child's executor returns the card at the end of each prompt no matter what the
         dispatch asked for. A ``None`` model is therefore the invariant there: nothing may be recorded as
         held that the child has already unloaded.
+
+        Args:
+            model: The model the grant covers, or None when the dispatch was granted nothing.
+            component_only: Whether the grant covers the job's UNet alone, as a disaggregated sampler stage's
+                does. Carried through the settle so the residency is priced at what the slot actually holds.
         """
         self.retention_granted_model = model
+        self.retention_granted_component_only = component_only and model is not None
 
     def settle_retention_after_job(self) -> None:
         """Resolve the in-flight retention grant into the slot's retained-resident record at job end.
@@ -518,12 +545,20 @@ class HordeProcessInfo:
         does not hold.
         """
         self.retained_resident_model = self.retention_granted_model
+        self.retained_resident_component_only = self.retention_granted_component_only
+        # A settle always begins a new episode: the job that just ended either left fresh weights behind or
+        # left nothing. Either way the previous hold's age is spent, and the scheduler stamps the new one.
+        self.retained_resident_since = None
         self.retention_granted_model = None
+        self.retention_granted_component_only = False
 
     def clear_retained_resident(self) -> None:
         """Forget any retained residency because this slot's device weights are being (or were) returned."""
         self.retained_resident_model = None
         self.retention_granted_model = None
+        self.retained_resident_since = None
+        self.retained_resident_component_only = False
+        self.retention_granted_component_only = False
 
     def is_process_busy(self) -> bool:
         """Return true if the process is actively engaged in a task.

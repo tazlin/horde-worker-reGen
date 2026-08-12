@@ -56,9 +56,18 @@ Reclaim is single-owner. The governor's SATURATED ladder and the arbiter's per-c
 through one engine, so the two triggers can never become two mechanisms evicting the same card by different
 rules. The engine reclaims in LIFO order (newest idle resident first, since the driver demotes the
 least-recently-touched allocator), and it **verifies**: after issuing a rung it compares the realized NVML
-device-free gain against the rung's promised figure over the next one or two governor samples, escalating on a
-shortfall rather than trusting the estimate, and marking the episode *unresolved* only once every rung has run
-without relieving the card. The **per-step floor** is the fast detector that forces that ladder early: two
+device-free gain against the rung's promised figure on each following governor sample, escalating only once the
+rung has realized nothing further for a verification budget scaled by the memory it promised, and marking the
+episode *unresolved* only once every rung has run without relieving the card. Because the budget scales with
+the promise, an idle-resident rung is priced from what the slot is known to cost the card: its measured
+allocator reservation where the slot has reported one, otherwise the checkpoint's measured resident watermark
+or, failing that, the same static resident-footprint estimate a retention grant charges a tracked resident at.
+Only a genuinely unknowable footprint prices at zero, which takes the unverifiable path (full budget, no
+credit, escalate on an honest absence of evidence) rather than being graded on the base allowance alone.
+Nothing frees synchronously, so
+grading a rung on a sample count reads a working multi-gigabyte release as a failure; the deepest rung (safety
+off the GPU) additionally carries a per-card dwell, because spending it is a whole process cycle. The
+**per-step floor** is the fast detector that forces that ladder early: two
 consecutive sampling steps each several times their expected per-step time, on a PRESSURE-or-SATURATED card,
 mean a job is being demand-paged (not merely heavy) and reclaim should run without waiting for the whole-job
 elapsed-ratio grade. Replacing the crawling sampler is the ladder's **last rung**: it fires only once the card
@@ -719,10 +728,106 @@ to the card. It is instead a governed live gate that grants only when:
   `PRESSURE` or `SATURATED` card is one the verified reclaim ladder is or may soon be reclaiming from, so it
   is handed no new resident to evict. This reads the one figure a WDDM driver cannot misreport under
   demand-paging (NVML device-free), so it holds precisely in the regime where measured free VRAM lies.
+- **The slot's own recent traffic repeats this model.** The dispatched model must appear among the slot's
+  previous `_RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3) dispatches. See
+  [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
 - **The card statically fits the job.** The card's reported total (a constant the driver cannot misreport)
   must absorb the job's sampling peak plus the reserve, after charging the sibling CUDA contexts, the models
   other slots are already holding resident under earlier grants, and the job's own post-processing that
   share the card while the weights are held.
+
+### Retention is granted on repeat evidence
+
+Card health and static fit say a copy *can* be held; neither says anything about whether one *should* be. A
+copy nothing comes back for is not free: it occupies the card, prices every later grant's static fit against
+itself, and is eventually handed back through the reclaim ladder having saved nothing. On a worker offering a
+wide model mix that describes most copies, and the accumulated holds recreate the pressure the ladder then has
+to resolve.
+
+The evidence a grant needs is therefore what the slot has already been asked to run: the dispatched model must
+appear among that slot's previous three dispatches. This adapts to whatever an operator offers without
+encoding an assumed mix or a machine's capacity. A slot serving a single-model pool supplies the evidence on
+every dispatch after its first and is granted exactly as freely as an ungated policy would grant it; a slot
+rotating more models than the window holds earns close to nothing.
+
+The evidence is **trailing**, never a queue lookahead, and that distinction is why the gate can exist at all.
+The pop cycle refills the queue immediately *after* a dispatch drains it, so at the dispatch instant a
+same-model successor is almost never visible in the pending set even when one arrives milliseconds later; a
+gate reading the queue would refuse a pool-locked worker every grant and make retention unreachable. What a
+slot has already run is under no such timing.
+
+The one cost is warmup: the first dispatch on a slot has no history behind it and is refused, so a streak pays
+for its weights twice rather than once. That amortizes to nothing over any real streak, and it is the price of
+granting on evidence rather than on assumption.
+
+The trailing history lives on the scheduler, keyed by slot, because it describes the slot's traffic rather
+than one process's residency: it must outlive every job boundary, and a slot whose child was replaced is still
+serving the same shape of work.
+
+### A hold nothing comes back for is revoked under sustained pressure
+
+A grant is a prediction, and before this nothing revisited one: only an eviction actuation could end a
+retention, so a hold taken in a healthy moment outlived every subsequent change in what its slot was being
+asked to run.
+
+Re-asking the *issuance* question is not what re-opens it. A live grant's own dispatch heads the slot's
+history, so the window a sweep would read is the window that issued the grant and every live retention passes
+by construction. What can refute the prediction is the predicted successor failing to arrive. When a card has
+been off `HEALTHY` continuously for `_RETENTION_PRESSURE_REVOKE_SECONDS` (15s), any retained copy that has
+gone unreused for `_RETENTION_STALE_HOLD_SECONDS` (60s) is given back. Both constants are starting points
+pending a signature sweep, and both are expressed in seconds of demand so they mean the same thing on any card
+and any offer size.
+
+A hold the traffic is still using is never revoked, however long the pressure lasts: each reuse ends its
+episode and starts a fresh one, so a pool-locked slot's hold age resets every job and can never reach the
+horizon. `HordeProcessInfo.retained_resident_since` carries the episode's start, stamped by the scheduler
+(which owns the clock every other retention window is measured on) rather than at the settle, which runs on
+the completion path.
+
+This is not a second reclaim ladder. Genuine saturation remains the verified ladder's to resolve, and retained
+residents are already first-class candidates for it; the sweep only removes holds that had stopped being a bet
+on anything. Revocation actuates through the ordinary idle-model unload and registers the same in-flight
+eviction record a dispatch-time eviction does, so a dispatch priced against those weights waits for the card
+to evidence the free rather than for the request to have been sent. A busy slot is never touched.
+
+### Reading retention back
+
+Retention decides on evidence that is only visible in aggregate, so the counters are what say whether the
+policy is paying for itself on a given worker rather than merely how often it fired. They reach
+`RunMetricsSnapshot` and the `GPU duty cycle` line beside the reload-churn figures:
+
+| Counter | What it says |
+| --- | --- |
+| `retention_grants_issued` | Dispatches whose weights were left on the card. |
+| `retention_grant_denials` | Refusals bucketed by the gate that refused (`no_repeat_evidence`, `governor_state`, `static_fit`, `unpriceable`, `wddm_paging`, `budget_inactive`, `actuation_disabled`). |
+| `retention_reuses` | Dispatches that landed on a slot already retaining that model: one per job served without an upload. |
+| `retention_evicted_unused` | Copies given back before any successor reused them. |
+| `retention_revokes` | Copies the sustained-pressure sweep took back as stale. |
+
+Reuses and unused evictions partition every retention episode, so their ratio is the read: a run where unused
+evictions dominate is paying for holds its traffic never came back for. The denial buckets separate a worker
+whose traffic retention cannot help (`no_repeat_evidence`) from one whose card will not carry what it could
+(`static_fit`, `governor_state`).
+
+Disaggregated sampling is granted the same way, and priced differently. A sampler runs the identical
+end-of-run eviction, so without a grant reaching it the stage returns the card after every sample and the next
+same-model sample re-uploads the UNet; the grant rides `HordeSampleControlMessage.keep_model_resident_after`
+into `hordelib`'s `sample_stage(defer_vram_unload=…)`, and the same dispatch carries the parent's device
+reading (`device_free_mb`) so the sampler's shortfall arithmetic is computed against the card rather than its
+own view. What such a slot then holds is the UNet alone (its text encoders ran in the encode service, its VAE
+in the image lane), which is recorded as `retained_resident_component_only` and charged at the checkpoint's
+component-identity residual rather than the whole checkpoint. Pricing it as a whole checkpoint would charge the
+card for support weights no process holds and collapse exactly the co-residency disaggregation exists to buy;
+an unreadable sidecar denies the grant rather than falling back to the over-charge.
+
+The grant is settled when the *sample stage* ends, not at the job's completion: that is the instant the
+sampler's device either holds the UNet or does not, and the decode that follows runs on the image lane and
+cannot change it. Settling at completion would leave the parent blind to those weights for the whole decode
+window (a window the scheduler may preload in) and would let a decode fault clear a residency the sampler
+really holds. A stage that faults, or a job that never reaches its sampler, discards its unsettled grant so no
+later completion on that slot can settle it into a phantom; weights the slot retains from an earlier job are
+left standing. The sampler's ownership record is retired at the same point, since the slot owns nothing once
+sampling has ended and the synthesized completion retires ownership on the decode lane.
 
 Retention is cumulative, which is why the fit charges the residents it has already granted. Each grant
 leaves weights on the card until an eviction actuates, so the next grant's sampling peak has to fit beside
@@ -742,6 +847,50 @@ beside the first. The wait is bounded by the same ttl-derived affinity budget th
 uses, ends the moment the retention record clears, and lets other resident work bypass it meanwhile, so the
 card is never idled by it. Where a second copy does fit, nothing is held back.
 
+Placement order defers to a retained copy. The preload pass walks the queue in its own order, so on a model
+rotation wider than the lane pool the cold head's load target is whichever slot is free, which is routinely a
+slot retaining a model still in the queue: the head loads over those weights, the job that would have reused
+them re-uploads onto the other slot, and two models can trade lanes for the rest of a session at a full upload
+per job. `_retention_affinity_candidates` names the pending jobs a slot's retained weights can serve at no
+upload (residency plus `can_accept_job`, never this instant's concurrency headroom), and
+`pending_inference_in_placement_order` moves those jobs ahead of the head, keeping their relative order and the
+relative order of everything behind them.
+
+The reorder is the whole mechanism. No load is withheld and no lane is excluded as a preload target; every
+consumer of the ordering then reaches the same conclusion without being told about retention. The preload pass
+takes the promoted job as its head, finds it dispatchable on the lane already holding its weights and so yields
+the cycle to dispatch; dispatch seats it there at no upload; a preload that does run targets the lane its own
+job needs. `retention_affinity_reorders` counts the reorders at the dispatch commit, where the dispatched job is
+compared against the queue's own head, so a mismatch identifies one without the selection path reporting it.
+
+FIFO first: a reorder is admitted only as a free win. `_reorder_is_pareto_admissible` requires both halves. The
+head must actually need a load, since a head that is resident and merely waiting on capacity is delayed by
+anything seated ahead of it; and that load must have an admissible target other than the retaining lane, so it
+runs alongside the promoted job's sampling and the head finishes no later than it would have. Where the retainer
+is the head's only possible target, the head keeps strict priority and its load evicts the retained weights:
+buying an upload back there means making the head wait for a whole other job to sample and finish, and the head
+is racing a server-side ttl this worker cannot observe, so its deadline is never asked to fund a reuse win. The
+refusals are counted in `_retention_reorder_pareto_vetoes`. The gate is deliberately unsatisfiable on a two-lane
+worker whose retainer is the one idle lane, which is where line-skipping would risk job aging for the least
+benefit; the win belongs to pools wide enough to stage the head's load elsewhere.
+
+Candidacy locates the retainer with `include_reserved=True`. A disaggregation-pinned sampler lane is a lane no
+job may be dispatched onto *yet*, and it is still a lane carrying weights: the pin is taken when a job is
+registered on the lane and released when its sampling ends, and for much of that the lane sits idle awaiting its
+conditioning while reporting an accepting state. Whether its weights may be thrown away is a residency question,
+and the pin lifting is precisely why the queued job will be seated there afterwards. Locating the retainer
+through the dispatch-legal query instead empties the scan on a disaggregating worker, where a lane is pinned for
+most of every job. Dispatch takes the opposite view of a pin, because it names a destination:
+`ProcessMap.get_process_by_horde_model_name` skips pinned lanes by default, so a promoted job whose only
+retainer is pinned is simply not dispatchable this cycle and the head's own load proceeds.
+
+The reorder is bounded by exactly the budget that bounds the bypass (the ttl-derived affinity window, the skip
+ceiling, and the anti-starvation age override). The ceiling is the operative bound, because seating a job ahead
+of the head *is* a committed pass of that head and advances the budget exactly as a line-skip does, so a head is
+passed a bounded number of times whatever its ttl and a head behind a steady stream of retained work sees no
+candidate named at all. It is keyed to a retained copy, so a worker holding none (a cold start, the legacy
+hatch, traffic with no repeat inside the queue window) schedules exactly as it did before.
+
 Dispatch admission charges the residents too. A dispatch that materializes weights is priced against every
 retained resident the card carries, not just the slot it lands on: on a non-fit the idle ones are evicted
 through the ladder's actuator and the job keeps its queue position until the child's own reports (a risen
@@ -757,6 +906,20 @@ residency record, so the child frees the old weights before materializing the ne
 both through the job. This is not left to the child's own free-view, which is untruthful under WDDM in
 exactly the regime double residency creates.
 
+Every dispatch carries the parent's device reading for that reason. `HordeInferenceControlMessage`'s
+`device_free_mb` is the parent's NVML device-level free figure at dispatch, and the child forwards it to
+hordelib as `device_free_truth_mb` so the executor's shortfall arithmetic (what it must free before a weight
+load or a sampling window) is computed against the card rather than against the process. A child sees only its
+own allocations and, under WDDM, memory the driver has not returned still reads as free, so an unclamped
+shortfall comes out too small: the child frees less than the load needs, allocates anyway, and real free VRAM
+craters to the paging cliff, where the governor saturates and the reclaim ladder starts taking the worker's own
+capacity down. Retention is what makes that reachable at all, since it is what leaves a footprint standing
+across a job boundary for the child's own arithmetic to be the last defense over. The parent's figure is
+likewise taken as a ceiling on the child-reported free VRAM the scheduler prices admission and headroom from,
+so the same overstatement cannot buy headroom on the parent side either. The scenarios in
+`tests/process_management/liveness/test_incident_scenarios.py` hold this: a streak whose true footprint nearly
+fills the card keeps its margin and its duty when the reading is on the dispatch, and craters when it is not.
+
 No measured-floor veto and no sole-residency rule apply in this seam. The measured identity is the
 admission/dispatch gate's job; re-imposing it on retention only reintroduces the never-fires problem via
 committed-figure noise. Sole residency is unnecessary because a second idle resident is safe: it is a
@@ -768,9 +931,11 @@ residents hold the card defers while the ladder evicts them (the head-of-queue r
 resident and re-asks once its free verifies), and the under-pressure reclaim overrides retention outright.
 The dispatch-reconciliation gate is the same reclaim in the other direction: where the preload gate makes
 room to bring a model *toward* the card, the dispatch gate makes room for an already-staged job to *commit*
-to the card, evicting the retained idle resident that would otherwise share the sampling peak. An unused hold
-costs only the interval until the next dispatch, so retention can stay generous while the card is healthy and
-the ladder takes the weights back the instant any overcommit picture appears. This dispatch-time
+to the card, evicting the retained idle resident that would otherwise share the sampling peak. Between them
+these bound what an unused hold can cost: the next cross-model dispatch on the card takes it back, the ladder
+takes it back the instant any overcommit picture appears, and on a card that simply stays pressured the stale
+sweep takes it back without waiting for either. What keeps unused holds rare in the first place is the repeat
+evidence a grant needs, so the just-in-time paths are the backstop rather than the policy. This dispatch-time
 reconciliation is the precondition for defaulting cross-job retention on: until a staged dispatch is priced
 against the card, retention's idle residents can only be reclaimed after the fact, so the retention default
 stays off pending that regime's validation at system scale.

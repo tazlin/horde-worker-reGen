@@ -10,6 +10,7 @@ governor is holding pops on purpose).
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -35,6 +36,30 @@ from tests.process_management.conftest import (
     make_testable_process_manager,
     track_popped_job_async,
 )
+
+
+@pytest.fixture(autouse=True)
+def _strictly_increasing_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``time.time`` injective for this module's tests.
+
+    The pop path stamps ``last_pop_attempt_completed_at`` with ``time.time()``, and these tests prove a
+    completed attempt was recorded by asserting the stamp strictly advanced. The OS clock's resolution can
+    be coarser than a whole stubbed pop cycle, in which case two legitimate recordings carry the same stamp
+    and the strict proof fails on timing alone. Nudging any repeated reading forward by a microsecond keeps
+    readings real while making strict advancement a sound proxy for "the recording happened".
+    """
+    real_time = time.time
+    last_reading = [0.0]
+
+    def _injective_time() -> float:
+        now = real_time()
+        if now <= last_reading[0]:
+            now = last_reading[0] + 1e-6
+        last_reading[0] = now
+        return now
+
+    monkeypatch.setattr(time, "time", _injective_time)
+
 
 _SAFETY_SLOT = 0
 """The process-map slot holding the safety lane the pop ladder requires before it will offer work."""
