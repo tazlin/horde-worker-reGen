@@ -8,6 +8,11 @@ from loguru import logger
 
 from horde_worker_regen.process_management.resources.duty_cycle import summarize_duty_cycle
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    ActiveSampler,
+    ClearanceController,
+    ClearanceInputs,
+)
 from tests.process_management.conftest import make_testable_process_manager
 
 
@@ -102,6 +107,31 @@ class TestLogDutyCycleSummary:
             logger.remove(handler_id)
         text = " ".join(message for _, message in messages)
         assert "reload churn: 23 model swaps, 18 VRAM evictions" in text
+
+    def test_tail_overlap_tally_named_on_the_line(self) -> None:
+        """The clearance handoff's grant/denial tally rides the duty line so its starving clause is readable."""
+        manager = make_testable_process_manager()
+        controller = ClearanceController(device_index=0, slot_cap=1, tail_overlap=True)
+        sampler = ActiveSampler(process_id=1, job_id="job-a", progress_fraction=0.9, remaining_sampling_seconds=1.0)
+        inputs = ClearanceInputs(
+            staged_waiters=(),
+            active_grants=(sampler,),
+            device_free_mb=20000.0,
+            vram_reserve_mb=2048.0,
+            paging_active=False,
+        )
+        for _ in range(2):
+            controller.step(inputs, admit_fn=lambda _process_id: True)
+        manager._clearance_controllers = {0: controller}
+
+        summary = summarize_duty_cycle([_job_with_gaps()], window_seconds=180.0, nvml_mean_percent=60.0)
+        messages, handler_id = _capture_logs()
+        try:
+            manager._log_duty_cycle_summary(summary, "inf#0=WAITING_FOR_JOB")
+        finally:
+            logger.remove(handler_id)
+        text = " ".join(message for _, message in messages)
+        assert "tail-overlap: 0 granted / 2 denied (no-waiter 100%)" in text
 
     def test_demand_limited_is_info_and_blames_the_horde(self) -> None:
         """A worker the horde left idle reads as demand-limited at INFO, never as a worker fault."""

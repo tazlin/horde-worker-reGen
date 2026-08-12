@@ -24,17 +24,36 @@ sampling window and logs it once rather than ever wedging the pool.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import enum
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
 from typing import Protocol
 
 from loguru import logger
 
-_TAIL_OVERLAP_PROGRESS_THRESHOLD = 0.8
-"""How far the most-advanced in-flight sampler must be through its denoise loop before the parent clears the
-next staged child early. High enough that the outgoing job finishes soon after the incoming one begins (so the
-two sampling windows only briefly overlap) rather than admitting a full second denoise."""
+TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE = 0.15
+"""How far through its denoise loop an in-flight sampler must be before its remaining sampling time is
+estimated at all. A rate taken from the first step or two of a job is dominated by the one-off cost of entering
+the loop, so an estimate below this fraction would be noise; a sampler under it reports no estimate and the
+handoff is denied as progress-unknown rather than fired on a guess."""
+
+_TAIL_OVERLAP_PAD_SECONDS = 1.0
+"""Slack added to the incoming child's estimated load time when sizing the handoff window. Covers the tick
+granularity of the parent's control loop and the child's own wake latency, so the incoming load starts a little
+before the outgoing sampler's tail rather than a little after it."""
+
+_DEFAULT_INCOMING_LOAD_SECONDS = 6.0
+"""Assumed RAM-to-VRAM weight-load seconds for an incoming child when the parent has measured none yet.
+Deliberately on the long side of a typical SDXL upload: over-estimating opens the handoff window earlier, which
+the headroom clause still gates, whereas under-estimating leaves the load outside the outgoing tail entirely,
+which is the failure this handoff exists to remove."""
+
+_TAIL_OVERLAP_DENIAL_REPEAT_SECONDS = 30.0
+"""How long an unchanged tail-overlap denial reason is suppressed before it is restated. The gate is evaluated
+every control-loop tick, so only the reason *edge* is interesting; the periodic restatement keeps a persistent
+starvation visible in a log that is otherwise silent about it."""
 
 _TAIL_OVERLAP_MARGIN_MB = 3072.0
 """Measured free-VRAM headroom (device free minus the configured reserve) required before an early clear. The
@@ -170,6 +189,12 @@ class ActiveSampler:
     """The granted job's id, binding a tail-overlap early clear to its outgoing sampler for one-per-job dedup."""
     progress_fraction: float
     """Denoise progress in ``[0.0, 1.0]``; a cleared-but-not-yet-sampling child reads ``0.0``."""
+    remaining_sampling_seconds: float | None = None
+    """Estimated wall seconds left in this sampler's denoise loop, or None while no rate can be trusted.
+
+    Computed by the scheduler from the child's reported step position and the elapsed time since its first
+    step. None until the job is far enough in (see :data:`TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE`) for the
+    rate to mean anything, and the tail-overlap gate never fires on a sampler without it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,6 +216,68 @@ class ClearanceInputs:
     """The configured VRAM reserve (MB) held back from admission."""
     paging_active: bool
     """Whether the parent's WDDM demand-paging detector is flagging this worker's allocations."""
+    incoming_load_seconds: float | None = None
+    """Measured RAM-to-VRAM weight-load seconds an incoming child is expected to pay, or None when unmeasured.
+
+    The recent median of observed weight uploads on this card; the tail-overlap window is sized from it so the
+    incoming load lands inside the outgoing sampler's tail. ``None`` falls back to
+    :data:`_DEFAULT_INCOMING_LOAD_SECONDS`."""
+
+
+class TailOverlapDenialReason(enum.Enum):
+    """Why the tail-overlap handoff did not fire on a tick where it could conceptually have fired.
+
+    Recorded whenever the feature is enabled and at least one child holds a grant, so a session's log and
+    counters name the clause that is actually starving the handoff rather than only showing its absence.
+    """
+
+    NO_STAGED_WAITER = "no-waiter"
+    """No staged child was waiting, so there was nobody to hand off to."""
+    PAGING_ACTIVE = "paging"
+    """The card is demand-paging; an overlap would deepen it."""
+    ALREADY_GRANTED = "already-granted"
+    """Every candidate outgoing sampler already triggered its one early clear (the one-per-job dedup)."""
+    PROGRESS_UNKNOWN = "progress-unknown"
+    """No active sampler is far enough along for its remaining sampling time to be estimated."""
+    REMAINING_ABOVE_WINDOW = "remaining"
+    """The soonest-finishing sampler has more time left than the incoming child's load needs to hide in."""
+    HEADROOM_SHORT = "headroom"
+    """Measured free VRAM net of the reserve does not cover the overlap margin."""
+    BONUS_SLOT_UNUSED = "slot-unused"
+    """The handoff slot opened but steady-state slots already covered every staged waiter.
+
+    A statement of applicability rather than a refusal: every clause passed and the card simply had room to
+    serve the queue without the bonus. Tallied separately from the refusing clauses for that reason, since a
+    lightly loaded worker reaches this every tick and would otherwise swamp the shares that name a starver."""
+
+
+@dataclasses.dataclass(frozen=True)
+class TailOverlapDenial:
+    """One tick's tail-overlap denial: the clause that failed first, with the arithmetic behind it."""
+
+    reason: TailOverlapDenialReason
+    """The first clause that failed, in evaluation order."""
+    progress_fraction: float | None = None
+    """The candidate sampler's denoise progress, where one was identified."""
+    remaining_seconds: float | None = None
+    """The candidate sampler's estimated remaining sampling seconds, where one could be estimated."""
+    load_estimate_seconds: float | None = None
+    """The incoming load estimate the remaining time was compared against."""
+    headroom_shortfall_mb: float | None = None
+    """How many megabytes short of the overlap margin the measured headroom was, for a headroom denial."""
+
+    def describe(self) -> str:
+        """A compact human-readable statement of the denial and its measured quantities."""
+        parts: list[str] = [self.reason.value]
+        if self.remaining_seconds is not None:
+            parts.append(f"remaining {self.remaining_seconds:.1f}s")
+        if self.load_estimate_seconds is not None:
+            parts.append(f"load estimate {self.load_estimate_seconds:.1f}s")
+        if self.progress_fraction is not None:
+            parts.append(f"progress {self.progress_fraction:.2f}")
+        if self.headroom_shortfall_mb is not None:
+            parts.append(f"{self.headroom_shortfall_mb:.0f}MB short of margin")
+        return ", ".join(parts)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -201,6 +288,64 @@ class ClearancePlan:
     """Staged children to attempt to clear this tick, in priority order (steady slots plus any tail bonus)."""
     tail_cleared_for_job_id: str | None = None
     """The outgoing sampler's job id a tail-overlap early clear is bound to this tick, for one-per-job dedup."""
+    tail_denial: TailOverlapDenial | None = None
+    """Why the handoff did not fire, when it was applicable and did not; None when it fired or did not apply."""
+
+
+def _evaluate_tail_overlap(
+    inputs: ClearanceInputs,
+    *,
+    tail_overlap_pad_seconds: float,
+    tail_overlap_margin_mb: float,
+    already_tail_cleared_job_ids: frozenset[str],
+) -> tuple[str | None, TailOverlapDenial | None]:
+    """Pick the outgoing sampler whose tail can hide the incoming load, or say which clause refused.
+
+    Returns the outgoing job id to bind the early clear to, or a denial naming the first failing clause.
+    Clauses are evaluated cheapest-and-most-fundamental first (is there anyone to hand off to, is the card
+    healthy, is a candidate still eligible) before the timing comparison, and headroom last: headroom only
+    matters once the timing says a handoff is due, so evaluating it earlier would mask the timing answer.
+    """
+    if not inputs.staged_waiters:
+        return None, TailOverlapDenial(TailOverlapDenialReason.NO_STAGED_WAITER)
+    if inputs.paging_active:
+        return None, TailOverlapDenial(TailOverlapDenialReason.PAGING_ACTIVE)
+
+    eligible = [grant for grant in inputs.active_grants if grant.job_id not in already_tail_cleared_job_ids]
+    if not eligible:
+        return None, TailOverlapDenial(TailOverlapDenialReason.ALREADY_GRANTED)
+
+    timed = [
+        (grant.remaining_sampling_seconds, grant) for grant in eligible if grant.remaining_sampling_seconds is not None
+    ]
+    if not timed:
+        best_progress = max(grant.progress_fraction for grant in eligible)
+        return None, TailOverlapDenial(TailOverlapDenialReason.PROGRESS_UNKNOWN, progress_fraction=best_progress)
+
+    # The soonest-finishing sampler owns the next free slot, so its tail is the one the handoff hides in.
+    remaining_seconds, outgoing = min(timed, key=lambda entry: entry[0])
+    load_seconds = inputs.incoming_load_seconds
+    if load_seconds is None:
+        load_seconds = _DEFAULT_INCOMING_LOAD_SECONDS
+    window_seconds = load_seconds + tail_overlap_pad_seconds
+    if remaining_seconds > window_seconds:
+        return None, TailOverlapDenial(
+            TailOverlapDenialReason.REMAINING_ABOVE_WINDOW,
+            progress_fraction=outgoing.progress_fraction,
+            remaining_seconds=remaining_seconds,
+            load_estimate_seconds=load_seconds,
+        )
+
+    headroom_mb = None if inputs.device_free_mb is None else inputs.device_free_mb - inputs.vram_reserve_mb
+    if headroom_mb is None or headroom_mb < tail_overlap_margin_mb:
+        return None, TailOverlapDenial(
+            TailOverlapDenialReason.HEADROOM_SHORT,
+            progress_fraction=outgoing.progress_fraction,
+            remaining_seconds=remaining_seconds,
+            load_estimate_seconds=load_seconds,
+            headroom_shortfall_mb=tail_overlap_margin_mb - (headroom_mb if headroom_mb is not None else 0.0),
+        )
+    return outgoing.job_id, None
 
 
 def decide_clearances(
@@ -209,7 +354,7 @@ def decide_clearances(
     slot_cap: int,
     held_grant_count: int,
     tail_overlap_enabled: bool,
-    tail_overlap_progress_threshold: float,
+    tail_overlap_pad_seconds: float,
     tail_overlap_margin_mb: float,
     already_tail_cleared_job_ids: frozenset[str],
 ) -> ClearancePlan:
@@ -223,43 +368,54 @@ def decide_clearances(
     ``held_grant_count`` (every child the controller has cleared or that is sampling, including a cleared child
     not yet in its denoise loop, which ``active_grants`` cannot yet show), and the best
     (lowest-priority-number) staged waiters fill them in head-of-queue order so queue position, not residency,
-    decides who samples next. Tail overlap (only when ``tail_overlap_enabled``) adds exactly one extra grant
-    for one handoff window: when the most advanced sampler is at or past ``tail_overlap_progress_threshold``, a
-    staged waiter exists, the card is not paging, and measured free net of the reserve clears
-    ``tail_overlap_margin_mb``, one more waiter is cleared early so the next sampling window opens before the
-    outgoing one closes. That early clear is bound to the outgoing sampler's job id and suppressed while that id
-    is in ``already_tail_cleared_job_ids``, so a given outgoing sampler triggers at most one early clear.
+    decides who samples next.
+
+    Tail overlap (only when ``tail_overlap_enabled``) adds exactly one extra grant for one handoff window. The
+    handoff exists to hide the incoming child's RAM-to-VRAM weight upload inside the outgoing sampler's tail,
+    so it is triggered on *time*: the soonest-finishing sampler's estimated remaining seconds must be at or
+    under the incoming load estimate plus ``tail_overlap_pad_seconds``. A progress-fraction trigger cannot do
+    this job, because a fixed fraction is a window whose width scales with the job's own duration: the same
+    fraction that opens seconds of overlap on a slow job opens a window on a fast job too narrow for the
+    parent's sampling of child progress to land inside, so exactly the jobs whose loads dominate their
+    wall time are the ones the handoff never fires for. Alongside the timing clause a staged waiter must
+    exist, the card must not be paging, and measured free net of the reserve must clear
+    ``tail_overlap_margin_mb``. The early clear is bound to the outgoing sampler's job id and suppressed while
+    that id is in ``already_tail_cleared_job_ids``, so a given outgoing sampler triggers at most one early
+    clear. When the gate is applicable (enabled, with at least one active grant) and does not fire, the plan
+    carries a :class:`TailOverlapDenial` naming the clause that refused.
     """
     base_slots = max(0, slot_cap - held_grant_count)
 
     tail_cleared_for_job_id: str | None = None
+    tail_denial: TailOverlapDenial | None = None
     tail_bonus = 0
-    if tail_overlap_enabled and inputs.staged_waiters and inputs.active_grants and not inputs.paging_active:
-        most_advanced = max(inputs.active_grants, key=lambda grant: grant.progress_fraction)
-        room = (
-            inputs.device_free_mb is not None
-            and inputs.device_free_mb - inputs.vram_reserve_mb >= tail_overlap_margin_mb
+    if tail_overlap_enabled and inputs.active_grants:
+        tail_cleared_for_job_id, tail_denial = _evaluate_tail_overlap(
+            inputs,
+            tail_overlap_pad_seconds=tail_overlap_pad_seconds,
+            tail_overlap_margin_mb=tail_overlap_margin_mb,
+            already_tail_cleared_job_ids=already_tail_cleared_job_ids,
         )
-        if (
-            most_advanced.progress_fraction >= tail_overlap_progress_threshold
-            and room
-            and most_advanced.job_id not in already_tail_cleared_job_ids
-        ):
+        if tail_cleared_for_job_id is not None:
             tail_bonus = 1
-            tail_cleared_for_job_id = most_advanced.job_id
 
     available = base_slots + tail_bonus
     if available <= 0 or not inputs.staged_waiters:
-        return ClearancePlan()
+        return ClearancePlan(tail_denial=tail_denial)
 
     ordered = sorted(inputs.staged_waiters, key=lambda waiter: waiter.priority)
     chosen = tuple(waiter.process_id for waiter in ordered[:available])
     if not chosen:
-        return ClearancePlan()
+        return ClearancePlan(tail_denial=tail_denial)
     # The tail bonus only applies when its extra slot is actually used by a chosen waiter.
     if tail_bonus and len(chosen) <= base_slots:
         tail_cleared_for_job_id = None
-    return ClearancePlan(clear_process_ids=chosen, tail_cleared_for_job_id=tail_cleared_for_job_id)
+        tail_denial = TailOverlapDenial(TailOverlapDenialReason.BONUS_SLOT_UNUSED)
+    return ClearancePlan(
+        clear_process_ids=chosen,
+        tail_cleared_for_job_id=tail_cleared_for_job_id,
+        tail_denial=tail_denial,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -295,8 +451,9 @@ class ClearanceController:
         device_index: int,
         slot_cap: int,
         tail_overlap: bool,
-        tail_overlap_progress_threshold: float = _TAIL_OVERLAP_PROGRESS_THRESHOLD,
+        tail_overlap_pad_seconds: float = _TAIL_OVERLAP_PAD_SECONDS,
         tail_overlap_margin_mb: float = _TAIL_OVERLAP_MARGIN_MB,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """Configure the controller for one card.
 
@@ -304,14 +461,17 @@ class ClearanceController:
             device_index: The card this controller governs (for logging).
             slot_cap: The steady-state cap on concurrent grants (the configured sampling-lease slot count).
             tail_overlap: Whether the one-extra-grant handoff window is enabled for this card.
-            tail_overlap_progress_threshold: The outgoing sampler's tail fraction that opens an early clear.
+            tail_overlap_pad_seconds: Slack added to the incoming load estimate when sizing the handoff window.
             tail_overlap_margin_mb: The measured free-minus-reserve headroom an early clear requires.
+            clock: Monotonic seconds source for the denial diagnostic's repeat throttle; defaults to
+                ``time.monotonic``.
         """
         self._device_index = device_index
         self._slot_cap = slot_cap
         self._tail_overlap = tail_overlap
-        self._tail_overlap_progress_threshold = tail_overlap_progress_threshold
+        self._tail_overlap_pad_seconds = tail_overlap_pad_seconds
         self._tail_overlap_margin_mb = tail_overlap_margin_mb
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
         self._proxies: dict[int, ClearanceLeaseProxy] = {}
         self._grant_state: dict[int, GrantState] = {}
         # The job id each held grant was issued for, so a grant is retired exactly when its child moves off that
@@ -321,6 +481,12 @@ class ClearanceController:
         self._tail_cleared_job_ids: set[str] = set()
         # Processes flagged as sampling without a recorded grant, so the unpriced warning is edge-triggered.
         self._unpriced_flagged: set[int] = set()
+        # Session tallies for the handoff: grants issued, and denials by the clause that refused. Read into
+        # the duty-cycle summary so one session's log answers which clause starves the overlap.
+        self._tail_overlap_grants = 0
+        self._tail_overlap_denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
+        # The denial reason last logged, when it was logged, and how many identical ticks were suppressed.
+        self._tail_denial_log_state: tuple[TailOverlapDenialReason, float, int] | None = None
 
     def register(self, process_id: int, proxy: ClearanceLeaseProxy) -> None:
         """Register a freshly spawned child's proxy so its clearance can be granted and its done drained."""
@@ -388,10 +554,12 @@ class ClearanceController:
             slot_cap=self._slot_cap,
             held_grant_count=self.held_grant_count,
             tail_overlap_enabled=self._tail_overlap,
-            tail_overlap_progress_threshold=self._tail_overlap_progress_threshold,
+            tail_overlap_pad_seconds=self._tail_overlap_pad_seconds,
             tail_overlap_margin_mb=self._tail_overlap_margin_mb,
             already_tail_cleared_job_ids=frozenset(self._tail_cleared_job_ids),
         )
+        if plan.tail_denial is not None:
+            self._note_tail_overlap_denial(plan.tail_denial)
 
         cleared: list[int] = []
         held: list[int] = []
@@ -404,6 +572,9 @@ class ClearanceController:
                     cleared.append(process_id)
                     if plan.tail_cleared_for_job_id is not None and process_id == plan.clear_process_ids[-1]:
                         self._tail_cleared_job_ids.add(plan.tail_cleared_for_job_id)
+                        self._tail_overlap_grants += 1
+                        # A fired handoff ends the denial run, so the next denial reason logs on its own edge.
+                        self._tail_denial_log_state = None
                         self._log_tail_overlap_clear(inputs, outgoing_job_id=plan.tail_cleared_for_job_id)
             else:
                 held.append(process_id)
@@ -456,6 +627,47 @@ class ClearanceController:
             f"Clearance lease on device {self._device_index}: tail-overlap early clear granted behind outgoing "
             f"sampler {outgoing_job_id[:8]} at progress {progress_fraction:.2f} with {headroom_mb:.0f}MB measured "
             f"headroom.",
+        )
+
+    @property
+    def tail_overlap_grant_count(self) -> int:
+        """How many tail-overlap handoff grants this controller has issued this session."""
+        return self._tail_overlap_grants
+
+    @property
+    def tail_overlap_denial_counts(self) -> Mapping[TailOverlapDenialReason, int]:
+        """How many ticks each clause held the handoff back this session, keyed by the clause.
+
+        Includes :attr:`TailOverlapDenialReason.BONUS_SLOT_UNUSED`, which records applicability rather than
+        refusal; :func:`format_tail_overlap_tally` reports it apart from the refusing clauses.
+        """
+        return self._tail_overlap_denials
+
+    def _note_tail_overlap_denial(self, denial: TailOverlapDenial) -> None:
+        """Tally a denied handoff tick and log it when the refusing clause changes (or after a long run).
+
+        The gate is evaluated every control-loop tick, so a per-tick line would be noise: the reason edge is
+        what carries information, and a persistent run is restated only every
+        ``_TAIL_OVERLAP_DENIAL_REPEAT_SECONDS`` with the count of ticks it stood for. Emitted at debug beside
+        the per-child clearance line, since a denied handoff is ordinary operation rather than a fault.
+        """
+        self._tail_overlap_denials[denial.reason] += 1
+
+        now = self._clock()
+        suppressed = 0
+        previous = self._tail_denial_log_state
+        if previous is not None:
+            previous_reason, previous_emit, previous_suppressed = previous
+            if previous_reason == denial.reason and (now - previous_emit) < _TAIL_OVERLAP_DENIAL_REPEAT_SECONDS:
+                self._tail_denial_log_state = (previous_reason, previous_emit, previous_suppressed + 1)
+                return
+            suppressed = previous_suppressed
+        self._tail_denial_log_state = (denial.reason, now, 0)
+
+        suffix = f" (suppressed {suppressed} unchanged repeats)" if suppressed > 0 else ""
+        logger.debug(
+            f"Clearance lease on device {self._device_index}: tail-overlap handoff denied "
+            f"({denial.describe()}).{suffix}",
         )
 
     def _drain_done_discard(self) -> None:
@@ -535,3 +747,36 @@ class ClearanceController:
             return
         live_job_ids = {grant.job_id for grant in inputs.active_grants}
         self._tail_cleared_job_ids &= live_job_ids
+
+
+def format_tail_overlap_tally(
+    granted: int,
+    denials: Mapping[TailOverlapDenialReason, int],
+    *,
+    max_reasons: int = 3,
+) -> str | None:
+    """A compact handoff tally for the duty-cycle line, or None when the gate was never applicable.
+
+    Reports grants against refusals and the share each clause took of those refusals, largest first, so a duty
+    figure short of target can be read straight across to the clause holding the handoff shut.
+    :attr:`TailOverlapDenialReason.BONUS_SLOT_UNUSED` is kept out of that arithmetic and trails the line in
+    brackets: it records a tick where every clause passed and the steady slots simply covered the queue, so
+    counting it as a refusal would drown the shares that name a starver on any lightly loaded worker.
+    """
+    slot_unused = denials.get(TailOverlapDenialReason.BONUS_SLOT_UNUSED, 0)
+    refusals = {
+        reason: count
+        for reason, count in denials.items()
+        if reason is not TailOverlapDenialReason.BONUS_SLOT_UNUSED and count
+    }
+    denied = sum(refusals.values())
+    if granted == 0 and denied == 0 and slot_unused == 0:
+        return None
+    line = f"tail-overlap: {granted} granted / {denied} denied"
+    if denied:
+        ranked = sorted(refusals.items(), key=lambda entry: (-entry[1], entry[0].value))[:max_reasons]
+        shares = ", ".join(f"{reason.value} {count / denied:.0%}" for reason, count in ranked)
+        line = f"{line} ({shares})"
+    if slot_unused:
+        line = f"{line} [slot-unused {slot_unused}]"
+    return line

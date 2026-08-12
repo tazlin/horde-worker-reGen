@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections
+import statistics
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -128,6 +130,11 @@ class RetiredProcessLaunch:
     retired_at: float
 
 
+_RECENT_VRAM_LOAD_SAMPLES = 16
+"""How many recent RAM-to-VRAM weight-load durations are kept per card. Long enough that one anomalous upload
+does not move the median, short enough that the figure tracks the models the worker is currently serving."""
+
+
 class ProcessMap(dict[int, HordeProcessInfo]):
     """A mapping of process IDs to HordeProcessInfo objects.
 
@@ -165,6 +172,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         # scheduler cannot dispatch a second (monolithic or disaggregated) job onto it. Unlike a monolithic
         # dispatch, no child message marks the pin, so this parent-side set is the sole booking record.
         self._disaggregation_reserved_process_ids: set[int] = set()
+        # Recently observed RAM-to-VRAM weight-load durations per card, newest last. Fed from each finished
+        # job's metrics; the clearance lease sizes its handoff window from the median so the incoming child's
+        # upload is timed against what uploads on this card actually cost.
+        self._recent_vram_load_seconds: dict[int, collections.deque[float]] = {}
 
     @override
     def __setitem__(self, process_id: int, process_info: HordeProcessInfo) -> None:
@@ -325,6 +336,9 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
         self[process_id].clear_job_references()
+        # A dead process's device weights go with it, so it can no longer be a retained resident the
+        # retention static fit charges or the dispatch path evicts.
+        self[process_id].clear_retained_resident()
         self[process_id].batch_amount = 1
 
         # Drop this slot's last VRAM/RAM sample. A dead process reports nothing further, so its final
@@ -456,6 +470,28 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 process_info.ram_used_high_water_mb,
                 phase_metrics.ram_used_high_water_mb,
             )
+
+        for model_load in phase_metrics.model_loads:
+            # Only the GPU upload is kept: it is the part of a load the clearance handoff hides inside an
+            # outgoing sampler's tail. A job that found its weights resident reports no such phase.
+            if model_load.phase != "ram_to_vram" or model_load.duration_seconds <= 0.0:
+                continue
+            samples = self._recent_vram_load_seconds.setdefault(
+                process_info.device_index,
+                collections.deque(maxlen=_RECENT_VRAM_LOAD_SAMPLES),
+            )
+            samples.append(model_load.duration_seconds)
+
+    def recent_vram_load_seconds(self, device_index: int) -> float | None:
+        """Median of recently observed RAM-to-VRAM weight-load seconds on a card, or None when none observed.
+
+        The measured answer to "how long will the next child take to get its weights onto this card", used to
+        size the clearance lease's handoff window. None until at least one job on the card has paid an upload.
+        """
+        samples = self._recent_vram_load_seconds.get(device_index)
+        if not samples:
+            return None
+        return statistics.median(samples)
 
     def on_download_metrics(self, process_id: int, events: list[DownloadEvent]) -> None:
         """Record ad-hoc download events reported by the given process ID."""
@@ -597,6 +633,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
         self[process_id].clear_job_references()
+        # A model gone from RAM is certainly gone from the device, so no retained residency survives it.
+        self[process_id].clear_retained_resident()
         self[process_id].recently_unloaded_from_ram = True
         self[process_id].last_received_timestamp = time.time()
         # The model left VRAM, so it no longer has a materialization time; the next materialization restamps.

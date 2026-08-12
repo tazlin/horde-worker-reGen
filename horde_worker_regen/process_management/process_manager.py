@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import asyncio.exceptions
+import collections
 import contextlib
 import dataclasses
 import os
@@ -196,6 +197,8 @@ from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
+    TailOverlapDenialReason,
+    format_tail_overlap_tally,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot, ModelDemandPoller
@@ -5887,6 +5890,9 @@ class HordeWorkerProcessManager:
         slot_attribution = self._format_slot_duty_window()
         if slot_attribution:
             explanation_parts.append(slot_attribution)
+        tail_overlap = self._format_tail_overlap_tally()
+        if tail_overlap:
+            explanation_parts.append(tail_overlap)
         explanation = "; ".join(explanation_parts) if explanation_parts else "no per-job attribution yet"
 
         context = (
@@ -5916,6 +5922,22 @@ class HordeWorkerProcessManager:
         self._last_slot_duty_totals_at_duty_log = totals
         window = {k: v - previous.get(k, 0.0) for k, v in totals.items() if v - previous.get(k, 0.0) > 0.0}
         return SlotDutyAccumulator.format_window(window, capacity=capacity)
+
+    def _format_tail_overlap_tally(self) -> str | None:
+        """The clearance handoff's session tally for the duty-cycle line, or None when it never applied.
+
+        Session-cumulative rather than windowed: the handoff fires rarely by construction, so a per-window
+        count would read as zero on most lines while the denial shares are what identify the clause holding
+        it shut. Summed across cards, since the tally names clauses rather than devices.
+        """
+        if not self._clearance_controllers:
+            return None
+        granted = 0
+        denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
+        for controller in self._clearance_controllers.values():
+            granted += controller.tail_overlap_grant_count
+            denials.update(controller.tail_overlap_denial_counts)
+        return format_tail_overlap_tally(granted, denials)
 
     def _build_stage_age_line(self) -> str | None:
         """A one-line per-stage census with the oldest age in each stage, or None when nothing is tracked.
