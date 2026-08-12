@@ -28,9 +28,11 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceControlMessage,
+    HordeProcessState,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -63,12 +65,14 @@ def _budget_on_scheduler(
     *,
     process_map: ProcessMap | None = None,
     horde_model_map: HordeModelMap | None = None,
+    legacy_comfy_vram_unload: bool = False,
 ) -> InferenceScheduler:
     """A scheduler with the VRAM budget active and the governor unsampled (defaults to HEALTHY)."""
     bridge_data = make_mock_bridge_data(
         enable_vram_budget=True,
         vram_reserve_mb=2048,
         ram_reserve_mb=4096,
+        legacy_comfy_vram_unload=legacy_comfy_vram_unload,
     )
     return _make_inference_scheduler(
         job_tracker=job_tracker,
@@ -454,6 +458,448 @@ async def test_idle_retained_resident_is_evicted_on_demand_for_a_cross_model_hea
     process_a.loaded_horde_model_name = None
     remaining = scheduler.build_reclaim_ladder_candidates(None)
     assert 1 not in {resident.process_id for resident in remaining.idle_residents}
+
+
+async def test_sibling_retained_resident_is_charged_and_can_deny_the_static_fit(monkeypatch) -> None:  # noqa: ANN001
+    """Weights another slot holds under an earlier grant are charged against this grant's static fit.
+
+    Retention is cumulative: a granted model stays on the card until an eviction actuates, so a later
+    grant's sampling peak has to fit beside it. A fit that counts only live contexts prices each grant as
+    if it were the only one, and a run of grants across sibling slots then sums past the card.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    sibling.retained_resident_model = _OTHER_MODEL
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+
+    def peak_8258(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+        return Mock(fits=False, predicted_mb=8258.0, reserve_mb=4096.0)
+
+    scheduler._vram_budget.check_job = peak_8258  # type: ignore[method-assign]
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    # 16375 - 2030 (sibling context) - 6800 (sibling's retained weights) leaves 7545MB, under the 8258 peak.
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+async def test_static_fit_grants_when_the_sibling_retains_nothing(monkeypatch) -> None:  # noqa: ANN001
+    """The same geometry grants once the sibling holds no retained weights: only the context is charged."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+
+    def peak_8258(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+        return Mock(fits=False, predicted_mb=8258.0, reserve_mb=4096.0)
+
+    scheduler._vram_budget.check_job = peak_8258  # type: ignore[method-assign]
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_same_model_re_grant_does_not_charge_its_own_retained_weights(monkeypatch) -> None:  # noqa: ANN001
+    """A same-model streak's re-grant charges nothing for the weights it is reusing.
+
+    The retained weights and the dispatched job's weights are the same bytes; double-charging them would
+    deny exactly the case retention exists to serve.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _MODEL
+    seen_free: list[float] = []
+
+    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+        seen_free.append(free_vram_mb)
+        return Mock(fits=True, predicted_mb=None, reserve_mb=0.0)
+
+    scheduler._vram_budget.check_job = record_check  # type: ignore[method-assign]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+    assert seen_free == [float(_TOTAL_VRAM_MB)]
+
+
+async def test_own_cross_model_retained_resident_is_charged(monkeypatch) -> None:  # noqa: ANN001
+    """A slot's own retained weights for a *different* model are still on the card and are charged."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _OTHER_MODEL
+    seen_free: list[float] = []
+
+    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+        seen_free.append(free_vram_mb)
+        return Mock(fits=True, predicted_mb=None, reserve_mb=0.0)
+
+    scheduler._vram_budget.check_job = record_check  # type: ignore[method-assign]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+    assert seen_free == [float(_TOTAL_VRAM_MB) - 6800.0]
+
+
+async def test_unpriceable_retained_resident_denies_retention(monkeypatch) -> None:  # noqa: ANN001
+    """A tracked resident whose footprint cannot be estimated denies the grant rather than charging zero."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: None)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _OTHER_MODEL
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+def _record_retention_reasons(scheduler: InferenceScheduler) -> list[str]:
+    """Capture the reason text of every retention verdict the scheduler emits."""
+    reasons: list[str] = []
+
+    def capture(model, process_with_model, *, granted, reason):  # noqa: ANN001, ANN202
+        reasons.append(reason)
+
+    scheduler._log_retention_decision = capture  # type: ignore[method-assign]
+    return reasons
+
+
+async def test_retention_decision_reports_the_retained_charge(monkeypatch) -> None:  # noqa: ANN001
+    """The grant/denial verdict carries the retained-resident charge, so it names what held the card."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _OTHER_MODEL
+    scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+        return_value=Mock(fits=True, predicted_mb=1000.0, reserve_mb=0.0),
+    )
+    reasons = _record_retention_reasons(scheduler)
+
+    scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None)
+
+    assert any("retained residents 6800MB" in reason for reason in reasons)
+
+
+async def test_retention_decision_omits_a_zero_retained_charge() -> None:
+    """With nothing retained the verdict keeps its existing composition; the charge is not reported as zero."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    reasons = _record_retention_reasons(scheduler)
+
+    scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None)
+
+    assert len(reasons) == 1
+    assert "retained residents" not in reasons[0]
+
+
+def test_granted_completion_records_the_retained_resident() -> None:
+    """A job dispatched with a grant leaves its model recorded as this slot's retained resident."""
+    process_info = make_mock_process_info(_PROCESS_ID, model_name=_MODEL)
+    process_info.note_retention_grant(_MODEL)
+
+    process_info.settle_retention_after_job()
+
+    assert process_info.retained_resident_model == _MODEL
+    assert process_info.retention_granted_model is None
+
+
+def test_ungranted_completion_clears_the_retained_resident() -> None:
+    """An ungranted job ends with the explicit evictor returning the card, so the slot retains nothing."""
+    process_info = make_mock_process_info(_PROCESS_ID, model_name=_MODEL)
+    process_info.retained_resident_model = _MODEL
+    process_info.note_retention_grant(None)
+
+    process_info.settle_retention_after_job()
+
+    assert process_info.retained_resident_model is None
+
+
+def test_granted_completion_for_another_model_replaces_the_retained_resident() -> None:
+    """A granted job for a different model replaces what the slot is recorded as holding."""
+    process_info = make_mock_process_info(_PROCESS_ID, model_name=_OTHER_MODEL)
+    process_info.retained_resident_model = _MODEL
+    process_info.note_retention_grant(_OTHER_MODEL)
+
+    process_info.settle_retention_after_job()
+
+    assert process_info.retained_resident_model == _OTHER_MODEL
+
+
+def test_process_death_clears_the_retained_resident() -> None:
+    """A dead slot's device weights go with it, so it is no longer charged or evicted as a resident."""
+    process_info = make_mock_process_info(_PROCESS_ID, model_name=_MODEL)
+    process_info.retained_resident_model = _MODEL
+    process_map = ProcessMap({_PROCESS_ID: process_info})
+
+    process_map.on_process_ending(_PROCESS_ID)
+
+    assert process_info.retained_resident_model is None
+
+
+async def test_ladder_unload_clears_the_retained_resident() -> None:
+    """The reclaim ladder's idle-model unload takes the slot out of the retained-resident set."""
+    job_tracker = JobTracker()
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _MODEL
+
+    assert scheduler.unload_idle_model(_PROCESS_ID) is True
+    assert process_info.retained_resident_model is None
+
+
+async def test_paging_reclaim_clears_the_retained_resident() -> None:
+    """The demand-paging rising edge reclaims through the ladder actuator, clearing the residency record."""
+    job_tracker = JobTracker()
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _MODEL
+
+    paging_pid = process_info.os_pid
+    assert paging_pid is not None
+    scheduler.note_wddm_paging({paging_pid: 900.0}, active=True)
+
+    assert process_info.retained_resident_model is None
+
+
+async def test_cross_model_dispatch_evicts_the_retained_resident_first() -> None:
+    """A dispatch for a different model returns the retained weights to the card before the new load.
+
+    Without this the slot carries both models' weights through the job, which is the overcommit the
+    static fit cannot price away once it has already happened.
+    """
+    job_tracker = JobTracker()
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _OTHER_MODEL
+
+    assert scheduler.evict_retained_resident_for_model_change(process_info, _MODEL) is True
+    assert process_info.retained_resident_model is None
+    sent = process_info.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
+    assert sent.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+    assert sent.horde_model_name == _OTHER_MODEL
+
+
+async def test_same_model_dispatch_does_not_evict_the_retained_resident() -> None:
+    """A same-model dispatch keeps the retained weights: reusing them is the whole saving."""
+    job_tracker = JobTracker()
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    process_info.retained_resident_model = _MODEL
+
+    assert scheduler.evict_retained_resident_for_model_change(process_info, _MODEL) is False
+    assert process_info.retained_resident_model == _MODEL
+    process_info.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def test_legacy_comfy_unload_denies_retention_with_its_own_reason() -> None:
+    """The legacy regime denies every grant, named as such: the child unloads below anything a grant reaches."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker, legacy_comfy_vram_unload=True)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    reasons = _record_retention_reasons(scheduler)
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+    assert any("legacy_comfy_vram_unload" in reason for reason in reasons)
+
+
+async def test_legacy_regime_records_no_retained_resident_across_a_dispatch() -> None:
+    """Through a full dispatch and completion under the legacy regime the slot is never tracked as retaining.
+
+    The tracking is what later dispatches wait on and are charged for, so a phantom entry for weights the
+    child has already unloaded would hold and price the card against memory that is free.
+    """
+    job = make_job_pop_response(model=_MODEL)
+    job_tracker = JobTracker()
+    await track_popped_job_async(job_tracker, job)
+    process_info = _dispatch_process()
+    process_info.last_process_state = HordeProcessState.PRELOADED_MODEL
+    scheduler = _budget_on_scheduler(
+        job_tracker,
+        process_map=ProcessMap({_PROCESS_ID: process_info}),
+        horde_model_map=_map_with_model_on_process(_MODEL, _PROCESS_ID),
+        legacy_comfy_vram_unload=True,
+    )
+
+    assert await scheduler.start_inference() is True
+    assert process_info.retention_granted_model is None
+
+    process_info.settle_retention_after_job()
+    assert process_info.retained_resident_model is None
+
+
+async def test_actuated_regime_records_the_grant_across_the_same_dispatch() -> None:
+    """The same dispatch with the hatch off does record the grant: the gate, not the geometry, is the change."""
+    job = make_job_pop_response(model=_MODEL)
+    job_tracker = JobTracker()
+    await track_popped_job_async(job_tracker, job)
+    process_info = _dispatch_process()
+    process_info.last_process_state = HordeProcessState.PRELOADED_MODEL
+    scheduler = _budget_on_scheduler(
+        job_tracker,
+        process_map=ProcessMap({_PROCESS_ID: process_info}),
+        horde_model_map=_map_with_model_on_process(_MODEL, _PROCESS_ID),
+    )
+
+    assert await scheduler.start_inference() is True
+    assert process_info.retention_granted_model == _MODEL
+
+    process_info.settle_retention_after_job()
+    assert process_info.retained_resident_model == _MODEL
+
+
+def _admission_scheduler(
+    *,
+    target_retains: str | None = None,
+    sibling_retains: str | None = None,
+    predicted_peak_mb: float,
+) -> tuple[InferenceScheduler, HordeProcessInfo, HordeProcessInfo]:
+    """A two-slot card whose dispatch target loads weights beside a sibling's tracked retained residents.
+
+    The static geometry: a 16376MB card, one sibling CUDA context at 2030MB, retained weights priced at
+    6800MB each, and a sampling peak the caller chooses to sit either side of what is left.
+    """
+    target = make_mock_process_info(_PROCESS_ID, model_name=None)
+    target.total_vram_mb = _TOTAL_VRAM_MB
+    target.retained_resident_model = target_retains
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=sibling_retains)
+    sibling.total_vram_mb = _TOTAL_VRAM_MB
+    sibling.retained_resident_model = sibling_retains
+    sibling.process_reserved_mb = 7000
+    horde_model_map = HordeModelMap(root={})
+    if sibling_retains is not None:
+        horde_model_map.update_entry(
+            sibling_retains,
+            load_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=_SIBLING_PROCESS_ID,
+        )
+    scheduler = _budget_on_scheduler(
+        JobTracker(),
+        process_map=ProcessMap({_PROCESS_ID: target, _SIBLING_PROCESS_ID: sibling}),
+        horde_model_map=horde_model_map,
+    )
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+    scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+        return_value=Mock(fits=False, predicted_mb=predicted_peak_mb, reserve_mb=4096.0),
+    )
+    return scheduler, target, sibling
+
+
+async def test_dispatch_beside_a_non_fitting_retained_resident_defers_and_evicts(monkeypatch) -> None:  # noqa: ANN001
+    """A load that cannot fit beside a sibling's retained weights holds, and asks for those weights back.
+
+    16376 total, less the sibling context (2030) and its retained weights (6800), leaves 7546MB: an 8258MB
+    sampling peak does not fit, so the dispatch is held rather than materialised into occupied memory.
+    """
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    scheduler, target, sibling = _admission_scheduler(sibling_retains=_OTHER_MODEL, predicted_peak_mb=8258.0)
+    job = make_job_pop_response(model=_MODEL)
+
+    assert scheduler._retained_resident_dispatch_holds(job, target) is True
+    assert sibling.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+    assert sibling.retained_resident_model is None
+    assert target.last_control_flag != HordeControlFlag.START_INFERENCE
+
+
+async def test_dispatch_stays_held_until_the_child_evidences_the_free(monkeypatch) -> None:  # noqa: ANN001
+    """The hold releases on the child's own post-free report, never on the eviction merely having been sent.
+
+    Retention tracking clears the instant the unload goes out, so a dispatch that trusted it would load into
+    memory the card has not returned yet. The child frees, then reports its fallen reservation; that report
+    is what admits the dispatch.
+    """
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    scheduler, target, sibling = _admission_scheduler(sibling_retains=_OTHER_MODEL, predicted_peak_mb=8258.0)
+    job = make_job_pop_response(model=_MODEL)
+
+    assert scheduler._retained_resident_dispatch_holds(job, target) is True
+    # Nothing has come back from the child yet: the room is owed, not returned.
+    assert scheduler._retained_resident_dispatch_holds(job, target) is True
+
+    sibling.process_reserved_mb = 200
+    assert scheduler._retained_resident_dispatch_holds(job, target) is False
+
+
+async def test_dispatch_that_fits_beside_the_retained_resident_proceeds_untouched(monkeypatch) -> None:  # noqa: ANN001
+    """A peak that fits beside the retained weights dispatches with no eviction: retention keeps its value."""
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    scheduler, target, sibling = _admission_scheduler(sibling_retains=_OTHER_MODEL, predicted_peak_mb=3000.0)
+    job = make_job_pop_response(model=_MODEL)
+
+    assert scheduler._retained_resident_dispatch_holds(job, target) is False
+    assert sibling.retained_resident_model == _OTHER_MODEL
+    sibling.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def test_dispatch_onto_the_retaining_slot_itself_is_not_double_evicted(monkeypatch) -> None:  # noqa: ANN001
+    """A cross-model dispatch onto a retaining slot keeps its own pre-load eviction and is not held for it.
+
+    Those weights are returned ahead of the same slot's START_INFERENCE, so charging them here would hold a
+    dispatch against a tenant that is already leaving, and evicting them here would ask for them twice.
+    """
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    scheduler, target, _sibling = _admission_scheduler(target_retains=_OTHER_MODEL, predicted_peak_mb=8258.0)
+    job = make_job_pop_response(model=_MODEL)
+
+    assert scheduler._retained_resident_dispatch_holds(job, target) is False
+    target.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
+
+    assert scheduler.evict_retained_resident_for_model_change(target, _MODEL) is True
+    assert target.pipe_connection.send.call_count == 1  # type: ignore[attr-defined]
+
+
+async def test_dispatch_onto_the_slot_retaining_this_model_loads_nothing(monkeypatch) -> None:  # noqa: ANN001
+    """Seating a job on the slot that already holds its weights materialises nothing, so nothing is held."""
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+    scheduler, target, sibling = _admission_scheduler(
+        target_retains=_MODEL,
+        sibling_retains=_OTHER_MODEL,
+        predicted_peak_mb=8258.0,
+    )
+    job = make_job_pop_response(model=_MODEL)
+
+    assert scheduler._retained_resident_dispatch_holds(job, target) is False
+    assert sibling.retained_resident_model == _OTHER_MODEL
 
 
 def test_inference_control_message_defaults_to_eviction() -> None:

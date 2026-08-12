@@ -1450,6 +1450,13 @@ class MessageDispatcher:
         # like the dispatch-in-flight owner of a *different* freshly dispatched job.
         if message.process_id in self._process_map:
             process_info = self._process_map[message.process_id]
+            # The job that just ended decides what the slot holds on the device next: a granted job leaves
+            # its model resident, an ungranted one ended with the explicit evictor returning the card. A
+            # result for a job the slot no longer owns is a late duplicate and must not resolve the grant
+            # belonging to whatever was dispatched after it.
+            owned_job = process_info.current_inference_job()
+            if owned_job is None or owned_job.id_ == message.sdk_api_job_info.id_:
+                process_info.settle_retention_after_job()
             process_info.current_inference_started_at = None
             process_info.current_first_step_at = None
             process_info.current_job_expected_sampling_seconds = None

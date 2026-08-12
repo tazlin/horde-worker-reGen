@@ -711,13 +711,51 @@ re-transfer.
 Retention is not routed through the arbiter, because holding already-materialized weights adds no new bytes
 to the card. It is instead a governed live gate that grants only when:
 
+- **Retention can actuate at all.** The `legacy_comfy_vram_unload` escape hatch restores the flag regime in
+  which the child's executor returns the card at the end of every prompt, below anything a grant reaches.
+  Every grant is denied there, so the parent never tracks (nor waits on, nor charges for) weights the child
+  has already unloaded.
 - **The card is healthy.** The device-free governor's committed state for the card is `HEALTHY`. A
   `PRESSURE` or `SATURATED` card is one the verified reclaim ladder is or may soon be reclaiming from, so it
   is handed no new resident to evict. This reads the one figure a WDDM driver cannot misreport under
   demand-paging (NVML device-free), so it holds precisely in the regime where measured free VRAM lies.
 - **The card statically fits the job.** The card's reported total (a constant the driver cannot misreport)
-  must absorb the job's sampling peak plus the reserve, after charging the sibling CUDA contexts and the
-  job's own post-processing that share the card while the weights are held.
+  must absorb the job's sampling peak plus the reserve, after charging the sibling CUDA contexts, the models
+  other slots are already holding resident under earlier grants, and the job's own post-processing that
+  share the card while the weights are held.
+
+Retention is cumulative, which is why the fit charges the residents it has already granted. Each grant
+leaves weights on the card until an eviction actuates, so the next grant's sampling peak has to fit beside
+them; a fit that counted only live contexts would price every grant as though it were the only one and let a
+run of grants across sibling slots sum past the card. The parent tracks what each inference slot retains
+(`HordeProcessInfo.retained_resident_model`, set from the dispatch verdict when the job's result arrives and
+cleared by every eviction actuation and at slot death), and charges each tracked resident at its full weight
+footprint. A slot's own retained model is charged only when it differs from the dispatched job's: a
+same-model streak's re-grant is reusing exactly those bytes. A tracked resident whose footprint cannot be
+estimated denies the grant rather than being charged zero.
+
+A retained resident is a dispatch destination, not only a charge. `loaded_horde_model_name` records that a
+slot has served a model, not that its weights are still there, so two slots can read as equally resident
+while only one carries the bytes; dispatch selection therefore prefers the slot that retains the model, and a
+same-model head whose retainer is busy waits for it rather than funding a second full copy that cannot fit
+beside the first. The wait is bounded by the same ttl-derived affinity budget the resident-bypass window
+uses, ends the moment the retention record clears, and lets other resident work bypass it meanwhile, so the
+card is never idled by it. Where a second copy does fit, nothing is held back.
+
+Dispatch admission charges the residents too. A dispatch that materializes weights is priced against every
+retained resident the card carries, not just the slot it lands on: on a non-fit the idle ones are evicted
+through the ladder's actuator and the job keeps its queue position until the child's own reports (a risen
+device-free reading, a fallen slot reservation, or the model map no longer placing those weights there)
+evidence the room is back, bounded so a child whose reports never arrive leaves the dispatch to the measured
+admission gate rather than parking the queue. The gate charges only *sibling* residents, because a
+cross-model dispatch onto a retaining slot already evicts that slot's own weights ahead of its
+`START_INFERENCE`; the two paths act on disjoint slots and never ask for the same weights twice.
+
+Model changes evict before they load. When a slot's next job is for a different model than the one it
+retains, the dispatch path sends that slot an explicit VRAM unload ahead of `START_INFERENCE` and clears its
+residency record, so the child frees the old weights before materializing the new ones instead of carrying
+both through the job. This is not left to the child's own free-view, which is untruthful under WDDM in
+exactly the regime double residency creates.
 
 No measured-floor veto and no sole-residency rule apply in this seam. The measured identity is the
 admission/dispatch gate's job; re-imposing it on retention only reintroduces the never-fires problem via

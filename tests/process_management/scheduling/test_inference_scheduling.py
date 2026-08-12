@@ -2151,3 +2151,138 @@ class TestRestoreGraceIsGrantedForChurn:
 
         assert scheduler.whole_card_residency_grace_active() is True
         assert scheduler._whole_card_ledger.state_for(None).restore_at != 0.0
+
+
+class TestRetentionAffinityDispatch:
+    """Dispatch routing when a busy slot still holds the head's model on the device.
+
+    ``loaded_horde_model_name`` records that a slot has served a model, not that its weights are still
+    there, so two slots can read as equally resident while only one is carrying the bytes. Seating a
+    same-model successor on the other one funds a second full copy beside the retained one; where that copy
+    does not fit, the head waits for the retaining slot instead, and other resident work keeps the card fed
+    meanwhile.
+    """
+
+    _MODEL = "retained_model"
+    _OTHER_MODEL = "other_model"
+    _TOTAL_VRAM_MB = 16376
+
+    def _card(
+        self,
+        *,
+        retainer_busy: bool,
+        predicted_peak_mb: float = 8258.0,
+        clock: Callable[[], float] | None = None,
+    ) -> tuple[InferenceScheduler, HordeProcessInfo, HordeProcessInfo, JobTracker]:
+        """Two slots that both name the model, only one of which retains its weights on the device.
+
+        16376MB total, less the sibling context (2030) and the retained weights (6800), leaves 7546MB for
+        the caller's chosen sampling peak. The retaining slot is registered second so the name-level
+        residency lookup would otherwise pick the slot that holds nothing.
+        """
+        retainer = make_mock_process_info(
+            1,
+            model_name=self._MODEL,
+            state=HordeProcessState.INFERENCE_STARTING if retainer_busy else HordeProcessState.WAITING_FOR_JOB,
+        )
+        retainer.total_vram_mb = self._TOTAL_VRAM_MB
+        retainer.retained_resident_model = self._MODEL
+        sibling = make_mock_process_info(2, model_name=self._MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        sibling.total_vram_mb = self._TOTAL_VRAM_MB
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(self._MODEL, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=1)
+        job_tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({2: sibling, 1: retainer}),
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=2048, ram_reserve_mb=4096),
+            max_concurrent=2,
+            max_inference=2,
+            clock=clock,
+        )
+        scheduler._overhead.set_marginal_overhead_mb(2030.0)
+        scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+            return_value=Mock(fits=False, predicted_mb=predicted_peak_mb, reserve_mb=4096.0),
+        )
+        return scheduler, retainer, sibling, job_tracker
+
+    @pytest.fixture(autouse=True)
+    def _priced_weights(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Price every model's resident weights at 6800MB so the fit turns on the geometry alone."""
+        monkeypatch.setattr(_sched_mod, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+
+    async def test_head_waits_for_the_busy_retainer_rather_than_funding_a_second_copy(self) -> None:
+        """A same-model head holds its queue position while the slot holding its weights is busy."""
+        scheduler, _retainer, sibling, job_tracker = self._card(retainer_busy=True)
+        await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
+
+        assert await scheduler.get_next_job_and_process() is None
+        assert sibling.last_control_flag != HordeControlFlag.START_INFERENCE
+
+    async def test_the_wait_names_the_busy_resident_slot(self) -> None:
+        """The waiting slot's wall clock is attributed to the resident slot being busy, not to a preload defer."""
+        scheduler, _retainer, _sibling, job_tracker = self._card(retainer_busy=True)
+        head = await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
+
+        bucket, reason = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is _sched_mod.SlotDutyBucket.RESIDENT_SLOT_BUSY
+        assert "process 1" in reason
+
+    async def test_a_fitting_second_copy_dispatches_without_waiting(self) -> None:
+        """Where the card can carry a second copy beside the retained one, nothing is held back."""
+        scheduler, _retainer, _sibling, job_tracker = self._card(retainer_busy=True, predicted_peak_mb=3000.0)
+        await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.process_with_model.process_id == 2
+
+    async def test_a_free_retainer_is_the_dispatch_destination(self) -> None:
+        """Once the retaining slot is free the job runs there, on the weights the card is already carrying."""
+        scheduler, _retainer, _sibling, job_tracker = self._card(retainer_busy=False)
+        await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.process_with_model.process_id == 1
+
+    async def test_the_wait_ends_when_its_budget_is_spent(self) -> None:
+        """The hold is bounded: past the ttl-derived budget the head takes the ordinary dispatch."""
+        scheduler, _retainer, _sibling, job_tracker = self._card(retainer_busy=True, clock=lambda: 100_000.0)
+        await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL), time_popped=0.0)
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.process_with_model.process_id == 2
+
+    async def test_the_wait_ends_when_the_retainer_stops_holding_the_weights(self) -> None:
+        """A retainer whose tracking clears (evicted, died) is no longer waited for."""
+        scheduler, retainer, _sibling, job_tracker = self._card(retainer_busy=True)
+        await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
+        retainer.clear_retained_resident()
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.process_with_model.process_id == 2
+
+    async def test_other_resident_work_still_fills_the_idle_slot_during_the_wait(self) -> None:
+        """The wait funds no fresh copy, so it does not idle the card: distinct resident work runs past it."""
+        scheduler, _retainer, _sibling, job_tracker = self._card(retainer_busy=True)
+        other_process = make_mock_process_info(3, model_name=self._OTHER_MODEL)
+        other_process.total_vram_mb = self._TOTAL_VRAM_MB
+        scheduler._process_map[3] = other_process
+        await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
+        other_job = await track_popped_job_async(job_tracker, make_job_pop_response(model=self._OTHER_MODEL))
+
+        selected = await scheduler.get_next_job_and_process()
+
+        assert selected is not None
+        assert selected.next_job.id_ == other_job.id_
+        assert selected.process_with_model.process_id == 3
+        assert selected.line_skip is not None

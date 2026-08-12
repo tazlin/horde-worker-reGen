@@ -369,10 +369,13 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
     the lease leaves at one slot: because the lease brackets the diffusion model's VRAM load as well as the
     denoise loop, the incoming job's load otherwise serializes behind the outgoing job's denoise and the
     GPU idles through the handoff. The lease carries one extra permit the parent holds, so processes still
-    see exactly `gpu_sampling_lease_slots` denoise slots in steady state; when the outgoing sampler nears
-    the end of its loop and a staged sibling is primed and waiting, and the card measurably has room with
-    the driver not demand-paging, the parent hands the permit over for one handoff window so the sibling
-    begins sampling before the outgoing job finishes. The parent takes the permit back the moment the
+    see exactly `gpu_sampling_lease_slots` denoise slots in steady state; when the outgoing sampler's
+    estimated remaining seconds drop to the incoming child's measured load estimate (plus a small pad), a
+    staged sibling is primed and waiting, and the card measurably has room with the driver not
+    demand-paging, the parent hands the permit over for one handoff window so the sibling begins its load
+    and sampling inside the outgoing job's tail. Ticks where the handoff is applicable but does not fire
+    are tallied by denial reason on the duty-cycle summary line, so a starved handoff is visible with its
+    binding clause rather than only as missing overlap. The parent takes the permit back the moment the
     outgoing sampler leaves its loop, restoring the steady-state slot count. It shrinks the inter-sampling
     gap without paying for sustained concurrent denoise, so it is the right shape even on no-MPS hardware;
     disable it only to restore the strict per-slot denoise gate.

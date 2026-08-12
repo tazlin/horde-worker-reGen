@@ -117,6 +117,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     ResolutionBucket,
 )
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
     ActiveSampler,
     ClearanceInputs,
     ClearanceWaiter,
@@ -513,6 +514,15 @@ anchored at ``time_popped`` and the job's own ttl, closes that gap independently
 below the affinity budget fraction so the head reclaims its slot with enough of the ttl left for its own
 staging, sampling, and submission."""
 
+_RETENTION_EVICTION_CONFIRMATION_PASSES = 3
+"""Scheduling passes a dispatch waits for its own retention eviction to be evidenced at the device.
+
+A child frees before it reports, so a dispatch that trusted the request rather than the report would load into
+memory the card has not returned. Waiting on the evidence costs a tick or two, which is what the reload it
+prevents would have cost many times over. The bound is what keeps that wait from becoming a wedge: a child
+whose reports never arrive leaves the dispatch to the measured admission gate, which prices it against device
+truth every pass, rather than parking the queue on evidence that is not coming."""
+
 _SAFETY_RECOVERY_HOLD_TTL_SECONDS = 120.0
 """How long the safety-recovery admission hold may keep new preloads off a saturated card while the safety
 pool crash-loops before it releases. The hold exists to let the card drain so a deferred safety GPU start can
@@ -663,6 +673,27 @@ class _MaterializationOutcome:
     device_index: int | None
     actuations_requested: tuple[ActuatorCommand, ...]
     actuations_applied: tuple[ActuatorCommand, ...]
+
+
+@dataclass
+class _PendingRetentionEviction:
+    """A retained resident whose eviction a dispatch issued and is still waiting to see land on the card.
+
+    Retention tracking clears the instant the unload is sent, but the bytes come back only when the child has
+    actually freed them. Holding the issuing dispatch against this record is what stops it racing its own
+    eviction: it carries the card's free reading and the slot's reported reservation as they stood when the
+    unload went out, so the child's post-free reports are what release the hold.
+
+    The wait is bounded by :data:`_RETENTION_EVICTION_CONFIRMATION_PASSES` scheduling passes. Evidence is
+    preferred, but an absence of evidence must never park the queue: past the bound the record is dropped and
+    the measured admission gate, which prices every dispatch against device truth on each pass, is what stands
+    between the job and the card.
+    """
+
+    model: str
+    reserved_baseline_mb: float | None
+    device_free_baseline_mb: float | None
+    passes_waited: int = 0
 
 
 def _preload_outcome_from_admission(decision: AdmissionDecision) -> _PreloadJobOutcome:
@@ -1135,6 +1166,11 @@ class InferenceScheduler:
         # :meth:`wddm_paging_victim_shared_mb_by_pid`.
         self._wddm_paging_victims_shared_mb_by_pid: dict[int, float] = {}
         self._wddm_paging_victims_updated_monotonic: float = 0.0
+        # Retention evictions this dispatch path issued, keyed by the slot they were sent to, kept until the
+        # child's own post-free reports evidence the room is back. A dispatch that made room for itself waits
+        # on these rather than on the tracking it just cleared.
+        self._pending_retention_evictions: dict[int, _PendingRetentionEviction] = {}
+
         # Edge-log throttle for the post-processing/sampling time-slice hold on dispatch.
         self._pp_mutex_hold_logged: bool = False
         # Edge-log throttle for a dispatch admitted via the measured-truth co-residency path that the
@@ -3581,6 +3617,12 @@ class InferenceScheduler:
         (:meth:`_log_dispatch_stall_if_needed`), which prints them alongside the parked-seconds count.
         """
         process = self._resident_process_for_job(head)
+        # Mirror dispatch's retention affinity: where a busy slot holds the head's model on the device and a
+        # second copy does not fit beside it, that slot is the head's destination, so the wait is named as the
+        # resident slot being busy rather than as a preload defer.
+        retention_retainer = self._retention_affinity_retainer(head, process)
+        if retention_retainer is not None:
+            process = retention_retainer
         if process is None:
             if head.model is not None and self._horde_model_map.is_model_loading(head.model):
                 return (
@@ -3636,9 +3678,14 @@ class InferenceScheduler:
                 "its model is not resident and no preload has been attempted for it this cycle"
             )
         if not process.can_accept_job():
+            retained_detail = (
+                " and holds the model's weights on the device, which a second copy cannot fit beside"
+                if process.retained_resident_model == head.model
+                else ""
+            )
             return SlotDutyBucket.RESIDENT_SLOT_BUSY, (
                 f"its model is resident on process {process.process_id}, but that process is busy "
-                f"({process.last_process_state.name})"
+                f"({process.last_process_state.name}){retained_detail}"
             )
 
         # Resident on an idle process: the interesting case. Name the gate that is holding dispatch.
@@ -3739,6 +3786,18 @@ class InferenceScheduler:
                 f"its model is resident and idle on process {process.process_id}, but dispatch is held to "
                 "reconcile residency (evicting idle VRAM): its materialisation would over-commit the card until "
                 "an idle resident is evicted, and it dispatches once that eviction frees room"
+            )
+
+        # The same reconciliation in the retention direction: weights a sibling slot holds across jobs occupy
+        # the card this head would load into, so the head waits for them to be returned. Read through the
+        # gate's own read-only predicate (naming a wait must never evict anything), and bounded by the
+        # confirmation window, so this too is a self-clearing wait rather than the gate-less stall below.
+        if self._retained_resident_hold_applies(head, process):
+            return SlotDutyBucket.RESIDENCY_RECONCILIATION, (
+                f"its model is resident and idle on process {process.process_id}, but dispatch is held to "
+                "reconcile residency (returning retained weights): a sibling slot holds model weights across "
+                "jobs that this job's materialisation cannot fit beside, and it dispatches once the card gives "
+                "them back"
             )
 
         return SlotDutyBucket.UNEXPLAINED, (
@@ -5440,6 +5499,29 @@ class InferenceScheduler:
 
         return 0.0
 
+    def _remaining_sampling_seconds(self, process_info: HordeProcessInfo) -> float | None:
+        """Estimated wall seconds left in a process's denoise loop, or None while no rate can be trusted.
+
+        The rate is taken from data the child already reports: its step position and the timestamp of its
+        first step, so the estimate is the job's own average step time extrapolated over the steps it has
+        left. Withheld until the job is at least :data:`TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE` through and
+        has advanced past its first step, because a rate measured across one step is dominated by the one-off
+        cost of entering the loop and would read far slower than the job really is.
+        """
+        total_steps = process_info.last_total_steps
+        current_step = process_info.last_current_step
+        first_step_at = process_info.current_first_step_at
+        if total_steps is None or current_step is None or first_step_at is None or total_steps <= 0:
+            return None
+        if current_step >= total_steps:
+            return 0.0
+        if current_step < 2 or (current_step / total_steps) < TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE:
+            return None
+        elapsed = self._clock() - first_step_at
+        if elapsed <= 0.0:
+            return None
+        return (total_steps - current_step) * (elapsed / current_step)
+
     def _in_flight_progress_fraction(self, job: ImageGenerateJobPopResponse) -> float:
         """How far along the in-flight job's sampling is, in ``[0.0, 1.0]``.
 
@@ -5459,8 +5541,10 @@ class InferenceScheduler:
         clear it into its load-and-sample window. A child inside its denoise loop
         (:attr:`HordeProcessState.INFERENCE_STARTING`) is an active sampler. The controller owns each child's
         grant state and derives the held-slot count and tail-overlap sampler from these populations plus the
-        measured free/reserve/paging truth. Waiter priority is dispatch order (earlier-dispatched first), so
-        queue position decides who samples next; the process id breaks ties deterministically.
+        measured free/reserve/paging truth. Each sampler additionally carries its estimated remaining sampling
+        seconds and the card carries the measured median weight-upload cost, the two quantities the handoff
+        window is sized from. Waiter priority is dispatch order (earlier-dispatched first), so queue position
+        decides who samples next; the process id breaks ties deterministically.
         """
         waiters: list[ClearanceWaiter] = []
         samplers: list[ActiveSampler] = []
@@ -5490,6 +5574,7 @@ class InferenceScheduler:
                         process_id=process_info.process_id,
                         job_id=str(referenced.id_),
                         progress_fraction=self._progress_fraction_of_process(process_info),
+                        remaining_sampling_seconds=self._remaining_sampling_seconds(process_info),
                     ),
                 )
         return ClearanceInputs(
@@ -5498,6 +5583,7 @@ class InferenceScheduler:
             device_free_mb=self._measured_device_free_mb(device_index),
             vram_reserve_mb=self._vram_budget.reserve_mb,
             paging_active=self._wddm_paging_active,
+            incoming_load_seconds=self._process_map.recent_vram_load_seconds(device_index),
         )
 
     def clearance_admit_process(self, process_id: int) -> bool:
@@ -7748,10 +7834,249 @@ class InferenceScheduler:
         ):
             return False
         process_info.clear_job_references()
+        process_info.clear_retained_resident()
         process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         self._record_churn("vram_eviction")
         logger.info(f"Reclaim ladder: unloading model {model_name} from VRAM on idle process {process_id}")
         return True
+
+    def evict_retained_resident_for_model_change(
+        self,
+        process_info: HordeProcessInfo,
+        dispatched_model: str,
+    ) -> bool:
+        """Return a slot's retained weights to the card before it loads a different model; True if issued.
+
+        Retention leaves a model on the device with no pending eviction, so a dispatch for a different
+        model onto the same slot would materialise the new weights beside the old ones and leave the card
+        carrying both. The unload is issued on the same pipe ahead of START_INFERENCE, so the child frees
+        before it loads, and the parent's residency record is cleared with it. This is deliberately not
+        left to the child's own free-view: under WDDM that view is untruthful in exactly the regime the
+        double residency creates.
+
+        A same-model dispatch is the retention case proper and is left alone: those weights are what the
+        successor reuses, which is the whole saving.
+        """
+        retained_model = process_info.retained_resident_model
+        if retained_model is None or retained_model == dispatched_model:
+            return False
+        if not process_info.safe_send_message(
+            HordeControlModelMessage(
+                control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
+                horde_model_name=retained_model,
+            ),
+        ):
+            return False
+        process_info.clear_retained_resident()
+        self._record_churn("vram_eviction")
+        logger.info(
+            f"Evicting retained model {retained_model} from VRAM on process {process_info.process_id} "
+            f"before it loads {dispatched_model}",
+        )
+        return True
+
+    def _retained_resident_dispatch_holds(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
+        """Whether this dispatch must wait for sibling retained weights to leave the card before it loads.
+
+        A dispatch that materialises weights is priced against every retained resident the card carries, not
+        just against the slot it lands on: weights another slot holds across jobs are as real a tenant as a
+        sampling peak, and nothing else in the dispatch path consults them. Where the load does not fit beside
+        them, the idle ones are evicted through the reclaim actuator and the dispatch holds its queue position
+        until the child's own reports evidence the room is back. Holding on that evidence rather than on the
+        eviction being *issued* is the point: the tracking clears the moment the unload is sent, so a dispatch
+        that trusted it would load into memory still occupied by the copy it just asked for back.
+
+        The slot's own retained weights are not charged here: a cross-model dispatch onto a retaining slot is
+        already evicted ahead of its START_INFERENCE (:meth:`evict_retained_resident_for_model_change`), so
+        charging them would hold a dispatch against a tenant that leaves before the load. The two paths act on
+        disjoint slots and never evict the same weights twice.
+
+        A dispatch onto the slot that already retains this model loads nothing and is never held.
+        """
+        device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        self._prune_confirmed_retention_evictions()
+        if not self._retained_resident_hold_applies(next_job, process_with_model):
+            return False
+        if self._retention_eviction_pending(device_index):
+            self._note_retention_dispatch_hold(next_job, reclaiming=True)
+            return True
+        reclaiming = self._evict_retained_residents_for_dispatch(process_with_model, device_index=device_index)
+        self._note_retention_dispatch_hold(next_job, reclaiming=reclaiming)
+        return True
+
+    def _retained_resident_hold_applies(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
+        """Whether this dispatch cannot yet load beside the card's retained residents. Read-only.
+
+        The condition :meth:`_retained_resident_dispatch_holds` acts on, without the actuation: an eviction
+        this path issued that the card has not evidenced yet, or a load that does not fit beside the weights
+        sibling slots hold across jobs. The stall diagnostic reads it to name the wait, so the gate and the
+        attribution can never disagree about whether a head is parked here, and naming a wait never evicts
+        anything.
+        """
+        model = next_job.model
+        if model is None:
+            return False
+        device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        if self._retention_eviction_pending(device_index):
+            return True
+        if process_with_model.retained_resident_model == model:
+            return False
+        if not self._card_has_sibling_retained_resident(process_with_model, device_index=device_index):
+            # No weights are being held across jobs on this card, so this gate has nothing to price. Every
+            # other admission concern belongs to the gates that already ran.
+            return False
+        return (
+            self._fits_beside_retained_residents(
+                next_job,
+                target=process_with_model,
+                device_index=device_index,
+                include_target_retained=False,
+            )
+            is False
+        )
+
+    def _card_has_sibling_retained_resident(
+        self,
+        target: HordeProcessInfo,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether a slot other than ``target`` is holding weights on this card between jobs."""
+        for process_info in self._process_map.values():
+            if process_info.process_id == target.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.retained_resident_model is not None:
+                return True
+        return False
+
+    def _evict_retained_residents_for_dispatch(
+        self,
+        target: HordeProcessInfo,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Return idle siblings' retained weights to the card for ``target``'s load; True if any unload issued.
+
+        Routed through the reclaim ladder's own single-slot actuator, so the eviction the dispatch needs is
+        the same actuation every other owner performs. A retainer that is busy is left alone: its weights go
+        back when its job ends, and the dispatch simply keeps holding until they do.
+        """
+        issued = False
+        for process_info in list(self._process_map.values()):
+            if process_info.process_id == target.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            retained_model = process_info.retained_resident_model
+            if retained_model is None or not process_info.can_accept_job():
+                continue
+            reserved_baseline_mb = (
+                float(process_info.process_reserved_mb) if process_info.process_reserved_mb is not None else None
+            )
+            if self.unload_idle_model(process_info.process_id, device_index):
+                self._pending_retention_evictions[process_info.process_id] = _PendingRetentionEviction(
+                    model=retained_model,
+                    reserved_baseline_mb=reserved_baseline_mb,
+                    device_free_baseline_mb=self._measured_free_vram_mb(device_index=device_index),
+                )
+                issued = True
+        return issued
+
+    def _prune_confirmed_retention_evictions(self) -> None:
+        """Drop the pending retention evictions the card has evidenced, leaving only the unlanded ones.
+
+        A child frees first and reports after: it sends a fresh memory report as soon as its allocator
+        reservation falls, and a model-state change moving the model out of device residency. A risen device
+        free reading, a fallen slot reservation, the map no longer placing those weights on that slot, the
+        slot no longer naming the model, or the slot being gone all evidence that the room is back.
+
+        Absent every one of them the record is kept for
+        :data:`_RETENTION_EVICTION_CONFIRMATION_PASSES` passes and then dropped: evidence is preferred, but a
+        child whose reports never arrive must not park the queue on evidence that is not coming.
+        """
+        for process_id, pending in list(self._pending_retention_evictions.items()):
+            process_info = self._process_map.get(process_id)
+            if process_info is None or process_info.loaded_horde_model_name != pending.model:
+                del self._pending_retention_evictions[process_id]
+                continue
+            reserved_mb = process_info.process_reserved_mb
+            if (
+                pending.reserved_baseline_mb is not None
+                and reserved_mb is not None
+                and float(reserved_mb) < pending.reserved_baseline_mb
+            ):
+                del self._pending_retention_evictions[process_id]
+                continue
+            device_free_mb = self._measured_free_vram_mb(
+                device_index=process_info.device_index if self._multi_gpu_routing_active else None,
+            )
+            if (
+                pending.device_free_baseline_mb is not None
+                and device_free_mb is not None
+                and device_free_mb > pending.device_free_baseline_mb
+            ):
+                del self._pending_retention_evictions[process_id]
+                continue
+            model_info = self._horde_model_map.root.get(pending.model)
+            map_places_weights_here = (
+                model_info is not None
+                and model_info.process_id == process_id
+                and model_info.horde_model_load_state
+                in (
+                    ModelLoadState.LOADED_IN_VRAM,
+                    ModelLoadState.IN_USE,
+                )
+            )
+            if not map_places_weights_here:
+                del self._pending_retention_evictions[process_id]
+                continue
+            pending.passes_waited += 1
+            if pending.passes_waited >= _RETENTION_EVICTION_CONFIRMATION_PASSES:
+                logger.debug(
+                    f"Retention eviction of {pending.model} on process {process_id} went unevidenced for "
+                    f"{pending.passes_waited} passes; the dispatch waiting on it now stands on the measured "
+                    "admission gate alone.",
+                )
+                del self._pending_retention_evictions[process_id]
+
+    def _retention_eviction_pending(self, device_index: int | None) -> bool:
+        """Whether a retention eviction issued for this card has not yet been evidenced at the device."""
+        for process_id in self._pending_retention_evictions:
+            process_info = self._process_map.get(process_id)
+            if process_info is None:
+                continue
+            if device_index is None or process_info.device_index == device_index:
+                return True
+        return False
+
+    def _note_retention_dispatch_hold(self, next_job: ImageGenerateJobPopResponse, *, reclaiming: bool) -> None:
+        """Disclose (throttled) that a dispatch is waiting for retained weights to come back off the card."""
+        suppressed = self._scheduler_diagnostic_suppressed_count(
+            "retained_resident_dispatch_hold",
+            (str(next_job.id_), reclaiming),
+        )
+        if suppressed is None:
+            return
+        detail = (
+            "idle retained weights are being returned to the card"
+            if reclaiming
+            else "waiting for the retained weights already asked back to leave the device"
+        )
+        logger.opt(colors=True).info(
+            "<fg #f0beff>Holding dispatch of {} until the card's retained residents fit beside it: {}.</>",
+            next_job.model,
+            detail,
+        )
 
     def reclaim_idle_resident_for_post_processing(self, *, device_index: int | None = None) -> str | None:
         """Unload the coldest idle resident model's VRAM to make room for a post-processing peak; return its name.
@@ -8490,11 +8815,16 @@ class InferenceScheduler:
         Pinned disaggregation-sampler lanes are excluded by default (a dispatch may never land on a pinned
         lane). ``include_reserved=True`` includes them, for the residency and pricing queries that must see a
         model's weights even where they sit on a lane no job may be dispatched onto yet.
+
+        A free slot that holds the model's *retained* weights wins over any other resident candidate. Both
+        record the model as loaded, but only the retainer still has it on the device, so seating the job
+        anywhere else pays a full RAM->VRAM re-upload for weights the card already carries.
         """
         if job.model is None:
             return None
         if not self._multi_gpu_routing_active:
-            return self._process_map.get_process_by_horde_model_name(job.model, include_reserved=include_reserved)
+            resident = self._process_map.get_process_by_horde_model_name(job.model, include_reserved=include_reserved)
+            return self._prefer_free_retainer(job.model, resident, include_reserved=include_reserved)
         allowed = self._eligible_card_indices(job)
         candidates = self._process_map.get_processes_by_horde_model_name(
             job.model,
@@ -8503,7 +8833,99 @@ class InferenceScheduler:
         )
         if not candidates:
             return None
-        return self._pick_best_resident_process(candidates)
+        free_retainers = [
+            candidate
+            for candidate in candidates
+            if candidate.retained_resident_model == job.model and candidate.can_accept_job()
+        ]
+        return self._pick_best_resident_process(free_retainers or candidates)
+
+    def _prefer_free_retainer(
+        self,
+        model: str,
+        resident: HordeProcessInfo | None,
+        *,
+        include_reserved: bool,
+    ) -> HordeProcessInfo | None:
+        """Swap a resident-by-name choice for a free slot that holds ``model``'s retained weights, if one exists.
+
+        ``loaded_horde_model_name`` records that a slot has served a model, not that its weights are still on
+        the device; the retention record is the parent's device-level truth. Where the two name different
+        slots, the retaining one is the dispatch destination.
+        """
+        if resident is None or resident.retained_resident_model == model:
+            return resident
+        for process_info in self._process_map.values():
+            if process_info.retained_resident_model != model or process_info.loaded_horde_model_name != model:
+                continue
+            if not include_reserved and self._process_map.is_reserved_for_disaggregation(process_info.process_id):
+                continue
+            if not process_info.can_accept_job():
+                continue
+            return process_info
+        return resident
+
+    def _retention_affinity_retainer(
+        self,
+        job: ImageGenerateJobPopResponse,
+        current_choice: HordeProcessInfo | None,
+    ) -> HordeProcessInfo | None:
+        """The busy slot holding ``job``'s model on the device that ``job`` must wait for, else None.
+
+        A same-model successor seated on any other slot funds a second full copy of weights the card is
+        already carrying. Where that copy does not fit beside the retained one, the head holds its queue
+        position for the retainer instead, on the pinned-lane precedent: the wait is not funding a fresh copy,
+        so it lets other resident work bypass it while the retainer finishes and becomes the destination.
+
+        The hold is bounded by the ttl-derived affinity budget and ends the moment the retention record clears
+        (an eviction, a death, a completed job that retained nothing). Falling through is safe rather than
+        merely tolerable: the dispatch admission gate then prices the fresh copy against the same residents.
+        A retainer that is free needs no wait, since ordinary dispatch already prefers it.
+        """
+        model = job.model
+        if model is None:
+            return None
+        if current_choice is not None and current_choice.retained_resident_model == model:
+            return None
+        allowed = self._eligible_card_indices(job) if self._multi_gpu_routing_active else None
+        for process_info in self._process_map.values():
+            if process_info.retained_resident_model != model:
+                continue
+            if allowed is not None and process_info.device_index not in allowed:
+                continue
+            if self._process_map.is_reserved_for_disaggregation(process_info.process_id):
+                continue
+            if process_info.can_accept_job():
+                continue
+            if self._retention_affinity_budget_spent(job):
+                return None
+            target = current_choice or self._select_preload_process(
+                job,
+                disallowed_processes=[process_info.process_id],
+            )
+            if target is None:
+                return None
+            device_index = process_info.device_index if self._multi_gpu_routing_active else None
+            if self._fits_beside_retained_residents(job, target=target, device_index=device_index) is False:
+                return process_info
+        return None
+
+    def _retention_affinity_budget_spent(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether a head has held for a retaining slot longer than the affinity budget allows.
+
+        Measured from the job's pop against the same ttl-derived budget the resident-bypass window uses, so a
+        head can never age out its deadline behind a retainer that is not releasing. A head whose wait cannot
+        be timed at all (no id, untracked, no pop time) counts as spent: an untimeable wait is the one shape
+        that could become unbounded, and falling through prices the fresh copy through dispatch admission.
+        """
+        job_id = job.id_
+        if job_id is None:
+            return True
+        tracked = self._job_tracker.get_tracked_job(job_id)
+        if tracked is None or tracked.time_popped is None:
+            return True
+        ttl = float(job.ttl) if job.ttl is not None else self._state.recent_job_ttl
+        return (self._clock() - tracked.time_popped) > affinity_budget_seconds(ttl)
 
     def _pinned_lane_resident_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The disaggregation-pinned lane holding ``job``'s model when that is the only resident copy, else None.
@@ -8709,6 +9131,13 @@ class InferenceScheduler:
                 return None
 
         process_with_model = self._resident_process_for_job(next_job)
+        # A slot busy with its own job may still be holding this model's weights on the device under an
+        # earlier retention grant. Seating the head anywhere else would load a second copy of those same
+        # weights; where that copy does not fit beside them, the retainer is the head's destination and the
+        # head waits for it (the busy-slot handling below keeps the card fed with other resident work).
+        retention_retainer = self._retention_affinity_retainer(next_job, process_with_model)
+        if retention_retainer is not None:
+            process_with_model = retention_retainer
         line_skip: LineSkip | None = None
 
         # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
@@ -8898,7 +9327,10 @@ class InferenceScheduler:
           demand-paging (NVML device-free), so it holds precisely in the regime measured free VRAM lies.
         - **Static fit**: the card's reported total VRAM must absorb this job's sampling peak plus the
           measurement noise buffer (and any committed in-flight reserves), after charging the sibling CUDA
-          contexts and the job's own post-processing that share the card while the weights are held. The margin
+          contexts, the models other slots are already holding resident under earlier grants, and the job's
+          own post-processing that share the card while the weights are held. Retention is cumulative: each
+          grant leaves weights on the card that the next grant's peak must fit beside, so a fit that counts
+          only contexts lets a run of grants sum past the card and hand the driver the overflow. The margin
           added on top of the peak is the admission noise buffer, not the operator's configured
           ``vram_reserve_mb``: that reserve is a sampling / co-residency headroom term, and enforcing it as a
           hard static-fit floor stacks it on an already activation-inclusive learned peak, denying retention on
@@ -8926,6 +9358,17 @@ class InferenceScheduler:
         """
         model = dispatched_job.model
         if model is None:
+            return False
+        if self._runtime_config.bridge_data.legacy_comfy_vram_unload is True:
+            # Under the legacy regime the child's executor returns the card at the end of every prompt, below
+            # anything the grant can suppress. Recording a grant there would have the parent track, wait on,
+            # and charge for weights that are no longer resident.
+            self._log_retention_decision(
+                model,
+                process_with_model,
+                granted=False,
+                reason="actuation disabled (legacy_comfy_vram_unload): the child unloads at end of prompt regardless",
+            )
             return False
         if not self._budget_active():
             return False
@@ -8961,7 +9404,21 @@ class InferenceScheduler:
                 reason="static: sibling contexts present but per-context overhead not yet measured",
             )
             return False
-        static_available_mb = total_vram_mb - static_charges_mb
+        retained_resident_mb = self._retained_resident_charges_mb(
+            dispatched_job,
+            model,
+            process_with_model=process_with_model,
+            device_index=device_index,
+        )
+        if retained_resident_mb is None:
+            self._log_retention_decision(
+                model,
+                process_with_model,
+                granted=False,
+                reason="static: a retained resident holds the card but its weight footprint is unpriceable",
+            )
+            return False
+        static_available_mb = total_vram_mb - static_charges_mb - retained_resident_mb
         static_verdict = self._vram_budget.check_job(
             dispatched_job,
             baseline,
@@ -8980,6 +9437,7 @@ class InferenceScheduler:
         noise_mb = admission_noise_buffer_mb(total_vram_mb)
         effective_available_mb = static_available_mb - committed_reserve_mb
         granted = predicted_mb is None or (predicted_mb + noise_mb) <= effective_available_mb
+        retained_detail = f", retained residents {retained_resident_mb:.0f}MB" if retained_resident_mb > 0 else ""
         self._log_retention_decision(
             model,
             process_with_model,
@@ -8987,7 +9445,7 @@ class InferenceScheduler:
             reason=(
                 f"static: peak {predicted_mb} + noise {noise_mb:.0f} vs {effective_available_mb:.0f}MB "
                 f"(total {total_vram_mb:.0f}MB minus sibling contexts, the job's own post-processing, and "
-                f"in-flight commitments)"
+                f"in-flight commitments{retained_detail})"
             ),
         )
         return granted
@@ -9062,6 +9520,124 @@ class InferenceScheduler:
                 charges_mb += max(0.0, own_post_processing_mb)
 
         return charges_mb
+
+    def _retained_resident_charges_mb(
+        self,
+        dispatched_job: ImageGenerateJobPopResponse,
+        dispatched_model: str,
+        *,
+        process_with_model: HordeProcessInfo,
+        device_index: int | None,
+        include_target_retained: bool = True,
+    ) -> float | None:
+        """VRAM (MB) of weights already held on the card by earlier retention grants.
+
+        A grant is not free after it is issued: the retained weights stay on the device until an eviction
+        actuates, so every later grant's sampling peak has to fit *beside* them. Charging only live CUDA
+        contexts prices the card as if each grant were the only one, which lets a run of grants across
+        sibling slots sum past the card total and leave the driver to demote the overflow.
+
+        Charged per slot at the model's full resident footprint (weights plus the text encoders and VAE the
+        engine force-loads), keyed on the baseline alone since weights do not scale with job shape:
+
+        - every *other* slot on this card whose retained model the parent is tracking;
+        - this slot's own retained model when it differs from the dispatched one, since those weights are
+          still on the card at the grant instant. A same-model re-grant charges nothing: the retained
+          weights and the dispatched job's weights are the same bytes, and the reuse is the point.
+
+        ``include_target_retained`` is False for a caller whose load is preceded by an eviction of this
+        slot's own retained weights (:meth:`evict_retained_resident_for_model_change`): those bytes are back
+        on the card before the load, so charging them would price a tenant that is already leaving.
+
+        Returns None when a tracked resident's footprint cannot be estimated: an unpriceable tenant denies
+        the grant rather than being waved through at zero, matching how unpriceable sibling contexts are
+        handled.
+        """
+        charges_mb = 0.0
+        for process_info in self._process_map.values():
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            retained_model = process_info.retained_resident_model
+            if retained_model is None:
+                continue
+            if process_info.process_id == process_with_model.process_id and (
+                retained_model == dispatched_model or not include_target_retained
+            ):
+                continue
+            # The footprint estimator keys on the baseline alone (weights do not scale with job shape);
+            # the job argument only satisfies its signature.
+            footprint_mb = predict_job_footprint_mb(
+                dispatched_job,
+                self._model_metadata.get_baseline(retained_model),
+            )
+            if footprint_mb is None:
+                return None
+            charges_mb += max(0.0, footprint_mb)
+        return charges_mb
+
+    def _fits_beside_retained_residents(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        target: HordeProcessInfo,
+        device_index: int | None,
+        include_target_retained: bool = True,
+    ) -> bool | None:
+        """Whether loading ``job``'s weights onto ``target`` fits the card beside every retained resident.
+
+        The static arithmetic of :meth:`_should_keep_model_resident`, asked in the other direction. A retained
+        resident is a priced occupant of the card, never a bystander a fresh load can race: the reported card
+        total (the one figure the driver cannot misreport while it is demand-paging), net of the sibling CUDA
+        contexts and the job's own post-processing, net of the weights other slots hold under earlier grants,
+        and net of the in-flight commitments, must absorb this job's sampling peak plus the admission noise
+        buffer. Where that fails, a second copy of the same weights (or a second model beside them) is what
+        the card is being asked to carry, which is the overcommit no later pricing can undo.
+
+        ``include_target_retained`` is passed through to :meth:`_retained_resident_charges_mb`.
+
+        Returns None when the fit cannot be judged on evidence: the budget is off, the card reported no total,
+        a sibling context or a tracked resident is unpriceable, or the job has no peak estimate. Callers treat
+        a None as no verdict and take their ordinary path, so this only ever acts on measurable arithmetic.
+        """
+        model = job.model
+        if model is None or not self._budget_active():
+            return None
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None:
+            return None
+        baseline = self._model_metadata.get_baseline(model)
+        static_charges_mb = self._retention_static_charges_mb(
+            job,
+            baseline,
+            process_with_model=target,
+            device_index=device_index,
+        )
+        if static_charges_mb is None:
+            return None
+        retained_resident_mb = self._retained_resident_charges_mb(
+            job,
+            model,
+            process_with_model=target,
+            device_index=device_index,
+            include_target_retained=include_target_retained,
+        )
+        if retained_resident_mb is None:
+            return None
+        committed_reserve_mb = self._committed_vram_reserve_mb(device_index=device_index)
+        static_available_mb = total_vram_mb - static_charges_mb - retained_resident_mb
+        static_verdict = self._vram_budget.check_job(
+            job,
+            baseline,
+            static_available_mb,
+            committed_reserve_mb=committed_reserve_mb,
+            disaggregated=self._is_disaggregation_class_eligible(job),
+        )
+        predicted_mb = static_verdict.predicted_mb
+        if predicted_mb is None:
+            return None
+        return (predicted_mb + admission_noise_buffer_mb(total_vram_mb)) <= (
+            static_available_mb - committed_reserve_mb
+        )
 
     def _coresident_lookahead_affordable(self, resident_model: str, *, device_index: int | None) -> bool:
         """Whether an idle resident copy of a queued model can coexist with the imminent job's sampling.
@@ -9755,6 +10331,9 @@ class InferenceScheduler:
             )
             process_with_model.loaded_horde_model_name = next_job.model
             process_with_model.loaded_horde_model_baseline = horde_model_baseline
+            # Carry the retention verdict on the slot: the completion path cannot see the dispatch decision,
+            # and it is what decides whether this job leaves its weights on the card.
+            process_with_model.note_retention_grant(next_job.model if keep_model_resident_after else None)
             # Optimistically mark the slot primed at dispatch (staging toward sampling, not yet in the
             # denoise loop); it advances to INFERENCE_STARTING on the first step. Keeps the slot readable
             # as busy-and-owning-the-job the instant START_INFERENCE is sent, before the child confirms.
@@ -10272,6 +10851,12 @@ class InferenceScheduler:
             # neither the preload nor the second-sampler admission consult.
             return False
 
+        if self._retained_resident_dispatch_holds(next_job, process_with_model):
+            # Weights another slot holds across jobs occupy the card this dispatch would load into. The job
+            # keeps its head-of-queue position while they are asked back, and dispatches once the card has
+            # evidenced the free rather than the moment the request went out.
+            return False
+
         # Every hold gate above is passed, so this dispatch is committed: advance the affinity skip window here
         # (never in get_next_job_and_process, which runs twice a cycle and must stay pure for information_only).
         # A resident_bypass skip is counted against the displaced head; a direct head dispatch (no line-skip)
@@ -10318,6 +10903,10 @@ class InferenceScheduler:
         # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
         # kept per card: a model unservable on a small card can still be advertised and run on a larger one.
         dispatched_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        # Evict before the load, not after: a slot holding another model under an earlier grant would
+        # otherwise carry both models' weights through this job. Ordered ahead of the retention verdict so
+        # the verdict prices the card the dispatch will actually run on.
+        self.evict_retained_resident_for_model_change(process_with_model, next_job.model)
         keep_model_resident_after = self._should_keep_model_resident(
             next_job,
             process_with_model=process_with_model,
@@ -10680,6 +11269,7 @@ class InferenceScheduler:
                         ),
                     )
                     process_info.clear_job_references()
+                    process_info.clear_retained_resident()
                     process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
                     unloaded_any = True
                     self._record_churn("vram_eviction")
@@ -10700,6 +11290,7 @@ class InferenceScheduler:
                             "Attempting to replace the process with a new one.",
                         )
                         self._process_lifecycle._replace_inference_process(process_info)
+                    process_info.clear_retained_resident()
                     process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
                     unloaded_any = True
 

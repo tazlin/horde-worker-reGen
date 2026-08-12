@@ -502,9 +502,15 @@ now the VRAM moment for a leased job. A clearance held for VRAM fit is attribute
 slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
 clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
 unpriced window once rather than ever wedging the pool. When `gpu_sampling_lease_tail_overlap` is set the
-controller clears one extra child early once the outgoing sampler passes 80% progress and measured free
-clears a margin, so the next sampling window opens before the current one closes (one early clear per
-outgoing sampler). With the lease disabled the whole-job inference semaphore is the sole denoise gate and
+controller clears one extra child early so the next sampling window opens before the current one closes
+(one early clear per outgoing sampler). The trigger is time-based: the early clear fires when the
+soonest-finishing sampler's estimated remaining seconds drop to the incoming child's measured
+RAM-to-VRAM load estimate plus a small pad, and measured free clears a margin. A progress-fraction
+trigger cannot do this job, because a fixed fraction opens a window whose width scales with the job's
+own duration, starving the handoff on exactly the fast jobs whose loads dominate their wall time. Every
+tick the handoff is applicable and does not fire records a denial reason (no staged waiter, paging,
+progress not yet estimable, remaining time above the window, headroom short), tallied on the duty-cycle
+summary line so a starved handoff names its binding clause. With the lease disabled the whole-job inference semaphore is the sole denoise gate and
 dispatch is the VRAM moment exactly as before.
 
 On a multi-GPU worker both this gate and the in-flight **count** cap (`_max_jobs_in_progress_allowed`) are
@@ -597,22 +603,22 @@ can statically afford that copy alongside the head-of-queue job's sampling peak;
 coexist, keeping the copy warm would force silent driver demand-paging during sampling, which costs far more
 than the one reload the protection saves.
 
-Underneath the scheduler's retention lever sits ComfyUI's own model management, and it has the final say on
-whether weights actually stay on the card. ComfyUI's *smart memory* keeps a just-used model resident in VRAM
-across executions; disabling it (`--disable-smart-memory`) makes ComfyUI aggressively offload every model to
-RAM the instant an execution finishes. That offload runs below the worker's `defer_vram_unload` request, so
-with smart memory off a same-model back-to-back job re-uploads the full UNet, CLIP, and VAE (three RAM→VRAM
-transfers) even when both the worker's retention and the parent model map agree the model is still resident:
-the retention lever is silently defeated one layer down. Cross-job residency (`comfy_smart_memory: true`)
-lets a same-model successor pay zero re-upload, and the parent retains the authority to undo it: the
-device-free governor reads truthful NVML device-free, and the verified reclaim ladder forces an actual VRAM
-free on any idle child (ComfyUI's own `free_memory` honors a full-card reclaim request regardless of the
-smart-memory setting). It nonetheless ships **off** by default: residency is not yet reconciled at dispatch
-time, so on a tight card a sampling peak landing beside an idle sibling's resident weights overcommits the
-device faster than the ladder's tick-paced eviction can clear it, and the driver demotes VRAM to system
-memory, a card-wide slowdown that costs more than the re-uploads residency saves. Until dispatch evicts
-conflicting residents before the peak materializes, per-job offloading remains the safe default; the field
-exists for cards whose headroom comfortably exceeds one sampling peak plus one resident model.
+Underneath the scheduler's retention lever sits ComfyUI's own model management. ComfyUI's *smart memory*
+keeps a just-used model resident in VRAM across executions; disabling it (`--disable-smart-memory`) makes
+ComfyUI unload every model the instant an execution finishes and turn every internal `free_memory` call into
+a free-everything. Both run below anything the worker can suppress, so a child launched with that flag can
+never honour a retention grant: a same-model back-to-back job re-uploads the full UNet, CLIP, and VAE even
+when the scheduler and the parent model map agree the model is still resident, and residency does not even
+survive the job's own decode load.
+
+Inference children therefore no longer carry the flag. Returning the card at the end of a job is instead an
+explicit hordelib eviction, which the scheduler's grant (`defer_vram_unload`) suppresses and nothing else
+does, so an ungranted job ends exactly as before and a granted one keeps its weights. The parent keeps every
+lever it had: the device-free governor reads truthful NVML device-free, and the verified reclaim ladder
+forces an actual VRAM free on any idle child in either ComfyUI memory mode. Component-lane, VAE-lane, and
+safety children take no grants and keep the flag, so they return the card every job unconditionally. The
+`legacy_comfy_vram_unload` field restores the flag on inference children for one release, as a rollback for
+an operator who needs the old regime; `comfy_smart_memory` is deprecated and inert.
 
 The support processes are additionally held to allocator-enforced VRAM quotas on CUDA hosts: the
 dedicated post-processing lane and the on-GPU safety process cap their own caching allocators. The parent

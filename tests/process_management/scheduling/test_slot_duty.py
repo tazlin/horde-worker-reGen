@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -281,6 +281,86 @@ class TestSchedulerClassifierBuckets:
         assert bucket is SlotDutyBucket.POST_PROCESSING_DEFER
         assert "post-processing chain" in text
         assert "no matching gate" not in text
+
+    async def _retained_sibling_card(self, *, predicted_peak_mb: float, monkeypatch):  # noqa: ANN001, ANN202
+        """A resident, idle head on a card where a sibling slot holds another model's weights across jobs.
+
+        16376MB total, less the sibling context (2030) and its retained weights (6800), leaves 7546MB for the
+        caller's chosen sampling peak.
+        """
+        monkeypatch.setattr(inference_scheduler_module, "predict_job_footprint_mb", lambda job, baseline: 6800.0)
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        holder = make_mock_process_info(1, model_name="model-a", state=HordeProcessState.PRELOADED_MODEL)
+        holder.total_vram_mb = 16376
+        retainer = make_mock_process_info(2, model_name="model-b")
+        retainer.total_vram_mb = 16376
+        retainer.retained_resident_model = "model-b"
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        horde_model_map.update_entry(
+            horde_model_name="model-b", load_state=ModelLoadState.LOADED_IN_VRAM, process_id=2
+        )
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({1: holder, 2: retainer}),
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(
+                max_threads=2,
+                enable_vram_budget=True,
+                vram_reserve_mb=2048,
+                ram_reserve_mb=4096,
+            ),
+            max_concurrent=2,
+            max_inference=2,
+        )
+        scheduler._overhead.set_marginal_overhead_mb(2030.0)
+        scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+            return_value=Mock(fits=False, predicted_mb=predicted_peak_mb, reserve_mb=4096.0),
+        )
+        return scheduler, head, retainer
+
+    async def test_retained_resident_hold_classifies_residency_reconciliation(self, monkeypatch) -> None:  # noqa: ANN001
+        """A head waiting on a sibling's retained weights is named as residency reconciliation.
+
+        The wait is a self-clearing swap of weights held across jobs, not the gate-less scheduler stall the
+        fall-through reports, so it must not read as ``no matching gate``.
+        """
+        scheduler, head, _retainer = await self._retained_sibling_card(
+            predicted_peak_mb=8258.0, monkeypatch=monkeypatch
+        )
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
+        assert "retained weights" in text
+        assert "no matching gate" not in text
+
+    async def test_naming_the_retained_resident_hold_evicts_nothing(self, monkeypatch) -> None:  # noqa: ANN001
+        """Classifying a stall is a read: the retained weights it names are still held afterwards.
+
+        The classifier runs every tick; if naming this wait actuated, the diagnostic itself would be
+        reclaiming the card behind the gate that owns that decision.
+        """
+        scheduler, head, retainer = await self._retained_sibling_card(
+            predicted_peak_mb=8258.0, monkeypatch=monkeypatch
+        )
+
+        scheduler._classify_dispatch_stall(head, {})
+
+        assert retainer.retained_resident_model == "model-b"
+        retainer.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_a_fitting_card_leaves_the_retained_sibling_unnamed(self, monkeypatch) -> None:  # noqa: ANN001
+        """Control: where the head fits beside the retained weights, this bucket does not claim the slot."""
+        scheduler, head, _retainer = await self._retained_sibling_card(
+            predicted_peak_mb=3000.0, monkeypatch=monkeypatch
+        )
+
+        bucket, _text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.UNEXPLAINED
 
     async def test_resident_idle_head_without_hold_classifies_unexplained(self) -> None:
         """The same resident-idle head with no reconciliation hold still falls through to UNEXPLAINED.

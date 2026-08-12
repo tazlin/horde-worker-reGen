@@ -247,6 +247,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.nsfw = False
     bd.post_process_job_overlap = False
     bd.unload_models_from_vram_often = False
+    bd.legacy_comfy_vram_unload = False
     bd.gpu_sampling_lease_enabled = False
     bd.gpu_sampling_lease_slots = None
     bd.gpu_sampling_lease_tail_overlap = True

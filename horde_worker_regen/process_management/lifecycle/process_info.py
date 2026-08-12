@@ -201,6 +201,20 @@ class HordeProcessInfo:
     elapsed-ratio grade (``current_job_slowdown_level``), it fires within a couple of slow steps rather than
     after the job is minutes past its total expected time. Reset at each job boundary."""
 
+    retention_granted_model: str | None
+    """Model this slot's in-flight job was dispatched with a VRAM-retention grant for, else None.
+
+    Stamped at dispatch from the scheduler's retention verdict and resolved into
+    :attr:`retained_resident_model` when the job's result arrives. The completion path cannot see the
+    dispatch decision, so this is the record that carries it across the job."""
+    retained_resident_model: str | None
+    """Model whose weights this slot holds on the device between jobs, or None when it holds none.
+
+    The parent's authoritative record of granted residency. The retention static fit charges every other
+    slot's retained weights against the card total (weights held across jobs are as real a tenant as a
+    sampling peak), and a dispatch for a different model returns them to the card before the new weights
+    load. Cleared by every parent-side eviction actuation and when the slot dies."""
+
     ram_usage_bytes: int
     """The amount of RAM used by this process."""
     vram_usage_mb: int
@@ -365,6 +379,8 @@ class HordeProcessInfo:
         self.current_job_slowdown_level = 0
         self.consecutive_slow_per_steps = 0
         self.current_job_per_step_floor_tripped = False
+        self.retention_granted_model = None
+        self.retained_resident_model = None
 
         self.ram_usage_bytes = 0
         self.vram_usage_mb = 0
@@ -478,6 +494,36 @@ class HordeProcessInfo:
         """Clear preload attribution and execution ownership at a job/process boundary."""
         self.preload_job_intent = None
         self.inference_ownership = None
+
+    def note_retention_grant(self, model: str | None) -> None:
+        """Record which model (if any) the dispatching job's retention verdict covers on this slot.
+
+        The scheduler denies every grant while the legacy comfy unload regime is configured, because under
+        that regime the child's executor returns the card at the end of each prompt no matter what the
+        dispatch asked for. A ``None`` model is therefore the invariant there: nothing may be recorded as
+        held that the child has already unloaded.
+        """
+        self.retention_granted_model = model
+
+    def settle_retention_after_job(self) -> None:
+        """Resolve the in-flight retention grant into the slot's retained-resident record at job end.
+
+        A granted job leaves its model on the device, so the slot becomes (or stays) a retained resident
+        for it; an ungranted job ends with the explicit evictor returning the card, so the slot retains
+        nothing. Both directions are applied here, which is also how a granted job for a different model
+        replaces the previously retained one.
+
+        Under the legacy comfy unload regime no grant is ever recorded, so this only ever clears: the
+        retained-resident map stays empty and no dispatch waits on, or is charged for, weights the child
+        does not hold.
+        """
+        self.retained_resident_model = self.retention_granted_model
+        self.retention_granted_model = None
+
+    def clear_retained_resident(self) -> None:
+        """Forget any retained residency because this slot's device weights are being (or were) returned."""
+        self.retained_resident_model = None
+        self.retention_granted_model = None
 
     def is_process_busy(self) -> bool:
         """Return true if the process is actively engaged in a task.
