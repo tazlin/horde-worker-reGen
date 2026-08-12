@@ -257,8 +257,14 @@ _DEPRECATED_CONFIG_KEY_POINTERS: dict[str, str] = {
         "let the pool fetch high-demand models within a session budget; see the `model_pool` section of "
         "bridgeData.yaml."
     ),
+    "comfy_smart_memory": (
+        "`comfy_smart_memory` is deprecated and has no effect. VRAM residency is now decided per dispatch "
+        "by the scheduler on device evidence, and inference children evict explicitly at the end of every "
+        "ungranted job, so there is no worker-wide memory mode left to select. Remove the key to silence "
+        "this notice; set `legacy_comfy_vram_unload: true` if you need the old flag-based regime back."
+    ),
 }
-"""Deprecation pointers keyed by model field name, each redirecting a legacy key at the fixed model pool."""
+"""Deprecation pointers keyed by model field name, each redirecting a legacy key at what replaced it."""
 
 
 _warned_deprecated_config_keys: set[str] = set()
@@ -1343,16 +1349,26 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Turn it off only to keep a forced pause in place until a human intervenes."""
 
     comfy_smart_memory: bool = Field(default=False)
-    """Keep ComfyUI's smart memory management on so inference children hold model weights resident in VRAM
-    across jobs.
+    """Deprecated and inert: whichever value this carries, it no longer affects any child process.
 
-    With this on, a back-to-back same-model job reuses the resident UNet/CLIP/VAE instead of re-uploading
-    them from RAM, eliminating the per-job RAM->VRAM transfers that dominate small-job wall-clock. It is
-    OFF by default because cross-process residency is not yet reconciled at dispatch time: a sampling peak
-    landing beside an idle sibling's resident weights overcommits a tight card faster than the device-free
-    governor's reclaim ladder can evict, and the driver then demotes VRAM to system memory (a card-wide
-    slowdown far costlier than the transfers this saves). Enable only for experimentation on cards with
-    headroom well above one sampling peak plus one resident model."""
+    It used to select ComfyUI's memory mode for every ComfyUI-running child, which decided cross-job VRAM
+    residency wholesale. Retention actuation superseded it: the scheduler grants residency per dispatch on
+    device evidence, hordelib evicts explicitly at the end of every ungranted job, and inference children
+    no longer carry ComfyUI's aggressive-offload flag at all. Setting it draws a one-time pointer at
+    ``legacy_comfy_vram_unload``, the escape hatch that restores the old flag-based regime."""
+
+    legacy_comfy_vram_unload: bool = Field(default=False)
+    """Restore the pre-retention memory regime on inference children by launching them with ComfyUI's
+    ``--disable-smart-memory``.
+
+    Under that flag ComfyUI unloads every model at the end of each prompt and frees everything on any
+    memory pressure, below anything the worker can suppress, so the scheduler's retention grants become
+    inert and a same-model streak re-uploads its weights from RAM every job. It exists as a rollback for
+    one release, for an operator who needs the old behaviour while the retention regime is being validated
+    on their hardware; expect it to be removed.
+
+    Component-lane, VAE-lane, and safety children always run with the flag regardless of this setting:
+    they take no retention grants and return the card at the end of every job."""
 
     dry_run_skip_inference: bool = Field(default=False)
     """Skip real GPU inference and return a dummy 1x1 image instead."""
@@ -1497,6 +1513,17 @@ class reGenBridgeData(CombinedHordeBridgeData):
         for field_name in ("dynamic_models", "number_of_dynamic_models_to_load", "max_dynamic_models_to_download"):
             if field_name in self.model_fields_set:
                 _warn_deprecated_config_key_once(field_name)
+        return self
+
+    @model_validator(mode="after")
+    def warn_deprecated_comfy_smart_memory(self) -> Self:
+        """Point an explicitly-set ``comfy_smart_memory`` at the retention actuation that replaced it.
+
+        The key is accepted with either value and ignored, so an existing bridgeData keeps loading and keeps
+        behaving the same as one that omits it. The pointer is logged once per process.
+        """
+        if "comfy_smart_memory" in self.model_fields_set:
+            _warn_deprecated_config_key_once("comfy_smart_memory")
         return self
 
     @field_validator("dreamer_worker_name", mode="after")

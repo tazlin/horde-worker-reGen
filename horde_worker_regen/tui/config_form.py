@@ -397,11 +397,11 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "comfy_smart_memory",
-        "Comfy smart memory",
+        "Comfy smart memory (deprecated)",
         FieldKind.BOOL,
         "Memory & performance",
-        "Keep ComfyUI smart memory enabled so child processes may keep model weights resident in VRAM "
-        "between jobs. Experimental on tight cards; requires restart because it is passed at child startup.",
+        "Deprecated and inert: VRAM residency is decided per dispatch by the scheduler. Use "
+        "legacy_comfy_vram_unload in bridgeData.yaml to restore the old flag-based regime.",
         requires_restart=True,
     ),
     ConfigField(

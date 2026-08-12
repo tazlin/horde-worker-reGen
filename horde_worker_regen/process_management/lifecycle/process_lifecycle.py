@@ -1156,7 +1156,6 @@ class ProcessLifecycleManager:
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
                     "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
-                    "comfy_smart_memory": bridge_data.comfy_smart_memory,
                 },
             )
 
@@ -1255,7 +1254,6 @@ class ProcessLifecycleManager:
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "dry_run_skip_post_processing": bridge_data.dry_run_skip_post_processing,
-                "comfy_smart_memory": bridge_data.comfy_smart_memory,
             },
         )
 
@@ -1688,7 +1686,6 @@ class ProcessLifecycleManager:
                 "directml": self._directml,
                 "horde_model_names": list(bridge_data.image_models_to_load),
                 "dry_run_skip_component_lane": bridge_data.dry_run_skip_inference,
-                "comfy_smart_memory": bridge_data.comfy_smart_memory,
             },
         )
         process.start()
@@ -1902,7 +1899,6 @@ class ProcessLifecycleManager:
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "dry_run_skip_vae_lane": bridge_data.dry_run_skip_inference,
-                "comfy_smart_memory": bridge_data.comfy_smart_memory,
             },
         )
         process.start()
@@ -2470,7 +2466,7 @@ class ProcessLifecycleManager:
                 # An alchemist-only worker (no image models configured, e.g. a CPU install) must not
                 # treat an empty image-model database as a fatal error in the child.
                 "expect_image_models": bool(card.config.image_models_to_load),
-                "comfy_smart_memory": bridge_data.comfy_smart_memory,
+                "legacy_comfy_vram_unload": bridge_data.legacy_comfy_vram_unload,
             },
         )
         process.start()

@@ -133,18 +133,22 @@ def resolve_worker_log_verbosity() -> int:
         return _DEFAULT_WORKER_LOG_VERBOSITY
 
 
-def _seed_extra_comfyui_args(*, comfy_smart_memory: bool) -> list[str]:
-    """Build the base ``extra_comfyui_args`` for a ComfyUI-running child from the smart-memory policy.
+def _seed_extra_comfyui_args(*, disable_smart_memory: bool) -> list[str]:
+    """Build the base ``extra_comfyui_args`` for a ComfyUI-running child.
 
-    ComfyUI's ``--disable-smart-memory`` makes it offload every model to RAM after each job, so a
-    back-to-back same-model job re-uploads the UNet/CLIP/VAE from RAM even when the worker asked hordelib
-    to keep them resident (``defer_vram_unload``): the flag acts below worker retention. With smart memory
-    on (the default, no flag) ComfyUI keeps weights device-resident across jobs. The parent's device-free
-    governor and verified reclaim ladder remain the authoritative evictor and force an actual VRAM free on
-    any idle child, so residency never overcommits the card. The flag is restored only when an operator
-    opts out via ``comfy_smart_memory=False``.
+    ``--disable-smart-memory`` makes ComfyUI unload every model at the end of each prompt and turn every
+    ``free_memory`` call into a free-everything, both below anything the worker can suppress: a child
+    launched with it can never honour a retention grant (``defer_vram_unload``), and even intra-job
+    residency does not survive the job's own decode load. Eviction authority instead lives in hordelib's
+    explicit end-of-job free, which the grant suppresses, plus the parent's device-free governor and
+    verified reclaim ladder, which force an actual free in either comfy memory mode. An inference child
+    therefore launches without the flag, so the scheduler's grant is what decides residency; it is
+    restored only for an operator who sets ``legacy_comfy_vram_unload``.
+
+    Lane and safety children take no retention grants and always launch with the flag, keeping their
+    contract of returning the card at the end of every job.
     """
-    if comfy_smart_memory:
+    if not disable_smart_memory:
         return []
     return ["--disable-smart-memory"]
 
@@ -168,7 +172,7 @@ class InferenceProcessEntryPoint(Protocol):
         vram_heavy_models: bool = False,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
-        comfy_smart_memory: bool = False,
+        legacy_comfy_vram_unload: bool = False,
     ) -> None:
         """Run an inference process until told to end."""
 
@@ -190,7 +194,6 @@ class SafetyProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_safety: bool = False,
-        comfy_smart_memory: bool = False,
     ) -> None:
         """Run a safety process until told to end."""
 
@@ -211,7 +214,6 @@ class PostProcessProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_post_processing: bool = False,
-        comfy_smart_memory: bool = False,
     ) -> None:
         """Run a post-processing process until told to end."""
 
@@ -232,7 +234,6 @@ class VaeLaneProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_vae_lane: bool = False,
-        comfy_smart_memory: bool = False,
     ) -> None:
         """Run the VAE lane process until told to end."""
 
@@ -254,7 +255,6 @@ class ComponentProcessEntryPoint(Protocol):
         directml: int | None = None,
         horde_model_names: list[str] | None = None,
         dry_run_skip_component_lane: bool = False,
-        comfy_smart_memory: bool = False,
     ) -> None:
         """Run the component lane process until told to end."""
 
@@ -304,7 +304,7 @@ def start_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: ClearanceLeaseProxy | None = None,
     expect_image_models: bool = True,
-    comfy_smart_memory: bool = False,
+    legacy_comfy_vram_unload: bool = False,
 ) -> None:
     """Start an inference process.
 
@@ -335,9 +335,9 @@ def start_inference_process(
         expect_image_models (bool, optional): Whether this worker serves image generation. False for an
             alchemist-only worker (e.g. a CPU install) that loads no image models, so an empty image-model
             database is expected rather than a fatal error. Defaults to True.
-        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
-            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to False.
+        legacy_comfy_vram_unload (bool, optional): Launch this child with ``--disable-smart-memory``, the
+            pre-retention regime in which ComfyUI unloads every model after each prompt and the scheduler's
+            retention grants cannot hold the card. Defaults to False.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
     # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
@@ -388,10 +388,10 @@ def start_inference_process(
                     f"accelerator_kind={accelerator_kind}, device_index={device_index}, "
                     f"expect_image_models={expect_image_models}, "
                     f"has_sampling_lease={gpu_sampling_lease is not None}",
-                    f" and comfy_smart_memory={comfy_smart_memory}",
+                    f" and legacy_comfy_vram_unload={legacy_comfy_vram_unload}",
                 )
 
-                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+                extra_comfyui_args = _seed_extra_comfyui_args(disable_smart_memory=legacy_comfy_vram_unload)
 
                 if amd_gpu:
                     extra_comfyui_args.append("--use-pytorch-cross-attention")
@@ -482,7 +482,6 @@ def start_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
-    comfy_smart_memory: bool = False,
 ) -> None:
     """Start a safety process.
 
@@ -504,9 +503,6 @@ def start_safety_process(
             with the specified device
         dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
             Defaults to False.
-        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
-            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "safety", "entry")
     # The on-GPU safety model (cpu_only False) must be masked to its assigned card before torch loads, the
@@ -553,7 +549,7 @@ def start_safety_process(
 
             logger.debug(f"Initialising hordelib with process_id={process_id}")
 
-            extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+            extra_comfyui_args = _seed_extra_comfyui_args(disable_smart_memory=True)
 
             if amd_gpu:
                 extra_comfyui_args.append("--use-pytorch-cross-attention")
@@ -612,7 +608,6 @@ def start_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
-    comfy_smart_memory: bool = False,
 ) -> None:
     """Start the dedicated post-processing process.
 
@@ -633,9 +628,6 @@ def start_post_process_process(
         directml (int | None, optional): The DirectML device index, if any. Defaults to None.
         dry_run_skip_post_processing (bool, optional): Skip real post-processing (and hordelib init) and \
             echo images back. Defaults to False.
-        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
-            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "post_process", "entry")
     if not dry_run_skip_post_processing:
@@ -673,7 +665,7 @@ def start_post_process_process(
             if not dry_run_skip_post_processing:
                 import hordelib
 
-                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+                extra_comfyui_args = _seed_extra_comfyui_args(disable_smart_memory=True)
                 if amd_gpu:
                     extra_comfyui_args.append("--use-pytorch-cross-attention")
                 if directml is not None:
@@ -737,7 +729,6 @@ def start_vae_lane_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_vae_lane: bool = False,
-    comfy_smart_memory: bool = False,
 ) -> None:
     """Start the dedicated VAE lane process.
 
@@ -758,9 +749,6 @@ def start_vae_lane_process(
         directml (int | None, optional): The DirectML device index, if any. Defaults to None.
         dry_run_skip_vae_lane (bool, optional): Skip the backend (and hordelib init) and return plausible \
             stand-in latent/image bytes. Defaults to False.
-        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
-            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "vae_lane", "entry")
     if not dry_run_skip_vae_lane:
@@ -798,7 +786,7 @@ def start_vae_lane_process(
             if not dry_run_skip_vae_lane:
                 import hordelib
 
-                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+                extra_comfyui_args = _seed_extra_comfyui_args(disable_smart_memory=True)
                 if amd_gpu:
                     extra_comfyui_args.append("--use-pytorch-cross-attention")
                 if directml is not None:
@@ -853,7 +841,6 @@ def start_component_process(
     directml: int | None = None,
     horde_model_names: list[str] | None = None,
     dry_run_skip_component_lane: bool = False,
-    comfy_smart_memory: bool = False,
 ) -> None:
     """Start the dedicated component lane process.
 
@@ -875,9 +862,6 @@ def start_component_process(
         horde_model_names (list[str] | None, optional): The worker's configured models; the lane holds the \
             components shared across them. Defaults to None.
         dry_run_skip_component_lane (bool, optional): Skip the backend and materialisation. Defaults to False.
-        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
-            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "component", "entry")
     if not dry_run_skip_component_lane:
@@ -915,7 +899,7 @@ def start_component_process(
             if not dry_run_skip_component_lane:
                 import hordelib
 
-                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+                extra_comfyui_args = _seed_extra_comfyui_args(disable_smart_memory=True)
                 if amd_gpu:
                     extra_comfyui_args.append("--use-pytorch-cross-attention")
                 if directml is not None:

@@ -55,6 +55,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordePostProcessResultMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
+    HordeRestoreComponentsControlMessage,
     HordeSafetyControlMessage,
     HordeSafetyEvaluation,
     HordeSafetyResultMessage,
@@ -672,6 +673,10 @@ class FakeInferenceProcess(HordeProcess):
             # The fake holds no real component cache, so the base handler no-ops; accepting the message
             # keeps the fake from faulting when the RAM-pressure rung targets it in a simulation.
             self.evict_held_components(message.identities)
+        elif isinstance(message, HordeRestoreComponentsControlMessage):
+            # Accepted on the same terms as eviction: no real cache to restore, and a fake targeted by the
+            # reclaim ladder's cheaper rung must not fault the simulation.
+            self.restore_held_components(message.identities)
 
     @override
     def cleanup_for_exit(self) -> None:
@@ -868,7 +873,7 @@ def start_fake_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: ClearanceLeaseProxy | None = None,
     expect_image_models: bool = True,
-    comfy_smart_memory: bool = True,
+    legacy_comfy_vram_unload: bool = False,
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
@@ -934,7 +939,6 @@ def start_fake_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
-    comfy_smart_memory: bool = True,
     fault_profile: FaultProfile | None = None,
 ) -> None:
     """Start a fake safety process.
@@ -1163,7 +1167,6 @@ def start_fake_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
-    comfy_smart_memory: bool = True,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
     sim_context_mb: float = 0.0,
@@ -1209,7 +1212,6 @@ def start_fake_vae_lane_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_vae_lane: bool = False,
-    comfy_smart_memory: bool = True,
 ) -> None:
     """Start a fake VAE lane process.
 
@@ -1220,7 +1222,7 @@ def start_fake_vae_lane_process(
     """
     from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 
-    _ = (accelerator_kind, amd_gpu, directml, dry_run_skip_vae_lane, comfy_smart_memory)
+    _ = (accelerator_kind, amd_gpu, directml, dry_run_skip_vae_lane)
     enable_child_faulthandler(f"fake_vae_lane_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake vae lane")
@@ -1253,7 +1255,6 @@ def start_fake_component_process(
     directml: int | None = None,
     horde_model_names: list[str] | None = None,
     dry_run_skip_component_lane: bool = False,
-    comfy_smart_memory: bool = True,
 ) -> None:
     """Start a fake component lane process.
 
@@ -1264,7 +1265,7 @@ def start_fake_component_process(
     """
     from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
 
-    _ = (accelerator_kind, amd_gpu, directml, horde_model_names, comfy_smart_memory)
+    _ = (accelerator_kind, amd_gpu, directml, horde_model_names)
     enable_child_faulthandler(f"fake_component_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake component")
