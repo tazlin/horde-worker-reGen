@@ -1,8 +1,12 @@
-"""Child-side tests for component-residency reporting and targeted eviction.
+"""Child-side tests for component-residency reporting and targeted restore or eviction.
 
-A GPU-bearing child attaches its component-cache residency to each memory report and evicts named entries on
-request, both best-effort and never faulting. The real VAE lane runs ML-free under ``dry_run``, so it stands
-in for any cache-bearing child here (its component-cache access lives in the shared ``HordeProcess`` base).
+A GPU-bearing child attaches its component-cache residency to each memory report, and restores or evicts
+named entries on request, all best-effort and never faulting. Restoring is the cheaper of the two reclaim
+actions: it hands back a component's device-memory claim while its pristine weights stay resident in host
+RAM, so the report carries which entries hold residue worth restoring.
+
+The real VAE lane runs ML-free under ``dry_run``, so it stands in for any cache-bearing child here; the
+component-cache access it exercises lives in the shared ``HordeProcess`` base.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlMessage,
     HordeEvictComponentsControlMessage,
     HordeProcessMemoryMessage,
+    HordeRestoreComponentsControlMessage,
 )
 from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 
@@ -44,10 +49,14 @@ def _make_dry_run_lane(queue: _FakeQueue) -> HordeVaeLaneProcess:
     )
 
 
-def _patch_shared_manager(monkeypatch: pytest.MonkeyPatch, cache: object) -> None:
-    """Point hordelib's ``SharedModelManager.manager._models_in_ram`` at ``cache``."""
-    fake_manager = SimpleNamespace(manager=SimpleNamespace(_models_in_ram=cache))
-    monkeypatch.setattr("hordelib.api.SharedModelManager", fake_manager)
+def _patch_residency_api(monkeypatch: pytest.MonkeyPatch, **replacements: object) -> None:
+    """Replace the declared ``hordelib.api`` residency helpers the child calls.
+
+    The child reaches these by name rather than through the cache object, so the stub sits on the
+    published surface instead of on ``SharedModelManager``'s private cache attribute.
+    """
+    for name, replacement in replacements.items():
+        monkeypatch.setattr(f"hordelib.api.{name}", replacement, raising=False)
 
 
 def _sole_memory_message(queue: _FakeQueue) -> HordeProcessMemoryMessage:
@@ -60,13 +69,16 @@ class TestHeldComponentReporting:
     """A cache-bearing child attaches its residency; a child without a cache reports None."""
 
     def test_report_carries_converted_held_components(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The memory report carries each cache entry converted to the worker-side snapshot type."""
+        """The memory report carries each cache entry converted to the worker-side snapshot type.
+
+        The stubbed snapshots carry no residue indicator, standing in for an installed hordelib older than
+        that field: the conversion reads it defensively, so the whole report survives the omission.
+        """
         held = [
             SimpleNamespace(kind="checkpoint", identity="ModelA", approx_ram_mb=7000.0),
             SimpleNamespace(kind="vae", identity="vae@abc", approx_ram_mb=512.0),
         ]
-        cache = SimpleNamespace(held_report=lambda: held)
-        _patch_shared_manager(monkeypatch, cache)
+        _patch_residency_api(monkeypatch, held_components=lambda: held)
 
         queue = _FakeQueue()
         lane = _make_dry_run_lane(queue)
@@ -81,6 +93,25 @@ class TestHeldComponentReporting:
             HeldComponentSnapshot(kind="checkpoint", identity="ModelA", approx_ram_mb=7000.0),
             HeldComponentSnapshot(kind="vae", identity="vae@abc", approx_ram_mb=512.0),
         ]
+
+    def test_report_carries_the_residue_indicator(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Whether an entry holds patch residue rides the report, so the parent can pick restore over evict."""
+        held = [
+            SimpleNamespace(kind="checkpoint", identity="Patched", approx_ram_mb=7000.0, mutated=True),
+            SimpleNamespace(kind="checkpoint", identity="Clean", approx_ram_mb=7000.0, mutated=False),
+        ]
+        _patch_residency_api(monkeypatch, held_components=lambda: held)
+
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        lane._reports_held_components = True
+        queue.messages.clear()
+
+        lane.send_memory_report_message(include_vram=False)
+
+        reported = _sole_memory_message(queue).held_components
+        assert reported is not None
+        assert {snapshot.identity: snapshot.mutated for snapshot in reported} == {"Patched": True, "Clean": False}
 
     def test_dry_run_lane_reports_none(self) -> None:
         """A dry-run lane has no loaded backend, so it reports None without importing hordelib."""
@@ -99,8 +130,7 @@ class TestHeldComponentReporting:
         def _boom() -> list[object]:
             raise RuntimeError("cache unavailable")
 
-        cache = SimpleNamespace(held_report=_boom)
-        _patch_shared_manager(monkeypatch, cache)
+        _patch_residency_api(monkeypatch, held_components=_boom)
 
         queue = _FakeQueue()
         lane = _make_dry_run_lane(queue)
@@ -118,9 +148,8 @@ class TestEvictHandler:
 
     def test_evict_forwards_identities_to_the_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A cache-bearing lane forwards the requested identities to the cache's eviction."""
-        cache = Mock()
-        cache.evict_identities.return_value = 2
-        _patch_shared_manager(monkeypatch, cache)
+        evict = Mock(return_value=2)
+        _patch_residency_api(monkeypatch, evict_components=evict)
 
         queue = _FakeQueue()
         lane = _make_dry_run_lane(queue)
@@ -130,13 +159,12 @@ class TestEvictHandler:
             HordeEvictComponentsControlMessage(identities=["ModelA", "ModelC"]),
         )
 
-        cache.evict_identities.assert_called_once_with(["ModelA", "ModelC"])
+        evict.assert_called_once_with(["ModelA", "ModelC"])
 
     def test_evict_unknown_identities_does_not_fault(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Evicting an identity the cache does not hold is a no-op (zero evicted), never an error."""
-        cache = Mock()
-        cache.evict_identities.return_value = 0
-        _patch_shared_manager(monkeypatch, cache)
+        evict = Mock(return_value=0)
+        _patch_residency_api(monkeypatch, evict_components=evict)
 
         queue = _FakeQueue()
         lane = _make_dry_run_lane(queue)
@@ -146,7 +174,7 @@ class TestEvictHandler:
         lane._receive_and_handle_control_message(
             HordeEvictComponentsControlMessage(identities=["does-not-exist"]),
         )
-        cache.evict_identities.assert_called_once_with(["does-not-exist"])
+        evict.assert_called_once_with(["does-not-exist"])
 
     def test_evict_without_a_cache_is_a_noop(self) -> None:
         """A dry-run lane (no backend) ignores the request without importing hordelib."""
@@ -172,3 +200,115 @@ class TestOldParentDispatchContract:
             lane._receive_and_handle_control_message(
                 HordeControlMessage(control_flag=HordeControlFlag.PRELOAD_MODEL),
             )
+
+
+class TestRestoreHandler:
+    """The restore handler returns named entries to their loaded state and never faults."""
+
+    def test_restore_forwards_identities_to_the_api(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cache-bearing lane forwards the requested identities to the declared restore helper."""
+        restore = Mock(return_value=2)
+        _patch_residency_api(monkeypatch, restore_components=restore)
+
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        lane._reports_held_components = True
+
+        lane._receive_and_handle_control_message(
+            HordeRestoreComponentsControlMessage(identities=["ModelA", "ModelC"]),
+        )
+
+        restore.assert_called_once_with(["ModelA", "ModelC"])
+
+    def test_restore_unknown_identities_does_not_fault(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Restoring an identity the cache does not hold is a no-op, never an error."""
+        restore = Mock(return_value=0)
+        _patch_residency_api(monkeypatch, restore_components=restore)
+
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        lane._reports_held_components = True
+
+        lane._receive_and_handle_control_message(
+            HordeRestoreComponentsControlMessage(identities=["does-not-exist"]),
+        )
+        restore.assert_called_once_with(["does-not-exist"])
+
+    def test_restore_failure_does_not_fault_the_lane(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A restore that raises is swallowed: a reclaim action must never take down the lane."""
+
+        def _boom(identities: list[str]) -> int:
+            raise RuntimeError("restore unavailable")
+
+        _patch_residency_api(monkeypatch, restore_components=_boom)
+
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        lane._reports_held_components = True
+
+        lane._receive_and_handle_control_message(
+            HordeRestoreComponentsControlMessage(identities=["ModelA"]),
+        )
+
+    def test_restore_without_a_cache_is_a_noop(self) -> None:
+        """A dry-run lane (no backend) ignores the request without importing hordelib."""
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        assert lane._reports_held_components is False
+
+        lane._receive_and_handle_control_message(
+            HordeRestoreComponentsControlMessage(identities=["ModelA"]),
+        )
+
+
+class TestRestoreStatsReporting:
+    """The memory report carries cumulative restore counters, so the parent can trend the contract."""
+
+    def test_report_carries_restore_counters(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Marked, restored, and released megabytes ride the report the parent already receives."""
+        stats = SimpleNamespace(marked=12, restored=5, restored_bytes=3 * 1024 * 1024)
+        _patch_residency_api(monkeypatch, held_components=list, component_restore_stats=lambda: stats)
+
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        lane._reports_held_components = True
+        queue.messages.clear()
+
+        lane.send_memory_report_message(include_vram=False)
+
+        message = _sole_memory_message(queue)
+        assert message.components_marked == 12
+        assert message.components_restored == 5
+        assert message.components_restored_mb == pytest.approx(3.0)
+
+    def test_a_stats_read_failure_leaves_the_memory_report_intact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A counter read that raises must not cost the report the memory figures it was sent for."""
+
+        def _boom() -> object:
+            raise RuntimeError("stats unavailable")
+
+        _patch_residency_api(monkeypatch, held_components=list, component_restore_stats=_boom)
+
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        lane._reports_held_components = True
+        queue.messages.clear()
+
+        lane.send_memory_report_message(include_vram=False)
+
+        message = _sole_memory_message(queue)
+        assert message.components_marked is None
+        assert message.ram_usage_bytes is not None
+
+    def test_a_lane_without_a_cache_reports_no_counters(self) -> None:
+        """A dry-run lane never imports hordelib, so the counters stay None rather than zero."""
+        queue = _FakeQueue()
+        lane = _make_dry_run_lane(queue)
+        queue.messages.clear()
+
+        lane.send_memory_report_message(include_vram=False)
+
+        message = _sole_memory_message(queue)
+        assert message.components_marked is None
+        assert message.components_restored is None
+        assert message.components_restored_mb is None

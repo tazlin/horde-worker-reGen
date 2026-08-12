@@ -517,9 +517,29 @@ class HordeProcess(abc.ABC):
             return False
 
         message.held_components = self._collect_held_components()
+        self._attach_restore_stats(message)
 
         self.process_message_queue.put(message)
         return True
+
+    def _attach_restore_stats(self, message: HordeProcessMemoryMessage) -> None:
+        """Attach this process's cumulative component-restore counters to *message*, best effort.
+
+        Gated and guarded exactly like :meth:`_collect_held_components`: a process with no loaded backend
+        never imports hordelib, and a read that fails leaves the fields None so the report still carries
+        the memory figures it was sent for.
+        """
+        if not self._reports_held_components:
+            return
+        try:
+            from hordelib.api import component_restore_stats
+
+            stats = component_restore_stats()
+            message.components_marked = stats.marked
+            message.components_restored = stats.restored
+            message.components_restored_mb = stats.restored_bytes / (1024 * 1024)
+        except Exception as e:
+            logger.debug(f"Could not read component restore stats: {type(e).__name__} {e}")
 
     def _collect_held_components(self) -> list[HeldComponentSnapshot] | None:
         """Snapshot the component cache's resident entries for the memory report, or None when unavailable.
@@ -533,16 +553,19 @@ class HordeProcess(abc.ABC):
         if not self._reports_held_components:
             return None
         try:
-            from hordelib.api import SharedModelManager
+            from hordelib.api import held_components
 
-            snapshots = SharedModelManager.manager._models_in_ram.held_report()
             return [
                 HeldComponentSnapshot(
                     kind=str(snapshot.kind),
                     identity=snapshot.identity,
                     approx_ram_mb=snapshot.approx_ram_mb,
+                    # Read defensively: a worker can be running against an installed hordelib older than
+                    # the residue indicator, and losing the whole residency report over a missing optional
+                    # field would cost the parent its view of what every lane holds.
+                    mutated=getattr(snapshot, "mutated", False),
                 )
-                for snapshot in snapshots
+                for snapshot in held_components()
             ]
         except Exception as e:
             if not self._held_components_read_failed_logged:
@@ -564,12 +587,42 @@ class HordeProcess(abc.ABC):
             logger.debug(f"Ignoring EVICT_COMPONENTS for {len(identities)} identity(ies): no component cache here")
             return
         try:
-            from hordelib.api import SharedModelManager
+            from hordelib.api import evict_components
 
-            evicted = SharedModelManager.manager._models_in_ram.evict_identities(identities)
+            evicted = evict_components(identities)
             logger.info(f"Evicted {evicted} of {len(identities)} requested component(s) from RAM under pressure")
         except Exception as e:
             logger.debug(f"Component eviction request failed: {type(e).__name__} {e}")
+
+    def restore_held_components(self, identities: list[str]) -> bool:
+        """Restore the named component-cache entries to their loaded state; report whether any were.
+
+        The reclaim action below a VRAM unload: the components keep their pristine weights in host RAM and
+        give up their device-memory claim, so a later job for the same model re-uploads rather than
+        re-reading from disk. Best effort on the same terms as :meth:`evict_held_components`: an identity
+        the cache does not hold is skipped, a process without a loaded backend treats it as a no-op and
+        never imports hordelib, and any failure is logged at debug rather than raised.
+
+        The returned flag exists because restoring alone reclaims nothing the device can see. Releasing a
+        component's weights returns their blocks to the torch caching allocator, which holds them as
+        reserved-but-unused rather than handing them back, so the card's free memory is unchanged until the
+        allocator cache is released. Callers act on a True return by doing exactly that, which is what
+        turns the restore into reclaim the parent's arbiter can measure.
+        """
+        if not identities:
+            return False
+        if not self._reports_held_components:
+            logger.debug(f"Ignoring RESTORE_COMPONENTS for {len(identities)} identity(ies): no component cache here")
+            return False
+        try:
+            from hordelib.api import restore_components
+
+            restored = restore_components(identities)
+            logger.info(f"Restored {restored} of {len(identities)} requested component(s) to their loaded state")
+            return restored > 0
+        except Exception as e:
+            logger.debug(f"Component restore request failed: {type(e).__name__} {e}")
+            return False
 
     def send_stage_job_metrics_message(self, job_id: str, *, stage: PipelineStageTag | None = None) -> None:
         """Drain hordelib's per-job metrics collector after a stage and forward the snapshot, stage-tagged.

@@ -199,7 +199,7 @@ class HeldComponentSnapshot(BaseModel):
     """One resident component-cache entry a child reports: its kind, content identity, and approximate RAM.
 
     The worker-side twin of hordelib's ``HeldComponentSnapshot`` (``hordelib.execution.component_cache``).
-    The parent is torch-free and must never import hordelib, so the three-field shape is duplicated here as a
+    The parent is torch-free and must never import hordelib, so the field shape is duplicated here as a
     plain pydantic model rather than shared: the child reads hordelib's snapshot inside the process that holds
     the cache and copies each field onto this transport type, which the parent decodes without any hordelib
     dependency. ``kind`` is one of ``unet``/``clip``/``vae``/``checkpoint`` (kept as ``str`` so a future
@@ -213,6 +213,13 @@ class HeldComponentSnapshot(BaseModel):
     """The content identity of the cached entry (a checkpoint entry's identity is the bare horde model name)."""
     approx_ram_mb: float
     """The entry's approximate resident RAM cost in megabytes, as hordelib's budget estimates it."""
+    mutated: bool = False
+    """Whether the entry carries patch residue that restoring would clear.
+
+    This is what lets the reclaim path choose restoring over evicting: a restore hands back the component's
+    weight-memory claim while its pristine weights stay resident, so the next job re-uploads rather than
+    re-reading from disk. An entry with nothing to restore gains nothing from being asked. Defaults False so
+    a child built before the field reports as though it had no residue."""
 
 
 class HordeProcessMemoryMessage(HordeProcessMessage):
@@ -288,6 +295,23 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
     An additive, optimistic-IPC field: an older parent ignores it, and a newer parent treats None as "no
     residency data from this process" rather than "nothing resident". The parent maps the checkpoint-kind
     identities to the staged-model set and to the RAM-pressure component-eviction rung."""
+    components_marked: int | None = None
+    """Cumulative acquisitions in this process that declared they would patch the component handed over.
+
+    Carried as counters rather than log lines because the readable questions are ratios over time. This
+    one alone answers whether jobs are still declaring: if it stops rising while work continues, the
+    declaration stopped arriving, which no amount of watching for restores would distinguish from a
+    quiet period with nothing to restore. None where the process has no component cache."""
+    components_restored: int | None = None
+    """Cumulative marked entries this process restored, on acquisition or by an explicit request.
+
+    Read against ``components_marked``: rising together means residue is being found and cleared, while
+    marks rising with restores flat means the declarations arrive and there is nothing to clear."""
+    components_restored_mb: float | None = None
+    """Cumulative device weight memory those restores gave up, in megabytes.
+
+    The weights return to host RAM, so this is what the component stopped claiming on the card rather
+    than memory handed back to the system; the card only sees it once the allocator cache is released."""
 
 
 class HordeHeartbeatType(enum.Enum):
@@ -577,6 +601,14 @@ class HordeControlFlag(enum.Enum):
     Unlike ``UNLOAD_MODELS_FROM_RAM`` (which clears the whole cache), this drops only the named content
     identities, so the RAM-pressure path can reclaim an idle, unprotected staged component while leaving a
     queued job's staged model resident. Naming an identity the cache does not hold is a no-op, never a fault."""
+    RESTORE_COMPONENTS = auto()
+    """Signal a GPU-bearing child to restore specific component-cache entries to the state they loaded in.
+
+    The cheaper rung below ``EVICT_COMPONENTS`` on the same ladder: restoring clears a component's patch
+    residue and hands back its weight-memory claim while the pristine weights stay resident in host RAM, so
+    the next job that wants it re-uploads instead of re-reading it from disk. Prefer this where the pressure
+    is on device memory rather than host RAM, and where the named entries report residue worth clearing.
+    Naming an identity the cache does not hold, or one with nothing to restore, is a no-op, never a fault."""
     RELEASE_ALLOCATOR_CACHE = auto()
     """Signal the child to release the torch allocator's cached free blocks WITHOUT unloading any models.
 
@@ -633,6 +665,20 @@ class HordeEvictComponentsControlMessage(HordeControlMessage):
     control_flag: HordeControlFlag = HordeControlFlag.EVICT_COMPONENTS
     identities: list[str] = Field(default_factory=list)
     """The content identities to evict (a checkpoint entry's identity is the bare horde model name)."""
+
+
+class HordeRestoreComponentsControlMessage(HordeControlMessage):
+    """Ask a GPU-bearing child to restore specific component-cache entries by content identity.
+
+    The reclaim action to reach for before eviction: the named components keep their pristine weights in
+    host RAM and give up their device-memory claim, so a later job for the same model re-uploads rather
+    than re-reading it from disk. The child restores every entry whose identity is listed and ignores any
+    it does not hold, so a raced request is harmless.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.RESTORE_COMPONENTS
+    identities: list[str] = Field(default_factory=list)
+    """The content identities to restore (a checkpoint entry's identity is the bare horde model name)."""
 
 
 class HordeDownloadControlMessage(HordeControlMessage):

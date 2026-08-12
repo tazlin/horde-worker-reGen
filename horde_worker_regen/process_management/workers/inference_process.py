@@ -42,6 +42,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
+    HordeRestoreComponentsControlMessage,
     HordeSampleControlMessage,
     HordeSampleResultMessage,
     ModelLoadState,
@@ -1501,6 +1502,14 @@ class HordeInferenceProcess(HordeProcess):
 
         if isinstance(message, HordeEvictComponentsControlMessage):
             self.evict_held_components(message.identities)
+            return
+
+        if isinstance(message, HordeRestoreComponentsControlMessage):
+            # Releasing the allocator cache is what makes the restore visible: the freed weights sit in
+            # torch's reserved-but-unused pool until it is emptied, so the card's free memory (and the
+            # parent's reserved figure) would otherwise be unchanged. That call also reports memory.
+            if self.restore_held_components(message.identities):
+                self.release_allocator_cache()
             return
 
         if isinstance(message, HordePreloadInferenceModelMessage):
