@@ -1,59 +1,40 @@
-# CLAUDE.md
+# AGENTS.md
 
-Guidance for Claude Code (claude.ai/code) when working in this repository. This file is a high-level
-map; the [`docs/`](docs/index.md) tree is the source of truth for depth and is kept current. Prefer
-linking a reader to a doc page over duplicating it here.
+Guidance for coding agents working in this repository. This file is a high-level map; the
+[`docs/`](docs/index.md) tree is the source of truth for depth. Link a reader to a doc page rather
+than duplicating it here.
 
 > [!IMPORTANT]
-> **Update the docs in the same change that alters behavior. This is not optional.**
-> Any substantial change (a new module, a new config field, a changed scheduling/budget/recovery rule,
-> a new IPC message or protocol bump, a renamed entry point) MUST land with the matching `docs/` edits in
-> the *same* commit/PR. Treat stale docs as a bug in the change, not a follow-up.
-> - **Narrative docs are hand-written and will silently rot** unless you edit them: the `explanation/`,
->   `how-to/`, `tutorials/`, and `reference/` pages (e.g. `explanation/performance_and_backpressure.md`,
->   `reference/codebase-map.md`, `reference/logs.md`). When you change a subsystem, find the page that
->   describes it and bring it in line; do not assume a reviewer will.
-> - **Keep `docs/reference/codebase-map.md` current when the code shape changes.** If you add, remove, move,
->   or rename an important module/package, entry point, process role/lane, manager/coordinator, CLI, durable
->   state file, or major supporting top-level package, update the codebase map in the same change.
-> - **API reference pages auto-generate** from docstrings via `docs/build_docs.py`. After adding or
->   removing a module under `horde_worker_regen/`, run `uv run --no-sync python docs/build_docs.py` and
->   commit the regenerated stub(s). The page content still comes from your docstrings, so write them.
->   `build_docs.py` may also rewrite unrelated stubs with line-ending-only churn (`git diff` shows
->   nothing but `git status` shows them modified); `git checkout --` those to keep the diff clean.
-> - Follow [Diátaxis](docs/index.md): put facts in the right quadrant (tutorial / how-to / reference /
->   explanation) and interlink rather than duplicate.
-> - **`docs/index.md` is the map.** Start there to find the page that owns a changed concept, and grep
->   `docs/` for the touched terms to catch drift you did not anticipate. When you rename a section, grep
->   for inbound `other.md#old-anchor` links and re-point them; verify every anchor you link exists.
-> - When you cannot fully reconcile a doc in the same change, say so explicitly in the change description
->   rather than leaving it silently stale.
+> **Docs land in the same change that alters behavior.** A new module, config field, IPC message,
+> scheduling/budget/recovery rule, or renamed entry point ships with the matching `docs/` edits in the
+> same commit. Narrative pages (`explanation/`, `how-to/`, `reference/codebase-map.md`, `reference/logs.md`)
+> are hand-written and rot silently; find the page that owns the changed concept via
+> [docs/index.md](docs/index.md) and grep `docs/` for the touched terms. API stubs regenerate via
+> `uv run --no-sync python docs/build_docs.py` (commit new/removed stubs; `git checkout --` any
+> line-ending-only churn it causes). If a doc cannot be fully reconciled in the change, say so in the
+> change description.
 
-## What this is and why it exists
+## What this is
 
-**Horde Worker reGen** is the local GPU worker for the [AI Horde](https://aihorde.net/): a free,
-decentralized network where people donate GPU time to generate AI images. The worker pulls jobs from
-the AI Horde API, runs Stable Diffusion / Flux inference (via `hordelib`/ComfyUI), screens results
-through an NSFW/CSAM safety classifier, uploads the images to R2, and submits the result back to the
-API. Operators earn **kudos** for completed work. A worker can additionally opt into **alchemy** jobs
-(upscaling, face-fixing, interrogation, captioning) on the same processes.
+**Horde Worker reGen** is the local GPU worker for the [AI Horde](https://aihorde.net/): it pops jobs
+from the API, runs image inference (via `hordelib`/ComfyUI), screens results through a safety
+classifier, uploads to R2, and submits back. Operators earn **kudos**; workers can also serve
+**alchemy** (upscaling, face-fixing, interrogation, captioning).
 
-**Why multiprocess.** Inference is VRAM-heavy and stateful, and ComfyUI is not thread-safe, so each
-GPU slot runs in its own OS process. The main process never touches the GPU; it orchestrates child
-**inference** and **safety** processes (and a separate background **download** process) over IPC. This
-buys crash isolation, model persistence across jobs, and parallelism (preload one model while another
-samples; run safety in parallel with inference). See [Architecture](docs/explanation/architecture.md).
+**Why multiprocess:** inference is VRAM-heavy and ComfyUI is not thread-safe, so each GPU slot is its
+own OS process. The main process never touches the GPU; it orchestrates inference/safety/download
+children over IPC. See [Architecture](docs/explanation/architecture.md).
 
 ## Start here (docs)
 
 - [Documentation home](docs/index.md): Diátaxis tree (tutorials / how-to / reference / explanation).
 - [Architecture](docs/explanation/architecture.md): process model, shared-state pattern, asyncio loop.
 - [Codebase map](docs/reference/codebase-map.md): file → responsibility quick reference.
-- [Job lifecycle](docs/explanation/job_lifecycle.md) and
-  [Job state machine](docs/explanation/job_state_machine.md): a job from pop to submit.
-- [Resilience and recovery](docs/explanation/resilience_and_recovery.md),
-  [Model downloads](docs/explanation/model_downloads.md), and
-  [Frontend and durable state](docs/explanation/frontend_and_state.md): the newer subsystems.
+- [Job lifecycle](docs/explanation/job_lifecycle.md),
+  [Job state machine](docs/explanation/job_state_machine.md),
+  [Resilience and recovery](docs/explanation/resilience_and_recovery.md),
+  [Model downloads](docs/explanation/model_downloads.md),
+  [Frontend and durable state](docs/explanation/frontend_and_state.md).
 
 ## The map (most important files & classes)
 
@@ -91,124 +72,170 @@ never reassigned), coordinated by `HordeWorkerProcessManager`.
 launches the headless worker as a child. Other console scripts: `download_models`, `horde-worker-web`,
 `horde-worker-host`, `horde-benchmark`. Full flag/env reference: [CLI](docs/reference/cli.md).
 
-**Durable state** lives in a `.horde_worker_regen/` working-directory folder (state.json, owned_pids
-.json, action_ledger.jsonl, perf_model.json), alongside `bridgeData.yaml`, `logs/`, and
+**Durable state** lives in `.horde_worker_regen/` in the working directory (state.json,
+owned_pids.json, action_ledger.jsonl, perf_model.json), alongside `bridgeData.yaml`, `logs/`, and
 `benchmark_results/`.
 
 ## Code quality
 
-Follow the **[Haidra Python style guide](docs/haidra-assets/docs/meta/python.md)** (it is the
-canonical reference). In brief: complete type hints on all public surfaces; `| None` over `Optional`;
-`StrEnum`/`Enum` and small classes over magic strings and bare dicts; guard clauses over deep nesting;
-never silently swallow exceptions; Google-style docstrings on public APIs; descriptive names. The
-codebase is written for static analysis (pyrefly) and pydantic models are used DataClass-like.
+Follow the **[Haidra Python style guide](docs/haidra-assets/docs/meta/python.md)** (canonical). In
+brief: complete type hints on public surfaces; `| None` over `Optional`; `StrEnum`/`Enum` and small
+classes over magic strings and bare dicts; guard clauses over deep nesting; never silently swallow
+exceptions; Google-style docstrings on public APIs. The codebase is written for static analysis
+(pyrefly); pydantic models are used dataclass-like.
 
-- **Python:** `>=3.12,<3.13`. Dependencies/venv via **uv** (`uv sync`, `uv run <cmd>`; this repo and
-  hordelib are often run with `uv run --no-sync`).
-- **Line length:** 119. `ruff format` is the canonical formatter.
+- **Python** `>=3.12,<3.13`; dependencies via **uv** (`uv sync`, `uv run <cmd>`, often
+  `uv run --no-sync` here and in hordelib).
+- **Line length** 119; `ruff format` is the canonical formatter.
 
 ## Lint, format, type-check, test
 
 ```bash
-# Format + lint (ruff is the linter and the formatter)
-uv run ruff format .
-uv run ruff check . --fix
+uv run ruff format . && uv run ruff check . --fix
+uv run pyrefly check                # pyrefly, not mypy
+prek run --all-files                # all hooks (prek, not pre-commit)
 
-# Type check (pyrefly is the type checker for this repo, not mypy)
-uv run pyrefly check
-
-# All hooks at once (ruff + pyrefly + file hygiene)
-prek run --all-files
-
-# Tests
-uv run pytest                       # default sweep: fast; the opt-in `slow` and `gpu` bands are skipped
-uv run pytest -m slow               # the slow band: real subprocess spawns / multi-second workloads
-uv run pytest -m "slow or gpu"      # both opt-in bands at once (gpu still needs a real device)
-uv run pytest -m chaos_sweep        # the generated chaos sweep (see the marker contract below)
-uv run pytest tests/process_management/
+uv run pytest                       # default sweep (opt-in bands skipped)
+uv run pytest -m slow               # real subprocess spawns / multi-second workloads
+uv run pytest -m gpu                # needs a real accelerator; auto-skips without CUDA
+uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-release gate)
 ```
 
-- Tests live in `tests/`. `tests/process_management/` is grouped by process-manager subsystem and builds a testable manager via
-  `make_testable_process_manager()`; `tests/e2e/` exercises the dry-run/fake flow end to end (marked
-  `e2e`). `tests/process_management/testing/test_chaos.py` drives the fault-injection harness.
-- **Marker contract.** Two bands are opt-in and skipped by a bare `pytest` so the default sweep finishes in
-  minutes rather than tens of minutes:
-    - `@pytest.mark.slow`: the test spawns real OS subprocesses (the `tests/e2e` harness family, the tui
-      worker-host/launcher tests that boot a real worker) or runs a multi-second workload. On Windows each
-      spawned child pays a full process spawn plus package import, which is what makes the band expensive.
-      Run it with `-m slow`. CI runs it as a dedicated step so its coverage is not lost.
-    - `@pytest.mark.gpu`: the test needs a real accelerator and boots real workers (minutes each). Run it
-      with `-m gpu`; even then it **auto-skips** when no CUDA device is present, so CI and GPU-less dev boxes
-      stay green.
-    - `@pytest.mark.chaos_sweep`: the generated wedge-liveness sweep, hundreds of seeded scenarios run as a
-      pre-release gate and nightly. The default suite runs its representative core slice instead. Its
-      full-worker half is also in the `slow` band, so running that half means naming both:
-      `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` carries the gate commands and the `HORDE_CHAOS_SEEDS`
-      replay/widen override.
-  - A band skips only when the `-m` expression does not name it, so `-m "not slow"` and `-m slow`
-    both behave as written. The day-to-day flow is: bare `pytest` while iterating, `-m slow` before pushing
-    a change that touches the worker lifecycle, `-m gpu` on a GPU box, the chaos sweep before a release.
-- **Targeted selection: never rerun a multi-minute band to inspect one failure.** Every `FAILED` line
-  carries a full node id; rerun exactly that:
-    - one test: `pytest "tests/path/file.py::Class::test_name" -q`; one parametrized cell: append its
-      bracketed id verbatim (`::test_row[seed1163-8gb-alternating-t1-n5]`) and quote the whole node id;
-    - one matrix row across its properties: `-k <row-label>` (row labels are unique by construction);
-    - one chaos seed: `HORDE_CHAOS_SEEDS=<seed>` with the sweep marker runs that seed alone; a range
-      (`1000:1100`) or list (`7,19`) widens it. Debug a single seed this way, never by rerunning the sweep;
-    - long runs are teed to a file once and grepped; the tee is the record, the node ids in it are the
-      rerun commands.
-  Iterating on a fix means iterating against the pinned reproduction test (seconds), not the band it came
-  from; the band reruns once when the fix is believed complete. One pytest invocation per working copy at
-  a time: concurrent suites in the same checkout abort each other's runs.
-- Most pipeline tests run **without a GPU or network** using dry-run mode (`CannedJobSource` +
-  `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode)
-  and `harness.py`.
-- `AI_HORDE_TESTING=1` is read at runtime to suppress side effects (e.g. action-ledger file mirroring)
-  during tests/harness runs.
-- `prek` (not `pre-commit`) runs the hooks; the pinned `ruff`/`pyrefly` versions in
-  `.pre-commit-config.yaml` must match `pyproject.toml` (there is a test that enforces this).
+- `tests/process_management/` is grouped by subsystem and builds a testable manager via
+  `make_testable_process_manager()`; `tests/e2e/` exercises the dry-run/fake flow (marked `e2e`).
+- **Marker contract:** the `slow`, `gpu`, and `chaos_sweep` bands run only when the `-m` expression
+  names them (`-m "not slow"` and `-m slow` both behave as written). The chaos sweep's full-worker
+  half is also `slow`: `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` carries the gate commands and
+  the `HORDE_CHAOS_SEEDS` replay/widen override.
+- **Rerun the failure, not the band.** Every `FAILED` line carries a node id; rerun exactly that
+  (quote parametrized ids verbatim). One chaos seed replays via `HORDE_CHAOS_SEEDS=<seed>`. Tee long
+  runs to a file once and grep the tee. One pytest invocation per working copy: concurrent suites in
+  the same checkout abort each other.
+- Most pipeline tests run **without GPU or network** via dry-run mode (`CannedJobSource` +
+  `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode).
+- `AI_HORDE_TESTING=1` suppresses runtime side effects (orphan reaping, action-ledger mirroring)
+  during tests. The flip side: a killed test run can leave child processes alive holding VRAM
+  indefinitely, and every real worker in a checkout shares the `logs/bridge_<n>.log` namespace. Before
+  blaming a GPU-band wedge on the code, check for stale python children.
+- **One real worker per card at a time.** A test that cold-boots its own worker cannot run beside a
+  live warm session: the second worker's preloads starve under VRAM admission. This is why
+  `tests/gpu/test_capability_probes.py` orders its cold baselines before the first warm probe.
+- **The harness derives worker config from the scenario.** A cold run builds bridge data per scenario
+  (`build_harness_bridge_data`); a warm session is provisioned once to the union ceiling of every
+  scenario it will host (`WarmHarnessSession(scenarios=...)`), both through
+  `_workload_capability_bridge_fields` in `harness.py`. A new job feature, workflow, or resolution
+  axis must extend that shared derivation, or the warm path's jobs are ineligible at dispatch and the
+  level scores on faults instead of running.
+- **A level's completed/faulted split reads from per-level run metrics**, with tracker deltas as
+  floor/fallback (`WarmHarnessSession._level_job_counts`). Per-job records trail the tracker's
+  counters by a message pump, so they are read through a bounded settle
+  (`_settle_level_metrics`), never at the instant a drain returns.
+- The pinned `ruff`/`pyrefly` versions in `.pre-commit-config.yaml` must match `pyproject.toml`
+  (a test enforces this).
 
 ## Gotchas
 
-- **The orchestrator must stay torch-free.** The main process orchestrates; it never runs inference, so
-  it must never load torch (~500MB RSS); only the inference/safety/download children should. Two traps:
-  (1) `hordelib.api` is a convenience facade that *eagerly* loads torch, so importing *any* symbol from it
-  (even a pure-Python helper like `estimate_job_burden`) drags torch in. In parent/host/planning code,
-  import from the torch-free *origin* submodule instead: `hordelib.feature_impact` (burden math),
-  `hordelib.feature_requirements` (capabilities), `hordelib.metrics`, `hordelib.utils.logger` (`HordeLog`),
-  `hordelib.pipeline.constants` / `hordelib.preload` (controlnet annotator helpers),
-  `hordelib.utils.torch_memory` (device/VRAM helpers). (2) Device *queries* (`enumerate_accelerators`,
-  `get_torch_*_vram_mb`) load torch when *called*, even via a torch-free import; run them out-of-process
-  via `utils/accelerator_probe.py::probe_accelerators` (used by `SystemResources.detect`, the config
-  wizard, and benchmark machine detection). `tests/process_management/manager/test_orchestrator_torch_free.py` is
-  the tripwire. (Upstream `hordelib.api` is now lazy for its one torch-heavy re-export,
-  `SharedModelManager`, but the worker pins a *published* engine, so don't rely on that here.)
+- **The orchestrator must stay torch-free.** The main process never loads torch (~500MB RSS). Two
+  traps: (1) `hordelib.api` eagerly loads torch on any import; in parent/host/planning code import the
+  torch-free origin submodule instead (`hordelib.feature_impact`, `hordelib.feature_requirements`,
+  `hordelib.metrics`, `hordelib.utils.logger`, `hordelib.pipeline.constants`, `hordelib.preload`,
+  `hordelib.utils.torch_memory`). (2) Device queries (`enumerate_accelerators`, `get_torch_*_vram_mb`)
+  load torch when called; run them out-of-process via `utils/accelerator_probe.py::probe_accelerators`.
+  `tests/process_management/manager/test_orchestrator_torch_free.py` is the tripwire.
 - **Subprocesses must never download model references.** The parent owns reference downloading; use
-  `reference_helper` to get an offline (read-only) reference manager in a child. On-disk layout facts
-  live in `horde_model_reference.on_disk_layout`, not in worker-local code.
-- **Telemetry is forced off by default** (it is expensive even with no collector); opt in only with a
-  collector running. See [Telemetry](docs/explanation/telemetry.md).
-- **Optimistic IPC sends:** the parent updates `ProcessMap`/`HordeModelMap` immediately after a send,
-  before the child confirms; `process_launch_identifier` discards messages from replaced processes.
+  `reference_helper` for an offline reference manager in a child. On-disk layout facts live in
+  `horde_model_reference.on_disk_layout`.
+- **Telemetry is off by default** (expensive even with no collector). See
+  [Telemetry](docs/explanation/telemetry.md).
+- **Optimistic IPC sends:** the parent updates `ProcessMap`/`HordeModelMap` immediately after a send;
+  `process_launch_identifier` discards messages from replaced processes.
 - **Config flows by reference:** sub-managers read `RuntimeConfig.bridge_data`; the file hot-reloads
   every 1 s unless config came from env vars (`-e`).
-- **A liveness proof the failure can satisfy is not a proof.** Whenever you touch a watchdog, escalation
-  counter, or "did it recover" signal, ask what the failure itself increments. Prefer completion counters
-  over attempt counters (an inference *start* rises freely while a downstream stage is the thing stuck),
-  scale any performance expectation by the concurrency actually present, and never let a counter be reset
-  by state the escalation's own remedy produces. Three separate instances of this defeated the recovery
-  escalation's backstops, so `made_progress_since_episode` and `RecoverySupervisor`'s episode close are
-  deliberately strict. Pair every "we did not fire" test with a positive-liveness test that work flows.
-- **Recovery must end in a working worker.** The escalation ladder is ordered least-destructive first and
-  its endpoint is a running worker, never a stopped one. Exiting is only a rung when something will start
-  a new process (the dashboard supervising its child, or `exit_on_unhandled_faults` plus a service
-  manager); otherwise the worker keeps escalating in place. Adding a rung means adding something that
-  *changes the condition*, since a rung that reproduces its own trigger is not a rung. See
-  [Resilience and recovery](docs/explanation/resilience_and_recovery.md).
-- **Do not gate a recovery action behind a preference flag.** A reclaim or degradation rung switched off
-  by a throughput or feature preference will be disabled by operators who have no idea they removed a
-  recovery capability. Give the recovery path its own key (defaulting to enabled) or let it override the
-  preference.
+- **Job acceptance is promised twice, and both promises must agree.** The popper advertises from live
+  `bridge_data`; dispatch eligibility judges each card's effective config (`CardRuntime.config`, via
+  `gpu/gpu_eligibility.py::reasons_card_cannot_serve`). A new field that gates jobs (an `allow_*`
+  flag, a resolution/limit) must reach `resolve_all_effective_gpu_configs`, which both the boot build
+  and the hot-reload refresh (`_refresh_card_configs`) derive from. When the surfaces disagree the
+  worker accepts jobs it then hard-faults, and those faults feed the consecutive-failure pop pause and
+  the fault-rate breaker.
+- **`total_num_completed_jobs` is a movement counter: terminal jobs, faults included.**
+  `num_jobs_faulted` rises at fault time with a per-job latch. Success is never `completed` alone;
+  it is completed minus faulted, or the per-job run-metrics records.
+- **Production breakers run under canned sources too.** The benchmark/harness path does not disable
+  the pop pause or fault-rate breaker; a canned job that terminally faults is never re-served
+  (`CannedJobSource`'s terminal-fault ledger), so a refusing worker fails a level in seconds instead
+  of looping through breaker pauses.
+- **A liveness proof the failure can satisfy is not a proof.** For any watchdog, escalation counter,
+  or "did it recover" signal: prefer completion counters over attempt counters, scale expectations by
+  the concurrency actually present, and never let a counter be reset by state the escalation's own
+  remedy produces. Pair every "did not fire" test with a positive-liveness test that work flows. An
+  adaptive sampler legally repeats its final step at full speed, so a stall check keyed on repeated
+  steps faults healthy samplers.
+- **Recovery must end in a working worker.** The escalation ladder is ordered least-destructive first
+  and its endpoint is a running worker. Exiting is only a rung when something restarts the process (the
+  dashboard, or `exit_on_unhandled_faults` plus a service manager). A rung that reproduces its own
+  trigger is not a rung. See [Resilience and recovery](docs/explanation/resilience_and_recovery.md).
+- **Do not gate a recovery action behind a preference flag.** Operators will switch it off without
+  knowing they removed a recovery capability; give recovery paths their own keys (default enabled).
+- **`getattr` on typed models is forbidden**, including to tolerate a partially-mocked test; read the
+  field. `isinstance` narrowing is fine.
+- **Mock bridge data is a maintenance contract.** Many `tests/process_management` tests use a `Mock`
+  bridge data whose every attribute is truthy: a new field in `bridge_data/data_model.py` goes into
+  `make_mock_bridge_data` (`tests/process_management/conftest.py`) in the same change, and an
+  off-by-default branch needs `is True` or it fires in every mocked test.
+- **Faulting a doomed job back to the horde sends the same burn to the next worker.** Before
+  automating what follows a failure (retries, quarantines, breakers), ask whether the failure has to
+  happen at all.
+
+## Changing scheduling, memory, or recovery behaviour
+
+These fail as interactions, not as units, so component tests stay green through most of what matters.
+
+- **Test in the simulator first.** `tests/process_management/liveness/_dispatch_world.py` runs the
+  real scheduler, governor and ladder over fake children with a conserved VRAM ledger. Changes to
+  admission, retention, leases, governor thresholds or recovery rungs ship with a closed-loop test
+  asserting an outcome (a duty floor, no safety teardown while serving, no free-VRAM crater). A live
+  run confirms; it is not where you find out.
+- **Every production incident becomes a permanent scenario** in `test_incident_scenarios.py`, written
+  so that undoing its fix makes it fail. If the simulator cannot express an incident, extend the
+  simulator.
+- **Do not weaken an old defensive default** without reproducing the failure it guards at full scale.
+  A single-process benchmark cannot disprove a multi-process problem.
+- **Aggressive operator settings are supported targets.** Duty loss, VRAM pressure, model thrash and
+  process recoveries are admission/scheduling/lifecycle defects; lowering `queue_size` or
+  `max_threads` is not a fix.
+- **Multiprocess is settled** (ComfyUI is not thread-safe), and the NVIDIA "Prefer No Sysmem
+  Fallback" setting is off the table for volunteer operators, so on WDDM admission has to prevent
+  overcommit itself.
+- **The dispatch mix is operator configuration plus traffic randomness, never a stable property.**
+  Operators offer one model or all of them and may lock any subset of slots to a model pool. Policy
+  adapts to observed traffic per slot; validate scheduling/retention changes across signatures
+  (diverse, pooled, heterogeneous), each judged by its own criteria. Log-derived numbers calibrate a
+  scenario, never justify a hard-coded threshold.
+- **No constant encodes one machine.** Cards run 8-24GB and system RAM 16-64GB. Budgets, windows and
+  gates derive from measured capacity or the size of the work at hand, with a floor for the small end.
+- **`VramArbiter` and `VerifiedReclaimLadder` return verdicts and emit nothing.** Telemetry goes
+  through a `DecisionSink` at the call site; `WorkerRunMetrics.record_decision` deduplicates.
+- **Any log line that can fire every tick** must be edge-triggered or rate-limited, with suppressed
+  repeats dropped to TRACE.
+
+## Measuring
+
+- **Score against what a second of wall clock earns.** Per-iteration scores seat the cheapest work;
+  many small jobs are worse than fewer large ones at identical iteration rates.
+- **What you advertise at pop time is a promise about later.** A gate reading free VRAM right now
+  leaks jobs it cannot serve. Start closed, require the condition to hold, open with margin, close at
+  the bare requirement.
+- **One hour of live traffic cannot rank two configurations**; alternate hourly or run for hours.
+- **Kudos numbers from before the v22 pricing retrain** cannot be compared with ones after it.
+- `state.jsonl` `kudos_hr` is this worker; the bridge log's "Total Kudos Accumulated" covers every
+  worker on the account. Do not mix them.
+
+## Working conventions
+
+- **Do not run tests or builds during a soak or live run in the same checkout.** The harness watches a
+  `.abort` file in the working directory, so a test run kills the worker, and the CPU contention ruins
+  the measurement.
 
 ## See also
 
