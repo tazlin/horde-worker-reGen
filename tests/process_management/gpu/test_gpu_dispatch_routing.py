@@ -15,6 +15,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Job
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -23,6 +24,7 @@ from tests.process_management.conftest import (
     make_test_card_runtimes,
     make_test_model_metadata,
     make_test_runtime_config,
+    make_testable_process_manager,
     track_popped_job_async,
 )
 
@@ -418,3 +420,75 @@ class TestPerCardPreloadSerialization:
 
         assert admitted is False, "a same-card preload must wait for the in-flight one to finish"
         assert idle_same_card.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+
+class TestCardConfigTracksConfigReload:
+    """A card's effective config follows a live config reload, so routing and advertising stay in step.
+
+    The popper advertises from live bridge data while eligibility is decided against each card's effective
+    config. If the card configs kept their startup values, a reload that raised a limit or enabled a feature
+    would have the worker accept work it then faults as ineligible.
+    """
+
+    @staticmethod
+    def _manager(**bridge_overrides: object) -> HordeWorkerProcessManager:
+        """A manager whose reload path can be driven without a live download process."""
+        manager = make_testable_process_manager(**bridge_overrides)
+        manager._process_lifecycle = Mock()  # pyrefly: ignore - a stub stands in for the lifecycle manager
+        manager._download_coordinator._process_lifecycle = manager._process_lifecycle
+        manager._download_coordinator.initial_download_requested = True
+        return manager
+
+    def test_raised_resolution_limit_makes_a_refused_job_eligible(self) -> None:
+        """A job above the configured max_pixels becomes servable once the reload raises the limit."""
+        manager = self._manager(max_pixels=1000, nsfw=True)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)  # 262144 px
+        assert manager._inference_scheduler._eligible_card_indices(job) == set()
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(max_pixels=5_000_000, nsfw=True, dry_run_skip_inference=True),
+        )
+
+        assert manager._inference_scheduler._eligible_card_indices(job) == {0}
+
+    def test_lowered_resolution_limit_makes_a_servable_job_ineligible(self) -> None:
+        """The refresh applies in both directions: a tightened limit stops offering the card for the job."""
+        manager = self._manager(max_pixels=5_000_000, nsfw=True)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert manager._inference_scheduler._eligible_card_indices(job) == {0}
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(max_pixels=1000, nsfw=True, dry_run_skip_inference=True),
+        )
+
+        assert manager._inference_scheduler._eligible_card_indices(job) == set()
+
+    def test_enabling_nsfw_makes_an_uncensored_job_eligible(self) -> None:
+        """A policy the card refused at startup is honoured from the reload, without a restart."""
+        manager = self._manager(max_pixels=5_000_000, nsfw=False)
+        job = make_job_pop_response(model="stable_diffusion", use_nsfw_censor=False)
+        assert manager._inference_scheduler._eligible_card_indices(job) == set()
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(max_pixels=5_000_000, nsfw=True, dry_run_skip_inference=True),
+        )
+
+        assert manager._inference_scheduler._eligible_card_indices(job) == {0}
+
+    def test_reload_leaves_the_card_plan_otherwise_untouched(self) -> None:
+        """Only the config moves: the session's concurrency primitives and sizes are not re-derived."""
+        manager = self._manager(max_pixels=1000, nsfw=True)
+        before = manager._card_runtimes[0]
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(max_pixels=5_000_000, nsfw=True, dry_run_skip_inference=True),
+        )
+
+        after = manager._card_runtimes[0]
+        assert after.config is not before.config
+        assert after.inference_semaphore is before.inference_semaphore
+        assert after.vae_decode_semaphore is before.vae_decode_semaphore
+        assert after.target_process_count == before.target_process_count
+        assert after.max_concurrent_inference == before.max_concurrent_inference
+        assert after.total_vram_mb == before.total_vram_mb
+        assert after.mask_kind == before.mask_kind

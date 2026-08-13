@@ -1627,6 +1627,11 @@ class HordeWorkerProcessManager:
         self._terminal_fault_history: list[tuple[float, str | None]] = []
         self._terminal_fault_breaker_last_trip_at = 0.0
         self._terminal_fault_breaker_escalation = 0
+
+        # Ids of canned-scenario jobs that finalized in a faulted state, handed to each installed
+        # benchmark scenario so a job the worker has already refused is not offered back to it. Only a
+        # canned source ever reads it; live pops are unaffected because the horde never re-serves an id.
+        self._canned_terminal_fault_ids: set[str] = set()
         self._job_tracker.set_terminal_fault_observer(self._on_terminal_job_fault)
 
         # Horde-maintenance episode bookkeeping. The episode marker is the latch timestamp the popper writes,
@@ -5649,6 +5654,10 @@ class HordeWorkerProcessManager:
         self._run_metrics.on_job_finalized(tracked, completed_job_info)
         self._performance_model.on_job_finalized(tracked, completed_job_info)
         self._inference_scheduler.release_dispatch_reservation(tracked.sdk_api_job_info)
+        # Finalization is the end of the line: a job that arrives here faulted has exhausted its retries
+        # (or was never retryable), so its id is recorded for the canned sources to skip.
+        if completed_job_info.state == GENERATION_STATE.faulted:
+            self._canned_terminal_fault_ids.add(str(tracked.job_id))
 
     def _record_process_crash(self, process_info: HordeProcessInfo, reason: str) -> None:
         """Forward a process recovery event to the run-metrics aggregator."""
@@ -6218,16 +6227,28 @@ class HordeWorkerProcessManager:
         *,
         jobs: list[ImageGenerateJobPopResponse] | None,
         alchemy_forms: list[AlchemyFormSpec] | None = None,
+        forget_terminal_faults: bool = True,
     ) -> None:
         """Swap in a fresh canned scenario and reset per-level metrics (warm benchmark worker).
 
         The worker keeps running between levels; this replaces the job/alchemy sources it pops from
         and clears the aggregated run metrics so the next level's numbers start clean. Completion is
-        tracked by the caller via job-tracker count deltas (the tracker itself is not reset).
+        tracked by the caller against the per-level run metrics, with job-tracker count deltas as the
+        fallback (the tracker itself is not reset).
+
+        ``forget_terminal_faults`` clears the terminal-fault ledger the installed source consults, which
+        is what a genuinely new scenario wants: the incoming jobs have their own generation ids and no
+        history. A caller re-installing the *same* job objects (a pre-warm pass followed by the measured
+        pass) clears it so the measured pass scores those jobs itself rather than inheriting the pre-warm
+        pass's refusals.
         """
+        if forget_terminal_faults:
+            self._canned_terminal_fault_ids.clear()
         # Always install concrete (possibly empty) sources: a None job source under skip_api would
         # make the popper fall back to the default cycling scenario, polluting the level.
-        self._job_popper.set_canned_job_source(CannedJobSource(jobs or []))
+        self._job_popper.set_canned_job_source(
+            CannedJobSource(jobs or [], terminal_fault_ledger=self._canned_terminal_fault_ids),
+        )
         self._alchemy_coordinator.set_canned_alchemy_source(CannedAlchemySource(alchemy_forms or []))
         self._run_metrics.reset()
         # The recovery counter is cumulative for the worker's lifetime; the warm benchmark reuses one
@@ -7708,6 +7729,8 @@ class HordeWorkerProcessManager:
         logger.debug(f"Models to load: {self.bridge_data.image_models_to_load}")
         logger.debug(f"Custom models: {self.bridge_data.custom_models}")
 
+        self._refresh_card_configs()
+
         self._process_lifecycle.set_download_controls(
             paused=self.bridge_data.downloads_paused,
             rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
@@ -7720,6 +7743,25 @@ class HordeWorkerProcessManager:
             previously_configured=previously_configured,
         )
         self._download_coordinator.forward_download_gating_if_changed(previous_download_flags)
+
+    def _refresh_card_configs(self) -> None:
+        """Re-derive each driven card's effective config from the current bridge data.
+
+        Card eligibility (max_pixels, the ``allow_*`` feature flags, nsfw, served models) is decided against
+        :attr:`CardRuntime.config`, while the popper advertises from live bridge data. If the card configs
+        stayed at their startup values, a reload that raises a limit or enables a feature would have the
+        worker accept jobs it then hard-faults as ineligible, which the horde sees as dropped generations and
+        which feeds the worker's own failure breakers.
+
+        Config only: the card's concurrency primitives, clearance controllers, and process counts are sized
+        for this session and must not move under a running pool. The runtime map is mutated in place because
+        the popper, scheduler, and lifecycle manager hold the same dict.
+        """
+        if not self._card_runtimes:
+            return
+        refreshed = resolve_all_effective_gpu_configs(self.bridge_data, sorted(self._card_runtimes))
+        for index, card in list(self._card_runtimes.items()):
+            self._card_runtimes[index] = dataclasses.replace(card, config=refreshed[index])
 
     def _handle_exception(self, task: asyncio.Task[None]) -> None:
         """Supervise a finished main-loop task; shut down gracefully if one ends unexpectedly.

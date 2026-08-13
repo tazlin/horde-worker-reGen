@@ -5,11 +5,13 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from tests.process_management.conftest import (
+    make_job_pop_response,
     make_mock_job,
     mark_job_in_progress_async,
     move_job_to_being_safety_checked_async,
@@ -404,3 +406,53 @@ class TestDispatchConditionStamps:
 
         assert job_tracker.invalidate_job_aux_preparation(job)
         assert tracked.aux_models_prepared_at is None
+
+
+class TestFaultCounting:
+    """A terminally faulted job is counted as faulted, exactly once, whichever path reaches it first."""
+
+    async def test_terminal_scheduling_fault_counts_as_faulted(
+        self,
+        job_tracker: JobTracker,
+        mock_job_pop_response: ImageGenerateJobPopResponse,
+    ) -> None:
+        """A job faulted before any child ran (an ineligible job) raises the faulted total immediately."""
+        await job_tracker.record_popped_job(mock_job_pop_response)
+
+        job_tracker.handle_job_fault_now(mock_job_pop_response, retryable=False, scheduling_fault=True)
+
+        assert job_tracker.num_jobs_faulted == 1
+        # The job is terminal and will be reported, so movement-based readers still see it move.
+        assert job_tracker.total_num_completed_jobs == 1
+
+    async def test_fault_report_submit_does_not_count_the_job_twice(
+        self,
+        job_tracker: JobTracker,
+        mock_job_pop_response: ImageGenerateJobPopResponse,
+    ) -> None:
+        """Delivering the fault report for an already-counted job leaves the total where it was."""
+        await job_tracker.record_popped_job(mock_job_pop_response)
+        job_tracker.handle_job_fault_now(mock_job_pop_response, retryable=False, scheduling_fault=True)
+
+        await job_tracker.increment_jobs_faulted(mock_job_pop_response.id_)
+
+        assert job_tracker.num_jobs_faulted == 1
+
+    async def test_fault_of_an_untracked_job_is_counted_as_given(self, job_tracker: JobTracker) -> None:
+        """A fault reported for a job the tracker no longer holds cannot be deduplicated, so it counts."""
+        await job_tracker.increment_jobs_faulted(None)
+
+        assert job_tracker.num_jobs_faulted == 1
+
+    async def test_fully_faulted_set_cannot_read_as_completed_only(self, job_tracker: JobTracker) -> None:
+        """A drain reading both deltas sees every job faulted rather than a clean run of completions."""
+        completed_before = job_tracker.total_num_completed_jobs
+        faulted_before = job_tracker.num_jobs_faulted
+
+        for _ in range(3):
+            job = make_job_pop_response()
+            await job_tracker.record_popped_job(job)
+            job_tracker.handle_job_fault_now(job, retryable=False, scheduling_fault=True)
+
+        assert job_tracker.total_num_completed_jobs - completed_before == 3
+        assert job_tracker.num_jobs_faulted - faulted_before == 3

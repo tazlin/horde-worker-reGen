@@ -451,7 +451,9 @@ class JobSubmitter:
                 f"Job popped {time_taken} seconds ago and took "
                 f"{new_submit.completed_job_info.time_to_generate:.2f} to generate.",
             )
-            await self._job_tracker.increment_jobs_faulted()
+            # The tracker's own key (``id_``), not this generation's id: a batch job's generations submit
+            # separately but are one faulted job.
+            await self._job_tracker.increment_jobs_faulted(new_submit.completed_job_info.sdk_api_job_info.id_)
 
         submit_time = time.time()
         self._state.note_first_kudos_event(submit_time)

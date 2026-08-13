@@ -308,6 +308,13 @@ class TrackedJob:
     this a post-mortem can see only that the job faulted and has to reconstruct the reason from logs.
     Cleared when a post-inference fault is withdrawn, so a job whose images were adopted after all does not
     finalize carrying the reason it briefly held."""
+    fault_counted: bool = False
+    """Whether this job has already been counted in the worker's faulted-job total.
+
+    A job can be marked faulted at the moment its fate is decided (a terminal inference or scheduling fault)
+    and again when its fault report is delivered to the horde. Both paths count through the same latch so the
+    total counts a faulted job exactly once, whichever path reaches it first and however many generations the
+    job would otherwise have submitted."""
     degraded_retry_used: bool = False
     """Whether this job has already spent its one degraded (isolated) retry for a resource failure."""
     needs_degraded_dispatch: bool = False
@@ -1929,8 +1936,25 @@ class JobTracker:
         """Get all recorded faults for a job."""
         return list(self._job_faults.get(job_id, []))
 
-    async def increment_jobs_faulted(self) -> None:
-        """Increment the count of jobs that have encountered faults."""
+    async def increment_jobs_faulted(self, job_id: GenerationID | None = None) -> None:
+        """Increment the count of jobs that have encountered faults.
+
+        ``job_id`` identifies the job so the count is latched per job: a job already counted when its fault
+        became terminal is not counted a second time when its fault report is delivered, and a batch job
+        whose generations submit separately counts once rather than once per generation. A job the tracker
+        no longer holds is counted as given.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None:
+            self._num_jobs_faulted += 1
+            return
+        self._count_job_faulted(tracked)
+
+    def _count_job_faulted(self, tracked: TrackedJob) -> None:
+        """Count ``tracked`` in the faulted-job total unless it has already been counted."""
+        if tracked.fault_counted:
+            return
+        tracked.fault_counted = True
         self._num_jobs_faulted += 1
 
     async def increment_jobs_completed(self) -> None:
@@ -2534,6 +2558,11 @@ class JobTracker:
             # worker's own queue-drain logic) waits forever on a job that has, in fact, finished
             # (as a fault). The faulted-kudos counter is still incremented once at submit time.
             self._total_num_completed_jobs += 1
+            # The job is terminally faulted here, before anything is reported to the horde, so the faulted
+            # total must rise here too. Counting only on a delivered fault report leaves a fault whose
+            # submit never lands (or never runs) visible solely as a completion, which reads to a
+            # fault-aware consumer (drains, run records, benchmark criteria) as a job that succeeded.
+            self._count_job_faulted(tracked)
 
         # Announced last, so the tracker's own bookkeeping for this job is complete before any observer
         # reads it back. A generation fault is a job the horde will count as dropped, whatever produced it,
