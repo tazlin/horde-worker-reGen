@@ -30,6 +30,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
@@ -1433,11 +1434,48 @@ async def _emit_progress_periodically(
             logger.debug(f"Progress sampling failed: {progress_error}")
 
 
+_HARNESS_LOG_SINK_ID: int | None = None
+"""The active harness parent-log sink id, so re-arming replaces rather than duplicates it."""
+
+
+def _arm_harness_log_sink() -> None:
+    """Attach the orchestrator's file sink for harness runs (``logs/bridge_harness.log``, DEBUG).
+
+    Telemetry configuration replaces every loguru handler with logfire's console handler
+    (hordelib's logfire integration calls ``logger.configure(handlers=[...])``), and pytest captures
+    the console besides, so without a file sink of its own the harness parent is a black box: the
+    scheduler's decisions, probe verdicts, and drain warnings vanish, and a run that wedges or is
+    killed leaves no parent-side record at all. Armed after telemetry configuration for exactly that
+    reason, and re-armed per run so a repeat telemetry configuration cannot silently strip it; the
+    previous sink is removed first so the process always holds at most one.
+    """
+    global _HARNESS_LOG_SINK_ID
+    if _HARNESS_LOG_SINK_ID is not None:
+        with contextlib.suppress(ValueError):
+            logger.remove(_HARNESS_LOG_SINK_ID)
+        _HARNESS_LOG_SINK_ID = None
+    try:
+        logs_dir = Path("logs")
+        logs_dir.mkdir(exist_ok=True)
+        _HARNESS_LOG_SINK_ID = logger.add(
+            logs_dir / "bridge_harness.log",
+            level="DEBUG",
+            enqueue=True,
+            backtrace=False,
+            diagnose=False,
+            rotation="64 MB",
+            retention=3,
+        )
+    except OSError as error:
+        logger.warning(f"Could not arm the harness parent log sink: {error}")
+
+
 async def run_harness_async(config: HarnessConfig) -> HarnessResult:
     """Run a full worker lifecycle against the configured scenario and report the outcome."""
     from horde_worker_regen.telemetry import configure_telemetry
 
     configure_telemetry()
+    _arm_harness_log_sink()
     _apply_production_worker_env(config.process_mode)
 
     # Remove any stale .abort sentinel before starting, so a previous crashed/
@@ -1995,6 +2033,7 @@ class WarmHarnessSession:
         from horde_worker_regen.telemetry import configure_telemetry
 
         configure_telemetry()
+        _arm_harness_log_sink()
         _apply_production_worker_env(self._process_mode)
         _cleanup_stale_abort_file()
 
