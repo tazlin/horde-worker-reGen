@@ -72,6 +72,7 @@ async def test_capability_canary_warm_reuse(
         process_mode="real",
         model_names=sorted(probe.scenario.models_referenced()),
         max_threads_ceiling=1,
+        scenarios=[probe.scenario],
     ) as session:
         boot_seconds = time.monotonic() - boot_started
         launch_ids_before = {

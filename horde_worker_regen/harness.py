@@ -475,6 +475,12 @@ class HarnessResult:
     criterion for a scheduling-clean soak is that this stays zero: no scheduling-caused failure backoff
     fired. Give-up faults tagged ``SCHEDULING_RECOVERY`` are already excluded from the count that arms it."""
 
+    warmup_seconds: float = 0.0
+    """Wall-clock the run spent pre-warming before the measured pass began (0.0 when it did not warm up).
+
+    Held apart from ``elapsed_seconds``, which covers the measured pass only, so a driver reporting a
+    probe's cost can separate the one-time feature-model load from the work that was actually scored."""
+
     boot_failed_no_progress: bool = False
     """True when a fixed-scenario run ended with no job accounted for (none completed, none faulted) via an
     early graceful shutdown rather than a timeout: the worker gave up (or never brought a child up) before it
@@ -650,6 +656,119 @@ def _normalized_bridge_overrides(overrides: Mapping[str, object]) -> dict[str, o
     return normalized
 
 
+def _needs_controlnet(features: ImageGenerationFeatureFlags) -> bool:
+    """Whether a workload's features require the worker to advertise controlnet support."""
+    return bool(
+        features.controlnets_feature_flags
+        or (features.workflows and KNOWN_IMAGE_WORKFLOWS.qr_code in features.workflows)
+    )
+
+
+def _needs_source_image(features: ImageGenerationFeatureFlags) -> bool:
+    """Whether a workload's features carry a source image (and so require ``allow_img2img``)."""
+    return bool(
+        features.extra_source_images
+        or features.controlnets_feature_flags
+        or features.workflows
+        or set(features.source_processing) - {KNOWN_IMAGE_SOURCE_PROCESSING.txt2img}
+    )
+
+
+def _workload_capability_bridge_fields(
+    workload_features: Sequence[ImageGenerationFeatureFlags],
+    *,
+    max_pixels_needed: int,
+    needs_alchemist: bool,
+) -> dict[str, object]:
+    """The bridge-data fields a workload's *union* of requirements demands.
+
+    A worker judges a job against the configuration it was built with: a feature the config does not
+    permit, or a resolution above what ``max_power`` advertises, makes the job ineligible and it is
+    faulted at dispatch rather than run. This derives the ceiling that covers every feature any part of
+    the workload needs, so nothing in it is refused for a capability the worker could have offered.
+
+    Shared by the per-scenario cold path (:func:`build_harness_bridge_data`) and the warm session's base
+    config (:func:`_warm_bridge_data_fields`), which differ only in what they hand in: one workload or
+    the union of a whole catalog's.
+    """
+    fields: dict[str, object] = {}
+    if any(_needs_source_image(features) for features in workload_features):
+        fields["allow_img2img"] = True
+    if any(
+        set(features.source_processing)
+        & {KNOWN_IMAGE_SOURCE_PROCESSING.inpainting, KNOWN_IMAGE_SOURCE_PROCESSING.outpainting}
+        for features in workload_features
+    ):
+        fields["allow_painting"] = True
+    if any(_needs_controlnet(features) for features in workload_features):
+        fields["allow_controlnet"] = True
+    if any(
+        features.controlnets_feature_flags
+        and set(features.controlnets_feature_flags.controlnets) & EXTENDED_CONTROL_TYPES
+        for features in workload_features
+    ):
+        fields["extended_controlnet"] = True
+    if any(
+        (features.workflows and KNOWN_IMAGE_WORKFLOWS.qr_code in features.workflows)
+        or (_needs_controlnet(features) and KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl in features.baselines)
+        for features in workload_features
+    ):
+        fields["allow_sdxl_controlnet"] = True
+    if needs_alchemist:
+        fields["alchemist"] = True
+    # A workload that carries LoRA/TI references needs the worker to advertise LoRA support, or the
+    # simulated pop matching (which honours the request exactly as the live API does) filters every
+    # auxiliary-bearing job out of the run and the harness silently measures only the control group.
+    if any(features.loras or features.tis for features in workload_features):
+        fields["allow_lora"] = True
+    if any(features.post_processing for features in workload_features):
+        fields["allow_post_processing"] = True
+    # max_power gates the largest resolution the pop request advertises (max_pixels = power * 8 * 64 * 64),
+    # so it must cover the workload's largest job or the simulated pop matching silently filters every
+    # heavier template and the run degrades to its smallest jobs.
+    if max_pixels_needed > 0:
+        fields["max_power"] = max(8, -(-max_pixels_needed // (8 * 64 * 64)))
+    return fields
+
+
+def _scenario_representative_jobs(scenario: Scenario) -> list[ImageGenerateJobPopResponse]:
+    """One materialized job per image-job spec in *scenario*.
+
+    Feature flags are read off a concrete pop response, but a spec's ``count`` copies are identical in
+    every respect that matters here, so one per spec answers "what does this scenario need?" without
+    minting (and building source images for) the whole expansion.
+    """
+    if not scenario.image_jobs:
+        return []
+    one_each = scenario.model_copy(
+        update={"image_jobs": [spec.model_copy(update={"count": 1}) for spec in scenario.image_jobs]},
+    )
+    return one_each.expand_image_jobs()
+
+
+def _scenario_catalog_requirements(
+    scenarios: Sequence[Scenario],
+) -> tuple[list[ImageGenerationFeatureFlags], int, bool]:
+    """The workload features, largest job in pixels, and alchemy need across a set of scenarios."""
+    features: list[ImageGenerationFeatureFlags] = []
+    max_pixels = 0
+    needs_alchemist = False
+    for scenario in scenarios:
+        needs_alchemist = needs_alchemist or bool(scenario.alchemy_forms)
+        for spec in scenario.image_jobs:
+            max_pixels = max(max_pixels, spec.width * spec.height)
+        for job in _scenario_representative_jobs(scenario):
+            features.append(
+                image_job_pop_response_to_feature_flags(
+                    job,
+                    resolved_baseline=(
+                        representative_baseline_for_model(job.model) if job.model is not None else None
+                    ),
+                ),
+            )
+    return features, max_pixels, needs_alchemist
+
+
 def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerateJobPopResponse]) -> reGenBridgeData:
     """Construct bridge data appropriate for the given harness configuration."""
     models_in_scenario = sorted({job.model for job in scenario if job.model is not None})
@@ -662,20 +781,6 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
     ]
     template_features = [image_template_to_feature_flags(template) for template in config.soak_image_templates]
     workload_features: list[ImageGenerationFeatureFlags] = [*scenario_features, *template_features]
-
-    def needs_controlnet(features: ImageGenerationFeatureFlags) -> bool:
-        return bool(
-            features.controlnets_feature_flags
-            or (features.workflows and KNOWN_IMAGE_WORKFLOWS.qr_code in features.workflows)
-        )
-
-    def needs_source_image(features: ImageGenerationFeatureFlags) -> bool:
-        return bool(
-            features.extra_source_images
-            or features.controlnets_feature_flags
-            or features.workflows
-            or set(features.source_processing) - {KNOWN_IMAGE_SOURCE_PROCESSING.txt2img}
-        )
 
     # Field aliases (dreamer_name, models_to_load) are required here: the bridge data
     # model populates by alias, matching the on-disk config file format.
@@ -702,42 +807,6 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         # exporting those would mix synthetic costs into the stream real measurements are read from.
         "stats_export_enabled": config.stats_export and config.process_mode == "real",
     }
-    if any(needs_source_image(features) for features in workload_features):
-        bridge_data_fields["allow_img2img"] = True
-    if any(
-        set(features.source_processing)
-        & {KNOWN_IMAGE_SOURCE_PROCESSING.inpainting, KNOWN_IMAGE_SOURCE_PROCESSING.outpainting}
-        for features in workload_features
-    ):
-        bridge_data_fields["allow_painting"] = True
-    if any(needs_controlnet(features) for features in workload_features):
-        bridge_data_fields["allow_controlnet"] = True
-    if any(
-        features.controlnets_feature_flags
-        and set(features.controlnets_feature_flags.controlnets) & EXTENDED_CONTROL_TYPES
-        for features in workload_features
-    ):
-        bridge_data_fields["extended_controlnet"] = True
-    if any(
-        (features.workflows and KNOWN_IMAGE_WORKFLOWS.qr_code in features.workflows)
-        or (needs_controlnet(features) and KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl in features.baselines)
-        for features in workload_features
-    ):
-        bridge_data_fields["allow_sdxl_controlnet"] = True
-    if config.alchemy_forms or config.soak_alchemy_templates:
-        bridge_data_fields["alchemist"] = True
-    # A workload that carries LoRA/TI references needs the worker to advertise LoRA support, or the
-    # simulated pop matching (which honours the request exactly as the live API does) filters every
-    # auxiliary-bearing job out of the run and the harness silently measures only the control group.
-    carries_aux_references = any(features.loras or features.tis for features in workload_features)
-    if carries_aux_references:
-        bridge_data_fields["allow_lora"] = True
-    carries_post_processing = any(features.post_processing for features in workload_features)
-    if carries_post_processing:
-        bridge_data_fields["allow_post_processing"] = True
-    # max_power gates the largest resolution the pop request advertises (max_pixels = power * 8 * 64 * 64),
-    # so it must cover the workload's largest job or the simulated pop matching silently filters every
-    # heavier template and the run degrades to its smallest jobs.
     max_pixels_needed = max(
         [
             *(int(job.payload.width or 0) * int(job.payload.height or 0) for job in scenario),
@@ -745,8 +814,13 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
             0,
         ],
     )
-    if max_pixels_needed > 0:
-        bridge_data_fields["max_power"] = max(8, -(-max_pixels_needed // (8 * 64 * 64)))
+    bridge_data_fields.update(
+        _workload_capability_bridge_fields(
+            workload_features,
+            max_pixels_needed=max_pixels_needed,
+            needs_alchemist=bool(config.alchemy_forms or config.soak_alchemy_templates),
+        ),
+    )
     if config.process_mode == "real":
         startup_budget = max(_REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS, int(config.timeout_seconds))
         bridge_data_fields["preload_timeout"] = startup_budget
@@ -1729,20 +1803,27 @@ def _warm_bridge_data_fields(
     model_names: list[str],
     process_mode: HarnessProcessMode,
     max_threads_ceiling: int,
+    scenarios: Sequence[Scenario] = (),
 ) -> dict[str, object]:
     """The warm session's base bridge-data fields, covering every level's models.
 
     Returned as a field mapping (rather than only the built model) so a per-level delta can be layered
     on top and rebuilt from the same base, which is what keeps one level's overrides from leaking into
     the next: every delta is applied to this, never to the previous level's result.
+
+    ``scenarios`` is everything the session will host. Per-card eligibility is judged against the
+    configuration the worker booted with, so a base that permits less than the heaviest level needs
+    makes that level's jobs ineligible at dispatch no matter what per-level delta is applied later. The
+    base is therefore provisioned to the catalog's ceiling: every feature any scenario needs, and a
+    ``max_power`` covering the largest job in any of them.
     """
+    catalog_features, catalog_max_pixels, _ = _scenario_catalog_requirements(scenarios)
     fields: dict[str, object] = {
         "api_key": "0000000000",
         "dreamer_name": "warm-benchmark-worker",
         "models_to_load": sorted(set(model_names)),
         "max_threads": 1,
         "queue_size": 1,
-        "alchemist": True,
         "safety_on_gpu": False,
         "cycle_process_on_model_change": False,
         "remove_maintenance_on_init": False,
@@ -1756,6 +1837,15 @@ def _warm_bridge_data_fields(
         "dry_run_skip_safety": process_mode != "real",
         "dry_run_skip_post_processing": process_mode != "real",
     }
+    # The alchemist stays on regardless of what the catalog asks for: the session hosts whatever level
+    # is installed next, and the alchemy coordinator is the source of its forms.
+    fields.update(
+        _workload_capability_bridge_fields(
+            catalog_features,
+            max_pixels_needed=catalog_max_pixels,
+            needs_alchemist=True,
+        ),
+    )
     if process_mode == "real":
         # See _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS: the warm worker cold-starts once, and must not
         # be torn down by the production startup timers before it finishes coming up.
@@ -1824,9 +1914,16 @@ class WarmHarnessSession:
         process_mode: HarnessProcessMode,
         model_names: list[str],
         max_threads_ceiling: int,
+        scenarios: Sequence[Scenario] = (),
         horde_model_reference_manager: ModelReferenceManager | None = None,
     ) -> None:
-        """Initialise the session description (the worker is built on ``__aenter__``)."""
+        """Initialise the session description (the worker is built on ``__aenter__``).
+
+        ``scenarios`` is every workload the session will be asked to host. The base configuration is
+        provisioned to their union, because the worker's eligibility judgement is made against the
+        config it booted with: a level needing a feature (or a resolution) the base does not permit has
+        its jobs faulted at dispatch, and a per-level delta applied afterwards cannot undo that.
+        """
         self._process_mode = process_mode
         self._model_names = sorted(set(model_names))
         self._max_threads_ceiling = max(1, max_threads_ceiling)
@@ -1837,6 +1934,7 @@ class WarmHarnessSession:
             model_names=self._model_names,
             process_mode=self._process_mode,
             max_threads_ceiling=self._max_threads_ceiling,
+            scenarios=scenarios,
         )
         self._applied_bridge_overrides: dict[str, object] = {}
 
@@ -2064,6 +2162,58 @@ class WarmHarnessSession:
             else:
                 dead_since = None
 
+    async def _settle_level_metrics(
+        self,
+        *,
+        expected_records: int,
+        base_completed: int,
+        budget_seconds: float = 3.0,
+    ) -> RunMetricsSnapshot | None:
+        """Return the level's run metrics once every accounted job has its record, or on a short deadline.
+
+        The drain returns the moment the job tracker's counters cover the level, but a job's run-metrics
+        record rides the child's metrics message, which can still be in the pipe at that instant. Reading
+        the snapshot immediately undercounts the level's last job(s), so completion is briefly pumped and
+        re-read until the image-record count catches up with the tracker's accounting. Faulted jobs are
+        recorded parent-side at finalization and are never late.
+        """
+        manager = self.manager
+        deadline = time.time() + budget_seconds
+        while True:
+            metrics = manager.get_run_metrics_snapshot()
+            records = [job for job in metrics.jobs if not job.is_alchemy] if metrics is not None else []
+            tracker_delta = manager._job_tracker.total_num_completed_jobs - base_completed
+            if len(records) >= min(expected_records, tracker_delta) or time.time() >= deadline:
+                return metrics
+            with contextlib.suppress(Exception):
+                await manager.receive_and_handle_process_messages()
+            await asyncio.sleep(0.1)
+
+    @staticmethod
+    def _level_job_counts(
+        metrics: RunMetricsSnapshot | None,
+        *,
+        tracker_completed: int,
+        tracker_faulted: int,
+    ) -> tuple[int, int]:
+        """One level's completed and faulted image-job counts, preferring the per-level run metrics.
+
+        The run metrics are reset per level and carry each finalized job's own outcome, so a job that
+        reached submission in a faulted state reads there as the fault it was. The job tracker's
+        cumulative completion counter does not make that distinction, which is what let a level whose
+        every job hard-faulted score as a clean pass. Tracker deltas remain the fallback for a driver
+        with no run metrics, and the tracker's fault delta is honoured as a floor so a fault that never
+        reached finalization (and so never reached the run metrics) is still counted.
+        """
+        if metrics is None:
+            return tracker_completed, tracker_faulted
+        records = [job for job in metrics.jobs if not job.is_alchemy]
+        if not records:
+            return tracker_completed, tracker_faulted
+        completed = sum(1 for record in records if not record.faulted)
+        faulted = max(sum(1 for record in records if record.faulted), tracker_faulted)
+        return completed, faulted
+
     async def run_level(
         self,
         *,
@@ -2081,9 +2231,10 @@ class WarmHarnessSession:
         before anything else runs (see :meth:`apply_bridge_data_overrides`) and replaced by the next
         level's.
 
-        Completion is tracked by the delta in the job tracker's cumulative counters (the tracker is
-        not reset between levels), so this returns once the level's own jobs and alchemy forms are
-        accounted for, or when ``timeout_seconds`` elapses.
+        The drain returns once the level's own jobs and alchemy forms are accounted for, or when
+        ``timeout_seconds`` elapses. The reported completed/faulted split comes from the per-level run
+        metrics (see :meth:`_level_job_counts`), which distinguish a job that finished from one that was
+        submitted faulted; the tracker's cumulative deltas are the fallback.
 
         When ``warmup`` is set, the level's full scenario is run once first to load any
         feature-specific weights (controlnet/QR checkpoints, upscaler/face-fixer/BLIP models) the warm
@@ -2095,7 +2246,9 @@ class WarmHarnessSession:
         work on the replacement. Absorbing that here makes the measured pass reflect steady state,
         matching a production worker that has preloaded its models. The measured pass re-installs the
         scenario, which resets the per-level metrics and the recovery counter, so the warmup's recovery
-        never counts against the level.
+        never counts against the level. A warm pass that faults every job instead stands as the level's
+        result: the worker refused the work outright and would refuse the identical generation ids again,
+        so a second pass would only earn the same faults while walking the pop-failure backstops twice.
 
         ``on_progress`` is invoked roughly every :data:`_WARM_PROGRESS_INTERVAL_SECONDS` with the live run
         metrics and the seconds elapsed since this call began, so a caller can stream the level's progress.
@@ -2128,31 +2281,79 @@ class WarmHarnessSession:
                 ),
             )
 
+        warmup_seconds = 0.0
+        measured_pass_skipped = False
+        base_completed = 0
+        base_faulted = 0
+        time_started = call_started
+        timed_out = False
         try:
             if warmup and (scenario_jobs or scenario_forms):
+                warmup_started = time.time()
+                warmup_budget = min(timeout_seconds, _WARMUP_DRAIN_TIMEOUT_SECONDS)
                 manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=scenario_forms)
-                await self._drain_installed_scenario(
+                warmup_base_completed = manager._job_tracker.total_num_completed_jobs
+                warmup_base_faulted = manager._job_tracker.num_jobs_faulted
+                warmup_drained = await self._drain_installed_scenario(
                     num_jobs_expected=num_jobs_expected,
                     num_forms_expected=num_forms_expected,
-                    base_completed=manager._job_tracker.total_num_completed_jobs,
-                    base_faulted=manager._job_tracker.num_jobs_faulted,
-                    timeout_seconds=min(timeout_seconds, _WARMUP_DRAIN_TIMEOUT_SECONDS),
+                    base_completed=warmup_base_completed,
+                    base_faulted=warmup_base_faulted,
+                    timeout_seconds=warmup_budget,
                 )
+                warmup_seconds = time.time() - warmup_started
+                warm_completed, warm_faulted = self._level_job_counts(
+                    manager.get_run_metrics_snapshot(),
+                    tracker_completed=manager._job_tracker.total_num_completed_jobs - warmup_base_completed,
+                    tracker_faulted=manager._job_tracker.num_jobs_faulted - warmup_base_faulted,
+                )
+                if not warmup_drained:
+                    # The warm pass owns a large slice of a level's budget, so abandoning it silently
+                    # (the historical behaviour) left minutes of wall-clock with nothing in the log to
+                    # attribute them to, and the measured pass then ran against a still-cold worker.
+                    logger.warning(
+                        f"Warm-up pass did not drain within its {warmup_budget:.0f}s budget "
+                        f"({warm_completed} completed, {warm_faulted} faulted of {num_jobs_expected} expected "
+                        f"job(s) and {num_forms_expected} alchemy form(s)); running the measured pass against a "
+                        f"worker that may still be cold. Process states: {_summarize_worker_processes(manager)}",
+                    )
+                # Nothing warmed and nothing can: the worker refused every job outright, and it will refuse
+                # the identical generation ids again. Re-running them would only spend another pass earning
+                # the same faults, walking the consecutive-failure pause and the fault-rate breaker a second
+                # time, so the warm pass stands as the level's own (faulted) result.
+                measured_pass_skipped = (
+                    warmup_drained
+                    and num_jobs_expected > 0
+                    and num_forms_expected == 0
+                    and warm_completed == 0
+                    and warm_faulted >= num_jobs_expected
+                )
+                if measured_pass_skipped:
+                    logger.warning(
+                        f"Warm-up pass faulted all {num_jobs_expected} of the level's jobs; scoring the level "
+                        "on that pass rather than serving the same jobs again.",
+                    )
+                    base_completed = warmup_base_completed
+                    base_faulted = warmup_base_faulted
+                    time_started = warmup_started
+                    warmup_seconds = 0.0
+                    timed_out = False
 
-            base_completed = manager._job_tracker.total_num_completed_jobs
-            base_faulted = manager._job_tracker.num_jobs_faulted
+            if not measured_pass_skipped:
+                base_completed = manager._job_tracker.total_num_completed_jobs
+                base_faulted = manager._job_tracker.num_jobs_faulted
 
-            manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
+                manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
 
-            time_started = time.time()
-            drained = await self._drain_installed_scenario(
-                num_jobs_expected=num_jobs_expected,
-                num_forms_expected=num_forms_expected,
-                base_completed=base_completed,
-                base_faulted=base_faulted,
-                timeout_seconds=timeout_seconds,
-            )
-            timed_out = not drained
+                time_started = time.time()
+                drained = await self._drain_installed_scenario(
+                    num_jobs_expected=num_jobs_expected,
+                    num_forms_expected=num_forms_expected,
+                    base_completed=base_completed,
+                    base_faulted=base_faulted,
+                    timeout_seconds=timeout_seconds,
+                )
+                timed_out = not drained
 
             with contextlib.suppress(Exception):
                 await manager.receive_and_handle_process_messages()
@@ -2162,8 +2363,15 @@ class WarmHarnessSession:
                 with contextlib.suppress(asyncio.CancelledError):
                     await progress_task
 
-        completed = manager._job_tracker.total_num_completed_jobs - base_completed
-        faulted = manager._job_tracker.num_jobs_faulted - base_faulted
+        metrics = await self._settle_level_metrics(
+            expected_records=num_jobs_expected,
+            base_completed=base_completed,
+        )
+        completed, faulted = self._level_job_counts(
+            metrics,
+            tracker_completed=manager._job_tracker.total_num_completed_jobs - base_completed,
+            tracker_faulted=manager._job_tracker.num_jobs_faulted - base_faulted,
+        )
 
         # A warm level that times out previously returned ``timed_out=True`` with no explanation, which is
         # the warm-path equivalent of the subprocess path's "no useful logs". Collect the same diagnostics
@@ -2193,7 +2401,8 @@ class WarmHarnessSession:
             timed_out=timed_out,
             exit_reason="timed_out" if timed_out else "completed",
             diagnostics=diagnostics,
-            metrics=manager.get_run_metrics_snapshot(),
+            metrics=metrics,
+            warmup_seconds=warmup_seconds,
             num_alchemy_forms_expected=num_forms_expected,
             num_alchemy_forms_completed=manager._alchemy_coordinator.num_canned_forms_completed,
             num_alchemy_forms_faulted=manager._alchemy_coordinator.num_canned_forms_faulted,

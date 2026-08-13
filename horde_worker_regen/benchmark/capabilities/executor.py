@@ -175,6 +175,10 @@ class ProbeExecutor:
             process_mode=self._process_mode,
             model_names=self._warm_model_names(plan.probes),
             max_threads_ceiling=max((_probe_threads(probe) for probe in plan.probes), default=1),
+            # The session's base config must permit everything the plan will ask of it: a feature or
+            # resolution the boot config withholds makes that probe's jobs ineligible at dispatch, and
+            # the per-probe delta applied later cannot reopen it.
+            scenarios=[probe.scenario for probe in plan.probes],
         ) as session:
             for index, probe in enumerate(plan.probes):
                 self._emit_started(probe, index=index, num_probes=len(plan.probes))

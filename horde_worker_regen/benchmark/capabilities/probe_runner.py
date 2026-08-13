@@ -142,6 +142,7 @@ def _result_from_harness(
         started_at_epoch=result.started_at_epoch,
         elapsed_seconds=result.elapsed_seconds,
         jobs=list(result.metrics.jobs) if result.metrics is not None else [],
+        warmup_seconds=result.warmup_seconds if result.warmup_seconds > 0 else None,
     )
     logger.info(f"probe {probe.probe_id} timing: {timing.summary()}")
     return CapabilityProbeResult(

@@ -73,12 +73,14 @@ class CannedJobSource:
     _jobs: list[ImageGenerateJobPopResponse]
     _cycle: bool
     _next_index: int
+    _terminal_fault_ledger: set[str] | None
 
     def __init__(
         self,
         jobs: list[ImageGenerateJobPopResponse],
         *,
         cycle: bool = False,
+        terminal_fault_ledger: set[str] | None = None,
     ) -> None:
         """Initialise the source.
 
@@ -86,10 +88,17 @@ class CannedJobSource:
             jobs (list[ImageGenerateJobPopResponse]): The jobs to hand out, in order.
             cycle (bool, optional): If true, restart from the beginning when the list is \
                 exhausted instead of stopping. Defaults to False.
+            terminal_fault_ledger (set[str] | None, optional): Ids of jobs that ended in a \
+                non-retryable fault. A source holding a fixed list hands out the same response \
+                objects (and therefore the same generation ids) every time it reaches them, so a \
+                job the worker has already refused would otherwise be served again and refused \
+                again, driving the consecutive-failure pop pause instead of resolving. Ids named \
+                here are skipped. Defaults to None (serve every job, the production posture).
         """
         self._jobs = list(jobs)
         self._cycle = cycle
         self._next_index = 0
+        self._terminal_fault_ledger = terminal_fault_ledger
 
     @property
     def exhausted(self) -> bool:
@@ -117,13 +126,24 @@ class CannedJobSource:
         replays a scripted scenario verbatim, so it ignores the request's shaping; generating sources
         honor it so pop-side governors (LoRA share caps, feature withholding) shape simulated traffic
         exactly as they shape live traffic.
+
+        Jobs named in the terminal-fault ledger are passed over: the worker has already refused them
+        for good, and re-offering the same generation id only walks it back into the same refusal. The
+        scan is bounded by the list length so a cycling source whose every job is refused reports no
+        job available rather than spinning.
         """
-        if len(self._jobs) == 0 or self.exhausted:
+        if len(self._jobs) == 0:
             return make_empty_pop_response()
 
-        job = self._jobs[self._next_index % len(self._jobs)]
-        self._next_index += 1
-        return job
+        for _ in range(len(self._jobs)):
+            if self.exhausted:
+                break
+            job = self._jobs[self._next_index % len(self._jobs)]
+            self._next_index += 1
+            if self._terminal_fault_ledger is not None and str(job.id_) in self._terminal_fault_ledger:
+                continue
+            return job
+        return make_empty_pop_response()
 
 
 def make_empty_pop_response() -> ImageGenerateJobPopResponse:

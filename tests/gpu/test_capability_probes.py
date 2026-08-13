@@ -97,6 +97,10 @@ class _LazyWarmSession:
                 process_mode="real",
                 model_names=_warm_model_names(),
                 max_threads_ceiling=_WARM_MAX_THREADS_CEILING,
+                # Provision the boot config to the whole catalog's ceiling, as ProbeExecutor does:
+                # eligibility is judged against it, so a probe needing a feature or resolution the base
+                # withholds is faulted at dispatch rather than run.
+                scenarios=[probe.scenario for probe in ALL_PROBES],
             ).__aenter__()
         return self._session
 
@@ -117,7 +121,13 @@ async def warm_session() -> AsyncGenerator[_LazyWarmSession, None]:
         await lazy.aclose()
 
 
-@pytest.mark.parametrize("probe", ALL_PROBES, ids=lambda probe: probe.capability.slug)
+# The cold-boot baselines run before every warm probe, not in catalog order: each boots its own full
+# worker, and once the first warm probe has booted the module's shared session, a cold boot would have
+# to fit a second worker beside it on the same card. The stable sort keeps catalog order otherwise.
+_ORDERED_PROBES = sorted(ALL_PROBES, key=lambda probe: 0 if _keeps_cold_boot(probe) else 1)
+
+
+@pytest.mark.parametrize("probe", _ORDERED_PROBES, ids=lambda probe: probe.capability.slug)
 async def test_capability_probe_real(
     probe: CapabilityProbe,
     gpu_machine_info: MachineInfo,

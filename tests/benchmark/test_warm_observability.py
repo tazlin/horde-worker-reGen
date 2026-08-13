@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
+from horde_worker_regen.benchmark.capabilities.stats import level_stats_from_harness_result
+from horde_worker_regen.benchmark.criteria import LevelCriteria, evaluate_level
 from horde_worker_regen.harness import (
     HarnessResult,
     WarmHarnessSession,
@@ -21,6 +23,7 @@ from horde_worker_regen.harness import (
 )
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, RunMetricsSnapshot
 from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 
 
@@ -93,7 +96,7 @@ class _StubManager:
     async def receive_and_handle_process_messages(self) -> None:
         return None
 
-    def get_run_metrics_snapshot(self) -> None:
+    def get_run_metrics_snapshot(self) -> RunMetricsSnapshot | None:
         return None
 
 
@@ -173,6 +176,66 @@ async def test_warm_level_abandons_dead_worker_before_full_timeout(monkeypatch: 
     assert result.timed_out is True
     assert elapsed < 10.0, f"dead-worker fast-fail should abandon quickly (took {elapsed:.1f}s)"
     assert result.diagnostics
+
+
+class _AllFaultedStubManager(_StubManager):
+    """A worker whose level ends with every job submitted in a faulted state.
+
+    Reproduces the shape a scheduling fault leaves behind: each job is handed back through submission,
+    which moves the tracker's cumulative completion counter, while the per-level run metrics record the
+    job for what it was. A level read off the tracker delta alone therefore scores as a clean pass.
+    """
+
+    def __init__(self, infos: list[_StubProcessInfo], *, num_jobs: int) -> None:
+        super().__init__(infos)
+        self._num_jobs = num_jobs
+
+    def install_benchmark_scenario(self, *, jobs: object, alchemy_forms: object = None) -> None:
+        self._job_tracker.total_num_completed_jobs += self._num_jobs
+
+    def get_run_metrics_snapshot(self) -> RunMetricsSnapshot:
+        return RunMetricsSnapshot(
+            jobs=[
+                JobMetricsRecord(
+                    job_id=f"faulted-{index}",
+                    faulted=True,
+                    fault_reason="no configured card can serve the accepted job",
+                )
+                for index in range(self._num_jobs)
+            ],
+            downloads=[],
+            vram_used_high_water_mb_per_process={},
+            ram_used_high_water_mb_per_process={},
+            disk_min_free_bytes={},
+            num_process_recoveries=0,
+            num_job_slowdowns=0,
+            time_spent_no_jobs_available=0.0,
+            process_crash_events=[],
+        )
+
+
+async def test_warm_level_of_all_faulted_jobs_is_disproven() -> None:
+    """A level whose every job hard-faults reports zero completions and is judged DISPROVEN for the faults."""
+    infos = [_StubProcessInfo(process_id=0, process_type=HordeProcessType.INFERENCE, alive=True)]
+    session = _make_session(infos)
+    session._manager = _AllFaultedStubManager(  # type: ignore[assignment]  # white-box: stub stands in for the manager
+        infos,
+        num_jobs=3,
+    )
+
+    result = await session.run_level(
+        jobs=[make_canned_job("Deliberate") for _ in range(3)],
+        threads=1,
+        timeout_seconds=10.0,
+    )
+
+    assert result.timed_out is False
+    assert result.num_jobs_completed == 0
+    assert result.num_jobs_faulted == 3
+
+    verdict = evaluate_level(level_stats_from_harness_result(result, total_vram_mb=None), LevelCriteria())
+    assert verdict.passed is False
+    assert any("faulted" in reason for reason in verdict.reasons), verdict.reasons
 
 
 def test_fake_inference_entry_point_records_startup_crash(

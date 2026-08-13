@@ -46,6 +46,7 @@ async def test_warm_session_runs_probes_without_per_check_rampup(
         process_mode="fake",
         model_names=model_names,
         max_threads_ceiling=threads_ceiling,
+        scenarios=[probe.scenario for probe in probes],
     ) as session:
         launch_ids_before = {
             p.process_launch_identifier for p in session.manager._process_map.get_inference_processes()

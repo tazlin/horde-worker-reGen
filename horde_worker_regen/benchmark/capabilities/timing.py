@@ -65,7 +65,13 @@ class ProbeTiming(BaseModel):
     """
 
     total_seconds: float
-    """The probe's whole wall-clock (the harness elapsed time)."""
+    """The probe's measured wall-clock (the harness elapsed time), excluding any pre-warm pass."""
+    warmup_seconds: float | None = None
+    """Wall-clock spent pre-warming before the measured pass, or None when the run did not warm up.
+
+    A feature probe on a reused worker runs its scenario once to cold-load the feature's weights before
+    the pass that is scored. That cost is real but is not part of what the probe measures, so it is
+    reported alongside :attr:`total_seconds` rather than inside it."""
     startup_seconds: float | None = None
     """Run start to the first job's inference: process spawn plus engine init (warmup the worker boot pays)."""
     active_window_seconds: float | None = None
@@ -100,6 +106,8 @@ class ProbeTiming(BaseModel):
             )
 
         segments: list[str] = []
+        if self.warmup_seconds is not None:
+            segments.append(f"warmup {self.warmup_seconds:.0f}s")
         if self.startup_seconds is not None:
             segments.append(f"startup {self.startup_seconds:.0f}s")
         if self.active_window_seconds is not None:
@@ -117,12 +125,14 @@ def probe_timing(
     started_at_epoch: float,
     elapsed_seconds: float,
     jobs: list[JobMetricsRecord],
+    warmup_seconds: float | None = None,
 ) -> ProbeTiming:
     """Build the warmup/inference/teardown split for one probe run.
 
     ``started_at_epoch`` is the harness run-start epoch (0.0 if the driver did not record it, in which
-    case the startup/teardown segments are reported as unknown); ``elapsed_seconds`` is the whole wall;
-    ``jobs`` is the run's per-job metrics. Only non-alchemy image jobs with stage timestamps bound the
+    case the startup/teardown segments are reported as unknown); ``elapsed_seconds`` is the measured
+    wall; ``jobs`` is the run's per-job metrics; ``warmup_seconds`` is the pre-warm pass that preceded
+    the measured one, when there was one. Only non-alchemy image jobs with stage timestamps bound the
     window, since they are what the inference processes spend their wall-clock on.
     """
     timed_jobs = [job for job in jobs if not job.is_alchemy and _INFERENCE_START_STAGE in (job.stage_timestamps or {})]
@@ -134,6 +144,7 @@ def probe_timing(
     if not timed_jobs:
         return ProbeTiming(
             total_seconds=elapsed_seconds,
+            warmup_seconds=warmup_seconds,
             gpu_active_seconds=gpu_active if has_phase_metrics else None,
             jobs_completed=0,
         )
@@ -155,6 +166,7 @@ def probe_timing(
 
     return ProbeTiming(
         total_seconds=elapsed_seconds,
+        warmup_seconds=warmup_seconds,
         startup_seconds=startup,
         active_window_seconds=active_window,
         teardown_seconds=teardown,
