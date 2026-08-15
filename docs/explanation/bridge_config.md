@@ -284,11 +284,29 @@ preloads and is less aggressive about keeping models in VRAM.
 
 `custom_models` allows the worker to accept jobs for model names not in the
 standard horde model reference. Each entry contains `name`, `baseline`, and
-`filepath`; at startup the worker writes those records into hordelib's custom
-model reference and adds the custom names to the pop request alongside the
-configured `image_models_to_load`. The Config tab includes an **Add custom
-model...** builder that writes this YAML shape and can also add the new model
-name to the Offer list.
+`filepath`. At startup the parent validates that the name does not shadow the
+public/beta reference and that the path is a readable regular file, then
+atomically materializes hordelib's custom-model registry before any inference or
+download child starts. The same validated record is merged into the parent's
+model metadata, so scheduling and child loading agree on its baseline. Invalid
+entries are withheld from the pop offer and reported in the log and dashboard.
+
+Baseline vocabulary comes from `horde_model_reference`; the worker subtracts
+hordelib's split-UNet and Stable Cascade families because this configuration
+shape represents one fused checkpoint. Thus dependency updates add newly
+supported checkpoint baselines without a copied worker/TUI allowlist. The Config
+tab's **Add custom model...** builder and its YAML validation use the same typed
+definition as startup.
+
+Defining a model does not implicitly offer it: its name must also resolve into
+`image_models_to_load` (the builder can add it to the Offer list). Changes are
+restart-only. A hot reload retains the running registry and model offer until the
+restart rather than letting the parent advertise a definition its existing
+children never loaded.
+
+On Windows, `filepath` accepts native backslashes when the YAML value is a plain
+(unquoted) scalar. The dashboard normalizes newly entered paths to forward slashes
+when writing the file, so its output is also safe if an operator later quotes it.
 
 ### The dedicated post-processing lane
 

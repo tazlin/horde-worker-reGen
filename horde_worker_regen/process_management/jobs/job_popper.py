@@ -231,7 +231,8 @@ def _select_models_for_pop(
     # inference process cannot find the checkpoint. While availability is unknown (no download process)
     # this is a no-op, preserving the behaviour of workers that pre-download everything.
     if model_availability is not None:
-        models = model_availability.filter_present(models)
+        ready_custom_models = set(bridge_data.custom_model_ready_names).intersection(configured)
+        models = model_availability.filter_present(models).union(ready_custom_models)
 
     loaded_models = {
         process.loaded_horde_model_name
@@ -318,23 +319,6 @@ def _select_models_for_pop(
     )
     if serviceability_held_back:
         models = models.difference(serviceability_held_back)
-
-    if bridge_data.custom_models is not None and len(bridge_data.custom_models) > 0:
-        logger.debug("Custom models are enabled, adding them to the list of models to pop")
-        # Custom model entries are free-form operator YAML and are the one offer source that does not pass
-        # through the model reference's known-name filter, so an entry with a missing or blank `name` would put
-        # an unloadable identity straight into the advertised set. Such an entry is already skipped when the
-        # custom model file is written, so dropping it here keeps the offer consistent with what can be loaded.
-        custom_model_names = set()
-        for model in bridge_data.custom_models:
-            name = model.get("name")
-            if not isinstance(name, str) or not name.strip():
-                logger.warning(
-                    f"Custom model entry {model} has no usable name; it will not be advertised in pop requests.",
-                )
-                continue
-            custom_model_names.add(name)
-        models.update(custom_model_names)
 
     if len(models) == 0:
         if (

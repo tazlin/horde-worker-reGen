@@ -237,6 +237,9 @@ class WorkerConfigSummary(BaseModel):
     horde_username: str | None = None
     num_models: int = 0
     custom_models: bool = False
+    custom_models_ready: int = 0
+    custom_models_configured: int = 0
+    custom_model_issues: tuple[str, ...] = ()
     max_power: int = 8
     max_threads: int = 1
     queue_size: int = 1

@@ -1947,6 +1947,20 @@ class HordeWorkerProcessManager:
                 )
             self.stable_diffusion_reference = None
             self._init_model_reference()
+        self._merge_custom_model_records()
+
+    def _merge_custom_model_records(self) -> None:
+        """Add ready worker-local records to the parent's scheduling/reference view."""
+        reference = self.stable_diffusion_reference
+        if reference is None:
+            raise RuntimeError("cannot merge custom models before the image model reference is initialized")
+        custom_records = self.bridge_data.custom_model_records
+        if not custom_records:
+            return
+        merged = dict(reference)
+        merged.update(custom_records)
+        self.stable_diffusion_reference = merged
+        logger.info(f"Activated {len(custom_records)} custom model record(s) for scheduling and dispatch.")
 
     def _build_card_runtimes(
         self,
@@ -7501,6 +7515,9 @@ class HordeWorkerProcessManager:
             horde_username=self.user_info.username if self.user_info is not None else None,
             num_models=len(bridge_data.image_models_to_load),
             custom_models=bool(bridge_data.custom_models),
+            custom_models_ready=len(bridge_data.custom_model_ready_names),
+            custom_models_configured=bridge_data.custom_model_configured_count,
+            custom_model_issues=bridge_data.custom_model_issue_summaries,
             max_power=bridge_data.max_power,
             max_threads=self.max_concurrent_inference_processes,
             queue_size=bridge_data.queue_size,
@@ -7711,6 +7728,15 @@ class HordeWorkerProcessManager:
         previous_effective = self._runtime_config.effective_max_threads
         previously_configured = set(self.bridge_data.image_models_to_load)
         previous_download_flags = self._download_coordinator.download_process_flags()
+
+        previous_custom_models = [definition.model_dump() for definition in self.bridge_data.custom_models]
+        reloaded_custom_models = [definition.model_dump() for definition in bridge_data.custom_models]
+        bridge_data.inherit_custom_model_runtime(self.bridge_data)
+        if reloaded_custom_models != previous_custom_models:
+            logger.warning(
+                "custom_models changed in bridgeData.yaml; keeping the running custom registry and offer "
+                "unchanged until the worker restarts.",
+            )
 
         self.bridge_data = bridge_data
         coerce_bridge_data_to_capabilities(self.bridge_data)

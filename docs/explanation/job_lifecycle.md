@@ -129,7 +129,9 @@ in [Performance → The pop gauntlet](performance_and_backpressure.md#the-pop-ga
 
 Model selection (`_select_models_for_pop`) applies [model
 stickiness](performance_and_backpressure.md#model-stickiness), removes models that already have ≥2
-queued jobs, and adds custom models. The pop response then goes through `_apply_sdk_workarounds`
+queued jobs, and filters the configured offer to locally ready files. Custom models participate only
+after startup validation has installed their hordelib and parent-side records; defining one does not
+silently add it to the configured offer. The pop response then goes through `_apply_sdk_workarounds`
 (seed/denoise fixups; note this _rebuilds_ the response object, which the [identity-stability
 invariant](#pipeline-invariants) depends on),
 [`SourceImageDownloader`][horde_worker_regen.process_management.jobs.source_image_downloader.SourceImageDownloader]'s

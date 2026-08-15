@@ -17,7 +17,10 @@ from collections.abc import MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
 from ruamel.yaml import YAML
+
+from horde_worker_regen.bridge_data.custom_models import CustomModelDefinition
 
 DEFAULT_CONFIG_PATH = Path("bridgeData.yaml")
 
@@ -1895,14 +1898,17 @@ def coerce_value(field: ConfigField, raw: object) -> object:
         if field.key == "custom_models":
             if parsed is None:
                 return []
-            if not isinstance(parsed, list):
-                raise ValueError("Custom models must be a YAML list")
-            for index, item in enumerate(parsed, start=1):
-                if not isinstance(item, dict):
-                    raise ValueError(f"Custom model #{index} must be a mapping")
-                for required in ("name", "baseline", "filepath"):
-                    if not str(item.get(required) or "").strip():
-                        raise ValueError(f"Custom model #{index} must include {required}")
+            try:
+                definitions = TypeAdapter(list[CustomModelDefinition]).validate_python(parsed)
+            except ValidationError as error:
+                first = error.errors(include_url=False)[0]
+                location = first["loc"]
+                index = location[0] + 1 if location and isinstance(location[0], int) else "?"
+                field_name = str(location[-1]) if location else "entry"
+                if first["type"] == "missing":
+                    raise ValueError(f"Custom model #{index} must include {field_name}") from error
+                raise ValueError(f"Custom model #{index} {field_name}: {first['msg']}") from error
+            return [definition.model_dump(mode="json") for definition in definitions]
         if field.key == "model_pool_pinned":
             if parsed is None:
                 return []

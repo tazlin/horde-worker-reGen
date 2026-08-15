@@ -48,6 +48,7 @@ def _make_bridge(
         image_models_to_skip=image_models_to_skip if image_models_to_skip is not None else [],
         only_models_on_disk=False,
         load_large_models=load_large_models,
+        custom_models=[],
     )
 
 

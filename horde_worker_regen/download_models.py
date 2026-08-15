@@ -15,6 +15,7 @@ def download_all_models(
 
     from loguru import logger
 
+    from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
     from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, reGenBridgeData
     from horde_worker_regen.consts import BRIDGE_CONFIG_FILENAME
     from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
@@ -29,7 +30,6 @@ def download_all_models(
                 horde_model_reference_manager=horde_model_reference_manager,
             )
             bridge_data.load_env_vars()
-            bridge_data.prepare_custom_models()
         else:
             bridge_data = BridgeDataLoader.load_from_env_vars(
                 horde_model_reference_manager=horde_model_reference_manager,
@@ -41,6 +41,10 @@ def download_all_models(
     if bridge_data is None:
         logger.error("Failed to load bridge data")
         exit(1)
+
+    bridge_data.prepare_custom_models(
+        known_model_names=set(beta_aware_image_records(horde_model_reference_manager)),
+    )
 
     import hordelib
     from horde_safety.deep_danbooru_model import download_deep_danbooru_model

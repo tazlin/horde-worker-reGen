@@ -45,6 +45,7 @@ def _make_bridge(image_models_to_load: list[str]) -> SimpleNamespace:
         image_models_to_skip=[],
         only_models_on_disk=False,
         load_large_models=False,
+        custom_models=[],
     )
 
 

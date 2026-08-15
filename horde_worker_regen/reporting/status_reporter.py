@@ -558,7 +558,8 @@ class StatusReporter:
                     f"(v{runtime_version()})",
                     f"horde user: {user_info.username if user_info is not None else 'Unknown'}",
                     f"num_models: {len(bridge_data.image_models_to_load)}",
-                    f"custom_models: {bool(bridge_data.custom_models)}",
+                    "custom_models: "
+                    f"{len(bridge_data.custom_model_ready_names)}/{bridge_data.custom_model_configured_count} ready",
                     f"max_power: {bridge_data.max_power} ({max_power_dimension}x{max_power_dimension})",
                     f"max_threads: {max_concurrent_inference_processes}",
                     f"queue_size: {bridge_data.queue_size}",

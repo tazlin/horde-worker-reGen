@@ -8,18 +8,9 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
+from horde_worker_regen.bridge_data.custom_models import CUSTOM_MODEL_BASELINES
 from horde_worker_regen.tui.model_catalog import friendly_baseline
 from horde_worker_regen.tui.responsive import ResponsiveModalScreen
-
-CUSTOM_MODEL_BASELINES: tuple[str, ...] = (
-    "stable_diffusion_1",
-    "stable_diffusion_2_512",
-    "stable_diffusion_2_768",
-    "stable_diffusion_xl",
-    "stable_cascade",
-    "flux_1",
-)
-"""Baselines accepted by the worker's custom-model path."""
 
 
 @dataclass(frozen=True)
@@ -78,7 +69,7 @@ class CustomModelBuilderModal(ResponsiveModalScreen[CustomModelBuilderResult | N
 
     def compose(self) -> ComposeResult:
         """Lay out the builder fields and action buttons."""
-        baseline_options = [(friendly_baseline(baseline), baseline) for baseline in CUSTOM_MODEL_BASELINES]
+        baseline_options = [(friendly_baseline(str(baseline)), str(baseline)) for baseline in CUSTOM_MODEL_BASELINES]
         with Vertical(id="custom-model-dialog"):
             yield Label("Add a custom model", classes="dialog-title")
             yield Static(
@@ -125,7 +116,7 @@ class CustomModelBuilderModal(ResponsiveModalScreen[CustomModelBuilderResult | N
             return
         name = self.query_one("#custom-model-name", Input).value.strip()
         baseline = str(self.query_one("#custom-model-baseline", Select).value).strip()
-        filepath = self.query_one("#custom-model-filepath", Input).value.strip()
+        filepath = self.query_one("#custom-model-filepath", Input).value.strip().replace("\\", "/")
         error = self.query_one("#custom-model-error", Static)
         if not name:
             error.update("Model name is required.")

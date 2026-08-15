@@ -1458,7 +1458,14 @@ class OverviewView(Vertical):
         else:
             add_pair("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
         add_pair("Horde user", config.horde_username or "-", "Uptime", uptime)
-        add_pair("Models", str(config.num_models), "Custom models", "yes" if config.custom_models else "no")
+        custom_model_status = (
+            f"{config.custom_models_ready}/{config.custom_models_configured} ready"
+            if config.custom_models_configured
+            else "none"
+        )
+        add_pair("Models", str(config.num_models), "Custom models", custom_model_status)
+        for issue in config.custom_model_issues:
+            add_pair("Custom issue", issue, "", "")
         add_pair("Threads", str(config.max_threads), "Queue size", str(config.queue_size))
         add_pair("Max power", str(config.max_power), "Max batch", str(config.max_batch))
         add_pair("Performance", performance_mode, "Safety on GPU", "yes" if config.safety_on_gpu else "no")

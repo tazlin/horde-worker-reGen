@@ -113,6 +113,14 @@ def main(
 
     bridge_data.load_env_vars()
 
+    # Custom models are a worker-owned overlay, not part of the public model reference. Materialize hordelib's
+    # registry and the matching parent-side records before any multiprocessing child is spawned. Invalid or
+    # missing local files are retained as dashboard issues but removed from the advertised model set.
+    from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
+
+    known_model_names = set(beta_aware_image_records(horde_model_reference_manager))
+    bridge_data.prepare_custom_models(known_model_names=known_model_names)
+
     # Once per worker start, from the orchestrator before any child is spawned: age out and size-cap the
     # shared logs/ directory so rotated archives and per-run files do not accumulate on disk indefinitely.
     from horde_worker_regen.logging_purge import purge_worker_logs_safely

@@ -453,8 +453,12 @@ class BridgeDataLoader:
                 set(bridge_data.image_models_to_load) - set(bridge_data.image_models_to_skip),
             )
 
-        # Remove models not in the model reference manager (canonical + opted-in beta)
-        known_models = set(beta_records)
+        # Preserve configured custom names through the reference filter. Startup readiness validation later
+        # removes any custom entry whose file/registry is unusable before a child can spawn or a pop can occur.
+        # Keeping them here also makes the TUI's "add to Offer list" choice authoritative instead of having the
+        # popper advertise every custom definition unconditionally.
+        custom_model_names = {definition.name for definition in bridge_data.custom_models}
+        known_models = set(beta_records).union(custom_model_names)
 
         total_resolved_models = len(bridge_data.image_models_to_load)
 
@@ -469,9 +473,15 @@ class BridgeDataLoader:
             )
 
         if bridge_data.only_models_on_disk:
+            offered_custom_models = set(bridge_data.image_models_to_load).intersection(custom_model_names)
             bridge_data.image_models_to_load = BridgeDataLoader._filter_to_models_on_disk(
                 bridge_data.image_models_to_load,
                 horde_model_reference_manager,
+            )
+            # The public reference manager cannot see the worker-local overlay yet. Startup validation is
+            # the authoritative disk gate for these names and will remove any unreadable path before spawn.
+            bridge_data.image_models_to_load = list(
+                set(bridge_data.image_models_to_load).union(offered_custom_models),
             )
 
         return bridge_data.image_models_to_load

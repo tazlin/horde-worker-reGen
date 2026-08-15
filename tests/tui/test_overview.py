@@ -79,6 +79,25 @@ def test_compact_readiness_line_omits_fully_disabled_features() -> None:
     assert OverviewView()._feature_readiness_line(None) is None
 
 
+def test_worker_table_exposes_custom_model_readiness_and_issues() -> None:
+    """The dashboard distinguishes configured definitions from models safe to advertise."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(
+            dreamer_name="Test",
+            worker_version="0",
+            custom_models=True,
+            custom_models_ready=1,
+            custom_models_configured=2,
+            custom_model_issues=("Broken XL: file does not exist",),
+        ),
+    )
+
+    table = _render(OverviewView()._render_worker_table(snapshot))
+
+    assert "1/2 ready" in table
+    assert "Broken XL: file does not exist" in table
+
+
 def test_overview_restores_worker_owned_trends_after_a_frontend_reconnect() -> None:
     """A fresh browser session starts with the worker's history instead of a warming-up chart."""
     view = OverviewView()

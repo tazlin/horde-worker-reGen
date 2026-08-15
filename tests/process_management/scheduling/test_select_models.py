@@ -362,13 +362,13 @@ class TestStickyModels:
 
 
 class TestCustomModels:
-    """Custom model injection."""
+    """Custom model offer handling."""
 
     def test_custom_models_added(self) -> None:
-        """Custom models should be added to the set on top of configured models."""
+        """A ready custom model explicitly configured in the offer is retained."""
         bridge_data = make_mock_bridge_data(
-            image_models_to_load=["model_a"],
-            custom_models=[{"name": "custom_model_1"}, {"name": "custom_model_2"}],
+            image_models_to_load=["model_a", "custom_model_1", "custom_model_2"],
+            custom_model_ready_names=frozenset({"custom_model_1", "custom_model_2"}),
         )
         process_map = ProcessMap({})
         job_tracker = JobTracker()
@@ -450,8 +450,8 @@ class TestSelectModelsForPopCombinations:
     async def test_custom_model_survives_duplicate_filter(self) -> None:
         """A custom model without queued jobs should survive duplicate filtering."""
         bridge_data = make_mock_bridge_data(
-            image_models_to_load=["model_a"],
-            custom_models=[{"name": "custom_1"}],
+            image_models_to_load=["model_a", "custom_1"],
+            custom_model_ready_names=frozenset({"custom_1"}),
         )
         process_map = ProcessMap({})
         job_tracker = JobTracker()

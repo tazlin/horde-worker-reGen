@@ -817,6 +817,9 @@ extra_model_directories: []
 # Define custom models not in the official model reference.
 # Each entry requires: name, baseline, filepath.
 # Example:
+# Custom model definitions are restart-only. A definition is offered only when its name is also selected
+# above and its single checkpoint file is readable at startup. The dashboard derives baseline choices from
+# the installed horde-model-reference and hordelib versions and reports readiness/rejection reasons.
 # custom_models:
 #   - name: "my-custom-model"
 #     baseline: "stable_diffusion_1"

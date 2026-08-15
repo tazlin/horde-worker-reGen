@@ -241,10 +241,13 @@ class TestSelectModelsForPopGating:
         assert models is None
 
     def test_custom_models_bypass_disk_gating(self) -> None:
-        """Custom models are advertised regardless of disk gating."""
+        """A startup-validated custom file need not appear in the downloader's public reference scan."""
         availability = ModelAvailability()
         availability.update(present=set(), currently_downloading=None, pending=(), failed=())
-        bridge = self._bridge(image_models_to_load=["a"], custom_models=[{"name": "my_custom"}])
+        bridge = self._bridge(
+            image_models_to_load=["a", "my_custom"],
+            custom_model_ready_names=frozenset({"my_custom"}),
+        )
         models = _select_models_for_pop(
             bridge,  # type: ignore[arg-type]
             ProcessMap({}),

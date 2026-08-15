@@ -23,8 +23,11 @@ If you are editing YAML by hand:
        filepath: /path/to/model/file.safetensors
    ```
 
-   Supported baselines: `stable_diffusion_1`, `stable_diffusion_2_768`, `stable_diffusion_2_512`,
-   `stable_diffusion_xl`, `stable_cascade`, `flux_1`.
+   The dashboard's baseline choices are generated from the installed
+   `horde_model_reference` baseline vocabulary and hordelib's loading capabilities. The current YAML
+   shape describes one fused checkpoint, so split-component baselines and Stable Cascade's two-stage
+   weights are not offered. An unsupported value is rejected when the config is edited or loaded rather
+   than being advertised and failing a job later.
 
 3. Add the model `name` to your `models_to_load` list.
 
@@ -33,6 +36,18 @@ If you are editing YAML by hand:
 - Only Flux.schnell models are allowed. Flux.dev and its derivatives are **not** permitted.
 - Custom model names cannot conflict with existing horde model names.
 - The horde treats custom models as SD 1.5 for kudos and safety purposes.
+- The checkpoint path must name a readable regular file on the worker host.
+
+At worker startup, reGen validates every entry and atomically writes the legacy registry hordelib reads at
+`.horde_worker_regen/custom_models.json`.
+Only entries that pass validation and also appear in `models_to_load` are advertised. The Overview panel
+shows `ready/configured` counts and lists any rejected model with its reason; the same details are written
+to the worker log. An explicitly set `HORDELIB_CUSTOM_MODELS` remains operator-owned, so reGen checks that
+its entries match `bridgeData.yaml` instead of overwriting it. The same applies to a historical root-level
+`custom_models.json`, which the worker continues to discover as an external registry.
+
+Changing `custom_models` requires a worker restart. A hot reload keeps the registry and offer from the
+running process, logs that a restart is needed, and does not advertise the new definition prematurely.
 
 See [Bridge configuration](../explanation/bridge_config.md#custom-models) for how custom models flow
 into the pop request.

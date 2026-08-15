@@ -20,7 +20,6 @@ from horde_worker_regen.load_env_vars import load_env_vars_from_config
 
 
 def _write_bridge_data(directory: Path, *, cache_home: Path | None = None) -> None:
-    # Forward slashes only: load_env_vars_from_config hard-exits on backslashes in the config.
     body = "dreamer_name: test\n"
     if cache_home is not None:
         body += f'cache_home: "{cache_home.as_posix()}"\n'
@@ -68,6 +67,25 @@ def test_peered_default_applies_when_neither_set(tmp_path: Path, monkeypatch: py
 def test_no_peered_default_without_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Outside the scripted installer (no HORDE_WORKER_DATA_DIR), nothing is forced (git/manual users)."""
     _write_bridge_data(tmp_path)  # no cache_home line
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HORDE_WORKER_DATA_DIR", raising=False)
+    monkeypatch.delenv("AIWORKER_CACHE_HOME", raising=False)
+
+    load_env_vars_from_config()
+
+    assert os.getenv("AIWORKER_CACHE_HOME") is None
+
+
+def test_plain_yaml_windows_paths_do_not_abort_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A native custom-model path is a valid YAML scalar and must survive the environment preflight."""
+    (tmp_path / "bridgeData.yaml").write_text(
+        "dreamer_name: test\n"
+        "custom_models:\n"
+        "- name: Local model\n"
+        "  baseline: stable_diffusion_xl\n"
+        "  filepath: T:\\models\\local.safetensors\n",
+        encoding="utf-8",
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HORDE_WORKER_DATA_DIR", raising=False)
     monkeypatch.delenv("AIWORKER_CACHE_HOME", raising=False)

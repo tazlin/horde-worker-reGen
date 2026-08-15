@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Collection
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Self
 
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS
 from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from ruamel.yaml import YAML
 
+from horde_worker_regen.bridge_data.custom_models import (
+    CustomModelDefinition,
+    CustomModelPreparation,
+    prepare_custom_models,
+)
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT, WORKER_KNOWN_EXTRA_ALCHEMY_FORMS
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
 
@@ -553,6 +559,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     _loaded_from_env_vars: bool = False
+    _custom_model_records: dict[str, ImageGenerationModelRecord] = PrivateAttr(default_factory=dict)
+    _custom_model_issue_summaries: tuple[str, ...] = PrivateAttr(default=())
+    _custom_model_registry_path: Path | None = PrivateAttr(default=None)
+    _custom_model_configured_count: int = PrivateAttr(default=0)
 
     gpu_device_indices: list[int] | None = Field(default=None)
     """Which accelerator indices (stable PCI-bus order) this one worker drives.
@@ -846,7 +856,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     change never kicks off a large download.
     """
 
-    custom_models: list[dict] = Field(
+    custom_models: list[CustomModelDefinition] = Field(
         default_factory=list,
     )
 
@@ -1560,40 +1570,69 @@ class reGenBridgeData(CombinedHordeBridgeData):
             validated_forms.append(normalized)
         return validated_forms
 
-    def prepare_custom_models(self) -> None:
-        """Prepare the custom models."""
-        if os.getenv("HORDELIB_CUSTOM_MODELS"):
-            logger.info(
-                f"HORDELIB_CUSTOM_MODELS already set to '{os.getenv('HORDELIB_CUSTOM_MODELS')}. "
-                "Doing nothing for custom models.",
-            )
-            return
-        custom_models_dict = {}
-        for model in self.custom_models:
-            if not model.get("name"):
-                logger.warning(f"Model name not specified for custom model entry {model}. Skipping")
-                continue
-            if not model.get("baseline"):
-                logger.warning(f"Model baseline not specified for custom model entry {model}. Skipping")
-                continue
-            if not model.get("filepath"):
-                logger.warning(f"Model filepath not specified for custom model entry {model}. Skipping")
-                continue
-            # TODO: Handle Stable Cascade models
-            custom_models_dict[model["name"]] = {
-                "name": model["name"],
-                "baseline": model["baseline"],
-                "type": "ckpt",
-                "config": {"files": [{"path": model["filepath"]}]},
-            }
-        cwd = os.getcwd()
-        if len(custom_models_dict) > 0:
-            with open(f"{cwd}/custom_models.json", "w") as f:
-                json.dump(custom_models_dict, f, indent=4)
-        else:
-            if os.path.exists(f"{cwd}/custom_models.json"):
-                os.remove(f"{cwd}/custom_models.json")
-        os.environ["HORDELIB_CUSTOM_MODELS"] = f"{cwd}/custom_models.json"
+    def prepare_custom_models(
+        self,
+        *,
+        known_model_names: set[str] | None = None,
+        working_directory: Path | None = None,
+    ) -> CustomModelPreparation:
+        """Materialize and activate only custom models that are safe for children to load.
+
+        Args:
+            known_model_names: Canonical/beta Horde names custom definitions must not shadow.
+            working_directory: Optional registry directory override, primarily for tests.
+
+        Returns:
+            The readiness result shared with parent-side scheduling metadata.
+        """
+        configured_offer = set(self.image_models_to_load)
+        result = prepare_custom_models(
+            self.custom_models,
+            known_model_names=known_model_names or set(),
+            working_directory=working_directory,
+        )
+        self._custom_model_records = dict(result.records)
+        self._custom_model_issue_summaries = tuple(issue.summary() for issue in result.issues)
+        self._custom_model_registry_path = result.registry_path
+        self._custom_model_configured_count = len(self.custom_models)
+
+        declared_names = {definition.name for definition in self.custom_models}
+        non_custom_models = [name for name in self.image_models_to_load if name not in declared_names]
+        ready_offered = sorted(result.ready_names.intersection(configured_offer))
+        self.image_models_to_load = non_custom_models + ready_offered
+        return result
+
+    def inherit_custom_model_runtime(self, previous: reGenBridgeData) -> None:
+        """Keep the active custom registry unchanged across a restart-only config hot reload."""
+        self._custom_model_records = dict(previous._custom_model_records)
+        self._custom_model_issue_summaries = previous._custom_model_issue_summaries
+        self._custom_model_registry_path = previous._custom_model_registry_path
+        self._custom_model_configured_count = previous._custom_model_configured_count
+
+        new_declared_names = {definition.name for definition in self.custom_models}
+        non_custom_models = [name for name in self.image_models_to_load if name not in new_declared_names]
+        active_offered = sorted(previous.custom_model_ready_names.intersection(previous.image_models_to_load))
+        self.image_models_to_load = non_custom_models + active_offered
+
+    @property
+    def custom_model_records(self) -> dict[str, ImageGenerationModelRecord]:
+        """Return the ready custom records used by parent-side scheduling."""
+        return dict(self._custom_model_records)
+
+    @property
+    def custom_model_ready_names(self) -> frozenset[str]:
+        """Return custom names confirmed usable when this worker process started."""
+        return frozenset(self._custom_model_records)
+
+    @property
+    def custom_model_issue_summaries(self) -> tuple[str, ...]:
+        """Return operator-facing reasons configured custom models were withheld."""
+        return self._custom_model_issue_summaries
+
+    @property
+    def custom_model_configured_count(self) -> int:
+        """Return the number of custom definitions evaluated for this running worker."""
+        return self._custom_model_configured_count
 
     @staticmethod
     def load_custom_models() -> None:
