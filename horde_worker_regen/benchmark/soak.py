@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, Literal
 
 from horde_sdk.generation_parameters.alchemy.consts import (
     KNOWN_CLIP_BLIP_TYPES,
@@ -398,8 +400,119 @@ def build_production_replay_soak_scenario(
     return Scenario(name="production_replay", image_jobs=image_jobs, soak_seconds=soak_seconds)
 
 
+SoakMix = Literal["production_replay", "lora_storm"]
+"""The named sustained-traffic mixes a standalone soak can run."""
+
+SOAK_MIXES: tuple[SoakMix, ...] = ("production_replay", "lora_storm")
+"""``SoakMix`` values in CLI choice order; the first is the default (production cadence)."""
+
+OPERATOR_THROUGHPUT_BRIDGE_FIELDS: tuple[str, ...] = (
+    "max_threads",
+    "queue_size",
+    "high_performance_mode",
+    "moderate_performance_mode",
+    "safety_on_gpu",
+    "unload_models_from_vram_often",
+    "legacy_comfy_vram_unload",
+    "whole_card_exclusive_residency",
+    "gpu_sampling_lease_enabled",
+    "dedicated_post_processing",
+    "enable_pipeline_disaggregation",
+    "gpu_device_indices",
+    "vram_to_leave_free",
+    "ram_to_leave_free",
+)
+"""Config fields a standalone soak carries over from the operator's ``bridgeData.yaml``.
+
+The set is the throughput-shaping half of the config: concurrency, residency and lane policy, plus the
+device selection those are measured on. Everything else the harness owns, because it is derived from the
+workload rather than chosen by the operator: ``models_to_load`` and ``max_power`` come from the mix (an
+operator ``max_power`` below what a template needs would make the job ineligible and fault it at
+dispatch), the ``allow_*`` capability flags come from the templates' features, and the api/dry-run keys
+are the harness's own. Only keys the file actually sets are carried, so an unwritten field keeps its
+worker default rather than being pinned to one.
+"""
+
+_DEFAULT_BRIDGE_DATA_PATH = Path("bridgeData.yaml")
+
+
+def operator_throughput_overrides(config_path: Path = _DEFAULT_BRIDGE_DATA_PATH) -> dict[str, object]:
+    """Read the throughput-relevant fields the operator set in ``bridgeData.yaml``.
+
+    Parses the file directly rather than through ``BridgeDataLoader`` so nothing is defaulted, coerced or
+    resolved on the way through: a soak arm has to be able to say which values it pinned, and a loader
+    would hand back a full config in which an operator's choice is indistinguishable from a default. Keys
+    absent from the file are absent from the result.
+
+    A missing or unreadable config yields an empty mapping: the soak then runs on harness defaults, which
+    is a valid (if less representative) measurement, so it must not be a hard failure.
+    """
+    if not config_path.is_file():
+        return {}
+    try:
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="safe").load(config_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001 - an unreadable config degrades the run's fidelity, not its validity
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    parsed: dict[str, Any] = data
+    return {field: parsed[field] for field in OPERATOR_THROUGHPUT_BRIDGE_FIELDS if field in parsed}
+
+
+def build_soak_mix_scenario(
+    mix: SoakMix,
+    *,
+    soak_seconds: float,
+    shared_lora_references: Sequence[str] | None = None,
+    unique_lora_references: Sequence[str] | None = None,
+    include_auxiliary_references: bool = True,
+) -> Scenario:
+    """Build one named soak mix, optionally with its LoRA/TI references stripped.
+
+    ``include_auxiliary_references=False`` drops every template's LoRA and textual-inversion references
+    while keeping the mix's model, resolution, batch and post-processing shape intact. Both classes go
+    together because both resolve through the same CivitAI prefetch path, so leaving either in place with
+    the builders' synthetic default names would measure the resolution-failure path in a real-mode run.
+    The result is a slightly cheaper mix than production (no LoRA load, no download pressure), which is
+    the caveat a before/after comparison run this way has to carry.
+    """
+    shared = shared_lora_references if shared_lora_references is not None else None
+    unique = unique_lora_references if unique_lora_references is not None else None
+    kwargs: dict[str, Any] = {"soak_seconds": soak_seconds}
+    if shared is not None:
+        kwargs["shared_lora_references"] = shared
+    if unique is not None:
+        kwargs["unique_lora_references"] = unique
+
+    if mix == "lora_storm":
+        scenario = build_lora_storm_soak_scenario(**kwargs)
+    else:
+        scenario = build_production_replay_soak_scenario(**kwargs)
+
+    if include_auxiliary_references:
+        return scenario
+    return strip_auxiliary_references(scenario)
+
+
+def strip_auxiliary_references(scenario: Scenario) -> Scenario:
+    """Return *scenario* with every image template's LoRA and textual-inversion references removed."""
+    return scenario.model_copy(
+        update={
+            "image_jobs": [spec.model_copy(update={"lora_names": [], "ti_names": []}) for spec in scenario.image_jobs],
+        },
+    )
+
+
 __all__ = [
+    "OPERATOR_THROUGHPUT_BRIDGE_FIELDS",
+    "SOAK_MIXES",
+    "SoakMix",
     "build_lora_storm_soak_scenario",
     "build_production_replay_soak_scenario",
+    "build_soak_mix_scenario",
     "build_soak_scenario",
+    "operator_throughput_overrides",
+    "strip_auxiliary_references",
 ]

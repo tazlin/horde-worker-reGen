@@ -149,6 +149,7 @@ Progressive worker benchmarking. Subcommands:
 | `run` | Run the capability-probe benchmark: prove what this machine can do, on one warm worker. |
 | `plan` | Show each probe's resource requirements and predicted run/skip verdict (no worker is started). |
 | `pricing-corpus` | Run the cost-attribution corpus that a pricing model is fitted against. |
+| `soak` | Sustain one named traffic mix for a fixed period and score it: the before/after vehicle. |
 | `report OUT_DIR` | Re-render the markdown report from an existing output directory. |
 | `monitor OUT_DIR` | Tail a run's `progress.jsonl` live (attach to or replay a run). |
 | `live` | Open-loop load generation against a live API (not yet implemented). |
@@ -319,6 +320,76 @@ not free, because three of the costs are properties of a job's *position* rather
 cold-load cell is always preceded by a different model, a LoRA reference is always first used by a
 cache-miss cell, and one cell deliberately runs three post-processing jobs back to back while every
 other post-processing job is spaced apart.
+
+### `soak`: the standalone before-and-after soak
+
+`soak` runs one sustained-traffic mix against the worker for a fixed period and nothing else: no capability
+probing, no recommendation, and no contact with the horde. It exists to answer "did this change make the
+worker faster", which needs two runs that differ only in the setting under test. Live traffic cannot give
+that (the model mix and job sizes vary between any two hours), so the mix is generated locally from the
+same templates the `run` soak uses.
+
+Two mixes are available. `production_replay` (the default) reproduces the shape of a measured production
+pop stream: SDXL-family dominant with an SD1.5 and a rare Flux minority, batch sizes and job magnitudes
+matching the observed distribution, LoRAs on a realistic minority of pops, post-processing on about a
+third. `lora_storm` is the adversarial download-pressure mix (roughly two thirds of pops carry LoRAs).
+Both are described under [LoRA backpressure](../explanation/performance_and_backpressure.md).
+
+The run measures the **operator's own configuration**: the throughput-shaping fields of `bridgeData.yaml`
+(`max_threads`, `queue_size`, `high_performance_mode`, `moderate_performance_mode`, `safety_on_gpu`,
+`unload_models_from_vram_often`, `legacy_comfy_vram_unload`, `whole_card_exclusive_residency`,
+`gpu_sampling_lease_enabled`, `dedicated_post_processing`, `enable_pipeline_disaggregation`,
+`gpu_device_indices`, `vram_to_leave_free`, `ram_to_leave_free`) are carried over, and only those the file
+actually sets. Everything else is the harness's, because it is derived from the workload rather than
+chosen: the model set and `max_power` come from the mix (an operator `max_power` below what a template
+needs would make the job ineligible and fault it at dispatch), and the `allow_*` capability flags come from
+the templates' own features. `--override key=value` layers on top, and is the A/B knob.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--mix {production_replay,lora_storm}` | `production_replay` | Which traffic mix to sustain. |
+| `--minutes N` | `20` | How long to sustain it. Short runs are noisy; prefer 20 minutes or more per arm. |
+| `--process-mode {fake,dry_run,real}` | `real` | Only `real` measures anything; `fake`/`dry_run` exercise the plumbing and export no stats. |
+| `--out DIR` | `benchmark_results/<ts>` | Run directory for `controller.log` and the `soak.json` manifest. |
+| `--label TEXT` | — | Names this arm (e.g. `baseline`, `unload-on`) in the manifest and the closing summary. |
+| `--bridge-data PATH` | `bridgeData.yaml` | The config the throughput fields are carried over from. |
+| `--ignore-bridge-data` | off | Carry nothing over; run on harness defaults plus `--override`. |
+| `--override KEY=VALUE` | — | Bridge-data override applied over the carried config (repeatable). |
+| `--no-loras` | off | Strip every LoRA and textual-inversion reference from the mix. |
+| `--shared-lora REFERENCE` | synthetic pool | Resolvable reference for the cache-hit pool (repeatable; at least 3). |
+| `--unique-lora REFERENCE` | synthetic pool | Resolvable reference for the download-pressure pool (repeatable; at least 8). |
+
+```bash
+# Arm A: the worker as configured today.
+horde-benchmark soak --minutes 20 --label baseline --no-loras
+
+# Arm B: the same traffic with one setting changed.
+horde-benchmark soak --minutes 20 --label unload-on --no-loras --override legacy_comfy_vram_unload=true
+
+# The adversarial download mix, with real LoRA references so the prefetch path is exercised:
+horde-benchmark soak --mix lora_storm --minutes 30 \
+  --shared-lora GlowingRunesAI --shared-lora ... --unique-lora ...
+```
+
+**The LoRA caveat.** Both mixes ship *synthetic* default LoRA and textual-inversion reference names, which
+exist only so a fake-mode run has something to mint. In a real-mode run they cannot resolve, so every
+LoRA-bearing job would measure the prefetch failure path instead of production cadence. Either supply
+resolvable references (`--shared-lora` / `--unique-lora`, at least 3 and 8 respectively) or pass
+`--no-loras`, which strips LoRA *and* textual-inversion references from every template while leaving the
+model, resolution, batch and post-processing shape untouched. `--no-loras` makes the mix slightly cheaper
+than production (no LoRA load, no download pressure); that is a fair comparison between two arms run the
+same way, but not a measurement of production LoRA cost. A real-mode run that does neither is warned about
+rather than silently accepted.
+
+**What it prints.** Real-mode runs export stats
+(`.horde_worker_regen/stats/stats-v*.jsonl`) stamped with the mix's scenario id, so `horde-duty-report` and
+`horde-log` can score the session afterwards exactly as they score a live one. At the end the subcommand
+names the stats files it wrote, renders the session's duty report (the same one `horde-duty-report --last`
+would produce), and closes with the throughput headline: completed jobs, the sampling slot-duty seconds
+that are the denoise time those jobs spent on the card, and the top non-sampling slot-duty buckets.
+**Kudos is not among them**: nothing priced this work, so an arm is compared on denoise seconds and on
+where the empty slot-seconds went. The `soak.json` manifest in the run directory records the label, the
+resolved bridge overrides, and the stats session id, which is the join from an arm back to its stats.
 
 ## `horde-log`
 

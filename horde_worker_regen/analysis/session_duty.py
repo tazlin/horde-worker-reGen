@@ -26,6 +26,28 @@ _DEFAULT_TARGET_DUTY_PERCENT = 90.0
 _DEFAULT_BUSY_THRESHOLD = 0.10
 _MAX_INFERRED_INTERVAL_SECONDS = 300.0
 
+_LANE_STATE_RE = re.compile(r"(?P<label>[a-z_]+)#\d+=(?:[a-z_]+:)?(?P<state>[A-Z_]+)")
+"""Matches one lane entry of ``process_state_summary`` (``post_process#1=WAITING_FOR_JOB``).
+
+An optional lower-case ``temperature:`` segment sits between ``=`` and the state in the
+richer per-slot rendering, so the state is read after it rather than from the raw token.
+"""
+
+_POST_PROCESS_LANE_LABEL = "post_process"
+_VAE_LANE_LABEL = "vae_lane"
+_COMPONENT_LANE_LABEL = "component"
+_MODEL_LOAD_LANE_STATES = frozenset({"DOWNLOADING_MODEL", "DOWNLOAD_COMPLETE", "PRELOADING_MODEL", "PRELOADED_MODEL"})
+_MODEL_UNLOAD_LANE_STATES = frozenset({"UNLOADED_MODEL_FROM_VRAM", "UNLOADED_MODEL_FROM_RAM"})
+_STAGING_LANE_STATES = frozenset({"INFERENCE_PRIMED"})
+_POST_PROCESSING_LANE_STATES = frozenset({"POST_PROCESSING"})
+_TEXT_ENCODE_LANE_STATES = frozenset({"INFERENCE_STARTING"})
+"""The state the component lane reports while it is encoding.
+
+The lane reuses ``INFERENCE_STARTING`` for its text-encode window, which on an inference lane means
+the denoise loop is running. Only the ``component`` label makes it a duty loss, so this set is never
+consulted without checking the lane it came from.
+"""
+
 
 class DutyLossKind(StrEnum):
     """Maintainer-facing buckets for GPU duty-cycle loss attribution."""
@@ -39,6 +61,8 @@ class DutyLossKind(StrEnum):
     SAFETY = "safety"
     SUBMIT = "submit"
     POST_PROCESSING = "post_processing"
+    VAE_DECODE = "vae_decode"
+    TEXT_ENCODE = "text_encode"
     PROCESS_RECOVERY = "process_recovery"
     LOCAL_PAUSE = "local_pause"
     API_BACKOFF = "api_backoff"
@@ -527,37 +551,81 @@ def _idle_kind(sample: dict[str, Any], previous_sample: dict[str, Any] | None) -
         return DutyLossKind.SCHEDULER_WAIT
     if _int_value(sample.get("alchemy_forms_pending")) + _int_value(sample.get("alchemy_forms_in_flight")) > 0:
         return DutyLossKind.AUX_DOWNLOAD
-    state = _state_text(sample)
-    if "MODEL" in state or "PRELOAD" in state:
+    if any(state in _MODEL_LOAD_LANE_STATES for _, state in _lane_states(sample)):
+        return DutyLossKind.MODEL_LOAD
+    text = _orchestration_text(sample)
+    if "MODEL" in text or "PRELOAD" in text:
         return DutyLossKind.MODEL_LOAD
     return DutyLossKind.UNKNOWN
 
 
 def _partial_kind(sample: dict[str, Any], *, fallback: DutyLossKind) -> DutyLossKind:
-    state = _state_text(sample)
     if _int_value(sample.get("jobs_pending_submit")) > 0:
         return DutyLossKind.SUBMIT
     if _int_value(sample.get("jobs_pending_safety_check")) + _int_value(sample.get("jobs_being_safety_checked")) > 0:
         return DutyLossKind.SAFETY
-    if "INFERENCE_POST_PROCESSING" in state or "POST_PROCESS" in state or "UPSCALE" in state or "FACE" in state:
+    lane_kind = _lane_loss_kind(_lane_states(sample))
+    if lane_kind is not None:
+        return lane_kind
+    text = _orchestration_text(sample)
+    if "POST_PROCESS" in text or "UPSCALE" in text or "FACE" in text:
         return DutyLossKind.POST_PROCESSING
-    if "PRELOADING_MODEL" in state or "MODEL" in state or "PRELOAD" in state:
+    if "MODEL" in text or "PRELOAD" in text:
         return DutyLossKind.MODEL_LOAD
-    # The one-time RAM->VRAM staging/prompt-encode window is INFERENCE_PRIMED (INFERENCE_STARTING now
-    # means the denoise loop is actually running, which is not a duty loss). Attribute the transfer gap
-    # to the primed window.
-    if "INFERENCE_PRIMED" in state or "VRAM" in state:
+    if "VRAM" in text:
         return DutyLossKind.VRAM_TRANSFER
-    if "UNLOAD" in state or "EVICT" in state:
+    if "UNLOAD" in text or "EVICT" in text:
         return DutyLossKind.MODEL_UNLOAD
     if _int_value(sample.get("jobs_in_progress")) > 0:
         return fallback
     return DutyLossKind.UNKNOWN
 
 
-def _state_text(sample: dict[str, Any]) -> str:
+def _lane_states(sample: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(lane_label, state)`` pairs parsed out of ``process_state_summary``.
+
+    The summary names every lane on every sample (``post_process#1=WAITING_FOR_JOB
+    vae_lane#3=POST_PROCESSING ...``), so a substring test against the whole string answers "does this
+    worker have such a lane", never "is that lane busy". Attribution has to read each lane's own state.
+    """
+    summary = str(sample.get("process_state_summary") or "")
+    return [(match.group("label"), match.group("state")) for match in _LANE_STATE_RE.finditer(summary)]
+
+
+def _lane_loss_kind(lanes: list[tuple[str, str]]) -> DutyLossKind | None:
+    """Attribute partial-utilization time to whichever lane is doing non-sampling work, if any.
+
+    A lane in ``WAITING_FOR_JOB`` contributes nothing. The disaggregated pipeline's lanes reuse states
+    that mean something else on an inference lane: both the dedicated post-processing lane and the VAE
+    lane report ``POST_PROCESSING``, and the component lane reports ``INFERENCE_STARTING`` while it is
+    text-encoding. They are three different stages, so the lane label decides the bucket and no state is
+    read without the label it came from.
+    """
+    if any(label == _POST_PROCESS_LANE_LABEL and state in _POST_PROCESSING_LANE_STATES for label, state in lanes):
+        return DutyLossKind.POST_PROCESSING
+    if any(label == _VAE_LANE_LABEL and state in _POST_PROCESSING_LANE_STATES for label, state in lanes):
+        return DutyLossKind.VAE_DECODE
+    if any(label == _COMPONENT_LANE_LABEL and state in _TEXT_ENCODE_LANE_STATES for label, state in lanes):
+        return DutyLossKind.TEXT_ENCODE
+    if any(state in _MODEL_LOAD_LANE_STATES for _, state in lanes):
+        return DutyLossKind.MODEL_LOAD
+    # The one-time RAM->VRAM staging/prompt-encode window is INFERENCE_PRIMED (INFERENCE_STARTING means
+    # the denoise loop is actually running, which is not a duty loss). Attribute the transfer gap to the
+    # primed window.
+    if any(state in _STAGING_LANE_STATES for _, state in lanes):
+        return DutyLossKind.VRAM_TRANSFER
+    if any(state in _MODEL_UNLOAD_LANE_STATES for _, state in lanes):
+        return DutyLossKind.MODEL_UNLOAD
+    return None
+
+
+def _orchestration_text(sample: dict[str, Any]) -> str:
+    """Upper-cased scheduler intent prose, deliberately excluding ``process_state_summary``.
+
+    The lane summary is matched structurally by :func:`_lane_states`; folding it into a flat string
+    would let lane *labels* satisfy state substring tests on every sample.
+    """
     parts = [
-        str(sample.get("process_state_summary") or ""),
         str(sample.get("orchestration_intent_summary") or ""),
         str(sample.get("orchestration_next_action") or ""),
         str(sample.get("orchestration_why") or ""),
@@ -765,7 +833,7 @@ def _dominant_partial_kind(phase_totals: dict[str, float]) -> DutyLossKind:
         "submit": DutyLossKind.SUBMIT,
         "graph_overhead": DutyLossKind.POST_PROCESSING,
         "encode": DutyLossKind.POST_PROCESSING,
-        "vae_decode": DutyLossKind.POST_PROCESSING,
+        "vae_decode": DutyLossKind.VAE_DECODE,
     }
     for phase in phase_totals:
         kind = mapping.get(phase)

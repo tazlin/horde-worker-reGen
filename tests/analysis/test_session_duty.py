@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from horde_worker_regen.analysis.duty_log_report import main as duty_report_main
-from horde_worker_regen.analysis.session_duty import DutyLossKind, analyze_stats_sessions
+from horde_worker_regen.analysis.session_duty import DutyLossKind, SessionDutyReport, analyze_stats_sessions
 
 
 def _write_jsonl(path: Path, events: list[dict[str, object]]) -> None:
@@ -184,14 +184,14 @@ class TestAttribution:
                     gpu_duty_percent=45.0,
                     gpu_busy_fraction=1.0,
                     jobs_in_progress=1,
-                    process_state_summary="inf#0=INFERENCE_STARTING model load",
+                    process_state_summary="inf#0=PRELOADING_MODEL",
                 ),
                 _sample(
                     110.0,
                     gpu_duty_percent=45.0,
                     gpu_busy_fraction=1.0,
                     jobs_in_progress=1,
-                    process_state_summary="inf#0=INFERENCE_STARTING model load",
+                    process_state_summary="inf#0=PRELOADING_MODEL",
                 ),
             ],
         )
@@ -201,6 +201,97 @@ class TestAttribution:
         bucket = next(item for item in report.buckets if item.kind == DutyLossKind.MODEL_LOAD)
         assert bucket.partial_utilization_seconds > 0
         assert bucket.idle_seconds == 0
+
+    _ALL_LANES_IDLE = (
+        "safety#0=WAITING_FOR_JOB post_process#1=WAITING_FOR_JOB component#2=WAITING_FOR_JOB "
+        "vae_lane#3=WAITING_FOR_JOB utilities#4=WAITING_FOR_JOB inference#5={inference} "
+        "inference#6=WAITING_FOR_JOB"
+    )
+
+    def _partial_loss_report(self, tmp_path: Path, summary: str) -> SessionDutyReport:
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260620-010203-000.jsonl",
+            [
+                _sample(
+                    timestamp,
+                    gpu_duty_percent=45.0,
+                    gpu_busy_fraction=1.0,
+                    jobs_in_progress=1,
+                    process_state_summary=summary,
+                )
+                for timestamp in (100.0, 110.0)
+            ],
+        )
+        return analyze_stats_sessions(stats_dir)[0]
+
+    def test_idle_post_process_lane_does_not_claim_partial_loss(self, tmp_path: Path) -> None:
+        """A worker that merely *has* a post-processing lane attributes nothing to post-processing.
+
+        Every sample names every lane, so the staging window is read off the inference lane's own
+        state rather than from the presence of the word ``post_process`` in the summary.
+        """
+        report = self._partial_loss_report(
+            tmp_path,
+            self._ALL_LANES_IDLE.format(inference="INFERENCE_PRIMED"),
+        )
+
+        buckets = {bucket.kind: bucket for bucket in report.buckets}
+        assert buckets[DutyLossKind.VRAM_TRANSFER].partial_utilization_seconds > 0
+        assert buckets[DutyLossKind.POST_PROCESSING].total_seconds == 0
+
+    def test_busy_post_process_lane_maps_to_post_processing(self, tmp_path: Path) -> None:
+        """A post-processing lane actually running post-processing owns the loss."""
+        report = self._partial_loss_report(
+            tmp_path,
+            "safety#0=WAITING_FOR_JOB post_process#1=POST_PROCESSING vae_lane#3=WAITING_FOR_JOB "
+            "inference#5=WAITING_FOR_JOB",
+        )
+
+        buckets = {bucket.kind: bucket for bucket in report.buckets}
+        assert buckets[DutyLossKind.POST_PROCESSING].partial_utilization_seconds > 0
+        assert buckets[DutyLossKind.VAE_DECODE].total_seconds == 0
+
+    def test_busy_vae_lane_maps_to_vae_decode(self, tmp_path: Path) -> None:
+        """The VAE lane reports ``POST_PROCESSING`` but does VAE work, so it gets its own bucket."""
+        report = self._partial_loss_report(
+            tmp_path,
+            "safety#0=WAITING_FOR_JOB post_process#1=WAITING_FOR_JOB vae_lane#3=POST_PROCESSING "
+            "inference#5=WAITING_FOR_JOB",
+        )
+
+        buckets = {bucket.kind: bucket for bucket in report.buckets}
+        assert buckets[DutyLossKind.VAE_DECODE].partial_utilization_seconds > 0
+        assert buckets[DutyLossKind.POST_PROCESSING].total_seconds == 0
+
+    def test_busy_component_lane_maps_to_text_encode(self, tmp_path: Path) -> None:
+        """The component lane reports ``INFERENCE_STARTING`` while text-encoding, not while sampling."""
+        report = self._partial_loss_report(
+            tmp_path,
+            "safety#0=WAITING_FOR_JOB post_process#1=WAITING_FOR_JOB component#2=INFERENCE_STARTING "
+            "vae_lane#3=WAITING_FOR_JOB inference#5=WAITING_FOR_JOB",
+        )
+
+        buckets = {bucket.kind: bucket for bucket in report.buckets}
+        assert buckets[DutyLossKind.TEXT_ENCODE].partial_utilization_seconds > 0
+        assert buckets[DutyLossKind.POST_PROCESSING].total_seconds == 0
+        assert buckets[DutyLossKind.VAE_DECODE].total_seconds == 0
+
+    def test_sampling_inference_lane_is_not_text_encode(self, tmp_path: Path) -> None:
+        """``INFERENCE_STARTING`` on an inference lane is the denoise loop, so it claims no encode loss.
+
+        The state name is shared with the component lane's encode window, which is why attribution reads
+        the lane label rather than the state alone.
+        """
+        report = self._partial_loss_report(
+            tmp_path,
+            "safety#0=WAITING_FOR_JOB post_process#1=WAITING_FOR_JOB component#2=WAITING_FOR_JOB "
+            "vae_lane#3=WAITING_FOR_JOB inference#5=INFERENCE_STARTING",
+        )
+
+        buckets = {bucket.kind: bucket for bucket in report.buckets}
+        assert buckets[DutyLossKind.TEXT_ENCODE].total_seconds == 0
 
     def test_missing_fields_degrade_to_unknown(self, tmp_path: Path) -> None:
         """Sparse legacy samples are counted as unknown, not dropped."""

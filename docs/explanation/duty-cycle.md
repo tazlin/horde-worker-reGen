@@ -224,7 +224,9 @@ dispatch stages the next job (checkpoint disk load, prompt encode) while another
 weights load at **clearance**, the moment the parent admits the child into its sample window against measured
 device truth. A busy slot is therefore an *actively sampling* child, not merely an in-progress one: a staged
 child whose clearance the parent is holding (its full materialisation does not yet fit, so the single reclaim
-owner evicts idle residents first) is an empty sampling slot attributed to `clearance_hold`. It clears once
+owner evicts idle residents first) is an empty sampling slot attributed to `clearance_hold`. A job landing on
+a slot that retains its model's weights is priced at its activation delta alone, so a same-model streak is
+not held for weights the card is already carrying. It clears once
 eviction frees room, or the child samples anyway through its bounded lease-acquire timeout (liveness over
 pricing), so like the other gate buckets it is a named, real head-park rather than the gate-less stall.
 `unexplained`
@@ -283,8 +285,28 @@ The report intentionally keeps three related views separate. Idle seconds are wa
 the GPU was mostly not doing work, attributed to demand limits, scheduler waits, local pause, API
 backoff, safety/submit queues, recovery, or `unknown`. Partial-utilization seconds are the remaining
 shortfall when the GPU was active but the mean utilization stayed below the target; those are attributed
-to the dominant phase or worker state (for example model load, VRAM transfer, safety, or
-post-processing). `inference_queue_wait` is popped-to-inference-start latency and can overlap active
+to the dominant phase or worker state (for example `model_load`, `vram_transfer`, `safety`, `submit`,
+`post_processing`, `vae_decode`, or `text_encode`).
+
+Worker-state attribution reads each lane's own state out of `process_state_summary`, which names *every*
+lane on every sample (`post_process#1=WAITING_FOR_JOB vae_lane#3=POST_PROCESSING ...`). An idle lane
+contributes nothing, so a worker that merely has a post-processing lane configured no longer books its
+partial-utilization time to `post_processing`. Both the dedicated post-processing lane and the
+disaggregated VAE lane report the `POST_PROCESSING` process state, so the lane label decides the bucket:
+`post_process` lanes fill `post_processing` and `vae_lane` lanes fill `vae_decode`. The component lane
+reuses `INFERENCE_STARTING` for its text-encode window, where on an inference lane that state means the
+denoise loop is running, so the same rule separates them: `component` lanes fill `text_encode` and an
+inference lane in `INFERENCE_STARTING` is productive sampling and books no loss at all. An inference lane
+in `INFERENCE_PRIMED` is the RAM-to-VRAM staging and prompt-encode window and fills `vram_transfer`;
+`PRELOADING_MODEL`/`PRELOADED_MODEL` fill `model_load`.
+
+The disaggregated stage buckets measure *loss*, not occupancy: a lane can be busy through a window that
+carried no shortfall, because the sampler was at or above the duty target the whole time. A session can
+therefore show a couple of hundred wall-clock seconds of text-encode against only a few seconds in the
+`text_encode` bucket, and that is the pipeline working as intended rather than a gap in the accounting.
+Read lane occupancy from the slot-duty line, and this bucket only as "how much duty the stage cost".
+
+`inference_queue_wait` is popped-to-inference-start latency and can overlap active
 sampling when a standby job waits behind the one legal inference slot. `inference_dispatch_gap` is the
 narrower scheduler-delay signal: sampled time where inference work was queued and no inference job was
 active. Because each stats session is grouped by the export filename stamp, rotated `.jsonl` and

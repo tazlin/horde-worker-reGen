@@ -5,6 +5,7 @@ Subcommands:
 - ``plan``: preview each probe's resource needs and run/skip verdict (no worker is started).
 - ``download``: fetch the checkpoints the selected tiers need, ahead of a timed run.
 - ``pricing-corpus``: run the cost-attribution corpus whose stats records fit a pricing model.
+- ``soak``: run one sustained-traffic mix for a fixed period, as a before/after performance vehicle.
 - ``report``: re-render the markdown report from an existing output directory.
 - ``monitor``: tail a run's progress.jsonl live (attach or replay).
 - ``live``: open-loop load generation against a live AI-Horde API (separate phase).
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -21,12 +23,19 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from horde_worker_regen.analysis.session_duty import (
+    analyze_stats_files,
+    discover_stats_sessions,
+    render_session_duty_report,
+)
 from horde_worker_regen.benchmark.capabilities.capability import CapabilityKind
 from horde_worker_regen.benchmark.enums import BenchTier
+from horde_worker_regen.benchmark.soak import SOAK_MIXES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from horde_worker_regen.analysis.session_duty import SessionDutyReport
     from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions
     from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
     from horde_worker_regen.benchmark.capabilities.result import CapabilityReport, MachineInfo
@@ -81,6 +90,70 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         "--verbose",
         action="store_true",
         help="Show per-process state in the live view.",
+    )
+
+
+def _add_soak_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``soak`` subcommand: one sustained-traffic mix, run standalone as an A/B arm."""
+    soak = subparsers.add_parser(
+        "soak",
+        help="Run one sustained-traffic soak mix for a fixed period and score it from its stats export.",
+    )
+    soak.add_argument(
+        "--mix",
+        default=SOAK_MIXES[0],
+        choices=SOAK_MIXES,
+        help="Which traffic mix to sustain (default: production_replay, the measured production cadence).",
+    )
+    soak.add_argument("--minutes", type=float, default=20.0, help="How long to sustain the mix (default: 20).")
+    soak.add_argument(
+        "--process-mode",
+        default="real",
+        choices=("fake", "dry_run", "real"),
+        help="`real` measures the GPU; `fake`/`dry_run` exercise the plumbing without inference.",
+    )
+    soak.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
+    soak.add_argument(
+        "--label",
+        default="",
+        help="Free text naming this arm (e.g. 'baseline', 'unload-on'); recorded in the run manifest.",
+    )
+    soak.add_argument(
+        "--bridge-data",
+        type=Path,
+        default=Path("bridgeData.yaml"),
+        help="Worker config the throughput-relevant fields are carried over from (default: bridgeData.yaml).",
+    )
+    soak.add_argument(
+        "--ignore-bridge-data",
+        action="store_true",
+        help="Do not carry any operator config over; run on harness defaults plus --override.",
+    )
+    soak.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Bridge-data override applied on top of the operator config (repeatable). This is the A/B knob.",
+    )
+    soak.add_argument(
+        "--no-loras",
+        action="store_true",
+        help="Strip every LoRA and textual-inversion reference from the mix (see the real-mode caveat).",
+    )
+    soak.add_argument(
+        "--shared-lora",
+        action="append",
+        default=[],
+        metavar="REFERENCE",
+        help="Resolvable LoRA reference for the mix's cache-hit pool (repeatable; at least 3 for real mode).",
+    )
+    soak.add_argument(
+        "--unique-lora",
+        action="append",
+        default=[],
+        metavar="REFERENCE",
+        help="Resolvable LoRA reference for the mix's download-pressure pool (repeatable; at least 8).",
     )
 
 
@@ -947,6 +1020,176 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
     return 0 if result.succeeded else 1
 
 
+_SOAK_START_MARGIN_SECONDS = 180.0
+"""Headroom over the soak period for the cold boot and model load before the mix starts flowing."""
+
+_SOAK_DRAIN_MARGIN_SECONDS = 60.0
+"""Headroom after the soak period for in-flight jobs to finish and the worker to shut down cleanly."""
+
+_SOAK_TOP_SLOT_DUTY_BUCKETS = 4
+"""How many non-sampling slot-duty buckets the closing summary names."""
+
+
+def _soak_stats_session(stats_dir: Path, known_session_ids: set[str]) -> tuple[str, list[Path]] | None:
+    """The stats session this soak wrote, or None when the export produced nothing.
+
+    Identified as a session id that was not present before the run, so a stats directory holding earlier
+    sessions cannot be mistaken for this one. Falls back to the only session present when the directory
+    held nothing beforehand, which is the first-run case.
+    """
+    sessions = discover_stats_sessions(stats_dir)
+    fresh = [(session_id, paths) for session_id, paths in sessions if session_id not in known_session_ids]
+    if fresh:
+        return fresh[-1]
+    if len(sessions) == 1 and not known_session_ids:
+        return sessions[0]
+    return None
+
+
+def _print_soak_summary(report: SessionDutyReport, *, label: str, stats_paths: list[Path]) -> None:
+    """Print the stats paths and the throughput headline a soak arm is compared on.
+
+    Kudos is unavailable offline (no horde priced this work), so the throughput readings are the ones the
+    worker measured itself: completed jobs, and the sampling slot-duty seconds that are the denoise time
+    those jobs spent on the card. The remaining slot-duty buckets name what the empty slot-seconds were
+    waiting on, which is where an arm's difference shows up.
+    """
+    print(f"\nStats: {', '.join(str(path.resolve()) for path in stats_paths)}")  # noqa: T201
+    print(render_session_duty_report([report]))  # noqa: T201
+    sampling_seconds = report.slot_duty_seconds.get("sampling", 0.0)
+    arm = f" [{label}]" if label else ""
+    print(  # noqa: T201
+        f"soak{arm}: {report.completed_jobs} jobs completed, {sampling_seconds:.0f}s denoise "
+        f"(sampling slot-duty); kudos is not available offline.",
+    )
+    other = sorted(
+        ((name, seconds) for name, seconds in report.slot_duty_seconds.items() if name != "sampling"),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:_SOAK_TOP_SLOT_DUTY_BUCKETS]
+    if other:
+        buckets = "  ".join(f"{name} {seconds:.0f}s" for name, seconds in other)
+        print(f"top non-sampling slot duty: {buckets}")  # noqa: T201
+
+
+def _run_soak(args: argparse.Namespace) -> int:
+    """Run one sustained-traffic soak mix and score it from the stats export it wrote."""
+    from horde_worker_regen.benchmark.gate_driver import _parse_overrides
+    from horde_worker_regen.benchmark.soak import build_soak_mix_scenario, operator_throughput_overrides
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+    from horde_worker_regen.harness import HarnessConfig, run_harness
+    from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
+    from horde_worker_regen.stats_operations import default_stats_dir
+
+    try:
+        cli_overrides = _parse_overrides(args.override)
+        scenario = build_soak_mix_scenario(
+            args.mix,
+            soak_seconds=args.minutes * 60.0,
+            shared_lora_references=args.shared_lora or None,
+            unique_lora_references=args.unique_lora or None,
+            include_auxiliary_references=not args.no_loras,
+        )
+    except (argparse.ArgumentTypeError, ValueError) as error:
+        logger.error(str(error))
+        return 2
+
+    out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
+    _setup_benchmark_file_logging(out_dir)
+
+    bridge_overrides: dict[str, object] = {}
+    if not args.ignore_bridge_data:
+        bridge_overrides.update(operator_throughput_overrides(args.bridge_data))
+        if not bridge_overrides:
+            logger.warning(
+                f"No throughput fields were read from {args.bridge_data}; the soak runs on harness defaults, "
+                "which are not the configuration this worker serves under.",
+            )
+    bridge_overrides.update(cli_overrides)
+
+    if args.process_mode == "real" and not args.no_loras and not (args.shared_lora and args.unique_lora):
+        logger.warning(
+            f"The {args.mix} mix carries LoRA references and none were supplied, so its LoRA-bearing "
+            "templates use synthetic names that cannot resolve: those jobs would measure the prefetch "
+            "failure path. Pass --shared-lora/--unique-lora with resolvable references, or --no-loras.",
+        )
+
+    ensure_worker_env(args.process_mode)
+    if args.process_mode == "real":
+        # Comparing two arms requires every stats record to carry the model's real baseline. Initializing
+        # the reference here (a plain sync context, before the harness event loop starts) is what lets the
+        # harness resolve real records instead of stubbing them.
+        try:
+            ensure_model_reference_manager_initialized()
+        except Exception as reference_error:  # noqa: BLE001 - a reference miss degrades records, not the run
+            logger.warning(
+                f"Could not initialize the model reference ({type(reference_error).__name__}); soak records "
+                "will carry stubbed baselines.",
+            )
+
+    stats_dir = default_stats_dir()
+    known_session_ids = {session_id for session_id, _ in discover_stats_sessions(stats_dir)}
+
+    logger.info(
+        f"Soaking the {scenario.name} mix for {args.minutes:.1f} min in {args.process_mode} mode "
+        f"({len(scenario.image_jobs)} templates over {len(scenario.models_referenced())} models); "
+        f"bridge overrides: {bridge_overrides or 'none'}.",
+    )
+    result = run_harness(
+        HarnessConfig.from_scenario(
+            scenario,
+            process_mode=args.process_mode,
+            timeout_seconds=args.minutes * 60.0 + _SOAK_START_MARGIN_SECONDS + _SOAK_DRAIN_MARGIN_SECONDS,
+            bridge_data_overrides=bridge_overrides,
+        ),
+    )
+    # The harness reconfigures loguru's sinks for the run, so the closing summary goes to stdout to
+    # reach the operator, and to the log for the run directory's own record.
+    finished = (
+        f"Soak finished: {result.num_jobs_completed} jobs completed, {result.num_jobs_faulted} faulted, "
+        f"in {result.elapsed_seconds:.0f}s ({result.exit_reason})."
+    )
+    logger.info(finished)
+    print(f"\n{finished}")  # noqa: T201
+
+    manifest: dict[str, object] = {
+        "label": args.label,
+        "mix": args.mix,
+        "scenario_id": scenario.name,
+        "minutes": args.minutes,
+        "process_mode": args.process_mode,
+        "loras_included": not args.no_loras,
+        "bridge_overrides": bridge_overrides,
+        "jobs_completed": result.num_jobs_completed,
+        "jobs_faulted": result.num_jobs_faulted,
+        "elapsed_seconds": result.elapsed_seconds,
+        "exit_reason": result.exit_reason,
+    }
+
+    session = _soak_stats_session(stats_dir, known_session_ids)
+    if session is None:
+        no_stats = (
+            f"No stats session was written to {stats_dir} (the export is real-mode only), so this soak "
+            "cannot be scored offline."
+        )
+        logger.warning(no_stats)
+        print(no_stats)  # noqa: T201
+    else:
+        session_id, stats_paths = session
+        manifest["stats_session_id"] = session_id
+        manifest["stats_files"] = [str(path.resolve()) for path in stats_paths]
+        _print_soak_summary(
+            analyze_stats_files(session_id=session_id, paths=stats_paths),
+            label=args.label,
+            stats_paths=stats_paths,
+        )
+
+    manifest_path = out_dir / "soak.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    print(f"Run manifest: {manifest_path.resolve()}")  # noqa: T201
+    return 0 if result.succeeded else 1
+
+
 def _record_capability_benchmark_in_app_state(report: CapabilityReport, out_dir: Path) -> None:
     """Record a finished capability run in app state, best-effort (bookkeeping must not fail the run)."""
     try:
@@ -1026,6 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_plan_parser(subparsers)
     _add_download_parser(subparsers)
     _add_pricing_corpus_parser(subparsers)
+    _add_soak_parser(subparsers)
 
     report = subparsers.add_parser("report", help="Re-render the markdown report from an output directory.")
     report.add_argument("out_dir", type=Path)
@@ -1051,6 +1295,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_download(args)
     if args.command == "pricing-corpus":
         return _run_pricing_corpus(args)
+    if args.command == "soak":
+        return _run_soak(args)
     if args.command == "report":
         return _run_report(args)
     if args.command == "monitor":

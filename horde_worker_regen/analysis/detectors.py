@@ -31,6 +31,12 @@ from .sessions import SessionEndReason
 # Signatures over orchestrator message text.
 _QUARANTINE_RE = re.compile(r"quarantined \(crash on start")
 _SOFT_RESET_RE = re.compile(r"Save-our-ship soft reset")
+
+_WEDGE_ESCALATION_RE = re.compile(r"(Queue deadlock detected|Deadlock detected|Save-our-ship)")
+"""The worker declaring the queue stopped, or its recovery ladder acting on that declaration.
+
+A hold that self-clears is ordinary packing; a hold whose own window contains one of these lines did not
+self-clear, whatever its per-hold text says, because the worker had already escalated past it."""
 _POOLS_RECOVERED_RE = re.compile(r"pools recovered.*limp-by cleared")
 _ABANDON_SHIP_RE = re.compile(r"abandoning ship|cannot restore a working process pool")
 # The live worker reclaims-and-retries on this same fingerprint; keep the signature single-sourced.
@@ -2094,6 +2100,22 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
         holds_per_hour > _RECONCILE_HOLD_RATE_WARNING_PER_HOUR
         or parked_fraction > _RECONCILE_HOLD_PARKED_FRACTION_WARNING
     )
+    # The benign reading rests entirely on each hold self-clearing once an eviction frees room. A deadlock
+    # declaration or a recovery remedy inside the span the holds cover says the opposite happened: the room
+    # never came and the worker escalated. Reporting that as low-cost duty noise sends a reader looking for a
+    # throughput tweak while the queue is stopped.
+    hold_span = [record.timestamp for record in holds if record.timestamp is not None]
+    wedge_lines = (
+        [
+            record
+            for record in _matching(context.session.records, _WEDGE_ESCALATION_RE)
+            if record.timestamp is not None and min(hold_span) <= record.timestamp <= max(hold_span)
+        ]
+        if hold_span
+        else []
+    )
+    wedged = bool(wedge_lines)
+    escalated = escalated or wedged
 
     model_breakdown = ", ".join(
         f"{model} x{count}" for model, count in sorted(per_model.items(), key=lambda kv: -kv[1])
@@ -2109,19 +2131,29 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
                 f"fit the card before it committed. Per model: {model_breakdown}. Roughly {parked_seconds_total:.0f}s "
                 f"of head parking was observed across these holds"
                 + (f" (~{parked_fraction:.0%} of the session)." if duration else ".")
-                + " This is the swap-churn cost of packing more models onto the card than fit at peak, not a "
-                "scheduler wedge: each hold self-clears once the eviction frees room."
                 + (
-                    " Sustained at this volume it is a real throughput and GPU-uptime drag."
-                    if escalated
-                    else " At this volume it is a benign, low-cost duty note."
+                    " These holds did not self-clear: the worker declared the queue deadlocked (or ran a "
+                    f"recovery remedy) {len(wedge_lines)} time(s) inside the same span, so the room the hold "
+                    "was waiting for never arrived and something else had to break the stall."
+                    if wedged
+                    else " This is the swap-churn cost of packing more models onto the card than fit at peak, "
+                    "not a scheduler wedge: each hold self-clears once the eviction frees room."
+                    + (
+                        " Sustained at this volume it is a real throughput and GPU-uptime drag."
+                        if escalated
+                        else " At this volume it is a benign, low-cost duty note."
+                    )
                 )
             ),
             remediation=(
-                "If this volume is high, reduce the co-resident model pressure that forces the evictions: lower "
-                "the served model set or concurrency for this VRAM size, or confirm the per-context VRAM cost is "
-                "measured so the card is not over-packed at peak. A handful of holds is normal headroom "
-                "management and needs no action."
+                "Treat this as a wedge rather than churn: find what held the card across the span (an idle "
+                "lane's component tenancy and a slot parked on a preload are both holders no job boundary "
+                "returns) and confirm the hold actually issued a reclaim against it."
+                if wedged
+                else "If this volume is high, reduce the co-resident model pressure that forces the "
+                "evictions: lower the served model set or concurrency for this VRAM size, or confirm the "
+                "per-context VRAM cost is measured so the card is not over-packed at peak. A handful of "
+                "holds is normal headroom management and needs no action."
             ),
             evidence=[_evidence(r) for r in holds[:3]],
             see_also="head_dispatch_stall",
@@ -2437,9 +2469,17 @@ def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
             ),
             remediation=(
                 "Find what the head was waiting for over that span: the disclosure names the scheduler's own "
-                "block reason where it has one. A residency held for a non-head model is the usual holder, and "
-                "it must release or downgrade rather than outlast the queue. Until then the accepted jobs age "
-                "toward their deadline and are faulted, which the horde counts against this worker."
+                "block reason where it has one."
+                + (
+                    " A residency held for a non-head model is the usual holder, and it must release or "
+                    "downgrade rather than outlast the queue."
+                    if residency_held
+                    else " No whole-card residency was open across the freeze, so the holder is something the "
+                    "card is carrying between jobs: an idle lane's component tenancy, a slot parked on a "
+                    "preload nothing dispatched, or weights a child reported freeing and did not."
+                )
+                + " Until then the accepted jobs age toward their deadline and are faulted, which the horde "
+                "counts against this worker."
             ),
             evidence=[_evidence(record) for record in frozen[:3]],
             see_also="whole_card_residency_churn",
