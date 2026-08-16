@@ -475,7 +475,16 @@ manager-side **actions**:
   in flight is likewise excused: it holds no inference lane by design while its
   LoRAs or textual inversions download, so the deadlock detector excludes it from
   both the queue- and general-deadlock conditions rather than reading "pending plus
-  every process idle" as a wedge. That exclusion is bounded by the coordinator's
+  every process idle" as a wedge. A detected queue deadlock clears only on real
+  dispatch progress: a job entering inference or completing since the detection.
+  The all-idle condition going false is not enough on its own, because every
+  constructive remedy falsifies it by design (a paused lane, a slot replaced,
+  safety moved off the card all take a process out of the waiting-for-job
+  population without a job moving). Clearing there handed the escalation a fresh
+  clock each time it acted, so the ladder oscillated between its two cheapest
+  rungs indefinitely and reached neither its terminal rung nor the give-up
+  assessor, whose "the accepted work is not faulted while a remedy remains" clause
+  kept the backlog aging in silence. That exclusion is bounded by the coordinator's
   per-job prefetch deadline, so a genuinely stalled download stops shielding the
   queue the moment its deadline lapses (the job is then served without its
   never-in-flight file, or faulted if its transfer stalled in flight, and either way

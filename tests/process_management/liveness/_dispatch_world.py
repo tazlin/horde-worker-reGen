@@ -21,6 +21,11 @@ decide whether a finished job leaves its weights behind. That is the fidelity a 
 trajectory and a duty figure are representable at, and it is what the incident scenarios in
 ``test_incident_scenarios.py`` are driven at.
 
+Two tenants of the card are not owned by any job and are opt-in per row: ``held_component_mb`` (weights an
+idle lane holds device-warm between jobs, returned only by an unload the parent actuates) and
+``child_evicts_granted_resident`` (the child freeing the whole of a lane's committed copy to fund a charge,
+leaving the parent's retained-resident record standing over an empty device).
+
 Assertion helpers over a completed run live in ``_world_assertions.py``.
 """
 
@@ -35,6 +40,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
     HordeControlFlag,
     HordeImageResult,
     HordeInferenceControlMessage,
@@ -378,6 +384,8 @@ class _DispatchWorld:
         footprint_undershoot: float = 1.0,
         safety_off_gpu_allowed: bool = False,
         unload_release_delay_seconds: float = 0.0,
+        child_evicts_granted_resident: bool = False,
+        child_unload_leaks_mb: float = 0.0,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -430,6 +438,18 @@ class _DispatchWorld:
                 memory back. An unload is an IPC the child services between its own allocations and the driver
                 then returns the block, so a multi-gigabyte release lands seconds after the command; at zero the
                 release is instantaneous, which no worker's card ever is.
+            child_evicts_granted_resident: Whether the child's executor may free the whole of a lane's
+                committed weights, retention grant included, when its own shortfall arithmetic runs out of
+                anything else to give. ComfyUI frees memory on the device to fund an allocation and its
+                requirement is unbounded, so the grant suppresses only the worker's own end-of-job evictor and
+                never ComfyUI's; the parent's record of what the slot holds is a prediction made at dispatch
+                and nothing in the parent can measure the difference. Off, every lane's device copy survives
+                exactly as the record says.
+            child_unload_leaks_mb: How much of a lane's committed weights an unload leaves on the card. A full
+                free is a request the child's backend answers by dropping what it can, and a model a live
+                reference still pins is skipped: the command returns, the card keeps the weights, and the lane
+                goes on reporting them as used. Zero is a backend that gives everything back, which is what
+                every unload elsewhere in this world does.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -437,6 +457,8 @@ class _DispatchWorld:
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.footprint_undershoot = footprint_undershoot
         self.unload_release_delay_seconds = unload_release_delay_seconds
+        self.child_evicts_granted_resident = child_evicts_granted_resident
+        self.child_unload_leaks_mb = child_unload_leaks_mb
         self.tick = 0
         self.now = 10_000.0
         """The world's clock, shared with the tracker and the scheduler so every window they gate on is
@@ -454,6 +476,35 @@ class _DispatchWorld:
         """Per-lane sampling activation charged to the card for the window a lane is sampling in."""
         self._offloaded_mb: dict[int, float] = {}
         """Per-lane weights the child kept in host RAM rather than commit, to relieve its own shortfall."""
+        self._held_component_mb: dict[int, float] = {}
+        """Per-lane component weights the child holds device-warm between jobs.
+
+        A tenant of the card that no job owns: it survives every job boundary, is not part of any dispatch's
+        footprint, and the only thing that returns it is an unload the parent actuates on that lane. A card
+        packed with these is therefore squeezed by lanes that are idle and hold no running work, which is the
+        regime a fit computed from live contexts and dispatched jobs alone cannot see."""
+        self._granted_resident_evicted: set[int] = set()
+        """Lanes whose committed weights the child freed mid-job while the parent still records them.
+
+        Cleared as each job settles, which is where the divergence either reaches the parent's record or
+        becomes the phantom the rest of the session is priced against."""
+        self.child_granted_resident_evictions: list[str] = []
+        """Every time the child freed a lane's granted weights to fund a charge it could not otherwise make."""
+        self.unload_leaks: list[str] = []
+        """Every unload the child could not complete, with what the card kept."""
+        self._unload_leaked: set[int] = set()
+        """Lanes whose standing unload command has already been served and refused.
+
+        One command is served once. The parent's record of it stands until something retires it, and reading
+        that standing record as a fresh command every tick would manufacture a re-issue the parent never
+        made, which is exactly the behaviour a scenario here has to be able to tell apart from the real one."""
+        self.retained_resident_divergences: list[tuple[int, int, str]] = []
+        """Every tick an idle slot's retained-resident record named weights the card was not holding.
+
+        As (tick, lane, model). Sampled on idle slots only: a slot mid-job can lose its weights to the child
+        at any moment and the parent cannot know until the job reports, so the record is only a claim about
+        the card between jobs. That is also where it is acted on, by the retention fit, the dispatch
+        admission gate and same-model routing alike."""
         self._occupancy: dict[str, _SlotOccupancy] = {}
         """Closed-loop only: the jobs currently holding a lane, keyed by job id."""
         self._dispatch_device_truth_mb: dict[str, float | None] = {}
@@ -651,7 +702,9 @@ class _DispatchWorld:
         static fit can price ahead of time, while a sampling window adds gigabytes for its own duration only,
         and it is the sum of the two across concurrent slots that reaches a paging cliff.
         """
-        held = sum(self._resident_mb.values()) + sum(self._transient_mb.values())
+        held = (
+            sum(self._resident_mb.values()) + sum(self._transient_mb.values()) + sum(self._held_component_mb.values())
+        )
         return max(0.0, self.card.total_mb - self._context_charge_mb() - held)
 
     def _actual_charge_mb(self, predicted_mb: float) -> float:
@@ -678,8 +731,12 @@ class _DispatchWorld:
         return None
 
     def _lane_charge_mb(self, lane_id: int) -> float:
-        """What one lane currently holds on the card: its committed weights plus its live activation."""
-        return self._resident_mb.get(lane_id, 0.0) + self._transient_mb.get(lane_id, 0.0)
+        """What one lane holds on the card: committed weights, live activation, and device-warm components."""
+        return (
+            self._resident_mb.get(lane_id, 0.0)
+            + self._transient_mb.get(lane_id, 0.0)
+            + self._held_component_mb.get(lane_id, 0.0)
+        )
 
     def _child_believed_free_mb(self, lane_id: int, job_id: str) -> float:
         """How much free VRAM the child on ``lane_id`` believes the card has while serving ``job_id``.
@@ -777,6 +834,8 @@ class _DispatchWorld:
                 f"charge a {shortfall_mb:.0f}MB shortfall to the card",
             )
             return charge_mb - offloaded_mb
+        if self._evict_granted_resident(lane_id, shortfall_mb, model=model):
+            return charge_mb
         offloaded_mb = min(shortfall_mb, self._resident_mb.get(lane_id, 0.0))
         if offloaded_mb > 0.0:
             self._resident_mb[lane_id] = self._resident_mb.get(lane_id, 0.0) - offloaded_mb
@@ -788,15 +847,41 @@ class _DispatchWorld:
             )
         return charge_mb
 
+    def _evict_granted_resident(self, lane_id: int, shortfall_mb: float, *, model: str) -> bool:
+        """Free the whole of ``lane_id``'s device copy when nothing but its own weights can cover a shortfall.
+
+        The point the lane has nothing left to give but the checkpoint it is running on, which is where the
+        grant stops meaning anything: the grant suppresses the worker's own end-of-job evictor and nothing
+        else, and the requirement ComfyUI frees against here is unbounded, so what comes back is the whole
+        copy rather than the shortfall's worth of it. The parent's record is deliberately left exactly as it
+        was, which is the whole subject: nothing the parent measures separates a slot whose weights are still
+        there from one whose are not, so the record stands until the child says otherwise.
+
+        Returns:
+            True when the copy was freed, so the caller skips the partial offload it would otherwise do.
+        """
+        if not self.child_evicts_granted_resident or shortfall_mb <= 0.0:
+            return False
+        freed_mb = self._resident_mb.pop(lane_id, 0.0)
+        if freed_mb <= 0.0:
+            return False
+        self._resident_model.pop(lane_id, None)
+        self._offloaded_mb[lane_id] = self._offloaded_mb.get(lane_id, 0.0) + freed_mb
+        self._granted_resident_evicted.add(lane_id)
+        self.child_granted_resident_evictions.append(
+            f"tick {self.tick}: lane {lane_id} freed its whole {freed_mb:.0f}MB copy of {model} against a "
+            f"{shortfall_mb:.0f}MB shortfall, keeping nothing the grant covered",
+        )
+        self._sync_reported_vram()
+        return True
+
     def _sync_reported_vram(self) -> None:
         """Publish the derived card state through the children's VRAM reports, as a live worker would."""
         used_mb = self.card.total_mb - self.device_free_mb()
         for lane in self._process_map.values():
             lane.total_vram_mb = int(self.card.total_mb)
             lane.vram_usage_mb = int(used_mb)
-            lane.process_reserved_mb = int(
-                self._resident_mb.get(lane.process_id, 0.0) + self._transient_mb.get(lane.process_id, 0.0),
-            )
+            lane.process_reserved_mb = int(self._lane_charge_mb(lane.process_id))
 
     # -- seeding ------------------------------------------------------------------------------------------
 
@@ -815,6 +900,25 @@ class _DispatchWorld:
             self._resident_model[lane_id] = model.name
         else:
             self._staged_mb[lane_id] = self._actual_charge_mb(model.weights_mb)
+        self._sync_reported_vram()
+
+    def seed_held_components(self, lane_id: int, held_component_mb: float) -> None:
+        """Give ``lane_id`` device-warm component weights it holds between jobs.
+
+        The tenancy an idle lane carries when the component cache keeps its entries on the device rather than
+        paging them to host RAM. It belongs to no job, so no dispatch's footprint includes it and no job
+        boundary returns it; only an unload the parent actuates on this lane does. The lane also reports it,
+        which is the parent's only view of what a slot holds beyond its checkpoint.
+        """
+        self._held_component_mb[lane_id] = held_component_mb
+        lane = self._process_map[lane_id]
+        lane.held_components = [
+            HeldComponentSnapshot(
+                kind="unet",
+                identity=f"held-component-lane-{lane_id}",
+                approx_ram_mb=held_component_mb,
+            ),
+        ]
         self._sync_reported_vram()
 
     async def pop(self, job: ImageGenerateJobPopResponse) -> None:
@@ -868,9 +972,12 @@ class _DispatchWorld:
         parent's own record of the command stands until the child reports the model's new state.
         """
         for lane in self._process_map.values():
+            if lane.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                self._unload_leaked.discard(lane.process_id)
             if (
                 lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
                 and lane.process_id not in self._unload_due_at
+                and lane.process_id not in self._unload_leaked
             ):
                 self.reclaim_commands += 1
                 self._unload_due_at[lane.process_id] = self.now + self.unload_release_delay_seconds
@@ -882,16 +989,23 @@ class _DispatchWorld:
         self._sync_reported_vram()
 
     def _release_unloaded_lane(self, lane: HordeProcessInfo) -> None:
-        """Give the card back everything an unloading lane was holding and clear the command it served."""
+        """Give the card back what an unloading lane was holding, less whatever the child could not free."""
         self._unload_due_at.pop(lane.process_id, None)
         self.unload_releases.append((self.tick, lane.process_id))
         name = lane.loaded_horde_model_name
+        if self._leak_unloaded_lane(lane):
+            return
         self._resident_mb.pop(lane.process_id, None)
         self._resident_model.pop(lane.process_id, None)
         self._staged_mb.pop(lane.process_id, None)
         self._loading.pop(lane.process_id, None)
         self._transient_mb.pop(lane.process_id, None)
         self._offloaded_mb.pop(lane.process_id, None)
+        # Device-warm components are returned by the same actuation and by nothing else: they outlive every
+        # job boundary, so an unload the parent ordered is the only thing that gives the card them back.
+        self._held_component_mb.pop(lane.process_id, None)
+        lane.held_components = None
+        self._granted_resident_evicted.discard(lane.process_id)
         lane.loaded_horde_model_name = None
         lane.last_control_flag = None
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
@@ -902,6 +1016,46 @@ class _DispatchWorld:
             entry = self._model_map.root.get(name)
             if entry is not None and entry.process_id == lane.process_id:
                 self._model_map.root.pop(name, None)
+
+    def _leak_unloaded_lane(self, lane: HordeProcessInfo) -> bool:
+        """Keep the part of ``lane``'s copy the child could not free on the card, and say whether any stayed.
+
+        A full free is a request: the backend drops what it can and skips a model a live reference still pins,
+        and the command reports nothing about the difference. The lane goes on holding those weights and goes
+        on reporting them as used, so the card is short by exactly as much as the parent believes it gained.
+        The child is what closes it, by judging the unload on what the device still holds and naming the
+        refusal; the parent's own refusal bookkeeping then keeps the slot recorded as VRAM-resident and out of
+        a reclaim that would ask the same question again next tick.
+        """
+        leaked_mb = min(self.child_unload_leaks_mb, self._resident_mb.get(lane.process_id, 0.0))
+        if leaked_mb <= 0.0:
+            return False
+        self._resident_mb[lane.process_id] = leaked_mb
+        self._staged_mb.pop(lane.process_id, None)
+        self._loading.pop(lane.process_id, None)
+        self._transient_mb.pop(lane.process_id, None)
+        self._offloaded_mb.pop(lane.process_id, None)
+        self._held_component_mb.pop(lane.process_id, None)
+        lane.held_components = None
+        self._granted_resident_evicted.discard(lane.process_id)
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        self._unload_leaked.add(lane.process_id)
+        self.unload_leaks.append(
+            f"tick {self.tick}: lane {lane.process_id} kept {leaked_mb:.0f}MB of "
+            f"{lane.loaded_horde_model_name} on the card through an unload",
+        )
+        self._process_map.on_vram_unload_refused(lane.process_id)
+        name = lane.loaded_horde_model_name
+        if name is not None and not lane.vram_unload_refused:
+            # A parent that does not record the refusal has nothing to hold the slot VRAM-resident with, so
+            # its map follows the command it issued rather than the device it issued it to.
+            self._model_map.update_entry(
+                name,
+                load_state=ModelLoadState.LOADED_IN_RAM,
+                process_id=lane.process_id,
+            )
+        self._sync_reported_vram()
+        return True
 
     def _begin_started_preloads(self) -> None:
         """Start the load of any model the scheduler has just told a lane to bring in."""
@@ -1191,6 +1345,31 @@ class _DispatchWorld:
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
         lane.last_control_flag = None
         retained = lane.retained_resident_model == occupancy.model and not self._legacy_unload_regime()
+        child_evicted = occupancy.lane_id in self._granted_resident_evicted
+        self._granted_resident_evicted.discard(occupancy.lane_id)
+        if retained and child_evicted:
+            # The grant was settled onto the slot for weights the child had already freed. The child is what
+            # closes that gap: it sees the device empty at the end of a run it was told to keep resident and
+            # reports the model out of VRAM, which is the same state change a parent-commanded unload sends
+            # and is handled by the same production reconciliation. Without it the record stands over an
+            # empty device and the rest of the session is priced, held and routed against a phantom.
+            self._resident_mb.pop(occupancy.lane_id, None)
+            self._resident_model.pop(occupancy.lane_id, None)
+            self._staged_mb[occupancy.lane_id] = occupancy.weights_mb
+            self._process_map.on_model_vram_clear(occupancy.lane_id)
+            if lane.retained_resident_model is None:
+                self._model_map.update_entry(
+                    occupancy.model,
+                    load_state=ModelLoadState.LOADED_IN_RAM,
+                    process_id=occupancy.lane_id,
+                )
+            else:
+                self._model_map.update_entry(
+                    occupancy.model,
+                    load_state=ModelLoadState.LOADED_IN_VRAM,
+                    process_id=occupancy.lane_id,
+                )
+            return
         if retained:
             # The explicit end-of-job evictor returns everything the grant does not cover, so a slot that
             # loaded beside stale weights is back to carrying exactly the model it retains.
@@ -1269,7 +1448,10 @@ class _DispatchWorld:
         self._loading.pop(lane_id, None)
         self._transient_mb.pop(lane_id, None)
         self._offloaded_mb.pop(lane_id, None)
+        self._held_component_mb.pop(lane_id, None)
+        self._granted_resident_evicted.discard(lane_id)
         self._unload_due_at.pop(lane_id, None)
+        self._unload_leaked.discard(lane_id)
         self._drop_occupancy_on(lane_id)
         if lane is None:
             return
@@ -1281,6 +1463,7 @@ class _DispatchWorld:
 
     def _drop_occupancy_on(self, lane_id: int) -> None:
         """Forget the hold a lane that has gone away was carrying, so no later tick completes its job."""
+        self._granted_resident_evicted.discard(lane_id)
         for job_id, occupancy in list(self._occupancy.items()):
             if occupancy.lane_id == lane_id:
                 self._occupancy.pop(job_id, None)
@@ -1316,7 +1499,10 @@ class _DispatchWorld:
         self._loading.pop(victim, None)
         self._transient_mb.pop(victim, None)
         self._offloaded_mb.pop(victim, None)
+        self._held_component_mb.pop(victim, None)
+        self._granted_resident_evicted.discard(victim)
         self._unload_due_at.pop(victim, None)
+        self._unload_leaked.discard(victim)
         self._drop_occupancy_on(victim)
         entry = self._model_map.root.get(model.name)
         if entry is not None and entry.process_id == victim:
@@ -1458,6 +1644,7 @@ class _DispatchWorld:
         self._begin_started_preloads()
         await self._dispatch_until_full()
         self.min_device_free_mb = min(self.min_device_free_mb, self.device_free_mb())
+        self._sample_retained_resident_divergence()
         self.offers[self.tick] = self.advertised_models()
         claim = self._scheduler.whole_card_pop_claim()
         if claim is not None:
@@ -1465,6 +1652,16 @@ class _DispatchWorld:
             self.claim_expires_at = claim.expires_at
         elif self.claim_ticks and self.claim_released_at == 0.0:
             self.claim_released_at = self.now
+
+    def _sample_retained_resident_divergence(self) -> None:
+        """Record any idle slot whose retained-resident record does not match what the card holds."""
+        busy_lanes = {occupancy.lane_id for occupancy in self._occupancy.values()}
+        for lane in self._process_map.values():
+            model = lane.retained_resident_model
+            if model is None or lane.process_id in busy_lanes:
+                continue
+            if self._resident_model.get(lane.process_id) != model:
+                self.retained_resident_divergences.append((self.tick, lane.process_id, model))
 
     async def run(self, ticks: int) -> None:
         """Advance ``ticks`` scheduling ticks."""
@@ -1539,6 +1736,25 @@ class _DispatchWorld:
             if (lane := self._process_map.get(info.process_id)) is not None
             and lane.loaded_horde_model_name is not None
             and lane.loaded_horde_model_name != name
+        ]
+
+    def unload_refused_lanes(self) -> list[int]:
+        """Lanes the parent has recorded as having refused an unload, so reclaim passes them over."""
+        return [lane.process_id for lane in self._process_map.values() if lane.vram_unload_refused]
+
+    def ram_recorded_over_resident_weights(self) -> list[str]:
+        """Models the parent records in host RAM while the card is still holding weights charged to their lane.
+
+        The ledger error a refused unload produces: the parent counts the freed room, admits against it, and
+        the card pages. Every entry here is room the worker believes it has and does not.
+        """
+        return [
+            f"{name} recorded in RAM on lane {info.process_id}, which still holds "
+            f"{self._resident_mb.get(info.process_id, 0.0):.0f}MB on the card"
+            for name, info in self._model_map.root.items()
+            if info.horde_model_load_state is ModelLoadState.LOADED_IN_RAM
+            and info.process_id is not None
+            and self._resident_mb.get(info.process_id, 0.0) > 0.0
         ]
 
     def vram_resident_lanes(self, model: str) -> list[int]:

@@ -500,11 +500,23 @@ full-materialisation room. Second, the full-price fit-or-evict moves to **cleara
 child the scheduler prices its job's full weights-plus-activation peak against measured device truth through
 the same `MONOLITHIC_DISPATCH` admission identity the dispatch residency gate uses, running the single reclaim
 owner's eviction on a non-fit and upgrading the reservation from the encode charge to the full peak on a
-grant. The post-processing co-residency mutex is applied at clearance too, since clearance, not dispatch, is
+grant. Weights the target slot already holds are credited out of that price: a slot carrying a retention
+grant for the model its next job needs never left those weights on the card, and the device-free reading
+already excludes them, so charging the whole peak would hold a same-model streak for room the card has
+already given it. Only the weights are credited; the activation peak and the noise buffer are charged in
+full. The parent's own retention record is what says the weights are there, which is the only truth that
+covers a disaggregated sampler: its sample stage reports no model-load transition, so the model map never
+shows a pinned sampler's UNet VRAM-resident however long the slot holds it.
+The post-processing co-residency mutex is applied at clearance too, since clearance, not dispatch, is
 now the VRAM moment for a leased job. A clearance held for VRAM fit is attributed to the `clearance_hold`
 slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
 clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
-unpriced window once rather than ever wedging the pool. When `gpu_sampling_lease_tail_overlap` is set the
+unpriced window once rather than ever wedging the pool. The lease brackets a disaggregated sample stage
+exactly as it brackets a whole job: the sampler resets its per-job grant when a sample control message
+arrives, so each stage waits for its own clearance and a multi-slice batch consumes one grant between them.
+Without that reset a pinned sampler blocks once, for its first stage, and passes straight through
+afterwards, which shows up as grants far outnumbered by unpriced sampling windows and a tail-overlap handoff
+that never fires for want of a waiter. When `gpu_sampling_lease_tail_overlap` is set the
 controller clears one extra child early so the next sampling window opens before the current one closes
 (one early clear per outgoing sampler). The trigger is time-based: the early clear fires when the
 soonest-finishing sampler's estimated remaining seconds drop to the incoming child's measured
@@ -1599,6 +1611,12 @@ distribution, LoRAs on a realistic minority of pops rather than the storm's majo
 about a third), so a worker is soaked under the traffic it will actually meet rather than a worst case. The
 storm answers "does the download path degrade gracefully under a flood"; the replay answers "does the
 configuration hold up under production's real mix".
+
+Either mix runs standalone through `horde-benchmark soak`, which is the before/after vehicle for a change
+like these: it sustains one mix for a fixed period against the operator's own throughput settings, exports
+stats, and prints the duty attribution for the session it just wrote. It never talks to the horde, so two
+arms differ only in the setting under test rather than in the traffic they happened to be offered. See
+[CLI reference](../reference/cli.md#soak-the-standalone-before-and-after-soak).
 
 ## Multi-GPU pop shaping
 

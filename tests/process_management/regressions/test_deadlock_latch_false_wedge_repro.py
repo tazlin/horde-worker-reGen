@@ -190,3 +190,61 @@ async def test_new_inference_start_counts_as_recovery_episode_progress() -> None
     await tracker.mark_inference_started(job)
 
     assert coordinator.made_progress_since_episode() is True
+
+
+async def test_a_remedy_tearing_down_a_lane_does_not_clear_the_deadlock() -> None:
+    """The recovery ladder's own remedy must not read as the progress that ends the wedge it is treating.
+
+    Every Save-our-ship remedy mutates the process map: a paused post-processing lane, safety moved off the
+    card, a slot replaced. Each takes a process out of the waiting-for-job population, which falsifies the
+    all-idle premise without a single job moving. Clearing on that hands the escalation a fresh clock every
+    time it acts, so the ladder oscillates between its cheapest rungs and never reaches its terminal rung or
+    the give-up assessor, while the accepted work ages out in silence.
+    """
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    idle = make_mock_process_info(1, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
+    pm._process_map[1] = idle
+    lane = make_mock_process_info(2, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+    pm._process_map[2] = lane
+
+    head = make_job_pop_response(model="unschedulable")
+    await track_popped_job_async(pm._job_tracker, head)
+
+    pm.detect_deadlock()
+    assert pm._message_dispatcher.get_deadlock_snapshot().in_queue_deadlock is True
+
+    # The remedy: the lane is torn down. No job started, none finished, the head is still stuck.
+    lane.last_process_state = HordeProcessState.PROCESS_ENDING
+
+    pm.detect_deadlock()
+
+    assert pm._message_dispatcher.get_deadlock_snapshot().in_queue_deadlock is True
+
+
+async def test_a_job_entering_inference_clears_the_deadlock() -> None:
+    """The positive half: real dispatch progress is what the latch clears on, and it still does.
+
+    Without this the rule above would be satisfied by a latch that never clears at all, which would fault a
+    recovering worker as wedged forever.
+    """
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    slot = make_mock_process_info(1, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
+    pm._process_map[1] = slot
+
+    head = make_job_pop_response(model="resident")
+    await track_popped_job_async(pm._job_tracker, head)
+
+    pm.detect_deadlock()
+    assert pm._message_dispatcher.get_deadlock_snapshot().in_queue_deadlock is True
+
+    await pm._job_tracker.mark_inference_started(head)
+    slot.last_process_state = HordeProcessState.INFERENCE_STARTING
+    slot.last_job_referenced = head
+
+    pm.detect_deadlock()
+
+    assert pm._message_dispatcher.get_deadlock_snapshot().in_queue_deadlock is False

@@ -144,6 +144,7 @@ class _DryRunResultingImage:
     rawpng: io.BytesIO
     faults: list[GenMetadataEntry] = field(default_factory=list)
     sampler_truncation: SamplerTruncationRecord | None = None
+    retained_weights_evicted: bool = False
 
 
 def read_sampler_truncation(result: object) -> SamplerTruncationRecord | None:
@@ -525,6 +526,7 @@ class HordeInferenceProcess(HordeProcess):
         process_state: HordeProcessState,
         horde_model_state: ModelLoadState,
         time_elapsed: float | None = None,
+        vram_unload_refused: bool = False,
     ) -> None:
         """Update the main process with the current process state and model state.
 
@@ -534,6 +536,8 @@ class HordeInferenceProcess(HordeProcess):
             horde_model_state (ModelLoadState): The state of the model.
             time_elapsed (float | None, optional): The time elapsed during the last operation, if applicable. \
                 Defaults to None.
+            vram_unload_refused (bool, optional): Whether the device refused this VRAM unload, so the
+                parent keeps the slot recorded as VRAM-resident. Defaults to False.
         """
         model_update_message = HordeModelStateChangeMessage(
             process_state=process_state,
@@ -543,6 +547,7 @@ class HordeInferenceProcess(HordeProcess):
             horde_model_name=horde_model_name,
             horde_model_state=horde_model_state,
             time_elapsed=time_elapsed,
+            vram_unload_refused=vram_unload_refused,
         )
         self.process_message_queue.put(model_update_message)
 
@@ -806,6 +811,13 @@ class HordeInferenceProcess(HordeProcess):
     deferred, LOADED_IN_RAM otherwise. The parent's retention gate reads that map to enforce a single
     VRAM-resident model per card, so reporting VRAM residency for weights hordelib just evicted would
     make every recently-active sibling look like a resident and starve retention."""
+    _retained_weights_evicted: bool = False
+    """Whether the engine reported that the job now finishing lost its retained weights to the backend.
+
+    ComfyUI frees other models on the device to fund an allocation, so a checkpoint held under a
+    retention grant can be gone by the time the job ends. The parent's retained-resident record is a
+    prediction made at dispatch, so it stays wrong for the rest of the session unless the divergence is
+    reported; this latches the engine's verdict for the reconciliation that follows the result."""
     _last_inference_error: str | None = None
     """Summary of the exception that failed the current job's inference, or None if it succeeded.
 
@@ -1078,6 +1090,7 @@ class HordeInferenceProcess(HordeProcess):
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
         self._current_job_kept_model_resident = keep_model_resident
+        self._retained_weights_evicted = False
         self._last_job_inference_rate = None
         self._last_inference_error = None
         self._last_progress_step_seen = None
@@ -1114,6 +1127,12 @@ class HordeInferenceProcess(HordeProcess):
                             premade_control_map_bytes=premade_control_map_bytes,
                             device_free_truth_mb=device_free_truth_mb,
                         )
+                        if any(result.retained_weights_evicted for result in results):
+                            # The grant bought nothing: the engine found the device empty at the end of
+                            # the run. Correct the residency this job reports before the result message
+                            # carries it, so the parent's model map is never told the weights are in VRAM.
+                            self._retained_weights_evicted = True
+                            self._current_job_kept_model_resident = False
         except Exception as e:
             # Keep a reason for the faulted result: the main process logs it and classifies a
             # resource/OOM failure (which earns a degraded retry) from this text. The full message is
@@ -1215,11 +1234,20 @@ class HordeInferenceProcess(HordeProcess):
 
         from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
+        # Reset the clearance grant before the stage runs, exactly as the monolithic path does at job start.
+        # The proxy's per-job flag latches on the first acquire and only this call clears it, so without it a
+        # sampler blocks for its first disaggregated stage and every later stage passes straight through: the
+        # parent's grant would stop bracketing the denoise loops it is meant to price. One grant covers the
+        # whole control message, so a multi-slice batch never waits twice.
+        if self._gpu_sampling_lease is not None:
+            self._gpu_sampling_lease.begin_job()
+
         # Primed for the sample stage: the pinned sampler advances to INFERENCE_STARTING on its first step.
         self.send_process_state_change_message(HordeProcessState.INFERENCE_PRIMED, info="Priming")
         start_time = time.time()
         reference_manager = ensure_offline_reference_manager()
         results: list[SampleSliceResult] = []
+        self._retained_weights_evicted = False
 
         for job_slice in message.slices:
             # Reset the step-tracking state per slice so every slice in a batch emits its own step
@@ -1247,6 +1275,10 @@ class HordeInferenceProcess(HordeProcess):
                     )
                     latent_bytes = sample_result.latent_bytes
                     truncation = read_sampler_truncation(sample_result)
+                    if sample_result.retained_weights_evicted:
+                        # One slice losing the UNet is enough: the grant covers the whole control
+                        # message, and what the parent holds after it is the same either way.
+                        self._retained_weights_evicted = True
                 results.append(
                     SampleSliceResult(
                         job_id=job_slice.job_id,
@@ -1275,6 +1307,9 @@ class HordeInferenceProcess(HordeProcess):
                 results=results,
             ),
         )
+        # After the result, for the same reason the monolithic path reports it there: the orchestrator
+        # settles this sampler's grant off the result, and the correction has to land on top of it.
+        self.report_retained_weights_evicted()
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, info="Waiting for job")
 
     def _make_dummy_latent_bytes(self) -> bytes:
@@ -1315,9 +1350,23 @@ class HordeInferenceProcess(HordeProcess):
 
     @logger.catch(reraise=True)
     def unload_models_from_vram(self) -> None:
-        """Unload all models from VRAM."""
+        """Unload all models from VRAM and report the residency the device was left with, not the one asked for.
+
+        The free is a request the backend answers by dropping what it can: a model a live reference still pins
+        is skipped and stays on the card. Reporting host-RAM residency on the strength of having issued the
+        command would hand the parent room the card does not have, and every admission decision after it is
+        made against that room. So the report follows what the backend says it still holds, and a refusal is
+        named as one so the parent stops asking the same slot the same question every tick.
+        """
+        unload_refused = False
         if not self._dry_run_skip_inference:
-            self._horde.backend.free_vram()
+            result = self._horde.backend.free_vram()
+            unload_refused = not result.complete
+            if unload_refused:
+                logger.warning(
+                    f"The VRAM unload left {result.remaining_loaded_models} model(s) loaded on this device "
+                    f"after freeing ~{result.freed_mb:.0f}MB; reporting the weights as still resident.",
+                )
 
             self.clear_gc_and_torch_cache()
 
@@ -1328,20 +1377,57 @@ class HordeInferenceProcess(HordeProcess):
 
         if self._active_model_name is not None:
             self.on_horde_model_state_change(
-                process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
+                # A refused unload is not an unload: reporting the state that names one would let the
+                # parent's own unload reconciliation clear a residency the device still has.
+                process_state=(
+                    HordeProcessState.WAITING_FOR_JOB if unload_refused else HordeProcessState.UNLOADED_MODEL_FROM_VRAM
+                ),
                 horde_model_name=self._active_model_name,
-                horde_model_state=ModelLoadState.LOADED_IN_RAM,
+                horde_model_state=(ModelLoadState.LOADED_IN_VRAM if unload_refused else ModelLoadState.LOADED_IN_RAM),
+                vram_unload_refused=unload_refused,
             )
 
             self.send_process_state_change_message(
                 process_state=HordeProcessState.WAITING_FOR_JOB,
-                info="Unloaded models from VRAM",
+                info=("Models remain in VRAM after an unload" if unload_refused else "Unloaded models from VRAM"),
             )
         else:
             self.send_process_state_change_message(
                 process_state=HordeProcessState.WAITING_FOR_JOB,
                 info="No models to unload from VRAM",
             )
+
+    def report_retained_weights_evicted(self) -> None:
+        """Tell the parent the device no longer holds weights its retention grant was recorded against.
+
+        The parent predicts residency at dispatch and has no way to observe the backend freeing a
+        granted checkpoint mid-run, so the correction has to come from here. Reported through the same
+        state change and fresh memory report a parent-commanded VRAM unload sends, because the outcome is
+        the same one: the weights are in host RAM and the slot's retained-resident record must be dropped
+        rather than charged, waited on, or routed to for the rest of the session.
+
+        Sent after the job's result, so the retention settle the result drives has already run and this
+        clears what it recorded rather than being overwritten by it.
+        """
+        if not self._retained_weights_evicted:
+            return
+        self._retained_weights_evicted = False
+        logger.warning(
+            "The backend evicted this process's retained weights during the job; reporting them out of VRAM "
+            "so the parent stops counting on them.",
+        )
+        self.send_memory_report_message(include_vram=True)
+        if self._active_model_name is None:
+            return
+        self.on_horde_model_state_change(
+            process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
+            horde_model_name=self._active_model_name,
+            horde_model_state=ModelLoadState.LOADED_IN_RAM,
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Retained weights were evicted by the backend",
+        )
 
     @logger.catch(reraise=True)
     def release_allocator_cache(self) -> None:
@@ -1633,6 +1719,7 @@ class HordeInferenceProcess(HordeProcess):
                     results=results,
                     time_elapsed=time.time() - time_start,
                 )
+                self.report_retained_weights_evicted()
             else:
                 logger.critical(f"Received unexpected message: {message}")
                 return

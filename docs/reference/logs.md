@@ -29,6 +29,18 @@ If you are adding a log line that fires on a timer rather than on an event, use
 `throttled_log_level()` from `horde_worker_regen/process_management/_internal/util.py` and log at the level
 it returns.
 
+## Deadlock snapshot free-VRAM figures
+
+The deadlock diagnostics carry two free-VRAM figures and they are not interchangeable:
+
+- `device_free_vram=` is derived from the children's torch view of the card. Under WDDM demand-paging that
+  view counts paged-out blocks as free and has been seen overstating a card by gigabytes, which reads as a
+  worker refusing to dispatch onto an empty card.
+- `measured_device_free_vram=` is the parent's own device-level (NVML) reading, the same figure admission
+  prices against. When the two disagree, this is the one the card is actually offering.
+
+A snapshot carrying only the first figure is from a worker with no device-level reading wired in.
+
 ## Rotation and retention
 
 The supervisor logs (`bridge_tui.log` / `bridge_host.log`) and the benchmark run logs rotate at a **25 MB**

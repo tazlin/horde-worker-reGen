@@ -38,6 +38,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     PipelineStageTag,
     SampleSliceSpec,
 )
+from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     FakeInferenceProcess,
     FakePostProcessProcess,
@@ -468,3 +469,111 @@ class TestFakeSafetyProcess:
         states = queue.state_changes()
         assert HordeProcessState.EVALUATING_SAFETY in states
         assert states[-1] == HordeProcessState.WAITING_FOR_JOB
+
+
+class _RecordingLeaseSemaphore:
+    """A counting semaphore that records every acquire, mirroring the multiprocessing primitive's protocol."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+        self.acquires: list[bool] = []
+
+    def acquire(self, block: bool = True, timeout: float | None = None) -> bool:
+        granted = self.value > 0
+        if granted:
+            self.value -= 1
+        self.acquires.append(granted)
+        return granted
+
+    def release(self) -> None:
+        self.value += 1
+
+
+def _leased_fake(*, grants: int) -> tuple[FakeInferenceProcess, RecordingQueue, _RecordingLeaseSemaphore]:
+    """A fake inference process under the clearance lease, with ``grants`` windows pre-granted."""
+    clearance = _RecordingLeaseSemaphore(grants)
+    done = _RecordingLeaseSemaphore()
+    lease = ClearanceLeaseProxy(clearance=clearance, done=done)
+    process, queue = make_fake_inference_process(gpu_sampling_lease=lease)
+    queue.messages.clear()  # drop the construction-time state traffic; these tests read the dispatch onward
+    return process, queue, clearance
+
+
+def _sample_message(model: str = "SDXL 1.0") -> HordeSampleControlMessage:
+    """A one-slice sample control message for ``model``."""
+    job = make_job_pop_response(model=model)
+    return HordeSampleControlMessage(
+        horde_model_name=model,
+        slices=[
+            SampleSliceSpec(
+                job_id=job.id_,
+                positive_conditioning_bytes=b"pos",
+                negative_conditioning_bytes=b"neg",
+                sdk_api_job_info=job,
+            ),
+        ],
+    )
+
+
+class TestFakeInferenceClearanceLease:
+    """The fake honours the real child's clearance handshake, so a harness run exercises the controller."""
+
+    def test_sample_stage_primes_then_waits_for_its_grant(self) -> None:
+        """A leased sample stage reports itself primed and blocks on the grant before sampling.
+
+        The per-stage metrics drain is left unstubbed: it is best-effort in the child and these tests read
+        the state and lease traffic, so a metrics snapshot that does or does not appear changes nothing.
+        """
+        process, queue, clearance = _leased_fake(grants=1)
+
+        process._receive_and_handle_control_message(_sample_message())
+
+        assert queue.state_changes()[0] == HordeProcessState.INFERENCE_PRIMED
+        assert clearance.acquires == [True]
+
+    def test_every_sample_stage_waits_for_its_own_grant(self) -> None:
+        """The second stage waits again rather than passing through on the first stage's consumed grant."""
+        process, _queue, clearance = _leased_fake(grants=1)
+
+        process._receive_and_handle_control_message(_sample_message())
+        process._receive_and_handle_control_message(_sample_message())
+
+        # Two stages, two acquires: the first took the granted permit, the second found none and degraded
+        # into unpriced sampling rather than silently reusing the first stage's grant.
+        assert clearance.acquires == [True, False]
+
+    def test_leased_whole_job_primes_rather_than_reporting_itself_sampling(self) -> None:
+        """A leased monolithic dispatch reports IN_USE at PRIMED; the parent advances it on the first step."""
+        process, queue, clearance = _leased_fake(grants=1)
+
+        process._receive_and_handle_control_message(
+            HordeInferenceControlMessage(
+                control_flag=HordeControlFlag.START_INFERENCE,
+                horde_model_name="Deliberate",
+                sdk_api_job_info=make_job_pop_response(model="Deliberate"),
+            ),
+        )
+
+        model_states = queue.of_type(HordeModelStateChangeMessage)
+        in_use = [m for m in model_states if m.horde_model_state == ModelLoadState.IN_USE]
+        assert [m.process_state for m in in_use] == [HordeProcessState.INFERENCE_PRIMED]
+        assert clearance.acquires == [True]
+
+    def test_unleased_whole_job_reports_sampling_directly(self) -> None:
+        """With no lease the fake keeps its original sequence: IN_USE at INFERENCE_STARTING, no priming."""
+        process, queue = make_fake_inference_process()
+        queue.messages.clear()
+
+        process._receive_and_handle_control_message(
+            HordeInferenceControlMessage(
+                control_flag=HordeControlFlag.START_INFERENCE,
+                horde_model_name="Deliberate",
+                sdk_api_job_info=make_job_pop_response(model="Deliberate"),
+            ),
+        )
+
+        in_use = [
+            m for m in queue.of_type(HordeModelStateChangeMessage) if m.horde_model_state == ModelLoadState.IN_USE
+        ]
+        assert [m.process_state for m in in_use] == [HordeProcessState.INFERENCE_STARTING]
+        assert HordeProcessState.INFERENCE_PRIMED not in queue.state_changes()

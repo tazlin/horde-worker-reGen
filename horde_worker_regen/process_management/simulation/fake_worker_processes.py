@@ -79,7 +79,10 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
 from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesProcessAdapter
-from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    ClearanceLeaseProxy,
+)
 from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 from horde_worker_regen.process_management.simulation.fault_injection import (
     FAULT_INFO_PREFIX,
@@ -90,6 +93,9 @@ from horde_worker_regen.process_management.simulation.sim_vram import (
     SimVramLedger,
     simulate_post_processing_allocation,
 )
+
+_DEFAULT_FAKE_SAMPLING_STEPS = 30
+"""Step count a fake sampling window reports when its job carries none, so a beat always has a position."""
 
 
 def _hang_forever(process_label: str, reason: str) -> None:
@@ -247,6 +253,7 @@ class FakeInferenceProcess(HordeProcess):
     _sim_total_vram_mb: float = 0.0
     _sim_weights_mb: float = 0.0
     _sim_context_mb: float = 0.0
+    _gpu_sampling_lease: ClearanceLeaseProxy | None = None
 
     def __init__(
         self,
@@ -259,6 +266,7 @@ class FakeInferenceProcess(HordeProcess):
         *,
         device_index: int = 0,
         job_delay_seconds: float = 0.0,
+        gpu_sampling_lease: ClearanceLeaseProxy | None = None,
         fail_every_n: int = 0,
         fault_profile: FaultProfile | None = None,
         sim_vram_ledger: SimVramLedger | None = None,
@@ -278,6 +286,11 @@ class FakeInferenceProcess(HordeProcess):
             process_launch_identifier (int): The unique identifier for this launch.
             device_index (int, optional): The stable index of the GPU this process is attributed to. Defaults to 0.
             job_delay_seconds (float, optional): How long each fake inference job takes. Defaults to 0.0.
+            gpu_sampling_lease (ClearanceLeaseProxy | None, optional): The parent's per-child
+                clearance proxy. When given, this fake honours the same handshake the real child does
+                around its sampling window (prime, wait for the grant, release when the window closes),
+                so a harness run exercises the parent's clearance controller end to end. Defaults to
+                None (no lease, and the fake's message sequence is unchanged).
             fail_every_n (int, optional): If > 0, every nth job reports a faulted result instead of \
                 images. Defaults to 0 (never fail).
             fault_profile (FaultProfile | None, optional): A misbehaviour script (hang, crash, drop \
@@ -303,6 +316,7 @@ class FakeInferenceProcess(HordeProcess):
         )
         self._inference_semaphore = inference_semaphore
         self._job_delay_seconds = job_delay_seconds
+        self._gpu_sampling_lease = gpu_sampling_lease
         self._fail_every_n = fail_every_n
         self._fault_profile = fault_profile if fault_profile is not None else FaultProfile()
         self._sim_vram_ledger = sim_vram_ledger
@@ -437,10 +451,84 @@ class FakeInferenceProcess(HordeProcess):
             ),
         )
 
+    def _begin_lease_job(self) -> None:
+        """Reset the clearance grant for the job or sample stage about to run, as the real child does.
+
+        One grant covers one dispatched unit of work; without this reset the first acquire latches the
+        proxy open and every later window passes straight through, which is the failure mode a harness
+        run under the lease exists to catch.
+        """
+        if self._gpu_sampling_lease is not None:
+            self._gpu_sampling_lease.begin_job()
+
+    def _await_clearance(self) -> None:
+        """Block where hordelib blocks the real child: at the sample call, until the parent grants clearance.
+
+        The caller has already reported itself primed (its pipeline staged, nothing sampling yet), which is
+        what makes it visible to the parent as a clearance waiter. A starved child is never wedged: the
+        bounded acquire returns after the same timeout the real child registers and it samples unpriced,
+        so a controller that never grants shows up as a slow, warned run rather than a deadlock.
+        """
+        if self._gpu_sampling_lease is None:
+            return
+        if not self._gpu_sampling_lease.acquire(True, CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS):
+            logger.warning(
+                f"Fake inference {self.process_id} sampled without a clearance grant "
+                f"(waited {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS}s)",
+            )
+
+    def _close_sampling_window(self) -> None:
+        """Signal the parent that this sampling window closed, as hordelib's lease wrapper does on return."""
+        if self._gpu_sampling_lease is not None:
+            self._gpu_sampling_lease.release()
+
+    def _emit_sampling_step_beat(self, *, progress_fraction: float, total_steps: int) -> None:
+        """Report one sampling step, carrying its position when this fake is under the clearance lease.
+
+        The parent reads the position for two things the lease depends on: a primed slot advances to
+        ``INFERENCE_STARTING`` on its first positioned step (so the parent learns the denoise loop was
+        entered and stops treating the slot as a waiter), and the tail-overlap handoff sizes its window
+        from the observed step rate. An unleased run keeps the position-free beat this fake has always
+        sent, so nothing shifts for it.
+        """
+        if self._gpu_sampling_lease is None:
+            self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.INFERENCE_STEP)
+            return
+        bounded = min(1.0, max(0.0, progress_fraction))
+        current_step = min(total_steps, int(bounded * total_steps) + 1)
+        self.send_heartbeat_message(
+            heartbeat_type=HordeHeartbeatType.INFERENCE_STEP,
+            percent_complete=int(bounded * 100),
+            current_step=current_step,
+            total_steps=total_steps,
+        )
+
+    def _sample_for(self, duration_seconds: float, *, total_steps: int, drop_heartbeats: bool) -> None:
+        """Spend a sampling window, beating out step progress across it.
+
+        A leased slot's zero-length window still emits one beat: the parent has to see the loop entered, or a
+        slot that primed and finished between two control-loop ticks would still read as a staged waiter.
+        An unleased slot stays silent through a zero-length window, as this fake has always been.
+        """
+        started_at = time.time()
+        if duration_seconds <= 0:
+            if self._gpu_sampling_lease is not None and not drop_heartbeats:
+                self._emit_sampling_step_beat(progress_fraction=1.0, total_steps=total_steps)
+            return
+        deadline = started_at + duration_seconds
+        while time.time() < deadline:
+            if not drop_heartbeats:
+                self._emit_sampling_step_beat(
+                    progress_fraction=(time.time() - started_at) / duration_seconds,
+                    total_steps=total_steps,
+                )
+            time.sleep(min(0.05, duration_seconds))
+
     def _run_fake_inference(self, job_info: ImageGenerateJobPopResponse) -> None:
         """Pretend to run inference and send the result messages for it, honoring any fault profile."""
         self._jobs_started += 1
         profile = self._fault_profile
+        self._begin_lease_job()
 
         if profile.crash_on_job_n == self._jobs_started:
             # Acquire the semaphore first, then die holding it: exercises the parent's semaphore-orphan
@@ -457,16 +545,21 @@ class FakeInferenceProcess(HordeProcess):
         should_fail = should_oom or (self._fail_every_n > 0 and self._jobs_started % self._fail_every_n == 0)
 
         self._inference_semaphore.acquire()
+        # The elapsed figure starts here, before the clearance wait, exactly as the real child's does: a job
+        # held at the lease really did take that long from the slot's point of view.
         time_start = time.time()
+        self._await_clearance()
         effective_delay = self._job_delay_seconds * profile.delay_factor_for_ordinal(self._jobs_started)
         try:
-            if effective_delay > 0:
-                deadline = time_start + effective_delay
-                while time.time() < deadline:
-                    if not profile.drop_heartbeats:
-                        self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.INFERENCE_STEP)
-                    time.sleep(min(0.05, effective_delay))
+            self._sample_for(
+                effective_delay,
+                total_steps=job_info.payload.ddim_steps or _DEFAULT_FAKE_SAMPLING_STEPS,
+                drop_heartbeats=profile.drop_heartbeats,
+            )
         finally:
+            # The window closes when sampling ends, before the result is assembled, mirroring where
+            # hordelib's lease wrapper returns around the sample call.
+            self._close_sampling_window()
             self._inference_semaphore.release()
 
         if profile.corrupt_on_job_n == self._jobs_started:
@@ -542,11 +635,27 @@ class FakeInferenceProcess(HordeProcess):
         LATENT per slice in a single ``HordeSampleResultMessage``, then returns to idle. The
         ``INFERENCE_STARTING`` this emits is the disaggregation state traffic the parent's dispatcher must
         tolerate on a sampler holding no whole-job model bookkeeping.
+
+        Under the clearance lease the sequence is the real sampler's: one grant covers the whole control
+        message, the stage reports itself primed and waits for that grant before any slice samples, and the
+        parent advances the slot to ``INFERENCE_STARTING`` on the first positioned step. Each slice spends
+        the configured job delay so a sampler has a denoise tail for the parent to hand off against; an
+        unleased run keeps the original immediate, position-free sequence.
         """
-        self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
+        self._begin_lease_job()
+        if self._gpu_sampling_lease is not None:
+            self.send_process_state_change_message(HordeProcessState.INFERENCE_PRIMED, info="Priming")
+            self._await_clearance()
+        else:
+            self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
         time_start = time.time()
         results = []
         for job_slice in message.slices:
+            self._sample_for(
+                self._job_delay_seconds,
+                total_steps=job_slice.sdk_api_job_info.payload.ddim_steps or _DEFAULT_FAKE_SAMPLING_STEPS,
+                drop_heartbeats=self._fault_profile.drop_heartbeats,
+            )
             results.append(
                 SampleSliceResult(
                     job_id=job_slice.job_id,
@@ -555,6 +664,7 @@ class FakeInferenceProcess(HordeProcess):
                 ),
             )
             self.send_stage_job_metrics_message(str(job_slice.job_id), stage=PipelineStageTag.SAMPLE)
+        self._close_sampling_window()
         self.process_message_queue.put(
             HordeSampleResultMessage(
                 process_id=self.process_id,
@@ -629,9 +739,16 @@ class FakeInferenceProcess(HordeProcess):
             if message.horde_model_name != self._active_model_name:
                 self.preload_model(message.horde_model_name)
 
+            # Under the lease the slot is primed, not sampling: its weights land at clearance and the parent
+            # advances it to INFERENCE_STARTING on its first step, exactly as the real child arranges. With
+            # no lease the slot goes straight to sampling, as this fake has always reported.
             self.on_horde_model_state_change(
                 horde_model_name=message.horde_model_name,
-                process_state=HordeProcessState.INFERENCE_STARTING,
+                process_state=(
+                    HordeProcessState.INFERENCE_PRIMED
+                    if self._gpu_sampling_lease is not None
+                    else HordeProcessState.INFERENCE_STARTING
+                ),
                 horde_model_state=ModelLoadState.IN_USE,
             )
 
@@ -887,6 +1004,9 @@ def start_fake_inference_process(
     be injected as a drop-in multiprocessing target. Memory/GPU related arguments (and
     ``expect_image_models``, which only gates the real worker's image-model presence check)
     are accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
+    ``gpu_sampling_lease`` is honoured rather than ignored: given a proxy, the fake runs the same clearance
+    handshake the real child does around every sampling window, so a harness run exercises the parent's
+    clearance controller. Passing None keeps the fake's original message sequence.
     ``fail_every_n`` makes every nth job report a faulted result (0 = never), and
     ``fault_profile`` scripts richer misbehaviour (hang, crash, drop heartbeats, slow, OOM,
     corrupt message), letting harnesses exercise the recovery paths. ``sim_vram_ledger`` (with
@@ -910,6 +1030,7 @@ def start_fake_inference_process(
             process_launch_identifier=process_launch_identifier,
             device_index=device_index,
             job_delay_seconds=dry_run_inference_delay,
+            gpu_sampling_lease=gpu_sampling_lease,
             fail_every_n=fail_every_n,
             fault_profile=fault_profile,
             sim_vram_ledger=sim_vram_ledger,

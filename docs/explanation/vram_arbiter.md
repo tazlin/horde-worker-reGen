@@ -732,9 +732,21 @@ to the card. It is instead a governed live gate that grants only when:
   previous `_RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3) dispatches. See
   [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
 - **The card statically fits the job.** The card's reported total (a constant the driver cannot misreport)
-  must absorb the job's sampling peak plus the reserve, after charging the sibling CUDA contexts, the models
-  other slots are already holding resident under earlier grants, and the job's own post-processing that
-  share the card while the weights are held.
+  must absorb the job's sampling peak plus the reserve, after charging everything else that shares the card
+  while the weights are held: the sibling CUDA contexts (inference siblings, the post-processing lane, the
+  disaggregated VAE and component lanes, the on-GPU safety process), the models other slots are already
+  holding resident under earlier grants, the component-cache tenancy idle lanes report holding between jobs,
+  the job's own post-processing, and any sibling the clearance lease is about to admit. That last term is
+  what a multi-slot lease adds: a staged sibling's weights land at *its* clearance, so at this instant the
+  shared ledger carries only its encode charge and the rest of its materialisation is charged here. Priced
+  without it, two grants each fit "alone" and jointly overflow the card, which is the shape every observed
+  out-of-memory on a two-slot lease took.
+
+A grant is settled into the slot's retained-resident record only when its job **succeeds**. A fault is
+evidence about the job and none at all about the device: a job that failed part-way through may have left
+its weights standing, freed them, or never loaded them, and the parent cannot tell which. Recording
+residency on that guess is what makes the static fit above charge weights that are not there and same-model
+routing seat a successor on an empty slot, so a faulted result drops the grant and the record together.
 
 ### Retention is granted on repeat evidence
 
@@ -838,6 +850,35 @@ cleared by every eviction actuation and at slot death), and charges each tracked
 footprint. A slot's own retained model is charged only when it differs from the dispatched job's: a
 same-model streak's re-grant is reusing exactly those bytes. A tracked resident whose footprint cannot be
 estimated denies the grant rather than being charged zero.
+
+The record is a prediction, and the child reconciles it. ComfyUI satisfies an allocation by freeing memory
+on the device, and hordelib's `load_models_gpu` hijack falls back to an unbounded requirement, so one load
+inside a run can unload every other model on the card, the granted checkpoint included. Nothing the parent
+can measure distinguishes that from a grant that held: the slot still reports a model, and the freed bytes
+read as ordinary headroom. Left alone, the phantom is charged by the retention fit, waited on by the
+dispatch admission gate, and routed to by same-model placement for the rest of the session, all for weights
+that have to be re-uploaded anyway. So the engine reports it: a run granted `defer_vram_unload` that ends
+with no model on the inference device carries `retained_weights_evicted` on its result (see hordelib's
+[ComfyUI bridge](https://github.com/Haidra-Org/hordelib/blob/main/docs/comfyui-bridge.md)), the inference
+child turns that into the `UNLOADED_MODEL_FROM_VRAM` state change and fresh memory report a
+parent-commanded unload already sends, and `ProcessMap.on_model_vram_clear` drops the slot's retained
+record. The clear takes the in-flight grant with it, because the report arrives around the end of the job
+whose result settles that grant into the record; clearing only the settled half would let the settle write
+the phantom straight back. The next dispatch to that slot is then priced as the cold load it really is.
+
+The same discipline runs in the other direction, for an unload. A full VRAM free is a request, not a
+guarantee: the child's backend drops what it can and skips any model a live reference still pins, and the
+command reports nothing about the difference. A child that reported host-RAM residency because that is what
+the command asked for would hand the parent gigabytes of room the card is still holding, and the head would
+then be held "not fitting" against a ledger showing space after every evict. So the child judges the unload
+by what the device is left holding (hordelib's `VramUnloadResult`, see its ComfyUI bridge doc) and reports
+the residency the device really has, flagging the refusal as `vram_unload_refused` on the model-state
+message. `ProcessMap.on_vram_unload_refused` then keeps the slot recorded as VRAM-resident, leaves its
+outstanding-unload flag standing, and does not restamp its materialization recency. Those three together are
+what make the reclaim ladder pass the slot over: every candidate set and the unload actuator already read a
+standing unload flag as a reason to skip, so the episode escalates to its next rung instead of asking the
+same refusal the same question every tick. The refusal is retired by a genuine re-materialization, by a
+verified clear, or by the slot's death, so a slot that recovers is a reclaim candidate again.
 
 A retained resident is a dispatch destination, not only a charge. `loaded_horde_model_name` records that a
 slot has served a model, not that its weights are still there, so two slots can read as equally resident

@@ -56,6 +56,28 @@ The failures encoded here:
   only dispatchable job left is a line-skip the head-protection hold rightly withholds for that head, and the
   hold then waits on a head no pass will ever load. Both lanes idle with a full queue and a card that is
   almost entirely free. That is the ``displaced residency`` scenario.
+- **Idle lanes holding device-warm components starve the head.** A component cache that keeps its entries on
+  the device holds VRAM that belongs to no job: it survives every job boundary, no dispatch's footprint
+  includes it, and the only thing that returns it is an unload the parent actuates on that lane. A card packed
+  with two such lanes leaves the queue head unable to materialise, and the dispatch residency-reconciliation
+  hold has nothing it will evict, so it waits for a fit that nothing is producing while both lanes sit idle.
+  That is the ``held components`` scenario.
+- **A child eviction the parent never learns about.** ComfyUI frees memory on the device to fund an
+  allocation and the requirement it frees against is unbounded, so a checkpoint held under a retention grant
+  can be gone before the job that was granted it ends. The grant suppresses the worker's own end-of-job
+  evictor and nothing else. The parent's retained-resident record is a prediction made at dispatch and nothing
+  the parent measures separates a slot whose weights are still there from one whose are not, so the record
+  stands over an empty device for the rest of the session, charged by the retention fit, waited on by the
+  dispatch gate, and routed to by same-model placement. The child is what closes it: a run granted the
+  deferral that ends with an empty device reports the model out of VRAM, and the parent's ordinary unload
+  reconciliation drops the record. That is the ``silent eviction`` scenario.
+- **An unload the device refused, booked as room.** A full VRAM free is a request: the backend drops what it
+  can and skips a model a live reference still pins, and the command reports nothing about the difference. A
+  child that reports host-RAM residency because that is what it was asked to do hands the parent gigabytes of
+  room the card is still holding, and the queue head is then held "not fitting" against a ledger that shows
+  space after every evict. The child judging the unload by what the device still holds, and the parent keeping
+  such a slot VRAM-resident and out of a reclaim that would ask it again, is what closes it. That is the
+  ``refused unload`` scenario.
 - **A selection that outlives the cycle it was derived in.** Dispatch selection may cache the job-and-lane pair
   a cycle chose so the cycle's look-ahead and its dispatch agree, and that pair is valid only while the lane
   still holds the job's model. Applying the children's reports invalidates it, and because every dispatch gate
@@ -71,6 +93,7 @@ import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeInferenceControlMessage
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
@@ -84,6 +107,7 @@ from tests.process_management.liveness._dispatch_world import (
     _CARD_16GB,
     _CARD_24GB,
     _CHILD_FREE_MARGIN_MB,
+    _FLUX,
     _SD15,
     _SD15_OTHER,
     _SDXL,
@@ -1473,3 +1497,366 @@ async def test_i_defect_reinjection_a_displaced_record_hides_the_head_from_the_p
         f"the wedged rotation reached {duty_fraction(world):.1%} duty, at or above the "
         f"{_ROTATION_3_DUTY_FLOOR:.1%} floor the scenario asserts, so that floor would pass unfixed"
     )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Held components: an idle lane's device-warm tenancy is still the card's, and something must ask for it back
+# --------------------------------------------------------------------------------------------------------
+
+_HELD_COMPONENT_MB = 6600.0
+"""Device-warm component weights one idle lane carries in these scenarios.
+
+Sized so two such lanes and three live contexts leave a 16 GB card with about a gigabyte free: enough that
+nothing is broken until a head has to materialise, and far short of what one does."""
+
+_HELD_COMPONENT_LANES = 2
+"""Idle lanes carrying that tenancy: two, so the card's shortfall cannot be met by reclaiming one of them."""
+
+_HELD_COMPONENT_DISPATCH_TICKS = 12
+"""Ticks the head may take to reach sampling once the card is packed with idle held components.
+
+A reclaim is an IPC the child services and a driver-side release that lands on a following tick, and the
+hold re-asks each scheduling pass, so a couple of ticks is the floor and this is several times it. What it
+excludes is a hold that waits for a fit nothing is producing."""
+
+_HELD_COMPONENT_FREE_FLOOR_MB = 1024.0
+"""Device free (MB) the card must hold above once the head has been let onto it.
+
+The child's own margin: a card taken below it was committed against something other than device truth, which
+is what a head admitted over an unreclaimed tenancy does."""
+
+
+def _held_component_world() -> _DispatchWorld:
+    """Build a 16 GB card whose two idle lanes hold device-warm components and whose third stages the head.
+
+    The head is seeded staged rather than popped cold on purpose: staging is what puts the dispatch, not the
+    preload, in charge of the fit, so the gate under test is the dispatch residency-reconciliation hold
+    rather than the preload admission path that runs before it.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=_HELD_COMPONENT_LANES + 1,
+        max_threads=1,
+        queue_depth=_QUEUE_DEPTH,
+        whole_card_enabled=True,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+    )
+    for lane_id in range(_HELD_COMPONENT_LANES):
+        world.seed_held_components(lane_id, _HELD_COMPONENT_MB)
+    world.seed_resident(_HELD_COMPONENT_LANES, _SDXL, in_vram=False)
+    return world
+
+
+async def _drive_held_component_head(world: _DispatchWorld) -> ImageGenerateJobPopResponse:
+    """Queue one head for the staged model and run until it samples or the tick ceiling is reached."""
+    head = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
+    await world.pop(head)
+    for _ in range(_MAX_TICKS):
+        await world.step()
+        if world.dispatch_tick(head) is not None:
+            break
+    return head
+
+
+async def test_j_a_head_is_let_onto_a_card_packed_with_idle_held_components() -> None:
+    """A head that cannot materialise over idle device-warm components gets them reclaimed, not waited on.
+
+    The failure this encodes: two idle lanes held their component cache on the device, the queue head's
+    materialisation did not fit, and the dispatch residency-reconciliation hold found nothing it would evict.
+    The hold's only release is the arbiter verdicting a fit, and nothing was producing one: both lanes sat
+    idle holding most of the card while the head re-asked every pass, until the run ended on the deadlock
+    path. An idle tenancy the parent can see and can unload is not a reason to stop serving.
+
+    Read as one statement and its consequences: the head samples inside a bounded number of ticks, something
+    was actually reclaimed to let it, and the card it lands on still has the child's own margin standing. The
+    escalation assertions are the other half: reaching a lane pause or moving safety off the card to recover
+    an idle lane's cache would be a working worker paying a teardown for a reclaim it could have asked for.
+    """
+    world = _held_component_world()
+
+    head = await _drive_held_component_head(world)
+
+    context = "idle held components"
+    dispatch_tick = world.dispatch_tick(head)
+    assert dispatch_tick is not None and dispatch_tick <= _HELD_COMPONENT_DISPATCH_TICKS, (
+        f"{context}: the head reached sampling at tick {dispatch_tick} against a "
+        f"{_HELD_COMPONENT_DISPATCH_TICKS}-tick bound, so the hold is waiting on a fit nothing is producing "
+        f"rather than asking an idle lane for its tenancy back. {world.state_dump()}"
+    )
+    assert world.reclaim_commands >= 1, (
+        f"{context}: the head was let through without anything being reclaimed, so the card it materialised "
+        f"onto still carries every idle tenancy. {world.state_dump()}"
+    )
+    assert_free_floor(world, _HELD_COMPONENT_FREE_FLOOR_MB, context=context)
+    assert_ladder_stayed_below(world, FIRST_LANE_TEARDOWN_RUNG, context=context)
+
+
+async def test_j_defect_reinjection_an_unreclaimable_tenancy_starves_the_head() -> None:
+    """With the idle unload refused, the same card starves the head, which is what the bound above forbids.
+
+    The reinjection is the actuator rather than a policy: whatever issues the reclaim, it issues it through
+    the one idle-unload surface, so refusing that surface reproduces the regime the scenario is about without
+    naming the decision that reaches it.
+    """
+    world = _held_component_world()
+    world.scheduler.unload_idle_model = lambda process_id, device_index=None: False  # type: ignore[method-assign]
+
+    head = await _drive_held_component_head(world)
+
+    dispatch_tick = world.dispatch_tick(head)
+    assert dispatch_tick is None or dispatch_tick > _HELD_COMPONENT_DISPATCH_TICKS, (
+        f"the head reached sampling at tick {dispatch_tick} with every idle unload refused, so the bound the "
+        f"scenario above asserts would pass on a worker that reclaims nothing. {world.state_dump()}"
+    )
+    assert world.reclaim_commands == 0, (
+        f"an unload was booked with the actuator refusing every one: {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# The silent eviction: a retention record the device stopped honouring
+# --------------------------------------------------------------------------------------------------------
+
+_SILENT_EVICTION_UNDERSHOOT = 1.8
+"""How much more of the card the streak's jobs really want than the scheduler's static fit priced them at.
+
+The regime the eviction is reachable in. A lane funds a shortfall out of its own footprint first, so on a job
+priced correctly its activation is always the smaller half and the copy it is running on is never the last
+thing left. A job that costs the card most of a card more than it was admitted for is: the parent's own
+defenses have already passed it, and only the child's freeing stands between the load and the device."""
+
+_SILENT_EVICTION_JOBS = 8
+"""Jobs in the streak these scenarios drive.
+
+Every job in it re-uploads its weights, because that is what the eviction costs, and a worker's own model-churn
+governance rightly holds a head off the card once a streak has thrashed the device that many times. This is
+comfortably inside that, so what the scenarios measure is the record's honesty rather than the governor's."""
+
+
+def _silent_eviction_world(*, child_evicts_granted_resident: bool) -> _DispatchWorld:
+    """Build a 16 GB card serving a retained streak whose jobs cost it more than they were admitted for."""
+    return _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=_QUEUE_DEPTH,
+        whole_card_enabled=True,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+        child_evicts_granted_resident=child_evicts_granted_resident,
+        footprint_undershoot=_SILENT_EVICTION_UNDERSHOOT,
+    )
+
+
+async def test_k_a_child_side_eviction_is_reconciled_rather_than_left_as_a_resident() -> None:
+    """When the child frees weights a grant covered, the parent's record follows the device, not the grant.
+
+    The failure this encodes: retention was granted, the dispatch was priced for it, and ComfyUI freed the
+    checkpoint during the run anyway to fund an allocation, because the grant suppresses the worker's own
+    end-of-job evictor and nothing else. The parent settled the grant into its retained-resident record all
+    the same, and from then on three paths acted on weights that were not there: the retention fit charged
+    them, the dispatch admission gate held loads behind them, and same-model routing kept seating successors
+    on the slot that held nothing.
+
+    Read as one statement: no idle slot ever claims weights the card is not holding. Its consequences are
+    that every dispatch after an eviction is priced as the cold load it really is, and that the streak still
+    drains and still samples, so the record's honesty is not bought by declining to work.
+    """
+    world = _silent_eviction_world(child_evicts_granted_resident=True)
+
+    jobs = await _drive_streak(world, _SDXL, job_count=_SILENT_EVICTION_JOBS)
+
+    context = "silent child eviction"
+    _assert_streak_drained(world, jobs, context=context)
+    assert world.child_granted_resident_evictions, (
+        f"{context}: the child never freed a granted copy, so the scenario measured nothing. {world.state_dump()}"
+    )
+    assert world.retained_resident_divergences == [], (
+        f"{context}: an idle slot claimed weights the card was not holding on "
+        f"{len(world.retained_resident_divergences)} tick(s), first at "
+        f"{world.retained_resident_divergences[:1]}. {world.state_dump()}"
+    )
+    assert world.weight_uploads == len(jobs), (
+        f"{context}: the streak paid {world.weight_uploads} weight uploads for {len(jobs)} jobs while the "
+        f"child was freeing its copy on every one of them, so a dispatch is still being priced against a "
+        f"copy the card does not hold. {world.state_dump()}"
+    )
+    assert_free_floor(world, _CHILD_FREE_MARGIN_MB, context=context)
+    assert_ladder_stayed_below(world, FIRST_LANE_TEARDOWN_RUNG, context=context)
+
+
+async def test_k_defect_reinjection_an_unreconciled_eviction_leaves_a_phantom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the unload reconciliation removed, the same run leaves a slot claiming an empty device.
+
+    The reinjection is the parent half of the fix: the child still reports the model out of VRAM, and the
+    handler that turns that report into a cleared record is made inert. What is left is the pre-fix worker
+    exactly, and the record it keeps is the phantom every later pricing, hold and routing decision is made
+    against.
+    """
+    monkeypatch.setattr(ProcessMap, "on_model_vram_clear", lambda self, process_id: None)
+    world = _silent_eviction_world(child_evicts_granted_resident=True)
+
+    jobs = await _drive_streak(world, _SDXL, job_count=_SILENT_EVICTION_JOBS)
+
+    _assert_streak_drained(world, jobs, context="unreconciled eviction")
+    assert world.child_granted_resident_evictions, "the reinjection must run the same evictions the scenario does"
+    assert world.retained_resident_divergences != [], (
+        "with the reconciliation inert an idle slot must go on claiming weights the card does not hold, or "
+        f"the scenario's record assertion would pass on a worker that never reconciles. {world.state_dump()}"
+    )
+
+
+async def test_k_a_streak_the_child_never_disturbs_keeps_its_retained_copy() -> None:
+    """The control: on the same packed card, a child that honours the grant reuses one copy all streak.
+
+    Without this the scenario above would be satisfied by a worker whose retention never holds anything, and
+    a record that claims nothing is trivially honest.
+    """
+    world = _silent_eviction_world(child_evicts_granted_resident=False)
+
+    jobs = await _drive_streak(world, _SDXL, job_count=_SILENT_EVICTION_JOBS)
+
+    context = "undisturbed streak"
+    _assert_streak_drained(world, jobs, context=context)
+    assert world.child_granted_resident_evictions == [], "the control must run with the child eviction off"
+    assert world.weight_uploads == _STREAK_WEIGHT_UPLOADS, (
+        f"{context}: the streak paid {world.weight_uploads} weight uploads for {len(jobs)} jobs, so the "
+        f"retained copy is not surviving the job boundary on this card at all. {world.state_dump()}"
+    )
+    assert world.retained_resident_divergences == [], (
+        f"{context}: the record diverged from the card without the child ever disturbing it. {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# The refused unload: room the parent counted and the card never gave back
+# --------------------------------------------------------------------------------------------------------
+
+_UNLOAD_LEAK_MB = 3000.0
+"""Weights (MB) the child's backend cannot free out of a lane it was told to unload.
+
+A full free drops what it can and skips a model a live reference still pins. Sized as a fraction of the
+resident copy rather than all of it, so the unload genuinely helps and the question is only whether the
+parent's ledger knows what it did not get back."""
+
+_UNLOAD_LEAK_DISPATCH_TICKS = 8
+"""Ticks the head may take to sample once the partial unload has landed.
+
+A release is an IPC the child services and a driver-side give-back on a following tick, so a couple of ticks
+is the floor. What this excludes is a head parked behind a refusal nothing escalates past."""
+
+
+def _refused_unload_world() -> _DispatchWorld:
+    """A 16 GB card holding a large idle resident that will only partly unload, and a staged head.
+
+    The head is staged rather than popped cold so the fit is decided at dispatch, and the idle resident is
+    the extra-large class so the head cannot materialise until something gives the card back.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=_QUEUE_DEPTH,
+        whole_card_enabled=True,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+        child_unload_leaks_mb=_UNLOAD_LEAK_MB,
+    )
+    world.seed_resident(0, _FLUX, in_vram=True)
+    world.seed_resident(1, _SDXL, in_vram=False)
+    return world
+
+
+async def _drive_refused_unload_head(world: _DispatchWorld) -> ImageGenerateJobPopResponse:
+    """Queue one head for the staged model and run until it samples or the tick ceiling is reached."""
+    head = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
+    await world.pop(head)
+    for _ in range(_MAX_TICKS):
+        await world.step()
+        if world.dispatch_tick(head) is not None:
+            break
+    return head
+
+
+async def test_l_an_unload_the_device_refused_is_not_recorded_as_room() -> None:
+    """A slot that could not give its weights back keeps reading as VRAM-resident, and the head still moves.
+
+    The failure this encodes: an unload was issued, the backend freed one component out of nearly nine
+    gigabytes and left the rest loaded behind a live reference, and the child reported the model moved to
+    host RAM because that is what the command had asked for. The parent booked the whole footprint as room
+    it had recovered, and for the rest of the session admitted against gigabytes the card was still holding;
+    the queue head was held "not fitting" for minutes while the ledger showed space after every evict.
+
+    Read as one statement: the parent never records host-RAM residency for weights the card is holding. Its
+    consequences are that the refusal is remembered once rather than re-asked every tick, and that the head
+    still reaches sampling, so honesty about the refusal is not bought by parking the queue behind it.
+    """
+    world = _refused_unload_world()
+
+    head = await _drive_refused_unload_head(world)
+
+    context = "refused unload"
+    assert world.unload_leaks, (
+        f"{context}: no unload was refused, so the scenario measured nothing. {world.state_dump()}"
+    )
+    assert world.ram_recorded_over_resident_weights() == [], (
+        f"{context}: the parent recorded host-RAM residency for weights still on the card: "
+        f"{world.ram_recorded_over_resident_weights()}. {world.state_dump()}"
+    )
+    assert world.unload_refused_lanes() == [0], (
+        f"{context}: the refusing lane is not marked as one, so reclaim will keep choosing it. {world.state_dump()}"
+    )
+    dispatch_tick = world.dispatch_tick(head)
+    assert dispatch_tick is not None and dispatch_tick <= _UNLOAD_LEAK_DISPATCH_TICKS, (
+        f"{context}: the head reached sampling at tick {dispatch_tick} against a "
+        f"{_UNLOAD_LEAK_DISPATCH_TICKS}-tick bound, so it is parked behind a refusal nothing escalates past. "
+        f"{world.state_dump()}"
+    )
+    assert world.reclaim_commands == 1, (
+        f"{context}: {world.reclaim_commands} unloads were served on a card with one thing to reclaim, so "
+        f"the same refusal is being asked again every tick instead of escalating. {world.state_dump()}"
+    )
+
+
+async def test_l_defect_reinjection_an_unverified_unload_books_room_the_card_still_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the refusal bookkeeping inert, the same unload is booked as room the card never gave back.
+
+    The reinjection is the parent half: the child still judges the unload by what the device holds and still
+    reports the refusal, and the handler that turns that report into a slot kept VRAM-resident is made a
+    no-op. What is left is the pre-fix worker, whose map follows the command it issued rather than the device
+    it issued it to.
+    """
+    monkeypatch.setattr(ProcessMap, "on_vram_unload_refused", lambda self, process_id: None)
+    world = _refused_unload_world()
+
+    await _drive_refused_unload_head(world)
+
+    assert world.unload_leaks, "the reinjection must run the same refused unload the scenario does"
+    assert world.ram_recorded_over_resident_weights() != [], (
+        "with the refusal bookkeeping inert the parent must book host-RAM residency for weights the card is "
+        f"still holding, or the scenario's ledger assertion would pass unfixed. {world.state_dump()}"
+    )
+
+
+async def test_l_an_unload_the_device_honoured_marks_nothing() -> None:
+    """The control: the ordinary complete unload leaves no refusal behind and gives the card everything back.
+
+    Without this the scenario above would be satisfied by a worker that marks every unload refused, which
+    would keep every slot out of reclaim for the rest of the session.
+    """
+    world = _refused_unload_world()
+    world.child_unload_leaks_mb = 0.0
+
+    head = await _drive_refused_unload_head(world)
+
+    context = "honoured unload"
+    assert world.unload_leaks == [], "the control must run with the leak off"
+    assert world.unload_refused_lanes() == [], (
+        f"{context}: a completed unload must leave no slot marked as refusing. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(head) is not None, f"{context}: the head never sampled. {world.state_dump()}"

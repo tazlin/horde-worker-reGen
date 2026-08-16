@@ -4865,9 +4865,22 @@ class InferenceScheduler:
         process itself reports this model loaded and the model map agrees the model is VRAM-resident. Aligning
         the credit with the floor's own truth stops the divergence from double-charging resident weights (once
         in the committed floor, again as the candidate delta) and wedging a dispatch to an idle resident model.
+
+        The parent's own retention record (``retained_resident_model``) is read first, because it is the only
+        truth that covers a slot holding weights *between* jobs. The model map tracks load transitions a child
+        reports, and a slot that finished a job under a retention grant reports its weights back in system RAM
+        or, on a disaggregated sampler, reports no transition at all: the sample stage emits none, so such a
+        slot never reads as VRAM-resident there however long it holds its UNet. Without this arm every job
+        landing on a retained resident is charged its weights a second time (once through the committed floor
+        that already contains them), which holds a job whose model is on the card at full materialisation
+        price. The credit taken against it is the core weight figure, which is exactly what a component-only
+        (UNet-alone) retention holds.
         """
         if model_name is None or process_id is None:
             return False
+        retainer = self._process_map.get(process_id)
+        if retainer is not None and retainer.retained_resident_model == model_name:
+            return True
         model_info = self._horde_model_map.root.get(model_name)
         model_map_says_vram_resident = model_info is not None and model_info.horde_model_load_state in (
             ModelLoadState.LOADED_IN_VRAM,
@@ -4875,12 +4888,7 @@ class InferenceScheduler:
         )
         if model_info is not None and model_info.process_id == process_id and model_map_says_vram_resident:
             return True
-        process_info = self._process_map.get(process_id)
-        return (
-            process_info is not None
-            and process_info.loaded_horde_model_name == model_name
-            and model_map_says_vram_resident
-        )
+        return retainer is not None and retainer.loaded_horde_model_name == model_name and model_map_says_vram_resident
 
     def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
         """Inject the single VRAM arbiter: the preload-admission authority and the observational overlay elsewhere."""
@@ -8233,27 +8241,52 @@ class InferenceScheduler:
         verification window on a rung that frees nothing.
         """
         process_info = self._process_map.get(process_id)
-        if process_info is None or process_info.loaded_horde_model_name is None:
+        if process_info is None:
             return False
-        if process_info.is_process_busy():
+        if process_info.is_process_busy() and not self._slot_is_reclaimable_while_busy(process_info):
             return False
         if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
             return False
         model_name = process_info.loaded_horde_model_name
-        if not process_info.safe_send_message(
-            HordeControlModelMessage(
+        if model_name is None and not process_info.held_components:
+            return False
+        # A lane holding component-cache entries but no tracked checkpoint is still holding the card, and it
+        # is precisely the tenancy no job boundary returns. Refusing it here made this rung a no-op against
+        # the one holder a starved head cannot outwait, so the whole-slot unload is issued instead: the child
+        # frees what it holds, named model or not.
+        message: HordeControlMessage = (
+            HordeControlMessage(control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM)
+            if model_name is None
+            else HordeControlModelMessage(
                 control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
                 horde_model_name=model_name,
-            ),
-        ):
+            )
+        )
+        if not process_info.safe_send_message(message):
             return False
         process_info.clear_job_references()
         self._note_retention_evicted_unused(process_info)
         process_info.clear_retained_resident()
         process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         self._record_churn("vram_eviction")
-        logger.info(f"Reclaim ladder: unloading model {model_name} from VRAM on idle process {process_id}")
+        logger.info(
+            f"Reclaim ladder: unloading {model_name or 'the held component tenancy'} from VRAM on idle "
+            f"process {process_id}",
+        )
         return True
+
+    def _slot_is_reclaimable_while_busy(self, process_info: HordeProcessInfo) -> bool:
+        """Whether a slot the busy predicate covers may still have its residency reclaimed.
+
+        The one case: a slot parked on a completed preload whose dispatch never came. It stays busy so no
+        dispatch races it, and past the retention staleness horizon (the same falsified-prediction horizon a
+        retained copy is judged on: a preload and a retention both assert an imminent same-slot job) its
+        weights are the ladder's to take back.
+        """
+        return process_info.is_parked_preload(
+            now=self._clock(),
+            dwell_seconds=_RETENTION_STALE_HOLD_SECONDS,
+        )
 
     def evict_retained_resident_for_model_change(
         self,
@@ -9700,6 +9733,49 @@ class InferenceScheduler:
             "yields so its preload runs.",
         )
 
+    def _slots_holding_the_head_model(
+        self,
+        job: ImageGenerateJobPopResponse,
+        disallowed_processes: list[int],
+    ) -> list[int]:
+        """Slots holding the queue head's model that a preload for ``job`` must not take, else an empty list.
+
+        A preload placed on the head's own warm slot displaces the copy the head is waiting to run: the head
+        loses its residency, its dispatch falls back to a cold load, and the slot it lost is now busy staging
+        somebody else's model. That is a priority inversion, and it is worst exactly when it is most likely,
+        because the head reaching its anti-starvation window is what makes the scheduler push a later job's
+        preload past it in the first place.
+
+        Two conditions, either sufficient. A slot the head's copy is on is refused outright whenever another
+        idle slot can take the preload: the placement costs nothing to move and the head keeps its copy. With
+        no other slot free the refusal holds only while the head is inside its anti-starvation window, so a
+        single-slot worker still swaps models between jobs as it always has, and only a head the queue is
+        actually starving is protected from having its own copy taken.
+
+        A preload for the head itself, or for the model the head needs, displaces nothing and is never
+        refused.
+        """
+        head = next(iter(self._job_tracker.jobs_pending_inference), None)
+        if head is None or head.model is None:
+            return []
+        if head.id_ == job.id_ or head.model == job.model:
+            return []
+        holders = [
+            process_info.process_id
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.loaded_horde_model_name == head.model
+            and process_info.process_id not in disallowed_processes
+        ]
+        if not holders:
+            return []
+        alternative = self._process_map.get_first_available_inference_process(
+            disallowed_processes=[*disallowed_processes, *holders],
+        )
+        if alternative is not None or self._head_aged_past_anti_starvation(head):
+            return holders
+        return []
+
     def _select_preload_process(
         self,
         job: ImageGenerateJobPopResponse,
@@ -9712,7 +9788,13 @@ class InferenceScheduler:
         same sticky-then-least-loaded policy dispatch uses: a card already holding this model first (avoid a
         duplicate load), then the card running the fewest inference jobs (balance fresh loads). Returns the
         first available slot on the best such card, or None when no eligible card has a free slot.
+
+        Slots carrying the queue head's own copy are excluded first
+        (:meth:`_slots_holding_the_head_model`), on either topology.
         """
+        head_slots = self._slots_holding_the_head_model(job, disallowed_processes)
+        if head_slots:
+            disallowed_processes = [*disallowed_processes, *head_slots]
         if not self._multi_gpu_routing_active:
             return self._process_map.get_first_available_inference_process(disallowed_processes=disallowed_processes)
         eligible = self._eligible_card_indices(job)
@@ -10265,11 +10347,19 @@ class InferenceScheduler:
         and to the committed-reserve ledger at grant time:
 
         - **Sibling CUDA contexts**: every other live GPU process (inference siblings, the
-          post-processing lane, the on-GPU safety process) holds a context whether or not it holds a
-          model. Charged at the measured marginal per-context cost (first-context overhead when no
-          marginal was measured), matching how the streaming forecast counts them. Returns None when
-          sibling contexts exist but no per-context cost has been measured yet: an unpriceable charge
-          must deny the grant, not be waved through at zero.
+          post-processing lane, the disaggregated VAE and component lanes, the on-GPU safety process)
+          holds a context whether or not it holds a model. Charged at the measured marginal per-context
+          cost (first-context overhead when no marginal was measured), matching how the streaming
+          forecast counts them. Returns None when sibling contexts exist but no per-context cost has
+          been measured yet: an unpriceable charge must deny the grant, not be waved through at zero.
+        - **Idle lanes' held components**: a lane's component cache outlives every job boundary and is
+          returned by nothing but an unload, so between jobs it is as real a tenant as a retained
+          checkpoint. The parent already receives what each lane holds on every memory report.
+        - **Concurrent clearance grants**: with more than one lease slot a sibling can be cleared into
+          its own load-and-sample window while these weights are held, and its materialisation lands on
+          the same card. A staged sibling has only its encode charge booked in the shared ledger, so the
+          remainder of its full materialisation is charged here; a sibling already sampling had its
+          reservation upgraded to that full peak at its clearance and is left to the ledger.
         - **The job's own post-processing chain**: a job that requests post-processing runs its
           upscaler/face-fixer right after sampling, precisely while retention is holding the weights.
           Its estimated peak only enters the committed ledger after inference finishes, one dispatch
@@ -10286,9 +10376,12 @@ class InferenceScheduler:
                 continue
             if device_index is not None and process_info.device_index != device_index:
                 continue
-            if process_info.process_type in (HordeProcessType.INFERENCE, HordeProcessType.POST_PROCESS) or (
-                process_info.process_type == HordeProcessType.SAFETY and safety_on_gpu
-            ):
+            if process_info.process_type in (
+                HordeProcessType.INFERENCE,
+                HordeProcessType.POST_PROCESS,
+                HordeProcessType.VAE_LANE,
+                HordeProcessType.COMPONENT,
+            ) or (process_info.process_type == HordeProcessType.SAFETY and safety_on_gpu):
                 sibling_contexts += 1
 
         charges_mb = 0.0
@@ -10306,6 +10399,91 @@ class InferenceScheduler:
             if own_post_processing_mb is not None:
                 charges_mb += max(0.0, own_post_processing_mb)
 
+        charges_mb += self._idle_lane_component_charges_mb(
+            process_with_model=process_with_model,
+            device_index=device_index,
+        )
+        concurrent_grant_mb = self._concurrent_clearance_grant_charges_mb(
+            process_with_model=process_with_model,
+            device_index=device_index,
+        )
+        if concurrent_grant_mb is None:
+            return None
+        charges_mb += concurrent_grant_mb
+
+        return charges_mb
+
+    def _idle_lane_component_charges_mb(
+        self,
+        *,
+        process_with_model: HordeProcessInfo,
+        device_index: int | None,
+    ) -> float:
+        """VRAM (MB) the card holds for component-cache entries idle lanes report between jobs.
+
+        Read from the residency each lane reports rather than predicted, because a cache's contents are the
+        lane's own history and nothing about the dispatched job says what they are. Only idle lanes are
+        charged: a lane mid-stage has its work priced by that stage's own admission, and charging it here as
+        well would price the same bytes twice. The target slot is excluded for the same reason its own
+        retained weights are.
+        """
+        charges_mb = 0.0
+        for process_info in self._process_map.values():
+            if process_info.process_id == process_with_model.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy() or not process_info.held_components:
+                continue
+            charges_mb += sum(max(0.0, held.approx_ram_mb) for held in process_info.held_components)
+        return charges_mb
+
+    def _concurrent_clearance_grant_charges_mb(
+        self,
+        *,
+        process_with_model: HordeProcessInfo,
+        device_index: int | None,
+    ) -> float | None:
+        """VRAM (MB) a sibling's imminent lease window will materialise beside these retained weights.
+
+        The clearance lease admits as many concurrent load-and-sample windows as it has slots. A retention
+        grant priced against the card minus contexts alone assumes it is the only claim in flight, so on a
+        multi-slot lease two grants can each fit "alone" and jointly overflow the card, which the driver then
+        resolves by demand-paging or by failing the allocation outright.
+
+        Only the part the shared ledger does not already carry is charged: a staged sibling has booked its
+        encode working set and nothing else (its weights load at clearance), so the remainder of its full
+        materialisation is charged here; a sibling already inside its window had its reservation upgraded to
+        that same full peak when it was cleared and is left to the ledger the caller subtracts. With no lease
+        a dispatch books its full charge at dispatch, so nothing is outstanding to add.
+
+        Returns None when a sibling's staged job cannot be priced: an unpriceable concurrent claim denies the
+        grant rather than being waved through, as every other unpriceable tenant here does.
+        """
+        if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
+            return 0.0
+        charges_mb = 0.0
+        for process_info in self._process_map.values():
+            if process_info.process_id == process_with_model.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.last_process_state != HordeProcessState.INFERENCE_PRIMED:
+                continue
+            staged_job = process_info.current_inference_job()
+            if staged_job is None or staged_job.model is None:
+                continue
+            staged_baseline = self._model_metadata.get_baseline(staged_job.model)
+            materialisation_mb = (
+                predict_job_sampler_only_vram_mb(staged_job, staged_baseline)
+                if self._is_disaggregation_class_eligible(staged_job)
+                else predict_job_sampling_vram_mb(staged_job, staged_baseline)
+            )
+            if materialisation_mb is None:
+                return None
+            charges_mb += max(0.0, materialisation_mb - _STAGING_ENCODE_VRAM_MB)
         return charges_mb
 
     def _retained_resident_charges_mb(
@@ -11281,6 +11459,73 @@ class InferenceScheduler:
             reason=reason,
         )
 
+    def _dispatch_hold_is_standing(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``job``'s dispatch hold has stood long enough to be a wedge rather than a tight moment.
+
+        Read from the hold ledger the gate already keeps, so the bound is the hold's own age rather than a
+        second clock. A card that is momentarily full while work flows resolves its own holds within a pass
+        or two, and stripping an idle lane's tenancy there would trade a warm cache for room the finishing
+        job was about to return anyway. Past the stall horizon nothing is finishing, and the tenancy is the
+        only thing left to ask.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return False
+        held_since = self._dispatch_hold_since.get(job_id)
+        return held_since is not None and (self._clock() - held_since) >= _DISPATCH_STALL_MIN_SECONDS
+
+    def _reclaim_idle_tenancy_for_head(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        target_process: HordeProcessInfo,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Ask idle lanes on this card for tenancy the arbiter cannot name, for a head that does not fit.
+
+        Two holders sit outside the arbiter's eviction description because neither is a resident checkpoint
+        it tracks: a lane holding component-cache entries between jobs, and a slot parked on a preload whose
+        dispatch never came. Both are the card's, both outlive every job boundary, and neither is returned by
+        anything except an unload the parent actuates, so a hold that waits for them to clear waits forever.
+
+        Issued through :meth:`unload_idle_model`, the single reclaim actuator, so this adds a caller rather
+        than a second ladder, and one lane at a time: the actuator refuses a slot already unloading, so a
+        card needing more than one lane's tenancy gives it up over successive holds rather than being
+        stripped in one pass. The head's own target slot is spared, as is any lane holding the head's model
+        (reclaiming the copy the head is about to use is the trade this exists to avoid).
+
+        Returns True when at least one unload was issued, which the hold reports as room being on the way.
+        """
+        active_jobs_on_card = (
+            self._jobs_in_progress_on_card(device_index)
+            if self._multi_gpu_routing_active and device_index is not None
+            else self._job_tracker.jobs_in_progress
+        )
+        if active_jobs_on_card:
+            # A job is sampling on this card, so its completion is the fit the hold is waiting for. Taking an
+            # idle lane's cache here would buy room the finishing job is about to return anyway, and pay for
+            # it with that lane's next cold load. The tenancy is only worth asking for when nothing on the
+            # card is producing a fit at all.
+            return False
+        head_model = head_job.model
+        acted = False
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_id == target_process.process_id:
+                continue
+            if process_info.loaded_horde_model_name == head_model and head_model is not None:
+                continue
+            holds_component_tenancy = bool(process_info.held_components)
+            if not holds_component_tenancy and not self._slot_is_reclaimable_while_busy(process_info):
+                continue
+            if self.unload_idle_model(process_info.process_id, device_index=device_index):
+                acted = True
+                break
+        return acted
+
     def _dispatch_residency_reconciliation_holds(
         self,
         next_job: ImageGenerateJobPopResponse,
@@ -11343,7 +11588,22 @@ class InferenceScheduler:
             self._resolve_dispatch_hold(next_job)
             return False
 
-        self._note_dispatch_hold(next_job, reclaim_applied=bool(outcome.actuations_applied))
+        # The arbiter describes evictions in terms of resident checkpoints, so a card held by idle tenancy it
+        # cannot name (a lane's component cache, a slot parked on a preload nothing dispatched) yields no
+        # command and the hold waits on a fit nothing is producing. Ask those holders for the card back
+        # through the one reclaim actuator before recording a hold that reclaims nothing.
+        tenancy_reclaimed = False
+        if is_head_of_queue and not outcome.actuations_applied and self._dispatch_hold_is_standing(next_job):
+            tenancy_reclaimed = self._reclaim_idle_tenancy_for_head(
+                next_job,
+                process_with_model,
+                device_index=device_index,
+            )
+
+        self._note_dispatch_hold(
+            next_job,
+            reclaim_applied=bool(outcome.actuations_applied) or tenancy_reclaimed,
+        )
 
         if self._decision_sink is not None and next_job.id_ is not None:
             measured = verdict.measured
@@ -11380,7 +11640,7 @@ class InferenceScheduler:
             # unchanged and must not be described as room being on the way.
             reclaim_note = (
                 " Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM."
-                if outcome.actuations_applied
+                if outcome.actuations_applied or tenancy_reclaimed
                 else (
                     " Reclaim was proposed but no actuator accepted it; the hold remains eligible for escalation."
                     if outcome.actuations_requested
@@ -12093,7 +12353,7 @@ class InferenceScheduler:
             if device_index is not None and process_info.device_index != device_index:
                 continue
 
-            if process_info.is_process_busy():
+            if process_info.is_process_busy() and not self._slot_is_reclaimable_while_busy(process_info):
                 logger.debug(f"Process {process_info.process_id} is busy")
                 continue
 

@@ -484,6 +484,8 @@ class ClearanceController:
         # Session tallies for the handoff: grants issued, and denials by the clause that refused. Read into
         # the duty-cycle summary so one session's log answers which clause starves the overlap.
         self._tail_overlap_grants = 0
+        self._grants_issued = 0
+        self._unpriced_sampling_windows = 0
         self._tail_overlap_denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
         # The denial reason last logged, when it was logged, and how many identical ticks were suppressed.
         self._tail_denial_log_state: tuple[TailOverlapDenialReason, float, int] | None = None
@@ -602,6 +604,7 @@ class ClearanceController:
         self._grant_state[process_id] = GrantState.CLEARED
         if job_id is not None:
             self._granted_job_id[process_id] = job_id
+        self._grants_issued += 1
         logger.debug(
             f"Clearance lease on device {self._device_index}: cleared process {process_id} into its "
             f"load-and-sample window.",
@@ -628,6 +631,26 @@ class ClearanceController:
             f"sampler {outgoing_job_id[:8]} at progress {progress_fraction:.2f} with {headroom_mb:.0f}MB measured "
             f"headroom.",
         )
+
+    @property
+    def grants_issued(self) -> int:
+        """How many load-and-sample windows this controller has granted this session.
+
+        The session tally against which sampling windows are read: a worker whose children enter more denoise
+        loops than the parent granted is sampling unpriced, which is the condition
+        :attr:`unpriced_sampling_windows` counts.
+        """
+        return self._grants_issued
+
+    @property
+    def unpriced_sampling_windows(self) -> int:
+        """How many times a child was first seen inside a denoise loop holding no grant, this session.
+
+        A child that waits out its bounded lease-acquire timeout samples anyway (liveness over pricing), and
+        so does a child that never waits at all. Either way the parent priced nothing for that window, so a
+        nonzero tally means the clearance handshake is not bracketing the work it is meant to bracket.
+        """
+        return self._unpriced_sampling_windows
 
     @property
     def tail_overlap_grant_count(self) -> int:
@@ -730,6 +753,7 @@ class ClearanceController:
             self._granted_job_id[grant.process_id] = grant.job_id
             if grant.process_id not in self._unpriced_flagged:
                 self._unpriced_flagged.add(grant.process_id)
+                self._unpriced_sampling_windows += 1
                 logger.warning(
                     f"Clearance lease on device {self._device_index}: process {grant.process_id} entered its "
                     f"denoise loop without a recorded grant (unpriced sampling window); liveness preserved.",

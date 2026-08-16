@@ -279,6 +279,14 @@ class HordeProcessInfo:
     changes; distinct from ``last_received_timestamp``, which refreshes on any report traffic and so is a poor
     materialization proxy. None (never materialized, or unset on an older child) falls back to the timestamp
     proxy for ranking."""
+    vram_unload_refused: bool
+    """Whether this slot's last VRAM unload left its weights on the device.
+
+    An unload is a request, and a backend that cannot drop a model a live reference still pins skips it
+    silently. Re-issuing the same unload the next tick asks the same question of the same refusal, so the
+    reclaim ladder has to be able to pass this slot over and escalate to its next rung instead. Cleared when
+    the slot next materialises weights or loads a model, which is the point the refusal stops describing it."""
+
     batch_amount: int
     """The total amount of batching being run by this process."""
 
@@ -402,6 +410,7 @@ class HordeProcessInfo:
         self.retained_resident_since = None
         self.retention_granted_component_only = False
         self.retained_resident_component_only = False
+        self.vram_unload_refused = False
 
         self.ram_usage_bytes = 0
         self.vram_usage_mb = 0
@@ -577,6 +586,22 @@ class HordeProcessInfo:
             or self.last_process_state == HordeProcessState.EVALUATING_SAFETY
             or self.last_process_state == HordeProcessState.PROCESS_STARTING
         )
+
+    def is_parked_preload(self, *, now: float, dwell_seconds: float) -> bool:
+        """Whether this slot has sat on a completed preload past ``dwell_seconds`` with no job to run.
+
+        A preload is a prediction that a dispatch is about to follow it. ``PRELOADED_MODEL`` counts as busy
+        so nothing races that dispatch, but the state carries no bound of its own: a slot whose dispatch
+        never came stays busy forever and every reclaim sweep skips it, so weights no job is waiting on hold
+        the card against a head that cannot fit. Past the dwell the prediction is falsified and the ladder
+        may take the slot's residency back; the slot stays busy for dispatch and lease purposes either way,
+        so this never opens a window for a job to land on a slot that is already committed.
+        """
+        if self.last_process_state != HordeProcessState.PRELOADED_MODEL:
+            return False
+        if self.current_inference_job() is not None:
+            return False
+        return (now - self.last_process_state_started_at) >= dwell_seconds
 
     def is_process_alive(self) -> bool:
         """Return true if the process is alive."""

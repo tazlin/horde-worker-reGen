@@ -14,7 +14,12 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from tests.process_management.conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    track_popped_job_async,
+)
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
@@ -397,3 +402,105 @@ def test_graph_alchemy_commitment_keeps_idle_post_processing_lane_out_of_pause_r
     candidates = scheduler.build_reclaim_ladder_candidates(None)
 
     assert all(candidate.kind is not ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
+
+
+class TestParkedPreloadIsReclaimable:
+    """A slot that preloaded a model and was never dispatched must not hold the card forever.
+
+    ``PRELOADED_MODEL`` counts as busy so nothing races the dispatch it is waiting for, but the state carries
+    no bound of its own: a live worker sat on one for the whole tail of a session while every reclaim tick
+    skipped it as busy and the head it was starving could not fit. The preload is a prediction that a dispatch
+    follows it, and past the same horizon a retained copy is judged on, the prediction is falsified.
+    """
+
+    _MODEL = "parked-model"
+    _DWELL_PAST_SECONDS = 61.0
+
+    def _scheduler_with_parked_preload(self, *, parked_for_seconds: float) -> InferenceScheduler:
+        parked = make_mock_process_info(1, model_name=self._MODEL, state=HordeProcessState.PRELOADED_MODEL)
+        parked.last_job_referenced = None
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({1: parked}),
+            bridge_data=make_mock_bridge_data(),
+        )
+        now = scheduler._clock()
+        parked.last_process_state_started_at = now - parked_for_seconds
+        return scheduler
+
+    def test_a_freshly_preloaded_slot_is_left_alone(self) -> None:
+        """Inside the dwell the slot is a dispatch about to happen, and taking its weights would waste them."""
+        scheduler = self._scheduler_with_parked_preload(parked_for_seconds=1.0)
+
+        assert scheduler.unload_idle_model(1) is False
+
+    def test_a_slot_parked_past_the_dwell_yields_its_weights(self) -> None:
+        """Past it nothing is coming, so the ladder may take the card back."""
+        scheduler = self._scheduler_with_parked_preload(parked_for_seconds=self._DWELL_PAST_SECONDS)
+
+        assert scheduler.unload_idle_model(1) is True
+
+    def test_a_parked_slot_that_owns_a_job_is_still_busy(self) -> None:
+        """A slot holding a dispatched job is mid-handoff however long the state has stood."""
+        scheduler = self._scheduler_with_parked_preload(parked_for_seconds=self._DWELL_PAST_SECONDS)
+        scheduler._process_map[1].record_inference_ownership(
+            make_job_pop_response(model=self._MODEL),
+            attempt_ordinal=0,
+        )
+
+        assert scheduler.unload_idle_model(1) is False
+
+
+class TestPreloadDoesNotDisplaceTheHeadsCopy:
+    """A later job's preload must not be staged onto the slot holding the queue head's own model.
+
+    Taking that slot costs the head its residency and hands the room to a job behind it, which a live worker
+    then compounded by anti-starvation-pinning the head it had just made cold.
+    """
+
+    _HEAD_MODEL = "head-model"
+    _NEXT_MODEL = "next-model"
+
+    async def _scheduler(self, *, spare_slots: int) -> tuple[InferenceScheduler, object]:
+        holder = make_mock_process_info(1, model_name=self._HEAD_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        processes = {1: holder}
+        for spare_id in range(2, 2 + spare_slots):
+            processes[spare_id] = make_mock_process_info(
+                spare_id,
+                model_name=None,
+                state=HordeProcessState.WAITING_FOR_JOB,
+            )
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model=self._HEAD_MODEL)
+        await track_popped_job_async(job_tracker, head)
+        follower = make_job_pop_response(model=self._NEXT_MODEL)
+        await track_popped_job_async(job_tracker, follower)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(processes),
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(),
+        )
+        return scheduler, follower
+
+    async def test_a_spare_slot_takes_the_preload_instead(self) -> None:
+        """With anywhere else to put it, the head's copy is never the placement."""
+        scheduler, follower = await self._scheduler(spare_slots=1)
+
+        selected = scheduler._select_preload_process(follower, [])
+
+        assert selected is not None and selected.process_id == 2
+
+    async def test_a_starved_head_keeps_its_only_slot(self) -> None:
+        """With no spare slot the placement is refused outright while the head is starving."""
+        scheduler, follower = await self._scheduler(spare_slots=0)
+        scheduler._head_aged_past_anti_starvation = lambda _job: True  # type: ignore[method-assign]
+
+        assert scheduler._select_preload_process(follower, []) is None
+
+    async def test_an_unstarved_head_on_a_single_slot_still_swaps(self) -> None:
+        """The ordinary one-slot worker keeps swapping models between jobs, as it always has."""
+        scheduler, follower = await self._scheduler(spare_slots=0)
+        scheduler._head_aged_past_anti_starvation = lambda _job: False  # type: ignore[method-assign]
+
+        selected = scheduler._select_preload_process(follower, [])
+
+        assert selected is not None and selected.process_id == 1

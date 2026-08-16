@@ -29,6 +29,8 @@ from __future__ import annotations
 import time
 from unittest.mock import Mock
 
+from horde_sdk.ai_horde_api import GENERATION_STATE
+
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceResultMessage,
@@ -186,6 +188,9 @@ async def test_dropped_result_retires_the_slots_dispatch_stamp() -> None:
     msg = Mock(spec=HordeInferenceResultMessage)
     msg.process_id = 3
     msg.sdk_api_job_info = dropped_job
+    # A real result carries its generation state, which the retention settle reads to tell a finished job
+    # from a faulted one; the mock has to carry it too or it is not the message the handler is given.
+    msg.state = GENERATION_STATE.ok
     await pm._message_dispatcher._handle_inference_result(msg)
 
     # The dropped result retired the stamp, so the slot can no longer phantom-own its stale reference.

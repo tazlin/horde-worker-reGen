@@ -627,8 +627,59 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """
         process_info = self[process_id]
         process_info.vram_materialized_monotonic = time.monotonic()
+        # A fresh materialization is a new tenancy, so whatever the previous unload refused to give back is no
+        # longer what this slot is holding; the refusal stops describing it and must not keep it out of reclaim.
+        process_info.vram_unload_refused = False
         if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
             process_info.last_control_flag = None
+
+    def on_vram_unload_refused(
+        self,
+        process_id: int,
+    ) -> None:
+        """Record that this slot's last VRAM unload left its weights on the device.
+
+        The child judges the unload by what the device still holds rather than by having issued the command,
+        and a backend that could not drop a model a live reference still pins reports the refusal here. Two
+        things follow. The slot keeps reading as VRAM-resident, so the ledger is not told about room the card
+        does not have. And the outstanding-unload flag is deliberately left standing: every reclaim candidate
+        set and the unload actuator already read it as a reason to pass this slot over, so the ladder
+        escalates to its next rung instead of asking the same question of the same refusal every tick. Only a
+        genuine re-materialization, a verified clear, or the slot's death retires it.
+
+        Args:
+            process_id (int): The ID of the process whose unload was not honoured.
+        """
+        process_info = self[process_id]
+        if not process_info.vram_unload_refused:
+            logger.warning(
+                f"Process {process_id} still holds its weights on the device after an unload; keeping it "
+                "recorded as VRAM-resident and passing it over for reclaim.",
+            )
+        process_info.vram_unload_refused = True
+
+    def on_model_vram_clear(
+        self,
+        process_id: int,
+    ) -> None:
+        """Drop this slot's retained residency because its device weights are gone.
+
+        Reached from every report that the slot's model left VRAM: the unload the parent commanded, and
+        the child's report that the backend freed weights a retention grant covered. The record is a
+        parent-side prediction made at dispatch, and three paths act on it (the retention static fit
+        charges it, the dispatch admission gate holds a load behind it, same-model routing sends a
+        successor to the slot), so a record left standing over an empty device misprices and misroutes
+        for the rest of the session.
+
+        Clearing the in-flight grant with it is what makes this hold against a report that arrives while
+        a job is still settling: the settle resolves the grant into the retained record, so clearing only
+        the record would let the settle put it straight back.
+
+        Args:
+            process_id (int): The ID of the process whose device weights were returned.
+        """
+        self[process_id].clear_retained_resident()
+        self[process_id].vram_unload_refused = False
 
     def on_model_ram_clear(
         self,
@@ -642,8 +693,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
         self[process_id].clear_job_references()
-        # A model gone from RAM is certainly gone from the device, so no retained residency survives it.
+        # A model gone from RAM is certainly gone from the device, so no retained residency survives it, and
+        # a refusal to give the device back cannot outlive the weights it was about.
         self[process_id].clear_retained_resident()
+        self[process_id].vram_unload_refused = False
         self[process_id].recently_unloaded_from_ram = True
         self[process_id].last_received_timestamp = time.time()
         # The model left VRAM, so it no longer has a materialization time; the next materialization restamps.
@@ -915,13 +968,19 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         ages = [(now - p.report_sampled_at) if p.report_sampled_at is not None else float("inf") for p in contributors]
         return max(ages)
 
-    def residency_snapshot(self) -> str:
+    def residency_snapshot(self, *, measured_device_free_mb: float | None = None) -> str:
         """One-line 'which model is resident on which inference slot' summary, for over-commit diagnostics.
 
         ``vram_usage_mb`` from the memory reports is *device-wide* used (children compute
         ``torch_total - torch_free``), not a per-slot figure, so this reports the per-slot resident model
         and state plus the single device-wide free VRAM. Logged when an over-commit is admitted or a
         slowdown is graded, so a live log shows the residency at the moment free VRAM ran out.
+
+        ``measured_device_free_mb`` is the parent's own device-level reading (NVML), reported beside the
+        child-derived figure when a caller has one. The two disagree in exactly the regime these lines are
+        read in: under WDDM demand-paging the child's torch view counts paged-out blocks as free and has
+        been seen overstating the card by gigabytes, so a snapshot carrying only that figure argues the
+        card had room when it did not.
         """
         parts: list[str] = []
         for process_id, process_info in sorted(self.items()):
@@ -940,7 +999,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 parts.append(f"#{process_id}:{model}[{process_info.last_process_state.name}]")
         free = self.get_free_vram_mb()
         free_str = f"{free:.0f}" if free is not None else "?"
-        return f"slots=[{', '.join(parts) if parts else 'none'}] device_free_vram={free_str}MB"
+        measured_str = (
+            "" if measured_device_free_mb is None else f" measured_device_free_vram={measured_device_free_mb:.0f}MB"
+        )
+        return f"slots=[{', '.join(parts) if parts else 'none'}] device_free_vram={free_str}MB{measured_str}"
 
     def num_inference_processes(self) -> int:
         """Return the number of inference processes."""

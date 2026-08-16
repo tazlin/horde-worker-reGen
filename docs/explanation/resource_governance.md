@@ -32,6 +32,27 @@ The decision layer lives in the
 [`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]
 provides the measurement and execution surfaces.
 
+## Tenancy no job boundary returns
+
+Two things hold a card outside every ledger that tracks jobs, and neither is returned by a job finishing:
+
+- a lane's **component cache**, whose entries outlive every job boundary (the parent sees them on each
+  memory report as that lane's held components), and
+- a slot **parked on a completed preload** whose dispatch never came. `PRELOADED_MODEL` counts as busy so
+  nothing races that dispatch, which also meant every reclaim sweep skipped such a slot indefinitely; past
+  the retention staleness horizon the prediction that a dispatch follows is falsified and the ladder may
+  take the residency back. The slot stays busy for dispatch and lease purposes throughout.
+
+Neither is a resident checkpoint, so the arbiter's eviction description names neither, and a dispatch
+residency-reconciliation hold over a card held by them waited for a fit nothing was producing. The hold now
+asks for that tenancy back through the single reclaim actuator (`unload_idle_model`), one lane per hold,
+once the hold has stood past the dispatch-stall horizon and nothing is in flight on the card. Both
+conditions matter: a card that is merely busy resolves its own holds when the running job finishes, and
+taking an idle lane's cache to buy room the finishing job is about to return trades a warm cache for
+nothing. A preload placement is likewise refused on the slot holding the queue head's own copy whenever
+another idle slot can take it, and refused outright while the head is inside its anti-starvation window,
+so a later job's staging cannot make the head cold and then pin it.
+
 ## The governor tick
 
 [`ResourceGovernor.tick`][horde_worker_regen.process_management.scheduling.governance.governor.ResourceGovernor.tick]

@@ -17,8 +17,10 @@ from horde_worker_regen.process_management.config.worker_state import WorkerStat
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
     HordeHeartbeatType,
     HordeInferenceResultMessage,
+    HordeModelStateChangeMessage,
     HordeProcessHeartbeatMessage,
     HordeProcessMemoryMessage,
     HordeProcessState,
@@ -27,6 +29,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
@@ -225,6 +228,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.process_state = HordeProcessState.PRELOADING_FAILED
         msg.info = "failed to load"
         msg.time_elapsed = None
+        msg.vram_unload_refused = False
 
         _enqueue(message_dispatcher, msg)
         await message_dispatcher.receive_and_handle_process_messages()
@@ -1079,3 +1083,132 @@ class TestMemoryMessageDispatchLogThrottle:
 
         levels = [level for level, message in records if message.startswith("Received HordeProcessStateChangeMessage")]
         assert levels == ["DEBUG", "DEBUG", "DEBUG"]
+
+
+class TestRetainedResidencyReconciliation:
+    """A slot reporting its model out of VRAM must stop reading as a retained resident.
+
+    The retained record is a prediction the parent makes at dispatch, and three paths act on it: the
+    retention static fit charges the weights, the dispatch admission gate holds a load behind them, and
+    same-model routing seats a successor on the slot. A child reports the unload both when the parent
+    commanded it and when the backend evicted a granted checkpoint on its own, and either way the record
+    describes weights the device no longer holds.
+    """
+
+    def _unload_report(self, process_id: int) -> HordeProcessStateChangeMessage:
+        return HordeProcessStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
+            info="Retained weights were evicted by the backend",
+        )
+
+    async def test_a_vram_unload_report_clears_the_retained_record(self) -> None:
+        """A slot that says its model left VRAM stops being charged and routed to as a retained resident."""
+        process_info = make_mock_process_info(0, model_name="stable_diffusion")
+        process_info.last_process_state = HordeProcessState.INFERENCE_COMPLETE
+        process_info.retained_resident_model = "stable_diffusion"
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}))
+        _enqueue(message_dispatcher, self._unload_report(0))
+
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert process_info.retained_resident_model is None
+
+    async def test_the_settle_that_follows_cannot_restore_the_record(self) -> None:
+        """A report arriving while the job settles must win: the settle resolves the same grant.
+
+        The child reports the eviction around the end of its job, so the in-flight grant is still stamped
+        on the slot. Clearing only the resolved record would let the settle write the phantom straight
+        back and the slot would carry it for the rest of the session.
+        """
+        process_info = make_mock_process_info(0, model_name="stable_diffusion")
+        process_info.last_process_state = HordeProcessState.INFERENCE_COMPLETE
+        process_info.retained_resident_model = "stable_diffusion"
+        process_info.retention_granted_model = "stable_diffusion"
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}))
+        _enqueue(message_dispatcher, self._unload_report(0))
+
+        await message_dispatcher.receive_and_handle_process_messages()
+        process_info.settle_retention_after_job()
+
+        assert process_info.retained_resident_model is None
+
+
+class TestRefusedVramUnload:
+    """An unload the device did not honour must not be booked as room the worker has.
+
+    The free is a request the child's backend answers by dropping what it can. A model a live reference still
+    pins is skipped and stays on the card, and the command itself reports nothing about the difference. The
+    child judges the unload on what the device still holds; what the parent does with that verdict is here.
+    """
+
+    def _refusal_report(self, process_id: int) -> HordeModelStateChangeMessage:
+        return HordeModelStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Models remain in VRAM after an unload",
+            horde_model_name="stable_diffusion",
+            horde_model_state=ModelLoadState.LOADED_IN_VRAM,
+            vram_unload_refused=True,
+        )
+
+    def _make_map(self) -> tuple[ProcessMap, HordeProcessInfo]:
+        process_info = make_mock_process_info(0, model_name="stable_diffusion")
+        process_info.process_launch_identifier = 0
+        process_info.last_process_state = HordeProcessState.PRELOADED_MODEL
+        process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        return ProcessMap({0: process_info}), process_info
+
+    async def test_a_refused_unload_keeps_the_model_recorded_in_vram(self) -> None:
+        """The map follows the device, so the ledger is never told about room the card did not give back."""
+        process_map, process_info = self._make_map()
+        horde_model_map = HordeModelMap(root={})
+        message_dispatcher = _make_dispatcher(process_map=process_map, horde_model_map=horde_model_map)
+        _enqueue(message_dispatcher, self._refusal_report(0))
+
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert process_info.vram_unload_refused is True
+        assert horde_model_map.root["stable_diffusion"].horde_model_load_state == ModelLoadState.LOADED_IN_VRAM
+
+    async def test_a_refusal_leaves_the_slot_out_of_reclaim_rather_than_re_asked(self) -> None:
+        """The spent command's record stands, which is what every reclaim candidate set reads as "pass over".
+
+        Retiring it would put the slot back at the head of the reclaim order it has already refused, and the
+        ladder would spend its cheap resident rung on the same refusal every tick instead of escalating.
+        """
+        process_map, process_info = self._make_map()
+        message_dispatcher = _make_dispatcher(process_map=process_map)
+        _enqueue(message_dispatcher, self._refusal_report(0))
+
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert process_info.vram_materialized_monotonic is None, (
+            "nothing materialized: re-stamping the recency key would rank a refusing slot as the newest "
+            "resident and put it first in the reclaim order"
+        )
+
+    async def test_a_genuine_load_clears_the_refusal(self) -> None:
+        """A fresh tenancy is not what the refusal was about, so it must not keep the slot out of reclaim."""
+        process_map, process_info = self._make_map()
+        process_info.vram_unload_refused = True
+        message_dispatcher = _make_dispatcher(process_map=process_map)
+        _enqueue(
+            message_dispatcher,
+            HordeModelStateChangeMessage(
+                process_id=0,
+                process_launch_identifier=0,
+                process_state=HordeProcessState.PRELOADED_MODEL,
+                info="loaded",
+                horde_model_name="stable_diffusion",
+                horde_model_state=ModelLoadState.LOADED_IN_VRAM,
+            ),
+        )
+
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert process_info.vram_unload_refused is False
+        assert process_info.last_control_flag is None

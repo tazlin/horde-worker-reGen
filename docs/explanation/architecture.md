@@ -236,6 +236,15 @@ host's NVML device; predictive scheduling and measured admission therefore reaso
 the same simulated card. A mutable shared VRAM ledger remains opt-in for tests that need
 allocations and reclamation to change the reading over time.
 
+Fake inference children also honour the GPU denoise clearance lease when the parent hands them one: the
+child resets its per-job grant, reports itself primed once its pipeline is staged, blocks on the parent's
+grant where hordelib brackets the real sample call, and signals the window closed when its sampling ends.
+It reports positioned step beats across that window, which is what advances a primed slot to sampling
+parent-side and what the tail-overlap handoff sizes its window from. Both the whole-job path and the
+disaggregated sample stage run the handshake, so a harness run exercises the clearance controller's
+admission, grant accounting, and handoff end to end rather than only its configuration. A child handed no
+lease keeps the unleased message sequence exactly, so runs with the lease off are unaffected.
+
 Bounded runs diagnose each pipeline stage separately. They also bound terminal
 accounting: once a finite source is exhausted and the tracker has finalized every
 job, a missing completion transition fails promptly with source, pop-gate, process,

@@ -28,6 +28,7 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
     HordeControlFlag,
     HordeInferenceControlMessage,
     HordeProcessState,
@@ -1075,3 +1076,80 @@ async def test_a_whole_job_retained_resident_still_charges_the_full_footprint(mo
     )
 
     assert charges_mb == pytest.approx(6800.0)
+
+
+async def test_a_second_concurrent_lease_grant_is_charged_against_the_card(monkeypatch) -> None:  # noqa: ANN001
+    """A sibling staged under the lease will materialise beside these weights, so its peak is charged now.
+
+    The failure this pins: with more than one lease slot the parent can clear two children into their
+    load-and-sample windows at once. Retention priced against the card minus contexts alone reads as if this
+    grant were the only claim in flight, so both fit "alone" and jointly overflow the card, which the driver
+    settles by demand-paging or by failing the allocation.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    staged_job = make_job_pop_response(model=_OTHER_MODEL)
+    await track_popped_job_async(job_tracker, staged_job)
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    sibling.last_process_state = HordeProcessState.INFERENCE_PRIMED
+    sibling.last_job_referenced = staged_job
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+
+    bridge_data = make_mock_bridge_data(
+        enable_vram_budget=True,
+        vram_reserve_mb=2048,
+        ram_reserve_mb=4096,
+        gpu_sampling_lease_enabled=True,
+    )
+    scheduler = _make_inference_scheduler(job_tracker=job_tracker, bridge_data=bridge_data, process_map=process_map)
+    for process_id in (_PROCESS_ID, _SIBLING_PROCESS_ID):
+        for model in (_MODEL, _OTHER_MODEL):
+            _seed_repeat_evidence(scheduler, process_id, model)
+    scheduler._overhead.set_marginal_overhead_mb(500.0)
+    scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+        return_value=Mock(fits=False, predicted_mb=8000.0, reserve_mb=4096.0),
+    )
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    # Without the staged sibling's window the card reads as 16376 - 500 = 15876MB against an 8000MB peak, an
+    # easy fit. Its 10000MB materialisation less the 2048MB encode charge the ledger already carries leaves
+    # 7924MB, which the peak plus the noise buffer does not fit into.
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_sampling_vram_mb", lambda job, baseline: 10000.0)
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+async def test_an_idle_lane_holding_components_is_charged_as_a_tenant() -> None:
+    """A lane's component cache outlives every job boundary, so retention is priced beside it.
+
+    The card is only as big as what nothing is holding. A cache no job boundary returns is as real a tenant as
+    a retained checkpoint, and the parent is told what each lane holds on every memory report, so pricing the
+    grant as if the lane held nothing packs the card past what it physically has.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    lane = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=None)
+    lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+    lane.held_components = [
+        HeldComponentSnapshot(kind="unet", identity="staged-checkpoint", approx_ram_mb=7600.0),
+    ]
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: lane})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(500.0)
+    scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+        return_value=Mock(fits=False, predicted_mb=8000.0, reserve_mb=4096.0),
+    )
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    # 16376 less the 500MB sibling context and the 7600MB the lane is holding leaves 8276MB, under the
+    # 8000MB peak plus its admission noise buffer. Charged as if the lane held nothing, the same grant reads
+    # as a comfortable fit.
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )

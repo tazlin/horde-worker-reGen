@@ -248,6 +248,14 @@ class MessageDispatcher:
     only for an episode an operator actually saw reported."""
     _queue_deadlock_summary_logged: bool = False
     """Whether the current queue-deadlock episode has had its diagnostics logged."""
+    _device_free_mb_provider: Callable[[int], float | None] | None = None
+    """The parent's device-level (NVML) free VRAM reading, or None when nothing injected one."""
+    _deadlock_dispatch_progress_mark: tuple[int, int] | None = None
+    """Cumulative (inference starts, completions) when the current queue deadlock was detected, else None.
+
+    What the clear path is measured against, so a deadlock ends when work moves rather than when the process
+    map does. Recovery remedies mutate the map by design (a paused lane, a slot replaced, safety moved off the
+    card), and reading that as progress resets the escalation clock the remedy itself was issued under."""
 
     _DEADLOCK_PRINT_SUSTAIN_SECONDS = 10.0
     """How long a raw deadlock condition must hold continuously before any of its diagnostics are logged.
@@ -1221,6 +1229,9 @@ class MessageDispatcher:
         ):
             self._handle_inference_starting(message.process_id)
 
+        if message.process_state == HordeProcessState.UNLOADED_MODEL_FROM_VRAM:
+            self._process_map.on_model_vram_clear(process_id=message.process_id)
+
         if (
             message.process_state == HordeProcessState.UNLOADED_MODEL_FROM_RAM
             and self._process_map[message.process_id].last_process_state != HordeProcessState.UNLOADED_MODEL_FROM_RAM
@@ -1351,6 +1362,12 @@ class MessageDispatcher:
         # restarts the settle window resident-footprint observation measures from.
         self._last_model_load_change_at[message.process_id] = time.time()
 
+        if message.vram_unload_refused:
+            # Recorded before the map is updated: the state this message carries is the residency the device
+            # really has (VRAM, not RAM), and the refusal is what keeps the slot out of a reclaim that would
+            # ask the same question again next tick.
+            self._process_map.on_vram_unload_refused(message.process_id)
+
         if message.horde_model_state == ModelLoadState.FAILED:
             # The model could not be loaded. Do not record it as resident anywhere: clear any LOADING entry
             # this process held for it (left by the PRELOADING_MODEL message moments earlier) so the model is
@@ -1387,14 +1404,24 @@ class MessageDispatcher:
                 or message.horde_model_state == ModelLoadState.LOADED_IN_RAM
             ):
                 if message.horde_model_state == ModelLoadState.LOADED_IN_VRAM:
-                    # Stamp the VRAM-materialization time so the reclaim ladder can rank this idle resident by
-                    # recency (LIFO): the driver demotes the least-recently-touched allocator, so the newest
-                    # resident is reclaimed first.
-                    self._process_map.note_vram_materialized(message.process_id)
-                    loaded_message = (
-                        f"Process {message.process_id} just finished inference, and has "
-                        f"{message.horde_model_name} in VRAM."
-                    )
+                    if message.vram_unload_refused:
+                        # Nothing materialized here: this is the same tenancy an unload failed to remove, so
+                        # re-stamping it would make a refused slot read as the newest resident and put it at
+                        # the head of the reclaim order it has already refused. The refusal record retires the
+                        # spent unload command in its place.
+                        loaded_message = (
+                            f"Process {message.process_id} still has {message.horde_model_name} in VRAM "
+                            "after an unload it did not honour."
+                        )
+                    else:
+                        # Stamp the VRAM-materialization time so the reclaim ladder can rank this idle
+                        # resident by recency (LIFO): the driver demotes the least-recently-touched
+                        # allocator, so the newest resident is reclaimed first.
+                        self._process_map.note_vram_materialized(message.process_id)
+                        loaded_message = (
+                            f"Process {message.process_id} just finished inference, and has "
+                            f"{message.horde_model_name} in VRAM."
+                        )
                     logger.debug(loaded_message)
                 elif message.horde_model_state == ModelLoadState.LOADED_IN_RAM:
                     loaded_message = (
@@ -1456,7 +1483,16 @@ class MessageDispatcher:
             # belonging to whatever was dispatched after it.
             owned_job = process_info.current_inference_job()
             if owned_job is None or owned_job.id_ == message.sdk_api_job_info.id_:
-                process_info.settle_retention_after_job()
+                if message.state == GENERATION_STATE.faulted:
+                    # A fault is evidence about the job, never about the device. The grant's whole claim is
+                    # that the child finished its sampling and left the weights standing; a job that failed
+                    # part-way through may have left them, freed them, or never loaded them, and the parent
+                    # cannot tell which. Recording residency on that guess is what makes the retention fit
+                    # charge weights that are not there and same-model routing seat a successor on an empty
+                    # slot, so the grant is dropped with the record instead.
+                    self._process_map.on_model_vram_clear(process_id=message.process_id)
+                else:
+                    process_info.settle_retention_after_job()
             process_info.current_inference_started_at = None
             process_info.current_first_step_at = None
             process_info.current_job_expected_sampling_seconds = None
@@ -1885,14 +1921,26 @@ class MessageDispatcher:
         logger.trace(f"horde_model_map: {self._horde_model_map}")
         logger.trace(f"process_map: {self._process_map}")
 
+    def set_device_free_mb_provider(self, provider: Callable[[int], float | None]) -> None:
+        """Inject the parent's device-level free VRAM reading, for the deadlock diagnostics.
+
+        Optional: with no provider the summary reports the child-derived figure alone, exactly as before.
+        """
+        self._device_free_mb_provider = provider
+
     def _deadlock_state_summary(self) -> str:
-        """Compact one-line description of the outstanding work and slot states behind a deadlock condition."""
+        """Compact one-line description of the outstanding work and slot states behind a deadlock condition.
+
+        Carries the parent's device reading beside the children's when one is available. A wedge is argued
+        about in these terms, and the child view is the untrustworthy half of the pair on a paging card.
+        """
+        measured_free_mb = None if self._device_free_mb_provider is None else self._device_free_mb_provider(0)
         return (
             f"pending={len(self._job_tracker.jobs_pending_inference)} "
             f"in_progress={len(self._job_tracker.jobs_in_progress)} "
             f"pending_safety={len(self._job_tracker.jobs_pending_safety_check)} "
             f"pending_submit={len(self._job_tracker.jobs_pending_submit)} "
-            f"{self._process_map.residency_snapshot()}"
+            f"{self._process_map.residency_snapshot(measured_device_free_mb=measured_free_mb)}"
         )
 
     def _deadlock_print_due(self, condition_since: float | None) -> bool:
@@ -1919,6 +1967,28 @@ class MessageDispatcher:
             self._last_deadlock_detail_log_time = now
             return True
         return False
+
+    def _dispatch_progress_counters(self) -> tuple[int, int]:
+        """The worker's cumulative (inference starts, terminal completions), the only real dispatch progress.
+
+        Both are monotonic movement counters over jobs, so neither can be advanced by the recovery ladder
+        rearranging processes: a paused lane, a replaced slot or a safety move changes the process map and
+        nothing here.
+        """
+        return (
+            self._job_tracker.total_num_inference_starts,
+            self._job_tracker.total_num_completed_jobs,
+        )
+
+    def _dispatch_progressed_since_deadlock(self) -> bool:
+        """Whether a job has entered inference or finished since the current deadlock was first detected.
+
+        A detection with no mark (a latch set before this bookkeeping existed, or already cleared) reads as
+        progress so the clear path is never wedged by its own absence of history.
+        """
+        if self._deadlock_dispatch_progress_mark is None:
+            return True
+        return self._dispatch_progress_counters() != self._deadlock_dispatch_progress_mark
 
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything.
@@ -1992,19 +2062,29 @@ class MessageDispatcher:
             self._in_queue_deadlock
             and not queue_deadlock_condition
             and (self._process_map.num_starting_processes() == 0 or self._process_map.has_inference_in_progress())
+            and self._dispatch_progressed_since_deadlock()
         ):
             # The ``num_starting_processes() == 0`` term is an anti-flap guard so a model-preload window (a
             # re-spawning slot in PROCESS_STARTING) does not prematurely clear a real all-idle deadlock. But a
             # slot genuinely mid-inference disproves the all-idle premise outright, so a slow-to-spawn sibling
             # must not keep the flag latched over a healthy, advancing worker.
+            #
+            # The condition alone is not enough to clear, because the recovery ladder's own remedies falsify
+            # it: pausing a lane or moving safety off the card takes a process out of the waiting-for-job
+            # population, so "not every process is idle" becomes true without a single job moving. Clearing
+            # there hands the escalation a fresh clock every time it acts, and the ladder oscillates between
+            # its cheapest rungs forever instead of reaching its terminal rung or the give-up assessor. Only
+            # a job actually entering inference or completing is progress a deadlock can be cleared on.
             if self._queue_deadlock_summary_logged:
                 logger.debug("Queue deadlock cleared.")
             self._in_queue_deadlock = False
             self._queue_deadlock_model = None
             self._queue_deadlock_process_id = None
             self._queue_deadlock_summary_logged = False
+            self._deadlock_dispatch_progress_mark = None
 
         if not self._in_queue_deadlock and queue_deadlock_condition:
+            self._deadlock_dispatch_progress_mark = self._dispatch_progress_counters()
             model_process_map: dict[str, int] = {}
             for process in self._process_map.values():
                 if process.loaded_horde_model_name is not None:

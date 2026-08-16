@@ -1486,6 +1486,11 @@ class HordeWorkerProcessManager:
             state=self._state,
             aux_hold_provider=self._aux_prefetch_coordinator.job_ids_with_live_deadlines,
         )
+        # The deadlock diagnostics argue about how full the card is, so they read the same device-level
+        # figure admission does rather than the children's paging-inflated view of it.
+        self._message_dispatcher.set_device_free_mb_provider(
+            lambda device_index: self.latest_device_free_mb(device_index)
+        )
         # A shared child-to-parent channel that has wedged a physical read (a torn frame, a stalled writer
         # lock) is unrecoverable in place because every child inherits the same queue; the only correct
         # terminal is a loud abort and restart onto a fresh channel.

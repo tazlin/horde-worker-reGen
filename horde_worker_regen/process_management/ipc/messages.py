@@ -367,6 +367,14 @@ class HordeModelStateChangeMessage(HordeProcessStateChangeMessage):
     """The name of the model as defined in the horde model reference."""
     horde_model_state: ModelLoadState
     """The state of the model."""
+    vram_unload_refused: bool = False
+    """Set when this report follows a VRAM unload the device did not honour.
+
+    A full free is a request the backend answers by dropping what it can; an entry a live reference still
+    pins is skipped and stays on the card, and the command itself reports nothing. Without this the parent
+    would record host-RAM residency for weights the device is holding, and the ledger would then show room
+    that does not exist for the rest of the session. The accompanying ``horde_model_state`` is the residency
+    the device really has, so the flag adds the *reason* rather than the fact."""
 
 
 class HordeDownloadProgressMessage(HordeModelStateChangeMessage):

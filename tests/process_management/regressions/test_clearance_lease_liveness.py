@@ -11,7 +11,9 @@ slot cap holds the next grant until a window retires).
 from __future__ import annotations
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
@@ -28,6 +30,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -329,3 +332,100 @@ class TestHeavyPairFence:
         result = controller.step(_inputs(staged=second_staged), admit_fn=lambda _pid: True)
         assert result.cleared_process_ids == (2,)
         assert controller.grant_state(2) is GrantState.CLEARED
+
+
+class TestClearanceResidentWeightCredit:
+    """Clearance prices a candidate whose weights the target slot already retains at its activation delta.
+
+    The regression: a slot granted retention for a model, taking its next job for the same model, was held
+    at clearance for the whole materialisation peak (weights plus activation) although those weights had
+    never left the card and were already excluded from the device-free reading. On a card with room for the
+    activation alone the streak stalled until the child timed its lease out and sampled unpriced. A
+    disaggregated sampler cannot escape it at all: its sample stage reports no model-load transition, so the
+    model map never shows its UNet VRAM-resident however long the slot holds it, and the parent's retention
+    record is the only truth that says the weights are there.
+    """
+
+    _WEIGHTS_MB = 5000.0
+    _PEAK_MB = 6000.0
+
+    def _pin_predictors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Price the candidate at a peak dominated by weights, so the credit decides the fit."""
+        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: self._PEAK_MB)
+        monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", lambda _job, _baseline: self._WEIGHTS_MB)
+
+    async def _scheduler_with_staged_waiter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        device_free_mb: float,
+        retained_model: str | None,
+    ) -> tuple[object, ImageGenerateJobPopResponse]:
+        """A slot primed with a same-model job while a sibling samples, the clearance situation under load."""
+        self._pin_predictors(monkeypatch)
+        job_tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            bridge_data=make_mock_bridge_data(
+                gpu_sampling_lease_enabled=True,
+                enable_vram_budget=True,
+                vram_reserve_mb=2048,
+                ram_reserve_mb=4096,
+            ),
+            job_tracker=job_tracker,
+            device_free_mb=device_free_mb,
+            max_concurrent=2,
+        )
+        waiter = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_PRIMED)
+        waiter.retained_resident_model = retained_model
+        sibling = make_mock_process_info(1, model_name=None, state=HordeProcessState.INFERENCE_STARTING)
+        scheduler._process_map = ProcessMap({0: waiter, 1: sibling})
+
+        # A sibling job already sampling on the card: the candidate's activation lands beside a live
+        # reservation, so its resident weights buy it a credit rather than an unconditional no-op admit.
+        sibling_job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(job_tracker, sibling_job)
+        await job_tracker.mark_inference_started(sibling_job)
+
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(job_tracker, job)
+        assert job.id_ is not None
+        assert job_tracker.mark_job_aux_prepared_if_ready(job.id_) is True
+        waiter.last_job_referenced = job
+        scheduler._record_dispatch_reservation(job, waiter, baseline=None, staging_only=True)
+        return scheduler, job
+
+    async def test_retained_resident_clears_when_the_activation_delta_fits(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Weights the slot holds are credited, so a card with room for the activation alone clears the job."""
+        scheduler, _job = await self._scheduler_with_staged_waiter(
+            monkeypatch,
+            device_free_mb=4000.0,  # under the full peak, well over the activation delta
+            retained_model="stable_diffusion",
+        )
+        assert scheduler.clearance_admit_process(0) is True
+
+    async def test_the_same_card_holds_a_candidate_whose_weights_are_not_resident(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The contrast: with nothing retained the weights must still land, so the full peak is charged."""
+        scheduler, _job = await self._scheduler_with_staged_waiter(
+            monkeypatch,
+            device_free_mb=4000.0,
+            retained_model=None,
+        )
+        assert scheduler.clearance_admit_process(0) is False
+
+    async def test_holds_when_even_the_activation_delta_does_not_fit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The credit is bounded to the weights: an activation the card cannot seat is still held."""
+        scheduler, _job = await self._scheduler_with_staged_waiter(
+            monkeypatch,
+            device_free_mb=600.0,  # under the activation delta too
+            retained_model="stable_diffusion",
+        )
+        assert scheduler.clearance_admit_process(0) is False

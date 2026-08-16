@@ -100,6 +100,17 @@ async def _make_deadlocked_dispatcher() -> tuple[MessageDispatcher, ProcessMap]:
     )
 
 
+async def _start_tracked_inference(message_dispatcher: MessageDispatcher, process_map: ProcessMap) -> None:
+    """Move a slot into inference the way dispatch does: the tracker records the start and the slot reports it.
+
+    A queue deadlock clears only on dispatch progress (a job entering inference or completing), never on a slot
+    state alone, because the recovery ladder's own remedies change slot states without moving any job.
+    """
+    job = message_dispatcher._job_tracker.jobs_pending_inference[0]
+    await message_dispatcher._job_tracker.mark_inference_started(job)
+    process_map[0] = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+
+
 def _age_deadlock_conditions(message_dispatcher: MessageDispatcher) -> None:
     """Backdate the raw-condition clocks so the next tick sees the conditions as sustained."""
     aged = time.time() - (MessageDispatcher._DEADLOCK_PRINT_SUSTAIN_SECONDS + 1)
@@ -354,7 +365,7 @@ class TestDetectDeadlock:
         message_dispatcher.detect_deadlock()
 
         with _capture_levels() as records:
-            process_map[0] = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+            await _start_tracked_inference(message_dispatcher, process_map)
             message_dispatcher.detect_deadlock()
 
         assert message_dispatcher._in_deadlock is False
@@ -366,7 +377,7 @@ class TestDetectDeadlock:
         sustained_dispatcher.detect_deadlock()
 
         with _capture_levels() as sustained_records:
-            sustained_process_map[0] = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+            await _start_tracked_inference(sustained_dispatcher, sustained_process_map)
             sustained_dispatcher.detect_deadlock()
 
         assert sustained_dispatcher._in_deadlock is False

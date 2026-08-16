@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
+from types import SimpleNamespace
 
+import pytest
 from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent
 
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState
@@ -22,6 +25,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     format_tail_overlap_tally,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
 
 _MARGIN_MB = 3072.0
@@ -689,3 +693,96 @@ class TestIncomingLoadEstimate:
         process_map[1] = make_mock_process_info(1, device_index=0)
         process_map.on_job_metrics(1, JobPhaseMetrics())
         assert process_map.recent_vram_load_seconds(0) is None
+
+
+class _SampleStageFake:
+    """A minimal stand-in for the sampler child, exposing only what ``_run_sample_stage`` touches in dry run.
+
+    Anything the stage reaches for beyond this raises, so the test states the stage's real dependency
+    surface rather than tolerating a half-mocked process.
+    """
+
+    process_id = 3
+    process_launch_identifier = 1
+    _dry_run_skip_inference = True
+
+    def __init__(self, lease: ClearanceLeaseProxy) -> None:
+        self._gpu_sampling_lease = lease
+        self._last_progress_step_seen: int | None = None
+        self._nonadvancing_progress_repeats = 0
+        self.messages: list[object] = []
+        self.process_message_queue = SimpleNamespace(put=self.messages.append)
+        self.states: list[HordeProcessState] = []
+        self.retained_weights_evicted_reports = 0
+
+    def send_process_state_change_message(self, process_state: HordeProcessState, info: str = "") -> None:
+        self.states.append(process_state)
+
+    def send_stage_job_metrics_message(self, job_id: str, *, stage: object) -> None:
+        return None
+
+    @staticmethod
+    def _make_dummy_latent_bytes() -> bytes:
+        return b"latent"
+
+    def report_retained_weights_evicted(self) -> None:
+        """Record the post-result residency correction the stage sends; its content is tested elsewhere."""
+        self.retained_weights_evicted_reports += 1
+
+
+class TestDisaggregatedSampleStageGrant:
+    """A pinned sampler's every disaggregated stage waits for its own grant, exactly as a whole job does.
+
+    The proxy's per-job flag latches on the first acquire and is cleared only by ``begin_job``. A sample
+    stage that never called it left the sampler blocking once, on its first stage, and passing straight
+    through on every stage after: the parent's grants stopped bracketing the denoise loops they price, and
+    every later window sampled unpriced.
+    """
+
+    def _run_stage(self, fake: _SampleStageFake, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Drive one dry-run sample stage over a single slice against the fake sampler."""
+        import horde_worker_regen.reference_helper as reference_helper
+
+        monkeypatch.setattr(reference_helper, "ensure_offline_reference_manager", lambda: None)
+        message = SimpleNamespace(slices=[SimpleNamespace(job_id=str(uuid.uuid4()))])
+        HordeInferenceProcess._run_sample_stage(fake, message)  # type: ignore[arg-type]
+
+    def test_each_stage_waits_for_its_own_grant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """After a stage consumes its grant, the next stage blocks again instead of passing through."""
+        clearance = _FakeSemaphore(1, bound=1)  # the parent has granted the first window
+        lease = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+        fake = _SampleStageFake(lease)
+
+        self._run_stage(fake, monkeypatch)
+        assert lease.acquire(True, 0.0) is True  # the stage's own sample takes the granted permit
+        assert clearance.value == 0
+
+        self._run_stage(fake, monkeypatch)
+        # No permit is available now, so the second stage's sample cannot proceed without a fresh grant.
+        assert lease.acquire(True, 0.0) is False
+
+    def test_a_multi_slice_batch_consumes_one_grant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One control message is one window: slices after the first pass through rather than waiting again."""
+        import horde_worker_regen.reference_helper as reference_helper
+
+        monkeypatch.setattr(reference_helper, "ensure_offline_reference_manager", lambda: None)
+        clearance = _FakeSemaphore(1, bound=1)
+        lease = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+        fake = _SampleStageFake(lease)
+        message = SimpleNamespace(
+            slices=[SimpleNamespace(job_id=str(uuid.uuid4())) for _ in range(3)],
+        )
+
+        HordeInferenceProcess._run_sample_stage(fake, message)  # type: ignore[arg-type]
+
+        assert lease.acquire(True, 0.0) is True
+        assert lease.acquire(True, 0.0) is True  # a sibling slice never waits for a second grant
+        assert clearance.value == 0
+
+    def test_the_stage_primes_before_waiting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The sampler reports ``INFERENCE_PRIMED`` before it can block, so the parent sees a staged waiter."""
+        fake = _SampleStageFake(ClearanceLeaseProxy(clearance=_held_empty_clearance(), done=_FakeSemaphore()))
+
+        self._run_stage(fake, monkeypatch)
+
+        assert fake.states[0] == HordeProcessState.INFERENCE_PRIMED
