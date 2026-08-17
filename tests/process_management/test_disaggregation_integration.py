@@ -26,6 +26,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
+    HordeControlFlag,
     HordeImageResult,
     HordePostProcessControlMessage,
     HordeProcessMessage,
@@ -291,6 +292,32 @@ async def test_an_ungranted_disaggregated_dispatch_stamps_no_grant() -> None:
     assert routed is True
     assert inference.retention_granted_model is None
     assert inference.retention_granted_component_only is False
+
+
+@pytest.mark.asyncio
+async def test_disaggregated_dispatch_retires_a_standing_unload_flag() -> None:
+    """A slot the ladder once told to unload reads as executing again once a disaggregated job pins it.
+
+    A disaggregated sampler never reports the VRAM materialisation that retires an outstanding-unload flag, so
+    the dispatch itself must stamp the slot as executing (as the monolithic path does). Left standing, the flag
+    makes every later idle-unload of that slot a no-op ("already unloading"), and a dispatch held for that
+    slot's retained weights has no actuator left and parks until the recovery ladder rebuilds the pool.
+    """
+    pm, inference = _make_manager_with_roles()
+    inference.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+    job = _make_source_job(source_processing="txt2img", source_image=None)
+    await pm._job_tracker.record_popped_job(job)
+
+    routed = await pm._inference_scheduler._dispatch_disaggregated(
+        job,
+        inference,
+        keep_model_resident_after=True,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+
+    assert routed is True
+    assert inference.last_control_flag == HordeControlFlag.START_INFERENCE
 
 
 @pytest.mark.asyncio

@@ -11207,6 +11207,12 @@ class InferenceScheduler:
             next_job,
             attempt_ordinal=(tracked.inference_attempts + 1) if tracked is not None else 1,
         )
+        # The pinned sampler is now executing, the same as a monolithic START_INFERENCE. Without this the slot
+        # keeps whatever control flag it last carried; a slot the ladder once told to unload would keep reading
+        # as "unload in flight" across every disaggregated job it serves afterwards, since a disaggregated
+        # sampler never reports a VRAM materialisation that would retire the flag, and both the reclaim
+        # candidate set and the unload actuator would pass it over for good.
+        process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
         process_with_model.loaded_horde_model_name = model
         process_with_model.loaded_horde_model_baseline = self._model_metadata.get_baseline(model)
         # Carry the retention verdict on the sampler lane: the sample stage's completion is synthesized by the
