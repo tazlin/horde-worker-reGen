@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen import harness as harness_module
-from horde_worker_regen.harness import HarnessConfig, HarnessResult, run_harness_async
+from horde_worker_regen.harness import HarnessConfig, HarnessResult, HarnessSimResources, run_harness_async
 from horde_worker_regen.process_management.ipc.messages import PipelineStageTag
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager, SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -72,8 +72,12 @@ async def test_disaggregated_streak_grants_every_sampling_window(monkeypatch: py
     managers: list[HordeWorkerProcessManager] = []
     build_manager = harness_module.build_harness_process_manager
 
-    def _capture_manager(config: HarnessConfig) -> tuple[HordeWorkerProcessManager, int]:
-        manager, num_jobs_expected = build_manager(config)
+    def _capture_manager(
+        config: HarnessConfig,
+        *,
+        sim_resources: HarnessSimResources | None = None,
+    ) -> tuple[HordeWorkerProcessManager, int]:
+        manager, num_jobs_expected = build_manager(config, sim_resources=sim_resources)
         managers.append(manager)
         return manager, num_jobs_expected
 
@@ -133,3 +137,76 @@ async def test_disaggregated_streak_grants_every_sampling_window(monkeypatch: py
     # The handoff is the pipeline's overlap: without it the next window opens only after the current one
     # closes, which is the inter-job GPU stall the lease exists to remove.
     assert handoffs >= 1, "the tail-overlap handoff never fired across the streak"
+
+
+@pytest.mark.e2e
+async def test_single_model_streak_on_one_sampling_slot_stays_priced_and_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-model streak at one sampling slot drains with every sampling window priced and nothing faulted.
+
+    The shape the two-model case above cannot cover: one model, ``max_threads`` 1 and a single lease slot, so
+    every job's only copy of the weights sits on the lane sampling the job in front of it. What this pins is
+    the lease's accounting under that serialisation, which is what a change to how a same-model head is
+    admitted can break: no sample stage enters a window the parent did not grant, and the queue still drains.
+
+    Two things this deliberately does not assert. The tail-overlap handoff cannot fire here at all: a
+    disaggregated child reaches primed only when its sample control message arrives, and it cannot read that
+    message while it is mid-denoise, so a single-sampler queue has no second child to hand a permit to. And the
+    fake-child pipeline encodes instantly, so the cost this shape pays live (the whole encode serialised behind
+    the sample) has no analogue here to measure.
+    """
+    managers: list[HordeWorkerProcessManager] = []
+    build_manager = harness_module.build_harness_process_manager
+
+    def _capture_manager(
+        config: HarnessConfig,
+        *,
+        sim_resources: HarnessSimResources | None = None,
+    ) -> tuple[HordeWorkerProcessManager, int]:
+        manager, num_jobs_expected = build_manager(config, sim_resources=sim_resources)
+        managers.append(manager)
+        return manager, num_jobs_expected
+
+    monkeypatch.setattr(harness_module, "build_harness_process_manager", _capture_manager)
+
+    scenario = [make_canned_job(_MODELS[0], width=512, height=512, ddim_steps=30) for _ in range(_NUM_JOBS)]
+    result = await run_harness_async(
+        HarnessConfig(
+            scenario=scenario,
+            process_mode="fake",
+            skip_api=True,
+            job_delay_seconds=_SAMPLE_SECONDS,
+            timeout_seconds=240.0,
+            bridge_data_overrides={
+                "max_threads": 1,
+                "queue_size": 2,
+                "enable_pipeline_disaggregation": True,
+                "gpu_sampling_lease_enabled": True,
+                "gpu_sampling_lease_slots": 1,
+                "gpu_sampling_lease_tail_overlap": True,
+                "enable_vram_budget": True,
+                "vram_reserve_mb": 2048,
+                "ram_reserve_mb": 4096,
+                "unload_models_from_vram_often": False,
+            },
+            system_resources=_single_card_resources(),
+        ),
+    )
+
+    assert not result.timed_out, result.failure_summary()
+    assert result.num_jobs_completed == len(scenario), result.failure_summary()
+    assert result.num_jobs_faulted == 0, result.failure_summary()
+    assert result.audit_failures == [], result.failure_summary()
+
+    sample_stages = _sample_stage_count(result)
+    assert sample_stages == len(scenario), f"expected one sample stage per job, saw {sample_stages}"
+
+    assert len(managers) == 1
+    controllers = managers[0]._clearance_controllers
+    assert controllers, "the lease was enabled, so the card must have a clearance controller"
+
+    unpriced = sum(controller.unpriced_sampling_windows for controller in controllers.values())
+    grants = sum(controller.grants_issued for controller in controllers.values())
+    assert unpriced == 0, f"{unpriced} sampling window(s) ran unpriced"
+    assert grants >= sample_stages, f"{grants} grant(s) for {sample_stages} sample stage(s)"

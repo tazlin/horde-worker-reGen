@@ -233,8 +233,14 @@ touching the network or a GPU. Fake inference children report the injected card'
 capacity through the normal memory-message protocol. When the inventory is injected,
 the measured-truth arbiter consumes that protocol reading rather than consulting the
 host's NVML device; predictive scheduling and measured admission therefore reason about
-the same simulated card. A mutable shared VRAM ledger remains opt-in for tests that need
-allocations and reclamation to change the reading over time.
+the same simulated card. A fake-mode run also carries a mutable shared VRAM ledger by default, so the
+simulated card's free reading moves the way a real one does: each slot charges the resident weights its
+scenario's models commit (priced from the same per-baseline registry the parent's own forecast reads), a
+per-process context overhead taken from the injected topology, and the sampling activation of the window
+in flight, released when it closes. Residency, admission, the device-free governor and the reclaim ladder
+therefore run against a card that is genuinely occupied rather than one that always reads empty, which is
+what makes an oracle such as "the governor never saturated" a statement about policy. A run that must keep
+the empty-card reading disables the ledger explicitly; a test needing a pre-seeded card supplies its own.
 
 Fake inference children also honour the GPU denoise clearance lease when the parent hands them one: the
 child resets its per-job grant, reports itself primed once its pipeline is staged, blocks on the parent's

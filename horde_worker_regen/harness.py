@@ -30,6 +30,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from multiprocessing.managers import SyncManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -57,6 +58,10 @@ from horde_worker_regen.process_management.process_manager import (
     SystemResources,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.resource_budget import (
+    predict_job_sampling_vram_mb,
+    predict_job_weight_mb,
+)
 from horde_worker_regen.process_management.resources.run_metrics import (
     SCENARIO_ID_ENV_VAR,
     SCENARIO_REVISION_ENV_VAR,
@@ -283,18 +288,34 @@ class HarnessConfig:
     """If set (fake process mode only), scripts the post-processing fake's misbehaviour on the job path."""
 
     sim_vram_ledger: SimVramLedger | None = None
-    """If set (fake process mode only), a shared simulated-device-VRAM ledger the inference fakes report
-    from and allocate against. Paired with an ``inference_fault_profile`` carrying ``post_processing_peak_mb``
-    it drives deterministic post-processing VRAM pressure (stall + recovery vs. completion) without a GPU.
-    The caller owns the backing ``multiprocessing.Manager`` and must keep it alive for the run."""
+    """A caller-built simulated-device-VRAM ledger the fake children report from and allocate against
+    (fake process mode only), overriding the one a run builds for itself.
+
+    Supply one to seed a card's residency before the run starts, or to read the ledger from the test.
+    Paired with an ``inference_fault_profile`` carrying ``post_processing_peak_mb`` it drives deterministic
+    post-processing VRAM pressure (stall + recovery vs. completion) without a GPU. The caller owns the
+    backing ``multiprocessing.Manager`` and must keep it alive for the run."""
+
+    sim_vram_ledger_enabled: bool = True
+    """Whether a fake-mode run builds its own VRAM ledger when ``sim_vram_ledger`` supplies none.
+
+    A fake card with no ledger reads as permanently empty, so residency, admission, the device-free
+    governor and the reclaim ladder all run against arithmetic that never moves and any "the card never
+    saturated" oracle over such a run is vacuous. The default charges each slot the weights its scenario's
+    models really commit, a per-process context overhead, and the sampling activation of the window in
+    flight. Set False for a run that must keep the empty-card reading (a case judging something other than
+    memory, where residency pressure would only add noise)."""
 
     sim_inference_weights_mb: float = 0.0
-    """Per-inference-process resident model-weight footprint (MB) to register on ``sim_vram_ledger`` when a
-    model loads. Ignored without a ledger."""
+    """Fallback per-inference-process resident model-weight footprint (MB) charged when a model loads.
+
+    Consulted only for a model the run's per-model table does not cover; the table is derived from the
+    scenario's baselines. Ignored without a ledger."""
 
     sim_inference_context_mb: float = 0.0
-    """Per-inference-process fixed CUDA-context overhead (MB) to register on ``sim_vram_ledger`` at startup.
-    Ignored without a ledger."""
+    """Per-inference-process fixed CUDA-context overhead (MB) to register at startup.
+
+    0.0 derives it from the topology's measured process overheads instead. Ignored without a ledger."""
 
     fake_initially_available_models: list[str] | None = None
     """Optional fake-mode model set present before the fake download process starts.
@@ -969,8 +990,118 @@ def _apply_scenario_provenance_env(config: HarnessConfig) -> None:
             os.environ.pop(env_var, None)
 
 
-def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerProcessManager, int]:
+_DEFAULT_SIM_CONTEXT_MB = 800.0
+"""Per-inference-process context overhead (MB) a simulated card charges when the topology declares none.
+
+A CUDA context costs the better part of a gigabyte before a single weight loads, and a fake card that
+charges nothing for it lets a scenario co-locate processes no real card would hold. Only a stand-in for
+an unmeasured topology: a scenario that states its own per-process overheads is charged those instead."""
+
+_SIM_DEVICE_BASELINE_SLOT = -1
+"""Ledger slot the shared one-time runtime cost is charged to, owned by no child process.
+
+``per_process_overhead_mb`` covers the first context *plus* the one-time runtime allocation every later
+context rides on, so charging it per slot double-counts that shared part. The difference between it and
+the marginal figure is charged once against this pseudo-slot, which no child frees."""
+
+
+@dataclass
+class HarnessSimResources:
+    """Spawn-shared simulation objects a fake-mode run owns for its lifetime.
+
+    The VRAM ledger lives in a ``multiprocessing.Manager`` process so the orchestrator and every spawned
+    fake child read and write one card. That helper process outlives the worker unless something closes it,
+    so the caller that opens the run holds this and closes it in its teardown.
+    """
+
+    sync_manager: SyncManager | None = None
+    vram_ledger: SimVramLedger | None = None
+
+    def open_vram_ledger(self) -> SimVramLedger:
+        """Return this run's ledger, starting the backing manager process on first use."""
+        if self.vram_ledger is None:
+            self.sync_manager = multiprocessing.get_context("spawn").Manager()
+            self.vram_ledger = SimVramLedger.from_manager(self.sync_manager)
+        return self.vram_ledger
+
+    def close(self) -> None:
+        """Shut the backing manager process down; safe to call when nothing was opened."""
+        if self.sync_manager is not None:
+            with contextlib.suppress(Exception):
+                self.sync_manager.shutdown()
+            self.sync_manager = None
+        self.vram_ledger = None
+
+
+def _sim_model_vram_tables(
+    scenario: list[ImageGenerateJobPopResponse],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Return per-model ``(resident weights, sampling activation)`` figures (MB) for the fake children.
+
+    Both come from the same hordelib per-baseline registry the parent's own forecast prices jobs from, so a
+    simulated card is occupied by the figures the scheduler is simultaneously reasoning about rather than by
+    numbers invented for the test. Residency is the core diffusion weights, which is what stays on the card
+    between a slot's jobs; the activation is the sampling peak less those weights, so a slot's charge while
+    it samples comes to exactly the peak the forecast admitted it at. Charging the fuller resident footprint
+    instead (weights plus the text encoders and VAE) would put every slot permanently above the price its
+    own admission was granted on, so the card would over-commit by construction and the simulation would be
+    testing the gap between two estimates rather than the policy.
+
+    A model appearing at several resolutions takes the largest of its jobs: weights do not scale with
+    resolution, and pricing the activation at the scenario's heaviest job keeps a card from looking roomier
+    than the run's worst moment.
+    """
+    weights_mb: dict[str, float] = {}
+    activation_mb: dict[str, float] = {}
+    for job in scenario:
+        if job.model is None:
+            continue
+        baseline = representative_baseline_for_model(job.model)
+        core = predict_job_weight_mb(job, baseline)
+        if core is not None:
+            weights_mb[job.model] = max(weights_mb.get(job.model, 0.0), float(core))
+        sampling = predict_job_sampling_vram_mb(job, baseline)
+        if core is not None and sampling is not None:
+            activation_mb[job.model] = max(activation_mb.get(job.model, 0.0), max(0.0, sampling - core))
+    return weights_mb, activation_mb
+
+
+def _seed_sim_vram_ledger(ledger: SimVramLedger, system_resources: SystemResources) -> None:
+    """Write each simulated card's capacity and shared runtime baseline into ``ledger``."""
+    marginal_mb = float(system_resources.marginal_process_overhead_mb)
+    # Only a topology that measured the marginal figure separates a shared part out: with no marginal
+    # measurement each slot is charged the whole per-process figure (as the forecast also charges it), so
+    # a baseline here would bill the one-time cost a second time.
+    shared_runtime_mb = (
+        max(0.0, float(system_resources.per_process_overhead_mb) - marginal_mb) if marginal_mb > 0 else 0.0
+    )
+    for device_index, device in system_resources.device_map.root.items():
+        ledger.set_total(device_index, device.total_memory / (1024 * 1024))
+        if shared_runtime_mb > 0:
+            ledger.set_context_overhead(device_index, _SIM_DEVICE_BASELINE_SLOT, shared_runtime_mb)
+
+
+def _sim_inference_context_mb(config: HarnessConfig, system_resources: SystemResources) -> float:
+    """Return the per-inference-process context overhead (MB) the fake children register on the ledger."""
+    if config.sim_inference_context_mb > 0:
+        return config.sim_inference_context_mb
+    measured = system_resources.marginal_process_overhead_mb or system_resources.per_process_overhead_mb
+    return float(measured) if measured else _DEFAULT_SIM_CONTEXT_MB
+
+
+def build_harness_process_manager(
+    config: HarnessConfig,
+    *,
+    sim_resources: HarnessSimResources | None = None,
+) -> tuple[HordeWorkerProcessManager, int]:
     """Construct a process manager wired according to the harness configuration.
+
+    Args:
+        config: The run description.
+        sim_resources: Holder for spawn-shared simulation objects this build may open, owned and closed by
+            the caller. Without one a fake-mode run gets no default VRAM ledger, because there would be
+            nothing to shut its backing manager process down: a caller that only builds a manager, rather
+            than running one, is not asking for a card to be simulated.
 
     Returns:
         The manager and the number of jobs the scenario expects to complete.
@@ -1002,10 +1133,21 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             device_index: device.total_memory / (1024 * 1024)
             for device_index, device in system_resources.device_map.root.items()
         }
-        if config.sim_vram_ledger is not None:
-            inference_kwargs["sim_vram_ledger"] = config.sim_vram_ledger
+        sim_vram_ledger = config.sim_vram_ledger
+        # A caller who built the ledger also stated its figures, so only a run's own default derives them:
+        # deriving over a hand-seeded card would change residency the caller arranged deliberately.
+        sim_context_mb = config.sim_inference_context_mb
+        if sim_vram_ledger is None and config.sim_vram_ledger_enabled and sim_resources is not None:
+            sim_vram_ledger = sim_resources.open_vram_ledger()
+            _seed_sim_vram_ledger(sim_vram_ledger, system_resources)
+            weights_by_model, activation_by_model = _sim_model_vram_tables(scenario)
+            inference_kwargs["sim_weights_mb_by_model"] = weights_by_model
+            inference_kwargs["sim_sampling_activation_mb_by_model"] = activation_by_model
+            sim_context_mb = _sim_inference_context_mb(config, system_resources)
+        if sim_vram_ledger is not None:
+            inference_kwargs["sim_vram_ledger"] = sim_vram_ledger
             inference_kwargs["sim_weights_mb"] = config.sim_inference_weights_mb
-            inference_kwargs["sim_context_mb"] = config.sim_inference_context_mb
+            inference_kwargs["sim_context_mb"] = sim_context_mb
         inference_entry_point = (
             functools.partial(start_fake_inference_process, **inference_kwargs)
             if inference_kwargs
@@ -1021,8 +1163,8 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         post_process_kwargs: dict = {}
         if config.post_process_fault_profile is not None:
             post_process_kwargs["fault_profile"] = config.post_process_fault_profile
-        if config.sim_vram_ledger is not None:
-            post_process_kwargs["sim_vram_ledger"] = config.sim_vram_ledger
+        if sim_vram_ledger is not None:
+            post_process_kwargs["sim_vram_ledger"] = sim_vram_ledger
         post_process_entry_point = (
             functools.partial(start_fake_post_process_process, **post_process_kwargs)
             if post_process_kwargs
@@ -1462,6 +1604,47 @@ _HARNESS_LOG_SINK_ID: int | None = None
 """The active harness parent-log sink id, so re-arming replaces rather than duplicates it."""
 
 
+@dataclass
+class GovernorTrajectory:
+    """The device-free governor's movement over a run, as the harness observed it."""
+
+    transitions: list[str] = field(default_factory=list)
+    """Band changes in order, as ``"<device>:<previous>-><next>"``."""
+
+    min_free_mb: dict[int, float] = field(default_factory=dict)
+    """Lowest free VRAM (MB) seen per card."""
+
+    total_mb: dict[int, float] = field(default_factory=dict)
+    """Each card's reported capacity (MB)."""
+
+
+async def _observe_governor_trajectory(
+    manager: HordeWorkerProcessManager,
+    trajectory: GovernorTrajectory,
+    *,
+    interval_seconds: float = 0.25,
+) -> None:
+    """Sample the parent's governor bands and device-free readings for the life of the run.
+
+    The metrics snapshot counts only the transitions *into* PRESSURE and SATURATED, so a card that moved
+    and recovered leaves no trace in it. Sampling the bands directly records the whole trajectory, which is
+    what tells a "never saturated" assertion apart from one made about a card that was never loaded.
+    """
+    last_state: dict[int, str] = {}
+    while True:
+        for device_index, state in manager._governor_states_by_device.items():
+            previous = last_state.get(device_index)
+            if previous is not None and previous != state.value:
+                trajectory.transitions.append(f"{device_index}:{previous}->{state.value}")
+            last_state[device_index] = state.value
+        for device_index, free_mb in manager._last_device_free_mb_by_device.items():
+            current = trajectory.min_free_mb.get(device_index)
+            if current is None or free_mb < current:
+                trajectory.min_free_mb[device_index] = free_mb
+        trajectory.total_mb.update(manager._last_device_total_mb_by_device)
+        await asyncio.sleep(interval_seconds)
+
+
 def _arm_harness_log_sink() -> None:
     """Attach the orchestrator's file sink for harness runs (``logs/bridge_harness.log``, DEBUG).
 
@@ -1508,7 +1691,8 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
 
     diagnostics: list[str] = []
 
-    manager, num_jobs_expected = build_harness_process_manager(config)
+    sim_resources = HarnessSimResources()
+    manager, num_jobs_expected = build_harness_process_manager(config, sim_resources=sim_resources)
 
     auditor: JobLifecycleAuditor | None = None
     if config.audit:
@@ -1566,6 +1750,9 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             _seed_synthetic_demand_periodically(manager, config.synthetic_demand),
         )
 
+    governor_trajectory = GovernorTrajectory()
+    governor_task = asyncio.create_task(_observe_governor_trajectory(manager, governor_trajectory))
+
     exception_raised: BaseException | None = None
     try:
         await manager._main_loop()
@@ -1581,10 +1768,14 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             progress_task.cancel()
         if demand_seed_task is not None and not demand_seed_task.done():
             demand_seed_task.cancel()
+        governor_task.cancel()
         # The main loop has returned, so this run's own teardown owns the process from here. Neutralize any
         # force-kill backstop it armed and join its thread before returning: an embedder that runs several
         # lifecycles in one interpreter must never inherit a thread that can later os._exit the process.
         manager._cancel_timed_shutdown()
+        # The children are gone, so nothing reads the simulated card any more; its manager process would
+        # otherwise outlive every run in the interpreter.
+        sim_resources.close()
 
     timed_out = False
     with contextlib.suppress(asyncio.CancelledError):
@@ -1700,6 +1891,9 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             manager._disaggregation_orchestrator.discarded_sample_reroute_count()
         ),
         boot_failed_no_progress=boot_failed_no_progress,
+        governor_state_transitions=governor_trajectory.transitions,
+        min_observed_device_free_mb=dict(governor_trajectory.min_free_mb),
+        observed_device_total_mb=dict(governor_trajectory.total_mb),
     )
 
 

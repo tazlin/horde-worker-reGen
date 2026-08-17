@@ -253,6 +253,8 @@ class FakeInferenceProcess(HordeProcess):
     _sim_total_vram_mb: float = 0.0
     _sim_weights_mb: float = 0.0
     _sim_context_mb: float = 0.0
+    _sim_weights_mb_by_model: dict[str, float]
+    _sim_sampling_activation_mb_by_model: dict[str, float]
     _gpu_sampling_lease: ClearanceLeaseProxy | None = None
 
     def __init__(
@@ -273,6 +275,8 @@ class FakeInferenceProcess(HordeProcess):
         sim_total_vram_mb: float = 0.0,
         sim_weights_mb: float = 0.0,
         sim_context_mb: float = 0.0,
+        sim_weights_mb_by_model: dict[str, float] | None = None,
+        sim_sampling_activation_mb_by_model: dict[str, float] | None = None,
     ) -> None:
         """Initialise the fake inference process.
 
@@ -302,9 +306,15 @@ class FakeInferenceProcess(HordeProcess):
                 This lets ordinary fake runs exercise measured-capacity admission without a manager process. \
                 Defaults to 0.0 (no device telemetry).
             sim_weights_mb (float, optional): This process's resident model-weight footprint to register on \
-                the ledger when a model is loaded. Defaults to 0.0.
+                the ledger when the slot samples. Defaults to 0.0.
             sim_context_mb (float, optional): This process's fixed CUDA-context overhead to register on the \
                 ledger at startup. Defaults to 0.0.
+            sim_weights_mb_by_model (dict[str, float] | None, optional): Per-model resident weight
+                footprints (MB), consulted before ``sim_weights_mb``, so one card carries the
+                differently-sized residency a mixed-model scenario really commits. Defaults to None.
+            sim_sampling_activation_mb_by_model (dict[str, float] | None, optional): Per-model sampling
+                activation (MB) charged on top of the resident weights for the length of a sampling
+                window and released when it closes. Defaults to None (no sampling transient).
         """
         super().__init__(
             process_id=process_id,
@@ -323,10 +333,16 @@ class FakeInferenceProcess(HordeProcess):
         self._sim_total_vram_mb = sim_total_vram_mb
         self._sim_weights_mb = sim_weights_mb
         self._sim_context_mb = sim_context_mb
+        self._sim_weights_mb_by_model = dict(sim_weights_mb_by_model or {})
+        self._sim_sampling_activation_mb_by_model = dict(sim_sampling_activation_mb_by_model or {})
 
         if self._sim_vram_ledger is not None:
+            # A slot's number is reused by whatever replaces it, so drop anything the previous tenant left
+            # charged: a replaced process's VRAM goes back to the card when its context dies, and a
+            # simulation that kept charging for it would drift the card down every recovery.
+            self._sim_vram_ledger.free_own_models(self.device_index, self.process_id)
             # A process's CUDA context is committed for its whole life and only a teardown reclaims it, so
-            # register it up front (its weights are added later, when a model preloads).
+            # register it up front (its weights are added later, when the slot actually samples).
             self._sim_vram_ledger.set_context_overhead(self.device_index, self.process_id, self._sim_context_mb)
 
         if self._fault_profile.crash_on_start:
@@ -366,9 +382,11 @@ class FakeInferenceProcess(HordeProcess):
     def get_process_vram_stats(self) -> tuple[int, int, int, int] | None:
         """Return plausible per-process allocator stats so parent-side attribution plumbing is exercised.
 
-        The fake has no torch allocator nor direct-IO residency pool to read; it reports zeros (an idle
-        context holds no reserved weights and no aimdo pool) so the memory report still carries the fields
-        (allocated, reserved, peak, aimdo) and the ledger/drift accounting runs.
+        The fake has no torch allocator nor direct-IO residency pool to read; it reports zeros so the memory
+        report still carries the fields (allocated, reserved, peak, aimdo) and the ledger/drift accounting
+        runs. A slot holding simulated weights reports none of them per-process, so the parent's
+        committed-VRAM attribution sees a card whose device-wide figure moves while its per-process
+        reservations stay flat: attribution drift is not modelled here.
         """
         return 0, 0, 0, 0
 
@@ -419,17 +437,51 @@ class FakeInferenceProcess(HordeProcess):
         time_start = time.time()
         self._active_model_name = horde_model_name
 
-        if self._sim_vram_ledger is not None:
-            # The model's weights are now resident on this slot: charge them to the simulated device so
-            # siblings (and this process's own later post-processing) see the committed VRAM.
-            self._sim_vram_ledger.set_resident_weights(self.device_index, self.process_id, self._sim_weights_mb)
-
         self.on_horde_model_state_change(
             process_state=HordeProcessState.PRELOADED_MODEL,
             horde_model_name=horde_model_name,
             horde_model_state=ModelLoadState.LOADED_IN_RAM,
             time_elapsed=time.time() - time_start,
         )
+
+    def _resident_weights_mb_for(self, horde_model_name: str) -> float:
+        """Return the resident weight footprint (MB) this slot commits while ``horde_model_name`` is loaded.
+
+        A per-model figure when the caller supplied one, so a card carrying a large checkpoint beside a small
+        one prices them apart; otherwise the single flat figure, which is what a caller wiring the ledger by
+        hand supplies.
+        """
+        return self._sim_weights_mb_by_model.get(horde_model_name, self._sim_weights_mb)
+
+    def _open_sampling_window_vram(self) -> None:
+        """Charge this slot's weights and sampling activation to the simulated device for the window ahead.
+
+        Both land here rather than at preload because preload only stages weights in host RAM: the device
+        pays nothing until the job actually samples. Charging them earlier makes the card look occupied by a
+        model that is not on it, and the parent's admission gates then refuse to dispatch the very job whose
+        weights they are reading, having no residency to credit the charge against.
+
+        The weights persist after the window closes (a slot holds them until it is told to unload, which is
+        what retention is); the activation is the per-step working set on top of them, and it goes back when
+        the denoise ends. Without the activation a fake card looks equally occupied whether a slot is idle or
+        sampling, and every admission, governor and reclaim judgement downstream reads a card that never
+        moves.
+        """
+        if self._sim_vram_ledger is None or self._active_model_name is None:
+            return
+        self._sim_vram_ledger.set_resident_weights(
+            self.device_index,
+            self.process_id,
+            self._resident_weights_mb_for(self._active_model_name),
+        )
+        activation_mb = self._sim_sampling_activation_mb_by_model.get(self._active_model_name, 0.0)
+        if activation_mb > 0:
+            self._sim_vram_ledger.set_transient(self.device_index, self.process_id, activation_mb)
+
+    def _close_sampling_transient(self) -> None:
+        """Release the sampling activation, leaving the slot's weights resident on the card."""
+        if self._sim_vram_ledger is not None:
+            self._sim_vram_ledger.clear_transient(self.device_index, self.process_id)
 
     def _emit_corrupt_result(self, job_info: ImageGenerateJobPopResponse) -> None:
         """Emit a stale-launch duplicate result just before the real one.
@@ -550,6 +602,7 @@ class FakeInferenceProcess(HordeProcess):
         time_start = time.time()
         self._await_clearance()
         effective_delay = self._job_delay_seconds * profile.delay_factor_for_ordinal(self._jobs_started)
+        self._open_sampling_window_vram()
         try:
             self._sample_for(
                 effective_delay,
@@ -559,6 +612,7 @@ class FakeInferenceProcess(HordeProcess):
         finally:
             # The window closes when sampling ends, before the result is assembled, mirroring where
             # hordelib's lease wrapper returns around the sample call.
+            self._close_sampling_transient()
             self._close_sampling_window()
             self._inference_semaphore.release()
 
@@ -650,6 +704,7 @@ class FakeInferenceProcess(HordeProcess):
             self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
         time_start = time.time()
         results = []
+        self._open_sampling_window_vram()
         for job_slice in message.slices:
             self._sample_for(
                 self._job_delay_seconds,
@@ -664,6 +719,7 @@ class FakeInferenceProcess(HordeProcess):
                 ),
             )
             self.send_stage_job_metrics_message(str(job_slice.job_id), stage=PipelineStageTag.SAMPLE)
+        self._close_sampling_transient()
         self._close_sampling_window()
         self.process_message_queue.put(
             HordeSampleResultMessage(
@@ -770,6 +826,10 @@ class FakeInferenceProcess(HordeProcess):
                 info="Unloaded models from VRAM",
             )
         elif message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
+            if self._sim_vram_ledger is not None:
+                # Weights dropped from host RAM cannot still be on the device, so the card gets them back
+                # here too; the VRAM unload the parent usually sends first has normally done it already.
+                self._sim_vram_ledger.free_own_models(self.device_index, self.process_id)
             if self._active_model_name is not None:
                 self.on_horde_model_state_change(
                     process_state=HordeProcessState.UNLOADED_MODEL_FROM_RAM,
@@ -797,11 +857,26 @@ class FakeInferenceProcess(HordeProcess):
 
     @override
     def cleanup_for_exit(self) -> None:
-        """No resources to release; report the final state like the real process."""
+        """Give this slot's simulated VRAM back to the card and report the final state."""
+        self._release_sim_vram()
         self.send_process_state_change_message(
             process_state=HordeProcessState.PROCESS_ENDED,
             info="Process ended",
         )
+
+    def _release_sim_vram(self) -> None:
+        """Return every charge this slot holds on the simulated card.
+
+        A dying context takes its weights, its activation and the context itself with it, so a slot that
+        exits and is not replaced must stop occupying the card. Without this a run that cycles processes
+        walks the card's free reading down by one context per recovery and eventually strands itself on
+        memory nothing holds. A slot killed outright cannot run this; its replacement clears the slot at
+        startup instead.
+        """
+        if self._sim_vram_ledger is None:
+            return
+        self._sim_vram_ledger.free_own_models(self.device_index, self.process_id)
+        self._sim_vram_ledger.set_context_overhead(self.device_index, self.process_id, 0.0)
 
 
 class FakeSafetyProcess(HordeProcess):
@@ -997,6 +1072,8 @@ def start_fake_inference_process(
     sim_total_vram_mb_by_device: dict[int, float] | None = None,
     sim_weights_mb: float = 0.0,
     sim_context_mb: float = 0.0,
+    sim_weights_mb_by_model: dict[str, float] | None = None,
+    sim_sampling_activation_mb_by_model: dict[str, float] | None = None,
 ) -> None:
     """Start a fake inference process.
 
@@ -1010,7 +1087,9 @@ def start_fake_inference_process(
     ``fail_every_n`` makes every nth job report a faulted result (0 = never), and
     ``fault_profile`` scripts richer misbehaviour (hang, crash, drop heartbeats, slow, OOM,
     corrupt message), letting harnesses exercise the recovery paths. ``sim_vram_ledger`` (with
-    ``sim_weights_mb`` / ``sim_context_mb``) wires this fake to a shared simulated-VRAM ledger so a
+    ``sim_weights_mb`` / ``sim_context_mb``, or the per-model ``sim_weights_mb_by_model`` /
+    ``sim_sampling_activation_mb_by_model`` tables) wires this fake to a shared simulated-VRAM ledger, so the
+    card's occupancy tracks what the scenario's models and in-flight sampling actually commit and a
     ``fault_profile.post_processing_peak_mb`` drives deterministic post-processing VRAM pressure
     (stall-and-recover vs. complete) without a GPU. Without a mutable ledger,
     ``sim_total_vram_mb_by_device`` makes the fake report the harness's injected device capacity while
@@ -1037,6 +1116,8 @@ def start_fake_inference_process(
             sim_total_vram_mb=(sim_total_vram_mb_by_device or {}).get(device_index, 0.0),
             sim_weights_mb=sim_weights_mb,
             sim_context_mb=sim_context_mb,
+            sim_weights_mb_by_model=sim_weights_mb_by_model,
+            sim_sampling_activation_mb_by_model=sim_sampling_activation_mb_by_model,
         )
         worker_process.main_loop()
     except Exception as e:
