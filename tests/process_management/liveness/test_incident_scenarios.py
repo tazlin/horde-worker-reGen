@@ -85,6 +85,23 @@ The failures encoded here:
   while a free lane holds preloaded weights for the head. That is the ``cycle-scoped selection`` scenario, and
   its reinjection is the cycle boundary itself: it pins the scope, which is the only thing keeping the stalled
   pair unreachable, so the harness may never drive a cycle without opening one.
+- **A teardown that took the slot a dispatched job was pinned to.** A disaggregated sampler is reserved and
+  granted execution ownership before its sample stage is sent, so it reports ``WAITING_FOR_JOB`` for the whole
+  encode window. A whole-card teardown that reads idleness off child state alone sees a spare lane there and
+  ends it, taking a job that was mid-flight with it. That is the ``pinned sampler`` scenario, and its
+  reinjection is the ownership-blind selector.
+- **A head that stood down from the card went on reserving it.** A churn governor may defer a whole-card
+  head's establishment: a brake on how fast the card is rotated, and explicitly not a finding that the head
+  cannot be served, so normal scheduling is supposed to continue around it. Head protection went on pricing
+  that head's whole demand anyway, so every smaller ready job behind it was withheld to keep room for a demand
+  nobody was making; the card sat empty for the length of the deferral with fitting work already on a lane,
+  and the recovery ladder then fired constructive remedies against a governance decision. That is the
+  ``governed head`` scenario, and its reinjection is head-protection pricing with the stand-down dropped.
+- **A residency that tore down its own pre-stage target.** A pre-staged whole-card head carries its model on
+  no lane until its load lands, and the model-name protection every residency shrink relies on cannot reach a
+  slot with no name. A reprice tightening the target in that window is a shrink whose own target is the first
+  idle lane it finds. That is the ``pre-stage target`` scenario, and its reinjection is the shrink called
+  without the spare.
 """
 
 from __future__ import annotations
@@ -92,13 +109,20 @@ from __future__ import annotations
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
-from horde_worker_regen.process_management.ipc.messages import HordeInferenceControlMessage
+from horde_worker_regen.process_management.ipc.messages import HordeInferenceControlMessage, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
+from horde_worker_regen.process_management.scheduling.governance.whole_card import _GRACE_BUDGET_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _HEAD_PROTECTION_MAX_STARVE_SECONDS,
     _SAFETY_PLACEMENT_RESTORE_STREAK,
+    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
     NextJobAndProcess,
 )
@@ -124,7 +148,10 @@ from tests.process_management.liveness._world_assertions import (
     assert_free_floor,
     assert_governor_never_reached,
     assert_ladder_stayed_below,
+    assert_never_idle_with_fitting_work,
+    assert_no_committed_slot_retired,
     assert_no_duplicate_vram_copy,
+    assert_no_unservable_dispatch_hold,
     duty_fraction,
 )
 
@@ -1860,3 +1887,435 @@ async def test_l_an_unload_the_device_honoured_marks_nothing() -> None:
         f"{context}: a completed unload must leave no slot marked as refusing. {world.state_dump()}"
     )
     assert world.dispatch_tick(head) is not None, f"{context}: the head never sampled. {world.state_dump()}"
+
+
+# --------------------------------------------------------------------------------------------------------
+# Committed slots a shrink must not take
+# --------------------------------------------------------------------------------------------------------
+
+_COMMITTED_SLOT_TICK_SECONDS = 2.0
+"""Seconds per tick for the two shrink scenarios, matching the rest of this module's closed-loop pace."""
+
+_ENCODE_TICKS = 6
+"""Ticks a pinned disaggregated sampler waits on the encode lane before its own sample stage runs.
+
+Long enough that the whole-card head arriving behind it finds the sampler still pinned and still reporting
+itself idle, which is the only window the defect exists in."""
+
+_PRESTAGE_LOAD_TICKS = 3
+"""Ticks a whole-card pre-stage's preload spends in flight, so the load is observable rather than atomic."""
+
+_COMMITTED_SLOT_SETTLE_TICKS = 40
+"""Ticks driven after the disturbance, so each scenario also says the queue kept moving afterwards."""
+
+
+async def _seed_live_job(world: _DispatchWorld, model: _ModelClass, *, steps: int) -> ImageGenerateJobPopResponse:
+    """Pop one job for ``model`` and run until it is dispatched, so a live job holds the card."""
+    job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=steps)
+    await world.pop(job)
+    for _ in range(_MAX_TICKS):
+        await world.step()
+        if world.dispatch_tick(job) is not None:
+            return job
+    raise AssertionError(f"the seeded job never reached a lane. {world.state_dump()}")
+
+
+def _pinned_sampler_world() -> _DispatchWorld:
+    """A card serving disaggregation-class work, with room for a whole-card head to demand the device.
+
+    Three lanes on a card a Flux head fills on its own, so the head's residency has a real teardown to order
+    and the pinned sampler is one of the lanes it can order away. Only the SDXL class runs disaggregated: the
+    head is priced and admitted as the whole-job load it is, which is what makes it ask for the card at all.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=3,
+        max_threads=2,
+        queue_depth=4,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=_COMMITTED_SLOT_TICK_SECONDS,
+        cooldown_seconds=120,
+        disaggregated=True,
+        disaggregated_encode_seconds=_COMMITTED_SLOT_TICK_SECONDS * _ENCODE_TICKS,
+    )
+    world.scheduler._is_disaggregation_class_eligible = lambda job: job.model == _SDXL.name  # type: ignore[method-assign]
+    return world
+
+
+async def _drive_pinned_sampler_scenario(world: _DispatchWorld) -> tuple[ImageGenerateJobPopResponse, int]:
+    """Pin a sampler, put a whole-card head behind it, and run past the residency's teardown.
+
+    Returns:
+        The pinned job and the lane it was dispatched onto.
+    """
+    pinned = await _seed_live_job(world, _SDXL, steps=30)
+    lane_id = world.lane_serving(pinned)
+    assert lane_id is not None, f"the pinned job is on no lane. {world.state_dump()}"
+    assert world.scheduler._process_map[lane_id].current_inference_job() is not None, (
+        f"precondition: the dispatched sampler must own its job. {world.state_dump()}"
+    )
+    assert world.scheduler._process_map[lane_id].can_accept_job(), (
+        "precondition: the pinned sampler must still report itself idle, or the scenario measures nothing. "
+        f"{world.state_dump()}"
+    )
+    head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=30)
+    await world.pop(head)
+    for _ in range(_COMMITTED_SLOT_SETTLE_TICKS):
+        await world.step()
+    return pinned, lane_id
+
+
+async def test_m_a_whole_card_teardown_spares_the_lane_a_pinned_sampler_owns() -> None:
+    """A residency's teardown leaves a slot that owns a dispatched job alone, and still collapses the pool.
+
+    The failure this encodes: a disaggregated sampler is pinned to its slot and granted execution ownership
+    before the sample stage is sent, so it sits reporting ``WAITING_FOR_JOB`` for the whole encode window. A
+    teardown that reads idleness off child state alone sees a free lane, ends it, and takes the job with it.
+
+    Read as one statement: ownership of a dispatched job makes a slot busy, whatever its child is reporting.
+    The pool still collapses toward the residency's target around it, so the guarantee is not bought by a
+    teardown that refuses to run.
+    """
+    world = _pinned_sampler_world()
+
+    pinned, lane_id = await _drive_pinned_sampler_scenario(world)
+
+    context = "pinned sampler"
+    assert_no_committed_slot_retired(world, context=context)
+    assert world.stage(pinned) is not JobStage.PENDING_INFERENCE, (
+        f"{context}: the pinned job never left the queue. {world.state_dump()}"
+    )
+    assert world.completed_jobs >= 1, (
+        f"{context}: the pinned sampler's job never completed, so the lane it was on was serving nothing. "
+        f"{world.state_dump()}"
+    )
+    assert len(world.inference_lane_ids()) < 3, (
+        f"{context}: the pool never shrank at all, so sparing the pinned lane cost the residency its "
+        f"teardown rather than redirecting it. {world.state_dump()}"
+    )
+
+
+def _kill_selection_blind_to_ownership(
+    self: ProcessMap,
+    disallowed_processes: list[int] | None = None,
+) -> HordeProcessInfo | None:
+    """Victim selection that reads idleness from the child's reported state alone.
+
+    The pre-fix selector: every skip it applies is a statement about what the child last said, so a slot the
+    parent has dispatched a job onto and is waiting on another lane for reads exactly like a spare.
+    """
+    for process_info in self.values():
+        if process_info.process_type != HordeProcessType.INFERENCE:
+            continue
+        if process_info.process_id in (disallowed_processes or []):
+            continue
+        if process_info.is_process_busy():
+            continue
+        if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
+            continue
+        return process_info
+    return None
+
+
+async def test_m_defect_reinjection_an_ownership_blind_teardown_takes_the_pinned_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ownership invisible to victim selection, the same teardown ends the lane that owns the job.
+
+    Everything else is the scenario above: the same card, the same pinned sampler, the same head asking for
+    the device. Only the selector's view of the slot changes.
+    """
+    monkeypatch.setattr(ProcessMap, "_get_first_inference_process_to_kill", _kill_selection_blind_to_ownership)
+    world = _pinned_sampler_world()
+
+    _pinned, lane_id = await _drive_pinned_sampler_scenario(world)
+
+    assert any(
+        f"lane {lane_id} was retired while owning dispatched job" in entry
+        for entry in world.committed_slot_retirements
+    ), (
+        "with ownership invisible the teardown must take the pinned sampler's lane, or the scenario's "
+        f"assertion would pass unfixed. retirements={world.committed_slot_retirements} {world.state_dump()}"
+    )
+
+
+def _prestage_target_world() -> _DispatchWorld:
+    """A card whose whole-card head is pre-staged into a spare while a live job still holds the device."""
+    return _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=3,
+        max_threads=2,
+        queue_depth=4,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=_COMMITTED_SLOT_TICK_SECONDS,
+        cooldown_seconds=120,
+        preload_latency_seconds=_COMMITTED_SLOT_TICK_SECONDS * _PRESTAGE_LOAD_TICKS,
+    )
+
+
+async def _drive_prestage_target_scenario(world: _DispatchWorld) -> int:
+    """Pre-stage a whole-card head, lose its load mid-flight, and run the reprice ticks that follow.
+
+    Returns:
+        The lane the residency recorded as its pre-stage target.
+    """
+    await _seed_live_job(world, _SDXL, steps=60)
+    head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=30)
+    await world.pop(head)
+    prestage_lane: int | None = None
+    for _ in range(_MAX_TICKS):
+        await world.step()
+        prestage_lane = world.scheduler._whole_card_ledger.state_for(None).prestage_process_id
+        if prestage_lane is not None:
+            break
+    assert prestage_lane is not None, (
+        f"the head was never pre-staged, so the scenario has no target. {world.state_dump()}"
+    )
+    assert world.scheduler._process_map[prestage_lane].last_process_state is HordeProcessState.PRELOADING_MODEL, (
+        f"precondition: the pre-stage load must still be in flight when it is lost. {world.state_dump()}"
+    )
+    # The child carrying the pre-stage dies mid-load and its slot is rebuilt empty. The residency still names
+    # that slot and no lane carries the head's model, so the convergence shrink (which waits for a holder)
+    # stands down and the reprice is the only shrink left running over a pool it can still cut.
+    assert world.kill_lane_holding(_FLUX), f"the pre-stage load had no lane to lose. {world.state_dump()}"
+    for _ in range(_COMMITTED_SLOT_SETTLE_TICKS):
+        await world.step()
+    return prestage_lane
+
+
+async def test_n_a_reprice_spares_the_slot_a_whole_card_head_is_pre_staging_into() -> None:
+    """A tightened residency target does not take the slot its own head is being loaded into.
+
+    The failure this encodes: a pre-staged head carries its model on no lane until its load lands, so the
+    model-name protection every residency shrink relies on cannot reach the slot the pre-stage chose. A
+    reprice that tightens the target in that window is a shrink with nothing protecting its own target, and
+    the slot the residency is loading into is the first idle lane it finds.
+
+    Read as one statement: the slot a residency has committed to is off-limits to that residency's own
+    shrink. The pool is still cut around it, so sparing the target does not cost the reprice its reduction.
+    """
+    world = _prestage_target_world()
+
+    prestage_lane = await _drive_prestage_target_scenario(world)
+
+    context = "pre-stage target"
+    assert_no_committed_slot_retired(world, context=context)
+    assert prestage_lane in world.inference_lane_ids(), (
+        f"{context}: lane {prestage_lane} left the pool while the residency was still loading its head into "
+        f"it. {world.state_dump()}"
+    )
+    assert len(world.inference_lane_ids()) < 3, (
+        f"{context}: the reprice never cut the pool at all, so sparing its target cost it the reduction "
+        f"rather than redirecting it. {world.state_dump()}"
+    )
+
+
+def _scale_without_sparing(
+    self: InferenceScheduler,
+    target: int,
+    *,
+    device_index: int | None,
+    protected_model: str | None,
+    spared_process_id: int | None,
+) -> int:
+    """Scale the pool with the caller's committed slot dropped from what the shrink must not take."""
+    del spared_process_id
+    return self._process_lifecycle.scale_inference_processes(
+        target,
+        device_index=device_index,
+        protected_model=protected_model,
+    )
+
+
+async def test_n_defect_reinjection_an_unspared_reprice_takes_its_own_pre_stage_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the spare dropped, the residency's own reprice ends the slot it is loading its head into.
+
+    The reinjection drops the named spare from every residency shrink; the tick under test is the reprice,
+    which is the only shrink running in this scenario's window (the convergence shrink stands down while the
+    head has no holder, which is the same condition that leaves the slot unprotected by name).
+    """
+    monkeypatch.setattr(InferenceScheduler, "_scale_sparing", _scale_without_sparing)
+    world = _prestage_target_world()
+
+    prestage_lane = await _drive_prestage_target_scenario(world)
+
+    assert any(
+        f"lane {prestage_lane} was retired while it was the pre-stage target" in entry
+        for entry in world.committed_slot_retirements
+    ), (
+        "with the spare dropped the reprice must end its own pre-stage target, or the scenario's assertion "
+        f"would pass unfixed. retirements={world.committed_slot_retirements} {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Governed head: a head that has stood down from the card may not go on reserving it from the queue behind it
+# --------------------------------------------------------------------------------------------------------
+
+_GOVERNED_HEAD_TICK_SECONDS = 2.0
+"""Seconds per tick for the governed-head scenarios.
+
+The windows that decide this scenario are the governor's deferral dwell (240s) and head protection's own
+starvation release (120s), and what it is about is the span between them. A tick worth a scheduling interval
+would step over that span in a handful of samples; at two seconds the idle run the defect produces is measured
+in the same units the incident was."""
+
+_GOVERNED_HEAD_TICKS = 90
+"""Ticks the governed-head scenarios run for: inside the governor's dwell, so the deferral is still in force
+at the end and the run says something about the deferral rather than about its expiry."""
+
+_GOVERNED_LIGHT_JOBS = 3
+"""Light jobs queued behind the governed head. Three is enough that serving them is a streak rather than a
+single dispatch that could be luck, and few enough that the run stays inside the dwell."""
+
+
+def _governed_head_world() -> _DispatchWorld:
+    """A 16 GB card whose whole-card grace allowance is spent, with the light class already resident.
+
+    The allowance is spent through the ledger's own charge record, which is what a card that has recently
+    cycled a residency twice carries. The light checkpoint is seeded resident because the failure is about
+    dispatch, not about staging: a line-skip only exists where a smaller ready job is already on a lane the
+    card can dispatch it from.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=3,
+        max_threads=2,
+        queue_depth=4,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=_GOVERNED_HEAD_TICK_SECONDS,
+        cooldown_seconds=120,
+    )
+    state = world.scheduler._whole_card_ledger.state_for(None)
+    cycle_seconds = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
+    for index in range(int(_GRACE_BUDGET_SECONDS // cycle_seconds) + 1):
+        state.grace_charges.append((world.now - index, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS))
+        state.grace_charges.append((world.now - index, _WHOLE_CARD_RESTORE_GRACE_SECONDS))
+    assert world.scheduler._whole_card_ledger.grace_budget_exhausted(None, now=world.now), (
+        "precondition: the card's rolling grace allowance must be spent, or no governor defers anything"
+    )
+    world.seed_resident(0, _SD15, in_vram=True)
+    return world
+
+
+async def _drive_governed_head(
+    world: _DispatchWorld,
+) -> tuple[ImageGenerateJobPopResponse, list[ImageGenerateJobPopResponse]]:
+    """Queue a whole-card head with light work behind it and run inside the governor's dwell.
+
+    Returns:
+        The head, and the light jobs queued behind it in order.
+    """
+    head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=20)
+    await world.pop(head)
+    light: list[ImageGenerateJobPopResponse] = []
+    for _ in range(_GOVERNED_LIGHT_JOBS):
+        job = make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20)
+        await world.pop(job)
+        light.append(job)
+    for _ in range(_GOVERNED_HEAD_TICKS):
+        await world.step()
+    return head, light
+
+
+def _assert_the_deferral_was_in_force(world: _DispatchWorld) -> None:
+    """Assert the run really spent its ticks behind a governor deferral of the head's whole-card ask."""
+    ledger = world.scheduler._whole_card_ledger
+    assert ledger.governor_deferred_head(None, now=world.now) == _FLUX.name, (
+        "precondition: the head's whole-card establishment must still be governor-deferred at the end of the "
+        f"run, or these ticks say nothing about a deferral. {world.state_dump()}"
+    )
+    assert not world.scheduler.is_whole_card_residency_active(), (
+        "precondition: the deferral must have stopped the residency being established, or the card was given "
+        f"to the head after all. {world.state_dump()}"
+    )
+
+
+async def test_o_a_governor_deferred_head_lets_the_work_behind_it_run() -> None:
+    """A head whose whole-card establishment is governor-deferred stops reserving the card from the queue.
+
+    The failure this encodes: the churn governor deferred a whole-card head's establishment, which is a brake
+    on how fast the card may be rotated and explicitly not a finding that the head cannot be served. Normal
+    scheduling is meant to continue around such a head. Head protection went on pricing that head's whole
+    fifteen-gigabyte demand anyway, so every smaller ready job behind it was withheld to keep room for a
+    demand nobody was making, and the card sat empty for the length of the deferral with fitting work on a
+    lane it could have been dispatched from. Save-our-ship remedies then fired against what was a governance
+    decision.
+
+    Read as one statement: a head that has stood down from asking for the card reserves nothing from the jobs
+    behind it. Its consequences are that the light work runs, that no tick passes idle with work the card's
+    free VRAM covers, and that no dispatch is held for an entity going nowhere.
+    """
+    world = _governed_head_world()
+
+    head, light = await _drive_governed_head(world)
+
+    context = "governor-deferred head"
+    _assert_the_deferral_was_in_force(world)
+    assert world.dispatch_tick(head) is None, (
+        f"{context}: the deferred head itself must not have taken the card, or the run measures an ordinary "
+        f"dispatch rather than what happens behind a deferral. {world.state_dump()}"
+    )
+    unserved = [str(job.id_)[:8] for job in light if world.dispatch_tick(job) is None]
+    assert not unserved, (
+        f"{context}: light job(s) {unserved} that fit the card were never dispatched while the head they sit "
+        f"behind was standing down from asking for it. {world.state_dump()}"
+    )
+    assert_never_idle_with_fitting_work(world, context=context)
+    assert_no_unservable_dispatch_hold(world, context=context)
+
+
+def _price_the_deferred_head(
+    self: InferenceScheduler,
+    displaced_head: ImageGenerateJobPopResponse,
+    *,
+    device_index: int | None,
+) -> float | None:
+    """Head-protection pricing with the governance stand-down dropped, and nothing else changed.
+
+    The starvation release is kept, so the reinjected worker is one that eventually notices the head is not
+    converging; what it does not have is the knowledge that the head is not asking for the card at all.
+    """
+    del device_index
+    if displaced_head.model is None:
+        return None
+    if self._head_starved_seconds(displaced_head) >= _HEAD_PROTECTION_MAX_STARVE_SECONDS:
+        return None
+    return self._measured_admission_candidate_delta_mb(
+        displaced_head,
+        self._model_metadata.get_baseline(displaced_head.model),
+        process_id=None,
+        disaggregated=self._is_disaggregation_class_eligible(displaced_head),
+    )
+
+
+async def test_o_defect_reinjection_a_governor_deferred_head_goes_on_reserving_the_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the stand-down dropped from head-protection pricing, the card idles behind a head nobody is loading.
+
+    Reinjected at the pricing alone: the governor still defers, the disclosure still says normal scheduling
+    continues, and the only difference is that the deferred head's demand is charged against the room a
+    fitting sibling would take. Both liveness verdicts must then fail, and their messages are what say which
+    failure this is: a run of idle ticks with fitting work on the card, and a dispatch held for a head that is
+    cold, unloading, and standing down.
+    """
+    monkeypatch.setattr(InferenceScheduler, "_displaced_head_outstanding_mb", _price_the_deferred_head)
+    world = _governed_head_world()
+
+    _head, light = await _drive_governed_head(world)
+
+    _assert_the_deferral_was_in_force(world)
+    assert [job for job in light if world.dispatch_tick(job) is None], (
+        "with the deferred head's demand charged again, work behind it must be withheld, or the reinjection "
+        f"did not reach the pricing it aims at. {world.state_dump()}"
+    )
+    with pytest.raises(AssertionError, match="the card was idle for"):
+        assert_never_idle_with_fitting_work(world, context="governor-deferred head")
+    with pytest.raises(AssertionError, match="head_protection hold"):
+        assert_no_unservable_dispatch_hold(world, context="governor-deferred head")

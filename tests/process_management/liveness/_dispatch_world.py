@@ -51,11 +51,12 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import DeviceFreeGovernor, GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRung,
@@ -67,12 +68,19 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     predict_job_sampling_vram_mb,
 )
+from horde_worker_regen.process_management.resources.run_metrics import (
+    DecisionEvent,
+    DecisionKind,
+    DecisionVerdict,
+    FlatScalarMap,
+)
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _SAFETY_GPU_LOAD_CHARGE_MB,
     InferenceScheduler,
 )
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -96,6 +104,10 @@ own accounting and the scheduler's forecast charge sibling contexts identically.
 _AMPLE_RAM_MB = 65_536.0
 """The host RAM reading every row runs against. These rows vary VRAM; a live psutil reading would make a
 heavy row's outcome depend on the machine running it."""
+
+_CLOCK_EPSILON = 1e-6
+"""Slack on a world-clock comparison, so an instant reached by accumulating tick advances still compares
+equal to the same instant computed as a multiple of the tick."""
 
 _TICK_SECONDS = 30.0
 """How much of the world's clock one scheduling tick advances.
@@ -238,6 +250,24 @@ _DEFAULT_DECODE_SECONDS_PER_MEGAPIXEL = 2.0
 
 
 @dataclass
+class _PendingPreload:
+    """One preload the parent has sent, between the command and the staged weights.
+
+    The two instants are separate because the parent's record and the slot's own state are separate: the send
+    is optimistic, so the model map reads as loading while the lane still reports itself idle and empty, and
+    only once the child reports does the lane read as busy. A shrink that runs in the first window sees a free
+    slot; one that runs in the second sees a busy one.
+    """
+
+    model: str
+    weights_mb: float
+    report_at: float
+    """When the child first reports ``PRELOADING_MODEL``, ending the window the slot reads idle in."""
+    ready_at: float
+    """When the weights are staged and the lane reports ``PRELOADED_MODEL``."""
+
+
+@dataclass
 class _SlotOccupancy:
     """One dispatched job's hold on its lane, in world seconds, and the transient it charges the card.
 
@@ -257,6 +287,123 @@ class _SlotOccupancy:
     sample_until: float
     decode_until: float
     transient_charged: bool = False
+
+
+# --------------------------------------------------------------------------------------------------------
+# Per-tick dispatch observation: what the world could see about why nothing was dispatched
+# --------------------------------------------------------------------------------------------------------
+
+_CYCLING_LANE_STATES = frozenset(
+    {
+        HordeProcessState.PROCESS_STARTING,
+        HordeProcessState.PROCESS_ENDING,
+        HordeProcessState.PROCESS_ENDED,
+        HordeProcessState.DOWNLOADING_MODEL,
+        HordeProcessState.PRELOADING_MODEL,
+    },
+)
+"""Lane states that mean the pool is mid-transition rather than sitting on its hands.
+
+A lane in one of these is on its way to being able to take work (or on its way out), so a tick where one
+stands is a tick the card is legitimately between things rather than idle against work it could seat."""
+
+
+@dataclass(frozen=True)
+class _FittingJob:
+    """One pending job the card has the room to seat right now, priced the way admission prices it."""
+
+    job_id: str
+    model: str
+    priced_mb: float
+
+    def __str__(self) -> str:
+        """Name the job, its model and its price, for a failing oracle's message."""
+        return f"{self.job_id[:8]} ({self.model}, {self.priced_mb:.0f}MB)"
+
+
+@dataclass(frozen=True)
+class _ProtectedDispatchHold:
+    """One dispatch declined on behalf of some other entity, with what the world can see of that entity.
+
+    The hold classes the scheduler discloses are read from its own records (the dispatch decision sink for
+    head protection, the stall classifier's bucket for the rest), never re-derived here. What this adds is
+    the other half the disclosure does not carry: whether the entity the hold is being kept for is itself
+    moving toward being served, and the name of the bounded grace it sits inside when it is not.
+    """
+
+    kind: str
+    """Which disclosed hold class this is."""
+    held_subject: str
+    """The ready job whose dispatch was declined."""
+    protected: str
+    """The job or model the hold is being kept for."""
+    progressing: bool
+    """Whether the protected entity is itself making progress toward being served."""
+    grace: str | None
+    """The bounded, disclosed grace the protected entity sits inside, or None when it is inside none."""
+    detail: str
+    """What the world saw of the protected entity, for a failing oracle's message."""
+
+    def __str__(self) -> str:
+        """Name both ends of the hold, for a failing oracle's message."""
+        return f"{self.kind}: held {self.held_subject[:8]} for {self.protected} ({self.detail})"
+
+
+@dataclass(frozen=True)
+class _TickObservation:
+    """What one tick looked like to everything that judges whether the card was earning.
+
+    Recorded at the close of every tick so a verdict over a run can ask about a span of ticks rather than
+    about the run's average, which is what lets a hundred seconds of idle be distinguished from a duty figure
+    it barely moves.
+    """
+
+    tick: int
+    now: float
+    device_free_mb: float
+    jobs_in_progress: int
+    fitting_pending: tuple[_FittingJob, ...]
+    """Pending jobs the card's free VRAM covers at the price admission would charge them."""
+    grace_reasons: tuple[str, ...]
+    """Named, bounded reasons the world itself recognises for a tick with no dispatch on it."""
+    head_job_id: str | None
+    head_model: str | None
+    head_stall_bucket: str | None
+    """The scheduler's own duty-bucket attribution for the parked head, as its stall classifier named it."""
+    head_stall_reason: str | None
+    protected_holds: tuple[_ProtectedDispatchHold, ...]
+
+    @property
+    def idle(self) -> bool:
+        """Whether the card held no dispatched work at the close of this tick."""
+        return self.jobs_in_progress == 0
+
+    def hold_summary(self) -> str:
+        """Every hold reason recorded on this tick, as one line."""
+        parts = [f"stall={self.head_stall_bucket}" if self.head_stall_bucket is not None else "stall=none"]
+        parts.extend(str(hold) for hold in self.protected_holds)
+        if self.grace_reasons:
+            parts.append("grace=" + "|".join(self.grace_reasons))
+        return "; ".join(parts)
+
+
+@dataclass(frozen=True)
+class _DecisionRecord:
+    """One verdict the scheduler recorded through its decision sink, stamped with the tick it landed on."""
+
+    tick: int
+    decision_kind: DecisionKind
+    subject: str
+    verdict: DecisionVerdict
+    reason: str
+    inputs: dict[str, object]
+
+
+_HEAD_PROTECTION_REASON_MARKER = "held for the head"
+"""The arbiter's own words for a non-head request declined so the head keeps the room it needs.
+
+Matched rather than re-derived so the oracle reads the same verdict the dispatch path acted on; the arbiter
+composes this text in one place (:meth:`VramArbiter._head_protection_defer`)."""
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -386,6 +533,9 @@ class _DispatchWorld:
         unload_release_delay_seconds: float = 0.0,
         child_evicts_granted_resident: bool = False,
         child_unload_leaks_mb: float = 0.0,
+        preload_report_latency_seconds: float = 0.0,
+        preload_latency_seconds: float = 0.0,
+        disaggregated_encode_seconds: float = 0.0,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -450,6 +600,21 @@ class _DispatchWorld:
                 reference still pins is skipped: the command returns, the card keeps the weights, and the lane
                 goes on reporting them as used. Zero is a backend that gives everything back, which is what
                 every unload elsewhere in this world does.
+            preload_report_latency_seconds: How long a lane goes on reporting itself idle and empty after the
+                parent has sent it a preload. The send is optimistic: the parent's model map records the load
+                immediately, while the slot itself does not move until the child wakes and reports
+                ``PRELOADING_MODEL``. In that window the slot carries no model name and reads as idle, which
+                is the window a shrink can take a slot the parent has already committed to. Zero collapses it,
+                so the lane reports the load on the same tick the command was sent.
+            preload_latency_seconds: How long a lane stays in ``PRELOADING_MODEL`` before its weights are
+                staged. Zero materialises the load on the tick after the report, so a load is never observable
+                mid-flight by a governance pass; a value of at least one tick puts the loading state inside a
+                pass's view.
+            disaggregated_encode_seconds: How long a disaggregation-class sampler waits for the encode lane
+                after it is dispatched. The sampler is pinned and owns the job from dispatch, but its child
+                reports nothing until the sample stage runs, so through this window the slot reads
+                ``WAITING_FOR_JOB`` while owning a dispatched job. Zero samples immediately, which is the
+                monolithic shape and what the rows that do not vary this run against.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -459,6 +624,9 @@ class _DispatchWorld:
         self.unload_release_delay_seconds = unload_release_delay_seconds
         self.child_evicts_granted_resident = child_evicts_granted_resident
         self.child_unload_leaks_mb = child_unload_leaks_mb
+        self.preload_report_latency_seconds = preload_report_latency_seconds
+        self.preload_latency_seconds = preload_latency_seconds
+        self.disaggregated_encode_seconds = disaggregated_encode_seconds
         self.tick = 0
         self.now = 10_000.0
         """The world's clock, shared with the tracker and the scheduler so every window they gate on is
@@ -471,7 +639,15 @@ class _DispatchWorld:
         """Per-lane weights held in the child's RAM cache, awaiting the dispatch that commits them."""
         self._resident_model: dict[int, str] = {}
         """The model whose weights each lane most recently committed to the device."""
-        self._loading: dict[int, tuple[str, float]] = {}
+        self._loading: dict[int, _PendingPreload] = {}
+        """Per-lane preloads the parent has commanded and the child has not finished, keyed by lane."""
+        self._encode_until: dict[int, float] = {}
+        """Per-lane instant a pinned disaggregated sampler stops waiting on the encode lane and starts sampling.
+
+        While one stands the lane owns its dispatched job and still reports itself idle, which is the state a
+        victim selector reading child state alone cannot tell apart from a free slot."""
+        self.committed_slot_retirements: list[str] = []
+        """Every retirement of a lane the parent had already committed to, as the structural oracle read it."""
         self._transient_mb: dict[int, float] = {}
         """Per-lane sampling activation charged to the card for the window a lane is sampling in."""
         self._offloaded_mb: dict[int, float] = {}
@@ -533,6 +709,14 @@ class _DispatchWorld:
         """Every time the safety context came back onto the card, as (tick, world clock)."""
         self.snapshot: MeasuredVramSnapshot | None = None
         """The most recent cycle-frozen device measurement, the surface a row reads obligations back from."""
+        self.decision_records: list[_DecisionRecord] = []
+        """Every verdict the scheduler disclosed through its decision sink, stamped with its tick.
+
+        The worker's own disclosure surface, wired here rather than re-derived: a hold the scheduler does not
+        record is a hold an operator cannot see either, so an oracle that reads this is held to the same
+        evidence a post-mortem has."""
+        self.tick_observations: list[_TickObservation] = []
+        """What each tick looked like to the verdicts that judge whether the card was earning."""
 
         self._service_contexts = service_contexts
         processes: dict[int, HordeProcessInfo] = {}
@@ -556,6 +740,15 @@ class _DispatchWorld:
         self._model_map = HordeModelMap(root={})
         self._job_tracker = JobTracker(clock=lambda: self.now)
         self._reserve_ledger = CommittedReserveLedger()
+        # The lifecycle's victim selection over this world's pool, and nothing else of the lifecycle: the
+        # selector reads only the process map and the tracker, while a constructed manager would want a
+        # multiprocessing context, live queues and real child pipes, and would answer the scheduler's
+        # placement and lane predicates from a config these rows do not set. Wiring the two collaborators the
+        # selection actually reads is what puts the shrink's choice in production's hands without standing a
+        # whole manager up around it.
+        self._scale_down_selector = ProcessLifecycleManager.__new__(ProcessLifecycleManager)
+        self._scale_down_selector._process_map = self._process_map
+        self._scale_down_selector._job_tracker = self._job_tracker
 
         reference: dict[str, object] = {
             model.name: make_mock_model_reference_record(model.name, baseline=model.baseline)
@@ -601,6 +794,7 @@ class _DispatchWorld:
             max_inference_processes=lane_count,
             lru=LRUCache(max(2, lane_count)),
             reserve_ledger=self._reserve_ledger,
+            decision_sink=self._record_decision,
             clock=lambda: self.now,
         )
         if disaggregated:
@@ -1058,7 +1252,12 @@ class _DispatchWorld:
         return True
 
     def _begin_started_preloads(self) -> None:
-        """Start the load of any model the scheduler has just told a lane to bring in."""
+        """Book the load of any model the scheduler has just told a lane to bring in.
+
+        The command is booked against the world clock rather than applied to the lane: a lane reports the load
+        only once its report latency has passed, so the parent's optimistic map entry and the slot's own state
+        can disagree for as long as a real child's wake takes.
+        """
         for name, info in list(self._model_map.root.items()):
             if info.horde_model_load_state != ModelLoadState.LOADING or info.process_id is None:
                 continue
@@ -1067,26 +1266,62 @@ class _DispatchWorld:
             model = _model_by_name(name)
             if model is None:
                 continue
-            self._loading[info.process_id] = (name, self._actual_charge_mb(model.weights_mb))
-            lane = self._process_map.get(info.process_id)
-            if lane is not None and lane.last_process_state != HordeProcessState.PRELOADING_MODEL:
-                lane.last_process_state = HordeProcessState.PRELOADING_MODEL
-        self._sync_reported_vram()
+            report_at = self.now + self.preload_report_latency_seconds
+            self._loading[info.process_id] = _PendingPreload(
+                model=name,
+                weights_mb=self._actual_charge_mb(model.weights_mb),
+                report_at=report_at,
+                ready_at=report_at + self.preload_latency_seconds,
+            )
+        self._advance_preloads()
 
-    def _materialise_preloads(self) -> None:
-        """Complete last tick's loads: the weights are staged and the lane can accept a job."""
-        for lane_id, (name, weights_mb) in list(self._loading.items()):
+    def _advance_preloads(self) -> None:
+        """Move each booked preload through its report and its materialisation as the clock passes them."""
+        for lane_id, pending in list(self._loading.items()):
             lane = self._process_map.get(lane_id)
             if lane is None:
                 self._loading.pop(lane_id, None)
                 continue
+            if self.now < pending.report_at - _CLOCK_EPSILON:
+                continue
+            # A load booked this tick is staged on a later one: the boundary instant still belongs to the
+            # loading state, so a zero-latency load reports now and stages on the next advance, which is the
+            # one-tick load every row without a latency of its own is written against.
+            if self.now <= pending.ready_at + _CLOCK_EPSILON:
+                if lane.last_process_state != HordeProcessState.PRELOADING_MODEL:
+                    lane.last_process_state = HordeProcessState.PRELOADING_MODEL
+                continue
             self._loading.pop(lane_id, None)
-            self._staged_mb[lane_id] = weights_mb
-            lane.loaded_horde_model_name = name
+            self._staged_mb[lane_id] = pending.weights_mb
+            lane.loaded_horde_model_name = pending.model
             lane.last_process_state = HordeProcessState.PRELOADED_MODEL
             lane.last_control_flag = None
-            self._model_map.update_entry(name, load_state=ModelLoadState.LOADED_IN_RAM, process_id=lane_id)
+            self._model_map.update_entry(pending.model, load_state=ModelLoadState.LOADED_IN_RAM, process_id=lane_id)
         self._sync_reported_vram()
+
+    def _materialise_preloads(self) -> None:
+        """Complete the loads whose latency has run out, staging their weights on the lane."""
+        self._advance_preloads()
+
+    def _advance_encode_windows(self) -> None:
+        """Start the sample stage on every pinned sampler whose encode wait has run out.
+
+        The point the child finally has work of its own to report, which is where the slot stops looking idle
+        and starts reading busy to everything that judges it on child state.
+        """
+        for lane_id, until in list(self._encode_until.items()):
+            if self.now < until - _CLOCK_EPSILON:
+                continue
+            self._encode_until.pop(lane_id, None)
+            lane = self._process_map.get(lane_id)
+            if lane is None:
+                continue
+            lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+
+    def _release_sampler_pin(self, lane_id: int) -> None:
+        """Give a pinned sampler's lane back to the available pool once its job is off it."""
+        self._encode_until.pop(lane_id, None)
+        self._process_map.release_disaggregation_reservation(lane_id)
 
     async def _complete_finished_samplers(self) -> None:
         """Return each lane that sampled on an earlier tick to an idle, still-resident state."""
@@ -1108,6 +1343,14 @@ class _DispatchWorld:
             self._dispatched_at.pop(str(job_id), None)
             lane_id = self._lane_of.pop(str(job_id), None)
             lane = self._process_map.get(lane_id) if lane_id is not None else None
+            if lane_id is not None:
+                self._release_sampler_pin(lane_id)
+            if lane is not None:
+                # A slot that kept its execution ownership would go on reading as the executor of a finished
+                # job for the rest of the run, which every selector that spares an owning slot then honours.
+                # The closed-loop completion path retires it in the same place, so both fidelities agree
+                # about when a lane stops owning what it was dispatched.
+                lane.retire_inference_ownership(job)
             if lane is not None and lane.loaded_horde_model_name is not None:
                 lane.last_process_state = HordeProcessState.PRELOADED_MODEL
                 # The weights stay resident on the freed lane, so the next same-model job needs no reload.
@@ -1160,7 +1403,27 @@ class _DispatchWorld:
             # The child reports the model IN_USE and its slot busy the moment it starts sampling: the first
             # takes the load out of the in-flight-admitted set (releasing its planned charge), the second
             # keeps the sampling lane out of the idle pool a shrink or a second dispatch could take.
-            self._process_map[lanes[0]].last_process_state = HordeProcessState.INFERENCE_STARTING
+            # The encode wait belongs to a disaggregation-class job, judged through the scheduler's own class
+            # seam, so a queue that mixes classes gives it only to the jobs that run as UNet-only samplers.
+            encode_seconds = (
+                self.disaggregated_encode_seconds
+                if self._scheduler._is_disaggregation_class_eligible(admitted)
+                else 0.0
+            )
+            if encode_seconds > 0.0:
+                # A disaggregation-class dispatch pins its sampler and grants it execution ownership before
+                # the sample stage exists: the UNet waits on the encode lane, and its child reports nothing
+                # in the meantime, so the slot goes on reading WAITING_FOR_JOB while owning a dispatched job.
+                # The reservation is what keeps a second dispatch off it; nothing but the ownership record
+                # separates it from a free slot for anything else that reads child state.
+                assert self._process_map[lanes[0]].current_inference_job() is not None, (
+                    "a dispatched job must leave its lane owning it"
+                )
+                self._process_map.reserve_for_disaggregation(lanes[0])
+                self._encode_until[lanes[0]] = self.now + encode_seconds
+                self._process_map[lanes[0]].last_process_state = HordeProcessState.WAITING_FOR_JOB
+            else:
+                self._process_map[lanes[0]].last_process_state = HordeProcessState.INFERENCE_STARTING
             if admitted.model is not None:
                 self._model_map.update_entry(admitted.model, load_state=ModelLoadState.IN_USE, process_id=lanes[0])
             # The dispatch the scheduler just sent is the world's only source for what the child was told about
@@ -1193,7 +1456,12 @@ class _DispatchWorld:
                 self._resident_model[lanes[0]] = admitted.model
                 self._sync_reported_vram()
             if self.closed_loop:
-                self._begin_occupancy(admitted, lane_id=lanes[0], loaded_now=loaded_now)
+                self._begin_occupancy(
+                    admitted,
+                    lane_id=lanes[0],
+                    loaded_now=loaded_now,
+                    encode_seconds=encode_seconds,
+                )
 
     # -- closed-loop occupancy ----------------------------------------------------------------------------
 
@@ -1203,6 +1471,7 @@ class _DispatchWorld:
         *,
         lane_id: int,
         loaded_now: bool,
+        encode_seconds: float = 0.0,
     ) -> None:
         """Give a dispatched job its load, sample and decode phases and charge its sampling transient.
 
@@ -1250,7 +1519,9 @@ class _DispatchWorld:
         offloaded_mb = self._offloaded_mb.get(lane_id, 0.0)
         if offloaded_mb > 0.0 and weights_mb > 0.0:
             sample_seconds *= 1.0 + _OFFLOAD_SAMPLING_PENALTY * min(1.0, offloaded_mb / weights_mb)
-        sample_from = self.now + load_seconds
+        # A disaggregated sampler's window opens only once the encode lane hands it the conditioning, so the
+        # encode wait sits between the dispatch and the first step rather than inside the sampling figure.
+        sample_from = self.now + load_seconds + encode_seconds
         sample_until = sample_from + sample_seconds
         occupancy = _SlotOccupancy(
             job_id=job_id,
@@ -1325,6 +1596,7 @@ class _DispatchWorld:
         self.completed_jobs += 1
         self._dispatched_at.pop(job_id, None)
         self._lane_of.pop(job_id, None)
+        self._release_sampler_pin(occupancy.lane_id)
         lane = self._process_map.get(occupancy.lane_id)
         if lane is None:
             return
@@ -1405,24 +1677,31 @@ class _DispatchWorld:
     ) -> int:
         """Grow or shrink the lane pool toward ``target_count``, returning the count after scaling.
 
-        Mirrors the lifecycle's contract at the grain these rows turn on: a shrink ends idle lanes only (a
-        busy lane is never killed, so the count may not reach the target in one call) and gives their VRAM
-        back to the card; a residency's shrink names its holder as ``protected_model`` and spares it, and the
-        slot the caller is about to load onto is spared by id through ``spared_process_id`` (a head not staged
-        anywhere carries its model on no lane, so the name-based protection cannot reach its target). Growth
-        restores empty lanes up to the pool's provisioned ceiling.
+        Which lane a shrink takes is production's answer, not this world's: the disallowed set is built the
+        way the lifecycle builds it (a residency's shrink protects its holder by model name through
+        ``protected_model``, plus the slot the caller already committed to through ``spared_process_id``) and
+        the victim itself comes from
+        :meth:`~horde_worker_regen.process_management.lifecycle.process_lifecycle.ProcessLifecycleManager
+        ._select_inference_process_to_scale_down`. A world-local idleness predicate would carry whatever the
+        production selector's did, so it could never disagree with it, and the two defects that reached
+        production are both selectors calling a committed slot idle. What stays local is the pool bookkeeping
+        a chosen victim causes: retiring the lane returns its VRAM, its map entry and its context to the card.
+
+        Growth restores empty lanes up to the pool's provisioned ceiling.
         """
-        del device_index, pressure_shortfall_mb
+        selector = self._scale_down_selector
         while len(self._inference_lanes()) > target_count:
-            victim = next(
-                (
-                    lane
-                    for lane in self._inference_lanes()
-                    if lane.can_accept_job()
-                    and lane.process_id != spared_process_id
-                    and (protected_model is None or lane.loaded_horde_model_name != protected_model)
-                ),
-                None,
+            if protected_model is not None:
+                disallowed = selector._whole_card_protected_processes(protected_model, device_index)
+            else:
+                # The stand-in lifecycle answers the queued-model protection with an empty list, which is the
+                # pool contract these rows are written against: a lane holding a queued model is stoppable.
+                disallowed = []
+            if spared_process_id is not None and spared_process_id not in disallowed:
+                disallowed = [*disallowed, spared_process_id]
+            victim = selector._select_inference_process_to_scale_down(
+                disallowed_processes=disallowed,
+                pressure_shortfall_mb=pressure_shortfall_mb,
             )
             if victim is None:
                 break
@@ -1441,6 +1720,7 @@ class _DispatchWorld:
         """Remove a lane from the pool, releasing its context, its resident weights, and its map entry."""
         lane = self._process_map.get(lane_id)
         if lane is not None:
+            self._record_committed_slot_retirement(lane)
             self._process_map.retire_process(lane, reason="whole-card residency teardown")
         self._resident_mb.pop(lane_id, None)
         self._resident_model.pop(lane_id, None)
@@ -1461,9 +1741,39 @@ class _DispatchWorld:
             if entry is not None and entry.process_id == lane_id:
                 self._model_map.root.pop(name, None)
 
+    def _record_committed_slot_retirement(self, lane: HordeProcessInfo) -> None:
+        """Note a retirement of a slot the parent had already committed to, at the retirement itself.
+
+        Three commitments outlive whatever the lane's child is currently reporting, and each one makes the
+        slot something other than spare capacity: an owned dispatched job (a pinned sampler waiting on the
+        encode lane owns its job while reporting itself idle), a load in flight, and the slot a whole-card
+        pre-stage is loading its head into (recorded on the residency before any lane carries its model
+        name). Reading them here rather than judging the run by its outcome is what makes the verdict name
+        the seam: the alternative, a job that never finished or a residency that never converged, is several
+        ticks downstream of the decision and reachable by unrelated causes.
+        """
+        owned = lane.current_inference_job()
+        if owned is not None:
+            self.committed_slot_retirements.append(
+                f"tick {self.tick}: lane {lane.process_id} was retired while owning dispatched job "
+                f"{str(owned.id_)[:8]} ({owned.model}), reporting {lane.last_process_state.name}",
+            )
+        if lane.last_process_state in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.DOWNLOADING_MODEL):
+            self.committed_slot_retirements.append(
+                f"tick {self.tick}: lane {lane.process_id} was retired mid-load, reporting "
+                f"{lane.last_process_state.name}",
+            )
+        for device_index, state in self._scheduler._whole_card_ledger.held():
+            if state.prestage_process_id == lane.process_id:
+                self.committed_slot_retirements.append(
+                    f"tick {self.tick}: lane {lane.process_id} was retired while it was the pre-stage target "
+                    f"for whole-card head {state.model} on device {device_index}",
+                )
+
     def _drop_occupancy_on(self, lane_id: int) -> None:
         """Forget the hold a lane that has gone away was carrying, so no later tick completes its job."""
         self._granted_resident_evicted.discard(lane_id)
+        self._release_sampler_pin(lane_id)
         for job_id, occupancy in list(self._occupancy.items()):
             if occupancy.lane_id == lane_id:
                 self._occupancy.pop(job_id, None)
@@ -1487,8 +1797,8 @@ class _DispatchWorld:
                 victim = lane.process_id
                 break
         if victim is None:
-            for lane_id, (name, _weights) in self._loading.items():
-                if name == model.name:
+            for lane_id, pending in self._loading.items():
+                if pending.model == model.name:
                     victim = lane_id
                     break
         if victim is None:
@@ -1622,6 +1932,7 @@ class _DispatchWorld:
         self.now += self.tick_seconds
         self._apply_control_flags()
         self._materialise_preloads()
+        self._advance_encode_windows()
         if self.closed_loop:
             await self._advance_occupancy()
         else:
@@ -1652,6 +1963,293 @@ class _DispatchWorld:
             self.claim_expires_at = claim.expires_at
         elif self.claim_ticks and self.claim_released_at == 0.0:
             self.claim_released_at = self.now
+        self._observe_dispatch_tick()
+
+    # -- dispatch observation ------------------------------------------------------------------------------
+
+    def _record_decision(
+        self,
+        *,
+        decision_kind: DecisionKind,
+        subject: str,
+        verdict: DecisionVerdict,
+        reason: str = "",
+        inputs: FlatScalarMap | None = None,
+        timestamp: float | None = None,
+    ) -> DecisionEvent | None:
+        """Take the scheduler's disclosure of one verdict, stamped with the tick it landed on.
+
+        The manager injects a recorder that coalesces repeats for the stats export; nothing here coalesces,
+        because a verdict repeated on every tick of a hold is precisely what a per-tick oracle reads. Returns
+        None: the scheduler ignores the return, and a run has no export to append to.
+        """
+        self.decision_records.append(
+            _DecisionRecord(
+                tick=self.tick,
+                decision_kind=decision_kind,
+                subject=subject,
+                verdict=verdict,
+                reason=reason,
+                inputs=dict(inputs or {}),
+            ),
+        )
+        return None
+
+    def _pending_jobs_that_fit(self) -> tuple[_FittingJob, ...]:
+        """Pending jobs whose priced demand the card's free VRAM covers right now.
+
+        Priced through the scheduler's own measured-admission candidate arithmetic, with no target process,
+        so the figure is the one admission would charge the job with no resident-weight credit taken: the
+        conservative end, since a job that fits at full price fits at any credit. Jobs the card has already
+        disclosed it cannot ever seat (the ceiling hold) and jobs still waiting on their pop-time preparation
+        are not offers the card is refusing, so neither counts as work being passed over.
+
+        A job whose model is the one a churn governor is currently deferring is left out too, and only that
+        model. The deferral is a bounded brake on how fast this card may be rotated, and it is aimed at that
+        head: for its dwell the head is deliberately not being served, and past the dwell it stops asking for
+        the card and takes ordinary admission. What the deferral says nothing about is the rest of the queue,
+        which is exactly why the work behind such a head stays counted here.
+        """
+        headroom_mb = self.device_free_mb() - admission_noise_buffer_mb(self.card.total_mb)
+        deferred_model = self._scheduler._whole_card_ledger.governor_deferred_head(None, now=self.now)
+        fitting: list[_FittingJob] = []
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.id_ is None or job.model is None:
+                continue
+            if job.model == deferred_model:
+                continue
+            if self._job_tracker.is_model_held_by_ceiling(job.model):
+                continue
+            if self._scheduler._job_requires_aux_preparation(job):
+                continue
+            priced_mb = self._scheduler._measured_admission_candidate_delta_mb(
+                job,
+                self._scheduler._model_metadata.get_baseline(job.model),
+                process_id=None,
+                disaggregated=self._scheduler._is_disaggregation_class_eligible(job),
+            )
+            if priced_mb is None or priced_mb > headroom_mb:
+                continue
+            fitting.append(_FittingJob(job_id=str(job.id_), model=job.model, priced_mb=priced_mb))
+        return tuple(fitting)
+
+    def _tick_grace_reasons(self) -> tuple[str, ...]:
+        """The named, bounded reasons a tick may legitimately pass with nothing dispatched.
+
+        Each is a window some part of the worker opened deliberately and closes on its own clock: a residency
+        being established or restored, a heavy head's load, a preload in flight, a lane on its way into or out
+        of the pool. A governor deferral is deliberately absent: the head it defers has stood down from asking
+        for the card and normal scheduling is meant to continue around it, so a deferral excuses nothing about
+        the work queued behind that head.
+        """
+        reasons: list[str] = []
+        if self._scheduler.whole_card_residency_grace_active():
+            reasons.append("whole-card establish/restore grace")
+        if self._scheduler.heavy_head_load_grace_active():
+            reasons.append("heavy head load grace")
+        if self._loading:
+            loading = ", ".join(sorted(pending.model for pending in self._loading.values()))
+            reasons.append(f"preload in flight ({loading})")
+        cycling = [
+            lane.process_id for lane in self._inference_lanes() if lane.last_process_state in _CYCLING_LANE_STATES
+        ]
+        if cycling:
+            reasons.append(f"lane(s) cycling ({', '.join(str(lane_id) for lane_id in cycling)})")
+        if self._encode_until:
+            reasons.append("disaggregated encode window open")
+        return tuple(reasons)
+
+    def _head_is_progressing(self, head: ImageGenerateJobPopResponse) -> tuple[bool, str]:
+        """Whether the head of queue is itself moving toward being served, and what the world saw.
+
+        Moving means the card is doing something on this head's behalf: its weights are loading, they are
+        staged on a lane awaiting the dispatch that commits them, or a lane already holds them. A head with
+        none of those is cold, and reserving card room for it holds the card against a demand nothing is
+        working on.
+        """
+        model = head.model
+        if model is None:
+            return False, "the head carries no model"
+        if self._model_map.is_model_loading(model):
+            return True, f"{model} is loading"
+        staged = [lane_id for lane_id, lane in self._process_map.items() if lane.loaded_horde_model_name == model]
+        if any(lane_id in self._staged_mb for lane_id in staged):
+            return True, f"{model} is staged in RAM awaiting dispatch"
+        if model in self._resident_model.values():
+            return True, f"{model} is resident on the card"
+        deferred = self._scheduler._whole_card_ledger.governor_deferred_head(None, now=self.now)
+        cold = f"{model} is cold: not loading, not staged, not resident"
+        if deferred == model:
+            return False, f"{cold}, and its whole-card establishment is governor-deferred"
+        return False, cold
+
+    def _protected_dispatch_holds(
+        self,
+        head: ImageGenerateJobPopResponse | None,
+        bucket: SlotDutyBucket | None,
+    ) -> tuple[_ProtectedDispatchHold, ...]:
+        """Every dispatch declined this tick on behalf of some other entity, with that entity's own state.
+
+        Read from the scheduler's own disclosures. The two gate holds come from the dispatch decision the
+        gate records as it holds, which exists only on a tick the gate really ran: the hold ledger it also
+        keeps outlives the pass that wrote it, so a bucket derived from that ledger would report a hold on
+        ticks where nothing was asked. The two residency holds come from the duty bucket the stall classifier
+        names, which is derived per tick from live state. Nothing about a fit is re-derived here; what is
+        added is whether the protected entity is itself progressing and which bounded grace, if any, it sits
+        inside.
+        """
+        holds: list[_ProtectedDispatchHold] = []
+        for record in self.decision_records:
+            if record.tick != self.tick or record.decision_kind is not DecisionKind.INFERENCE_DISPATCH:
+                continue
+            if record.verdict is not DecisionVerdict.DEFER:
+                continue
+            if _HEAD_PROTECTION_REASON_MARKER in record.reason:
+                if head is None:
+                    continue
+                progressing, detail = self._head_is_progressing(head)
+                holds.append(
+                    _ProtectedDispatchHold(
+                        kind="head_protection",
+                        held_subject=record.subject,
+                        protected=f"head {str(head.id_)[:8]} ({head.model})",
+                        progressing=progressing,
+                        grace=self._whole_card_grace_label(head.model),
+                        detail=detail,
+                    ),
+                )
+            elif record.inputs.get("is_head_of_queue") is True:
+                reconciliation = self._residency_reconciliation_hold(record)
+                if reconciliation is not None:
+                    holds.append(reconciliation)
+        if head is None or bucket is None:
+            return tuple(holds)
+        held_subject = str(head.id_)
+        if bucket is SlotDutyBucket.WHOLE_CARD_RESERVED:
+            holds.append(self._whole_card_reserved_hold(held_subject))
+        elif bucket is SlotDutyBucket.EXCLUSIVE_ISOLATION:
+            holds.append(self._exclusive_isolation_hold(held_subject))
+        return tuple(holds)
+
+    def _whole_card_grace_label(self, model: str | None) -> str | None:
+        """The bounded whole-card window a model sits inside right now, or None when it sits inside none."""
+        if self._scheduler.whole_card_residency_grace_active():
+            return "whole-card establish/restore grace"
+        if model is not None and self._scheduler.heavy_head_load_grace_active():
+            return "heavy head load grace"
+        return None
+
+    def _whole_card_reserved_hold(self, held_subject: str) -> _ProtectedDispatchHold:
+        """The hold a whole-card residency held for a non-head model places on the head behind it."""
+        state = self._scheduler._whole_card_ledger.get(None)
+        residency_model = state.model if state is not None else None
+        serving = any(job.model == residency_model for job in self._job_tracker.jobs_in_progress)
+        loading = residency_model is not None and self._model_map.is_model_loading(residency_model)
+        grace = self._whole_card_grace_label(residency_model)
+        if grace is None and self._scheduler._whole_card_ledger.min_hold_active(None, now=self.now):
+            grace = "whole-card minimum hold"
+        detail = (
+            f"residency holds {residency_model}: serving={serving} loading={loading}"
+            if residency_model is not None
+            else "a residency reserved the card with no model recorded against it"
+        )
+        return _ProtectedDispatchHold(
+            kind="whole_card_reserved",
+            held_subject=held_subject,
+            protected=f"residency model {residency_model}",
+            progressing=serving or loading,
+            grace=grace,
+            detail=detail,
+        )
+
+    def _exclusive_isolation_hold(self, held_subject: str) -> _ProtectedDispatchHold:
+        """The hold an exclusively-admitted over-budget job places on everything else on the card."""
+        running = self._job_tracker.has_exclusive_job_running(None)
+        residency_live = self._scheduler._exclusive_residency_live(None)
+        return _ProtectedDispatchHold(
+            kind="exclusive_isolation",
+            held_subject=held_subject,
+            protected="the exclusively-admitted over-budget job",
+            progressing=running,
+            grace="exclusive whole-card residency live" if residency_live else None,
+            detail=f"exclusive job running={running}, its residency live={residency_live}",
+        )
+
+    def _residency_reconciliation_hold(self, record: _DecisionRecord) -> _ProtectedDispatchHold | None:
+        """The hold the dispatch reconciliation gate places while it asks the card's tenants for room back.
+
+        None when the card carries no tenancy this job's dispatch could displace. The gate holds for two
+        different reasons under one name: a job whose materialisation cannot fit beside somebody else's
+        weights, and a job that does not fit the card at all with nothing on it. Only the first is a hold
+        kept for another entity; the second is the head against the card's own ceiling, which the arbiter
+        resolves on its own measured-attempt path and which has no protected entity to ask about.
+
+        What this waits on is room another tenant holds, so it progresses on any of the ways that room comes
+        back: an eviction the gate itself requested or applied (both carried on the gate's own record of the
+        hold), an unload already in flight, or a job actually running whose completion returns what it took.
+        What is left is a head held against tenancy that nothing is running, nothing is unloading and nothing
+        has asked for, which is a wait for a fit nothing is producing.
+
+        The gate's opening pass is exempt, through the gate's own standing predicate. A hold is stamped
+        before it may escalate to asking idle lanes for tenancy the arbiter cannot name, so the first pass
+        necessarily asks for nothing; the escalation runs on the next one. That is a bounded, disclosed
+        single pass rather than a wait on nothing, and the bound is the gate's own.
+        """
+        held_model = record.inputs.get("model")
+        displaceable = sorted(
+            lane_id
+            for lane_id in set(self._resident_mb) | set(self._held_component_mb)
+            if self._resident_mb.get(lane_id, 0.0) > 0.0
+            and self._resident_model.get(lane_id) != held_model
+            or self._held_component_mb.get(lane_id, 0.0) > 0.0
+        )
+        if not displaceable:
+            return None
+        unloads_in_flight = sorted(self._unload_due_at)
+        requested = bool(record.inputs.get("reclaim_requested")) or bool(record.inputs.get("reclaim_applied"))
+        running = len(self._job_tracker.jobs_in_progress)
+        held_job = next(
+            (job for job in self._job_tracker.jobs_pending_inference if str(job.id_) == record.subject),
+            None,
+        )
+        opening_pass = held_job is not None and not self._scheduler._dispatch_hold_is_standing(held_job)
+        return _ProtectedDispatchHold(
+            kind="residency_reconciliation",
+            held_subject=record.subject,
+            protected=f"the room lane(s) {displaceable} hold",
+            progressing=requested or bool(unloads_in_flight) or running > 0,
+            grace="the gate's opening pass, before its hold stands" if opening_pass else None,
+            detail=(
+                f"reclaim requested={requested}, unloads in flight on lane(s) {unloads_in_flight}, "
+                f"jobs running={running}"
+            ),
+        )
+
+    def _observe_dispatch_tick(self) -> None:
+        """Record what this tick looked like to the verdicts that judge whether the card was earning."""
+        head = self._scheduler._undispatched_head()
+        bucket: SlotDutyBucket | None = None
+        reason: str | None = None
+        if head is not None:
+            bucket, reason = self._scheduler._classify_dispatch_stall(
+                head,
+                self._scheduler._model_metadata.require_reference(),
+            )
+        self.tick_observations.append(
+            _TickObservation(
+                tick=self.tick,
+                now=self.now,
+                device_free_mb=self.device_free_mb(),
+                jobs_in_progress=len(self._job_tracker.jobs_in_progress),
+                fitting_pending=self._pending_jobs_that_fit(),
+                grace_reasons=self._tick_grace_reasons(),
+                head_job_id=None if head is None or head.id_ is None else str(head.id_),
+                head_model=None if head is None else head.model,
+                head_stall_bucket=None if bucket is None else bucket.value,
+                head_stall_reason=reason,
+                protected_holds=self._protected_dispatch_holds(head, bucket),
+            ),
+        )
 
     def _sample_retained_resident_divergence(self) -> None:
         """Record any idle slot whose retained-resident record does not match what the card holds."""
@@ -1714,6 +2312,14 @@ class _DispatchWorld:
         """The tracker's current stage for ``job``."""
         assert job.id_ is not None
         return self._job_tracker.get_stage(job.id_)
+
+    def lane_serving(self, job: ImageGenerateJobPopResponse) -> int | None:
+        """The lane holding ``job``, or None once it is off every lane."""
+        return self._lane_of.get(str(job.id_))
+
+    def inference_lane_ids(self) -> list[int]:
+        """The inference lanes the pool currently holds, in map order."""
+        return [lane.process_id for lane in self._inference_lanes()]
 
     def retained_residents(self) -> dict[int, str]:
         """The parent's authoritative record of which slot holds which model's weights between jobs."""

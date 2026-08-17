@@ -77,6 +77,11 @@ from tests.process_management.liveness._dispatch_world import (
     _JobShape,
     _ModelClass,
 )
+from tests.process_management.liveness._world_assertions import (
+    assert_never_idle_with_fitting_work,
+    assert_no_committed_slot_retired,
+    assert_no_unservable_dispatch_hold,
+)
 
 # --------------------------------------------------------------------------------------------------------
 # Axis values
@@ -812,6 +817,10 @@ async def test_whole_queue_drains_and_obligations_close(row: _Row) -> None:
     admitted preloads, the whole-card residency claim over the device, and the safety / post-processing GPU
     pauses a residency takes out. Each must be back at its released value once the queue has drained, because
     a charge or a pause that outlives the work it was taken for is what wedges the next head.
+
+    The run's own ticks are then read back for the two liveness obligations an end-state check cannot see: a
+    card that sat idle with work its free VRAM covered, and a dispatch held for an entity that was itself
+    going nowhere. Both are compatible with a queue that drains, so neither is implied by anything above.
     """
     world, jobs = await _build_world(row)
 
@@ -845,6 +854,9 @@ async def test_whole_queue_drains_and_obligations_close(row: _Row) -> None:
     assert world.lifecycle.is_post_process_gpu_paused is False, (
         f"{row.label}: the post-processing lane was left paused after the queue drained. {world.state_dump()}"
     )
+    assert_no_committed_slot_retired(world, context=row.label)
+    assert_never_idle_with_fitting_work(world, context=row.label)
+    assert_no_unservable_dispatch_hold(world, context=row.label)
 
 
 @pytest.mark.parametrize(

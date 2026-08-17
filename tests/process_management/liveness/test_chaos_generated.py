@@ -72,6 +72,11 @@ from tests.process_management.liveness._dispatch_world import (
     _DispatchWorld,
     _ModelClass,
 )
+from tests.process_management.liveness._world_assertions import (
+    assert_never_idle_with_fitting_work,
+    assert_no_committed_slot_retired,
+    assert_no_unservable_dispatch_hold,
+)
 
 # --------------------------------------------------------------------------------------------------------
 # Seed selection
@@ -437,6 +442,11 @@ async def _assert_scenario_is_served(scenario: ChaosScenario) -> None:
     assert {receipt.event for receipt in run.event_receipts} == set(scenario.world_events()), run.message(
         "one or more requested disturbances never found their required state and changed nothing",
     )
+
+    context = f"chaos scenario {scenario.label}"
+    assert_no_committed_slot_retired(run.world, context=context)
+    assert_never_idle_with_fitting_work(run.world, context=context)
+    assert_no_unservable_dispatch_hold(run.world, context=context)
 
     assert not run.incoherent_claims, run.message(
         "a whole-card residency was granted to reduce a process count the card was already at or below:\n    "
