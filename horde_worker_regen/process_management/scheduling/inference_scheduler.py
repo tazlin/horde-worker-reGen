@@ -3745,7 +3745,8 @@ class InferenceScheduler:
 
         # Represent the posture with the first held residency (single-GPU has at most one).
         # ``active`` is true while any card holds a residency.
-        representative = next((state for _index, state in self._held_residencies()), None)
+        held = self._held_residencies()
+        representative_index, representative = held[0] if held else (None, None)
         model = representative.model if representative is not None else None
         active = model is not None
         forecast = representative.forecast if representative is not None else None
@@ -3772,7 +3773,9 @@ class InferenceScheduler:
             processes_target = max_resident_processes or 1
 
         total_vram_mb = (
-            forecast.total_vram_mb if forecast is not None else self._process_map.get_reported_total_vram_mb()
+            forecast.total_vram_mb
+            if forecast is not None
+            else self._process_map.get_reported_total_vram_mb(device_index=representative_index)
         )
 
         # The claim is a separate fact from the residency: a card can hold a model without narrowing the
@@ -6025,8 +6028,8 @@ class InferenceScheduler:
                 own sampling-slot and process ceilings are used so the big card's spare threads never
                 inflate a small card's allowance. ``None`` keeps the worker-wide global ceilings, which
                 is exactly the single-GPU case (byte-identical to before). The free-VRAM staging
-                headroom is measured worker-wide either way (a deliberate conservatism until per-card
-                memory-report attribution is implemented).
+                headroom is that card's own measured free; ``None`` reads the worker-wide (tightest-card)
+                figure.
         """
         # An exclusive admit suppresses only its planned card once routing has attributed it. Before attribution
         # (and on the worker-wide single-GPU path), the conservative worker-wide answer still blocks every card.
@@ -6057,7 +6060,7 @@ class InferenceScheduler:
         # processes idle while jobs queued). The full materialisation is priced at clearance, so speculation
         # here never over-commits the device: it only funds the encode footprint the staging actually incurs.
         reserve_mb = self._vram_budget.reserve_mb if self._budget_active() else 0.0
-        free_vram_mb = self._measured_free_vram_mb()
+        free_vram_mb = self._measured_free_vram_mb(device_index=card.device_index if card is not None else None)
         if free_vram_mb is None:
             self._note_staging_defer(
                 StagingDeferReason.MEASUREMENT_UNREAD,

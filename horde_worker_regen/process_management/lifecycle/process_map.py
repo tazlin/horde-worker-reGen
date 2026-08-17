@@ -997,12 +997,23 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             else:
                 model = process_info.loaded_horde_model_name or "-"
                 parts.append(f"#{process_id}:{model}[{process_info.last_process_state.name}]")
+        # The leading figure stays the tightest card so log parsers keep one number; a multi-card host also
+        # names each card's own reading, since a single figure cannot say which card is short.
         free = self.get_free_vram_mb()
         free_str = f"{free:.0f}" if free is not None else "?"
+        reporting_cards = sorted({p.device_index for p in self.values() if p.total_vram_mb > 0})
+        per_card_str = ""
+        if len(reporting_cards) > 1:
+            per_card = []
+            for index in reporting_cards:
+                card_free = self.get_free_vram_mb(device_index=index)
+                per_card.append(f"card{index}={card_free:.0f}MB" if card_free is not None else f"card{index}=?")
+            per_card_str = f" ({', '.join(per_card)})"
         measured_str = (
             "" if measured_device_free_mb is None else f" measured_device_free_vram={measured_device_free_mb:.0f}MB"
         )
-        return f"slots=[{', '.join(parts) if parts else 'none'}] device_free_vram={free_str}MB{measured_str}"
+        slots_str = ", ".join(parts) if parts else "none"
+        return f"slots=[{slots_str}] device_free_vram={free_str}MB{per_card_str}{measured_str}"
 
     def num_inference_processes(self) -> int:
         """Return the number of inference processes."""

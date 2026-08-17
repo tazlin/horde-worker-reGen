@@ -35,7 +35,8 @@ The deadlock diagnostics carry two free-VRAM figures and they are not interchang
 
 - `device_free_vram=` is derived from the children's torch view of the card. Under WDDM demand-paging that
   view counts paged-out blocks as free and has been seen overstating a card by gigabytes, which reads as a
-  worker refusing to dispatch onto an empty card.
+  worker refusing to dispatch onto an empty card. On a multi-GPU host the leading figure is the tightest
+  card and a parenthetical names each card's own reading (`(card0=6750MB, card1=7580MB)`).
 - `measured_device_free_vram=` is the parent's own device-level (NVML) reading, the same figure admission
   prices against. When the two disagree, this is the one the card is actually offering.
 
