@@ -42,6 +42,9 @@ _DISK_FLOOR_BYTES = 20 * 1024**3
 _INFERENCE_STATES = frozenset(
     {"INFERENCE_PRIMED", "INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING", "JOB_RECEIVED"},
 )
+_GPU_DUTY_LOW_PERCENT = 5
+"""Duty below this, with a job in flight on the card, is the near-idle condition worth an operator's eye."""
+
 _READY_STATES = frozenset({"WAITING_FOR_JOB", "INFERENCE_COMPLETE", "ALCHEMY_COMPLETE", "PRELOADED_MODEL"})
 _LOADING_STATES = frozenset(
     {"PROCESS_STARTING", "DOWNLOADING_MODEL", "PRELOADING_MODEL"},
@@ -518,18 +521,32 @@ def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     return [HealthCheck("GPUs", HealthStatus.OK, f"{len(cards)} cards healthy")]
 
 
-def is_gpu_duty_low(snapshot: WorkerStateSnapshot) -> bool:
-    """True when the GPU is near-idle while a job is in flight (the low-duty attention condition).
+def gpu_duty_low_cards(snapshot: WorkerStateSnapshot) -> list[int]:
+    """Device indices of cards that are near-idle while a job is in flight on them, ascending.
 
-    The duty cycle itself is surfaced in the Trends region rather than as a health row, so this predicate
-    lets that region flag the concerning case (a job running against an idle GPU) without duplicating a
-    check. Returns False when the duty cycle has not been sampled or no job is running.
+    The duty cycle itself is surfaced in the Trends region rather than as a health row, so this lets that
+    region flag the concerning case (a job running against an idle card) without duplicating a check.
+
+    Decided per card: a worker driving several cards has one duty cycle per card, and a busy card beside a
+    starved one reduces to a worker-wide figure that flags neither. A card qualifies only on its own
+    evidence: its own processes mid-job and its own sampled duty near zero. When no per-card duty is
+    present the worker-wide figure stands in for every busy card, which is exact on a single-card worker.
     """
-    duty = snapshot.gpu_utilization_mean_percent
-    if duty is None:
-        return False
-    busy = any(process.last_process_state in _INFERENCE_STATES for process in snapshot.processes)
-    return busy and duty < 5
+    duty_per_card = snapshot.gpu_utilization_mean_percent_per_card
+    busy_cards = {
+        process.device_index for process in snapshot.processes if process.last_process_state in _INFERENCE_STATES
+    }
+    low: list[int] = []
+    for device_index in sorted(busy_cards):
+        duty = duty_per_card.get(device_index) if duty_per_card else snapshot.gpu_utilization_mean_percent
+        if duty is not None and duty < _GPU_DUTY_LOW_PERCENT:
+            low.append(device_index)
+    return low
+
+
+def is_gpu_duty_low(snapshot: WorkerStateSnapshot) -> bool:
+    """True when any driven card is near-idle while a job is in flight on it."""
+    return bool(gpu_duty_low_cards(snapshot))
 
 
 def _disk_check(snapshot: WorkerStateSnapshot) -> HealthCheck:

@@ -62,6 +62,8 @@ class _CardRow:
     its_per_second: float | None = None
     jobs_per_hour: float | None = None
     jobs_spark: list[float] = field(default_factory=list)
+    duty_percent: float | None = None
+    """This card's sampled hardware duty cycle, or None when it has no utilization telemetry."""
 
 
 def _gpu_cell(row: _CardRow) -> Text:
@@ -110,12 +112,16 @@ def _jobs_cell(row: _CardRow) -> Text:
 
 
 def _duty_cell(row: _CardRow) -> Text:
-    """The Duty cell: a busy-context proxy bar (this card's mid-inference share of its loaded contexts).
+    """The Duty cell: this card's sampled hardware duty cycle, or a busy-context proxy when unsampled.
 
-    A proxy for hardware duty until per-card NVML sampling lands: it answers "is this card's capacity being
-    used" from the contexts actually sampling, which is the actionable signal for an under-fed card.
+    The measured figure is preferred because it answers "is this card doing work" directly. Without
+    utilization telemetry (non-NVIDIA hosts, CPU runs) the card's mid-inference share of its loaded
+    contexts stands in: it answers "is this card's capacity being used", the actionable signal for an
+    under-fed card.
     """
     card = row.card
+    if row.duty_percent is not None:
+        return Text(mini_bar(row.duty_percent / 100.0, 8), style="green")
     if card.loaded_contexts <= 0:
         return Text("-", style="grey50")
     fraction = card.busy_contexts / card.loaded_contexts
@@ -239,6 +245,7 @@ class GpusView(VerticalScroll):
                     its_per_second=self._card_its(snapshot, card.device_index),
                     jobs_per_hour=rate,
                     jobs_spark=deltas,
+                    duty_percent=snapshot.gpu_utilization_mean_percent_per_card.get(card.device_index),
                 ),
             )
         return rows

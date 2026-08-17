@@ -1176,9 +1176,18 @@ class WorkerStateSnapshot(BaseModel):
     active_models: list[str] = Field(default_factory=list)
 
     gpu_utilization_mean_percent: float | None = None
+    """Worker-wide duty cycle: the mean of the per-card means below, so cards count equally."""
     gpu_utilization_busy_fraction: float | None = None
+    """Worker-wide busy fraction, reduced across the driven cards the same way."""
     gpu_utilization_samples: int = 0
-    """How many GPU-utilization samples back the figures above (0 = unmeasured, e.g. no NVML)."""
+    """How many GPU-utilization samples back the figures above, summed across cards (0 = unmeasured)."""
+
+    gpu_utilization_mean_percent_per_card: dict[int, float] = Field(default_factory=dict)
+    """Per-card duty cycle keyed by device index; cards with no samples in the window are absent."""
+    gpu_utilization_busy_fraction_per_card: dict[int, float] = Field(default_factory=dict)
+    """Per-card busy fraction keyed by device index; cards with no samples in the window are absent."""
+    gpu_utilization_samples_per_card: dict[int, int] = Field(default_factory=dict)
+    """Per-card retained sample counts keyed by device index (0 for a card with no telemetry)."""
 
     vram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
     ram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)

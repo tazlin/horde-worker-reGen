@@ -245,7 +245,7 @@ from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMe
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
-from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
+from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 from horde_worker_regen.utils.wddm_paging_monitor import WddmPagingMonitor, assess_worker_paging
@@ -1516,10 +1516,12 @@ class HordeWorkerProcessManager:
         self._session_end_reason: str | None = None
 
         # Measure real GPU core uptime (the duty cycle) for the whole worker session, not just the
-        # benchmark. A coarse 1s poll is plenty for the rolling-window trend and threshold logs and
-        # is far cheaper than the benchmark's 0.1s sampler. It no-ops on CPU/fake/non-NVIDIA backends
-        # (no telemetry -> no thread), so creating it here is always safe.
-        self._gpu_sampler = GpuUtilizationSampler(interval_seconds=1.0)
+        # benchmark. One sampler per driven card, because a worker driving several cards has one duty
+        # cycle per card; the worker-wide figures are reductions over those. A coarse 1s poll is plenty
+        # for the rolling-window trend and threshold logs and is far cheaper than the benchmark's 0.1s
+        # sampler. It no-ops on CPU/fake/non-NVIDIA backends (no telemetry -> no thread), so creating it
+        # here is always safe.
+        self._gpu_sampler = GpuUtilizationSamplers(sorted(self._card_runtimes) or [0], interval_seconds=1.0)
         # Direct WDDM demand-paging telemetry: per-process GPU shared-segment usage, the signal the
         # driver cannot fake when the card is over-subscribed (measured free VRAM and core utilization
         # both read healthy in that regime). No-ops on non-Windows hosts and on any PDH failure (no
@@ -5891,14 +5893,16 @@ class HordeWorkerProcessManager:
             if inference_starts:
                 self._first_inference_started_at = min(inference_starts)
 
-        nvml_mean = self._gpu_sampler.mean_percent(
+        nvml_mean_per_card = self._gpu_sampler.mean_percent_per_card(
             window_seconds=window_seconds,
             not_before=self._first_inference_started_at,
         )
-        nvml_busy = self._gpu_sampler.busy_fraction(
+        nvml_busy_per_card = self._gpu_sampler.busy_fraction_per_card(
             window_seconds=window_seconds,
             not_before=self._first_inference_started_at,
         )
+        nvml_mean = mean_across_cards(nvml_mean_per_card.values())
+        nvml_busy = mean_across_cards(nvml_busy_per_card.values())
 
         window_start = self._last_duty_cycle_log_time
         jobs_in_window = [
@@ -5925,10 +5929,20 @@ class HordeWorkerProcessManager:
             nvml_busy_fraction=nvml_busy,
             churn_counts=churn_counts,
         )
-        self._log_duty_cycle_summary(summary, metrics.process_state_summary)
+        self._log_duty_cycle_summary(summary, metrics.process_state_summary, nvml_mean_per_card)
 
-    def _log_duty_cycle_summary(self, summary: DutyCycleSummary, process_state_summary: str) -> None:
-        """Emit one structured ``GPU duty cycle`` line for ``summary`` at a severity matched to the cause."""
+    def _log_duty_cycle_summary(
+        self,
+        summary: DutyCycleSummary,
+        process_state_summary: str,
+        duty_per_card: dict[int, float] | None = None,
+    ) -> None:
+        """Emit one structured ``GPU duty cycle`` line for ``summary`` at a severity matched to the cause.
+
+        ``duty_per_card`` adds a per-card breakdown beside the worker-wide headline when more than one card
+        was measured; the headline itself is a reduction over those cards and would otherwise hide a busy
+        card sitting beside an idle one. A single-card worker's line carries no breakdown.
+        """
         duty = summary.effective_duty_percent()
         if duty is None:
             return  # Nothing measured this window (no GPU telemetry and no completed jobs to attribute).
@@ -5937,8 +5951,12 @@ class HordeWorkerProcessManager:
         demand_limited = summary.completed_jobs == 0 and summary.is_demand_limited()
 
         busy_str = f"{summary.nvml_busy_fraction:.0%}" if summary.nvml_busy_fraction is not None else "n/a"
+        per_card = ""
+        if duty_per_card is not None and len(duty_per_card) > 1:
+            breakdown = ", ".join(f"card {index}: {value:.0f}%" for index, value in sorted(duty_per_card.items()))
+            per_card = f" ({breakdown})"
         head = (
-            f"GPU duty cycle {duty:.0f}% over last {summary.window_seconds:.0f}s "
+            f"GPU duty cycle {duty:.0f}%{per_card} over last {summary.window_seconds:.0f}s "
             f"(target {self._DUTY_CYCLE_TARGET_PERCENT:.0f}%, source={summary.headline_source()}, busy={busy_str})"
         )
 
@@ -7480,12 +7498,15 @@ class HordeWorkerProcessManager:
         )
 
         now = time.time()
-        gpu_utilization_mean_percent = self._gpu_sampler.mean_percent(
+        gpu_duty_per_card = self._gpu_sampler.mean_percent_per_card(
             window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS,
         )
-        gpu_utilization_busy_fraction = self._gpu_sampler.busy_fraction(
+        gpu_busy_per_card = self._gpu_sampler.busy_fraction_per_card(
             window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS,
         )
+        # Reduce from the per-card figures already computed rather than re-walking each card's buffer.
+        gpu_utilization_mean_percent = mean_across_cards(gpu_duty_per_card.values())
+        gpu_utilization_busy_fraction = mean_across_cards(gpu_busy_per_card.values())
         last_pop_time = self._state.last_job_pop_time
         seconds_since_last_pop = (now - last_pop_time) if last_pop_time else None
         api_messages: list[str] = []
@@ -7636,6 +7657,9 @@ class HordeWorkerProcessManager:
             gpu_utilization_mean_percent=gpu_utilization_mean_percent,
             gpu_utilization_busy_fraction=gpu_utilization_busy_fraction,
             gpu_utilization_samples=self._gpu_sampler.sample_count,
+            gpu_utilization_mean_percent_per_card=gpu_duty_per_card,
+            gpu_utilization_busy_fraction_per_card=gpu_busy_per_card,
+            gpu_utilization_samples_per_card=self._gpu_sampler.sample_count_per_card(),
             vram_high_water_mb_per_process=run_metrics.vram_used_high_water_mb_per_process,
             ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
             disk_free_bytes=dict(self._disk_monitor.current_free_bytes),

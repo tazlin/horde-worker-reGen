@@ -56,7 +56,7 @@ from horde_worker_regen.tui.health import (
     HealthReport,
     HealthStatus,
     WorkerPhase,
-    is_gpu_duty_low,
+    gpu_duty_low_cards,
     summarize_skips,
 )
 from horde_worker_regen.tui.responsive import (
@@ -2064,7 +2064,8 @@ class OverviewView(Vertical):
         # A near-idle GPU while a job is in flight is the one duty-cycle condition worth an alert. Rather
         # than a separate health row, it is flagged here where the duty figure already lives: the row and
         # the panel border turn orange and a "(!)" rides the value.
-        duty_low = is_gpu_duty_low(snapshot)
+        low_duty_cards = gpu_duty_low_cards(snapshot)
+        duty_low = bool(low_duty_cards)
         duty_style = "dark_orange" if duty_low else "bold cyan"
         duty_value: RenderableType = format_percent(snapshot.gpu_utilization_mean_percent)
         if duty_low:
@@ -2072,12 +2073,19 @@ class OverviewView(Vertical):
                 (format_percent(snapshot.gpu_utilization_mean_percent), "dark_orange"),
                 (" (!)", "bold dark_orange"),
             )
+        # With several cards the worker-wide value is a reduction that hides a starved card, so the detail
+        # column spends itself on the per-card figures instead of the busy/idle word.
+        duty_per_card = snapshot.gpu_utilization_mean_percent_per_card
+        if len(duty_per_card) > 1:
+            duty_detail = " · ".join(f"card {index} {value:.0f}%" for index, value in sorted(duty_per_card.items()))
+        else:
+            duty_detail = "busy" if busy_fraction and busy_fraction > 0.5 else "idle"
         add_trend(
             Text("GPU duty", style=duty_style),
             duty_value,
             duty_bar,
             Text(sparkline(gpu_series) or "…", style="green"),
-            "busy" if busy_fraction and busy_fraction > 0.5 else "idle",
+            duty_detail,
         )
 
         window = self._trend_window_label()
@@ -2092,11 +2100,19 @@ class OverviewView(Vertical):
             else:
                 notice = Text(self._trend_notice, style="italic yellow")
 
-        duty_warning = (
-            Text("GPU near-idle while a job is running: check the loaded model and the logs.", style="dark_orange")
-            if duty_low
-            else None
-        )
+        duty_warning = None
+        if duty_low:
+            # A single-card worker has only one thing the warning could mean, so it stays unqualified.
+            if len(snapshot.per_card) <= 1:
+                which = "GPU"
+            elif len(low_duty_cards) == 1:
+                which = f"GPU {low_duty_cards[0]}"
+            else:
+                which = "GPUs " + ", ".join(str(index) for index in low_duty_cards)
+            duty_warning = Text(
+                f"{which} near-idle while a job is running: check the loaded model and the logs.",
+                style="dark_orange",
+            )
 
         parts: list[RenderableType] = [part for part in (notice, duty_warning, grid) if part is not None]
         body = Group(*parts)

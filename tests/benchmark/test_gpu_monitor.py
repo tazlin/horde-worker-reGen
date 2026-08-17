@@ -7,7 +7,11 @@ import time
 
 import pytest
 
-from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler, _make_utilization_reader
+from horde_worker_regen.utils.gpu_monitor import (
+    GpuUtilizationSampler,
+    GpuUtilizationSamplers,
+    _make_utilization_reader,
+)
 
 
 class TestGpuUtilizationSampler:
@@ -141,3 +145,66 @@ class TestUtilizationReaderDelegatesToHordelib:
         target = tmp_path / "timeline.json"
         sampler.dump_timeline(target)
         assert json.loads(target.read_text(encoding="utf-8")) == [[1000.0, 42], [1001.0, 7]]
+
+
+class TestGpuUtilizationSamplers:
+    """The multi-card holder keeps one sampler per driven card and reduces across them."""
+
+    def test_samples_every_driven_card_from_its_own_reader(self) -> None:
+        """Each card is polled through its own reader; the per-card figures stay separate."""
+        samplers = GpuUtilizationSamplers(
+            [0, 1],
+            interval_seconds=0.002,
+            busy_threshold_percent=50,
+            readers={0: lambda: 90, 1: lambda: 10},
+        )
+        samplers.start()
+        time.sleep(0.05)
+        samplers.stop()
+
+        assert samplers.device_indices == (0, 1)
+        assert samplers.mean_percent_per_card() == {0: 90.0, 1: 10.0}
+        assert samplers.busy_fraction_per_card() == {0: 1.0, 1: 0.0}
+        assert all(count >= 1 for count in samplers.sample_count_per_card().values())
+
+    def test_worker_wide_figures_reduce_across_cards(self) -> None:
+        """The scalar figures are the unweighted mean of the per-card ones, so cards count equally."""
+        samplers = GpuUtilizationSamplers([0, 1], busy_threshold_percent=50)
+        samplers._samplers[0]._samples.extend([100, 100, 100, 100])  # noqa: SLF001 - drive the math directly
+        samplers._samplers[1]._samples.extend([0])  # noqa: SLF001
+
+        assert samplers.mean_percent() == 50.0
+        assert samplers.busy_fraction() == 0.5
+        assert samplers.sample_count == 5
+
+    def test_unmeasured_cards_are_omitted_rather_than_counted_as_zero(self) -> None:
+        """A card with no telemetry drops out of the per-card view and out of the reduction."""
+        samplers = GpuUtilizationSamplers([0, 1])
+        samplers._samplers[0]._samples.extend([60, 80])  # noqa: SLF001
+
+        assert samplers.mean_percent_per_card() == {0: 70.0}
+        assert samplers.sample_count_per_card() == {0: 2, 1: 0}
+        assert samplers.mean_percent() == 70.0
+
+    def test_no_measured_cards_report_none(self) -> None:
+        """With nothing sampled anywhere the reductions are None, never zero."""
+        samplers = GpuUtilizationSamplers([0, 1])
+        assert samplers.mean_percent() is None
+        assert samplers.busy_fraction() is None
+        assert samplers.sample_count == 0
+
+    def test_single_card_matches_a_bare_sampler(self) -> None:
+        """A single-GPU host's figures are identical to one sampler on index 0."""
+        samplers = GpuUtilizationSamplers([0], busy_threshold_percent=50)
+        bare = GpuUtilizationSampler(busy_threshold_percent=50)
+        for values in (samplers._samplers[0]._samples, bare._samples):  # noqa: SLF001
+            values.extend([100, 100, 0, 100])
+
+        assert samplers.mean_percent() == bare.mean_percent()
+        assert samplers.busy_fraction() == bare.busy_fraction()
+        assert samplers.sample_count == bare.sample_count
+        assert samplers.mean_percent_per_card() == {0: bare.mean_percent()}
+
+    def test_stop_is_safe_when_never_started(self) -> None:
+        """Stopping cards that never started (no telemetry) is harmless."""
+        GpuUtilizationSamplers([0, 1], readers={}).stop()  # must not raise

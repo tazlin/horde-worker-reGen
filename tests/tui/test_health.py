@@ -451,3 +451,56 @@ def test_is_gpu_duty_low_flags_idle_gpu_during_a_job() -> None:
     assert is_gpu_duty_low(running_busy) is False
     assert is_gpu_duty_low(waiting_idle) is False
     assert is_gpu_duty_low(unsampled) is False
+
+
+def test_gpu_duty_low_is_decided_per_card() -> None:
+    """A card is flagged only on its own evidence: its processes mid-job and its own duty near idle."""
+    from horde_worker_regen.tui.health import gpu_duty_low_cards
+
+    busy_card_one = _snapshot(
+        processes=[_process("WAITING_FOR_JOB", device_index=0), _process("INFERENCE_STARTING", device_index=1)],
+        gpu_utilization_mean_percent=45.0,
+        gpu_utilization_mean_percent_per_card={0: 89.0, 1: 1.0},
+    )
+    assert gpu_duty_low_cards(busy_card_one) == [1]
+
+    # Card 0 is idle because it has no work, not because it is starved; only the working card can qualify.
+    idle_card_zero = _snapshot(
+        processes=[_process("WAITING_FOR_JOB", device_index=0), _process("INFERENCE_STARTING", device_index=1)],
+        gpu_utilization_mean_percent=45.0,
+        gpu_utilization_mean_percent_per_card={0: 0.0, 1: 90.0},
+    )
+    assert gpu_duty_low_cards(idle_card_zero) == []
+
+    both_starved = _snapshot(
+        processes=[_process("INFERENCE_STARTING", device_index=0), _process("INFERENCE_STARTING", device_index=1)],
+        gpu_utilization_mean_percent=1.0,
+        gpu_utilization_mean_percent_per_card={0: 1.0, 1: 2.0},
+    )
+    assert gpu_duty_low_cards(both_starved) == [0, 1]
+
+
+def test_gpu_duty_low_falls_back_to_the_worker_wide_figure() -> None:
+    """Without per-card duty (a single-card worker, or an older snapshot) the scalar decides."""
+    from horde_worker_regen.tui.health import gpu_duty_low_cards, is_gpu_duty_low
+
+    running_idle = _snapshot(processes=[_process("INFERENCE_STARTING")], gpu_utilization_mean_percent=1.0)
+    assert gpu_duty_low_cards(running_idle) == [0]
+    assert is_gpu_duty_low(running_idle) is True
+
+
+def test_per_card_duty_survives_a_snapshot_round_trip() -> None:
+    """The per-card duty fields cross the supervisor channel intact, keyed by device index."""
+    snapshot = _snapshot(
+        gpu_utilization_mean_percent=45.0,
+        gpu_utilization_busy_fraction=0.5,
+        gpu_utilization_samples=8,
+        gpu_utilization_mean_percent_per_card={0: 89.0, 1: 1.0},
+        gpu_utilization_busy_fraction_per_card={0: 0.9, 1: 0.1},
+        gpu_utilization_samples_per_card={0: 4, 1: 4},
+    )
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert restored.gpu_utilization_mean_percent_per_card == {0: 89.0, 1: 1.0}
+    assert restored.gpu_utilization_busy_fraction_per_card == {0: 0.9, 1: 0.1}
+    assert restored.gpu_utilization_samples_per_card == {0: 4, 1: 4}
+    assert restored.gpu_utilization_mean_percent == 45.0

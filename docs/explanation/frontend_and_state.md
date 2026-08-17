@@ -45,7 +45,10 @@ defines the structured protocol over it:
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
   strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
-  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. The snapshot also carries
+  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. GPU duty is carried both
+  per card (`gpu_utilization_mean_percent_per_card`, `gpu_utilization_busy_fraction_per_card` and
+  `gpu_utilization_samples_per_card`, keyed by device index) and as the long-standing worker-wide
+  scalars, which are reductions across the driven cards. The snapshot also carries
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
   export toggle and disk-size warning. The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`

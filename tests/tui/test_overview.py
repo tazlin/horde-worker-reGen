@@ -727,6 +727,45 @@ def test_trends_panel_shows_value_direction_and_window() -> None:
     assert "42 done" in text
 
 
+def test_trends_show_per_card_duty_and_name_the_starved_card() -> None:
+    """With several cards the duty row states each card's figure and the alert names the starved one."""
+    view = OverviewView()
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process(), _busy_process()],
+        per_card=[CardSnapshot(device_index=0), CardSnapshot(device_index=1)],
+        gpu_utilization_mean_percent=45.0,
+        gpu_utilization_busy_fraction=0.45,
+        gpu_utilization_mean_percent_per_card={0: 88.0, 1: 2.0},
+    )
+    snapshot.processes[1].device_index = 1
+    view._record_trends(snapshot)
+
+    text = _render(view._render_trends(snapshot), width=120)
+
+    assert "card 0 88%" in text and "card 1 2%" in text
+    assert "GPU 1 near-idle" in text
+
+
+def test_single_card_trends_keep_the_unqualified_duty_row() -> None:
+    """A single-GPU worker's duty row and alert are unchanged by the per-card work."""
+    view = OverviewView()
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+        per_card=[CardSnapshot(device_index=0)],
+        gpu_utilization_mean_percent=2.0,
+        gpu_utilization_busy_fraction=0.02,
+        gpu_utilization_mean_percent_per_card={0: 2.0},
+    )
+    view._record_trends(snapshot)
+
+    text = _render(view._render_trends(snapshot), width=120)
+
+    assert "card 0" not in text
+    assert "GPU near-idle" in text
+
+
 def test_phone_trends_preserve_each_value_and_graph_without_squeezing_columns() -> None:
     """Phone trends stack summaries over graphs instead of dividing 44 columns into five slivers."""
     view = OverviewView()

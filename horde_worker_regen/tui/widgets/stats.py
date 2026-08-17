@@ -151,10 +151,17 @@ class StatsView(Vertical):
         grid = Table.grid(padding=(0, 3))
         grid.add_column(style="bold cyan", no_wrap=True)
         grid.add_column(no_wrap=True)
+        # The headline figure is a reduction across the driven cards, so a multi-GPU worker gets each
+        # card's own duty beside it rather than a number that describes neither card.
+        duty_per_card = snapshot.gpu_utilization_mean_percent_per_card
+        gpu_duty = format_percent(snapshot.gpu_utilization_mean_percent)
+        if len(duty_per_card) > 1:
+            breakdown = ", ".join(f"card {index} {value:.0f}%" for index, value in sorted(duty_per_card.items()))
+            gpu_duty = f"{gpu_duty} ({breakdown})"
         rows = [
             ("Jobs", f"{snapshot.num_jobs_submitted:,} submitted / {snapshot.num_jobs_faulted:,} faulted"),
             ("Kudos/hr", "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"),
-            ("GPU duty", format_percent(snapshot.gpu_utilization_mean_percent)),
+            ("GPU duty", gpu_duty),
             ("Recoveries", f"{snapshot.num_process_recoveries:,}"),
             ("Slowdowns", f"{snapshot.num_job_slowdowns:,}"),
             ("No-work time", human_duration(snapshot.time_spent_no_jobs_available)),

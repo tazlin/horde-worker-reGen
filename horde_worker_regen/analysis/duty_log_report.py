@@ -42,8 +42,11 @@ _EPOCH_BOUNDARY_FALLBACK_RE = re.compile(r"worker_identity:_verify_worker_names_
 _EPOCH_COLLAPSE_SECONDS = 30.0
 """Boundary lines closer together than this belong to the same startup burst, not a new epoch."""
 
+# A multi-GPU worker states each card's duty in a parenthetical after the worker-wide headline; the
+# headline keeps its shape either way, so the breakdown is an optional group here.
 _DUTY_RE = re.compile(
-    r"GPU duty cycle (?P<duty>\d+)% over last (?P<window>\d+)s "
+    r"GPU duty cycle (?P<duty>\d+)%(?: \((?P<per_card>card \d+: \d+%(?:, card \d+: \d+%)*)\))? "
+    r"over last (?P<window>\d+)s "
     r"\(target \d+%, source=(?P<source>[\w-]+), busy=(?P<busy>\d+)%\)",
 )
 # Clauses end at the next "; " part separator or the ". " before the jobs/processes context. A plain

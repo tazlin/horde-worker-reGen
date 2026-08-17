@@ -88,6 +88,15 @@ memory use **per card**, so account for them across every driven card, not once 
 [Configure for your GPU](configure-for-your-gpu.md) and
 [Performance and backpressure](../explanation/performance_and_backpressure.md).
 
+## Watching each card
+
+Every duty signal is measured per card. The periodic `GPU duty cycle` log line states each card's own
+figure beside the worker-wide one, the dashboard's Trends row and GPUs panel show per-card duty, and
+the near-idle alert names the card it means. The worker-wide number is a mean across the driven cards,
+so treat it as a summary and read the per-card figures when it looks middling: one saturated card
+beside a starved one produces exactly the same average as two evenly-fed ones. See
+[GPU duty cycle](../explanation/duty-cycle.md).
+
 ## Alternative: one worker per GPU
 
 You can still run a separate worker instance per card, each pinned to a device and given its own name.

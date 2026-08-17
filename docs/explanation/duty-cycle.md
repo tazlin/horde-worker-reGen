@@ -42,6 +42,15 @@ the worker itself makes no NVIDIA assumption and never touches `pynvml` directly
 utilization source (CPU, fake, or a backend without a telemetry path) the sampler collects nothing and
 reports `None`, and the worker falls back to the phase-derived proxy described below.
 
+A worker driving several cards has one duty cycle per card, so
+[`GpuUtilizationSamplers`][horde_worker_regen.utils.gpu_monitor.GpuUtilizationSamplers] holds one
+sampler per driven device index and every worker-wide figure (the log headline, the snapshot scalars,
+the dashboard trend) is a *reduction* over those: the unweighted mean across the cards that produced
+samples, so cards count equally regardless of sampling rate. A single-GPU worker has exactly one card
+in that set and reads identically to a bare sampler on device 0. Reach for the per-card figures
+whenever the reduction looks middling: a busy card beside a starved one averages to a number that
+describes neither.
+
 Every 180 seconds the worker emits one `GPU duty cycle` line (see
 [`HordeWorkerProcessManager._maybe_log_duty_cycle`][horde_worker_regen.process_management.process_manager.HordeWorkerProcessManager._maybe_log_duty_cycle]),
 where the window each report covers is exactly that same 180 seconds, so the utilization figure, the
@@ -176,6 +185,13 @@ model load (disk) 1.8s/job, safety 0.9s/job; reload churn: 23 model swaps, 18 VR
 jobs: 14 done | 3 pending | 1 in-flight; processes: ...
 ```
 
+On a multi-GPU worker the headline keeps that shape and gains a per-card breakdown beside it, so the
+reduction can never hide a starved card:
+
+```text
+GPU duty cycle 61% (card 0: 88%, card 1: 34%) over last 180s (target 90%, source=nvml, busy=78%). ...
+```
+
 Read left to right: the GPU was busy 82% of the time but only averaged 47% load (light, latency-bound
 work, not saturation); none of the window was demand-limited (no "had no jobs available" clause, so
 this is efficiency loss, not lack of demand); the biggest worker-side sinks were disk model loads and
@@ -240,10 +256,12 @@ which works even on stats files predating the slot-duty fields.
 ### The dashboard
 
 The [TUI dashboard](../how-to/use-the-dashboard.md) shows the same sampled figure live: the health
-panel reports a `% duty cycle` check (and flags the GPU sitting near-idle while a job is supposedly
-running), and the Overview's Trends panel plots the rolling mean. The dashboard is the quickest way to
-see the number move while you change a setting; the log line and the report below are for attribution
-and for comparing runs.
+panel reports a `% duty cycle` check (and flags a card sitting near-idle while a job is supposedly
+running on it, naming the card on a multi-GPU worker), and the Overview's Trends panel plots the
+rolling mean, stating each card's own duty beside it when more than one card is driven. The GPUs panel
+draws each card's measured duty in its `Duty` column, falling back to a busy-context proxy on hosts
+with no utilization telemetry. The dashboard is the quickest way to see the number move while you
+change a setting; the log line and the report below are for attribution and for comparing runs.
 
 ### Across sessions: `horde-duty-report`
 
@@ -482,7 +500,9 @@ python -m horde_worker_regen.benchmark.gate_driver \
   [`summarize_duty_cycle`][horde_worker_regen.process_management.resources.duty_cycle.summarize_duty_cycle]: the
   shared summary used by both the live worker and the benchmark
 - [`GpuUtilizationSampler`][horde_worker_regen.utils.gpu_monitor.GpuUtilizationSampler]: the background
-  utilization sampler
+  utilization sampler, and
+  [`GpuUtilizationSamplers`][horde_worker_regen.utils.gpu_monitor.GpuUtilizationSamplers]: the per-card
+  holder the worker drives it through
 - [`horde_worker_regen.analysis.session_duty`][horde_worker_regen.analysis.session_duty]: the
   stats-backed session analyzer behind the preferred `horde-duty-report` path
 - [`horde_worker_regen.analysis.duty_log_report`][horde_worker_regen.analysis.duty_log_report]: the

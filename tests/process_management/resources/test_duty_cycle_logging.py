@@ -67,6 +67,49 @@ class TestLogDutyCycleSummary:
         assert "biggest worker-side gaps" in text
         assert "inf#0=WAITING_FOR_JOB" in text
 
+    def test_multi_card_line_states_each_card_and_stays_parseable(self) -> None:
+        """More than one driven card adds a per-card breakdown that the log parser still matches."""
+        from horde_worker_regen.analysis.duty_log_report import parse_duty_window
+
+        manager = make_testable_process_manager()
+        summary = summarize_duty_cycle(
+            [_job_with_gaps()],
+            window_seconds=180.0,
+            nvml_mean_percent=61.0,
+            nvml_busy_fraction=0.78,
+        )
+        messages, handler_id = _capture_logs()
+        try:
+            manager._log_duty_cycle_summary(summary, "inf#0=WAITING_FOR_JOB", {0: 88.0, 1: 34.0})
+        finally:
+            logger.remove(handler_id)
+
+        text = " ".join(message for _, message in messages)
+        assert "GPU duty cycle 61% (card 0: 88%, card 1: 34%) over last 180s" in text
+        window = parse_duty_window(next(message for _, message in messages), None)
+        assert window is not None
+        assert window.duty_percent == 61
+        assert window.busy_percent == 78
+
+    def test_single_card_line_carries_no_breakdown(self) -> None:
+        """One driven card leaves the line exactly as a single-GPU worker has always emitted it."""
+        manager = make_testable_process_manager()
+        summary = summarize_duty_cycle(
+            [_job_with_gaps()],
+            window_seconds=180.0,
+            nvml_mean_percent=60.0,
+            nvml_busy_fraction=0.8,
+        )
+        messages, handler_id = _capture_logs()
+        try:
+            manager._log_duty_cycle_summary(summary, "inf#0=WAITING_FOR_JOB", {0: 60.0})
+        finally:
+            logger.remove(handler_id)
+
+        text = " ".join(message for _, message in messages)
+        assert "GPU duty cycle 60% over last 180s" in text
+        assert "card 0" not in text
+
     def test_near_target_is_info(self) -> None:
         """Between the warn band and the target, the shortfall is a gentle INFO, not a warning."""
         manager = make_testable_process_manager()
@@ -176,7 +219,7 @@ class TestMaybeLogDutyCycle:
         """Once a report interval has elapsed, the full path measures the window and logs a line."""
         manager = make_testable_process_manager()
         now = time.time()
-        manager._gpu_sampler._timeline.extend([(now - 1.0, 60), (now - 2.0, 60), (now - 3.0, 60)])
+        manager._gpu_sampler._samplers[0]._timeline.extend([(now - 1.0, 60), (now - 2.0, 60), (now - 3.0, 60)])
         manager._run_metrics._jobs.append(_job_with_gaps(finalized_at=now - 10.0))
         manager._last_duty_cycle_log_time = now - 200.0
         manager._last_no_jobs_seconds_at_duty_log = 0.0
@@ -196,7 +239,7 @@ class TestMaybeLogDutyCycle:
         assert manager._inference_scheduler._churn_observer == manager._run_metrics.record_churn
 
         now = time.time()
-        manager._gpu_sampler._timeline.extend([(now - 1.0, 60), (now - 2.0, 60), (now - 3.0, 60)])
+        manager._gpu_sampler._samplers[0]._timeline.extend([(now - 1.0, 60), (now - 2.0, 60), (now - 3.0, 60)])
         manager._run_metrics._jobs.append(_job_with_gaps(finalized_at=now - 10.0))
         manager._last_duty_cycle_log_time = now - 200.0
         manager._last_no_jobs_seconds_at_duty_log = 0.0
@@ -221,8 +264,8 @@ class TestSnapshotPopulatesDutyCycle:
         """In normal operation the GPU fields come from the worker's sampler, lighting up the TUI trend."""
         manager = make_testable_process_manager()
         now = time.time()
-        manager._gpu_sampler._timeline.extend([(now - 1.0, 70), (now - 2.0, 70), (now - 3.0, 0)])
-        manager._gpu_sampler._samples.extend([70, 70, 0])
+        manager._gpu_sampler._samplers[0]._timeline.extend([(now - 1.0, 70), (now - 2.0, 70), (now - 3.0, 0)])
+        manager._gpu_sampler._samplers[0]._samples.extend([70, 70, 0])
 
         snapshot = manager._build_worker_state_snapshot()
 
@@ -230,6 +273,27 @@ class TestSnapshotPopulatesDutyCycle:
         assert 40.0 < snapshot.gpu_utilization_mean_percent < 50.0
         assert snapshot.gpu_utilization_busy_fraction == 2 / 3
         assert snapshot.gpu_utilization_samples == 3
+
+    def test_snapshot_carries_per_card_duty_and_reduces_for_the_scalars(self) -> None:
+        """Each driven card reports its own duty; the worker-wide fields are the reduction over them."""
+        from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers
+
+        manager = make_testable_process_manager()
+        manager._gpu_sampler = GpuUtilizationSamplers([0, 1], busy_threshold_percent=50)
+        now = time.time()
+        manager._gpu_sampler._samplers[0]._timeline.extend([(now - 1.0, 90), (now - 2.0, 90)])
+        manager._gpu_sampler._samplers[0]._samples.extend([90, 90])
+        manager._gpu_sampler._samplers[1]._timeline.extend([(now - 1.0, 10), (now - 2.0, 10)])
+        manager._gpu_sampler._samplers[1]._samples.extend([10, 10])
+
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.gpu_utilization_mean_percent_per_card == {0: 90.0, 1: 10.0}
+        assert snapshot.gpu_utilization_busy_fraction_per_card == {0: 1.0, 1: 0.0}
+        assert snapshot.gpu_utilization_samples_per_card == {0: 2, 1: 2}
+        assert snapshot.gpu_utilization_mean_percent == 50.0
+        assert snapshot.gpu_utilization_busy_fraction == 0.5
+        assert snapshot.gpu_utilization_samples == 4
 
     def test_snapshot_gpu_fields_none_without_telemetry(self) -> None:
         """With no samples (CPU/fake/non-NVIDIA) the GPU fields stay None/0, exactly as before."""

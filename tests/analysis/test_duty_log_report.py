@@ -58,6 +58,19 @@ class TestDutyLineParsing:
         assert window.gaps == {"queue wait": 26.5, "submit": 3.4}
         assert window.churn == {"model swaps": 23, "VRAM evictions": 18}
 
+    def test_multi_card_breakdown_still_parses(self) -> None:
+        """A multi-GPU worker's per-card parenthetical rides beside the headline without hiding the line."""
+        message = (
+            "GPU duty cycle 61% (card 0: 88%, card 1: 34%) over last 180s "
+            "(target 90%, source=nvml, busy=78%). biggest worker-side gaps: queue wait 4.0s/job. jobs: 15 done"
+        )
+        window = parse_duty_window(message, None)
+        assert window is not None
+        assert window.duty_percent == 61
+        assert window.window_seconds == 180
+        assert window.busy_percent == 78
+        assert window.gaps == {"queue wait": 4.0}
+
     def test_non_duty_line_returns_none(self) -> None:
         """A line that is not a duty-cycle report parses to None."""
         assert parse_duty_window("just some other log line", None) is None
