@@ -36,6 +36,9 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramVerdict,
 )
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    _GOVERNOR_DEFER_DWELL_SECONDS,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -256,6 +259,99 @@ class TestHeadProtectionIsBounded:
         )
 
         assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
+
+
+class TestGovernorDeferredHeadStopsReservingRoom:
+    """A head whose whole-card establishment a churn governor defers is not asking for the card.
+
+    The governor brakes how fast the card may be rotated and says so: normal scheduling continues around the
+    deferred head, which takes no establishment for the length of the deferral. Charging its whole-card demand
+    against the ready work behind it therefore reserves the card for a claim nobody is making, and the card
+    sits empty while smaller jobs that fit are turned away. Once the deferral clears or its dwell is spent the
+    head is served by ordinary admission and its normal charge applies again.
+    """
+
+    async def _deferrable_head(self):  # noqa: ANN202
+        """A scheduler whose head is briefly parked, so only the deferral can release head protection."""
+        scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        _install_cycle(scheduler, _fitting_state())
+        scheduler._head_starved_seconds = Mock(return_value=5.0)  # type: ignore[method-assign]
+        return scheduler, job, target
+
+    async def test_a_deferred_head_prices_no_demand(self) -> None:
+        """With the deferral in force the head charges nothing, so a fitting line-skipper is not measured."""
+        scheduler, job, _target = await self._deferrable_head()
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
+
+        scheduler._whole_card_ledger.note_governor_defer(None, model=job.model, now=scheduler._clock())
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
+
+    async def test_a_deferral_of_another_model_leaves_this_head_protected(self) -> None:
+        """The release is keyed on the deferred model, so an unrelated deferral changes nothing."""
+        scheduler, job, _target = await self._deferrable_head()
+
+        scheduler._whole_card_ledger.note_governor_defer(None, model="some_other_model", now=scheduler._clock())
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
+
+    async def test_a_spent_dwell_restores_the_normal_charge(self) -> None:
+        """Past the dwell the head is served co-resident by ordinary admission, so it reserves room again."""
+        now = [1_000.0]
+        scheduler, job, _target = await self._deferrable_head()
+        scheduler._clock = lambda: now[0]  # type: ignore[method-assign]
+        scheduler._whole_card_ledger.note_governor_defer(None, model=job.model, now=now[0])
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
+
+        now[0] += _GOVERNOR_DEFER_DWELL_SECONDS + 1.0
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
+
+    async def test_a_fitting_line_skip_dispatches_while_the_head_is_deferred(self) -> None:
+        """The end-to-end contract: the same fitting candidate that is held for the head runs once it stands down.
+
+        The control half is the point of the pairing. Head protection must still hold a fitting line-skipper
+        for a head that is genuinely waiting on the room; only the deferred head, which has stood down, stops
+        reserving it.
+        """
+        scheduler, job, target = await self._deferrable_head()
+        protected_demand_mb = scheduler._displaced_head_outstanding_mb(job, device_index=None)
+        assert protected_demand_mb is not None
+
+        # Priced so the candidate fits the card outright while the head's demand would not fit beside it,
+        # which is exactly the arithmetic head protection exists to enforce.
+        _install_cycle(
+            scheduler,
+            DeviceVramState(
+                total_vram_mb=24000.0,
+                baseline_mb=1000.0,
+                committed_vram_mb=2000.0,
+                planned_unmaterialized_mb=0.0,
+                committed_is_stale=False,
+                device_free_mb=protected_demand_mb * 1.5,
+            ),
+        )
+        assert (
+            scheduler._dispatch_residency_reconciliation_holds(
+                job,
+                target,
+                is_head_of_queue=False,
+                head_outstanding_mb=protected_demand_mb,
+            )
+            is True
+        )
+
+        scheduler._whole_card_ledger.note_governor_defer(None, model=job.model, now=scheduler._clock())
+
+        assert (
+            scheduler._dispatch_residency_reconciliation_holds(
+                job,
+                target,
+                is_head_of_queue=False,
+                head_outstanding_mb=scheduler._displaced_head_outstanding_mb(job, device_index=None),
+            )
+            is False
+        )
 
 
 class TestStarvedDispatchHeadSignals:

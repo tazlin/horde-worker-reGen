@@ -316,6 +316,16 @@ been parked past its protection window without dispatching, the gate stops prese
 fitting sibling is admitted, and the release is disclosed and recorded as a dispatch decision. The head keeps
 its queue position and first claim on the next opportunity.
 
+Protection is released the same way, and immediately, while a churn governor is deferring that head's
+whole-card establishment on the target card (see
+[Bounding residency churn](resource_governance.md#bounding-residency-churn)). For the length of that deferral
+the head is deliberately not asking for the card: the governor's own disclosure says normal scheduling
+continues around it. Charging its whole-card demand against the ready work behind it would reserve the card
+for a claim nobody is making, so the card stands empty while smaller jobs that measurably fit are turned
+away. The pricing seam reads the deferral from the whole-card ledger and omits the head's demand for as long
+as it stands; once the governor releases the card, or the deferral's dwell is spent and the head is served
+co-resident by ordinary admission, the head's normal charge applies again.
+
 The "foreign" label is earned, not assumed. Before a non-fitting head is charged to foreign pressure, the
 arbiter separates a shortfall the worker can itself reclaim: a head whose deficit is held by its own idle
 sibling contexts (a bare CUDA context whose VRAM returns only when the process exits, so no model-unload or

@@ -3403,6 +3403,19 @@ class InferenceScheduler:
             restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
 
+    def whole_card_governor_defer_active(self) -> bool:
+        """Whether a churn governor is deferring a head's whole-card establishment, so a held queue is chosen.
+
+        The governor brakes how fast a card may be rotated; while it holds, the head does not take the card
+        and the smaller work behind it is admitted by ordinary measured admission. That window can legitimately
+        present as an idle card with pending work, which is the raw shape a structural wedge is read from, so
+        the recovery supervisor must not answer a governance brake with constructive remedies or a pool reset.
+        Bounded by the ledger's defer dwell, after which the head stops asking for the card and is served
+        co-resident, so a governor that never releases still leaves the wedge assessment reachable. Public:
+        read by the process manager's wedge assessment.
+        """
+        return self._whole_card_ledger.any_governor_defer_active(now=self._clock())
+
     def heavy_head_load_grace_active(self) -> bool:
         """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
 
@@ -7721,8 +7734,17 @@ class InferenceScheduler:
         worth anything if the head eventually takes it: a head whose own admission keeps declining holds the
         card empty while runnable siblings that fit are turned away, which serves nobody. The head keeps its
         queue position and first claim on the next opportunity; it simply stops blocking work in the meantime.
+
+        It is released the same way while a churn governor is deferring this head's whole-card establishment
+        on this card. For the length of that deferral the head is not asking for the card at all (normal
+        scheduling continues around it by design), so reserving its whole-card demand against smaller ready
+        work would idle the card against a claim nobody is making. Once the deferral clears or its dwell is
+        spent the head is served by ordinary admission and its normal charge applies again.
         """
         if displaced_head.model is None:
+            return None
+        if self._whole_card_ledger.governor_deferred_head(device_index, now=self._clock()) == displaced_head.model:
+            self._note_head_protection_governor_deferred(displaced_head)
             return None
         if self._head_starved_seconds(displaced_head) >= _HEAD_PROTECTION_MAX_STARVE_SECONDS:
             self._note_head_protection_released(displaced_head)
@@ -7733,6 +7755,32 @@ class InferenceScheduler:
             baseline,
             process_id=None,
             disaggregated=self._is_disaggregation_class_eligible(displaced_head),
+        )
+
+    def _note_head_protection_governor_deferred(self, head: ImageGenerateJobPopResponse) -> None:
+        """Disclose that a head whose whole-card ask is governor-deferred has stopped reserving card room."""
+        if head.id_ is None:
+            return
+        if self._decision_sink is not None:
+            self._decision_sink(
+                decision_kind=DecisionKind.INFERENCE_DISPATCH,
+                subject=str(head.id_),
+                verdict=DecisionVerdict.NO_OP,
+                reason="head protection released: the head's whole-card establishment is governor-deferred",
+                inputs={"model": str(head.model)},
+            )
+        suppressed = self._scheduler_diagnostic_suppressed_count(
+            "head_protection_governor_deferred",
+            (str(head.id_),),
+        )
+        if suppressed is None:
+            return
+        logger.opt(colors=True).warning(
+            "<fg #ff8c69>Head {} ({}) is not asking for this card while a governor defers its whole-card "
+            "residency, so it no longer reserves card room from the jobs behind it; a fitting sibling may "
+            f"dispatch. The head keeps its queue position.{self._suppressed_suffix(suppressed)}</>",
+            str(head.id_)[:8],
+            head.model,
         )
 
     def _note_head_protection_released(self, head: ImageGenerateJobPopResponse) -> None:

@@ -37,6 +37,9 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     record_affinity_skip,
 )
 from horde_worker_regen.process_management.scheduling.governance import AdmissionDecision
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    _GOVERNOR_DEFER_DWELL_SECONDS,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
@@ -2196,6 +2199,53 @@ class TestSchedulerClockIsInjectable:
         scheduler = _make_inference_scheduler()
 
         assert abs(scheduler._clock() - time.time()) < 1.0
+
+
+class TestGovernorDeferralIsAGovernanceHold:
+    """A churn governor deferring a whole-card establishment is a chosen hold, not a wedge.
+
+    While the deferral stands the head does not take the card and the work behind it is admitted by ordinary
+    measured admission, which can legitimately present as an idle card with pending work: the raw shape the
+    recovery supervisor reads a structural wedge from. The predicate is what tells it apart, and it is bounded
+    by the ledger's defer dwell so a governor that never releases still leaves the wedge assessment reachable.
+    """
+
+    def _scheduler_on(self, now: list[float]) -> InferenceScheduler:
+        return _make_inference_scheduler(
+            process_map=ProcessMap({0: make_mock_process_info(0, model_name=None)}),
+            clock=lambda: now[0],
+        )
+
+    def test_a_recorded_deferral_arms_the_predicate(self) -> None:
+        """A card holding a head off with a governor reports the hold for as long as the dwell runs."""
+        now = [1_000.0]
+        scheduler = self._scheduler_on(now)
+
+        assert scheduler.whole_card_governor_defer_active() is False
+
+        scheduler._whole_card_ledger.note_governor_defer(None, model="flux_model", now=now[0])
+
+        assert scheduler.whole_card_governor_defer_active() is True
+
+    def test_a_spent_dwell_disarms_the_predicate(self) -> None:
+        """Past the dwell the head stops asking for the card, so the hold is over and a wedge is assessable."""
+        now = [1_000.0]
+        scheduler = self._scheduler_on(now)
+        scheduler._whole_card_ledger.note_governor_defer(None, model="flux_model", now=now[0])
+
+        now[0] += _GOVERNOR_DEFER_DWELL_SECONDS + 1.0
+
+        assert scheduler.whole_card_governor_defer_active() is False
+
+    def test_a_cleared_deferral_disarms_the_predicate(self) -> None:
+        """The governor releasing the card ends the hold immediately rather than at the dwell."""
+        now = [1_000.0]
+        scheduler = self._scheduler_on(now)
+        scheduler._whole_card_ledger.note_governor_defer(None, model="flux_model", now=now[0])
+
+        scheduler._whole_card_ledger.clear_governor_defer(None)
+
+        assert scheduler.whole_card_governor_defer_active() is False
 
 
 class TestRestoreGraceIsGrantedForChurn:

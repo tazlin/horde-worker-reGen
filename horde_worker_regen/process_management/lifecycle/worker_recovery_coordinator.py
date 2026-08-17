@@ -648,6 +648,7 @@ class WorkerRecoveryCoordinator:
             return False
         queue_held_for_capacity = (
             self._inference_scheduler.whole_card_residency_grace_active()
+            or self._inference_scheduler.whole_card_governor_defer_active()
             or self._inference_scheduler.heavy_head_load_grace_active()
             or self._inference_scheduler.ram_reclaim_cycle_grace_active()
             or self._inference_starts_backing_off()

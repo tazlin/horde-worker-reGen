@@ -1,9 +1,10 @@
 """The give-up path must read the same structural-wedge verdict the wedge assessment does.
 
 A structural queue wedge is excused while the scheduler is deliberately holding the queue: a whole-card
-model establishing residency, a heavy head loading, a RAM reclaim cycle, backing-off inference starts, or
-inference actually in progress. If the give-up path recomputes that verdict with a narrower set of
-excuses than ``assess_wedge`` applies, it faults the very backlog the scheduler is holding on purpose.
+model establishing residency, a churn governor deferring a whole-card establishment, a heavy head loading, a
+RAM reclaim cycle, backing-off inference starts, or inference actually in progress. If the give-up path
+recomputes that verdict with a narrower set of excuses than ``assess_wedge`` applies, it faults the very
+backlog the scheduler is holding on purpose.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ class TestGiveUpHonoursTheSameWedgeExcuses:
         "excusing_grace",
         [
             "whole_card_residency_grace_active",
+            "whole_card_governor_defer_active",
             "heavy_head_load_grace_active",
         ],
     )

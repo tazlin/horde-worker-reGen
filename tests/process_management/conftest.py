@@ -694,6 +694,7 @@ def make_test_recovery_coordinator(
     scheduler_defaults: dict[str, bool] = {
         "head_model_materializing": False,
         "whole_card_residency_grace_active": False,
+        "whole_card_governor_defer_active": False,
         "heavy_head_load_grace_active": False,
         "ram_reclaim_cycle_grace_active": False,
         "governance_healthy_but_held": False,

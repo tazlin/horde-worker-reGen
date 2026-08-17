@@ -470,7 +470,11 @@ manager-side **actions**:
   storm, or job pops held at one gate past `POP_GATE_HELD_WEDGE_SECONDS` with
   nothing completing behind it. A busy, slow, replacing, or model-loading worker is never wedged, and a
   queue deliberately held while a heavy model establishes whole-card residency is
-  excused by a bounded grace. A pending job whose
+  excused by a bounded grace, as is one held while a churn governor defers a new
+  whole-card establishment (see
+  [Bounding residency churn](resource_governance.md#bounding-residency-churn)):
+  the head is being braked on purpose and normal scheduling continues around it,
+  so answering that with reclaim remedies or a pool rebuild addresses nothing. A pending job whose
   [auxiliary prefetch](model_downloads.md#job-driven-auxiliary-prefetch) is still
   in flight is likewise excused: it holds no inference lane by design while its
   LoRAs or textual inversions download, so the deadlock detector excludes it from

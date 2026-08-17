@@ -376,6 +376,14 @@ call sites, bound that churn:
   deliberate action as the wedge. The liveness bound on a residency that never completes is therefore the
   granted window's own duration. The budget replenishes as old grants age out of the window.
 
+A deferral from either of the two admission governors is recorded per card (the deferred model and when the
+deferral began) and has two consequences beyond the head's own re-ask. The deferred head stops charging its
+whole-card demand against the jobs behind it, because it is not asking for the card while the deferral stands
+(see [head protection](vram_arbiter.md)); and the recovery supervisor reads the deferral as a deliberate hold
+rather than a structural wedge, so it does not answer a rotation brake with reclaim remedies or a pool reset.
+Both are bounded by the deferral dwell, after which the head stops preferring the card, is served co-resident
+if the device can hold it, and both its normal charge and the ordinary wedge assessment resume.
+
 ### The residency claims intake
 
 The three governors above bound how fast a residency may be *cycled*. They say nothing about the traffic that

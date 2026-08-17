@@ -692,6 +692,26 @@ class WholeCardResidencyLedger:
         state.governor_deferred_model = None
         state.governor_deferred_since = 0.0
 
+    def governor_deferred_head(self, device_index: int | None, *, now: float) -> str | None:
+        """Return the model this card's governor deferral is still holding off, or None when none is in force.
+
+        Only a deferral inside its dwell counts. Past the dwell the head stops asking for the card and is
+        served by ordinary admission, so it is no longer a governance hold and no longer a head that has
+        deliberately stood down.
+        """
+        state = self._residencies.get(device_index)
+        if state is None or state.governor_deferred_since == 0.0:
+            return None
+        if (now - state.governor_deferred_since) >= _GOVERNOR_DEFER_DWELL_SECONDS:
+            return None
+        return state.governor_deferred_model
+
+    def any_governor_defer_active(self, *, now: float) -> bool:
+        """Return whether any card is inside a governor deferral's dwell."""
+        return any(
+            self.governor_deferred_head(device_index, now=now) is not None for device_index in self._residencies
+        )
+
     @staticmethod
     def _window_active(
         state: WholeCardResidency,
