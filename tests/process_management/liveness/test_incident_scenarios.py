@@ -107,6 +107,13 @@ The failures encoded here:
   eligible copy to dispatch to and was called already loaded by the preload pass. Neither lane could move it
   and both cards idled against a full queue. That is the ``ineligible-card residency`` scenario, and its
   reinjection is the card-blind gate.
+- **A sibling card's peak evicted safety from a card that was serving.** Runtime safety placement was judged
+  against the heaviest sampling peak the whole worker was committed to. On a multi-card pool that peak is
+  routinely a job this card can never be given, and one whose model it holds no weights for, so its entire
+  footprint read as memory this card still had to find. The card's measured free never covered it, the demotion
+  dwell was met within seconds, and the safety process was ended on a card comfortably serving its own traffic;
+  the restore forecast read the same phantom, so the eviction never reversed. That is the ``per-card safety
+  placement`` scenario, and its reinjection is the worker-wide peak.
 """
 
 from __future__ import annotations
@@ -120,6 +127,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
+    PauseOwner,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
@@ -136,6 +144,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 )
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
+    _CARD_10GB,
     _CARD_16GB,
     _CARD_24GB,
     _CHILD_FREE_MARGIN_MB,
@@ -153,6 +162,7 @@ from tests.process_management.liveness._world_assertions import (
     LANE_TEARDOWN_RUNGS,
     SAFETY_TEARDOWN_RUNG,
     assert_duty_floor,
+    assert_duty_floor_on_card,
     assert_free_floor,
     assert_governor_never_reached,
     assert_ladder_stayed_below,
@@ -1406,7 +1416,20 @@ async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeyp
         f"{context}: safety never came back, so the run buys its dwell by leaving the worker without an "
         f"on-GPU safety process rather than by pacing the cycle. {world.state_dump()}"
     )
+    ladder_owned = [owner for _tick, _when, owner in world.safety_pause_events if owner is PauseOwner.RECLAIM_LADDER]
+    assert ladder_owned, (
+        f"{context}: no safety pause was the ladder's, so the run does not exercise the ladder rung's dwell "
+        f"or a ladder-owned restore. Owners: {[owner.name for _t, _w, owner in world.safety_pause_events]}. "
+        f"{world.state_dump()}"
+    )
     cooldown_seconds = reclaim_ladder_module._SAFETY_RUNG_COOLDOWN_SECONDS
+    # A gap list is empty when only one pause happened, so it cannot by itself say the dwell paced anything;
+    # bound the count directly by what the run's length allows under the cooldown.
+    max_pauses_allowed = int((_THRASH_TICKS * _TICK_SECONDS) // cooldown_seconds) + 1
+    assert len(world.safety_pause_events) <= max_pauses_allowed, (
+        f"{context}: safety was taken off the card {len(world.safety_pause_events)} times in a run whose length "
+        f"allows at most {max_pauses_allowed} under a {cooldown_seconds:.0f}s cooldown. {world.state_dump()}"
+    )
     short_gaps = [gap for gap in _safety_cycle_gaps(world) if gap < cooldown_seconds]
     assert not short_gaps, (
         f"{context}: safety was cycled again {[f'{gap:.0f}s' for gap in short_gaps]} after the previous cycle, "
@@ -2508,3 +2531,238 @@ async def test_p_defect_reinjection_a_card_blind_residency_gate_wedges_both_card
     )
     with pytest.raises(AssertionError, match="the card was idle for"):
         assert_never_idle_with_fitting_work(world, context="ineligible-card residency")
+
+
+# --------------------------------------------------------------------------------------------------------
+# Per-card safety placement: a peak that can only land on a sibling card is not this card's pressure
+# --------------------------------------------------------------------------------------------------------
+
+_TWO_CARD_PIXELS = {0: 4_194_304, 1: 1_048_576}
+"""Per-card resolution ceilings for the two-card pool: the heavy card takes anything these rows generate, and
+the card hosting safety is capped at a megapixel. Only the resolution axis differs, so which card may serve a
+job is decided by its pixels alone, and the heavy class can only ever land on card 0."""
+
+_TWO_CARD_SAFETY_CARD = 1
+"""The card the safety process is pinned to: the one whose own work is light, so its measured evidence says it
+is serving comfortably while its sibling carries the peak the worker cannot give it."""
+
+_TWO_CARD_HEAVY_SHAPE = (1280, 1280)
+_TWO_CARD_HEAVY_BATCH = 2
+"""The heavy class: a hires batch four times the safety card's ceiling, so it is only ever eligible on card 0.
+Its predicted sampling peak is around 6.1 GB, well past anything the safety card could absorb."""
+
+_TWO_CARD_LIGHT_SHAPE = (1024, 1024)
+_TWO_CARD_LIGHT_STEPS = 60
+"""The light class: a megapixel job at the safety card's exact ceiling, with enough steps that its sampling
+window spans several ticks and the card it runs on earns a real duty figure. Its peak is around 4.1 GB, which
+the card already holds the weights and the context for."""
+
+_TWO_CARD_PENDING_PER_CLASS = 2
+"""Jobs of each class the queue is kept holding.
+
+One is not enough: a class with a single job in flight leaves the moment between that job's completion and the
+next pop with nothing of its own anywhere, and the peak a card is committed to then reads as absent for a tick.
+Real traffic keeps a queue, and what this scenario is about is what a card is committed to while it has one."""
+
+_TWO_CARD_TICKS = 300
+"""Ticks these rows run for: ten simulated minutes at this module's tick, twenty times the dwell a placement
+demotion has to sustain, so a policy that arms itself once has the whole run to act on it."""
+
+_TWO_CARD_DUTY_FLOOR = 0.30
+"""Fraction of its own slot-time each card must spend sampling.
+
+The positive half of the placement verdict: a pool that keeps safety on the card by never dispatching would
+satisfy every memory claim here. Each card serves one class with its weights already resident, so the ceiling
+is the share of a job that is neither load nor decode, and this is a comfortable fraction of it."""
+
+
+def _two_card_safety_world() -> _DispatchWorld:
+    """Two independent 10 GB cards, one inference lane each, safety pinned to the lighter card's ledger.
+
+    Both cards carry a resident checkpoint of their own and serve their own class of traffic; safety sits on
+    card 1 with that card's context, its resident weights and its sampling activation beside it. Whole-card
+    residency is off, so nothing but the placement policy and the reclaim ladder can move safety, and the
+    ladder only runs on a saturated card.
+
+    Ten gigabytes rather than eight because eight cannot express the regime. The card hosting safety carries
+    the one-time runtime context (1354 MB), safety's whole-process charge (3044 MB) and a 3.2 GB checkpoint
+    before any job runs: 7598 MB, leaving 594 MB of an 8192 MB card against a 1024 MB PRESSURE soft floor. Such
+    a card is off HEALTHY with nothing sampling on it, and demoting its safety process is then measured
+    evidence acted on correctly rather than the misattribution this scenario is about. Ten gigabytes is the
+    smallest class that fits the light class's activation (944 MB) and a healthy margin on top of those
+    tenants.
+    """
+    world = _DispatchWorld(
+        card=_CARD_10GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=_QUEUE_DEPTH,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        service_contexts=True,
+        safety_readiness_seconds=_SAFETY_READINESS_SECONDS,
+        safety_load_transient_mb=_SAFETY_LOAD_TRANSIENT_MB,
+        card_max_pixels=_TWO_CARD_PIXELS,
+        safety_card_index=_TWO_CARD_SAFETY_CARD,
+    )
+    world.seed_resident(0, _SD15_OTHER, in_vram=True)
+    world.seed_resident(1, _SD15, in_vram=True)
+    assert world.card_of_lane(0) == 0 and world.card_of_lane(1) == _TWO_CARD_SAFETY_CARD, (
+        "precondition: each lane must sit on its own card, so each card's ledger carries one resident"
+    )
+    return world
+
+
+async def _drive_two_card_traffic(world: _DispatchWorld) -> list[int]:
+    """Keep both classes queued for the whole run and record when safety's card read as pressured.
+
+    The pressure predicate is sampled once per tick rather than inferred from whether a flip happened, so the
+    verdict does not depend on the demotion dwell: a card that never reads pressured cannot arm a demotion
+    however long the run is, and a card that does is a card the policy is entitled to act on.
+
+    Returns:
+        The ticks on which safety's own card read as pressured.
+    """
+    heavy_width, heavy_height = _TWO_CARD_HEAVY_SHAPE
+    light_width, light_height = _TWO_CARD_LIGHT_SHAPE
+    pressured_ticks: list[int] = []
+    for _ in range(_TWO_CARD_TICKS):
+        pending = list(world.job_tracker.jobs_pending_inference)
+        heavy_pending = sum(1 for job in pending if job.payload.width > light_width)
+        if heavy_pending < _TWO_CARD_PENDING_PER_CLASS:
+            await world.pop(
+                make_job_pop_response(
+                    _SD15_OTHER.name,
+                    width=heavy_width,
+                    height=heavy_height,
+                    n_iter=_TWO_CARD_HEAVY_BATCH,
+                    ddim_steps=20,
+                ),
+            )
+        if len(pending) - heavy_pending < _TWO_CARD_PENDING_PER_CLASS:
+            await world.pop(
+                make_job_pop_response(
+                    _SD15.name,
+                    width=light_width,
+                    height=light_height,
+                    ddim_steps=_TWO_CARD_LIGHT_STEPS,
+                ),
+            )
+        await world.step()
+        if world.scheduler._safety_placement_card_is_pressured(_TWO_CARD_SAFETY_CARD):
+            pressured_ticks.append(world.tick)
+    return pressured_ticks
+
+
+def _safety_placement_pauses(world: _DispatchWorld) -> list[tuple[int, float]]:
+    """Every time the runtime placement policy itself took safety off the card, as (tick, world clock)."""
+    return [
+        (tick, when) for tick, when, owner in world.safety_pause_events if owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT
+    ]
+
+
+def _price_the_peak_worker_wide(
+    self: InferenceScheduler,
+    device_index: int | None,
+) -> list[ImageGenerateJobPopResponse]:
+    """The pre-fix sampling-peak set: every job the worker holds, whatever card could run it.
+
+    Card-blind exactly as it was, so the heaviest peak any queued or running job carries is charged against
+    every card and a card is held responsible for demand its own config forbids it from being given.
+    """
+    del device_index
+    return [*self._job_tracker.jobs_in_progress, *self._job_tracker.jobs_pending_inference]
+
+
+async def test_q_safety_stays_on_a_card_committed_only_to_the_work_it_serves() -> None:
+    """A card serving its own light work keeps its safety process while a sibling card carries the heavy peak.
+
+    The failure this encodes: safety's placement was judged against a worker-wide sampling peak. On a
+    multi-card pool the heaviest queued job is routinely one this card can never be given (its effective
+    config excludes the resolution outright), and the card holds no weights for that job's model either, so the
+    whole of that peak read as memory this card still had to find. Measured free never covered it, the demotion
+    dwell was met within seconds of the first heavy job, and the safety process was ended on a card that was
+    serving its own traffic comfortably. The restore forecast then asked for the same phantom peak plus
+    safety's footprint, which no card in the pool could ever show, so the eviction was permanent and every
+    result the worker produced afterwards was cleared on the CPU.
+
+    Read as one statement: cards are independent memory domains, so a peak that can only land on a sibling card
+    is not this card's pressure. Its consequences are that the placement policy never demotes safety, that
+    neither card's governor leaves HEALTHY and no reclaim rung is spent, that each card keeps the resident it
+    was serving from, and that both cards go on earning while all of that holds.
+    """
+    world = _two_card_safety_world()
+
+    pressured_ticks = await _drive_two_card_traffic(world)
+
+    context = "per-card safety placement"
+    safety_card = world.safety_card_index()
+    assert not pressured_ticks, (
+        f"{context}: card {safety_card} read as short of memory on tick(s) {pressured_ticks[:6]} while it was "
+        f"serving its own work with its weights already resident, so a demotion was armed against a card that "
+        f"has nothing left to find. {world.state_dump()}"
+    )
+    assert not _safety_placement_pauses(world), (
+        f"{context}: the placement policy took safety off card {safety_card} at "
+        f"{_safety_placement_pauses(world)}, which costs the pipeline the rebuild twice and leaves every later "
+        f"result to be cleared on the CPU. {world.state_dump()}"
+    )
+    assert not world.ladder_actuations and world.reclaim_commands == 0, (
+        f"{context}: the worker spent {len(world.ladder_actuations)} reclaim rung(s) and "
+        f"{world.reclaim_commands} unload command(s) on a pool where neither card ever left its floors, so it "
+        f"took its own capacity down against nothing. {world.state_dump()}"
+    )
+    assert_governor_never_reached(world, GovernorState.PRESSURE, context=context)
+    for device_index in world.card_indices():
+        expected = _SD15_OTHER.name if device_index == 0 else _SD15.name
+        assert list(world.card_resident_models(device_index).values()) == [expected], (
+            f"{context}: card {device_index} ended holding {world.card_resident_models(device_index)} "
+            f"({world.card_resident_mb(device_index)}) rather than the {expected} copy it was serving from, so "
+            f"the run stopped being two cards each serving one class off its own resident weights. "
+            f"{world.state_dump()}"
+        )
+        assert_duty_floor_on_card(world, device_index, _TWO_CARD_DUTY_FLOOR, context=context)
+    heaviest_pool_wide = world.scheduler._largest_active_sampling_peak(None)
+    heaviest_on_safety_card = world.scheduler._largest_active_sampling_peak(safety_card)
+    assert heaviest_pool_wide is not None and heaviest_on_safety_card is not None, (
+        f"{context}: the pool was committed to no sampling peak at all at the end of the run, so nothing here "
+        f"was priced against a peak. {world.state_dump()}"
+    )
+    assert heaviest_pool_wide[0] > heaviest_on_safety_card[0], (
+        f"{context}: the pool's heaviest peak ({heaviest_pool_wide}) was no heavier than what card "
+        f"{safety_card} is committed to ({heaviest_on_safety_card}), so this run would pass with the peak "
+        f"priced worker-wide and says nothing about per-card attribution. {world.state_dump()}"
+    )
+
+
+async def test_q_defect_reinjection_a_worker_wide_peak_evicts_safety_from_a_healthy_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the peak priced worker-wide again, a sibling's demand permanently evicts safety from a serving card.
+
+    Reinjected at the attribution alone: the routing, the ledgers, the dwell and the restore forecast are
+    untouched, and the only difference is that the heaviest peak any job carries is charged to every card. The
+    card hosting safety is then judged unable to find memory it was never going to be asked for, and because
+    the restore forecast reads the same phantom, what comes back is the pre-fix signature in full: one demotion
+    the worker never undoes.
+    """
+    monkeypatch.setattr(InferenceScheduler, "_sampling_peak_jobs_for_card", _price_the_peak_worker_wide)
+    world = _two_card_safety_world()
+
+    pressured_ticks = await _drive_two_card_traffic(world)
+
+    assert pressured_ticks, (
+        "a worker-wide peak must make safety's card read as pressured, which is the whole of this defect; the "
+        f"card read comfortable throughout. {world.state_dump()}"
+    )
+    pauses = _safety_placement_pauses(world)
+    assert pauses, (
+        f"the placement policy never acted on {len(pressured_ticks)} pressured tick(s), so the eviction the "
+        f"scenario forbids would not have happened on a tree that prices the peak worker-wide. "
+        f"{world.state_dump()}"
+    )
+    assert not world.safety_restore_events, (
+        f"safety came back at {world.safety_restore_events}, so this defect is a cycle rather than the "
+        f"permanent eviction the restore forecast's own phantom peak produces. {world.state_dump()}"
+    )

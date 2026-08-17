@@ -135,6 +135,7 @@ class _CardClass:
 
 
 _CARD_8GB = _CardClass("8gb", 8192.0)
+_CARD_10GB = _CardClass("10gb", 10240.0)
 _CARD_16GB = _CardClass("16gb", 16384.0)
 _CARD_24GB = _CardClass("24gb", 24576.0)
 
@@ -405,6 +406,13 @@ class _DecisionRecord:
     inputs: dict[str, object]
 
 
+_GOVERNOR_SEVERITY = {
+    GovernorState.HEALTHY: 0,
+    GovernorState.PRESSURE: 1,
+    GovernorState.SATURATED: 2,
+}
+"""How bad each governor state is, so a pool-wide verdict can name its worst card's state."""
+
 _HEAD_PROTECTION_REASON_MARKER = "held for the head"
 """The arbiter's own words for a non-head request declined so the head keeps the room it needs.
 
@@ -545,6 +553,7 @@ class _DispatchWorld:
         preload_latency_seconds: float = 0.0,
         disaggregated_encode_seconds: float = 0.0,
         card_max_pixels: dict[int, int] | None = None,
+        safety_card_index: int = 0,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -637,10 +646,13 @@ class _DispatchWorld:
             card_max_pixels: Per-card ``max_pixels`` for a multi-card pool, keyed by device index. The lanes
                 are pinned round-robin over those indices and the scheduler is handed a per-card runtime whose
                 effective config differs only in this ceiling, so a job's resolution alone decides which cards
-                may serve it. The VRAM ledger stays a single derived pool that every card reads the same
-                figure from, so such a row can state routing and admission outcomes and says nothing about
-                per-card VRAM physics. None keeps the single-card pool every other row runs on, where routing
-                is a strict no-op.
+                may serve it. Each index also gets its own entry in the VRAM ledger, so the cards are
+                independent memory domains: every card carries its own total, its own committed tenants and its
+                own measured free reading. None keeps the single card every other row runs on, where routing is
+                a strict no-op and the ledger holds one entry.
+            safety_card_index: The card the on-GPU safety process is pinned to, which is the card its charge
+                lands on and the card its placement policy reasons about. The lowest index is the historical
+                fixed pin and what every single-card row runs on.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -755,6 +767,13 @@ class _DispatchWorld:
 
         self._service_contexts = service_contexts
         card_indices = sorted(card_max_pixels) if card_max_pixels else [0]
+        self._card_totals: dict[int, float] = dict.fromkeys(card_indices, card.total_mb)
+        """The conserved ledger, one entry per card: what that card's total is, and therefore what its free
+        reading is once the tenants charged to it are taken off. Cards are independent memory domains, so
+        every figure derived from the ledger is derived per index; a single-card row holds one entry and every
+        such derivation collapses to the whole-pool figure it was before."""
+        self._safety_card_index = safety_card_index if safety_card_index in self._card_totals else card_indices[0]
+        """The card safety's charge lands on, and the card its placement policy is told it occupies."""
         self._lane_cards = {lane_id: card_indices[lane_id % len(card_indices)] for lane_id in range(lane_count)}
         processes: dict[int, HordeProcessInfo] = {}
         for lane_id in range(lane_count):
@@ -771,6 +790,7 @@ class _DispatchWorld:
                 model_name=None,
                 process_type=HordeProcessType.SAFETY,
                 state=HordeProcessState.WAITING_FOR_JOB,
+                device_index=self._safety_card_index,
             )
             processes[_POST_PROCESS_LANE_ID] = make_mock_process_info(
                 _POST_PROCESS_LANE_ID,
@@ -865,7 +885,7 @@ class _DispatchWorld:
             # Pinning it is what makes a row's jobs priced, admitted, and dispatched on the disaggregated
             # path without standing up the orchestrator's lanes, which these rows do not vary.
             self._scheduler._is_disaggregation_class_eligible = lambda _job: True  # type: ignore[method-assign]
-        self._scheduler.set_device_free_mb_provider(lambda _device_index: self.device_free_mb())
+        self._scheduler.set_device_free_mb_provider(self.device_free_mb)
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
@@ -878,15 +898,19 @@ class _DispatchWorld:
         self._governor = DeviceFreeGovernor()
         self._reclaim_ladder = VerifiedReclaimLadder()
         self._actuator = _RecordingActuator(self)
-        self._healthy_since: float | None = None
-        self.governor_states: list[GovernorState] = []
-        """The governor's committed state at every tick of a closed-loop run, in order."""
+        self._healthy_since: dict[int, float] = {}
+        self.governor_states_by_card: dict[int, list[GovernorState]] = {index: [] for index in self._card_totals}
+        """Each card's committed governor state at every tick of a closed-loop run, in order."""
         self.ladder_actuations: list[_LadderActuation] = []
         """Every reclaim rung the ladder actually performed, in the order it performed them."""
-        self.min_device_free_mb = self.device_free_mb()
-        """The lowest device-free reading the card ever showed, sampled once per tick after the card moves."""
+        self.min_card_free_mb: dict[int, float] = {index: self.card_free_mb(index) for index in self._card_totals}
+        """Per card, the lowest device-free reading it ever showed, sampled once per tick after the card moves."""
         self.sampling_slot_seconds = 0.0
         """Slot-seconds spent sampling: the numerator of the run's duty figure."""
+        self.sampling_slot_seconds_by_card: dict[int, float] = dict.fromkeys(self._card_totals, 0.0)
+        """Per card, the slot-seconds its own lanes spent sampling, so duty is a claim about each card.
+
+        A pool where one card earns for both would hold any worker-wide duty floor while a card sits idle."""
         self.started_at = self.now
         self.completed_jobs = 0
         self.weight_uploads = 0
@@ -908,19 +932,33 @@ class _DispatchWorld:
         """The pool's inference lanes, which is what the row's residency and teardown bookkeeping is about."""
         return [lane for lane in self._process_map.values() if lane.process_type == HordeProcessType.INFERENCE]
 
-    def _context_charge_mb(self) -> float:
-        """The card's total context cost: the one-time runtime, each further context, and safety's weights.
+    def _card_of(self, process_id: int) -> int:
+        """The card a process's charges land on, whether or not the process is still in the pool.
 
-        The safety process carries resident classifier weights on top of its context, so it is charged its
-        whole-process figure (the one the scheduler also prices it at) rather than a bare context; the
-        post-processing lane holds a context and no at-rest model, so it costs the marginal. Safety paused off
-        the card costs it nothing, which is the whole of what the reclaim rung that moves it buys.
+        A lane the pool has retired keeps no map entry, so its pinning is read from the row's own round-robin
+        rather than from the map; nothing a retired lane held may quietly move to another card's ledger.
         """
-        lanes = max(1, len(self._inference_lanes()))
+        process = self._process_map.get(process_id)
+        if process is not None:
+            return process.device_index
+        return self._lane_cards.get(process_id, self._safety_card_index)
+
+    def _context_charge_mb(self, device_index: int) -> float:
+        """One card's total context cost: the one-time runtime, each further context, and safety's weights.
+
+        Every card pays its own one-time runtime allocation: a context on one device buys nothing on another.
+        The safety process carries resident classifier weights on top of its context, so it is charged its
+        whole-process figure (the one the scheduler also prices it at) rather than a bare context, and only to
+        the card it is pinned to; the post-processing lane holds a context and no at-rest model, so it costs
+        the marginal on its own card. Safety paused off the card costs it nothing, which is the whole of what
+        the reclaim rung that moves it buys.
+        """
+        lanes = max(1, sum(1 for lane in self._inference_lanes() if lane.device_index == device_index))
         charge = _FIRST_CONTEXT_MB + _MARGINAL_CONTEXT_MB * (lanes - 1)
         if self._service_contexts:
-            charge += _MARGINAL_CONTEXT_MB
-            if not self.safety_is_off_gpu():
+            if self._card_of(_POST_PROCESS_LANE_ID) == device_index:
+                charge += _MARGINAL_CONTEXT_MB
+            if self._safety_card_index == device_index and not self.safety_is_off_gpu():
                 charge += _SAFETY_GPU_LOAD_CHARGE_MB
                 if self._safety_transition_until is not None:
                     # A restore is still materialising: the classifier weights are being read and copied, so the
@@ -981,17 +1019,32 @@ class _DispatchWorld:
         """What the lifecycle reports one placement flip costs, floored the way the real manager floors it."""
         return max(self.safety_readiness_seconds, SAFETY_READINESS_LATENCY_FLOOR_SECONDS)
 
-    def device_free_mb(self) -> float:
-        """The truthful device-free reading: the card total less its contexts, weights, and live activation.
+    def card_free_mb(self, device_index: int) -> float:
+        """The truthful device-free reading for one card: its total less its contexts, weights and activation.
 
         The sampling activation term is what makes a crater representable: weights are a persistent tenant a
         static fit can price ahead of time, while a sampling window adds gigabytes for its own duration only,
-        and it is the sum of the two across concurrent slots that reaches a paging cliff.
+        and it is the sum of the two across concurrent slots that reaches a paging cliff. Only the tenants
+        charged to this card count, so work on a sibling card neither consumes this card's room nor excuses it.
         """
-        held = (
-            sum(self._resident_mb.values()) + sum(self._transient_mb.values()) + sum(self._held_component_mb.values())
+        held = sum(
+            charge_mb
+            for charges in (self._resident_mb, self._transient_mb, self._held_component_mb)
+            for lane_id, charge_mb in charges.items()
+            if self._card_of(lane_id) == device_index
         )
-        return max(0.0, self.card.total_mb - self._context_charge_mb() - held)
+        return max(0.0, self._card_totals[device_index] - self._context_charge_mb(device_index) - held)
+
+    def device_free_mb(self, device_index: int | None = None) -> float:
+        """The truthful device-free reading for ``device_index``, or the tightest card's when none is named.
+
+        The scheduler is handed this as its per-card measured reading. An unkeyed read answers with the
+        lowest card, which is the figure a floor is about; on a single-card row it is that one card, so every
+        such read is the whole-pool reading it was before the ledger was keyed.
+        """
+        if device_index is None:
+            return min(self.card_free_mb(index) for index in self._card_totals)
+        return self.card_free_mb(device_index)
 
     def _actual_charge_mb(self, predicted_mb: float) -> float:
         """What a charge the scheduler priced at ``predicted_mb`` really costs the card.
@@ -1032,7 +1085,7 @@ class _DispatchWorld:
         since the dispatch (the only allocations it can account for) and takes the lower of the two, which is
         what keeps a shortfall computed against the device rather than against the process.
         """
-        believed = self.device_free_mb() + self.child_free_view_lie_mb
+        believed = self.card_free_mb(self._card_of(lane_id)) + self.child_free_view_lie_mb
         dispatch_truth = self._dispatch_device_truth_mb.get(job_id)
         if dispatch_truth is not None:
             own_growth = self._lane_charge_mb(lane_id) - self._lane_charge_at_dispatch.get(job_id, 0.0)
@@ -1071,10 +1124,11 @@ class _DispatchWorld:
             charge_mb=charge_mb,
             weight_load=weight_load,
         )
-        if committed_mb > self.device_free_mb():
+        card_free_mb = self.card_free_mb(self._card_of(lane_id))
+        if committed_mb > card_free_mb:
             self.child_overcommits.append(
                 f"tick {self.tick}: lane {lane_id} committed {committed_mb:.0f}MB to a card with "
-                f"{self.device_free_mb():.0f}MB really free, believing it had "
+                f"{card_free_mb:.0f}MB really free, believing it had "
                 f"{self._child_believed_free_mb(lane_id, job_id):.0f}MB",
             )
         return committed_mb
@@ -1163,10 +1217,10 @@ class _DispatchWorld:
 
     def _sync_reported_vram(self) -> None:
         """Publish the derived card state through the children's VRAM reports, as a live worker would."""
-        used_mb = self.card.total_mb - self.device_free_mb()
         for lane in self._process_map.values():
-            lane.total_vram_mb = int(self.card.total_mb)
-            lane.vram_usage_mb = int(used_mb)
+            total_mb = self._card_totals[lane.device_index]
+            lane.total_vram_mb = int(total_mb)
+            lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
             lane.process_reserved_mb = int(self._lane_charge_mb(lane.process_id))
 
     # -- seeding ------------------------------------------------------------------------------------------
@@ -1635,7 +1689,10 @@ class _DispatchWorld:
         window_start = self.now - self.tick_seconds
         for occupancy in list(self._occupancy.values()):
             sampled_until = min(self.now, occupancy.sample_until)
-            self.sampling_slot_seconds += max(0.0, sampled_until - max(window_start, occupancy.sample_from))
+            sampled_seconds = max(0.0, sampled_until - max(window_start, occupancy.sample_from))
+            self.sampling_slot_seconds += sampled_seconds
+            card = self._card_of(occupancy.lane_id)
+            self.sampling_slot_seconds_by_card[card] = self.sampling_slot_seconds_by_card[card] + sampled_seconds
             if occupancy.transient_charged and self.now >= occupancy.sample_until:
                 self._release_transient(occupancy)
             if self.now >= occupancy.decode_until:
@@ -1804,6 +1861,7 @@ class _DispatchWorld:
                 lane_id,
                 model_name=None,
                 state=HordeProcessState.WAITING_FOR_JOB,
+                device_index=self._lane_cards.get(lane_id, self._safety_card_index),
             )
         self._sync_reported_vram()
         return len(self._inference_lanes())
@@ -1909,7 +1967,12 @@ class _DispatchWorld:
         entry = self._model_map.root.get(model.name)
         if entry is not None and entry.process_id == victim:
             self._model_map.root.pop(model.name, None)
-        replacement = make_mock_process_info(victim, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        replacement = make_mock_process_info(
+            victim,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            device_index=self._card_of(victim),
+        )
         self._process_map[victim] = replacement
         self._sync_reported_vram()
         return True
@@ -1948,7 +2011,7 @@ class _DispatchWorld:
         obligation readback a statement about the running worker instead of about this harness.
         """
         self.snapshot = self._scheduler.build_vram_arbiter_snapshot(
-            device_free_mb_by_device={0: self.device_free_mb()},
+            device_free_mb_by_device={index: self.card_free_mb(index) for index in self._card_totals},
         )
 
     def _discharge_context_reductions(self) -> None:
@@ -1977,44 +2040,60 @@ class _DispatchWorld:
         the truthful device-free figure through the per-device state machine, pushes the resulting growth hold
         and committed state into the scheduler, and advances the card's reclaim episode. Kept in the same drive
         order (debounce, state commit, ladder tick) so a change to the manager's sequence is findable from
-        here; the manager's own metrics recording and its multi-card loop are the parts left out, since this
-        world models one card and reads its verdicts from state rather than from records.
+        here; the manager's own metrics recording is the part left out, since this world reads its verdicts
+        from state rather than from records. Every card in the ledger is folded in on its own reading, its own
+        total and its own reclaim episode, because a card is an independent memory domain and a state committed
+        from a sibling's reading would govern work that cannot move between them.
 
         The per-step floor latch the manager can force the ladder with is absent: it is set from a sampling
         slot's crawling heartbeats, which this world does not model, so the ladder here is SATURATED-driven
         only. The stranded-lane and stranded-reduction backstops are likewise the manager's, not the
         governor's, and are left to the suites that drive a manager.
         """
-        device_free_mb = self.device_free_mb()
-        sample = self._governor.observe(0, device_free_mb=device_free_mb, total_vram_mb=self.card.total_mb)
-        self.governor_states.append(sample.state)
-        self._scheduler.set_vram_growth_hold(0, sample.state in (GovernorState.PRESSURE, GovernorState.SATURATED))
-        self._scheduler.set_governor_state(0, sample.state)
+        for device_index in sorted(self._card_totals):
+            self._evaluate_one_card_governor(device_index)
+
+    def _evaluate_one_card_governor(self, device_index: int) -> None:
+        """Fold one card's reading through its governor and advance that card's reclaim episode."""
+        device_free_mb = self.card_free_mb(device_index)
+        sample = self._governor.observe(
+            device_index,
+            device_free_mb=device_free_mb,
+            total_vram_mb=self._card_totals[device_index],
+        )
+        self.governor_states_by_card[device_index].append(sample.state)
+        self._scheduler.set_vram_growth_hold(
+            device_index,
+            sample.state in (GovernorState.PRESSURE, GovernorState.SATURATED),
+        )
+        self._scheduler.set_governor_state(device_index, sample.state)
         if sample.state is GovernorState.HEALTHY:
-            if self._healthy_since is None:
-                self._healthy_since = self.now
+            self._healthy_since.setdefault(device_index, self.now)
         else:
-            self._healthy_since = None
+            self._healthy_since.pop(device_index, None)
         self._reclaim_ladder.on_tick(
-            0,
+            device_index,
             saturated=sample.state is GovernorState.SATURATED,
             healthy=sample.state is GovernorState.HEALTHY,
             device_free_mb=device_free_mb,
             actuator=self._actuator,
-            ladder_builder=lambda: build_reclaim_ladder(self._scheduler.build_reclaim_ladder_candidates(0)),
-            context_restore_ready=self._context_restore_ready(),
+            ladder_builder=lambda: build_reclaim_ladder(
+                self._scheduler.build_reclaim_ladder_candidates(device_index),
+            ),
+            context_restore_ready=self._context_restore_ready(device_index),
             now=self.now,
         )
 
-    def _context_restore_ready(self) -> bool:
-        """Whether a reclaim episode may regrow the pool a context reduction shrank.
+    def _context_restore_ready(self, device_index: int) -> bool:
+        """Whether a reclaim episode may regrow the pool a context reduction shrank on this card.
 
         The manager's ``_context_restore_ready`` on this world's clock: a card continuously HEALTHY for the
         dwell, and no head of queue still parked on the demand the reduction was made for.
         """
-        if self._healthy_since is None:
+        healthy_since = self._healthy_since.get(device_index)
+        if healthy_since is None:
             return False
-        if (self.now - self._healthy_since) < HordeWorkerProcessManager._CONTEXT_RESTORE_DWELL_SECONDS:
+        if (self.now - healthy_since) < HordeWorkerProcessManager._CONTEXT_RESTORE_DWELL_SECONDS:
             return False
         return not self._scheduler.head_of_queue_is_parked()
 
@@ -2047,7 +2126,11 @@ class _DispatchWorld:
         self._scheduler.preload_models()
         self._begin_started_preloads()
         await self._dispatch_until_full()
-        self.min_device_free_mb = min(self.min_device_free_mb, self.device_free_mb())
+        for device_index in self._card_totals:
+            self.min_card_free_mb[device_index] = min(
+                self.min_card_free_mb[device_index],
+                self.card_free_mb(device_index),
+            )
         self._sample_retained_resident_divergence()
         self.offers[self.tick] = self.advertised_models()
         claim = self._scheduler.whole_card_pop_claim()
@@ -2103,7 +2186,12 @@ class _DispatchWorld:
         the card and takes ordinary admission. What the deferral says nothing about is the rest of the queue,
         which is exactly why the work behind such a head stays counted here.
         """
-        headroom_mb = self.device_free_mb() - admission_noise_buffer_mb(self.card.total_mb)
+        # Priced against the roomiest card, since a job the pool can seat anywhere is work the pool is
+        # passing over; on a single-card row that is the one card's headroom.
+        headroom_mb = max(
+            self.card_free_mb(index) - admission_noise_buffer_mb(total_mb)
+            for index, total_mb in self._card_totals.items()
+        )
         deferred_model = self._scheduler._whole_card_ledger.governor_deferred_head(None, now=self.now)
         fitting: list[_FittingJob] = []
         for job in self._job_tracker.jobs_pending_inference:
@@ -2377,6 +2465,50 @@ class _DispatchWorld:
         return self._job_tracker
 
     @property
+    def governor_states(self) -> list[GovernorState]:
+        """Per tick, the least healthy state any card was committed to, in order.
+
+        A pool is only as healthy as its worst card, so this is what a run-wide governor verdict is about; on a
+        single-card row it is that card's own series. A verdict about one card of several reads
+        :attr:`governor_states_by_card`.
+        """
+        series = [self.governor_states_by_card[index] for index in sorted(self._card_totals)]
+        return [max(states, key=_GOVERNOR_SEVERITY.__getitem__) for states in zip(*series, strict=True) if states]
+
+    @property
+    def min_device_free_mb(self) -> float:
+        """The lowest device-free reading any card ever showed, which is the figure a free floor is about."""
+        return min(self.min_card_free_mb.values())
+
+    def card_indices(self) -> list[int]:
+        """The cards the ledger holds, in index order (``[0]`` on every single-card row)."""
+        return sorted(self._card_totals)
+
+    def card_resident_mb(self, device_index: int) -> dict[int, float]:
+        """What each lane on one card holds committed to that card's VRAM, keyed by lane.
+
+        The card's resident set: contexts, activation and device-warm components are not in it, so this is the
+        weights the card is carrying and nothing else.
+        """
+        return {
+            lane_id: charge_mb
+            for lane_id, charge_mb in sorted(self._resident_mb.items())
+            if charge_mb > 0.0 and self._card_of(lane_id) == device_index
+        }
+
+    def card_resident_models(self, device_index: int) -> dict[int, str]:
+        """The model each lane on one card most recently committed to that card, keyed by lane."""
+        return {
+            lane_id: model
+            for lane_id, model in sorted(self._resident_model.items())
+            if self._card_of(lane_id) == device_index
+        }
+
+    def safety_card_index(self) -> int:
+        """The card the on-GPU safety process is pinned to, and whose ledger carries its charge."""
+        return self._safety_card_index
+
+    @property
     def reserve_ledger(self) -> CommittedReserveLedger:
         """The shared committed/planned reserve ledger the scheduler books admissions against."""
         return self._reserve_ledger
@@ -2479,8 +2611,12 @@ class _DispatchWorld:
             for lane in self._process_map.values()
         )
         pending = ", ".join(str(job.model) for job in self._job_tracker.jobs_pending_inference)
+        cards = ", ".join(
+            f"{index}:{self.card_free_mb(index):.0f}/{total_mb:.0f}MB"
+            for index, total_mb in sorted(self._card_totals.items())
+        )
         return (
-            f"tick={self.tick} free={self.device_free_mb():.0f}/{self.card.total_mb:.0f}MB "
+            f"tick={self.tick} free=[{cards}] "
             f"lanes=[{lanes}] pending=[{pending}] in_progress={len(self._job_tracker.jobs_in_progress)} "
             f"residency_active={self._scheduler.is_whole_card_residency_active()} "
             f"planned={self.planned_overlay_mb():.0f}MB "
@@ -2508,6 +2644,11 @@ def _make_mock_lifecycle(world: _DispatchWorld) -> Mock:
     lifecycle.safety_placement_transition_pending = False
     lifecycle.pause_safety_on_gpu = world.pause_safety_on_gpu
     lifecycle.restore_safety_on_gpu = world.restore_safety_on_gpu
+    # Truthful "which card is safety on", the manager's own contract: the card it was pinned to at its last
+    # bring-up, and None while it is off the card. The placement policy reads it to pick the card whose
+    # evidence decides the flip, so a pool of several cards judged by a stand-in that never says which one
+    # would be judging safety's placement against a card it does not sit on.
+    lifecycle.safety_gpu_card_index = lambda: None if world.safety_is_off_gpu() else world.safety_card_index()
     lifecycle.safety_readiness_latency_seconds = world.safety_readiness_latency_seconds
     lifecycle.is_post_process_gpu_paused = False
     lifecycle.post_process_processes_should_be_replaced = False

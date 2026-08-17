@@ -70,6 +70,18 @@ def duty_fraction(world: _DispatchWorld) -> float:
     return world.sampling_slot_seconds / (capacity * elapsed)
 
 
+def duty_fraction_on_card(world: _DispatchWorld, device_index: int) -> float:
+    """Return the fraction of one card's slot-time that was spent sampling on that card.
+
+    Its own lanes' sampling seconds over the sampling capacity those lanes provide, so a pool where one card
+    earns for both cannot satisfy a claim about the card that is idle.
+    """
+    lanes = max(1, sum(1 for lane_id in world.inference_lane_ids() if world.card_of_lane(lane_id) == device_index))
+    capacity = min(lanes, max(1, int(world.scheduler._runtime_config.bridge_data.max_threads)))
+    elapsed = max(1e-9, world.now - world.started_at)
+    return world.sampling_slot_seconds_by_card[device_index] / (capacity * elapsed)
+
+
 def jobs_per_simulated_hour(world: _DispatchWorld) -> float:
     """Return the completed-job rate the run achieved, in jobs per simulated hour."""
     elapsed = max(1e-9, world.now - world.started_at)
@@ -91,13 +103,26 @@ def assert_duty_floor(world: _DispatchWorld, floor: float, *, context: str) -> N
     )
 
 
+def assert_duty_floor_on_card(world: _DispatchWorld, device_index: int, floor: float, *, context: str) -> None:
+    """Assert one card kept its own sampling slots busy for at least ``floor`` of the run.
+
+    A pool-wide duty floor is satisfiable by one card carrying the run, so a claim that both cards kept
+    serving has to be made of each of them.
+    """
+    achieved = duty_fraction_on_card(world, device_index)
+    assert achieved >= floor, (
+        f"{context}: card {device_index} sampled {achieved:.0%} of the run, under the {floor:.0%} floor its "
+        f"own lanes were expected to hold. {world.state_dump()}"
+    )
+
+
 def assert_governor_never_reached(world: _DispatchWorld, state: GovernorState, *, context: str) -> None:
-    """Assert the device-free governor's committed state never got as far as ``state``."""
+    """Assert the device-free governor's committed state never got as far as ``state`` on any card."""
     reached = [tick for tick, seen in enumerate(world.governor_states, start=1) if seen is state]
     assert not reached, (
-        f"{context}: the card reached governor {state.value} at tick(s) {reached[:5]}, so its free VRAM "
-        f"crossed a floor the workload was supposed to stay above (low water {world.min_device_free_mb:.0f}MB "
-        f"of {world.card.total_mb:.0f}MB). {world.state_dump()}"
+        f"{context}: a card reached governor {state.value} at tick(s) {reached[:5]}, so its free VRAM "
+        f"crossed a floor the workload was supposed to stay above (low water {world.min_device_free_mb:.0f}MB). "
+        f"{world.state_dump()}"
     )
 
 

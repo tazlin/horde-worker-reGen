@@ -634,7 +634,11 @@ never beyond that grant.
 **Every term the policy reads is about safety's own card** (the card it occupies, or the card it would land on
 while it is off). Cards are independent VRAM domains, so the peak a sibling card is committed to says nothing
 about this one: the peak is taken over the jobs running on this card plus the queued jobs its effective config
-can serve, and on a single-GPU host that is the same set the worker-wide figure would give.
+can serve, and on a single-GPU host that is the same set the worker-wide figure would give. The `per-card safety
+placement` scenario in `tests/process_management/liveness/test_incident_scenarios.py` holds this over two
+independent card ledgers: a card serving its own light class keeps its safety process while its sibling carries a
+peak it can never be given, and pricing that peak worker-wide again evicts safety from the serving card for the
+rest of the run.
 
 GPU placement treats CLIP plus its CUDA context as the lane's fixed residency, not the last evaluation's
 high-water mark. DeepDanbooru stays in host RAM until an anime check calls it; BLIP and the aesthetic head are

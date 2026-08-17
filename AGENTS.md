@@ -192,7 +192,8 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
 These fail as interactions, not as units, so component tests stay green through most of what matters.
 
 - **Test in the simulator first.** `tests/process_management/liveness/_dispatch_world.py` runs the
-  real scheduler, governor and ladder over fake children with a conserved VRAM ledger. Changes to
+  real scheduler, governor and ladder over fake children with a conserved VRAM ledger, keyed per card so a
+  multi-card row states each card's own total, tenants and measured free (one entry on a single card). Changes to
   admission, retention, leases, governor thresholds or recovery rungs ship with a closed-loop test
   asserting an outcome (a duty floor, no safety teardown while serving, no free-VRAM crater). A live
   run confirms; it is not where you find out.
