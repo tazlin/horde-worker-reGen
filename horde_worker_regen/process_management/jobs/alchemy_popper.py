@@ -8,7 +8,10 @@ queue is empty). Beneath it, the *capacity* layer decides whether the device can
 another form: alchemy shares the same :class:`CommittedReserveLedger` as image generation, so a
 form is admitted only when *effective* free VRAM/RAM (measured free minus what in-flight image and
 alchemy work has already committed) covers the form's predicted cost. The two flows therefore
-cannot independently admit against the same free VRAM the way two separate gates once could.
+cannot independently admit against the same free VRAM the way two separate gates once could. VRAM is
+judged per card: every alchemy-capable process is pinned to one, so a form is admissible when some card
+hosting an available capable process has the room, and the card whose headroom admitted it is the card the
+form is dispatched to.
 
 Graph forms (upscalers, facefixers, strip_background) are dispatched to the post-processing lane;
 text-output forms (caption, interrogation, nsfw, vectorize) to the safety process. Dispatch is keyed
@@ -78,6 +81,7 @@ from horde_worker_regen.server_capabilities import server_supports_interrogation
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+    from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
     from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
     from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 
@@ -168,6 +172,14 @@ The SDK's ``default_forms`` validator does not fire for the default empty list, 
 path and the dashboard projection fall back to this set. The yaml/legacy spelling is ``post-process``;
 the SDK enum value is ``post_process``.
 """
+
+_ALCHEMY_CAPABILITIES: tuple[WorkerCapability, ...] = (
+    WorkerCapability.ALCHEMY_GRAPH,
+    WorkerCapability.ALCHEMY_CLIP,
+    WorkerCapability.IMAGE_UTILITIES,
+)
+"""The capabilities alchemy forms dispatch to. Every process declaring one is pinned to a single card, so
+these are also the cards alchemy admission and cost sampling consider."""
 
 ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS = 30.0
 """Maximum time an alchemy pop may occupy its coordinator loop.
@@ -354,6 +366,12 @@ class AlchemyCoordinator:
     _pending_forms: deque[AlchemyFormSpec]
     _in_flight: dict[str, AlchemyFormSpec]
     """Forms dispatched to a child process, keyed by form_id, awaiting a result message."""
+    _in_flight_card: dict[str, int]
+    """form_id -> the ``device_index`` of the process the form was dispatched to.
+
+    Recorded at dispatch rather than looked up later, so a form whose process has since gone is still
+    attributed to the card it ran on. A form absent here has no known card and is charged (and sampled)
+    against every card."""
     _in_flight_owner: dict[str, tuple[int, int]]
     """form_id -> the (process_id, process_launch_identifier) the form was dispatched to.
 
@@ -364,10 +382,13 @@ class AlchemyCoordinator:
     _form_time_popped: dict[str, float]
 
     _estimator: AlchemyHeadroomEstimator
-    _free_vram_baseline_mb: float | None
-    """Free VRAM (MB) sampled while no alchemy was in flight; the cost baseline."""
-    _min_free_vram_mb: float | None
-    """Low-water mark of free VRAM (MB) seen while the current alchemy batch was in flight."""
+    _free_vram_baseline_mb: dict[int | None, float]
+    """Per card, the free VRAM (MB) sampled while no alchemy was in flight on it; the cost baseline.
+
+    Keyed by device index so a form's observed cost is measured against the fluctuations of the card it ran
+    on. The ``None`` key is the worker-wide reading, used while no capable process reports a card."""
+    _min_free_vram_mb: dict[int | None, float]
+    """Per card, the low-water mark of free VRAM (MB) seen while that card had a form in flight."""
 
     _last_pop_time: float
     _pop_frequency: float
@@ -426,6 +447,7 @@ class AlchemyCoordinator:
 
         self._pending_forms = deque()
         self._in_flight = {}
+        self._in_flight_card = {}
         self._in_flight_owner = {}
         self._pending_submits = deque()
         self._form_time_popped = {}
@@ -435,8 +457,8 @@ class AlchemyCoordinator:
         None for a form whose image could not be decoded. Pruned to the live forms each projection."""
 
         self._estimator = AlchemyHeadroomEstimator()
-        self._free_vram_baseline_mb = None
-        self._min_free_vram_mb = None
+        self._free_vram_baseline_mb = {}
+        self._min_free_vram_mb = {}
 
         self._last_pop_time = 0.0
         self._pop_frequency = 4.0
@@ -645,22 +667,85 @@ class AlchemyCoordinator:
         )
         return idle_image_lanes > undispatched_image_jobs
 
-    def _has_vram_headroom(self) -> bool:
-        """Return True if *effective* free VRAM covers a typical alchemy form (per the estimator).
+    def _candidate_cards(self, capability: WorkerCapability) -> list[int]:
+        """Return the device indices of the processes declaring the capability, in process-map order."""
+        cards: list[int] = []
+        for process_info in self._process_map.get_capable_processes(capability):
+            if process_info.device_index not in cards:
+                cards.append(process_info.device_index)
+        return cards
 
-        Effective free is the measured device-wide free VRAM minus everything the shared ledger records
-        as already committed by in-flight image and alchemy work, so a form is not admitted against VRAM
-        another flow is about to claim.
+    def _reserved_against_card_mb(self, device_index: int | None) -> float:
+        """Return the committed VRAM (MB) chargeable to one card.
+
+        The shared ledger is worker-wide and records no card, so every other flow's commitment is charged
+        against each card: that is the conservative reading, and the only one available. Alchemy's own holds
+        are the exception, because the card each form was dispatched to is known: a form running on another
+        card is not charged here. A form with no known card stays charged against every card. The per-form
+        figure mirrors what :meth:`_sync_reserve_ledger` publishes, so the subtraction cannot exceed the
+        ledger's own alchemy total.
         """
-        free_vram_mb = self._process_map.get_free_vram_mb()
+        total_mb = self._reserve_ledger.total_vram_mb()
+        if device_index is None:
+            return total_mb
+        predicted_mb = self._estimator.predicted_cost_mb(float(self.bridge_data.alchemy_vram_headroom_mb))
+        elsewhere_mb = sum(
+            predicted_mb
+            for form_id, spec in self._in_flight.items()
+            if required_capability(spec.form) is WorkerCapability.ALCHEMY_GRAPH
+            and self._in_flight_card.get(form_id) not in (None, device_index)
+        )
+        return total_mb - elsewhere_mb
+
+    def _card_has_headroom(self, device_index: int | None) -> bool:
+        """Return True if one card's *effective* free VRAM covers a typical alchemy form (per the estimator).
+
+        Effective free is that card's measured free VRAM minus what :meth:`_reserved_against_card_mb` charges
+        against it, so a form is not admitted against VRAM another flow is about to claim. ``None`` asks the
+        worker-wide question (the most conservative free reading across every card, against the whole ledger).
+        A card with no VRAM telemetry of its own defers to that worker-wide reading.
+        """
+        free_vram_mb = self._process_map.get_free_vram_mb(device_index=device_index)
         if free_vram_mb is None:
+            if device_index is not None:
+                return self._card_has_headroom(None)
             # No VRAM telemetry yet (cold start or CPU-only): fall back to backfill.
             return len(self._job_tracker.jobs_pending_inference) == 0
-        effective_free_mb = free_vram_mb - self._reserve_ledger.total_vram_mb()
         return self._estimator.fits(
-            free_vram_mb=effective_free_mb,
+            free_vram_mb=free_vram_mb - self._reserved_against_card_mb(device_index),
             floor_mb=float(self.bridge_data.alchemy_vram_headroom_mb),
         )
+
+    def _admissible_process(self, capability: WorkerCapability) -> HordeProcessInfo | None:
+        """Return an available process for the capability sitting on a card with the VRAM headroom, or None.
+
+        Each candidate card is judged on its own effective free VRAM, so on a multi-GPU host one starved card
+        cannot withhold work the roomy cards can serve. This is the single selection the admission gate and
+        dispatch share: the card whose headroom admitted the form is the card the form is placed on. None means
+        either that no available capable process sits on a card that fits, or that no capable process reports a
+        card at all; callers fall back to the worker-wide reading.
+        """
+        for device_index in self._candidate_cards(capability):
+            process_info = self._process_map.get_first_available(capability, device_index=device_index)
+            if process_info is not None and self._card_has_headroom(device_index):
+                return process_info
+        return None
+
+    def _has_vram_headroom(self) -> bool:
+        """Return True if some card can physically take another alchemy form (per the estimator).
+
+        A card qualifies when it has an available process capable of serving an alchemy form and its effective
+        free VRAM covers the estimator's requirement. On a single-card worker this is the worker-wide check; on
+        a multi-GPU host it admits as long as one card has both a lane and the room. Before any capable process
+        reports a card, the worker-wide reading decides.
+        """
+        capable_cards_known = False
+        for capability in _ALCHEMY_CAPABILITIES:
+            if self._candidate_cards(capability):
+                capable_cards_known = True
+            if self._admissible_process(capability) is not None:
+                return True
+        return False if capable_cards_known else self._card_has_headroom(None)
 
     def _has_ram_headroom(self) -> bool:
         """Return True if effective available system RAM clears the alchemy RAM floor.
@@ -685,18 +770,39 @@ class AlchemyCoordinator:
         except Exception:
             return None
 
+    def _sampled_cards(self) -> list[int | None]:
+        """Return the cards the estimator samples: every card an alchemy form can land on, else worker-wide."""
+        cards: list[int | None] = []
+        for capability in _ALCHEMY_CAPABILITIES:
+            for device_index in self._candidate_cards(capability):
+                if device_index not in cards:
+                    cards.append(device_index)
+        return cards or [None]
+
+    def _card_has_in_flight(self, device_index: int | None) -> bool:
+        """Return True when a form is in flight on the given card.
+
+        A form whose card is unknown counts against every card, so an unattributable form cannot let a
+        baseline be re-sampled while alchemy is still drawing VRAM.
+        """
+        if device_index is None:
+            return bool(self._in_flight)
+        return any(self._in_flight_card.get(form_id) in (None, device_index) for form_id in self._in_flight)
+
     def _sample_vram(self) -> None:
-        """Track the free-VRAM baseline and in-flight low-water mark for the cost estimator."""
-        free_vram_mb = self._process_map.get_free_vram_mb()
-        if free_vram_mb is None:
-            return
-        if self._in_flight:
-            self._min_free_vram_mb = (
-                free_vram_mb if self._min_free_vram_mb is None else min(self._min_free_vram_mb, free_vram_mb)
-            )
-        else:
-            self._free_vram_baseline_mb = free_vram_mb
-            self._min_free_vram_mb = None
+        """Track each card's free-VRAM baseline and in-flight low-water mark for the cost estimator."""
+        for device_index in self._sampled_cards():
+            free_vram_mb = self._process_map.get_free_vram_mb(device_index=device_index)
+            if free_vram_mb is None:
+                continue
+            if self._card_has_in_flight(device_index):
+                previous_mb = self._min_free_vram_mb.get(device_index)
+                self._min_free_vram_mb[device_index] = (
+                    free_vram_mb if previous_mb is None else min(previous_mb, free_vram_mb)
+                )
+            else:
+                self._free_vram_baseline_mb[device_index] = free_vram_mb
+                self._min_free_vram_mb.pop(device_index, None)
 
     async def _download_source_image(self, source_image: str) -> bytes:
         """Return the form's source image as raw bytes, downloading it if it is a URL.
@@ -864,11 +970,20 @@ class AlchemyCoordinator:
     # region dispatch
 
     def dispatch_pending_forms(self) -> None:
-        """Send queued forms to the first available process declaring the needed capability."""
+        """Send queued forms to an available process declaring the needed capability.
+
+        Placement follows admission: :meth:`_admissible_process` picks a process on a card whose own free VRAM
+        covers the form, so the card the pop was promised against is the card the form lands on. A form already
+        popped is owed to the horde, so when no card still has the headroom (or none reports one) it is placed
+        on any available capable process rather than stranded.
+        """
         still_pending: deque[AlchemyFormSpec] = deque()
         while self._pending_forms:
             spec = self._pending_forms.popleft()
-            process_info = self._process_map.get_first_available(required_capability(spec.form))
+            capability = required_capability(spec.form)
+            process_info = self._admissible_process(capability)
+            if process_info is None:
+                process_info = self._process_map.get_first_available(capability)
             if process_info is None:
                 still_pending.append(spec)
                 continue
@@ -881,6 +996,7 @@ class AlchemyCoordinator:
             )
             if sent:
                 self._in_flight[spec.form_id] = spec
+                self._in_flight_card[spec.form_id] = process_info.device_index
                 self._in_flight_owner[spec.form_id] = (
                     process_info.process_id,
                     process_info.process_launch_identifier,
@@ -912,6 +1028,7 @@ class AlchemyCoordinator:
         ]
         for form_id in lost:
             spec = self._in_flight.pop(form_id, None)
+            self._in_flight_card.pop(form_id, None)
             self._in_flight_owner.pop(form_id, None)
             self._form_time_popped.pop(form_id, None)
             self.num_forms_faulted += 1
@@ -960,12 +1077,13 @@ class AlchemyCoordinator:
     def on_alchemy_result(self, message: HordeAlchemyResultMessage) -> None:
         """Accept a form result from a child process and queue it for submission."""
         spec = self._in_flight.pop(message.form_id, None)
+        device_index = self._in_flight_card.pop(message.form_id, None)
         self._in_flight_owner.pop(message.form_id, None)
         if spec is None:
             logger.warning(f"Received alchemy result for unknown form {message.form_id} ({message.form})")
 
         time_popped = self._form_time_popped.pop(message.form_id, time.time())
-        self._record_estimator_observation(time_popped)
+        self._record_estimator_observation(time_popped, device_index=device_index)
 
         self._pending_submits.append(
             PendingAlchemySubmitJob(
@@ -975,18 +1093,25 @@ class AlchemyCoordinator:
             ),
         )
 
-    def _record_estimator_observation(self, time_popped: float) -> None:
-        """Feed the headroom estimator the duration and (once a batch drains) VRAM cost."""
+    def _record_estimator_observation(self, time_popped: float, *, device_index: int | None) -> None:
+        """Feed the headroom estimator the duration and (once a card's batch drains) VRAM cost.
+
+        The cost is read from the series of the card the form ran on, so a multi-GPU host attributes the draw
+        to the card that produced it rather than to whichever card happened to be tightest. A form dispatched
+        before its card was ever sampled falls back to the worker-wide series.
+        """
         duration_s = time.time() - time_popped
-        # Attribute the observed VRAM draw only once the whole in-flight batch has drained,
+        card = device_index if device_index in self._free_vram_baseline_mb else None
+        baseline_mb = self._free_vram_baseline_mb.get(card)
+        min_free_mb = self._min_free_vram_mb.get(card)
+        # Attribute the observed VRAM draw only once that card's in-flight batch has drained,
         # so the baseline-to-low-water delta reflects alchemy's footprint rather than noise.
-        if self._in_flight or self._free_vram_baseline_mb is None or self._min_free_vram_mb is None:
+        if self._card_has_in_flight(card) or baseline_mb is None or min_free_mb is None:
             self._estimator.record_run(vram_cost_mb=None, duration_s=duration_s)
             return
-        observed_cost_mb = self._free_vram_baseline_mb - self._min_free_vram_mb
-        self._estimator.record_run(vram_cost_mb=observed_cost_mb, duration_s=duration_s)
-        self._free_vram_baseline_mb = None
-        self._min_free_vram_mb = None
+        self._estimator.record_run(vram_cost_mb=baseline_mb - min_free_mb, duration_s=duration_s)
+        self._free_vram_baseline_mb.pop(card, None)
+        self._min_free_vram_mb.pop(card, None)
 
     # endregion
 

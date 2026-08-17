@@ -1523,16 +1523,23 @@ so it never starves image jobs:
 - **Spare-lane gate**: in concurrent mode (`alchemy_allow_concurrent: true`), a
   graph form pops only when an inference lane is idle beyond what the undispatched
   image queue needs. Image jobs always win contention for a process.
-- **VRAM-headroom gate**: a form pops only when *effective* free VRAM exceeds
-  `alchemy_vram_headroom_mb`, where effective free is the measured device-wide free
-  VRAM minus everything the shared
+- **VRAM-headroom gate**: a form pops only when some card's *effective* free VRAM exceeds
+  `alchemy_vram_headroom_mb`, where effective free is that card's measured free
+  VRAM minus what the shared
   [`CommittedReserveLedger`][horde_worker_regen.process_management.resources.resource_budget.CommittedReserveLedger]
-  records as already committed by in-flight image and alchemy work. Image generation
+  charges against it from in-flight image and alchemy work. Image generation
   reads the same combined figure, so the two flows cannot independently admit against
   the same free VRAM. An `AlchemyHeadroomEstimator` tracks the rolling median VRAM cost
   of recent forms and raises the requirement toward it; free VRAM is read from the
   worker's per-process memory reports. With no VRAM telemetry yet (cold start /
   CPU-only), it falls back to backfill.
+    - **Per card on a multi-GPU host**: every alchemy-capable process is pinned to one card, so
+      each candidate card is judged on its own free reading and one starved card cannot withhold
+      alchemy from the rest. Dispatch then places the form on the card that admitted it. The ledger
+      itself is worker-wide, so another flow's commitment is charged against every card, while an
+      alchemy form's own hold is charged only to the card it was dispatched to. The estimator keeps a
+      baseline and low-water mark per card, so an observed cost is attributed to the card the form ran
+      on. On a single-card worker this is the same judgement as the worker-wide one.
 - **RAM-headroom gate**: because graph forms keep weights resident in system RAM, a
   form also pops only when effective available RAM clears `alchemy_ram_headroom_mb`,
   keeping alchemy from pushing a memory-resident worker into paging. When RAM cannot

@@ -13,9 +13,10 @@ from __future__ import annotations
 from collections import deque
 
 import pytest
+from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
+from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec, HordeAlchemyResultMessage
 from horde_worker_regen.process_management.jobs import alchemy_popper as alchemy_popper_module
 from horde_worker_regen.process_management.jobs.alchemy_popper import AlchemyCoordinator, AlchemyHeadroomEstimator
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
@@ -68,7 +69,13 @@ class _StubProcessMap:
         self._image_lanes = [_IdleLane() for _ in range(idle_image_lanes)]
         self._free_vram_mb = free_vram_mb
 
-    def get_first_available(self, capability: WorkerCapability) -> object:
+    def get_first_available(
+        self,
+        capability: WorkerCapability,
+        disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
+    ) -> object:
         return object()  # a capable process always exists for these admission tests
 
     def get_capable_processes(self, capability: WorkerCapability) -> list[_IdleLane]:
@@ -80,7 +87,7 @@ class _StubProcessMap:
     def num_loaded_post_process_processes(self) -> int:
         return 1  # a capable lane always exists for these admission tests
 
-    def get_free_vram_mb(self) -> float | None:
+    def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         return self._free_vram_mb
 
 
@@ -106,10 +113,13 @@ def _make_coordinator(
     coordinator._reserve_ledger = reserve_ledger
     coordinator._pending_forms = deque()
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
+    coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
     coordinator._pending_submits = deque()
     coordinator._form_time_popped = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
+    coordinator._free_vram_baseline_mb = {}
+    coordinator._min_free_vram_mb = {}
     coordinator._last_pop_time = 0.0
     coordinator._pop_frequency = 4.0
     coordinator.num_forms_faulted = 0
@@ -390,9 +400,10 @@ class TestAlchemyRamReserve:
 class _DispatchProcessInfo:
     """Stands in for a HordeProcessInfo at the dispatch + launch-liveness seam."""
 
-    def __init__(self, process_id: int, launch: int) -> None:
+    def __init__(self, process_id: int, launch: int, device_index: int = 0) -> None:
         self.process_id = process_id
         self.process_launch_identifier = launch
+        self.device_index = device_index
         self.sent: list[object] = []
 
     def safe_send_message(self, message: object) -> bool:
@@ -419,8 +430,21 @@ class _LivenessProcessMap:
         self._free_vram_mb = free_vram_mb
         self._alive: dict[int, int] = {p.process_id: p.process_launch_identifier for p in processes.values()}
 
-    def get_first_available(self, capability: WorkerCapability) -> _DispatchProcessInfo | None:
-        return self._processes.get(capability)
+    def get_first_available(
+        self,
+        capability: WorkerCapability,
+        disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
+    ) -> _DispatchProcessInfo | None:
+        process_info = self._processes.get(capability)
+        if process_info is None or (device_index is not None and process_info.device_index != device_index):
+            return None
+        return process_info
+
+    def get_capable_processes(self, capability: WorkerCapability) -> list[_DispatchProcessInfo]:
+        process_info = self._processes.get(capability)
+        return [process_info] if process_info is not None else []
 
     def is_launch_active(self, process_id: int, process_launch_identifier: int) -> bool:
         return self._alive.get(process_id) == process_launch_identifier
@@ -428,7 +452,7 @@ class _LivenessProcessMap:
     def kill(self, process_id: int) -> None:
         self._alive.pop(process_id, None)
 
-    def get_free_vram_mb(self) -> float | None:
+    def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         return self._free_vram_mb
 
 
@@ -541,6 +565,191 @@ class TestLostFormReaping:
         assert "form-ann" not in coordinator._in_flight
         assert "form-ann" not in coordinator._in_flight_owner
         assert coordinator.num_forms_faulted == 1
+
+
+class _CardProcessInfo:
+    """Stands in for a HordeProcessInfo pinned to one card at the alchemy admission and dispatch seam."""
+
+    def __init__(self, process_id: int, *, device_index: int, capability: WorkerCapability) -> None:
+        self.process_id = process_id
+        self.process_launch_identifier = 1
+        self.device_index = device_index
+        self.capability = capability
+        self.sent: list[object] = []
+
+    def safe_send_message(self, message: object) -> bool:
+        self.sent.append(message)
+        return True
+
+
+class _MultiCardProcessMap:
+    """A process map whose capable processes are pinned to cards with independent free-VRAM readings.
+
+    Mirrors the per-card half of the real :class:`ProcessMap` contract alchemy admission touches:
+    ``get_capable_processes`` (which cards can serve a capability), ``get_first_available`` filtered by
+    ``device_index``, and ``get_free_vram_mb`` reporting one card's figure or the conservative minimum
+    across every card when unfiltered.
+    """
+
+    def __init__(
+        self,
+        processes: list[_CardProcessInfo],
+        *,
+        free_vram_mb_by_card: dict[int, float],
+    ) -> None:
+        self._processes = processes
+        self.free_vram_mb_by_card = free_vram_mb_by_card
+
+    def get_capable_processes(self, capability: WorkerCapability) -> list[_CardProcessInfo]:
+        return [p for p in self._processes if p.capability is capability]
+
+    def get_first_available(
+        self,
+        capability: WorkerCapability,
+        disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
+    ) -> _CardProcessInfo | None:
+        for process_info in self.get_capable_processes(capability):
+            if device_index is None or process_info.device_index == device_index:
+                return process_info
+        return None
+
+    def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
+        if device_index is not None:
+            return self.free_vram_mb_by_card.get(device_index)
+        return min(self.free_vram_mb_by_card.values()) if self.free_vram_mb_by_card else None
+
+
+class TestPerCardAlchemyAdmission:
+    """Alchemy admission and placement are judged per card, so one starved card cannot speak for the worker.
+
+    On a multi-GPU host every alchemy-capable process is pinned to a card, and the worker-wide free-VRAM
+    reading is the tightest card's. Judging admission on that figure withholds alchemy the roomy cards could
+    serve, and placing the form somewhere other than the card whose headroom admitted it makes the promise
+    and the placement disagree.
+    """
+
+    def _coordinator(
+        self,
+        process_map: _MultiCardProcessMap,
+        *,
+        ledger: CommittedReserveLedger | None = None,
+        headroom_mb: int = 2000,
+    ) -> AlchemyCoordinator:
+        return _make_coordinator(
+            bridge_data=_bridge_data(alchemy_vram_headroom_mb=headroom_mb),
+            process_map=process_map,  # type: ignore[arg-type]
+            job_tracker=_StubJobTracker(pending=1),
+            reserve_ledger=ledger if ledger is not None else CommittedReserveLedger(),
+        )
+
+    def _graph_lane_per_card(self, cards: tuple[int, ...]) -> list[_CardProcessInfo]:
+        return [
+            _CardProcessInfo(10 + card, device_index=card, capability=WorkerCapability.ALCHEMY_GRAPH) for card in cards
+        ]
+
+    def test_roomy_card_admits_and_receives_the_form_while_another_starves(self) -> None:
+        """One starved card does not withhold alchemy, and the form lands on the card that admitted it."""
+        processes = self._graph_lane_per_card((0, 1))
+        process_map = _MultiCardProcessMap(processes, free_vram_mb_by_card={0: 500.0, 1: 8000.0})
+        coordinator = self._coordinator(process_map)
+
+        assert coordinator._has_vram_headroom() is True
+
+        coordinator._pending_forms.append(
+            AlchemyFormSpec(form_id="form-a", form="RealESRGAN_x4plus", source_image_bytes=b"hi"),
+        )
+        coordinator.dispatch_pending_forms()
+
+        assert coordinator._in_flight_card == {"form-a": 1}
+        assert processes[0].sent == []
+        assert len(processes[1].sent) == 1
+
+    def test_every_card_starved_withholds_the_pop(self) -> None:
+        """With no card able to hold a form, admission is withheld rather than falling to the roomiest."""
+        process_map = _MultiCardProcessMap(
+            self._graph_lane_per_card((0, 1)),
+            free_vram_mb_by_card={0: 500.0, 1: 900.0},
+        )
+        coordinator = self._coordinator(process_map)
+
+        assert coordinator._has_vram_headroom() is False
+        assert coordinator._admissible_process(WorkerCapability.ALCHEMY_GRAPH) is None
+
+    def test_another_card_alchemy_hold_is_not_charged_to_this_card(self) -> None:
+        """A form running on one card does not eat the headroom of the card being judged.
+
+        The shared ledger is worker-wide, but alchemy knows which card each of its in-flight forms went to,
+        so only holds on this card (and holds it cannot attribute) are subtracted from it.
+        """
+        ledger = CommittedReserveLedger()
+        process_map = _MultiCardProcessMap(
+            self._graph_lane_per_card((0, 1)),
+            free_vram_mb_by_card={0: 8000.0, 1: 3000.0},
+        )
+        coordinator = self._coordinator(process_map, ledger=ledger)
+        coordinator._in_flight["form-running"] = AlchemyFormSpec(
+            form_id="form-running",
+            form="RealESRGAN_x4plus",
+            source_image_bytes=b"hi",
+        )
+        coordinator._in_flight_card["form-running"] = 0
+        coordinator._sync_reserve_ledger()
+        assert ledger.total_vram_mb() == 2000.0
+
+        # Card 1 has 3000 MB free and the only committed hold is card 0's, so it still fits a 2000 MB form.
+        assert coordinator._card_has_headroom(1) is True
+        # Card 0 carries the hold itself: 8000 free less its own 2000 still fits, and a second hold there
+        # (charged to both cards while unattributable) takes it below the floor.
+        coordinator._in_flight["form-unplaced"] = AlchemyFormSpec(
+            form_id="form-unplaced",
+            form="RealESRGAN_x4plus",
+            source_image_bytes=b"hi",
+        )
+        coordinator._sync_reserve_ledger()
+        assert coordinator._card_has_headroom(1) is False
+
+    @pytest.mark.parametrize(("free_mb", "admits"), [(8000.0, True), (500.0, False)])
+    def test_single_card_matches_the_worker_wide_reading(self, free_mb: float, admits: bool) -> None:
+        """On a single-card worker the per-card judgement is the worker-wide one it replaced."""
+        process_map = _MultiCardProcessMap(self._graph_lane_per_card((0,)), free_vram_mb_by_card={0: free_mb})
+        coordinator = self._coordinator(process_map)
+
+        assert coordinator._has_vram_headroom() is admits
+        assert coordinator._card_has_headroom(0) is coordinator._card_has_headroom(None)
+
+    def test_observed_cost_is_attributed_to_the_card_the_form_ran_on(self) -> None:
+        """The estimator learns the draw on the form's own card, not the fluctuations of the tightest one."""
+        processes = self._graph_lane_per_card((0, 1))
+        process_map = _MultiCardProcessMap(processes, free_vram_mb_by_card={0: 1000.0, 1: 8000.0})
+        coordinator = self._coordinator(process_map)
+
+        coordinator._sample_vram()
+        assert coordinator._free_vram_baseline_mb == {0: 1000.0, 1: 8000.0}
+
+        coordinator._pending_forms.append(
+            AlchemyFormSpec(form_id="form-a", form="RealESRGAN_x4plus", source_image_bytes=b"hi"),
+        )
+        coordinator.dispatch_pending_forms()
+        assert coordinator._in_flight_card == {"form-a": 1}
+
+        # The form draws 5000 MB on card 1 while unrelated work eats 800 MB on card 0.
+        process_map.free_vram_mb_by_card = {0: 200.0, 1: 3000.0}
+        coordinator._sample_vram()
+        coordinator.on_alchemy_result(
+            HordeAlchemyResultMessage(
+                process_id=11,
+                process_launch_identifier=1,
+                info="",
+                form_id="form-a",
+                form="RealESRGAN_x4plus",
+                state=GENERATION_STATE.ok,
+                image_bytes=b"out",
+            ),
+        )
+
+        assert coordinator._estimator.predicted_cost_mb(2000.0) == 5000.0
 
 
 class _FakeVmem:

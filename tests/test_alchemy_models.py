@@ -494,9 +494,10 @@ class TestAestheticPredictor:
 class _StubProcessInfo:
     """Stands in for HordeProcessInfo at the dispatch seam."""
 
-    def __init__(self, process_id: int, process_launch_identifier: int = 0) -> None:
+    def __init__(self, process_id: int, process_launch_identifier: int = 0, device_index: int = 0) -> None:
         self.process_id = process_id
         self.process_launch_identifier = process_launch_identifier
+        self.device_index = device_index
         self.sent_messages: list[HordeAlchemyControlMessage] = []
 
     def safe_send_message(self, message: HordeAlchemyControlMessage) -> bool:
@@ -507,27 +508,54 @@ class _StubProcessInfo:
 class _StubProcessMap:
     """Stands in for ProcessMap; records which capability each dispatch asked for."""
 
-    def __init__(self, available: dict[WorkerCapability, _StubProcessInfo]) -> None:
+    def __init__(
+        self,
+        available: dict[WorkerCapability, _StubProcessInfo],
+        *,
+        free_vram_mb: float | None = 8000.0,
+    ) -> None:
         self.available = available
+        self.free_vram_mb = free_vram_mb
         self.requested_capabilities: list[WorkerCapability] = []
 
-    def get_first_available(self, capability: WorkerCapability) -> _StubProcessInfo | None:
+    def get_first_available(
+        self,
+        capability: WorkerCapability,
+        disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
+    ) -> _StubProcessInfo | None:
         self.requested_capabilities.append(capability)
-        return self.available.get(capability)
+        process_info = self.available.get(capability)
+        if process_info is None or (device_index is not None and process_info.device_index != device_index):
+            return None
+        return process_info
+
+    def get_capable_processes(self, capability: WorkerCapability) -> list[_StubProcessInfo]:
+        process_info = self.available.get(capability)
+        return [process_info] if process_info is not None else []
+
+    def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
+        return self.free_vram_mb
 
 
 def _make_coordinator(process_map: _StubProcessMap) -> AlchemyCoordinator:
     coordinator = AlchemyCoordinator.__new__(AlchemyCoordinator)
     coordinator._process_map = process_map  # type: ignore[assignment]
+    coordinator._runtime_config = _StubRuntimeConfig(  # type: ignore[assignment]
+        reGenBridgeData(api_key="0" * 22, alchemist=True, alchemy_vram_headroom_mb=2000),  # type: ignore[arg-type]
+    )
+    coordinator._job_tracker = _StubJobTracker()  # type: ignore[assignment]
     coordinator._reserve_ledger = CommittedReserveLedger()
     coordinator._pending_forms = deque()
     coordinator._in_flight = {}
+    coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
     coordinator._pending_submits = deque()
     coordinator._form_time_popped = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
-    coordinator._free_vram_baseline_mb = None
-    coordinator._min_free_vram_mb = None
+    coordinator._free_vram_baseline_mb = {}
+    coordinator._min_free_vram_mb = {}
     coordinator.num_forms_faulted = 0
     return coordinator
 
@@ -724,7 +752,13 @@ class _PolicyProcessMap:
         self._free_vram_mb = free_vram_mb
         self._utilities_lanes = utilities_lanes
 
-    def get_first_available(self, capability: WorkerCapability) -> object:
+    def get_first_available(
+        self,
+        capability: WorkerCapability,
+        disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
+    ) -> object:
         if capability is WorkerCapability.ALCHEMY_GRAPH:
             return self._graph
         if capability is WorkerCapability.ALCHEMY_CLIP:
@@ -738,7 +772,7 @@ class _PolicyProcessMap:
             return self._image_lanes
         return []
 
-    def get_free_vram_mb(self) -> float | None:
+    def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         return self._free_vram_mb
 
     def num_loaded_utilities_processes(self) -> int:
@@ -764,6 +798,7 @@ def _make_policy_coordinator(
     coordinator._reserve_ledger = CommittedReserveLedger()
     coordinator._pending_forms = deque()
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
+    coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
     coordinator._last_pop_time = 0.0
