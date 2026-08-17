@@ -218,3 +218,34 @@ def test_publish_is_dirty_gated_with_a_floor() -> None:
     manager._last_supervisor_publish_time -= manager._supervisor_publish_floor_interval + 1.0
     manager._publish_supervisor_snapshot()
     assert recorder.count == 3
+
+
+def test_headless_publish_still_builds_the_snapshot_at_the_floor() -> None:
+    """With no supervisor attached the snapshot is still built at the floor cadence, and never sent.
+
+    The build is what records the periodic stats sample the exported stats file carries, so a headless run
+    (harness, soak, a worker whose supervisor went away) keeps its offline duty spine.
+    """
+    manager = make_testable_process_manager()
+    manager._supervisor = None
+    builds = 0
+
+    def _build() -> object:
+        nonlocal builds
+        builds += 1
+        return object()
+
+    manager._build_worker_state_snapshot = _build  # type: ignore[assignment,method-assign]
+    manager._process_map[0] = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+
+    manager._publish_supervisor_snapshot()
+    assert builds == 1
+
+    # Within the floor: no rebuild, and a state change alone does not force one (nothing is watching).
+    manager._process_map[0].last_process_state = HordeProcessState.INFERENCE_STARTING
+    manager._publish_supervisor_snapshot()
+    assert builds == 1
+
+    manager._last_supervisor_publish_time -= manager._supervisor_publish_floor_interval + 1.0
+    manager._publish_supervisor_snapshot()
+    assert builds == 2

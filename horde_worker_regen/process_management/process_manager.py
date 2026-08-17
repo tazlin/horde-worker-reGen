@@ -6324,11 +6324,23 @@ class HordeWorkerProcessManager:
         surface within one control-loop tick, ~2 Hz) and at least every ``_supervisor_publish_floor_interval``
         seconds otherwise. A hard ``_supervisor_publish_min_interval`` floor can rate-limit bursts. The send
         itself is non-blocking (the channel's daemon thread owns the pipe), so this never stalls the loop.
+
+        Building the snapshot is also what records the periodic stats sample, and the exported stats file
+        is what offline duty analysis reads. A headless run (no supervisor attached, or one that has gone
+        away) therefore still builds the snapshot at the floor interval so its stats session carries the
+        per-second duty spine; it just has nowhere to send it.
         """
-        if self._supervisor is None:
-            return
         now = time.time()
         since_last = now - self._last_supervisor_publish_time
+        if self._supervisor is None:
+            if since_last < self._supervisor_publish_floor_interval:
+                return
+            self._last_supervisor_publish_time = now
+            try:
+                self._build_worker_state_snapshot()
+            except Exception as e:
+                logger.debug(f"Failed to build stats snapshot: {e}")
+            return
         if since_last < self._supervisor_publish_min_interval:
             return
 
