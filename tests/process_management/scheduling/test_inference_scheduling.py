@@ -2695,3 +2695,221 @@ class TestRetentionPlacementProtection:
         assert scheduler._retention_affinity_candidates(head) == []
         assert scheduler.preload_models() is True
         assert processes[1].last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+
+def _per_card_config(*, max_pixels: int) -> Mock:
+    """A per-card effective config whose only differentiator from its siblings is its resolution ceiling."""
+    cfg = make_mock_bridge_data()
+    cfg.image_models_to_load = ["stable_diffusion"]
+    cfg.max_pixels = max_pixels
+    cfg.nsfw = True
+    return cfg
+
+
+def _large_and_small_cards() -> dict[int, CardRuntime]:
+    """Card 0 serving any resolution these tests use, card 1 capped at 512x512 by its ``max_power``."""
+    return {
+        **make_test_card_runtimes(device_indices=(0,), config=_per_card_config(max_pixels=4_194_304)),
+        **make_test_card_runtimes(device_indices=(1,), config=_per_card_config(max_pixels=262_144)),
+    }
+
+
+class TestCardAwareResidencyGate:
+    """The preload pass counts a model as already loaded only where the copy can serve the job asking.
+
+    A copy on a card whose effective config cannot serve a job leaves that job needing its own: dispatch will
+    not seat it on the ineligible copy, so a gate that counted it would leave the job unable to move at all.
+    """
+
+    def _scheduler(
+        self, *, resident_card: int | None, cards: dict[int, CardRuntime] | None = None
+    ) -> tuple[
+        InferenceScheduler,
+        ProcessMap,
+    ]:
+        """A two-lane pool, one lane per card, with the model seeded resident on ``resident_card`` or nowhere."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=None, device_index=0),
+                1: make_mock_process_info(1, model_name=None, device_index=1),
+            },
+        )
+        horde_model_map = HordeModelMap(root={})
+        if resident_card is not None:
+            process_map[resident_card].loaded_horde_model_name = "stable_diffusion"
+            process_map[resident_card].last_process_state = HordeProcessState.PRELOADED_MODEL
+            horde_model_map.update_entry(
+                "stable_diffusion",
+                load_state=ModelLoadState.LOADED_IN_VRAM,
+                process_id=resident_card,
+            )
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            card_runtimes=_large_and_small_cards() if cards is None else cards,
+        )
+        return scheduler, process_map
+
+    def test_a_copy_on_an_ineligible_card_is_not_already_loaded(self) -> None:
+        """The oversized job's model is resident only on the card whose ceiling excludes it."""
+        scheduler, _process_map = self._scheduler(resident_card=1)
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        assert scheduler._eligible_card_indices(job) == {0}
+        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is False
+
+    def test_a_copy_on_an_eligible_card_is_already_loaded(self) -> None:
+        """The same copy counts for a job the small card can serve, and for one on the large card."""
+        scheduler, _process_map = self._scheduler(resident_card=1)
+        small_job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert scheduler._model_loaded_for_job(small_job, {"stable_diffusion"}) is True
+
+        scheduler, _process_map = self._scheduler(resident_card=0)
+        oversized = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        assert scheduler._model_loaded_for_job(oversized, {"stable_diffusion"}) is True
+
+    def test_a_load_in_flight_counts_only_on_the_card_it_is_landing_on(self) -> None:
+        """A LOADING map entry is read through the device its owning process is pinned to."""
+        scheduler, _process_map = self._scheduler(resident_card=None)
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        scheduler._horde_model_map.update_entry(
+            "stable_diffusion",
+            load_state=ModelLoadState.LOADING,
+            process_id=1,
+        )
+        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is False
+
+        scheduler._horde_model_map.update_entry("stable_diffusion", process_id=0)
+        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is True
+
+    def test_a_record_whose_process_is_gone_is_not_a_copy(self) -> None:
+        """A map entry naming a process the pool no longer holds records no residency this job can use."""
+        scheduler, process_map = self._scheduler(resident_card=1)
+        process_map.pop(1)
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is False
+
+    def test_single_gpu_keeps_the_card_blind_membership_test(self) -> None:
+        """One card leaves routing inactive, so the gate is the plain set membership it has always been."""
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name="stable_diffusion", device_index=0)})
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            card_runtimes=make_test_card_runtimes(device_indices=(0,), config=_per_card_config(max_pixels=1000)),
+        )
+        assert scheduler._multi_gpu_routing_active is False
+        # A resolution no card would serve: the single-GPU answer still comes from the set alone.
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is True
+        assert scheduler._model_loaded_for_job(job, set()) is False
+
+    async def test_the_head_is_preloaded_onto_the_card_that_can_serve_it(self) -> None:
+        """With the only copy on an ineligible card, the pass stages a second one onto the eligible card."""
+        scheduler, process_map = self._scheduler(resident_card=1)
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert scheduler.preload_models() is True
+        assert process_map[0].loaded_horde_model_name == "stable_diffusion"
+
+    async def test_a_dispatchable_copy_stages_nothing_further(self) -> None:
+        """The gate still refuses a duplicate when the resident copy is on a card that can serve the job."""
+        scheduler, process_map = self._scheduler(resident_card=0)
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert scheduler.preload_models() is False
+        assert process_map[1].loaded_horde_model_name is None
+
+
+class TestIneligibleCardResidencyIsNotAMissingModel:
+    """Dispatch finding no eligible copy of a resident model must not run the missing-model recovery."""
+
+    def _scheduler(self) -> InferenceScheduler:
+        """A two-lane pool with the model resident on the small card only, and a free lane on the large one."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=None, device_index=0),
+                1: make_mock_process_info(1, model_name="stable_diffusion", device_index=1),
+            },
+        )
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            "stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=1,
+        )
+        return _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            card_runtimes=_large_and_small_cards(),
+        )
+
+    async def test_the_truthful_residency_record_survives_dispatch(self) -> None:
+        """No dispatch target on an eligible card leaves the record standing and the latch clear."""
+        scheduler = self._scheduler()
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert scheduler._resident_only_on_ineligible_cards(job) is True
+        assert await scheduler.get_next_job_and_process(information_only=False) is None
+        assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is True
+        assert scheduler._model_recently_missing is False
+
+    async def test_without_the_check_the_record_is_expired_as_stale(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The paired defect: read as a missing model, the recovery discards a record that was accurate."""
+        monkeypatch.setattr(InferenceScheduler, "_resident_only_on_ineligible_cards", lambda self, job: False)
+        scheduler = self._scheduler()
+        job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert await scheduler.get_next_job_and_process(information_only=False) is None
+        assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is False
+        assert scheduler._model_recently_missing is True
+
+
+class TestMissingModelLatchBound:
+    """The missing-model recovery latch expires on the preload budget rather than standing for the run."""
+
+    def _scheduler_and_clock(self) -> tuple[InferenceScheduler, list[float]]:
+        """A scheduler on a hand-advanced clock, with the default numeric preload budget in config."""
+        now = [1000.0]
+        bridge_data = make_mock_bridge_data()
+        bridge_data.preload_timeout = 150
+        scheduler = _make_inference_scheduler(bridge_data=bridge_data, clock=lambda: now[0])
+        return scheduler, now
+
+    async def test_the_latch_expires_on_the_preload_budget(self) -> None:
+        """Inside the budget the latch suppresses a repeat; past it the recovery may run again."""
+        scheduler, now = self._scheduler_and_clock()
+        job = make_job_pop_response(model="stable_diffusion")
+        scheduler._horde_model_map.update_entry(
+            "stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=0,
+        )
+
+        await scheduler._handle_process_missing(job)
+        assert scheduler._model_recently_missing is True
+        assert scheduler._missing_model_recovery_latched() is True
+
+        # A second stale record inside the budget is left alone: one recovery per budget.
+        scheduler._horde_model_map.update_entry(
+            "stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=0,
+        )
+        now[0] += 149.0
+        await scheduler._handle_process_missing(job)
+        assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is True
+
+        now[0] += 2.0
+        assert scheduler._missing_model_recovery_latched() is False
+        await scheduler._handle_process_missing(job)
+        assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is False
+
+    def test_a_never_latched_scheduler_reports_no_latch(self) -> None:
+        """The unlatched flag is answered without consulting the clock or the budget."""
+        scheduler, _now = self._scheduler_and_clock()
+        assert scheduler._missing_model_recovery_latched() is False

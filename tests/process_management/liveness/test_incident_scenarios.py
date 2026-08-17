@@ -102,6 +102,11 @@ The failures encoded here:
   slot with no name. A reprice tightening the target in that window is a shrink whose own target is the first
   idle lane it finds. That is the ``pre-stage target`` scenario, and its reinjection is the shrink called
   without the spare.
+- **A copy on a card that cannot serve the job counted as the job's own.** Residency was judged card-blind
+  while dispatch was judged per card, so a head whose model sat on a card its resolution excluded had no
+  eligible copy to dispatch to and was called already loaded by the preload pass. Neither lane could move it
+  and both cards idled against a full queue. That is the ``ineligible-card residency`` scenario, and its
+  reinjection is the card-blind gate.
 """
 
 from __future__ import annotations
@@ -2319,3 +2324,142 @@ async def test_o_defect_reinjection_a_governor_deferred_head_goes_on_reserving_t
         assert_never_idle_with_fitting_work(world, context="governor-deferred head")
     with pytest.raises(AssertionError, match="head_protection hold"):
         assert_no_unservable_dispatch_hold(world, context="governor-deferred head")
+
+
+# --------------------------------------------------------------------------------------------------------
+# Ineligible-card residency: a copy on a card that cannot serve the job is not a copy the job has
+# --------------------------------------------------------------------------------------------------------
+
+_INELIGIBLE_CARD_PIXELS = {0: 4_194_304, 1: 262_144}
+"""Per-card resolution ceilings for the two-card pool: a large card and one whose ``max_power`` override caps
+it at 512x512. Only the resolution axis differs, so which cards may serve a job is decided by its pixels
+alone."""
+
+_INELIGIBLE_CARD_HEAD_SHAPE = (1024, 1024)
+"""The head's resolution: inside the large card's ceiling and four times the small card's, so the head can
+only ever run on the large card while the model it needs sits on the small one."""
+
+_INELIGIBLE_CARD_TICK_CEILING = 10
+"""Ticks the head may take to reach sampling once its own copy has to be loaded onto the eligible card.
+
+A preload is commanded on one pass, reported on the next and dispatched after that, so a handful of ticks is
+the floor. What this excludes is a head that never loads at all."""
+
+_INELIGIBLE_CARD_TICKS = 30
+"""Ticks each of these rows runs, comfortably past the ceiling above so a run that wedges shows a long idle
+stretch rather than merely an unfinished one."""
+
+
+def _ineligible_card_world() -> _DispatchWorld:
+    """Two cards of differing resolution ceilings, the head's model resident only on the card that cannot serve it.
+
+    One lane per card, one sampling slot, and a queue depth of one: the operator posture the failure was found
+    on. The model sits on the small card as a genuine, dispatchable residency, so nothing here is stale; the
+    head simply needs a copy of it on the only card allowed to run it.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        card_max_pixels=_INELIGIBLE_CARD_PIXELS,
+    )
+    world.seed_resident(1, _SD15, in_vram=True)
+    assert world.card_of_lane(1) == 1, "precondition: the seeded copy must sit on the small card"
+    assert world.card_of_lane(0) == 0, "precondition: the free lane must sit on the large card"
+    return world
+
+
+async def _drive_ineligible_card_head(
+    world: _DispatchWorld,
+) -> tuple[ImageGenerateJobPopResponse, list[int]]:
+    """Queue the oversized head against the small card's resident copy and run the row out.
+
+    Returns:
+        The head, and the ticks on which the missing-model recovery latch was standing.
+    """
+    width, height = _INELIGIBLE_CARD_HEAD_SHAPE
+    head = make_job_pop_response(_SD15.name, width=width, height=height, ddim_steps=20)
+    await world.pop(head)
+    latched_ticks: list[int] = []
+    for _ in range(_INELIGIBLE_CARD_TICKS):
+        await world.step()
+        if world.scheduler._model_recently_missing:
+            latched_ticks.append(world.tick)
+    return head, latched_ticks
+
+
+async def test_p_a_head_gets_its_own_copy_when_the_resident_card_cannot_serve_it() -> None:
+    """A model resident only on a card that cannot serve the head is loaded again onto one that can.
+
+    The failure this encodes: residency was judged card-blind while dispatch was judged per card. The head's
+    model was resident, on a card whose resolution ceiling excluded this job, so dispatch found nothing to
+    dispatch to and the preload pass called the model already loaded. Neither lane could move the head:
+    dispatch had no eligible copy and no pass would fund one, and both cards idled against a full queue until
+    save-our-ship rebuilt the pools. Dispatch also read the empty per-card lookup as a stale residency record
+    and expired a model-map entry that was telling the truth, latching the missing-model flag against a card
+    that was serving.
+
+    Read as one statement: a copy on a card that cannot serve a job is not a copy that job has. Its
+    consequences are that the head is staged onto an eligible card and sampled inside a bounded schedule, that
+    no card sits idle with work its memory covers, and that nothing treats the truthful residency as missing.
+    """
+    world = _ineligible_card_world()
+
+    head, latched_ticks = await _drive_ineligible_card_head(world)
+
+    context = "ineligible-card residency"
+    dispatch_tick = world.dispatch_tick(head)
+    assert dispatch_tick is not None, (
+        f"{context}: the head never reached sampling, though the large card was free the whole run and the "
+        f"only thing it needed was its own copy of {_SD15.name}. {world.state_dump()}"
+    )
+    assert dispatch_tick <= _INELIGIBLE_CARD_TICK_CEILING, (
+        f"{context}: the head took {dispatch_tick} ticks to reach sampling, past the "
+        f"{_INELIGIBLE_CARD_TICK_CEILING}-tick ceiling a load onto a free eligible lane comes in under. "
+        f"{world.state_dump()}"
+    )
+    lanes = [lane for model, lane in world.dispatch_lanes if model == _SD15.name]
+    assert lanes and all(world.card_of_lane(lane) == 0 for lane in lanes), (
+        f"{context}: the head was dispatched to lane(s) {lanes}, which is not on the only card whose "
+        f"resolution ceiling covers it. {world.state_dump()}"
+    )
+    assert not latched_ticks, (
+        f"{context}: the missing-model recovery was latched on tick(s) {latched_ticks[:6]} over a model that "
+        f"was resident throughout, so a truthful residency record was expired as stale. {world.state_dump()}"
+    )
+    assert_never_idle_with_fitting_work(world, context=context)
+
+
+async def test_p_defect_reinjection_a_card_blind_residency_gate_wedges_both_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the already-loaded gate card-blind again, the head is never staged and both cards idle.
+
+    Reinjected at that gate alone: dispatch still routes per card and still finds nothing, and the only
+    difference is that the preload pass counts a copy on a card that cannot serve this job. What comes back is
+    the wedge in full, and its signature is what distinguishes it from memory pressure: a queue that holds
+    work, lanes that hold nothing to do, and a card with almost all of its memory free.
+    """
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_model_loaded_for_job",
+        lambda self, job, loaded_models: job.model in loaded_models,
+    )
+    world = _ineligible_card_world()
+
+    head, _latched_ticks = await _drive_ineligible_card_head(world)
+
+    assert world.dispatch_tick(head) is None, (
+        "a card-blind already-loaded gate must keep the head out of the preload pass entirely, which is the "
+        f"whole of this defect; it sampled anyway. {world.state_dump()}"
+    )
+    assert world.job_tracker.jobs_pending_inference and not world.job_tracker.jobs_in_progress, (
+        "the wedge idles every lane against a queue that still holds work; a run with a job sampling or an "
+        f"empty queue is a slow schedule rather than this defect. {world.state_dump()}"
+    )
+    with pytest.raises(AssertionError, match="the card was idle for"):
+        assert_never_idle_with_fitting_work(world, context="ineligible-card residency")

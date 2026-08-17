@@ -334,6 +334,10 @@ def format_staging_defer_tally(defers: Mapping[StagingDeferReason, int]) -> str 
     return f"staging deferred: {total} ({shares})"
 
 
+_MISSING_MODEL_LATCH_FALLBACK_SECONDS = 150.0
+"""Bound for the missing-model recovery latch when no numeric ``preload_timeout`` is configured.
+Matches the ``preload_timeout`` default."""
+
 _RESIDENCY_GRACE_SECONDS = 30.0
 """How long a model stays protected from RAM eviction after its last live demand, in the
 models-exceed-processes regime. Bridges the gap between a model's consecutive jobs so a
@@ -3849,7 +3853,7 @@ class InferenceScheduler:
         head = self._undispatched_head()
         if head is None or head.model is None:
             return False
-        return self._horde_model_map.is_model_loading(head.model) or self._model_recently_missing
+        return self._horde_model_map.is_model_loading(head.model) or self._missing_model_recovery_latched()
 
     def _clear_head_starvation_timer(self) -> None:
         """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
@@ -9009,7 +9013,12 @@ class InferenceScheduler:
                     new_state=HordeProcessState.WAITING_FOR_JOB,
                 )
 
-        if loaded_models == pending_models:
+        # The fast path out of the pass: every pending job's model is already accounted for. Set equality
+        # alone is not enough on a multi-GPU host, where a model can be loaded on a card that cannot serve the
+        # job that wants it, so each pending job must find its copy on a card eligible for it.
+        if loaded_models == pending_models and all(
+            self._model_loaded_for_job(job, loaded_models) for job in self._job_tracker.jobs_pending_inference
+        ):
             return False
 
         # The first queued job not already in progress is the head of the queue. Only when *its* model
@@ -9362,7 +9371,8 @@ class InferenceScheduler:
         Args:
             job: The pending job to consider loading a model for.
             head_job: The queue head, which alone may escalate to displacing another queued model.
-            loaded_models: The models already resident or loading, so a repeat is not staged.
+            loaded_models: The models already resident or loading, so a repeat is not staged. Read through
+                :meth:`_model_loaded_for_job`, which asks the question per job rather than card-blind.
         """
         bridge_data = self._runtime_config.bridge_data
         if job.model is None:
@@ -9399,7 +9409,7 @@ class InferenceScheduler:
                 self._job_tracker.handle_job_fault_now(job, retryable=False)
             return self._preload_outcome(AdmissionDecision.QUARANTINED, job=job, reason="model load quarantined")
 
-        if job.model in loaded_models:
+        if self._model_loaded_for_job(job, loaded_models):
             return self._preload_outcome(
                 AdmissionDecision.ALREADY_LOADED, job=job, reason="model already resident or loading"
             )
@@ -9950,6 +9960,55 @@ class InferenceScheduler:
             return resident
         return None
 
+    def _model_loaded_for_job(self, job: ImageGenerateJobPopResponse, loaded_models: set[str | None]) -> bool:
+        """Whether ``job``'s model already counts as resident or loading *for this job's routing*.
+
+        Single-GPU (or the empty plan unit tests construct): the card-blind membership test the preload pass
+        has always used, so behaviour there is unchanged. Multi-GPU: a copy only counts when it sits on a card
+        eligible to serve this job. A model resident solely on a card that cannot serve this job (its
+        resolution, features or weights exceed that card's effective config) leaves the job needing its own
+        copy on an eligible card. Dispatch will not seat it on the ineligible copy, and counting that copy
+        here withholds the preload that would give the job one, so neither lane can move the job. A job with
+        no eligible card at all keeps the card-blind answer; the eligibility fault path owns that case.
+        """
+        model = job.model
+        if model is None:
+            return False
+        if not self._multi_gpu_routing_active:
+            return model in loaded_models
+        allowed = self._eligible_card_indices(job)
+        if not allowed:
+            return model in loaded_models
+        if self._process_map.get_processes_by_horde_model_name(model, allowed_cards=allowed, include_reserved=True):
+            return True
+        model_info = self._horde_model_map.root.get(model)
+        if model_info is None:
+            return False
+        if not (
+            model_info.horde_model_load_state.is_loaded()
+            or model_info.horde_model_load_state == ModelLoadState.LOADING
+        ):
+            return False
+        owner = self._process_map.get(model_info.process_id)
+        # An entry whose owning process is gone records a residency that no longer exists; counting it would
+        # suppress the preload that replaces it.
+        return owner is not None and owner.device_index in allowed
+
+    def _resident_only_on_ineligible_cards(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``job``'s model is resident somewhere, but on no card eligible to serve this job.
+
+        This is not a missing model: the weights are where the model map says they are, on a card whose
+        effective config cannot serve this particular job. The job needs its own copy on an eligible card,
+        which is the preload pass's business, so dispatch falls through instead of treating a truthful
+        residency record as stale and expiring it.
+        """
+        model = job.model
+        if model is None or not self._multi_gpu_routing_active:
+            return False
+        if self._resident_process_for_job(job, include_reserved=True) is not None:
+            return False
+        return self._process_map.get_process_by_horde_model_name(model, include_reserved=True) is not None
+
     def _head_aged_past_anti_starvation(self, head_job: ImageGenerateJobPopResponse) -> bool:
         """Whether a queued head has waited past the anti-starvation fraction of its ttl and must not be bypassed.
 
@@ -10076,19 +10135,31 @@ class InferenceScheduler:
                 return candidate
         return None
 
-    async def _handle_process_missing(
-        self,
-        job: ImageGenerateJobPopResponse,
-        *,
-        process_with_model: HordeProcessInfo | None,
-    ) -> None:
+    def _missing_model_recovery_latched(self) -> bool:
+        """Whether the missing-model recovery latch still holds, within the preload budget.
+
+        The latch is set when the head's model was expected resident but no process held it, and the next
+        committed dispatch selection clears it. No dispatch is guaranteed to follow, so the latch also expires
+        on ``preload_timeout``: the fresh preload the recovery released the job for either lands inside that
+        window or has failed. Unbounded, one recovery would bar every later one for the rest of the run and
+        would keep telling the recovery coordinator a load is still in flight. Read-only; the flag is left as
+        written and only ever read through this bound.
+        """
+        if not self._model_recently_missing:
+            return False
+        budget = self._runtime_config.bridge_data.preload_timeout
+        budget_seconds = float(budget) if isinstance(budget, int | float) else _MISSING_MODEL_LATCH_FALLBACK_SECONDS
+        return (self._clock() - self._model_recently_missing_time) < budget_seconds
+
+    async def _handle_process_missing(self, job: ImageGenerateJobPopResponse) -> None:
         """Recover when the head's model was expected resident but no process holds it.
 
-        Expires the stale model-map entry, clears any process still tagged with the model, and releases
-        the job from in-progress so a fresh preload can be scheduled. Guarded by ``_model_recently_missing``
-        so the recovery runs at most once until a model loads again.
+        Reached only when the model map claims the model is loaded and no process is tagged with it, so the
+        map entry is the stale half: it is expired and the job is released from in-progress so a fresh preload
+        can be scheduled. Guarded by the missing-model latch so the recovery runs at most once per preload
+        budget.
         """
-        if self._model_recently_missing:
+        if self._missing_model_recovery_latched():
             return
         logger.warning(
             f"Expected to find a process with model {job.model} but none was found. Attempt to load it now...",
@@ -10099,17 +10170,6 @@ class InferenceScheduler:
         if job.model is not None:
             logger.debug(f"Expiring entry for model {job.model}")
             self._horde_model_map.expire_entry(job.model)
-
-            if process_with_model is not None:
-                logger.debug(f"Clearing process {process_with_model.process_id} of model {job.model}")
-
-                horde_model_baseline = self._model_metadata.get_baseline(job.model)
-
-                self._process_map.on_model_load_state_change(
-                    process_id=process_with_model.process_id,
-                    horde_model_name=job.model,
-                    horde_model_baseline=horde_model_baseline,
-                )
 
             logger.debug(f"Horde model map: {self._horde_model_map}")
             logger.debug(f"Process map: {self._process_map}")
@@ -10329,13 +10389,20 @@ class InferenceScheduler:
                 if next_job_model is None:
                     raise ValueError(f"next_job.model is None ({next_job})")
 
+                # The model is resident, but only on a card that cannot serve this job. Nothing is
+                # missing, so the recovery must not run: expiring the entry would discard a truthful
+                # residency and latch the missing-model flag against a card that is serving. The job needs
+                # its own copy on an eligible card, which the preload pass admits.
+                if self._resident_only_on_ineligible_cards(next_job):
+                    return None
+
                 if (
                     self._preload_delay_notified
                     or self._horde_model_map.is_model_loading(next_job_model)
                     or information_only
                 ):
                     return None
-                await self._handle_process_missing(next_job, process_with_model=process_with_model)
+                await self._handle_process_missing(next_job)
                 return None
 
         if not process_with_model.can_accept_job():

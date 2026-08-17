@@ -39,6 +39,7 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
     HordeControlFlag,
@@ -85,6 +86,7 @@ from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_card_runtimes,
     make_test_model_metadata,
     make_test_runtime_config,
     track_popped_job_async,
@@ -536,6 +538,7 @@ class _DispatchWorld:
         preload_report_latency_seconds: float = 0.0,
         preload_latency_seconds: float = 0.0,
         disaggregated_encode_seconds: float = 0.0,
+        card_max_pixels: dict[int, int] | None = None,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -615,6 +618,13 @@ class _DispatchWorld:
                 reports nothing until the sample stage runs, so through this window the slot reads
                 ``WAITING_FOR_JOB`` while owning a dispatched job. Zero samples immediately, which is the
                 monolithic shape and what the rows that do not vary this run against.
+            card_max_pixels: Per-card ``max_pixels`` for a multi-card pool, keyed by device index. The lanes
+                are pinned round-robin over those indices and the scheduler is handed a per-card runtime whose
+                effective config differs only in this ceiling, so a job's resolution alone decides which cards
+                may serve it. The VRAM ledger stays a single derived pool that every card reads the same
+                figure from, so such a row can state routing and admission outcomes and says nothing about
+                per-card VRAM physics. None keeps the single-card pool every other row runs on, where routing
+                is a strict no-op.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -719,9 +729,16 @@ class _DispatchWorld:
         """What each tick looked like to the verdicts that judge whether the card was earning."""
 
         self._service_contexts = service_contexts
+        card_indices = sorted(card_max_pixels) if card_max_pixels else [0]
+        self._lane_cards = {lane_id: card_indices[lane_id % len(card_indices)] for lane_id in range(lane_count)}
         processes: dict[int, HordeProcessInfo] = {}
         for lane_id in range(lane_count):
-            lane = make_mock_process_info(lane_id, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+            lane = make_mock_process_info(
+                lane_id,
+                model_name=None,
+                state=HordeProcessState.WAITING_FOR_JOB,
+                device_index=self._lane_cards[lane_id],
+            )
             processes[lane_id] = lane
         if service_contexts:
             processes[_SAFETY_PROCESS_ID] = make_mock_process_info(
@@ -780,6 +797,26 @@ class _DispatchWorld:
         """When the standing claim's maximum hold runs out, as the claim itself reported it."""
         self.claim_released_at = 0.0
         """The world's clock when the claim first stopped standing; 0.0 while one has never ended."""
+        card_runtimes: dict[int, CardRuntime] = {}
+        if card_max_pixels:
+            for device_index, max_pixels in sorted(card_max_pixels.items()):
+                card_config = make_mock_bridge_data(
+                    max_threads=max_threads,
+                    queue_size=queue_depth,
+                    image_models_to_load=[model.name for model in _MODEL_CLASSES],
+                    max_pixels=max_pixels,
+                )
+                lanes_on_card = sum(1 for card in self._lane_cards.values() if card == device_index)
+                card_runtimes.update(
+                    make_test_card_runtimes(
+                        device_indices=(device_index,),
+                        config=card_config,
+                        total_vram_mb=card.total_mb,
+                        target_process_count=max(1, lanes_on_card),
+                        max_concurrent_inference=max_threads,
+                    ),
+                )
+        self._card_runtimes: dict[int, CardRuntime] | None = card_runtimes or None
         self._lane_ceiling = lane_count
         self._lifecycle = _make_mock_lifecycle(self)
         self._scheduler = InferenceScheduler(
@@ -790,6 +827,7 @@ class _DispatchWorld:
             process_lifecycle=self._lifecycle,
             runtime_config=make_test_runtime_config(bridge_data=bridge_data),
             model_metadata=make_test_model_metadata(reference),
+            card_runtimes=self._card_runtimes,
             max_concurrent_inference_processes=max_threads,
             max_inference_processes=lane_count,
             lru=LRUCache(max(2, lane_count)),
@@ -2316,6 +2354,10 @@ class _DispatchWorld:
     def lane_serving(self, job: ImageGenerateJobPopResponse) -> int | None:
         """The lane holding ``job``, or None once it is off every lane."""
         return self._lane_of.get(str(job.id_))
+
+    def card_of_lane(self, lane_id: int) -> int:
+        """The device index the pool pinned ``lane_id`` to (0 on every single-card row)."""
+        return self._process_map[lane_id].device_index
 
     def inference_lane_ids(self) -> list[int]:
         """The inference lanes the pool currently holds, in map order."""

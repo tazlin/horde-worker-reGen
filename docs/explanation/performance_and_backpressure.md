@@ -309,6 +309,11 @@ response stay live even when the queue is empty.
    the queue head is already resident on an idle process, dispatch is attempted
    before later models are preloaded; when pending post-processing has an idle
    lane and a known peak, preloads also yield so the lane gets the drain window.
+   "Already loaded" is judged per job on a multi-GPU worker: a resident (or
+   loading) copy counts only where it sits on a card eligible for *that* job, so
+   a job whose model is resident on a card its resolution or features exclude is
+   staged its own copy on a card that can serve it. A single-GPU worker keeps the
+   card-blind membership test.
 2. **Single-inference hold**: defer launch while `keep_single_inference` is
    active, such as an idle ControlNet-XL resident that must keep its slot
    exclusive. A batch is not held here; its multiplied activation peak is priced
@@ -1662,6 +1667,14 @@ that preload, dispatch, and placement share) and never dispatches a job to a car
 The head-of-queue make-room fallback may override affinity and queued-model preservation to prevent starvation,
 but it retains that eligible-card set. A busy or restarting eligible card therefore makes the head wait; it does
 not permit the scheduler to strand the head's model on an idle card that cannot execute the job.
+
+A model resident only on cards that cannot serve the head is not a missing model. Dispatch finds no target,
+but the model map and the holding process are both telling the truth, so the missing-model recovery (which
+expires the map entry and releases the job for a fresh preload) is reserved for the genuine inconsistency: the
+map records the model as loaded and no process is tagged with it. In the ineligible-card case dispatch simply
+yields and the preload pass stages the head its own copy on an eligible card. That recovery's suppression latch
+also expires on `preload_timeout`, so one such episode cannot bar every later attempt or keep reporting a load
+in flight to the recovery coordinator.
 
 Feature compatibility is not re-derived from worker-local booleans. The SDK converts each accepted pop response to
 `ImageGenerationFeatureFlags`; each card adapts its effective config and hordelib's torch-free execution vocabularies
