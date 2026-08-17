@@ -457,7 +457,7 @@ class TestHeterogeneousCardPopRotation:
     """Each heterogeneous offer stays within one card's routeable capability rectangle."""
 
     async def test_successive_pops_rotate_complete_card_scoped_offers(self) -> None:
-        """Model, feature, policy, resolution, and capacity fields rotate together by card."""
+        """Model, feature, resolution, and capacity fields rotate together by card; nsfw stays fleet-wide."""
         plain_config = make_mock_bridge_data(
             image_models_to_load=["plain-model"],
             allow_controlnet=False,
@@ -511,7 +511,9 @@ class TestHeterogeneousCardPopRotation:
         assert [request.allow_controlnet for request in requests] == [False, True, False, True]
         assert [request.allow_post_processing for request in requests] == [False, True, False, True]
         assert [request.allow_lora for request in requests] == [False, True, False, True]
-        assert [request.nsfw for request in requests] == [False, True, False, True]
+        # nsfw does not rotate: a popped job is not pinned to the offering card and carries no NSFW marker,
+        # so a fleet with any SFW card offers SFW work only.
+        assert [request.nsfw for request in requests] == [False, False, False, False]
         assert [request.max_pixels for request in requests] == [2 * 8 * 64 * 64, 8 * 8 * 64 * 64] * 2
         assert [request.threads for request in requests] == [1, 2, 1, 2]
 

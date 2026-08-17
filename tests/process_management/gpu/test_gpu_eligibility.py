@@ -95,7 +95,6 @@ class TestCardCanServe:
                     ),
                 },
             ),
-            needs_nsfw=requirements.needs_nsfw,
             pixels=requirements.pixels,
             batch=requirements.batch,
         )

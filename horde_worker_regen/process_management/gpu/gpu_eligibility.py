@@ -2,7 +2,7 @@
 
 The SDK owns the canonical request vocabulary, wire extraction, and directional compatibility predicate.
 This module adapts a card's effective worker configuration to that seam, then applies constraints that are
-necessarily local: model assignment, weight fit, resolution, and NSFW policy. Keeping those layers separate
+necessarily local: model assignment, weight fit, and resolution. Keeping those layers separate
 lets pop placement and dispatch routing use one eligibility decision without copying feature taxonomies.
 
 The module is torch-free. Backend vocabularies come from ``hordelib.pipeline.constants``, whose values are
@@ -58,7 +58,6 @@ class CARD_NOT_CAPABLE_REASON(StrEnum):
 
     model_weights = auto()
     model_not_served = auto()
-    nsfw_policy = auto()
     max_pixels = auto()
     max_batch = auto()
 
@@ -179,7 +178,6 @@ class JobRequirements:
     baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None
     weight_mb: float | None
     image_features: ImageGenerationFeatureFlags
-    needs_nsfw: bool
     pixels: int
     batch: int
 
@@ -209,13 +207,18 @@ def describe_job_requirements(
     baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
     weight_mb: float | None,
 ) -> JobRequirements:
-    """Extract canonical portable and local requirements from an accepted image job."""
+    """Extract canonical portable and local requirements from an accepted image job.
+
+    NSFW is deliberately absent. A popped job carries no NSFW signal: ``use_nsfw_censor`` states whether the
+    requester wants accidental NSFW output censored, not that the job is NSFW. The horde server filters NSFW
+    work by the ``nsfw`` flag on the offer, so the policy is enforced at pop time (see
+    [`gpu_pop_shaping`][horde_worker_regen.process_management.gpu.gpu_pop_shaping]) rather than per card.
+    """
     return JobRequirements(
         model=job.model,
         baseline=baseline,
         weight_mb=weight_mb,
         image_features=image_job_pop_response_to_feature_flags(job, resolved_baseline=baseline),
-        needs_nsfw=not job.payload.use_nsfw_censor,
         pixels=int(job.payload.width) * int(job.payload.height),
         batch=int(job.payload.n_iter),
     )
@@ -249,8 +252,6 @@ def reasons_card_cannot_serve(card: CardProfile, requirements: JobRequirements) 
         and requirements.model not in card.served_models
     ):
         reasons.append(CARD_NOT_CAPABLE_REASON.model_not_served)
-    if requirements.needs_nsfw and not card.config.nsfw:
-        reasons.append(CARD_NOT_CAPABLE_REASON.nsfw_policy)
     configured_max_pixels = card.config.max_pixels
     if (
         isinstance(configured_max_pixels, int)

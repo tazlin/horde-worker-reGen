@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import hashlib
 import random
 import time
@@ -1898,7 +1899,13 @@ class JobPopper:
                 target_reason = "heterogeneous offer rotation"
             if target_card is not None:
                 advertised_card_runtimes = {target_card: self._card_runtimes[target_card]}
-                advertised = advertised_capabilities(advertised_card_runtimes)
+                # A popped job is not pinned to the card whose offer fetched it and carries no NSFW marker, so
+                # a card-scoped offer must still carry the fleet-wide nsfw policy or an NSFW job could route
+                # to a card configured SFW.
+                advertised = dataclasses.replace(
+                    advertised_capabilities(advertised_card_runtimes),
+                    nsfw=advertised.nsfw,
+                )
                 logger.debug(
                     f"Card-scoped pop: selecting card {target_card} due to {target_reason}; the request carries "
                     "only combinations that card can serve.",

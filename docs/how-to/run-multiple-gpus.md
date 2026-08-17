@@ -70,6 +70,10 @@ alchemy, …) cannot be overridden per card and are rejected if you try.
 `max_batch` is a per-card ceiling on the images one request may ask for: the pop asks for the offered card's
 own ceiling, and a job arriving above a card's ceiling is not dispatched there.
 
+`nsfw` is enforced at the offer rather than per card: a popped job carries no NSFW marker, so the worker
+cannot tell which returned job was NSFW. Cards that disagree on `nsfw` therefore advertise SFW for the
+combined offer and for every card-scoped offer; NSFW work is only requested when every card permits it.
+
 `safety_on_gpu` is a per-card *permission to host*, not a request. The safety check is one process on one
 card, so the worker places it on a card that permits it (the one with the most measured headroom) and runs it
 off-GPU when no card does. Turn it off for a card you want kept clear of safety's CUDA context; on a

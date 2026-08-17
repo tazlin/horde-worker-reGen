@@ -59,6 +59,8 @@ _PAYLOAD_AXES: dict[str, tuple[object, ...]] = {
     "aux": ("none", "lora", "ti", "both"),
     "control": ("none", "canny", "qr_code", "custom_workflow"),
     "post_processing": ("none", "single", "chain"),
+    # A popped job carries no NSFW signal, so the censor request and the card's nsfw setting must leave
+    # requirement extraction and routing unchanged; both axes stay to hold that.
     "uncensored": (False, True),
     "geometry": ((64, 64), (64, 128), (128, 128)),
 }
@@ -209,7 +211,6 @@ def _expected_requirements(case: _MaterializedPayload) -> JobRequirements:
             tis=[KNOWN_AUX_MODEL_SOURCE.HORDELING] if aux in {"ti", "both"} else None,
             loras=[KNOWN_AUX_MODEL_SOURCE.CIVITAI] if aux in {"lora", "both"} else None,
         ),
-        needs_nsfw=bool(row["uncensored"]),
         pixels=width * height,
         batch=1,
     )
@@ -259,8 +260,6 @@ def _expected_eligibility(config: _Row, case: _MaterializedPayload) -> bool:
     if (source != "txt2img" or control != "none") and not config["allow_img2img"]:
         return False
     if source in {"inpainting", "outpainting"} and not config["allow_inpainting"]:
-        return False
-    if row["uncensored"] and not config["nsfw"]:
         return False
     return width * height <= 64 * 128
 

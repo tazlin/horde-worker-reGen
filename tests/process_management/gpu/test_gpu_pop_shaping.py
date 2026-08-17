@@ -56,7 +56,7 @@ class TestUnionAdvertising:
         envelope = advertised_capabilities({0: card0, 1: card1})
 
         assert envelope.models == frozenset({"model_a", "model_b", "shared"})
-        assert envelope.nsfw is True  # card 1 serves NSFW
+        assert envelope.nsfw is False  # card 0 is SFW, so the combined offer is SFW
         assert envelope.allow_controlnet is True  # card 1 allows ControlNet
         assert envelope.allow_lora is True  # card 0 allows LoRA
         assert envelope.max_power == 16  # the bigger card's resolution ceiling
@@ -101,6 +101,17 @@ class TestUnionAdvertising:
         assert advertised_capabilities({0: classic_only}).allow_controlnet is True
         assert advertised_capabilities({0: classic_only}).allow_sdxl_controlnet is False
         assert advertised_capabilities({0: classic_only, 1: sdxl}).allow_sdxl_controlnet is True
+
+    def test_mixed_nsfw_policy_advertises_sfw(self) -> None:
+        """A popped job cannot be attributed to a card, so a mixed fleet must offer SFW work only."""
+        sfw = _card(device_index=0, max_concurrent=1, nsfw=False)
+        nsfw = _card(device_index=1, max_concurrent=1, nsfw=True)
+        also_nsfw = _card(device_index=2, max_concurrent=1, nsfw=True)
+
+        assert advertised_capabilities({0: sfw, 1: nsfw}).nsfw is False
+        assert advertised_capabilities({1: nsfw, 2: also_nsfw}).nsfw is True
+        assert advertised_capabilities({0: sfw}).nsfw is False
+        assert advertised_capabilities({1: nsfw}).nsfw is True
 
     def test_extended_offer_requires_every_server_extended_type(self) -> None:
         """A backend missing any extended type must not emit the protocol's all-extended bit."""

@@ -463,16 +463,10 @@ class TestCardConfigTracksConfigReload:
 
         assert manager._inference_scheduler._eligible_card_indices(job) == set()
 
-    def test_enabling_nsfw_makes_an_uncensored_job_eligible(self) -> None:
-        """A policy the card refused at startup is honoured from the reload, without a restart."""
+    def test_sfw_card_admits_an_ordinary_job(self) -> None:
+        """NSFW is an offer-level policy: a card configured SFW still routes the jobs the horde returns."""
         manager = self._manager(max_pixels=5_000_000, nsfw=False)
-        job = make_job_pop_response(model="stable_diffusion", use_nsfw_censor=False)
-        assert manager._inference_scheduler._eligible_card_indices(job) == set()
-
-        manager._apply_reloaded_bridge_data(
-            make_mock_bridge_data(max_pixels=5_000_000, nsfw=True, dry_run_skip_inference=True),
-        )
-
+        job = make_job_pop_response(model="stable_diffusion")
         assert manager._inference_scheduler._eligible_card_indices(job) == {0}
 
     def test_reload_leaves_the_card_plan_otherwise_untouched(self) -> None:

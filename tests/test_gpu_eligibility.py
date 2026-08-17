@@ -35,7 +35,7 @@ def _make_job(
     post_processing: list[str] | None = None,
     source_processing: str = "txt2img",
     source_image: str | None = None,
-    use_nsfw_censor: bool = True,
+    use_nsfw_censor: bool = False,
     scheduler: str | None = None,
     transparent: bool = False,
 ) -> ImageGenerateJobPopResponse:
@@ -92,12 +92,11 @@ class TestDescribeJobRequirements:
         assert req.image_features.controlnets_feature_flags is None
         assert req.image_features.loras is None
         assert req.image_features.source_processing == [KNOWN_IMAGE_SOURCE_PROCESSING.txt2img]
-        assert req.needs_nsfw is False
         assert req.baseline == "stable_diffusion_xl"
         assert req.pixels == 640 * 512
 
     def test_feature_flags_detected(self) -> None:
-        """Controlnet, lora, post-processing, img2img, inpainting, and nsfw are each detected."""
+        """Controlnet, lora, post-processing, img2img, and inpainting are each detected."""
         cn = describe_job_requirements(_make_job(control_type="canny"), None, None)
         assert cn.image_features.controlnets_feature_flags is not None
         lora = describe_job_requirements(_make_job(loras=[{"name": "x"}]), None, None)
@@ -108,8 +107,6 @@ class TestDescribeJobRequirements:
         assert img.image_features.source_processing == [KNOWN_IMAGE_SOURCE_PROCESSING.img2img]
         inpaint = describe_job_requirements(_make_job(source_image="data", source_processing="inpainting"), None, None)
         assert inpaint.image_features.source_processing == [KNOWN_IMAGE_SOURCE_PROCESSING.inpainting]
-        nsfw = describe_job_requirements(_make_job(use_nsfw_censor=False), None, None)
-        assert nsfw.needs_nsfw is True
 
 
 class TestCardCanServe:
@@ -233,13 +230,12 @@ class TestCardCanServe:
         req = describe_job_requirements(_make_job(width=512, height=512), None, None)  # 262144 px
         assert card_can_serve(small, req) is False
 
-    def test_nsfw_job_needs_nsfw_card(self) -> None:
-        """An uncensored (nsfw) job is refused by an SFW card and served by an NSFW card."""
+    def test_sfw_card_serves_an_ordinary_job(self) -> None:
+        """``use_nsfw_censor`` is a censoring request, not an NSFW marker, so it never excludes a SFW card."""
         sfw = CardProfile(0, 24576, _config(nsfw=False), frozenset({"modelA"}))
-        nsfw = CardProfile(1, 24576, _config(nsfw=True), frozenset({"modelA"}))
-        req = describe_job_requirements(_make_job(use_nsfw_censor=False), None, None)
-        assert card_can_serve(sfw, req) is False
-        assert card_can_serve(nsfw, req) is True
+        assert reasons_card_cannot_serve(sfw, describe_job_requirements(_make_job(), None, None)) == ()
+        uncensored = describe_job_requirements(_make_job(use_nsfw_censor=False), None, None)
+        assert reasons_card_cannot_serve(sfw, uncensored) == ()
 
 
 class TestWeightBudgetHeterogeneous:

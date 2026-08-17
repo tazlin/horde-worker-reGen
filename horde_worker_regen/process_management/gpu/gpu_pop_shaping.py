@@ -54,7 +54,7 @@ class AdvertisedCapabilities:
     models: frozenset[str]
     """The union of every card's configured image models (the candidate set before stickiness/holdback)."""
     nsfw: bool
-    """True if any card serves NSFW work."""
+    """True only if every card serves NSFW work; a popped job cannot be attributed to one card's policy."""
     image_worker_features: ImageWorkerFeatureFlags
     """The canonical union of portable image features supported by at least one card."""
     max_power: int
@@ -113,10 +113,14 @@ class AdvertisedCapabilities:
 def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> AdvertisedCapabilities:
     """Build an independently aggregated capability envelope from a card runtime plan.
 
-    Portable feature values are unioned; NSFW is OR-ed, ``max_power`` and ``max_batch`` are max-ed, threads
-    are summed, and models are unioned. The result is directly safe to emit only for a singleton or
-    externally equivalent cards. Empty input is rejected because the SDK image profile requires at least one
-    supported baseline; the caller handles an absent card plan before invoking this function.
+    Portable feature values are unioned; ``max_power`` and ``max_batch`` are max-ed, threads are summed, and
+    models are unioned. The result is directly safe to emit only for a singleton or externally equivalent
+    cards. Empty input is rejected because the SDK image profile requires at least one supported baseline;
+    the caller handles an absent card plan before invoking this function.
+
+    NSFW is AND-ed rather than unioned. A returned job carries no NSFW signal, so a job popped under an NSFW
+    offer cannot be attributed to the cards that permit NSFW; a mixed fleet must therefore offer SFW work
+    only; the popper applies the fleet-wide value to card-scoped offers as well.
 
     Args:
         card_runtimes: The driven cards keyed by stable device index.
@@ -126,7 +130,7 @@ def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> Adverti
         [`AdvertisedCapabilities`][horde_worker_regen.process_management.gpu.gpu_pop_shaping.AdvertisedCapabilities].
     """
     models: set[str] = set()
-    nsfw = False
+    nsfw = True
     feature_profiles: list[ImageWorkerFeatureFlags] = []
     max_power = 0
     max_batch = 0
@@ -135,7 +139,7 @@ def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> Adverti
     for card in card_runtimes.values():
         config = card.config
         models.update(config.image_models_to_load)
-        nsfw = nsfw or bool(config.nsfw)
+        nsfw = nsfw and bool(config.nsfw)
         feature_profiles.append(image_worker_feature_flags(config))
         max_power = max(max_power, int(config.max_power))
         max_batch = max(max_batch, int(config.max_batch))
