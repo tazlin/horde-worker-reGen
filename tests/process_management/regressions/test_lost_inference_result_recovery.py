@@ -24,6 +24,7 @@ the reference.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
@@ -78,6 +79,8 @@ class TestPromptLostResultRecovery:
         await job_tracker.record_popped_job(job)
         await mark_job_in_progress_async(job_tracker, job)
         process_info.last_job_referenced = job
+        # The child reported its active state after the dispatch, so this idle is the job's own return.
+        process_info.last_process_state_started_at = time.time()
         assert job in job_tracker.jobs_in_progress
         assert job.id_ is not None
 
@@ -104,6 +107,7 @@ class TestPromptLostResultRecovery:
         await job_tracker.record_popped_job(job)
         await mark_job_in_progress_async(job_tracker, job)
         process_info.last_job_referenced = job
+        process_info.last_process_state_started_at = time.time()
         assert job.id_ is not None
 
         dispatcher._handle_process_state_change(_waiting_for_job_message(2))
@@ -279,6 +283,50 @@ class TestDispatchRaceIsNotReapedAsLostResult:
         dispatcher._handle_process_state_change(_waiting_for_job_message(1))
 
         assert job in job_tracker.jobs_in_progress
+
+    async def test_idle_trailing_the_previous_job_does_not_reap_a_slot_rebound_in_the_same_tick(self) -> None:
+        """A sampler re-bound inside the previous job's result tick keeps its new job through the old idle report.
+
+        The child's transition to idle for the job it just finished travels behind that job's result, so it can
+        arrive after the parent has already given the slot its next job. Ownership carries the instant it was
+        taken; an idle report whose state began before that instant belongs to the previous job.
+        """
+        import dataclasses
+        import time
+
+        process_info = make_mock_process_info(
+            6,
+            model_name="Nova Anime XL",
+            state=HordeProcessState.INFERENCE_STARTING,
+        )
+        process_info.last_process_state_started_at = time.time() - 20.0
+        process_map = ProcessMap({6: process_info})
+        job_tracker = JobTracker()
+        job_tracker.set_retry_policy(2)
+        dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
+
+        job = make_job_pop_response(model="Nova Anime XL")
+        await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+        process_info.record_inference_ownership(job, attempt_ordinal=1)
+        assert process_info.inference_ownership is not None
+        assert process_info.inference_ownership.recorded_at > process_info.last_process_state_started_at
+
+        dispatcher._handle_process_state_change(_waiting_for_job_message(6))
+
+        assert job in job_tracker.jobs_in_progress
+
+        # Control: ownership older than the state being closed is the job the slot actually ran, so the idle
+        # report does mean its result was lost.
+        process_info.last_process_state = HordeProcessState.INFERENCE_STARTING
+        process_info.last_process_state_started_at = time.time()
+        process_info.inference_ownership = dataclasses.replace(
+            process_info.inference_ownership,
+            recorded_at=process_info.last_process_state_started_at - 30.0,
+        )
+        dispatcher._handle_process_state_change(_waiting_for_job_message(6))
+
+        assert job not in job_tracker.jobs_in_progress
 
     async def test_idle_from_preload_complete_does_not_reap_a_freshly_dispatched_job(self) -> None:
         """The same window, reached via a preload-complete path rather than an unload.

@@ -195,6 +195,7 @@ def _make_harness(
         3: image_lane,
     }
     reserved: set[int] = set()
+    bound: list[tuple[object, _FakeProcess]] = []
     completed: list[tuple[object, list[HordeImageResult], GENERATION_STATE, DisaggregatedFault | None]] = []
     sampling_completed: list[object] = []
     rerouted: list[object] = []
@@ -204,9 +205,20 @@ def _make_harness(
     peak_callable = estimate_sampling_peak_mb if estimate_sampling_peak_mb is not None else (lambda _job_info: None)
     decode_callable = estimate_decode_spike_mb if estimate_decode_spike_mb is not None else (lambda _job_info: None)
 
+    def _record_bind(job_info: object, process: _FakeProcess) -> None:
+        """Stand in for the scheduler's bind bookkeeping, of which slot ownership is what the tests read."""
+        process.owned_job = job_info.sdk_api_job_info  # type: ignore[attr-defined]
+        bound.append((job_info, process))
+
     orchestrator = DisaggregationOrchestrator(
         find_encode_service=lambda: encode_service,  # type: ignore[arg-type]
-        find_sampler=lambda _model: by_id.get(_SAMPLER_PID),  # type: ignore[arg-type,return-value]
+        # The dispatch-side finder excludes a lane reserved as somebody's pinned sampler, as the real process
+        # map does; the reserved-inclusive finder is what tells a staged-ahead job the lane merely busy.
+        find_sampler=(
+            lambda _model: None if _SAMPLER_PID in reserved else by_id.get(_SAMPLER_PID)  # type: ignore[arg-type,return-value]
+        ),
+        find_reserved_sampler=lambda _model: by_id.get(_SAMPLER_PID),  # type: ignore[arg-type,return-value]
+        on_sampler_bound=_record_bind,  # type: ignore[arg-type]
         find_image_lane=lambda: image_lane,  # type: ignore[arg-type]
         loader_identity=_identity,  # type: ignore[arg-type]
         on_images_ready=lambda ji, imgs, st, fault, _elapsed: completed.append((ji, imgs, st, fault)),
@@ -232,6 +244,7 @@ def _make_harness(
         image_lane=image_lane,
         by_id=by_id,
         reserved=reserved,
+        bound=bound,
         completed=completed,
         sampling_completed=sampling_completed,
         rerouted=rerouted,
@@ -657,13 +670,16 @@ async def test_retired_sampler_releases_pin_and_reresolves() -> None:
         ),
     )
 
-    # The pinned sampler crashes before the sample dispatch: its reservation must be released.
+    # The conditioning arriving dispatches the sample on the same result, so one message is already out.
+    assert len(h.sampler.sent) == 1
+
+    # The pinned sampler crashes mid-sample: its reservation must be released.
     h.orchestrator.on_stage_process_retired(_SAMPLER_PID)
     assert _SAMPLER_PID not in h.reserved
 
-    # A live process still holds the model (find_sampler resolves it); the next tick re-pins and dispatches.
+    # A live process still holds the model (find_sampler resolves it); the next tick re-pins and re-dispatches.
     h.orchestrator.tick()
-    assert len(h.sampler.sent) == 1
+    assert len(h.sampler.sent) == 2
     assert _SAMPLER_PID in h.reserved  # re-resolution re-booked the sampler
 
 
@@ -1752,3 +1768,128 @@ async def test_an_encode_fault_before_sampling_discards_the_grant() -> None:
 
     assert h.sampler.retention_granted_model is None
     assert h.sampler.retained_resident_model is None
+
+
+# -- staged ahead of a pinned sampler -------------------------------------------------------------
+
+
+def _ok_encode_result(job_id: object) -> HordeTextEncodeResultMessage:
+    """A successful text-encode result carrying conditioning for ``job_id``."""
+    return HordeTextEncodeResultMessage(
+        process_id=1,
+        process_launch_identifier=0,
+        info="",
+        job_id=job_id,  # type: ignore[arg-type]
+        positive_conditioning_bytes=b"pos",
+        negative_conditioning_bytes=b"neg",
+        state=GENERATION_STATE.ok,
+    )
+
+
+def _pinned_sample_ok(job_id: object) -> HordeSampleResultMessage:
+    """A successful sample result for ``job_id``, which releases its sampler pin."""
+    return HordeSampleResultMessage(
+        process_id=_SAMPLER_PID,
+        process_launch_identifier=0,
+        info="",
+        results=[SampleSliceResult(job_id=job_id, latent_bytes=b"latent", state=GENERATION_STATE.ok)],  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_staged_ahead_job_encodes_then_binds_when_the_pin_releases() -> None:
+    """A job admitted with no sampler runs its encode at once and binds the lane the pin release frees.
+
+    This is the whole point of admitting it early: on a same-model streak the only copy of the weights is on
+    the lane sampling the job in front, so the follower's conditioning would otherwise be produced only after
+    that sample ended, serialising the encode behind every sample instead of beside it.
+    """
+    h = _make_harness()
+    ahead = _job()
+    follower = _job()
+    h.orchestrator.register(ahead, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.register(follower, needs_source_latent=False, pinned_sampler_process_id=None)
+
+    # Both encodes go out on the first tick: the follower needs the component lane, not the pinned sampler.
+    h.orchestrator.tick()
+    assert len(h.encode_service.sent) == 2
+    assert h.orchestrator.unbound_job_ids() == {str(follower.sdk_api_job_info.id_)}
+    assert h.bound == []
+    assert h.sampler.owned_job is None
+
+    # The follower's conditioning lands first; its sample cannot go out while the lane is still pinned, and
+    # that wait is the design, so it is not aged toward the no-role patience fault.
+    await h.orchestrator.handle_stage_result(_ok_encode_result(follower.sdk_api_job_info.id_))
+    h.orchestrator.tick()
+    h.virtual_now[0] = _STAGE_PATIENCE_SECONDS + 20.0
+    h.orchestrator.tick()
+    assert h.sampler.sent == []
+    assert h.completed == []
+    assert h.orchestrator.has_job(follower)
+
+    # The job in front samples and finishes, releasing the pin.
+    await h.orchestrator.handle_stage_result(_ok_encode_result(ahead.sdk_api_job_info.id_))
+    assert len(h.sampler.sent) == 1  # the pinned job's sample
+    await h.orchestrator.handle_stage_result(_pinned_sample_ok(ahead.sdk_api_job_info.id_))
+    assert _SAMPLER_PID not in h.reserved
+
+    # The follower binds that lane on the next tick: it re-books the reservation and its sample goes out.
+    h.orchestrator.tick()
+    assert len(h.sampler.sent) == 2
+    assert _SAMPLER_PID in h.reserved
+    assert h.orchestrator.unbound_job_ids() == set()
+    assert [job_info for job_info, _process in h.bound] == [follower]
+    # Slot ownership is recorded at the bind, not at the registration: until now no slot was running it.
+    assert h.sampler.owned_job is follower.sdk_api_job_info
+
+
+@pytest.mark.asyncio
+async def test_staged_ahead_job_faults_once_sampling_stops_progressing_anywhere() -> None:
+    """The wait for a pin is bounded: with no sample results anywhere, the job ages into the patience fault."""
+    h = _make_harness()
+    ahead = _job()
+    follower = _job()
+    h.orchestrator.register(ahead, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.register(follower, needs_source_latent=False, pinned_sampler_process_id=None)
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(_ok_encode_result(follower.sdk_api_job_info.id_))
+
+    # Sampling has not produced a result anywhere for the whole sanity window, so the pin is a wedge rather
+    # than a queue: the job starts aging, then faults once the patience window on top of it elapses.
+    h.virtual_now[0] = 181.0
+    h.orchestrator.tick()
+    assert h.completed == []
+    h.virtual_now[0] = 181.0 + _STAGE_PATIENCE_SECONDS + 1.0
+    h.orchestrator.tick()
+    assert len(h.completed) == 1
+    assert h.completed[0][2] == GENERATION_STATE.faulted
+    assert not h.orchestrator.has_job(follower)
+    assert h.orchestrator.unbound_job_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_staged_ahead_job_is_released_when_the_lane_holding_its_model_dies() -> None:
+    """A pinned lane that dies before the staged job binds leaves no held state and no booked reservation."""
+    h = _make_harness()
+    ahead = _job()
+    follower = _job()
+    h.orchestrator.register(ahead, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    h.orchestrator.register(follower, needs_source_latent=False, pinned_sampler_process_id=None)
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(_ok_encode_result(follower.sdk_api_job_info.id_))
+
+    # The lane holding the model crashes and is reaped: no process holds the model at all now.
+    h.by_id.pop(_SAMPLER_PID)
+    h.orchestrator.on_stage_process_retired(_SAMPLER_PID)
+    assert _SAMPLER_PID not in h.reserved
+
+    # That is a genuinely missing role rather than a busy one, so the staged job ages through the ordinary
+    # patience fault and is dropped: it never bound a sampler, so it books nothing on the way out.
+    h.virtual_now[0] = _STAGE_PATIENCE_SECONDS + 1.0
+    h.orchestrator.tick()
+    h.virtual_now[0] = 2 * _STAGE_PATIENCE_SECONDS + 2.0
+    h.orchestrator.tick()
+    assert not h.orchestrator.has_job(follower)
+    assert h.orchestrator.unbound_job_ids() == set()
+    assert h.reserved == set()
+    assert h.bound == []

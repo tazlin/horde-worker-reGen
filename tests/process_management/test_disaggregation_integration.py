@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessMessage,
     HordeProcessState,
     HordeSampleResultMessage,
+    HordeTextEncodeControlMessage,
     HordeTextEncodeResultMessage,
     HordeVaeDecodeControlMessage,
     HordeVaeDecodeResultMessage,
@@ -41,6 +42,8 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.scheduling.inference_scheduler import _STAGING_ENCODE_VRAM_MB
+from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     FakeInferenceProcess,
 )
@@ -896,6 +899,207 @@ async def test_orphan_punt_releases_the_job_from_the_orchestrator() -> None:
     assert str(job.id_) not in orchestrator._jobs  # no longer held
     assert pm._process_map.is_reserved_for_disaggregation(0) is False  # pin/reservation dropped
     assert orchestrator._active_sampling_peaks == {}  # no ledger entry leaked
+
+
+@pytest.mark.asyncio
+async def test_head_staged_ahead_of_a_pin_encodes_and_is_not_punted_as_an_orphan() -> None:
+    """A head whose only copy of its model is on a pinned lane is admitted, encodes, and owns no slot yet.
+
+    On a same-model streak the head cannot be dispatched (its weights are on the lane sampling the job in
+    front of it) but its text encode needs only the component lane, so it is admitted with the sampler
+    unresolved. That leaves it in progress with no owning inference slot, which is exactly the shape the
+    orphaned-in-progress watchdog punts, so the watchdog has to recognise it.
+    """
+    pm, inference = _make_manager_with_roles()
+    ahead = make_job_pop_response(model=_MODEL)
+    follower = make_job_pop_response(model=_MODEL)
+    await pm._job_tracker.record_popped_job(ahead)
+    await pm._job_tracker.record_popped_job(follower)
+    await pm._inference_scheduler._dispatch_disaggregated(
+        ahead,
+        inference,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+    assert pm._process_map.is_reserved_for_disaggregation(0) is True
+
+    await pm._inference_scheduler._stage_head_ahead_of_pin(follower, inference)
+    orchestrator = pm._disaggregation_orchestrator
+    assert orchestrator.unbound_job_ids() == {str(follower.id_)}
+    assert pm._job_tracker.get_stage(follower.id_) == JobStage.INFERENCE_IN_PROGRESS
+    # No second reservation was taken: the staged job books no slot until the pin it waits on releases.
+    assert pm._process_map.is_reserved_for_disaggregation(0) is True
+
+    # Its encode goes out on the component lane while the pinned lane samples the job in front.
+    orchestrator.tick()
+    component = pm._process_map[1]
+    encode_sends = [
+        call.args[0]
+        for call in component.pipe_connection.send.call_args_list  # type: ignore[union-attr]
+        if isinstance(call.args[0], HordeTextEncodeControlMessage)
+    ]
+    assert [message.job_id for message in encode_sends] == [ahead.id_, follower.id_]
+
+    coordinator = pm._recovery_coordinator
+    assert coordinator.inference_slot_owns_job(follower.id_) is False
+    coordinator.orphan_in_progress_since[follower.id_] = time.time() - (
+        coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+    )
+    coordinator.reconcile_orphaned_in_progress_jobs()
+
+    # The staged job is still in flight: it is bounded by the orchestrator's own stage patience, not by this.
+    assert pm._job_tracker.get_stage(follower.id_) == JobStage.INFERENCE_IN_PROGRESS
+    assert str(follower.id_) in orchestrator._jobs
+
+
+def _dispatch_reservations_mb(pm: HordeWorkerProcessManager) -> float:
+    """The dispatch flow's outstanding reservation total (MB), as the arbiter prices it."""
+    return pm._inference_scheduler._reserve_ledger.effective_planned_vram_mb_for_flow(DISPATCH_ADMISSION_FLOW, {})
+
+
+async def _deliver_text_encode(pm: HordeWorkerProcessManager, job: ImageGenerateJobPopResponse) -> None:
+    """Feed the component lane's conditioning result for a job, which is what makes its sample ready."""
+    await pm._disaggregation_orchestrator.handle_stage_result(
+        HordeTextEncodeResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            job_id=job.id_,
+            positive_conditioning_bytes=b"pos",
+            negative_conditioning_bytes=b"neg",
+            state=GENERATION_STATE.ok,
+        ),
+    )
+
+
+async def _deliver_sample_result(pm: HordeWorkerProcessManager, job: ImageGenerateJobPopResponse) -> None:
+    """Feed the sampler's latent for a job, which releases the pin the next staged head is queued behind."""
+    await pm._disaggregation_orchestrator.handle_stage_result(
+        HordeSampleResultMessage(
+            process_id=0,
+            process_launch_identifier=0,
+            info="",
+            results=[SampleSliceResult(job_id=job.id_, latent_bytes=b"latent", state=GENERATION_STATE.ok)],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_staged_ahead_job_returns_its_encode_charge_when_its_sampler_binds() -> None:
+    """A job staged ahead of a pin is priced like any disaggregated dispatch once its sampler binds.
+
+    Staging books the encode charge against the component lane, which is the room the conditioning actually
+    takes. At the bind that room is spent and the job becomes an ordinary disaggregated dispatch, whose full
+    materialisation peak is booked against the sampler at clearance instead. Holding the encode charge past the
+    bind leaves the admission overlay charging a card that is really free, so clearance is withheld from the
+    very samplers the staging exists to keep fed.
+    """
+    pm, inference = _make_manager_with_roles()
+    ahead = make_job_pop_response(model=_MODEL)
+    follower = make_job_pop_response(model=_MODEL)
+    await pm._job_tracker.record_popped_job(ahead)
+    await pm._job_tracker.record_popped_job(follower)
+
+    await pm._inference_scheduler._dispatch_disaggregated(
+        ahead,
+        inference,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+    ordinary_dispatch_mb = _dispatch_reservations_mb(pm)
+
+    await pm._inference_scheduler._stage_head_ahead_of_pin(follower, inference)
+    assert _dispatch_reservations_mb(pm) == pytest.approx(ordinary_dispatch_mb + _STAGING_ENCODE_VRAM_MB)
+
+    orchestrator = pm._disaggregation_orchestrator
+    orchestrator.tick()  # both encodes go out on the component lane
+    await _deliver_text_encode(pm, ahead)  # the ahead job samples on its pinned lane
+    await _deliver_text_encode(pm, follower)  # ready to sample, but its lane is still pinned
+    assert orchestrator.unbound_job_ids() == {str(follower.id_)}
+    await _deliver_sample_result(pm, ahead)  # the pin releases
+    orchestrator.tick()  # so the follower binds it
+
+    assert orchestrator.unbound_job_ids() == set()
+    assert _dispatch_reservations_mb(pm) == pytest.approx(ordinary_dispatch_mb)
+
+
+@pytest.mark.asyncio
+async def test_repeated_stage_ahead_and_bind_cycles_do_not_accumulate_reservations() -> None:
+    """A same-model streak of staged-ahead jobs holds no more than the one in-flight encode charge.
+
+    The cost of an encode charge surviving its bind is cumulative rather than per-job: it adds up once per
+    staged job, so a streak walks the outstanding total up until admission holds every clearance on room the
+    device has. Each cycle here is the steady state of such a streak: the head stages behind the sampling job
+    in front of it, encodes, and binds that lane when its sample result releases the pin.
+    """
+    pm, inference = _make_manager_with_roles()
+    sampling = make_job_pop_response(model=_MODEL)
+    await pm._job_tracker.record_popped_job(sampling)
+    await pm._inference_scheduler._dispatch_disaggregated(
+        sampling,
+        inference,
+        dispatched_device_index=None,
+        degraded_dispatch=False,
+    )
+    orchestrator = pm._disaggregation_orchestrator
+    orchestrator.tick()
+    await _deliver_text_encode(pm, sampling)
+    baseline_mb = _dispatch_reservations_mb(pm)
+
+    outstanding_after_each_bind = []
+    for _ in range(4):
+        head = make_job_pop_response(model=_MODEL)
+        await pm._job_tracker.record_popped_job(head)
+        await pm._inference_scheduler._stage_head_ahead_of_pin(head, inference)
+        orchestrator.tick()  # the staged head's encode goes out while the lane in front samples
+        await _deliver_text_encode(pm, head)
+        await _deliver_sample_result(pm, sampling)  # the lane in front finishes, releasing the pin
+        orchestrator.tick()  # the staged head binds that lane and samples on it
+        outstanding_after_each_bind.append(_dispatch_reservations_mb(pm))
+        # The head now sampling is what the next staged head queues behind.
+        sampling = head
+
+    assert outstanding_after_each_bind == [pytest.approx(baseline_mb)] * 4
+
+
+@pytest.mark.asyncio
+async def test_staged_ahead_job_that_never_binds_returns_its_encode_charge_on_every_exit() -> None:
+    """Every way a staged-ahead job leaves the pipeline unbound returns its encode charge.
+
+    An external release (the orphan punt and the give-up path), a monolithic re-route, and the pin-wait
+    patience fault all end the encode the charge was booked for. Each takes the job out of the in-progress set
+    the dispatch flow is reconciled against, so the charge is dropped by omission on the next cycle exactly as
+    a finished dispatch's is.
+    """
+    for exit_name in ("release_job", "reroute", "patience_fault"):
+        pm, inference = _make_manager_with_roles()
+        ahead = make_job_pop_response(model=_MODEL)
+        follower = make_job_pop_response(model=_MODEL)
+        await pm._job_tracker.record_popped_job(ahead)
+        await pm._job_tracker.record_popped_job(follower)
+        await pm._inference_scheduler._dispatch_disaggregated(
+            ahead,
+            inference,
+            dispatched_device_index=None,
+            degraded_dispatch=False,
+        )
+        await pm._inference_scheduler._stage_head_ahead_of_pin(follower, inference)
+        assert _dispatch_reservations_mb(pm) > 0.0, exit_name
+
+        orchestrator = pm._disaggregation_orchestrator
+        state = orchestrator._jobs[str(follower.id_)]
+        if exit_name == "release_job":
+            await pm._job_tracker.release_in_progress(follower)  # the punt path's tracker-side release
+            orchestrator.release_job(follower.id_)
+        elif exit_name == "reroute":
+            orchestrator._reroute_to_monolithic(state, reason="the role lane is paused off-GPU")
+        else:
+            orchestrator._fault_and_finish(state, reason="staged ahead of a sampler pin that never released")
+            await pm.drive_disaggregation()
+
+        assert str(follower.id_) not in orchestrator._jobs, exit_name
+        pm._inference_scheduler.build_vram_arbiter_device_state(None)  # the per-cycle reconcile
+        assert _dispatch_reservations_mb(pm) == pytest.approx(0.0), exit_name
 
 
 @pytest.mark.asyncio

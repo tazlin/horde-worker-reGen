@@ -1360,6 +1360,12 @@ class MessageDispatcher:
             and process_info.current_inference_started_at > previous_state_started_at
         ):
             return
+        # A disaggregated sampler takes no sampling-timing stamp at dispatch, but its ownership record carries
+        # the instant it was bound; an idle report whose state began before that instant is the previous job's
+        # trailing transition, not this job's slot going idle.
+        ownership = process_info.inference_ownership
+        if ownership is not None and ownership.recorded_at > previous_state_started_at:
+            return
         # Only a whole-job INFERENCE slot can lose an inference result here. A disaggregated stage lane
         # (the encode service reports INFERENCE_STARTING, then WAITING_FOR_JOB) would otherwise trip this
         # inference-active-to-idle check though it holds no whole-job result; the orchestrator owns its

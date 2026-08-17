@@ -81,6 +81,14 @@ class InferenceExecutionOwnership:
     job: ImageGenerateJobPopResponse
     process_launch_identifier: int
     attempt_ordinal: int
+    recorded_at: float = 0.0
+    """Wall-clock time the ownership was taken.
+
+    A slot's state reports and its dispatches share no clock: a child's trailing idle report for the job it
+    just finished can land after the parent has already given the slot its next job (a disaggregated sampler
+    is re-bound inside the previous job's sample-result tick). Readers that close a job on an idle report
+    compare the report's state start against this instant so a report older than the ownership is not read as
+    the new job's slot having gone idle."""
 
 
 class HordeProcessInfo:
@@ -489,6 +497,7 @@ class HordeProcessInfo:
             job=job,
             process_launch_identifier=self.process_launch_identifier,
             attempt_ordinal=attempt_ordinal,
+            recorded_at=time.time(),
         )
         if self.preload_job_intent is not None and self.preload_job_intent.job == job:
             self.preload_job_intent = None

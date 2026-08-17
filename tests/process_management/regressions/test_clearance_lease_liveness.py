@@ -244,6 +244,37 @@ class TestSlotDutyClearanceAttribution:
         assert hold == str(SlotDutyBucket.CLEARANCE_HOLD)
 
 
+class TestTrailingActiveStateIsNotTheNewJobsGrant:
+    """A slot's active state from the previous job is not read as the newly bound job sampling unpriced.
+
+    A disaggregated sampler is re-bound inside the previous job's result tick; for a moment it still reports
+    that job's INFERENCE_STARTING while ownership already names the next job. Read as an active grant for the
+    new job, the reconciler flags an unpriced window and marks the slot sampling, so the PRIMED that follows for
+    the real sample stage is never granted and the child idles until its lease-acquire timeout.
+    """
+
+    def test_active_state_older_than_the_ownership_is_not_an_active_grant(self) -> None:
+        import time
+
+        scheduler = _make_inference_scheduler(
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+            max_concurrent=1,
+        )
+        proc = make_mock_process_info(5, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_STARTING)
+        proc.last_process_state_started_at = time.time() - 20.0
+        job = make_job_pop_response("stable_diffusion")
+        proc.record_inference_ownership(job, attempt_ordinal=1)
+        scheduler._process_map = ProcessMap({5: proc})
+
+        inputs = scheduler.build_clearance_inputs(device_index=0)
+        assert inputs.active_grants == ()
+
+        # Control: the active state reported after the ownership was taken is this job's own sampling.
+        proc.last_process_state_started_at = time.time() + 1.0
+        inputs = scheduler.build_clearance_inputs(device_index=0)
+        assert [grant.process_id for grant in inputs.active_grants] == [5]
+
+
 class _FakeSemaphore:
     """A counting semaphore mirroring the multiprocessing primitive, with an optional bound for the clearance."""
 

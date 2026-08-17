@@ -202,8 +202,9 @@ classification that explains a parked head
 ([`InferenceScheduler._classify_dispatch_stall`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler._classify_dispatch_stall]),
 so the attribution line and the `Inference dispatch stalled` text never name different causes. Gate buckets
 include the disaggregation-specific causes: `disagg_pin_wait` (the head's model is resident only on a
-disaggregation-pinned sampler lane, so the head waits for that pin to release rather than fund a second copy)
-and `degraded_isolation_pending` (the head must run isolated and waits for the card to clear). A
+disaggregation-pinned sampler lane, so the head waits for that pin to release rather than fund a second copy;
+a disaggregation-eligible head is meanwhile staged into the pipeline with no sampler so its text encode runs
+on the component lane during that wait) and `degraded_isolation_pending` (the head must run isolated and waits for the card to clear). A
 `residency_reconciliation` slot is a resident-idle head the dispatch gate is holding for a few ticks while
 it evicts an idle sibling's VRAM so the head's on-device materialisation fits: a benign, self-clearing
 swap-churn wait, deliberately distinct from `unexplained`. A `post_processing_defer` slot is a resident-idle

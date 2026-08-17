@@ -1133,8 +1133,11 @@ class InferenceScheduler:
         # charging use this, so a job that *will* run disaggregated is always priced sampler-only, even during
         # a whole-card window when the lane is transiently paused. Defaults monolithic for standalone tests.
         self._is_disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool] = lambda _job: False
+        # The process argument is None for a job staged ahead of a pin: its model's only copy is on a lane
+        # pinned to the job in front of it, so it is admitted with the sampler unresolved and binds when that
+        # pin releases.
         self._register_disaggregated_job: (
-            Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]] | None
+            Callable[[ImageGenerateJobPopResponse, HordeProcessInfo | None], Awaitable[bool]] | None
         ) = None
         # Read-only disaggregation diagnostics for the dispatch-stall classifier: the job pinning a given
         # process as its sampler, and the current in-flight sampling peaks. Defaults (no owner, empty peaks)
@@ -1152,6 +1155,12 @@ class InferenceScheduler:
         # lane. The whole-card residency reads this instead, because it cannot claim the card until that work
         # drains anyway, so pausing under a sampling job only costs the sample. See VaeLanePauseRequester.
         self._vae_lane_bound_job_count: Callable[[], int] = lambda: 0
+        # Staging a pin-waiting head ahead of its sampler starts its text encode against the sample in front of
+        # it instead of after it. The encode charge it books at register is returned at bind (covered by the
+        # reservation tests); the fake harness cannot reach the staging path with a single served model, since
+        # `resolve_card_concurrency` collapses that pool to one process, so a multi-model harness case is the
+        # remaining prediction to add. Kept as a switch so the path can be held off without a code change.
+        self._stage_ahead_of_pin_enabled: bool = True
         self._vae_pause_deferred_for_decode = False
 
         # Runtime safety-placement policy hysteresis (see _reconcile_runtime_safety_placement). ``wants_off``
@@ -1382,7 +1391,7 @@ class InferenceScheduler:
         *,
         is_disaggregatable: Callable[[ImageGenerateJobPopResponse], bool],
         is_disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool],
-        register_disaggregated: Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]],
+        register_disaggregated: Callable[[ImageGenerateJobPopResponse, HordeProcessInfo | None], Awaitable[bool]],
         pin_owner: Callable[[int], str | None] | None = None,
         sampling_peaks: Callable[[], dict[str, float]] | None = None,
         vae_decode_pending_count: Callable[[], int] | None = None,
@@ -6100,6 +6109,13 @@ class InferenceScheduler:
             elif state == HordeProcessState.INFERENCE_STARTING:
                 if referenced is None or referenced.id_ is None:
                     continue
+                # A sampler re-bound inside the previous job's result tick still reports that job's active
+                # state for a moment; read against the new ownership it would look like the new job sampling
+                # with no grant, the reconciler would mark it sampling, and the child's real PRIMED that follows
+                # would never be granted. An active state older than the ownership belongs to the previous job.
+                ownership = process_info.inference_ownership
+                if ownership is not None and ownership.recorded_at > process_info.last_process_state_started_at:
+                    continue
                 samplers.append(
                     ActiveSampler(
                         process_id=process_info.process_id,
@@ -10300,6 +10316,13 @@ class InferenceScheduler:
                     # fresh preload (it cannot fit beside the pinned residents and would wedge the card); hold
                     # the head's queue position until the pin releases and the resident lane becomes
                     # dispatchable, then it dispatches onto that lane priced as already resident.
+                    #
+                    # Holding does not mean idling. A disaggregation-eligible head needs the component lane and
+                    # the encode working set to produce its conditioning, not a free sampler, so that half of
+                    # its pipeline can run against the pinned lane's sample rather than behind it. Admit it into
+                    # the disaggregated pipeline now with no sampler; it binds the lane when the pin releases.
+                    if not information_only and self._stage_ahead_of_pin_enabled:
+                        await self._stage_head_ahead_of_pin(next_job, pinned_resident)
                     return None
 
                 next_job_model = next_job.model
@@ -11413,6 +11436,57 @@ class InferenceScheduler:
 
         logger.debug(f"All Batch IDs: {next_job.ids}")
 
+    async def _stage_head_ahead_of_pin(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        pinned_resident: HordeProcessInfo,
+    ) -> None:
+        """Admit a pin-waiting head into the disaggregated pipeline with no sampler, so its encode runs now.
+
+        On a same-model streak the head's only copy of the weights is on the lane sampling the job in front of
+        it, so the head cannot be dispatched and, until it is, nothing of its pipeline runs. Its text encode
+        does not need that lane: it needs the component lane and the encode working set. Registering the job
+        here starts that encode against the in-flight sample instead of after it, and leaves the sample stage
+        the only thing the pin release still gates. The orchestrator binds the lane in ``_resolve_sampler`` the
+        moment the reservation drops, which is also where the slot-side dispatch records are made
+        (:meth:`note_disaggregated_sampler_bound`); no weights are preloaded anywhere by this.
+
+        Nothing here changes what may be dispatched: the concurrency cap, the exclusive-admit suppression and
+        the whole-card pop claim have all already been applied to this head by the caller, and the staged job
+        counts against the cap exactly as a dispatched one does (its relaxation to the process ceiling is what
+        prices the encode working set of a staged job in the first place). The charge is booked against the
+        component lane, the process that actually holds the conditioning, and is returned at the bind
+        (:meth:`note_disaggregated_sampler_bound`) or, on any exit that leaves the job unbound, by the dispatch
+        flow's reconcile-by-omission once the job is out of the in-progress set.
+        """
+        if self._register_disaggregated_job is None or next_job.id_ is None:
+            return
+        if not self._is_disaggregatable_job(next_job):
+            return
+        encode_lane = self._process_map.get_component_process()
+        if encode_lane is None:
+            # Without a component lane there is no encode to run ahead, and admitting the job would only park
+            # it in the pipeline until the pin releases, which is what holding here already does.
+            return
+        if not await self._register_disaggregated_job(next_job, None):
+            return
+        device_index = pinned_resident.device_index if self._multi_gpu_routing_active else None
+        await self._job_tracker.mark_inference_started(
+            next_job,
+            device_index=device_index,
+            whole_card=self._serving_under_whole_card(next_job.model, device_index),
+        )
+        self._record_dispatch_reservation(
+            next_job,
+            encode_lane,
+            baseline=self._model_metadata.get_baseline(next_job.model) if next_job.model is not None else None,
+            staging_only=True,
+        )
+        logger.info(
+            f"Job {str(next_job.id_)[:8]} staged ahead of the sampler pin on process "
+            f"{pinned_resident.process_id}: its text encode runs on the component lane while that lane samples.",
+        )
+
     async def _dispatch_disaggregated(
         self,
         next_job: ImageGenerateJobPopResponse,
@@ -11451,6 +11525,32 @@ class InferenceScheduler:
             whole_card=self._serving_under_whole_card(model, dispatched_device_index),
             process_age_seconds=time.time() - process_with_model.spawned_at,
         )
+        self._commit_disaggregated_sampler_slot(
+            next_job,
+            process_with_model,
+            keep_model_resident_after=keep_model_resident_after,
+        )
+        if degraded_dispatch:
+            self._job_tracker.clear_degraded_dispatch(next_job)
+        return True
+
+    def _commit_disaggregated_sampler_slot(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        *,
+        keep_model_resident_after: bool,
+    ) -> None:
+        """Make the slot-side records of a dispatch on the process now pinned as ``next_job``'s sampler.
+
+        Shared by the two ways a sampler becomes a job's: pinned at admission, or bound later for a job staged
+        ahead of that pin. Everything recorded here describes a slot that is running the job, so it belongs to
+        the binding instant in both cases; a staged-ahead job that has not bound owns no slot and must carry
+        none of it.
+        """
+        model = next_job.model
+        if model is None:
+            return
         # The pinned process references this job so the orphaned-job watchdog credits it as owned across the
         # whole encode-and-sample window (the reservation, not a START_INFERENCE flag, is that ownership
         # record: see WorkerRecoveryCoordinator.inference_slot_owns_job). No sampling-timing stamp is set here;
@@ -11475,8 +11575,6 @@ class InferenceScheduler:
             model if keep_model_resident_after else None,
             component_only=True,
         )
-        if degraded_dispatch:
-            self._job_tracker.clear_degraded_dispatch(next_job)
         self._process_lifecycle.action_ledger.record(
             LedgerEventType.INFERENCE_DISPATCHED,
             process_id=process_with_model.process_id,
@@ -11490,7 +11588,49 @@ class InferenceScheduler:
             f"to process {process_with_model.process_id}.</>",
             str(next_job.id_)[:8],
         )
-        return True
+
+    def note_disaggregated_sampler_bound(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> None:
+        """Commit the sampler slot for a staged-ahead job that has just bound one, retention verdict included.
+
+        A job admitted ahead of a pin has no sampler at registration, so the dispatch bookkeeping the pinned
+        path performs there runs here instead, at the instant the pin released and the sample is going out. The
+        retention verdict is taken now for the same reason: it prices the card as it is when the weights would
+        be held, not as it was a job earlier.
+
+        The model-change eviction a monolithic dispatch runs is deliberately not repeated here: this job binds
+        this lane precisely because the lane already holds its model, so there is no other model on it to evict.
+
+        The encode charge :meth:`_stage_head_ahead_of_pin` booked against the component lane is returned here:
+        the conditioning is produced by the time a sampler binds, and from this instant the job is priced
+        exactly as a job dispatched disaggregated at admission is, which is to say it carries no dispatch
+        reservation until clearance books its full materialisation peak against the sampler
+        (:meth:`clearance_admit_process`). Leaving the encode charge outstanding would hold clearance on room
+        the card really has, once per staged job, for as long as each job stayed in progress.
+        """
+        self.release_dispatch_reservation(next_job)
+        model = next_job.model
+        if model is None:
+            return
+        if process_with_model.retained_resident_model == model:
+            self._retention_reuses += 1
+            # The bet paid, so this episode's age is spent: the hold that follows this job is a new prediction.
+            process_with_model.retained_resident_since = None
+        keep_model_resident_after = self._should_keep_model_resident(
+            next_job,
+            process_with_model=process_with_model,
+            device_index=process_with_model.device_index if self._multi_gpu_routing_active else None,
+        )
+        # Recorded after the verdict, never before: the gate asks what this slot ran *previously*.
+        self._record_slot_dispatch(process_with_model.process_id, model)
+        self._commit_disaggregated_sampler_slot(
+            next_job,
+            process_with_model,
+            keep_model_resident_after=keep_model_resident_after,
+        )
 
     async def _dispatch_inference_message(
         self,

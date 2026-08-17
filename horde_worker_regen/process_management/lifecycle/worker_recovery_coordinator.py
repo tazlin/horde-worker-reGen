@@ -184,6 +184,7 @@ class WorkerRecoveryCoordinator:
         max_inference_processes_provider: Callable[[], int],
         terminal_recovery_callback: Callable[[], RecoveryDisposition],
         release_disaggregated_job: Callable[[GenerationID], None] = lambda _job_id: None,
+        unbound_disaggregated_job_ids: Callable[[], set[str]] = set,
         head_aux_prefetch_in_flight: Callable[[], bool] = lambda: False,
         head_block_reason: Callable[[], str | None] = lambda: None,
         recovery_supervisor: RecoverySupervisor | None = None,
@@ -209,6 +210,10 @@ class WorkerRecoveryCoordinator:
                 job, called whenever a job leaves the tracker by a watchdog/give-up path outside the
                 orchestrator's own flow. Idempotent and a no-op for a job the orchestrator does not hold, so it
                 is safe to call for every released job.
+            unbound_disaggregated_job_ids: Report the ids of disaggregated jobs staged ahead of a sampler pin,
+                which own no inference slot by design until that pin releases. The orphaned-in-progress
+                watchdog treats them as owned: they are bounded by the orchestrator's own stage patience, and
+                punting them would undo the staging on every streak. Defaults to none for an unwired caller.
             head_aux_prefetch_in_flight: Report whether the head-of-queue job is auxiliary-gated with a
                 prefetch still in flight (its per-job deadline exists and has not expired). Save-our-ship
                 give-up defers to it exactly as it defers to a head whose model is materialising: a head
@@ -235,6 +240,7 @@ class WorkerRecoveryCoordinator:
         self._max_inference_processes_provider = max_inference_processes_provider
         self._terminal_recovery_callback = terminal_recovery_callback
         self._release_disaggregated_job = release_disaggregated_job
+        self._unbound_disaggregated_job_ids = unbound_disaggregated_job_ids
         self._head_aux_prefetch_in_flight = head_aux_prefetch_in_flight
         self._head_block_reason = head_block_reason
         self._clock = clock
@@ -407,7 +413,15 @@ class WorkerRecoveryCoordinator:
         """Punt jobs stuck in inference with no owning live slot."""
         now = self._clock()
         in_progress = self._job_tracker.jobs_in_progress
-        live_ids = {job.id_ for job in in_progress if job.id_ is not None and self.inference_slot_owns_job(job.id_)}
+        # A job staged ahead of a sampler pin is in progress with no slot by design: its encode is running on
+        # the component lane and it binds a sampler when the pin releases. The orchestrator's stage patience
+        # bounds that wait, so it is owned for this watchdog's purposes rather than orphaned.
+        staged_ahead_ids = self._unbound_disaggregated_job_ids()
+        live_ids = {
+            job.id_
+            for job in in_progress
+            if job.id_ is not None and (self.inference_slot_owns_job(job.id_) or str(job.id_) in staged_ahead_ids)
+        }
 
         current_ids = {job.id_ for job in in_progress if job.id_ is not None}
         for job_id in list(self.orphan_in_progress_since):

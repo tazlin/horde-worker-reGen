@@ -365,6 +365,35 @@ Without this cache the launch call could pick a different job and waste the
 peek's decision. The head keeps its queue position and dispatches once its
 process frees.
 
+### Staging a pin-waiting head ahead of its sampler
+
+A head whose model is resident only on a disaggregation-pinned lane cannot be
+dispatched: seating it anywhere else funds a second copy of the same weights.
+Waiting is right for the *sample* stage, which needs that lane, and wrong for
+everything before it. A disaggregation-eligible head in that position is
+therefore admitted into the disaggregated pipeline with the sampler unresolved
+(`InferenceScheduler._stage_head_ahead_of_pin`), so its text encode runs on the
+component lane against the in-flight sample instead of after it. It books the
+encode charge against that component lane and no slot ownership; the orchestrator binds the lane in
+`_resolve_sampler` when the pin releases, and the slot-side dispatch records
+(ownership, control flag, retention verdict) are made at that bind
+(`InferenceScheduler.note_disaggregated_sampler_bound`), which also returns the
+encode charge: from the bind the job is priced as any disaggregated dispatch is,
+carrying no dispatch reservation until clearance books its full materialisation
+peak against the sampler. A staged head that never binds (released, re-routed, or
+faulted at the pin-wait patience bound) drops the charge through the dispatch
+flow's reconcile-by-omission, the same seam a finished dispatch uses.
+
+Two consequences follow from owning no slot before the bind. The
+orphaned-in-progress watchdog would read such a job as unowned, so it is
+exempted while unbound, bounded instead by the orchestrator's own stage
+patience: the wait is held clear of the no-role fault clock only while sample
+results keep arriving somewhere, and ages into the ordinary patience fault once
+they stop. And the staged job counts against the in-progress concurrency cap
+exactly as a dispatched one does, so the cap's staging relaxation (which admits
+extra staged jobs only while measured free VRAM covers the encode working set)
+is what bounds how many heads can be staged ahead.
+
 A line-skip is not the genuine head of queue, so it dispatches as a non-head
 request (`is_head_of_queue=False`): it is priced against measured physical VRAM
 but may not consume the room the true head needs, and it routes any reclaim

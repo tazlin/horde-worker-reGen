@@ -1822,6 +1822,7 @@ class HordeWorkerProcessManager:
             max_inference_processes_provider=lambda: self.max_inference_processes,
             terminal_recovery_callback=self._request_terminal_recovery,
             release_disaggregated_job=self._disaggregation_orchestrator.release_job,
+            unbound_disaggregated_job_ids=self._disaggregation_orchestrator.unbound_job_ids,
             head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
             head_block_reason=self._head_block_reason,
         )
@@ -3052,12 +3053,16 @@ class HordeWorkerProcessManager:
     async def _register_disaggregated_job(
         self,
         sdk_job: ImageGenerateJobPopResponse,
-        sampler_process: HordeProcessInfo,
+        sampler_process: HordeProcessInfo | None,
     ) -> bool:
         """Register a scheduled job with the orchestrator, pinned to the process chosen as its sampler.
 
         Called from the scheduler at the dispatch seam in place of START_INFERENCE. Returns False when the
         job's result-carrying info is not available (so the scheduler falls back to a monolithic dispatch).
+
+        ``sampler_process`` is None for a job staged ahead of a pin: its model's only copy is on a lane pinned
+        to the job in front of it, so it is admitted with the sampler unresolved, runs its encode stages on the
+        component lanes, and binds that lane when the pin releases.
         """
         job_info = await self._job_tracker.get_job_info(sdk_job)
         if job_info is None:
@@ -3067,10 +3072,16 @@ class HordeWorkerProcessManager:
         self._disaggregation_orchestrator.register(
             job_info,
             needs_source_latent=job_requires_source_image_input(sdk_job),
-            pinned_sampler_process_id=sampler_process.process_id,
-            pinned_sampler_launch_identifier=sampler_process.process_launch_identifier,
+            pinned_sampler_process_id=sampler_process.process_id if sampler_process is not None else None,
+            pinned_sampler_launch_identifier=(
+                sampler_process.process_launch_identifier if sampler_process is not None else 0
+            ),
         )
         return True
+
+    def _on_disaggregated_sampler_bound(self, job_info: HordeJobInfo, sampler_process: HordeProcessInfo) -> None:
+        """Apply the scheduler's dispatch bookkeeping to the sampler a staged-ahead job has just bound."""
+        self._inference_scheduler.note_disaggregated_sampler_bound(job_info.sdk_api_job_info, sampler_process)
 
     async def drive_disaggregation(self) -> None:
         """Advance the disaggregated pipeline: (re)dispatch stages and route completions.

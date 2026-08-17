@@ -140,6 +140,13 @@ class _DispatchOutcome(StrEnum):
     """No live role process (or the send failed) could take the stage; this ages toward the patience fault."""
     GATE_DEFERRED = auto()
     """A ready sample was held back by the concurrent-sampling admission gate; healthy backpressure, never ages."""
+    AWAITING_PIN = auto()
+    """A staged-ahead job's sample is ready but its model's only lane is still pinned to the job ahead of it.
+
+    The encode-ahead path admits a job whose model sits on a disaggregation-pinned sampler, so its conditioning
+    is produced while that sampler works. Its sample then waits for the pin to release, which is the design
+    rather than a missing role, so it must not age the no-role patience clock while sampling is progressing
+    system-wide."""
     RESOURCE_DEFERRED = auto()
     """An encode or decode stage was withheld by the VRAM arbiter under device pressure; it does not age the
     no-role patience clock but arms the resource-defer window, so it either dispatches when the pressure clears
@@ -223,6 +230,14 @@ class _DisaggJobState:
     retired/crashed/replaced, so the next dispatch re-resolves to whichever live process now holds the model.
     The launch identifier distinguishes the pinned process from an id-reusing cold replacement that never held
     the preloaded model."""
+    awaiting_sampler_bind: bool = False
+    """Whether this job was admitted with no sampler yet, and still owes its first sampler binding.
+
+    Set for a job staged ahead of the lane its model sits on: it runs its text encode on the component lane
+    while that lane samples the job in front of it, and binds a sampler only when the pin releases. While set,
+    the job owns no inference slot, so the slot-side records a dispatch normally makes (ownership, the control
+    flag, the retention verdict) are deferred to the bind, and the orphaned-in-progress watchdog must not read
+    the job as unowned. Cleared the moment a sampler is bound."""
     sampler_process_id: int | None = None
     """The process the sample stage was last dispatched to, kept past the pin's release.
 
@@ -290,8 +305,10 @@ class DisaggregationOrchestrator:
         find_process_by_id: Callable[[int], HordeProcessInfo | None] = lambda _pid: None,
         reserve_sampler_process: Callable[[int], None] = lambda _pid: None,
         release_sampler_process: Callable[[int], None] = lambda _pid: None,
+        find_reserved_sampler: Callable[[str], HordeProcessInfo | None] = lambda _model: None,
+        on_sampler_bound: Callable[[HordeJobInfo, HordeProcessInfo], None] = lambda _job_info, _process: None,
         on_sampling_complete: Callable[[HordeJobInfo], None] = lambda _job_info: None,
-        reroute_monolithic: Callable[[HordeJobInfo], None] = lambda _job_info: None,
+        reroute_monolithic: Callable[[HordeJobInfo, str], None] = lambda _job_info, _reason: None,
         encode_lane_paused: Callable[[], bool] = lambda: False,
         image_lane_paused: Callable[[], bool] = lambda: False,
         image_lane_pause_owner: Callable[[], PauseOwner | None] = lambda: None,
@@ -320,11 +337,20 @@ class DisaggregationOrchestrator:
                 to send the sample stage to the pinned sampler.
             reserve_sampler_process: Marks a process id booked as a pinned sampler (skipped by availability).
             release_sampler_process: Releases a pinned-sampler reservation (returns it to the pool).
+            find_reserved_sampler: Given a model name, returns a process holding the model even when it is
+                reserved as somebody else's pinned sampler, or None. Read only to tell a staged-ahead job
+                waiting for a pin to release ("the lane exists, it is busy with the job in front") apart from a
+                genuinely missing sampler, which the patience clock must still age.
+            on_sampler_bound: Called with a job and the process just bound as its sampler, for a job admitted
+                with no sampler. The slot-side records of a dispatch (inference ownership, the control flag,
+                the retention verdict) are made here rather than at registration, because until the bind no
+                slot is running the job.
             on_sampling_complete: Called with a job when its sampling finishes, so the tracker can free the
                 inference slot (move the job to the decoding stage) while the job stays in-flight.
             reroute_monolithic: Called with a job whose stage kept hitting resource-class faults past the defer
                 window, or whose role lane is deliberately paused, to return it to the monolithic inference
-                path (the job stays owned/tracked throughout).
+                path (the job stays owned/tracked throughout), and the reason phrase describing which of those
+                caused it, so the parent's operator-facing log names the real cause rather than one of them.
             encode_lane_paused: Whether the encode/component service lane is deliberately paused off-GPU by a
                 policy holder (whole-card residency or the reclaim ladder). A missing role process under such a
                 pause is a routing decision, not a crash: the job reroutes monolithically at once instead of
@@ -360,6 +386,8 @@ class DisaggregationOrchestrator:
         self._on_images_ready = on_images_ready
         self._find_process_by_id = find_process_by_id
         self._reserve_sampler_process = reserve_sampler_process
+        self._find_reserved_sampler = find_reserved_sampler
+        self._on_sampler_bound = on_sampler_bound
         self._release_sampler_process = release_sampler_process
         self._on_sampling_complete = on_sampling_complete
         self._reroute_monolithic = reroute_monolithic
@@ -490,7 +518,7 @@ class DisaggregationOrchestrator:
         job_info: HordeJobInfo,
         *,
         needs_source_latent: bool,
-        pinned_sampler_process_id: int,
+        pinned_sampler_process_id: int | None,
         pinned_sampler_launch_identifier: int = 0,
     ) -> None:
         """Admit a job into the disaggregated pipeline at its first stage, pinning its sampler.
@@ -502,6 +530,13 @@ class DisaggregationOrchestrator:
         process is reserved out of the availability pool immediately so the scheduler cannot double-book it
         while the encode service produces conditioning; the reservation is released once sampling finishes
         (early release) or the job faults/retires.
+
+        A ``pinned_sampler_process_id`` of None admits the job with no sampler: the model's only dispatchable
+        copy is on a lane already pinned to the job in front of it, so there is nothing to pin yet. The encode
+        stages still run at once, on the component lanes, which is the whole point of admitting it early; the
+        sampler binds in :meth:`_resolve_sampler` when that pin releases, and the slot-side records of a
+        dispatch are made then (see ``on_sampler_bound``). No reservation is taken here, so an unbound job
+        never books a slot it is not running on.
 
         img2img/remix jobs start by VAE-encoding the source (AWAITING_SOURCE_LATENT) while the encode
         service runs in parallel; txt2img jobs start straight at AWAITING_CONDITIONING.
@@ -517,13 +552,31 @@ class DisaggregationOrchestrator:
             stage=initial_stage,
             needs_source_latent=needs_source_latent,
             registered_at=self._clock(),
-            pinned_sampler=(pinned_sampler_process_id, pinned_sampler_launch_identifier),
+            pinned_sampler=(
+                None
+                if pinned_sampler_process_id is None
+                else (pinned_sampler_process_id, pinned_sampler_launch_identifier)
+            ),
+            awaiting_sampler_bind=pinned_sampler_process_id is None,
         )
+        if pinned_sampler_process_id is None:
+            logger.debug(f"Disaggregation: registered job {key} at stage {initial_stage} ahead of a sampler pin")
+            return
         self._reserve_sampler_process(pinned_sampler_process_id)
         logger.debug(
             f"Disaggregation: registered job {key} at stage {initial_stage} pinned to sampler "
             f"{pinned_sampler_process_id}",
         )
+
+    def unbound_job_ids(self) -> set[str]:
+        """Return the ids of held jobs that were staged ahead of a pin and have not bound a sampler yet.
+
+        Read by the orphaned-in-progress watchdog: such a job is in progress by design with no inference slot
+        owning it, which is precisely the shape that watchdog punts. The set is bounded by this orchestrator's
+        own stage patience (the wait for a pin ages toward a fault once sampling stops progressing system-wide),
+        so exempting it cannot make a job unbounded.
+        """
+        return {key for key, state in self._jobs.items() if state.awaiting_sampler_bind}
 
     def has_job(self, job_info: HordeJobInfo) -> bool:
         """Whether a job is currently in the disaggregated pipeline."""
@@ -651,6 +704,8 @@ class DisaggregationOrchestrator:
                 state.decode_pause_held_since = None
             elif outcome == _DispatchOutcome.GATE_DEFERRED:
                 self._handle_gate_deferral(state, now)
+            elif outcome == _DispatchOutcome.AWAITING_PIN:
+                self._handle_pin_wait(state, now)
             elif outcome == _DispatchOutcome.RESOURCE_DEFERRED:
                 # The arbiter withheld an encode/decode under device pressure: this is not a missing role, so it
                 # must not age the no-role patience clock. The resource-defer window armed by the dispatch is
@@ -953,6 +1008,10 @@ class DisaggregationOrchestrator:
         identity = self._loader_identity(state.job_info)
         sampler = self._resolve_sampler(state, identity.horde_model_name)
         if sampler is None:
+            if state.awaiting_sampler_bind and self._model_lane_still_pinned(identity.horde_model_name):
+                # Staged ahead of the lane holding this model: the sampler exists and is working the job in
+                # front. Waiting is the design, so this is not the missing role the patience clock ages.
+                return _DispatchOutcome.AWAITING_PIN
             return _DispatchOutcome.NO_ROLE
         # Gate a second (or later) concurrent sampling against the device's static sampling headroom, so two
         # activation peaks never over-commit the card and drive it into WDDM demand-paging. Checked here, after
@@ -994,6 +1053,15 @@ class DisaggregationOrchestrator:
         self._active_sampling_peaks[self._key(state.job_info)] = peak_mb if peak_mb is not None else 0.0
         state.sample_dispatched_at = self._clock()
         return _DispatchOutcome.DISPATCHED
+
+    def _model_lane_still_pinned(self, horde_model_name: str) -> bool:
+        """Whether the only lane holding ``horde_model_name`` is currently reserved as somebody's pinned sampler.
+
+        The dispatch-side finder excludes reserved lanes, so a staged-ahead job whose model sits on the lane in
+        front of it resolves no sampler at all. This separates that (a live lane, busy with the job ahead) from
+        a model that is resident nowhere, which is a genuinely missing role.
+        """
+        return self._find_reserved_sampler(horde_model_name) is not None
 
     def _admit_concurrent_sampling(self, peak_mb: float | None) -> bool:
         """Whether a sample may dispatch now, the VRAM arbiter deciding the concurrent-sampling memory question.
@@ -1103,6 +1171,16 @@ class DisaggregationOrchestrator:
             return None
         state.pinned_sampler = (sampler.process_id, sampler.process_launch_identifier)
         self._reserve_sampler_process(sampler.process_id)
+        if state.awaiting_sampler_bind:
+            # First binding of a job staged ahead of a pin: the slot only starts running this job now, so the
+            # records a dispatch makes on it (ownership, control flag, retention verdict) are made here.
+            state.awaiting_sampler_bind = False
+            self._on_sampler_bound(state.job_info, sampler)
+            logger.debug(
+                f"Disaggregation: bound sampler {sampler.process_id} for staged-ahead job "
+                f"{self._key(state.job_info)} once its pin released",
+            )
+            return sampler
         logger.debug(
             f"Disaggregation: re-resolved sampler for {self._key(state.job_info)} to process "
             f"{sampler.process_id} after its pinned sampler was lost",
@@ -1177,8 +1255,15 @@ class DisaggregationOrchestrator:
         # img2img may still be encoding the source latent; only advance to SAMPLING once both are in.
         if state.needs_source_latent and state.source_latent_bytes is None:
             state.stage = DisaggJobStage.AWAITING_CONDITIONING  # stay pending the source latent
-        else:
-            state.stage = DisaggJobStage.SAMPLING
+            return
+        state.stage = DisaggJobStage.SAMPLING
+        # Dispatch on this result rather than on the next tick. The conditioning arriving is the event that
+        # makes the sample ready, and the sampler is often free at that instant (a job staged ahead of a pin
+        # that has since released); waiting a tick to notice adds that whole interval to the GPU's idle gap
+        # between two samples. Every deferral outcome is left to the tick, which owns the patience bookkeeping.
+        if self._try_dispatch(state) == _DispatchOutcome.DISPATCHED:
+            state.first_stalled_at = None
+            state.gate_deferred_since = None
 
     def _on_vae_encode_result(self, message: HordeVaeEncodeResultMessage) -> None:
         state = self._lookup(message.job_id)
