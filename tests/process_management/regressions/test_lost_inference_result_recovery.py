@@ -134,6 +134,8 @@ class TestPromptLostResultRecovery:
         await job_tracker.record_popped_job(job)
         await mark_job_in_progress_async(job_tracker, job)
         process_info.last_job_referenced = job
+        # The child reported its active state after the dispatch, so this idle is the job's own return.
+        process_info.last_process_state_started_at = time.time()
         assert job.id_ is not None
 
         stale_result = Mock(spec=HordeInferenceResultMessage)
