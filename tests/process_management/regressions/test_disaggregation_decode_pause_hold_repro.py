@@ -15,8 +15,9 @@ The specification here:
 
 * a job at latent decode whose VAE lane is paused by the reclaim ladder holds (no reroute, no fault) for the
   restore, up to a bound, then dispatches its decode and completes disaggregated once the lane returns;
-* a whole-card residency pause of the same lane still reroutes at once (its pause lasts a heavy model's whole
-  residency, so waiting is not worth the finished sample);
+* a whole-card residency pause of the same lane holds only for a far shorter bound, long enough for a decode
+  that raced the establishing pause to land, and reroutes past it (the pause itself lasts a heavy model's
+  whole residency, so waiting it out is not worth the finished sample);
 * a reclaim-ladder pause that never lifts reroutes at the bound as a backstop, losing no job and raising no
   fault; and
 * the hold never ages the job toward the no-role patience fault.
@@ -37,6 +38,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import Pa
 from horde_worker_regen.process_management.workers.disaggregation_orchestrator import (
     _DECODE_PAUSE_WAIT_SECONDS,
     _STAGE_PATIENCE_SECONDS,
+    _WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS,
     DisaggJobStage,
 )
 
@@ -123,23 +125,70 @@ async def test_reclaim_ladder_paused_decode_holds_then_completes_on_restore() ->
     assert not h.orchestrator.has_job(job)
 
 
-async def test_whole_card_paused_decode_reroutes_at_once() -> None:
-    """Control: a whole-card residency pause of the VAE lane still reroutes the decode immediately (today's behavior).
+async def test_whole_card_paused_decode_holds_briefly_then_reroutes() -> None:
+    """A whole-card pause of the VAE lane holds the decode for its own short bound, then reroutes past it.
 
-    Expected-RED is not applicable: this pins the unchanged whole-card behavior so the owner-aware hold does not
-    accidentally start holding a residency pause that genuinely lasts minutes.
+    The residency withholds its VAE-lane pause while a decode is pending, so a decode that meets a whole-card
+    pause anyway arrived within a cycle of it and has a real chance to land. Past the short bound the pause is
+    genuinely the residency's, which lasts a heavy model's whole run, so waiting is not worth the finished
+    sample and the job reroutes.
     """
     h = _make_harness()
     job = _job()
+    job_id = job.sdk_api_job_info.id_
     await _drive_to_decode_pending(h, job, _SAMPLER_PID)
 
     _pause_image_lane(h, owner=PauseOwner.WHOLE_CARD)
+
+    # Within the bound the finished sampling is kept: the job holds at decode, unrerouted and unfaulted.
+    assert _WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS < _DECODE_PAUSE_WAIT_SECONDS, (
+        "a whole-card pause is not a wait for a restore, so its bound must be far shorter than the ladder's"
+    )
+    for elapsed in (0.0, _WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS - 1.0):
+        h.virtual_now[0] = elapsed
+        h.orchestrator.tick()
+        assert h.rerouted == [], "the whole-card-paused decode was rerouted inside its hold bound"
+        assert h.completed == [], "the held decode must not fault"
+        assert h.orchestrator._jobs[str(job_id)].stage == DisaggJobStage.AWAITING_LATENT_DECODE
+
+    h.virtual_now[0] = _WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS + 1.0
     h.orchestrator.tick()
 
-    assert h.rerouted == [job], "a whole-card-paused decode must reroute at once, not hold"
-    assert h.completed == []
+    assert h.rerouted == [job], "a whole-card pause outlasting the short hold bound must reroute the job"
+    assert h.completed == [], "the backstop reroute must not fault the job"
     assert not h.orchestrator.has_job(job)
     assert h.reserved == set()
+
+
+async def test_whole_card_paused_decode_completes_when_the_lane_returns_inside_the_bound() -> None:
+    """A decode that raced the establishing pause still lands if the lane returns within the short bound."""
+    h = _make_harness()
+    job = _job()
+    job_id = job.sdk_api_job_info.id_
+    await _drive_to_decode_pending(h, job, _SAMPLER_PID)
+
+    _pause_image_lane(h, owner=PauseOwner.WHOLE_CARD)
+    h.virtual_now[0] = 0.0
+    h.orchestrator.tick()
+    assert h.rerouted == []
+
+    _restore_image_lane(h)
+    h.virtual_now[0] = _WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS - 1.0
+    h.orchestrator.tick()
+    assert len(h.image_lane.sent) == 1, "the held decode did not dispatch once the VAE lane returned"
+
+    await h.orchestrator.handle_stage_result(
+        HordeVaeDecodeResultMessage(
+            process_id=_IMAGE_LANE_PID,
+            process_launch_identifier=0,
+            info="",
+            job_id=job_id,
+            job_image_results=[HordeImageResult(image_bytes=b"img")],
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    assert len(h.completed) == 1
+    assert h.rerouted == []
 
 
 async def test_reclaim_ladder_pause_that_never_lifts_reroutes_at_the_bound() -> None:

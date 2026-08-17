@@ -88,8 +88,17 @@ orphaned pause. So a job at :attr:`DisaggJobStage.AWAITING_LATENT_DECODE` (its s
 sample to avoid a wait that is typically under a minute. The hold does not age the job toward any fault; on
 expiry (the lane did not restore within this window) the job reroutes monolithically as a backstop, so a pause
 that never lifts can never strand the job. Sized to outlast the ladder's own idle-release yet stay well under
-the server-side job timeout. A whole-card residency pause (owner :attr:`PauseOwner.WHOLE_CARD`, or an unknown or
-absent owner) is not bounded this way and reroutes at once instead."""
+the server-side job timeout. A whole-card residency pause holds on the much shorter
+:data:`_WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS`; an unknown or absent pause owner reroutes at once."""
+
+_WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS = 8.0
+"""How long a finished-sampling job may hold at latent decode for a whole-card-paused VAE lane to restore.
+
+A :attr:`PauseOwner.WHOLE_CARD` pause lasts a heavy model's whole residency, so this is not a wait for the
+restore. It covers the narrow race the residency's own decode-drain check leaves: the residency withholds the
+VAE-lane pause while a decode is pending, so a decode that meets a whole-card pause anyway arrived within a
+cycle of it. One decode plus a scheduling tick is enough for that decode to land and spare the finished
+sampling; past it the pause is genuinely the residency's and the job reroutes monolithically as before."""
 
 _SAMPLING_LIVENESS_GRACE_SECONDS = 5.0
 """How long a ledgered sample whose sampler reports idle on the device is tolerated before it counts as stale.
@@ -381,6 +390,11 @@ class DisaggregationOrchestrator:
         # reclaim-ladder-paused VAE lane, so the "holding N job(s)" line is emitted once per hold episode rather
         # than every tick, and re-armed once every held job has dispatched or rerouted.
         self._decode_pause_hold_active: bool = False
+        # How many jobs have been rerouted monolithically after their sample result had already arrived, so a
+        # finished sample was thrown away and re-run whole. Distinct from a reroute before or during sampling,
+        # which discards nothing: this one is pure lost GPU work and is the cost every lane-pause and
+        # resource-defer rule around the decode stage exists to avoid.
+        self._discarded_sample_reroute_count: int = 0
 
     def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
         """Inject the single VRAM arbiter: the authority for the concurrent-sampling and encode/decode gates."""
@@ -405,6 +419,15 @@ class DisaggregationOrchestrator:
                 return key
         return None
 
+    def discarded_sample_reroute_count(self) -> int:
+        """Return how many jobs were rerouted monolithically with a finished sample in hand.
+
+        A job past its sample result carries a completed denoise; rerouting it whole throws that away and pays
+        for it again on the monolithic path. Any nonzero value is lost GPU work, so this is the counter a
+        closed-loop run reads to judge that no finished sample was discarded.
+        """
+        return self._discarded_sample_reroute_count
+
     def pending_vae_decode_count(self) -> int:
         """Return how many in-flight jobs need the VAE lane for a decode right now (queued or dispatched to it).
 
@@ -413,13 +436,35 @@ class DisaggregationOrchestrator:
         decode result pops the job, so this one count covers a decode both queued and in flight. Pausing the VAE
         lane off-GPU while any such job exists strands a completed sample, since the job then reroutes monolithic
         and its finished sampling is discarded to free room for a dispatch the decode itself clears within
-        seconds. The lane-pause eligibility reads this so a pause is not executed while decodes are pending. Jobs
-        merely sampling are excluded: they reach the reroute path only if a pause outlasts their defer window,
-        and relieving pressure matters more than protecting a sample that has not yet finished. O(jobs) over the
-        small held-job map, under no lock beyond the single-threaded control loop that already drives this
-        orchestrator.
+        seconds. The reclaim ladder's lane-pause eligibility reads this so a pause is not executed while decodes
+        are pending. Jobs merely sampling are excluded: they reach the reroute path only if a pause outlasts
+        their defer window, and for a pressure-relieving reclaim, relieving that pressure matters more than
+        protecting a sample that has not yet finished. A whole-card residency is not relieving pressure and
+        reads :meth:`jobs_bound_for_vae_decode_count` instead. O(jobs) over the small held-job map, under no
+        lock beyond the single-threaded control loop that already drives this orchestrator.
         """
         return sum(1 for state in self._jobs.values() if state.stage == DisaggJobStage.AWAITING_LATENT_DECODE)
+
+    def jobs_bound_for_vae_decode_count(self) -> int:
+        """Return how many in-flight jobs will still need the VAE lane before they can finish.
+
+        Broader than :meth:`pending_vae_decode_count` by one stage: a job at
+        :attr:`DisaggJobStage.SAMPLING` (queued for a sampler or already dispatched to one) has no decode
+        queued yet, but every path out of that stage other than a fault ends at the VAE lane, so a pause taken
+        while it samples is a pause taken against a decode that is seconds away.
+
+        The two counts exist because the callers weigh the same job differently. A reclaim-ladder pause is
+        relieving VRAM pressure now, and a sampling job's unfinished work is worth less than that relief. A
+        whole-card residency is pre-staging a head that cannot claim the card until the in-flight work drains
+        anyway, so pausing under a sampling job buys it nothing it will not have moments later and costs the
+        job's finished sample when the short decode hold expires. The residency's establish and converge passes
+        read this; the reclaim ladder reads the narrower count.
+        """
+        return sum(
+            1
+            for state in self._jobs.values()
+            if state.stage in (DisaggJobStage.SAMPLING, DisaggJobStage.AWAITING_LATENT_DECODE)
+        )
 
     def stage_snapshot(self) -> list[DisaggStageEntry]:
         """Return each in-flight disaggregated job's current stage and dispatch target (read-only).
@@ -617,11 +662,10 @@ class DisaggregationOrchestrator:
                 state.gate_deferred_since = None
                 if self._stage_lane_deliberately_paused(state.stage):
                     if self._decode_hold_applies(state):
-                        # A reclaim-ladder VAE-lane pause is bounded (its idle-release restores the lane within
-                        # seconds), and this job's sampling has already finished: hold at the decode stage for
-                        # the restore rather than discarding the finished sample to a monolithic reroute. The
-                        # hold is kept clear of the patience fault and reroutes only as a backstop if the lane
-                        # never returns within the wait bound.
+                        # This job's sampling has already finished, so hold at the decode stage for the lane to
+                        # return rather than discarding the finished sample to a monolithic reroute. The hold is
+                        # kept clear of the patience fault and reroutes as a backstop once the pause owner's
+                        # bound elapses.
                         self._hold_decode_for_bounded_pause(state, now)
                         continue
                     # The lane is not crashed: a policy holder (whole-card residency claiming the card for a
@@ -642,41 +686,80 @@ class DisaggregationOrchestrator:
                     self._fault_and_finish(state, reason=f"no role process for stage {state.stage}")
         self._reconcile_decode_pause_hold_log()
 
+    def _handle_pin_wait(self, state: _DisaggJobState, now: float) -> None:
+        """Hold a staged-ahead job whose sampler lane is still pinned, bounded by system-wide sampling progress.
+
+        The wait is legitimate exactly while the pin it is queued behind is being released on a cadence, which
+        sample results system-wide are the evidence for. While they keep arriving the job is kept clear of the
+        no-role patience clock; once they stop for the whole sanity window the pin is not a queue but a wedge,
+        so the job ages through the ordinary patience fault and the horde reissues it.
+        """
+        state.gate_deferred_since = None
+        state.decode_pause_held_since = None
+        if now - self._last_sample_result_at <= _GATE_DEFER_SANITY_SECONDS:
+            state.first_stalled_at = None
+            return
+        if state.first_stalled_at is None:
+            logger.warning(
+                f"Disaggregation: staged-ahead job {self._key(state.job_info)} has waited for a sampler pin "
+                f"with no sampling progress anywhere for {_GATE_DEFER_SANITY_SECONDS:.0f}s; aging it into the "
+                "patience path.",
+            )
+            state.first_stalled_at = now
+        elif now - state.first_stalled_at > _STAGE_PATIENCE_SECONDS:
+            self._fault_and_finish(state, reason="staged ahead of a sampler pin that never released")
+
     def _decode_hold_applies(self, state: _DisaggJobState) -> bool:
-        """Whether a paused-lane decode stage should hold for a bounded restore rather than reroute at once.
+        """Whether a paused-lane decode stage should hold for a bounded window rather than reroute at once.
 
         True only for a job at :attr:`DisaggJobStage.AWAITING_LATENT_DECODE` whose VAE lane is paused off-GPU by
-        :attr:`PauseOwner.RECLAIM_LADDER`: that pause is bounded by the ladder's idle-release, so holding the
-        finished-sampling job for the restore is cheaper than rerouting it monolithic and redoing the sampling.
-        A whole-card residency pause, an unknown or absent owner, and every non-decode stage return False, so
-        those keep the instant reroute (a whole-card pause lasts a heavy model's residency; an encode or
-        source-latent stage discards nothing worth waiting on).
+        a known policy holder: holding a finished-sampling job for a bounded window is cheaper than rerouting it
+        monolithic and redoing the sampling. Each owner brings its own bound
+        (:meth:`_decode_hold_bound_seconds`). An unknown or absent owner and every non-decode stage return
+        False, so those keep the instant reroute (an encode or source-latent stage discards nothing worth
+        waiting on).
         """
-        return (
-            state.stage == DisaggJobStage.AWAITING_LATENT_DECODE
-            and self._image_lane_pause_owner() is PauseOwner.RECLAIM_LADDER
+        return state.stage == DisaggJobStage.AWAITING_LATENT_DECODE and self._image_lane_pause_owner() in (
+            PauseOwner.RECLAIM_LADDER,
+            PauseOwner.WHOLE_CARD,
         )
 
+    def _decode_hold_bound_seconds(self) -> float:
+        """How long a decode may hold for the VAE lane's current pause owner before it reroutes monolithically.
+
+        A whole-card residency pause is not a wait for a restore (it lasts the heavy model's residency), so it
+        gets the far shorter :data:`_WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS`, enough only for a decode that raced
+        the establishing pause to land.
+        """
+        if self._image_lane_pause_owner() is PauseOwner.WHOLE_CARD:
+            return _WHOLE_CARD_DECODE_PAUSE_WAIT_SECONDS
+        return _DECODE_PAUSE_WAIT_SECONDS
+
+    def _image_lane_pause_owner_phrase(self) -> str:
+        """A log-facing phrase naming which policy holder has the VAE lane paused off-GPU."""
+        return "whole-card" if self._image_lane_pause_owner() is PauseOwner.WHOLE_CARD else "reclaim-ladder"
+
     def _hold_decode_for_bounded_pause(self, state: _DisaggJobState, now: float) -> None:
-        """Hold a finished-sampling job at latent decode for the reclaim ladder to restore the VAE lane.
+        """Hold a finished-sampling job at latent decode for its VAE lane's pause owner to release the lane.
 
         Anchors the hold on the first tick it applies and keeps the job clear of the no-role patience fault so it
-        does not age toward a fault while waiting for a bounded restore. The next tick re-attempts the decode
-        dispatch with no manual kick (the job's dispatch marker stays unset, so :meth:`tick` re-runs the stage),
-        which succeeds the moment the lane returns. Should the lane not restore within
-        :data:`_DECODE_PAUSE_WAIT_SECONDS`, the job reroutes monolithically as the backstop, so a pause that never
-        lifts can never strand it.
+        does not age toward a fault while waiting. The next tick re-attempts the decode dispatch with no manual
+        kick (the job's dispatch marker stays unset, so :meth:`tick` re-runs the stage), which succeeds the moment
+        the lane returns. Should the lane not return within the owner's bound
+        (:meth:`_decode_hold_bound_seconds`), the job reroutes monolithically as the backstop, so a pause that
+        never lifts can never strand it.
         """
         if state.decode_pause_held_since is None:
             state.decode_pause_held_since = now
-        # Keep the hold clear of the no-role patience clock: a legitimate wait for a bounded restore is not a stall.
+        # Keep the hold clear of the no-role patience clock: a legitimate bounded wait is not a stall.
         state.first_stalled_at = None
-        if now - state.decode_pause_held_since > _DECODE_PAUSE_WAIT_SECONDS:
+        bound_seconds = self._decode_hold_bound_seconds()
+        if now - state.decode_pause_held_since > bound_seconds:
             self._reroute_to_monolithic(
                 state,
                 reason=(
-                    f"the VAE lane stayed reclaim-ladder-paused past the {_DECODE_PAUSE_WAIT_SECONDS:.0f}s "
-                    "decode-hold window"
+                    f"the VAE lane stayed {self._image_lane_pause_owner_phrase()}-paused past the "
+                    f"{bound_seconds:.0f}s decode-hold window"
                 ),
             )
 
@@ -691,8 +774,8 @@ class DisaggregationOrchestrator:
         if holding and not self._decode_pause_hold_active:
             logger.info(
                 f"Disaggregation: holding {holding} finished-sampling job(s) at latent decode for the "
-                f"reclaim-ladder-paused VAE lane to restore (up to {_DECODE_PAUSE_WAIT_SECONDS:.0f}s before "
-                "rerouting monolithically).",
+                f"{self._image_lane_pause_owner_phrase()}-paused VAE lane to restore (up to "
+                f"{self._decode_hold_bound_seconds():.0f}s before rerouting monolithically).",
             )
             self._decode_pause_hold_active = True
         elif not holding and self._decode_pause_hold_active:
@@ -1279,18 +1362,32 @@ class DisaggregationOrchestrator:
         """Return a job to the monolithic inference path instead of forfeiting it.
 
         Taken when a stage kept failing resource-class past its defer window, or when its role lane is
-        deliberately paused off-GPU. The job stays owned and tracked throughout: its pin is released and it is
-        popped from the pipeline, then the injected ``reroute_monolithic`` returns it to the normal
-        claim/dispatch path (latched so the re-claim runs monolithic). No images-faulted report is emitted;
-        the job runs whole instead.
+        deliberately paused off-GPU. The job stays owned and tracked throughout: its unsettled sampler grant is
+        discarded, its pin is released and it is popped from the pipeline, then the injected
+        ``reroute_monolithic`` returns it to the normal claim/dispatch path (latched so the re-claim runs
+        monolithic) with ``reason``, which the parent's operator-facing log states. No images-faulted report is
+        emitted; the job runs whole instead.
         """
+        sample_discarded = state.stage == DisaggJobStage.AWAITING_LATENT_DECODE
+        if sample_discarded:
+            self._discarded_sample_reroute_count += 1
         logger.warning(
-            f"Disaggregation: re-routing job {self._key(state.job_info)} to monolithic inference; {reason}",
+            f"Disaggregation: re-routing job {self._key(state.job_info)} to monolithic inference; {reason}"
+            + (
+                "; its finished sample is discarded and the whole job will be sampled again"
+                if sample_discarded
+                else ""
+            ),
         )
+        # The re-routed job's sample stage never delivered, so the grant its sampler still holds describes
+        # weights that slot never sampled; discarding it here keeps the next completion on that slot from
+        # settling it into a residency the device does not hold. Ordered ahead of the pin release for the same
+        # reason as in :meth:`_finish`: the release erases the last record of which slot the grant was stamped on.
+        self._discard_unsettled_sampler_grant(state)
         self._release_pin(state)
         self._release_sampling_peak(state)
         self._jobs.pop(self._key(state.job_info), None)
-        self._reroute_monolithic(state.job_info)
+        self._reroute_monolithic(state.job_info, reason)
 
     # -- completion / fault ------------------------------------------------------------------------
 

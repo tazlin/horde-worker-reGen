@@ -120,7 +120,8 @@ only remaining step is a short VAE decode on that lane. Pausing the lane out fro
 monolithic and discards the finished sampling, to make room for a dispatch the decode itself would clear in
 seconds. So the executing actuator reports the VAE-lane pause as a no-op while any disaggregated decode is
 queued or in flight on the lane, and both reclaim paths (the governor rung and the post-processing borrow) then
-move to their next relief option, exactly as they do for any rung whose target has gone away. A job merely
+move to their next relief option, exactly as they do for any rung whose target has gone away. The whole-card
+residency's own VAE-lane pause asks the same predicate and retries on later convergence cycles. A job merely
 sampling does not withhold the pause, and the component/text-encode lane is not gated, because rerouting a job
 that has not yet finished sampling discards no completed work (see
 [Process lanes and chaining](process_lanes_and_chaining.md#decode-drain-eligibility-a-vae-lane-pause-defers-to-a-queued-decode)).

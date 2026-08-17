@@ -214,7 +214,7 @@ def _make_harness(
         reserve_sampler_process=reserved.add,
         release_sampler_process=reserved.discard,
         on_sampling_complete=sampling_completed.append,
-        reroute_monolithic=rerouted.append,
+        reroute_monolithic=lambda job_info, _reason: rerouted.append(job_info),
         estimate_sampling_peak_mb=peak_callable,  # type: ignore[arg-type]
         estimate_decode_spike_mb=decode_callable,  # type: ignore[arg-type]
         measured_device_free_mb=(
@@ -1629,6 +1629,32 @@ async def test_a_slot_already_running_another_job_keeps_its_own_grant() -> None:
     assert h.sampler.retained_resident_model is None, "the later job's grant must not settle early"
     assert h.sampler.retention_granted_model == "SDXL 1.0", "the later job's grant must still be in flight"
     assert h.sampler.retired_jobs == []
+
+
+@pytest.mark.asyncio
+async def test_a_reroute_before_sampling_discards_the_grant_it_never_earned() -> None:
+    """A job re-routed to the monolithic path leaves its pinned sampler recorded as holding nothing.
+
+    The grant is stamped on the pinned sampler at admission, so a job that leaves the pipeline before its
+    sample stage delivers takes one with it. Left in place, the next completion on that slot would settle it,
+    recording a residency for a model the slot never sampled.
+    """
+    h = _make_harness()
+    job = _job()
+    _grant(h, job)
+    h.orchestrator.register(job, needs_source_latent=False, pinned_sampler_process_id=_SAMPLER_PID)
+    state = h.orchestrator._jobs[str(job.sdk_api_job_info.id_)]
+    assert state.stage == DisaggJobStage.AWAITING_CONDITIONING, "precondition: the job has not sampled yet"
+
+    h.orchestrator._reroute_to_monolithic(state, reason="the encode lane is deliberately paused off-GPU")
+
+    assert h.rerouted == [job]
+    assert h.sampler.retention_granted_model is None, (
+        "the re-routed job left an unsettled grant on its pinned sampler; the next completion there would "
+        "settle it into a residency the device does not hold"
+    )
+    assert h.sampler.retained_resident_model is None, "a re-route settles nothing: it never sampled"
+    assert h.reserved == set(), "the re-route must release the pin it discarded the grant for"
 
 
 @pytest.mark.asyncio

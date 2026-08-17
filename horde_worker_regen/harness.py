@@ -482,6 +482,28 @@ class HarnessResult:
     Held apart from ``elapsed_seconds``, which covers the measured pass only, so a driver reporting a
     probe's cost can separate the one-time feature-model load from the work that was actually scored."""
 
+    disaggregation_discarded_sample_reroutes: int = 0
+    """How many disaggregated jobs were rerouted monolithically after their sample result had arrived.
+
+    Each one throws away a finished denoise and pays for it again on the monolithic path, so a run that
+    served its whole queue can still have burned GPU work. A clean run leaves this at zero."""
+
+    governor_state_transitions: list[str] = field(default_factory=list)
+    """Device-free governor band changes observed during the run, as ``"<device>:<previous>-><next>"``.
+
+    Sampled by the harness rather than derived from the metrics snapshot, which counts only the transitions
+    into PRESSURE and SATURATED and so cannot show a card that moved and recovered."""
+
+    min_observed_device_free_mb: dict[int, float] = field(default_factory=dict)
+    """Lowest device-free VRAM (MB) the run observed on each driven card.
+
+    The occupancy floor a run reached. Read against :attr:`observed_device_total_mb`, this is what makes a
+    "the card never saturated" oracle mean something: a card whose free reading never left its total was
+    never asked the question."""
+
+    observed_device_total_mb: dict[int, float] = field(default_factory=dict)
+    """Total VRAM (MB) each driven card reported, as the parent's governor read it."""
+
     boot_failed_no_progress: bool = False
     """True when a fixed-scenario run ended with no job accounted for (none completed, none faulted) via an
     early graceful shutdown rather than a timeout: the worker gave up (or never brought a child up) before it
@@ -539,6 +561,8 @@ class HarnessResult:
             parts.append(f"alchemy_faulted={self.num_alchemy_forms_faulted}")
         if self.num_alchemy_forms_completed < self.num_alchemy_forms_expected:
             parts.append(f"alchemy_completed={self.num_alchemy_forms_completed}/{self.num_alchemy_forms_expected}")
+        if self.disaggregation_discarded_sample_reroutes > 0:
+            parts.append(f"discarded_sample_reroutes={self.disaggregation_discarded_sample_reroutes}")
         if self.diagnostics:
             parts.append(f"diagnostics={self.diagnostics}")
         return "; ".join(parts) if parts else "no issues detected"
@@ -1672,6 +1696,9 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_faulted_with_loras=lora_split[2],
         num_jobs_faulted_without_loras=lora_split[3],
         consecutive_failed_jobs_pause_count=manager._state.consecutive_failed_jobs_pause_count,
+        disaggregation_discarded_sample_reroutes=(
+            manager._disaggregation_orchestrator.discarded_sample_reroute_count()
+        ),
         boot_failed_no_progress=boot_failed_no_progress,
     )
 

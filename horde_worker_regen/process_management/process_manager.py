@@ -1767,6 +1767,11 @@ class HordeWorkerProcessManager:
             find_process_by_id=self._process_map.get,
             reserve_sampler_process=self._process_map.reserve_for_disaggregation,
             release_sampler_process=self._process_map.release_disaggregation_reservation,
+            find_reserved_sampler=lambda model: self._process_map.get_process_by_horde_model_name(
+                model,
+                include_reserved=True,
+            ),
+            on_sampler_bound=self._on_disaggregated_sampler_bound,
             on_sampling_complete=self._on_disaggregation_sampling_complete,
             reroute_monolithic=self._reroute_disaggregated_job_monolithic,
             encode_lane_paused=lambda: self._process_lifecycle.is_component_gpu_paused,
@@ -1793,6 +1798,7 @@ class HordeWorkerProcessManager:
             pin_owner=self._disaggregation_orchestrator.pinned_job_id_for_process,
             sampling_peaks=self._disaggregation_orchestrator.active_sampling_peaks_snapshot,
             vae_decode_pending_count=self._disaggregation_orchestrator.pending_vae_decode_count,
+            vae_lane_bound_job_count=self._disaggregation_orchestrator.jobs_bound_for_vae_decode_count,
         )
 
         self._recovery_coordinator = WorkerRecoveryCoordinator(
@@ -2883,13 +2889,15 @@ class HordeWorkerProcessManager:
         """
         self._job_tracker.mark_disaggregation_decoding(job_info.sdk_api_job_info)
 
-    def _reroute_disaggregated_job_monolithic(self, job_info: HordeJobInfo) -> None:
+    def _reroute_disaggregated_job_monolithic(self, job_info: HordeJobInfo, reason: str) -> None:
         """Return a disaggregated job to the monolithic inference path (the orchestrator has released it).
 
-        Called synchronously by the orchestrator when a job's stage kept failing resource-class (device
-        out-of-memory) past the defer window: the job is still owned/tracked, so it is moved back to the
-        pending-inference queue (latched so the re-claim runs monolithic) rather than being faulted. The
-        scheduler then preloads and dispatches it via START_INFERENCE on the next cycle.
+        Called synchronously by the orchestrator when a stage kept failing resource-class (device
+        out-of-memory) past its defer window, or when the stage's role lane is deliberately paused off-GPU: the
+        job is still owned/tracked, so it is moved back to the pending-inference queue (latched so the re-claim
+        runs monolithic) rather than being faulted. The scheduler then preloads and dispatches it via
+        START_INFERENCE on the next cycle. ``reason`` is the orchestrator's own phrase for which of those
+        happened, carried into the operator-facing line so a paused lane is not reported as device pressure.
         """
         sdk_job = job_info.sdk_api_job_info
         if not self._job_tracker.requeue_disaggregated_for_monolithic(sdk_job):
@@ -2899,9 +2907,9 @@ class HordeWorkerProcessManager:
             )
             return
         logger.opt(colors=True).warning(
-            "<fg #f0beff>Job {} re-routed to the monolithic inference path after its "
-            "disaggregated stage could not clear device pressure within the defer window.</>",
+            "<fg #f0beff>Job {} re-routed to the monolithic inference path: {}.</>",
             str(sdk_job.id_)[:8],
+            reason,
         )
 
     def _disaggregation_class_eligible(self, sdk_job: ImageGenerateJobPopResponse) -> bool:

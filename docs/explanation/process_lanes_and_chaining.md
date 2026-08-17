@@ -171,18 +171,30 @@ step is a ~1-2s VAE decode on that same lane. Pausing the lane out from under su
 sample, since the job then reroutes monolithic and re-runs whole, discarding the completed sampling to free
 room for a dispatch the decode itself would have cleared within seconds.
 
-So the reclaim-ladder VAE-lane pause is **decode-drain-aware**: it reports no-op while the orchestrator has any
-job needing the lane for a decode (queued or dispatched to it but not yet resulted). Both reclaim paths that
-stop this lane, the governor's saturation rung and a post-processing borrow, execute through the one reclaim
-owner, so a single no-op there makes each move to its next relief option exactly as any rung whose target has
-gone away does; the pause is simply not eligible this tick and pressure logic proceeds. The eligibility reads a
-cheap orchestrator accessor (the count of jobs at the decode stage) injected into the scheduler as a callable,
-and emits one edge-latched INFO line naming the pending-decode count when it withholds a pause, so the lever is
-visible in live forensics.
+So every VAE-lane pause is **decode-drain-aware**: it is withheld while the orchestrator has any job needing
+the lane for a decode (queued or dispatched to it but not yet resulted). One scheduler predicate states the
+rule, and every path that stops the lane asks it first:
 
-A job that is *merely sampling* does not withhold the pause. Rerouting an unfinished sample discards no
-completed work, the existing defer window already covers a sampler whose lane a pause outlasts, and relieving
-device pressure matters more than protecting a sample that has not yet produced a latent. The mirror case for
+- the **reclaim-ladder actuator**, which both the governor's saturation rung and a post-processing borrow
+  execute through, reports no-op, so each moves to its next relief option exactly as any rung whose target has
+  gone away does; the pause is simply not eligible this tick and pressure logic proceeds.
+- the **whole-card residency**, which stops the lane so a heavy head is not tipped into host-RAM streaming by
+  its context. A residency suppresses *new* disaggregated dispatch, but a job dispatched moments before it is
+  still in the pipeline, so establishment skips the pause and the per-cycle convergence pass retries it. The
+  lane therefore leaves the card on the first cycle after that work drains, rather than the residency's claim
+  discarding a finished sample.
+
+The two requesters read different counts, because they are buying different things. The reclaim ladder reads
+jobs at the decode stage only (`pending_vae_decode_count`): it is relieving device pressure *now*, and a job
+that is merely sampling has no completed work to strand, so relief wins. The whole-card residency reads the
+wider count of jobs sampling *or* decoding (`jobs_bound_for_vae_decode_count`): it is pre-staging a head that
+cannot claim the card until the in-flight job drains anyway, so pausing under a sampler frees a context seconds
+before the residency could use it and costs that job's finished sample, which the lane's short whole-card
+decode hold cannot outlast. Both counts are cheap orchestrator accessors injected into the scheduler as
+callables, and either way one edge-latched INFO line names the requester and what is being waited on when a
+pause is withheld, so the lever is visible in live forensics.
+
+The mirror case for
 the component/text-encode lane is deliberately left ungated: encode sits at the front of the pipeline, so
 rerouting an `AWAITING_CONDITIONING` job monolithic discards nothing, and the wasted-work argument that
 motivates the VAE-lane gate does not apply.
@@ -191,11 +203,11 @@ motivates the VAE-lane gate does not apply.
 
 The decode-drain eligibility gate only stops a *new* pause from executing while a decode is already pending. It
 cannot cover the window where the pause lands earlier: because a job merely sampling does not withhold the
-pause, a reclaim-ladder pause can execute while a job is still sampling, and that job then finishes sampling and
-reaches `AWAITING_LATENT_DECODE` a few ticks later to find the lane already paused off-GPU. The general rule for
-a deliberately-paused role lane is an immediate monolithic reroute (waiting on the card is arbitrated by the
+pause, a pause can execute while a job is still sampling, and that job then finishes sampling and reaches
+`AWAITING_LATENT_DECODE` a few ticks later to find the lane already paused off-GPU. The general rule for a
+deliberately-paused role lane is an immediate monolithic reroute (waiting on the card is arbitrated by the
 monolithic queue, and parking the job only ages it toward a patience fault). At the decode stage that rule is
-made **owner-aware**, because the two pause owners differ in how long they last:
+made **owner-aware**: both pause owners hold, on bounds sized to how long each lasts.
 
 - a **reclaim-ladder** pause is bounded by construction (its idle-release restores the lane within seconds of
   the borrower going idle, and the self-heal backstop covers an orphan), so a job whose sampling has already
@@ -204,9 +216,11 @@ made **owner-aware**, because the two pause owners differ in how long they last:
   and the next tick re-attempts the decode dispatch with no manual kick, dispatching the moment the lane returns.
   Should the lane not restore within the bounded hold window, the job reroutes monolithically as a backstop, so a
   pause that never lifts can never strand it. One edge-latched INFO names the held-job count for live forensics.
-- a **whole-card residency** pause (or an unknown or absent owner while paused) lasts a heavy model's whole
-  residency (minutes), so the instant reroute remains correct: waiting is not worth protecting the finished
-  sample.
+- a **whole-card residency** pause lasts a heavy model's whole residency (minutes), so it is not a wait for a
+  restore. It holds on a much shorter bound, a decode plus a scheduling tick, which covers only the narrow race
+  the residency's own decode-drain check leaves: a decode meeting a whole-card pause arrived within a cycle of
+  it and has a real chance to land. Past that bound the pause is genuinely the residency's and the job reroutes
+  monolithically. An unknown or absent owner while paused keeps the instant reroute.
 
 The owner reaches the orchestrator through the same injected-predicate seam as the lane-paused check: lifecycle
 exposes the VAE-lane pause owner and the manager injects an accessor callable alongside the paused predicate.

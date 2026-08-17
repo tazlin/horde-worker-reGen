@@ -703,6 +703,20 @@ def _performance_mode_headway_scale(bridge_data: reGenBridgeData) -> float:
     return 1.0
 
 
+class VaeLanePauseRequester(enum.StrEnum):
+    """Which subsystem is asking to pause the VAE lane, and therefore which decode-drain rule applies.
+
+    The value is the log-facing subsystem name. The distinction is not cosmetic: it selects how much of the
+    disaggregated pipeline counts as "still needs this lane" in
+    :meth:`InferenceScheduler._vae_lane_pause_deferred_for_decode`.
+    """
+
+    RECLAIM_LADDER = "Reclaim ladder"
+    """Pausing to relieve VRAM pressure now; only a queued or in-flight decode withholds the pause."""
+    WHOLE_CARD_RESIDENCY = "Whole-card residency"
+    """Pausing to clear a card it cannot claim until in-flight work drains; a sampling job withholds it too."""
+
+
 class _WholeCardDemandOutcome(enum.Enum):
     """How the whole-card residency decision resolves a budget-gated head's preload.
 
@@ -1134,6 +1148,10 @@ class InferenceScheduler:
         # pause for a decode it has no orchestrator to see. ``_vae_pause_deferred_for_decode`` edge-latches the
         # one INFO line so a sustained pressure run logs the deferral once, re-arming when a pause next proceeds.
         self._vae_decode_pending_count: Callable[[], int] = lambda: 0
+        # The same wiring one stage wider: jobs sampling or awaiting decode, i.e. everything still bound for the
+        # lane. The whole-card residency reads this instead, because it cannot claim the card until that work
+        # drains anyway, so pausing under a sampling job only costs the sample. See VaeLanePauseRequester.
+        self._vae_lane_bound_job_count: Callable[[], int] = lambda: 0
         self._vae_pause_deferred_for_decode = False
 
         # Runtime safety-placement policy hysteresis (see _reconcile_runtime_safety_placement). ``wants_off``
@@ -1368,6 +1386,7 @@ class InferenceScheduler:
         pin_owner: Callable[[int], str | None] | None = None,
         sampling_peaks: Callable[[], dict[str, float]] | None = None,
         vae_decode_pending_count: Callable[[], int] | None = None,
+        vae_lane_bound_job_count: Callable[[], int] | None = None,
     ) -> None:
         """Wire the pipeline-disaggregation predicates and router (see the ``_is_disaggregatable_job`` attr).
 
@@ -1382,8 +1401,9 @@ class InferenceScheduler:
         in-flight sampling peaks; both are read-only, used only by the dispatch-stall classifier to name a head
         held behind a pinned sampler lane. ``vae_decode_pending_count`` returns how many disaggregated jobs need
         the VAE lane for a decode now, read by the reclaim-ladder VAE-lane pause so the lane is not stopped out
-        from under a queued or in-flight decode. All three are optional so standalone tests need not wire the
-        orchestrator.
+        from under a queued or in-flight decode; ``vae_lane_bound_job_count`` is the wider count (sampling as
+        well as decoding) that the whole-card residency's lane pause reads instead. All four are optional so
+        standalone tests need not wire the orchestrator.
         """
         self._is_disaggregatable_job = is_disaggregatable
         self._is_disaggregation_class_eligible = is_disaggregation_class_eligible
@@ -1394,6 +1414,8 @@ class InferenceScheduler:
             self._disaggregation_sampling_peaks = sampling_peaks
         if vae_decode_pending_count is not None:
             self._vae_decode_pending_count = vae_decode_pending_count
+        if vae_lane_bound_job_count is not None:
+            self._vae_lane_bound_job_count = vae_lane_bound_job_count
 
     def _disaggregation_sibling_charge_mb(
         self,
@@ -2649,6 +2671,29 @@ class InferenceScheduler:
             return False
         return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
+    def _pause_vae_lane_for_residency_if_drained(self, device_index: int | None) -> bool:
+        """Stop the VAE lane off the residency's card once no disaggregated job still needs it.
+
+        The establishment pass withholds this pause while any job dispatched before the residency is still
+        sampling or awaiting its decode, so the lane can still be on the card once the residency is held.
+        Retried every convergence cycle for the same reason the sibling scale-down is: the room the residency
+        wants is only actually freed when the lane's context goes. Idempotent once the lane is paused under
+        this owner, and it never takes over another owner's pause.
+
+        Args:
+            device_index: Card holding the residency; None is the single-GPU / worker-wide case.
+
+        Returns:
+            True when this call initiated the pause.
+        """
+        if not self._residency_should_pause_vae_lane(device_index):
+            return False
+        if self._process_lifecycle.vae_lane_pause_owner is PauseOwner.WHOLE_CARD:
+            return False
+        if self._vae_lane_pause_deferred_for_decode(requester=VaeLanePauseRequester.WHOLE_CARD_RESIDENCY):
+            return False
+        return self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
+
     def _establish_whole_card_residency(
         self,
         job: ImageGenerateJobPopResponse,
@@ -2711,10 +2756,15 @@ class InferenceScheduler:
             forecast=forecast,
         )
         # The disaggregated pipeline's VAE lane holds an equivalent bare CUDA context; stop it off-GPU on the
-        # residency's card so the heavy model's weights are not tipped into host-RAM streaming by it. Disagg
-        # dispatch is already suppressed while a residency is active, so the lane is idle here. A no-op unless
+        # residency's card so the heavy model's weights are not tipped into host-RAM streaming by it. New
+        # disagg dispatch is suppressed while a residency is active, but a job dispatched before it is still
+        # sampling or decoding, and the residency cannot claim the card until that job drains anyway; pausing
+        # under it buys nothing and discards the sample the lane's short decode hold cannot outlast. The pause
+        # is retried each cycle by _converge_whole_card_residency once that work drains. A no-op unless
         # disaggregation is enabled and the lane sits on this card.
-        if self._residency_should_pause_vae_lane(device_index):
+        if self._residency_should_pause_vae_lane(device_index) and not self._vae_lane_pause_deferred_for_decode(
+            requester=VaeLanePauseRequester.WHOLE_CARD_RESIDENCY,
+        ):
             self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
         # The disaggregated pipeline's component (text-encode) lane holds an equivalent bare CUDA context plus
         # resident encoders; stop it off-GPU on the residency's card for the same reason as the VAE lane.
@@ -2895,7 +2945,9 @@ class InferenceScheduler:
         scale-down guard would otherwise protect and thereby pin the count above the target forever. Those
         queued jobs wait and reload once the head drains (see :meth:`_restore_siblings_after_whole_card`).
         Reclaiming the siblings' CUDA contexts and moving safety off-GPU leaves the staged head the whole card
-        when it samples. A no-op until a residency is held and its model is staged; idempotent at the target.
+        when it samples. The VAE lane is retried here as well: establishment withholds its pause while a
+        disaggregated decode is still in flight on it, so the lane leaves the card on the first cycle after
+        those decodes drain. A no-op until a residency is held and its model is staged; idempotent at the target.
         Converges every held residency, so on a multi-GPU host each card's pre-staged head collapses its own
         card independently.
         """
@@ -2918,6 +2970,7 @@ class InferenceScheduler:
                 )
             if forecast is not None:
                 self._pause_post_process_for_residency_if_idle(device_index, model_name=model, forecast=forecast)
+            self._pause_vae_lane_for_residency_if_drained(device_index)
 
     def _whole_card_residency_has_holder(self, model: str, device_index: int | None) -> bool:
         """Whether a held whole-card model is staged or resident on a live process.
@@ -8691,27 +8744,59 @@ class InferenceScheduler:
             self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
         )
 
+    def _vae_lane_pause_deferred_for_decode(self, *, requester: VaeLanePauseRequester) -> bool:
+        """Whether a VAE-lane pause must be withheld because disaggregated work still needs the lane.
+
+        Pausing the lane out from under a queued or in-flight decode strands a job whose sampling already
+        finished: it reroutes monolithic and discards that sampling, to free room for a dispatch the decode
+        itself clears within seconds. Every path that stops this lane asks here first (the reclaim ladder's
+        actuator, which both the governor's saturation rung and a post-processing borrow route through, and the
+        whole-card residency's establish and converge passes), so the eligibility rule is stated once and each
+        caller simply treats the pause as not eligible this tick.
+
+        ``requester`` selects how wide "still needs the lane" is. The reclaim ladder is buying VRAM relief now,
+        so only a queued or in-flight decode outweighs it. A whole-card residency is pre-staging a head that
+        cannot claim the card until the in-flight work drains regardless, so it also waits on a job that is
+        merely sampling: pausing under one frees the lane's context seconds before the residency could use it
+        and discards the sample the short decode hold cannot outlast.
+
+        Emits one edge-latched INFO per deferral episode naming ``requester`` and the blocking count, re-armed
+        once the work has drained, so a per-cycle caller cannot spam the log.
+
+        Args:
+            requester: The subsystem asking to pause the lane; names it in the log and picks the count.
+
+        Returns:
+            True when the pause must be withheld this tick.
+        """
+        whole_card = requester is VaeLanePauseRequester.WHOLE_CARD_RESIDENCY
+        blocking = self._vae_lane_bound_job_count() if whole_card else self._vae_decode_pending_count()
+        if blocking <= 0:
+            self._vae_pause_deferred_for_decode = False
+            return False
+        if not self._vae_pause_deferred_for_decode:
+            self._vae_pause_deferred_for_decode = True
+            waiting_on = (
+                f"{blocking} disaggregated job(s) still bound for the VAE lane"
+                if whole_card
+                else f"{blocking} disaggregated decode(s) are queued or in flight on it"
+            )
+            logger.info(
+                f"{requester.value}: holding the VAE-lane pause while {waiting_on}; the lane frees itself "
+                "sooner than the monolithic reroute a pause would force, which discards the finished sampling.",
+            )
+        return True
+
     def pause_vae_lane(self, device_index: int | None) -> bool:
         """Pause the VAE lane off the GPU to reclaim its context (reclaim-ladder actuator).
 
-        Reports no-op (does not pause) while the disaggregation orchestrator has jobs awaiting a VAE-lane
-        decode. Pausing the lane out from under a queued or in-flight decode strands a job whose sampling
-        already finished: it reroutes monolithic and discards that sampling, to free room for a dispatch the
-        decode itself clears within seconds. Both reclaim paths that stop this lane (the governor's saturation
-        rung and a post-processing borrow) route through here, so a no-op makes each move to its next relief
-        option exactly as any rung whose target has gone away does; the pause is simply not eligible this tick.
+        Reports no-op (does not pause) while a disaggregated decode still needs the lane
+        (:meth:`_vae_lane_pause_deferred_for_decode`). Both reclaim paths that stop this lane (the governor's
+        saturation rung and a post-processing borrow) route through here, so a no-op makes each move to its next
+        relief option exactly as any rung whose target has gone away does.
         """
-        pending_decodes = self._vae_decode_pending_count()
-        if pending_decodes > 0:
-            if not self._vae_pause_deferred_for_decode:
-                self._vae_pause_deferred_for_decode = True
-                logger.info(
-                    f"Reclaim ladder: holding the VAE-lane pause while {pending_decodes} disaggregated "
-                    "decode(s) are queued or in flight on it; the decode frees the lane sooner than the "
-                    "monolithic reroute a pause would force, which discards the finished sampling.",
-                )
+        if self._vae_lane_pause_deferred_for_decode(requester=VaeLanePauseRequester.RECLAIM_LADDER):
             return False
-        self._vae_pause_deferred_for_decode = False
         return self._note_lane_cycle(self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER))
 
     def pause_component_lane(self, device_index: int | None) -> bool:
