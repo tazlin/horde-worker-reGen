@@ -104,7 +104,10 @@ residency was granted is immutable: it remains the evidence and fit guarantee th
 Current allocator-derived checkpoint footprints and live reserve commitments instead produce a separate
 `repriced_target`. That target may only tighten while the residency is held. If it falls below the live
 context count, the scheduler stops idle siblings and records one `ContextReduction` restore obligation with
-the verified reclaim ladder; a roomier later reading never grows contexts back underneath the heavy model.
+the verified reclaim ladder; a slot is idle for this purpose only when it neither reports a busy state nor
+owns a dispatched job, since a disaggregated sampler is pinned and granted execution ownership before the
+sample stage is sent and so reports `WAITING_FOR_JOB` for the whole text-encode lane while its job is in
+flight; a roomier later reading never grows contexts back underneath the heavy model.
 The residency release owns physical regrowth and discharges the ladder debt. An obligation whose restore
 actuator reports it did not act (the context restore stands down for as long as a residency owns the pool) is
 kept and retried on a later healthy tick, so the debt outlives the episode that recorded it rather than
@@ -307,6 +310,14 @@ allocator-attributable evidence and may lower it when the held model now needs m
 and dispatch readiness consult that tighten-only target. They never raise it mid-hold; capacity returns only
 after the residency drains, through the normal restore path.
 
+Retention is justified by the residency's own queued work being about to run on it, so it lapses when that
+work has lost every route to the card. A held model that is staged and resident nowhere on the card, with
+nothing loading it and no exclusive job of its own in flight, while the undispatched head is a different
+model, can neither converge nor drain: the preload pass serves the head, and the head is barred by this very
+residency. Such a residency releases through the normal restore path instead of being retained by its queued
+work. The no-holder reading is only trusted past the establish grace, since a residency legitimately has no
+holder for as long as its pre-stage preload takes to land.
+
 The dispatch gate releases the head either on a live free-VRAM reading that genuinely holds the weights, or,
 once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized
 for a card every other context has left, safety included, so the scheduler passes in the charge of whatever
@@ -381,6 +392,11 @@ never what it will serve: work already accepted keeps its queue position and dra
 the same reason, a foreign job cannot line-skip onto the residency card while the claim stands, since pulling
 another model forward there is the very eviction the residency was taken out to prevent; only the resident
 model may still bypass, so a burst for it keeps flowing.
+
+That bypass is exempt from the affinity skip budget, on the same ground as a pin-waiting head: a residency
+held for some other model bars the head from loading at all until it drains, and the only work that drains it
+is the resident model's own queued jobs. Holding them behind the head funds no fresh copy of anything and
+leaves nothing that can release the card, so the budget has nothing to protect there.
 
 A claim that could stand indefinitely would be a worker that has advertised itself down to one model, so it
 has three ends, and the first to arrive wins:

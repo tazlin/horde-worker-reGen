@@ -684,6 +684,60 @@ class TestGetNextJobAndProcess:
         assert result.line_skip is not None
         assert result.line_skip.reason == "resident_bypass"
 
+    async def test_whole_card_residency_model_bypasses_regardless_of_budget(self) -> None:
+        """The model a whole-card residency is held for bypasses a foreign head even with the budget spent.
+
+        The residency bars the head from loading until it drains, and the only work that drains it is that
+        model's own queued jobs. Holding them behind the head funds no copy of anything and leaves nothing
+        that can release the card.
+        """
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+        sched._sibling_teardown_for_model = "resident_b"
+
+        result = await sched.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.process_with_model is holder
+        assert result.line_skip is not None
+        assert result.line_skip.displaced_job is head_job
+        assert result.line_skip.reason == "resident_bypass"
+
+    async def test_residency_bypass_does_not_admit_an_unrelated_model(self) -> None:
+        """The exemption is the residency's model only: other resident work still needs the affinity budget."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+        sched._sibling_teardown_for_model = "some_other_model"
+
+        assert await sched.get_next_job_and_process() is None
+
     async def test_information_only_does_not_advance_affinity_window(self) -> None:
         """The look-ahead call surfaces the bypass but must not advance the skip window (only dispatch does)."""
         holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)

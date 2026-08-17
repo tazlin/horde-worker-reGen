@@ -2635,6 +2635,10 @@ class ProcessLifecycleManager:
                 continue
             if process_info.is_process_busy():
                 continue
+            # Execution ownership outlives the child's idle report on the disaggregated path: the sampler
+            # is pinned and owns the job while it waits for the encode lane, so an owned slot is serving.
+            if process_info.current_inference_job() is not None:
+                continue
             if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
                 continue
             if process_info.ram_usage_bytes >= shortfall_bytes:

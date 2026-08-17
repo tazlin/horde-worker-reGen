@@ -478,6 +478,81 @@ class TestWholeCardSiblingTeardown:
         scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
         assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
 
+    async def test_restore_releases_a_residency_that_can_no_longer_converge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A residency whose model has no holder and no route to one is released, not retained.
+
+        Retention is justified by the residency's own queued work being about to run on it. That justification
+        fails when the model is staged and resident nowhere, nothing is loading it, and the undispatched head
+        is a different model: the preload pass serves the head, the head is barred from loading by this very
+        residency, and the queue can neither converge the residency nor drain it.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+
+        scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=2, max_inference=4)
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
+        head_job = make_job_pop_response("CyberRealistic Pony")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL))
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_established_at = time.time() - 600.0
+
+        scheduler._restore_siblings_after_whole_card()
+
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
+        assert scheduler._sibling_teardown_for_model is None
+
+    async def test_restore_releases_an_unconvergeable_residency_despite_a_pending_exclusive_admit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A pending exclusive admit for the residency's model does not keep a residency that has no holder.
+
+        The pending exclusive job is exactly the work with no route to a holder, and its standing claim on the
+        card is what bars every other head, so counting it as "still serving" would hold the card for nothing.
+        Only a job actually sampling keeps the residency.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+
+        scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=2, max_inference=4)
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
+        head_job = make_job_pop_response("CyberRealistic Pony")
+        await track_popped_job_async(job_tracker, head_job)
+        flux_job = make_job_pop_response(_FLUX_MODEL)
+        await track_popped_job_async(job_tracker, flux_job)
+        job_tracker.mark_admitted_exclusive(flux_job)
+        assert job_tracker.has_exclusive_job_in_progress(None)
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_established_at = time.time() - 600.0
+
+        scheduler._restore_siblings_after_whole_card()
+
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
+        assert scheduler._sibling_teardown_for_model is None
+
+    async def test_restore_retains_a_residency_whose_model_still_has_a_holder(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Control: with the model resident on a live slot the residency can still run, so it is retained."""
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+
+        scheduler, process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=2, max_inference=4)
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
+        process_map[1].loaded_horde_model_name = _FLUX_MODEL
+        head_job = make_job_pop_response("CyberRealistic Pony")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL))
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_established_at = time.time() - 600.0
+
+        scheduler._restore_siblings_after_whole_card()
+
+        scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
+        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
+
     async def test_restore_held_through_cooldown_then_restores(
         self,
         monkeypatch: pytest.MonkeyPatch,

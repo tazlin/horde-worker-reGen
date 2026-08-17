@@ -401,6 +401,44 @@ async def test_governance_reprice_tightens_a_held_residency_without_rewriting_it
     assert reclaim_ladder.has_context_reduction(None) is True
 
 
+async def test_governance_reprice_spares_the_prestage_target_before_it_carries_the_model_name() -> None:
+    """A reprice shrink during a pre-stage takes an idle sibling, never the slot the head is loading into.
+
+    The pre-stage target carries no model name until its preload lands, so model-name protection cannot cover
+    it; the residency remembers the slot for exactly this reason, and every shrink issued while the residency
+    is held has to honour it.
+    """
+    case = WholeCardLifecycleCase(
+        mode="prestaged",
+        target=2,
+        total_processes=2,
+        holder_state=HordeProcessState.WAITING_FOR_JOB,
+        holder_load_state=ModelLoadState.LOADING,
+        sibling_models=(_RESIDENT_SDXL,),
+        queue_tail=(),
+    )
+    harness = _make_flux_head_harness(case)
+    await _queue_flux_head_case(harness, case)
+    prestage_target = harness.process_map[1]
+    prestage_target.loaded_horde_model_name = None
+    harness.scheduler._begin_whole_card_residency(
+        harness.flux_job,
+        _forecast_for_target(2),
+        announce=False,
+        target_process=prestage_target,
+    )
+    harness.scheduler._forecast_streaming = Mock(return_value=_forecast_for_target(1))
+
+    harness.scheduler._reprice_held_whole_card_residencies()
+
+    assert harness.process_map.num_loaded_inference_processes() == 1
+    assert 1 in harness.process_map
+    assert harness.process_map[1].last_process_state not in (
+        HordeProcessState.PROCESS_ENDING,
+        HordeProcessState.PROCESS_ENDED,
+    )
+
+
 async def test_governance_reprice_never_grows_a_held_residency() -> None:
     """A later roomier forecast cannot add contexts underneath a model that still owns the card."""
     case = WholeCardLifecycleCase(

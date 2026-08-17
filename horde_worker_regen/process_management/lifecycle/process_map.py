@@ -1166,6 +1166,12 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             if p.is_process_busy():
                 continue
 
+            # A slot that owns a dispatched job is serving it even while its child still reports idle:
+            # a disaggregated sampler is pinned and granted ownership before the sample stage is sent, so
+            # it sits in WAITING_FOR_JOB through the encode lane. Ownership spans exactly that window.
+            if p.current_inference_job() is not None:
+                continue
+
             # Already ending or ended; the pipe is already closing; do not re-target.
             if p.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
                 continue

@@ -3486,6 +3486,53 @@ class InferenceScheduler:
         """Operator-configured seconds to hold a whole-card residency after its last job drains."""
         return float(self._runtime_config.bridge_data.whole_card_residency_cooldown_seconds)
 
+    def _residency_can_never_converge(
+        self,
+        device_index: int | None,
+        state: WholeCardResidency,
+        *,
+        now: float,
+    ) -> bool:
+        """Whether a held residency has lost every route to either running its model or draining.
+
+        A residency is normally retained while its model still has queued or in-flight work, because that work
+        is what it was taken out to serve. The retention becomes self-defeating when the model has no holder
+        left on the card (a pool rebuild can drop a pre-stage while the ledger entry survives), nothing is
+        staging it, and the undispatched head is some other model: the preload pass targets the head, the head
+        is barred by this very residency, and no path remains to give the residency a holder or let it drain.
+        Such a residency is released through the normal restore path instead.
+
+        The no-holder condition is only trusted past the establish grace, since a residency legitimately has no
+        holder for as long as its pre-stage preload takes to land.
+        """
+        model = state.model
+        if model is None:
+            return False
+        if state.established_at == 0.0 or (now - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS:
+            return False
+        if self._whole_card_residency_has_holder(model, device_index):
+            return False
+        if self._horde_model_map.is_model_loading(model):
+            return False
+        prestage_process_id = state.prestage_process_id
+        if prestage_process_id is not None:
+            # The pre-stage target is remembered for the life of the residency, so its mere existence says
+            # nothing; only a slot still mid-load is a route to a holder.
+            prestage_process = self._process_map.get(prestage_process_id)
+            if (
+                prestage_process is not None
+                and prestage_process.is_process_alive()
+                and prestage_process.last_process_state
+                in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.DOWNLOADING_MODEL)
+            ):
+                return False
+        # Only a job actually sampling keeps the residency: a pending exclusive admit for this model is exactly
+        # the work that has no route to a holder, and its own claim on the card is what bars every other head.
+        if self._job_tracker.has_exclusive_job_running(device_index):
+            return False
+        head = self._undispatched_head()
+        return not (head is not None and head.model == model)
+
     def _restore_siblings_after_whole_card(self) -> None:
         """Restore inference concurrency and safety-on-GPU after a whole-card residency has fully drained.
 
@@ -3521,7 +3568,9 @@ class InferenceScheduler:
                 now=now,
                 max_hold_seconds=max_hold_seconds,
             )
-            if model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index):
+            if (
+                model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
+            ) and not self._residency_can_never_converge(device_index, state, now=now):
                 # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
                 # back-to-back heavy jobs).
                 if not retention_ended:
@@ -4580,10 +4629,13 @@ class InferenceScheduler:
             live_count = self._process_map.num_loaded_inference_processes(device_index=device_index)
             if effective_target is None or live_count <= effective_target:
                 continue
-            after = self._process_lifecycle.scale_inference_processes(
+            # A tightened target can arrive while the head is still pre-staging into a slot that does not yet
+            # carry its model name, so the shrink is told which slot that is, the same as the convergence shrink.
+            after = self._scale_sparing(
                 effective_target,
                 device_index=device_index,
                 protected_model=model,
+                spared_process_id=state.prestage_process_id,
             )
             if after >= live_count:
                 continue
@@ -10025,11 +10077,27 @@ class InferenceScheduler:
             # to prevent, and the job it would serve is one the queue can serve after the release. Only the
             # claimed model may still bypass, so a burst for it keeps flowing.
             pop_claim = self.whole_card_pop_claim()
-            if pinned_resident is not None or within_affinity_budget:
+            # A residency held for a model other than the head's bars the head from loading at all until it
+            # drains, and the only work that drains it is that model's own queued jobs. Those jobs therefore
+            # bypass regardless of the affinity budget, on the same ground as the pin-wait exemption: they
+            # fund no fresh copy of anything, and the head was not going to run in the meantime, so no bypass
+            # budget is being spent against it. The pop-claim restriction above still applies.
+            residency_bypass_models = {
+                residency.model
+                for _residency_device_index, residency in self._held_residencies()
+                if residency.model is not None and residency.model != next_job.model
+            }
+            if pinned_resident is not None or within_affinity_budget or residency_bypass_models:
                 for candidate_job in next_n_jobs:
                     if candidate_job.model is None or candidate_job.model == next_job.model:
                         continue
                     if pop_claim is not None and candidate_job.model != pop_claim.model:
+                        continue
+                    if (
+                        pinned_resident is None
+                        and not within_affinity_budget
+                        and candidate_job.model not in residency_bypass_models
+                    ):
                         continue
                     # A degraded retry must run isolated (see the diversity path), so it is never a bypass target.
                     if self._job_tracker.is_degraded_dispatch_pending(candidate_job):

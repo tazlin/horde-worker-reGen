@@ -2198,6 +2198,41 @@ def test_scale_down_spares_the_slot_the_caller_named() -> None:
     assert list(plm._process_map.keys()) == [0]
 
 
+def test_scale_down_spares_a_slot_that_owns_a_dispatched_job() -> None:
+    """A slot holding execution ownership is serving, so the teardown takes an unowned slot instead.
+
+    A disaggregated sampler is pinned and granted ownership before the sample stage is sent, so it sits in
+    ``WAITING_FOR_JOB`` through the text-encode lane while its job is in flight. Selecting victims on the
+    child's reported state alone kills the pinned sampler of a running job.
+    """
+    owner = make_mock_process_info(0, model_name="juggernaut", state=HordeProcessState.WAITING_FOR_JOB)
+    owner.record_inference_ownership(make_job_pop_response(model="juggernaut"), attempt_ordinal=0)
+    idle = make_mock_process_info(1, model_name="other", state=HordeProcessState.WAITING_FOR_JOB)
+    plm = _make_plm(process_map=ProcessMap({0: owner, 1: idle}))
+
+    plm.scale_inference_processes(1, protected_model="flux_model")
+
+    assert list(plm._process_map.keys()) == [0]
+
+
+def test_pressure_scale_down_spares_a_slot_that_owns_a_dispatched_job() -> None:
+    """The RAM-pressure victim search honours execution ownership too, even when the owner is the best fit."""
+    owner = make_mock_process_info(0, model_name="juggernaut", state=HordeProcessState.WAITING_FOR_JOB)
+    owner.record_inference_ownership(make_job_pop_response(model="juggernaut"), attempt_ordinal=0)
+    owner.ram_usage_bytes = 4 * 1024 * 1024 * 1024
+    idle = make_mock_process_info(1, model_name="other", state=HordeProcessState.WAITING_FOR_JOB)
+    idle.ram_usage_bytes = 8 * 1024 * 1024 * 1024
+    plm = _make_plm(process_map=ProcessMap({0: owner, 1: idle}))
+
+    victim = plm._select_inference_process_to_scale_down(
+        disallowed_processes=[],
+        pressure_shortfall_mb=1024.0,
+    )
+
+    assert victim is not None
+    assert victim.process_id == 1
+
+
 def test_scale_down_without_a_named_slot_is_unchanged() -> None:
     """With nothing named, victim selection keeps its prior behaviour and takes the first eligible slot."""
     first = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
