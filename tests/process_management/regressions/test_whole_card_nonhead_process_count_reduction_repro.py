@@ -290,7 +290,7 @@ class TestVerdictDrivenEstablishGatedByWarrant:
         process_map = _idle_context_map(_LIVE_CONTEXT_COUNT, free_mb=4709.0)
         job_tracker = JobTracker()
         scheduler = _make_scheduler(process_map, job_tracker, safety_on_gpu=False)
-        scheduler._marginal_process_overhead_mb = lambda: marginal_mb  # type: ignore[method-assign]
+        scheduler._marginal_process_overhead_mb = lambda _device_index=None: marginal_mb  # type: ignore[method-assign]
         return scheduler, make_job_pop_response(_HEAD_SDXL)
 
     async def test_card_light_sdxl_head_unmeasured_marginal_does_not_reserve_card(

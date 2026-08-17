@@ -218,3 +218,164 @@ class TestFirstContextOverheadExcludesTheDeviceBaseline:
         """The arithmetic itself, independent of any probe plumbing."""
         assert _first_context_overhead_mb(context_device_used_mb=3878, device_baseline_mb=3600) == 278
         assert _first_context_overhead_mb(context_device_used_mb=3878, device_baseline_mb=None) == 3878
+
+
+class TestPerDeviceProbeFigures:
+    """The probe measures every card, so ``detect`` carries each card's own overhead alongside the maxima."""
+
+    def _payload(self, entries: list[dict[str, object]]) -> str:
+        """One probe result line carrying several devices' before/after pairs."""
+        return _RESULT_PREFIX + json.dumps(entries)
+
+    def _run_probe(self, monkeypatch: pytest.MonkeyPatch, payload: str) -> list[ProbedAccelerator]:
+        """Run ``probe_accelerators`` against a canned child result, with no subprocess and no GPU."""
+        monkeypatch.setattr(accelerator_probe_module, "_nvml_device_count", lambda: 2)
+        monkeypatch.setattr(
+            accelerator_probe_module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(args=[], returncode=0, stdout=payload, stderr=""),
+        )
+        return probe_accelerators()
+
+    def test_each_device_keeps_its_own_derived_overhead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two cards with different baselines and different context costs stay distinct through parsing."""
+        accelerators = self._run_probe(
+            monkeypatch,
+            self._payload(
+                [
+                    {
+                        "index": 0,
+                        "name": "GPU0",
+                        "total_vram_mb": 24564,
+                        "context_device_used_mb": 3600 + 278,
+                        "device_baseline_mb": 3600,
+                        "marginal_overhead_mb": 240,
+                    },
+                    {
+                        "index": 1,
+                        "name": "GPU1",
+                        "total_vram_mb": 8192,
+                        "context_device_used_mb": 120 + 412,
+                        "device_baseline_mb": 120,
+                        "marginal_overhead_mb": 190,
+                    },
+                ],
+            ),
+        )
+        assert [a.runtime_overhead_mb for a in accelerators] == [278, 412]
+        assert [a.marginal_overhead_mb for a in accelerators] == [240, 190]
+
+    def test_an_unmeasurable_card_reports_no_figures(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card the child could not read leaves both figures at 0, which consumers treat as unmeasured."""
+        accelerators = self._run_probe(
+            monkeypatch,
+            self._payload(
+                [
+                    {
+                        "index": 0,
+                        "name": "GPU0",
+                        "total_vram_mb": 24564,
+                        "context_device_used_mb": 3600 + 278,
+                        "device_baseline_mb": 3600,
+                        "marginal_overhead_mb": 240,
+                    },
+                    {
+                        "index": 1,
+                        "name": "GPU1",
+                        "total_vram_mb": 8192,
+                        "context_device_used_mb": 0,
+                        "device_baseline_mb": None,
+                        "marginal_overhead_mb": 0,
+                        "marginal_note": "no device-wide reading for this card",
+                    },
+                ],
+            ),
+        )
+        assert accelerators[1].runtime_overhead_mb == 0
+        assert accelerators[1].marginal_overhead_mb == 0
+
+    def test_single_device_payload_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One card parses to exactly the figures it did before the probe walked every device."""
+        accelerators = self._run_probe(
+            monkeypatch,
+            self._payload(
+                [
+                    {
+                        "index": 0,
+                        "name": "GPU0",
+                        "total_vram_mb": 16375,
+                        "context_device_used_mb": 3600 + 1288,
+                        "device_baseline_mb": 3600,
+                        "marginal_overhead_mb": 455,
+                    },
+                ],
+            ),
+        )
+        assert len(accelerators) == 1
+        assert accelerators[0].runtime_overhead_mb == 1288
+        assert accelerators[0].marginal_overhead_mb == 455
+
+    def test_timeout_scales_with_the_device_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A four-card host gets four times the per-card budget; a single-card host is bounded as before."""
+        seen: list[float] = []
+
+        def _capture(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            seen.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+            return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(accelerator_probe_module.subprocess, "run", _capture)
+        monkeypatch.setattr(accelerator_probe_module, "_nvml_device_count", lambda: 4)
+        probe_accelerators(timeout_seconds=120.0)
+        monkeypatch.setattr(accelerator_probe_module, "_nvml_device_count", lambda: 1)
+        probe_accelerators(timeout_seconds=120.0)
+        monkeypatch.setattr(accelerator_probe_module, "_nvml_device_count", lambda: 0)
+        probe_accelerators(timeout_seconds=120.0)
+        assert seen == [480.0, 120.0, 120.0]
+
+
+class TestDetectCarriesPerCardFigures:
+    """``SystemResources.detect`` carries both the per-card figures and the worker-wide maxima."""
+
+    def test_per_card_map_and_maxima(self, fake_probe: list[ProbedAccelerator]) -> None:
+        """The maxima remain the worker-wide reduction; the maps let a card-scoped forecast price its card."""
+        fake_probe.extend(
+            [
+                ProbedAccelerator(
+                    index=0,
+                    name="GPU0",
+                    total_vram_mb=24564,
+                    runtime_overhead_mb=1288,
+                    marginal_overhead_mb=455,
+                ),
+                ProbedAccelerator(
+                    index=1,
+                    name="GPU1",
+                    total_vram_mb=8192,
+                    runtime_overhead_mb=4112,
+                    marginal_overhead_mb=480,
+                ),
+            ],
+        )
+        resources = SystemResources.detect()
+        assert resources.per_process_overhead_mb_by_device == {0: 1288, 1: 4112}
+        assert resources.marginal_process_overhead_mb_by_device == {0: 455, 1: 480}
+        assert resources.per_process_overhead_mb == 4112
+        assert resources.marginal_process_overhead_mb == 480
+
+    def test_unmeasured_card_is_absent_from_the_maps(self, fake_probe: list[ProbedAccelerator]) -> None:
+        """A card with no measurement contributes no key, so its consumers fall back to the maxima."""
+        fake_probe.extend(
+            [
+                ProbedAccelerator(
+                    index=0,
+                    name="GPU0",
+                    total_vram_mb=24564,
+                    runtime_overhead_mb=1288,
+                    marginal_overhead_mb=455,
+                ),
+                ProbedAccelerator(index=1, name="GPU1", total_vram_mb=8192),
+            ],
+        )
+        resources = SystemResources.detect()
+        assert resources.per_process_overhead_mb_by_device == {0: 1288}
+        assert resources.marginal_process_overhead_mb_by_device == {0: 455}

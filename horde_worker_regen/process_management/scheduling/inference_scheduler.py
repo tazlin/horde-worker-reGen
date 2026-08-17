@@ -1738,18 +1738,38 @@ class InferenceScheduler:
         ):
             self._job_tracker.mark_admitted_exclusive(job, device_index=device_index)
 
-    def set_measured_per_process_overhead_mb(self, overhead_mb: int | float) -> None:
-        """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast."""
-        self._overhead.set_per_process_overhead_mb(overhead_mb)
+    def set_measured_per_process_overhead_mb(
+        self,
+        overhead_mb: int | float,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast.
 
-    def set_measured_marginal_overhead_mb(self, marginal_mb: int | float) -> None:
+        Args:
+            overhead_mb: The measured first/sole-context cost (MB).
+            device_index: The card it was measured on, so that card's forecasts price its own context; None
+                records the worker-wide figure every card-less caller and every unmeasured card reads.
+        """
+        self._overhead.set_per_process_overhead_mb(overhead_mb, device_index=device_index)
+
+    def set_measured_marginal_overhead_mb(
+        self,
+        marginal_mb: int | float,
+        *,
+        device_index: int | None = None,
+    ) -> None:
         """Record the startup-measured *marginal* per-additional-context VRAM cost (MB) from the probe.
 
         Hard data (the probe's second-context delta) available from the first scheduling tick, so it fixes the
         startup-window over-count without waiting for siblings to reach idle. 0 (or unmeasurable) leaves the
         scheduler on its idle-residency fallback.
+
+        Args:
+            marginal_mb: The measured per-additional-context cost (MB).
+            device_index: The card it was measured on; None records the worker-wide figure.
         """
-        self._overhead.set_marginal_overhead_mb(marginal_mb)
+        self._overhead.set_marginal_overhead_mb(marginal_mb, device_index=device_index)
 
     def _config_overhead_override_mb(self) -> float | None:
         """Return the coerced ``vram_per_process_overhead_mb`` config override, or None when unset/non-numeric.
@@ -1759,15 +1779,22 @@ class InferenceScheduler:
         """
         return config_number(self._runtime_config.bridge_data.vram_per_process_overhead_mb)
 
-    def _per_process_overhead_mb(self) -> float:
+    def _per_process_overhead_mb(self, device_index: int | None = None) -> float:
         """Return the per-process VRAM overhead (MB) to assume: configured override, else measured, else 0.
 
         An explicit ``vram_per_process_overhead_mb`` config value (> 0) wins so operators can tune; otherwise
         the startup-measured figure is used. This is the *first/sole* context cost (it includes the one-time
         CUDA runtime allocation), used to size ``free_if_alone``; the per-additional-context cost is
         :meth:`_marginal_process_overhead_mb`.
+
+        Args:
+            device_index: The card being priced, so a heterogeneous host charges each card its own measured
+                context cost. None (or a card the probe could not measure) reads the worker-wide maximum.
         """
-        return self._overhead.per_process_mb(config_override_mb=self._config_overhead_override_mb())
+        return self._overhead.per_process_mb(
+            config_override_mb=self._config_overhead_override_mb(),
+            device_index=device_index,
+        )
 
     def _bare_context_total_mb(
         self,
@@ -1855,7 +1882,11 @@ class InferenceScheduler:
             # The baseline estimate absorbed the context cost (it was captured with tenants already up): there
             # is no attributable residual to latch, and the marginal correctly falls back to probe/seed.
             return
-        self._overhead.observe_idle_residency(context_total_mb=context_total_mb, context_count=context_count)
+        self._overhead.observe_idle_residency(
+            context_total_mb=context_total_mb,
+            context_count=context_count,
+            device_index=device_index,
+        )
 
     def invalidate_idle_context_floor(
         self,
@@ -1889,9 +1920,10 @@ class InferenceScheduler:
         self._overhead.observe_device_residency(
             context_total_mb=max(0.0, context_total_mb),
             context_count=context_count,
+            device_index=device_index,
         )
 
-    def _marginal_process_overhead_mb(self) -> float | None:
+    def _marginal_process_overhead_mb(self, device_index: int | None = None) -> float | None:
         """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
 
         Prefers the probe's directly-measured second-context delta (hard data, available from the first tick,
@@ -1899,8 +1931,15 @@ class InferenceScheduler:
         could not measure it on this backend), derives it from the measured all-contexts idle residency.
         Returns None when neither is available, in which case the forecast conservatively reuses the
         first-context overhead per additional context.
+
+        Args:
+            device_index: The card being priced, so a heterogeneous host charges each card its own measured
+                per-context cost. None (or a card with no measurement) reads the worker-wide figures.
         """
-        return self._overhead.marginal_mb(config_override_mb=self._config_overhead_override_mb())
+        return self._overhead.marginal_mb(
+            config_override_mb=self._config_overhead_override_mb(),
+            device_index=device_index,
+        )
 
     def resolved_context_constant_mb(self) -> float:
         """Return the per-process CUDA-context VRAM charge (MB) for the committed-VRAM attribution ledger.
@@ -2116,8 +2155,8 @@ class InferenceScheduler:
         """
         return max_coresident_for_peak(
             total_vram_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
-            per_process_overhead_mb=self._per_process_overhead_mb(),
-            marginal_overhead_mb=self._marginal_process_overhead_mb(),
+            per_process_overhead_mb=self._per_process_overhead_mb(device_index),
+            marginal_overhead_mb=self._marginal_process_overhead_mb(device_index),
             peak_mb=peak_mb,
             reserve_mb=reserve_mb,
         )
@@ -2203,7 +2242,7 @@ class InferenceScheduler:
             str(baseline) if baseline is not None else None,
             free_now_mb=self._measured_free_vram_mb(device_index=device_index),
             total_vram_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
-            per_process_overhead_mb=self._per_process_overhead_mb(),
+            per_process_overhead_mb=self._per_process_overhead_mb(device_index),
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
             num_extra_resident_contexts=num_post_process_contexts,
@@ -2212,7 +2251,7 @@ class InferenceScheduler:
             measured_resident_footprint_mb=measured_resident_mb,
             measured_observation_count=measured_observation_count,
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
-            marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
+            marginal_process_overhead_mb=self._marginal_process_overhead_mb(device_index),
             wants_whole_card=wants_whole_card,
             disaggregated=disaggregated,
             disaggregation_sibling_charge_mb=(
@@ -3788,7 +3827,7 @@ class InferenceScheduler:
             enabled=enabled,
             safety_off_gpu_enabled=safety_off_enabled,
             cooldown_seconds=self._whole_card_cooldown_seconds(),
-            per_process_overhead_mb=self._per_process_overhead_mb(),
+            per_process_overhead_mb=self._per_process_overhead_mb(representative_index),
             total_vram_mb=total_vram_mb,
             active=active,
             model=model,
@@ -5571,8 +5610,8 @@ class InferenceScheduler:
         )
 
         override_mb = self._config_overhead_override_mb()
-        per_process_mb = self._overhead.per_process_mb(config_override_mb=override_mb)
-        marginal_mb = self._overhead.marginal_mb(config_override_mb=override_mb)
+        per_process_mb = self._overhead.per_process_mb(config_override_mb=override_mb, device_index=device_index)
+        marginal_mb = self._overhead.marginal_mb(config_override_mb=override_mb, device_index=device_index)
         if marginal_mb is None or marginal_mb <= 0:
             marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
         safety_contexts = (
@@ -10966,9 +11005,12 @@ class InferenceScheduler:
         charges_mb = 0.0
         if sibling_contexts > 0:
             override_mb = self._config_overhead_override_mb()
-            per_context_mb = self._overhead.marginal_mb(config_override_mb=override_mb)
+            per_context_mb = self._overhead.marginal_mb(config_override_mb=override_mb, device_index=device_index)
             if per_context_mb is None:
-                per_context_mb = self._overhead.per_process_mb(config_override_mb=override_mb)
+                per_context_mb = self._overhead.per_process_mb(
+                    config_override_mb=override_mb,
+                    device_index=device_index,
+                )
             if per_context_mb <= 0:
                 return None
             charges_mb = sibling_contexts * per_context_mb
@@ -11262,9 +11304,9 @@ class InferenceScheduler:
         if total_vram_mb is None:
             return True
         override_mb = self._config_overhead_override_mb()
-        per_context_mb = self._overhead.marginal_mb(config_override_mb=override_mb)
+        per_context_mb = self._overhead.marginal_mb(config_override_mb=override_mb, device_index=device_index)
         if per_context_mb is None:
-            per_context_mb = self._overhead.per_process_mb(config_override_mb=override_mb)
+            per_context_mb = self._overhead.per_process_mb(config_override_mb=override_mb, device_index=device_index)
         if per_context_mb <= 0:
             return True
         safety_context = 1 if self._safety_on_gpu_permitted and not self._process_lifecycle.is_safety_gpu_paused else 0

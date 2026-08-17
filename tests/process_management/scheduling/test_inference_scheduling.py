@@ -2920,3 +2920,48 @@ class TestMissingModelLatchBound:
         """The unlatched flag is answered without consulting the clock or the budget."""
         scheduler, _now = self._scheduler_and_clock()
         assert scheduler._missing_model_recovery_latched() is False
+
+
+class TestPerCardContextOverhead:
+    """A card-scoped sizing charges the context cost measured on that card, not another card's."""
+
+    _SMALL_CARD_OVERHEAD_MB = 600.0
+    """The first-context cost the probe measured on the 8 GB card."""
+    _BIG_CARD_OVERHEAD_MB = 1300.0
+    """The first-context cost the probe measured on the 24 GB card: a different runtime, a different cost."""
+
+    def _two_card_scheduler(self) -> InferenceScheduler:
+        """A scheduler over two cards of different capacity, each with its own probed context figures."""
+        process_map = ProcessMap({})
+        for process_id, device_index, total_vram_mb in ((1, 0, 8192), (2, 1, 24564)):
+            proc = make_mock_process_info(process_id, model_name=None, device_index=device_index)
+            proc.total_vram_mb = total_vram_mb
+            process_map[process_id] = proc
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(vram_per_process_overhead_mb=0),
+        )
+        scheduler.set_measured_per_process_overhead_mb(self._SMALL_CARD_OVERHEAD_MB, device_index=0)
+        scheduler.set_measured_per_process_overhead_mb(self._BIG_CARD_OVERHEAD_MB, device_index=1)
+        scheduler.set_measured_marginal_overhead_mb(200.0, device_index=0)
+        scheduler.set_measured_marginal_overhead_mb(500.0, device_index=1)
+        return scheduler
+
+    def test_each_card_sizes_from_its_own_measured_overhead(self) -> None:
+        """The co-residency depth on each card follows that card's own first-context and marginal costs."""
+        scheduler = self._two_card_scheduler()
+        # 8192 - 4000 - 0 = 4192 budget; (4192 - 600) // 200 = 17 extra contexts beside the loader's.
+        assert scheduler._max_coresident_for_peak_mb(4000.0, 0.0, device_index=0) == 18
+        # 24564 - 4000 - 0 = 20564 budget; (20564 - 1300) // 500 = 38 extra contexts.
+        assert scheduler._max_coresident_for_peak_mb(4000.0, 0.0, device_index=1) == 39
+
+    def test_an_unmeasured_card_falls_back_to_the_worker_wide_maxima(self) -> None:
+        """A card the probe could not measure prices exactly as it did before per-card figures existed."""
+        scheduler = self._two_card_scheduler()
+        assert scheduler._per_process_overhead_mb(2) == pytest.approx(self._BIG_CARD_OVERHEAD_MB)
+        assert scheduler._marginal_process_overhead_mb(2) == pytest.approx(500.0)
+        # And a caller with no card in hand keeps the same worker-wide reduction it always had.
+        assert scheduler._per_process_overhead_mb() == pytest.approx(self._BIG_CARD_OVERHEAD_MB)
+        assert scheduler._marginal_process_overhead_mb() == pytest.approx(500.0)

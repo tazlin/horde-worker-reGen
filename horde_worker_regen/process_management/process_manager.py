@@ -322,12 +322,22 @@ class SystemResources:
     """Approx. VRAM (MB) the *first/sole* inference process consumes for its torch/CUDA context with no model
     loaded (the one-time runtime cost plus one context), measured by the accelerator probe on the idle
     device. The streaming forecast subtracts this from total VRAM to estimate the free achievable under sole
-    residency. 0 when unmeasured."""
+    residency. The worker-wide reduction over :attr:`per_process_overhead_mb_by_device` (the maximum, the
+    conservative direction for an overhead charge), for the callers that have no card in hand. 0 when
+    unmeasured."""
     marginal_process_overhead_mb: int = 0
     """Approx. VRAM (MB) each *additional* inference process's context costs once the first has paid the
     shared one-time runtime cost, measured by the probe's second-context delta. The forecast multiplies this
     (not the one-time-inclusive ``per_process_overhead_mb``) by the sibling count for free-after-model-evict.
-    0 when unmeasured, where the forecast falls back to charging the full overhead per context."""
+    The worker-wide maximum over :attr:`marginal_process_overhead_mb_by_device`. 0 when unmeasured, where the
+    forecast falls back to charging the full overhead per context."""
+    per_process_overhead_mb_by_device: dict[int, int] = dataclasses.field(default_factory=dict)
+    """Each card's own first-context overhead (MB), keyed by device index; the probe measures every device
+    separately. A card the probe could not measure is absent, and its forecasts fall back to the worker-wide
+    figure above."""
+    marginal_process_overhead_mb_by_device: dict[int, int] = dataclasses.field(default_factory=dict)
+    """Each card's own per-additional-context marginal (MB), keyed by device index. A card the probe could
+    not measure is absent, and its forecasts fall back to the worker-wide figure above."""
 
     @classmethod
     def detect(cls) -> SystemResources:
@@ -370,15 +380,19 @@ class SystemResources:
                 kind=accelerator.kind,
             )
 
-        # Both figures are worker-wide, because the model that consumes them (``ContextOverheadModel``) holds
-        # one measurement for the whole worker rather than one per card. The probe measures a context on the
-        # active device only and reports that same measurement against every accelerator, so on a multi-card
-        # host these maxima select between copies of one figure, not between cards. That is sound only because
-        # the figures are now each context's *own* cost (a before/after delta, see ``accelerator_probe``): the
-        # cards differ by tens of MB. It was not sound while the first-context figure was a device-wide used
-        # reading, where the busiest card's other tenants set a worker-wide overhead that a small card cannot
-        # afford. Making the term genuinely per-card needs per-device measurement in the probe and a per-card
-        # overhead model behind the scheduler; until then the collapse is deliberate and named here.
+        # The probe measures each card separately, so both figures are carried per device and every card-scoped
+        # forecast prices its own card. The worker-wide fields remain as the maximum across the cards: they are
+        # what a caller with no card in hand reads, and what an unmeasured card falls back to. The maximum is
+        # the conservative direction for an overhead charge, and it is safe here only because the figures are
+        # each context's *own* cost (a before/after delta, see ``accelerator_probe``), where cards differ by
+        # tens of MB. It was not safe while the first-context figure was a device-wide used reading, in which
+        # the busiest card's other tenants would set a worker-wide overhead a small card cannot afford.
+        per_process_overhead_mb_by_device = {
+            a.index: a.runtime_overhead_mb for a in accelerators if a.runtime_overhead_mb > 0
+        }
+        marginal_process_overhead_mb_by_device = {
+            a.index: a.marginal_overhead_mb for a in accelerators if a.marginal_overhead_mb > 0
+        }
         per_process_overhead_mb = max((a.runtime_overhead_mb for a in accelerators), default=0)
         marginal_process_overhead_mb = max((a.marginal_overhead_mb for a in accelerators), default=0)
 
@@ -387,6 +401,8 @@ class SystemResources:
             device_map=device_map,
             per_process_overhead_mb=per_process_overhead_mb,
             marginal_process_overhead_mb=marginal_process_overhead_mb,
+            per_process_overhead_mb_by_device=per_process_overhead_mb_by_device,
+            marginal_process_overhead_mb_by_device=marginal_process_overhead_mb_by_device,
         )
 
 
@@ -1715,8 +1731,17 @@ class HordeWorkerProcessManager:
         # can estimate the free VRAM achievable under sole residency (total - one process's context) and,
         # from the probe's second-context delta, the marginal cost of each additional sibling context (so
         # free-after-model-evict is not the one-time runtime cost multiplied by the process count).
+        # Fed per card as well as worker-wide: a card-scoped forecast prices its own card's context, while a
+        # card the probe could not measure (and every worker-wide caller) falls back to the maxima.
         self._inference_scheduler.set_measured_per_process_overhead_mb(system_resources.per_process_overhead_mb)
         self._inference_scheduler.set_measured_marginal_overhead_mb(system_resources.marginal_process_overhead_mb)
+        for device_index, overhead_mb in system_resources.per_process_overhead_mb_by_device.items():
+            self._inference_scheduler.set_measured_per_process_overhead_mb(overhead_mb, device_index=device_index)
+        for device_index, device_marginal_mb in system_resources.marginal_process_overhead_mb_by_device.items():
+            self._inference_scheduler.set_measured_marginal_overhead_mb(
+                device_marginal_mb,
+                device_index=device_index,
+            )
         # Attribute between-jobs reload/respawn churn (model swaps, VRAM evictions, process cycles) into
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)

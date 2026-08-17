@@ -67,6 +67,27 @@ class MarginalOverheadBreakdown:
     not the first-context overhead, is what is charged per extra context."""
 
 
+@dataclass
+class _IdleResidencyScope:
+    """One scope's idle bare-context observations: a single card's, or the worker's across every card.
+
+    Held per scope so a heterogeneous host derives each card's per-context marginal from readings taken on
+    that card, while the worker-wide scope keeps the pooled series every caller that has no card in hand
+    still reads.
+    """
+
+    clean_total_mb: float | None = None
+    """Lowest worker-attributable bare-context total (MB) seen while every inference process was idle and
+    model-less (the clean all-contexts baseline, typically at startup). None until seen."""
+    clean_count: int = 0
+    """Live GPU-context-bearing process count at the reading behind :attr:`clean_total_mb`."""
+    effective_total_mb: float | None = None
+    """Highest clean all-idle bare-context total (MB) seen: the floor reclaim provably cannot get below,
+    ratcheted back down when a later reading proves the device runs lower. None until seen."""
+    effective_count: int = 0
+    """Live GPU-context-bearing process count at the reading behind :attr:`effective_total_mb`."""
+
+
 class ContextOverheadModel:
     """Tracks measured per-process and marginal CUDA-context VRAM costs and derives forecast inputs.
 
@@ -74,6 +95,12 @@ class ContextOverheadModel:
     runtime allocation); the marginal overhead is the cost of each *additional* sibling context. Both are
     measured at startup by the manager's probe; the marginal can also be derived from an observed
     all-contexts idle residency when the probe could not measure it directly.
+
+    Every figure is held twice: once per card, and once worker-wide. A caller that knows which card it is
+    reasoning about passes ``device_index`` and gets that card's own measurement; a caller that does not
+    (or a card that could not be measured) gets the worker-wide reduction, which is the maximum across the
+    cards. The maximum is the conservative direction for an overhead charge, and it is what the whole model
+    returned before the probe measured cards separately, so an unmeasured card behaves exactly as before.
     """
 
     def __init__(self) -> None:
@@ -83,55 +110,99 @@ class ContextOverheadModel:
         # until measured (free-if-alone == total then). NB: this is the *first/sole* context cost (it
         # includes the one-time, device-wide CUDA runtime allocation), NOT the marginal cost of an
         # additional sibling context, which is derived below.
-        self._per_process_overhead_mb: float = 0.0
+        self._per_process_overhead_worker_mb: float = 0.0
+        self._per_process_overhead_by_device: dict[int, float] = {}
         # Startup-measured *marginal* VRAM cost of each additional sibling context (the probe's second-
         # context delta). Hard data available from the first scheduling tick, so it sizes
         # free_after_model_evict correctly even in the startup window before any sibling reaches idle. 0
         # until measured (or unmeasurable), where the model falls back to the idle-residency derivation
         # and then to the conservative overhead-per-context sizing.
-        self._marginal_overhead_mb: float = 0.0
-        # Lowest worker-attributable bare-context total (MB) observed while every loaded inference process is
-        # idle with no model resident (the clean all-contexts baseline, typically at startup). The caller
-        # computes the reading as truthful device-used minus the shared device baseline minus every GPU
-        # tenant's byte-exact allocator reservation, so it contains ONLY the context costs of the live GPU
-        # tenants: the one-time CUDA runtime plus one context each. The marginal cost of an additional
-        # context is then (residency - per_process_overhead) / (count - 1). A runtime fallback for the
-        # probe's direct marginal measurement: sizes free_after_model_evict from measurement instead of
-        # multiplying the one-time cost by the process count. None until seen.
-        self._idle_context_residency_mb: float | None = None
-        self._idle_residency_context_count: int = 0
-        # Highest bare-context total observed at a clean all-idle reading: the floor reclaim can never get
-        # below. The clean baseline above keeps the *minimum* on the assumption a context's runtime-held VRAM
-        # returns when its work ends; when that assumption fails (the runtime retains allocations the torch
-        # allocator cannot see, so they survive the reservation subtraction), the *effective* floor is the
-        # maximum, not the minimum. A probe measured against a minimal holder under-counts this, so once the
-        # effective floor is known it supersedes the probe in deriving the per-context marginal; otherwise
-        # the forecast believes in reclaimable VRAM the device never returns and routes every load into an
-        # evict-all admit. The max can over-read on a transient spike (a reading taken before a freed
-        # allocation actually returned), so observe_device_residency ratchets it back down when a later
-        # reading proves the device runs below it: capture raises it to the worst clean reading,
-        # invalidation lowers it toward the level the device actually sustains. None until seen.
-        self._effective_idle_context_total_mb: float | None = None
-        self._effective_idle_context_count: int = 0
+        self._marginal_overhead_worker_mb: float = 0.0
+        self._marginal_overhead_by_device: dict[int, float] = {}
+        # Idle bare-context observations, keyed by card (None being the worker-wide series every card feeds).
+        # The caller computes each reading as truthful device-used minus the shared device baseline minus
+        # every GPU tenant's byte-exact allocator reservation, so it contains ONLY the context costs of the
+        # live GPU tenants: the one-time CUDA runtime plus one context each. The marginal cost of an
+        # additional context is then (residency - per_process_overhead) / (count - 1), a runtime fallback for
+        # the probe's direct measurement that sizes free_after_model_evict from measurement instead of
+        # multiplying the one-time cost by the process count.
+        self._idle_residency_by_device: dict[int | None, _IdleResidencyScope] = {}
 
-    def set_per_process_overhead_mb(self, overhead_mb: int | float) -> None:
-        """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast."""
+    def _residency_scope(self, device_index: int | None) -> _IdleResidencyScope:
+        """Return the observation scope for ``device_index``, creating it on first use."""
+        scope = self._idle_residency_by_device.get(device_index)
+        if scope is None:
+            scope = _IdleResidencyScope()
+            self._idle_residency_by_device[device_index] = scope
+        return scope
+
+    def _read_residency_scope(self, device_index: int | None) -> _IdleResidencyScope:
+        """Return the scope to derive from for ``device_index``: the card's own, else the worker-wide one.
+
+        A card with no observations of its own (a reading path that reported no index, a card whose tenants
+        never reached the clean window) reads the pooled worker-wide series rather than nothing at all.
+        """
+        if device_index is not None:
+            scope = self._idle_residency_by_device.get(device_index)
+            if scope is not None:
+                return scope
+        return self._idle_residency_by_device.get(None) or _IdleResidencyScope()
+
+    def set_per_process_overhead_mb(self, overhead_mb: int | float, *, device_index: int | None = None) -> None:
+        """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast.
+
+        Args:
+            overhead_mb (int | float): The measured first/sole-context cost (MB).
+            device_index (int | None): The card the measurement was taken on, recorded so that card's own
+                forecasts price its own context. None records the worker-wide figure directly; the figure
+                every card-less caller reads is the maximum of that and every per-card measurement.
+        """
         coerced = config_number(overhead_mb)
-        if coerced is not None and coerced >= 0:
-            self._per_process_overhead_mb = coerced
+        if coerced is None or coerced < 0:
+            return
+        if device_index is None:
+            self._per_process_overhead_worker_mb = coerced
+        else:
+            self._per_process_overhead_by_device[device_index] = coerced
 
-    def set_marginal_overhead_mb(self, marginal_mb: int | float) -> None:
+    def set_marginal_overhead_mb(self, marginal_mb: int | float, *, device_index: int | None = None) -> None:
         """Record the startup-measured *marginal* per-additional-context VRAM cost (MB) from the probe.
 
         Hard data (the probe's second-context delta) available from the first scheduling tick, so it fixes
         the startup-window over-count without waiting for siblings to reach idle. 0 (or unmeasurable) leaves
         the model on its idle-residency fallback.
+
+        Args:
+            marginal_mb (int | float): The measured per-additional-context cost (MB).
+            device_index (int | None): The card the measurement was taken on. None records the worker-wide
+                figure directly; the figure every card-less caller reads is the maximum of that and every
+                per-card measurement.
         """
         coerced = config_number(marginal_mb)
-        if coerced is not None and coerced >= 0:
-            self._marginal_overhead_mb = coerced
+        if coerced is None or coerced < 0:
+            return
+        if device_index is None:
+            self._marginal_overhead_worker_mb = coerced
+        else:
+            self._marginal_overhead_by_device[device_index] = coerced
 
-    def per_process_mb(self, *, config_override_mb: float | None) -> float:
+    def _measured_per_process_mb(self, device_index: int | None) -> float:
+        """Return the measured first-context overhead (MB) for a card, else the worker-wide maximum."""
+        if device_index is not None and device_index in self._per_process_overhead_by_device:
+            return self._per_process_overhead_by_device[device_index]
+        return max(
+            [self._per_process_overhead_worker_mb, *self._per_process_overhead_by_device.values()],
+        )
+
+    def _measured_marginal_mb(self, device_index: int | None) -> float:
+        """Return the measured per-additional-context marginal (MB) for a card, else the worker-wide maximum."""
+        if device_index is not None and device_index in self._marginal_overhead_by_device:
+            return self._marginal_overhead_by_device[device_index]
+        return max(
+            [self._marginal_overhead_worker_mb, *self._marginal_overhead_by_device.values()],
+        )
+
+    def per_process_mb(self, *, config_override_mb: float | None, device_index: int | None = None) -> float:
         """Return the per-process VRAM overhead (MB) to assume: configured override, else measured, else 0.
 
         An explicit ``vram_per_process_overhead_mb`` config value (> 0) wins so operators can tune; otherwise
@@ -142,12 +213,21 @@ class ContextOverheadModel:
         Args:
             config_override_mb (float | None): The coerced ``vram_per_process_overhead_mb`` config value, or
                 None when it is unset or non-numeric (the scheduler coerces it before passing it in).
+            device_index (int | None): The card being priced. Its own measurement is returned when one
+                landed; otherwise (an unmeasured card, a probe payload predating per-card figures, or a
+                caller reasoning worker-wide) the worker-wide maximum is returned.
         """
         if config_override_mb is not None and config_override_mb > 0:
             return config_override_mb
-        return self._per_process_overhead_mb
+        return self._measured_per_process_mb(device_index)
 
-    def observe_idle_residency(self, *, context_total_mb: float, context_count: int) -> None:
+    def observe_idle_residency(
+        self,
+        *,
+        context_total_mb: float,
+        context_count: int,
+        device_index: int | None = None,
+    ) -> None:
         """Record the bare-context total observed while every inference process is idle and model-less.
 
         The reading is the true combined cost of the live GPU tenants' contexts (the one-time CUDA runtime
@@ -163,28 +243,35 @@ class ContextOverheadModel:
         only context costs: never the device baseline, never resident weights. Attributing anything else here
         multiplies it into the per-context marginal and prices the whole card into phantom over-commit.
 
+        The reading is card-attributable: the caller derives it from one card's device-used truth and that
+        card's tenants, so a ``device_index`` reading is recorded against that card as well as into the
+        pooled worker-wide series.
+
         Args:
             context_total_mb (float): Worker-attributable bare-context VRAM total (MB) at the reading.
             context_count (int): Number of live GPU-context-bearing worker processes at the reading.
+            device_index (int | None): The card the reading was taken on, or None when the caller has no
+                card in hand and the reading is worker-wide.
         """
-        if self._idle_context_residency_mb is None or context_total_mb < self._idle_context_residency_mb:
-            self._idle_context_residency_mb = context_total_mb
-            self._idle_residency_context_count = context_count
-        # The effective floor is the *worst* (highest) fully-idle, fully-evicted reading: the VRAM reclaim
-        # provably cannot return. Kept per the live context count so a later, fewer-process reading does not
-        # mask an earlier over-commit.
-        if (
-            self._effective_idle_context_total_mb is None
-            or context_count > self._effective_idle_context_count
-            or (
-                context_count == self._effective_idle_context_count
-                and context_total_mb > self._effective_idle_context_total_mb
-            )
-        ):
-            self._effective_idle_context_total_mb = context_total_mb
-            self._effective_idle_context_count = context_count
+        scopes = [self._residency_scope(None)]
+        if device_index is not None:
+            scopes.append(self._residency_scope(device_index))
+        for scope in scopes:
+            if scope.clean_total_mb is None or context_total_mb < scope.clean_total_mb:
+                scope.clean_total_mb = context_total_mb
+                scope.clean_count = context_count
+            # The effective floor is the *worst* (highest) fully-idle, fully-evicted reading: the VRAM
+            # reclaim provably cannot return. Kept per the live context count so a later, fewer-process
+            # reading does not mask an earlier over-commit.
+            if (
+                scope.effective_total_mb is None
+                or context_count > scope.effective_count
+                or (context_count == scope.effective_count and context_total_mb > scope.effective_total_mb)
+            ):
+                scope.effective_total_mb = context_total_mb
+                scope.effective_count = context_count
 
-    def marginal_mb(self, *, config_override_mb: float | None) -> float | None:
+    def marginal_mb(self, *, config_override_mb: float | None, device_index: int | None = None) -> float | None:
         """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
 
         See :meth:`marginal_breakdown` for the full resolution rule; this returns only the chosen value.
@@ -192,10 +279,17 @@ class ContextOverheadModel:
         Args:
             config_override_mb (float | None): The coerced ``vram_per_process_overhead_mb`` config value (it
                 feeds the per-process overhead the derivation subtracts), or None when unset.
+            device_index (int | None): The card being priced; its own probe figure and idle observations are
+                preferred, falling back to the worker-wide ones.
         """
-        return self.marginal_breakdown(config_override_mb=config_override_mb).chosen_mb
+        return self.marginal_breakdown(config_override_mb=config_override_mb, device_index=device_index).chosen_mb
 
-    def marginal_breakdown(self, *, config_override_mb: float | None) -> MarginalOverheadBreakdown:
+    def marginal_breakdown(
+        self,
+        *,
+        config_override_mb: float | None,
+        device_index: int | None = None,
+    ) -> MarginalOverheadBreakdown:
         """Resolve the per-additional-context marginal and report the signals behind it.
 
         Prefers the larger of the probe's directly-measured second-context delta and the idle-residency
@@ -215,19 +309,23 @@ class ContextOverheadModel:
         Args:
             config_override_mb (float | None): The coerced ``vram_per_process_overhead_mb`` config value (it
                 feeds the per-process overhead the derivation subtracts), or None when unset.
+            device_index (int | None): The card being priced; its own probe figure and idle observations are
+                preferred, falling back to the worker-wide ones.
         """
-        per_process = self.per_process_mb(config_override_mb=config_override_mb)
+        per_process = self.per_process_mb(config_override_mb=config_override_mb, device_index=device_index)
 
         def _derive(residency: float | None, count: int) -> float | None:
             if residency is None or count < 2 or per_process <= 0 or residency <= per_process:
                 return None
             return (residency - per_process) / (count - 1)
 
-        probe = self._marginal_overhead_mb if self._marginal_overhead_mb > 0 else None
-        idle_floor = _derive(self._effective_idle_context_total_mb, self._effective_idle_context_count)
+        measured_marginal = self._measured_marginal_mb(device_index)
+        probe = measured_marginal if measured_marginal > 0 else None
+        scope = self._read_residency_scope(device_index)
+        idle_floor = _derive(scope.effective_total_mb, scope.effective_count)
         if idle_floor is None:
             # No effective (worst-case) floor yet: fall back to the clean idle-residency derivation (startup).
-            idle_floor = _derive(self._idle_context_residency_mb, self._idle_residency_context_count)
+            idle_floor = _derive(scope.clean_total_mb, scope.clean_count)
 
         candidates = [
             (value, source) for value, source in ((probe, "probe"), (idle_floor, "idle_floor")) if value is not None
@@ -237,7 +335,13 @@ class ContextOverheadModel:
         chosen, source = max(candidates, key=lambda candidate: candidate[0])
         return MarginalOverheadBreakdown(probe, idle_floor, chosen, source)
 
-    def observe_device_residency(self, *, context_total_mb: float, context_count: int) -> None:
+    def observe_device_residency(
+        self,
+        *,
+        context_total_mb: float,
+        context_count: int,
+        device_index: int | None = None,
+    ) -> None:
         """Lower a latched effective idle floor once a later reading proves it was not sustained.
 
         The effective floor (:meth:`observe_idle_residency`) keeps the *worst* clean all-idle reading on the
@@ -256,10 +360,16 @@ class ContextOverheadModel:
         Args:
             context_total_mb (float): Current worker-attributable bare-context VRAM total (MB).
             context_count (int): Number of live GPU-context-bearing worker processes at the reading.
+            device_index (int | None): The card the reading was taken on, or None when worker-wide. A card's
+                reading corrects that card's floor and the pooled worker-wide floor alike.
         """
-        if self._effective_idle_context_total_mb is None:
-            return
-        if context_count < self._effective_idle_context_count:
-            return
-        if context_total_mb < self._effective_idle_context_total_mb:
-            self._effective_idle_context_total_mb = max(0.0, context_total_mb)
+        scopes = [self._idle_residency_by_device.get(None)]
+        if device_index is not None:
+            scopes.append(self._idle_residency_by_device.get(device_index))
+        for scope in scopes:
+            if scope is None or scope.effective_total_mb is None:
+                continue
+            if context_count < scope.effective_count:
+                continue
+            if context_total_mb < scope.effective_total_mb:
+                scope.effective_total_mb = max(0.0, context_total_mb)

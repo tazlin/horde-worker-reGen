@@ -14,7 +14,12 @@ supports (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU), not just NVIDIA.
 
 Beyond the inventory, the subprocess also measures two VRAM figures the streaming forecast needs, which
 correspond to two distinct terms of the device's VRAM decomposition (device baseline / per-process
-marginal overhead / model weights / activation peaks; see ``scheduling/context_overhead_model``):
+marginal overhead / model weights / activation peaks; see ``scheduling/context_overhead_model``). Both are
+measured **per card**, one card at a time: the probe materialises its own context on each device in turn and
+brings up a sibling context pinned to that device, so a heterogeneous host gets each card's own figures
+rather than one card's applied to all of them. Where a card cannot be measured (no NVML on a card that is
+not the active torch device) its entry reports the figures as unmeasured and the consumer falls back to the
+worker-wide reduction. The two figures are:
 
 - the *first/sole* process's context cost: the one-time, device-wide CUDA runtime allocation plus one
   context. This is paid once per device and sizes ``free_if_alone``; it is never the cost of an additional
@@ -50,9 +55,11 @@ from pydantic import BaseModel
 # parsing is robust against any stray stdout (logging/telemetry banners) the import might produce.
 _RESULT_PREFIX = "ACCEL_PROBE_JSON:"
 
-# A minimal second process that materialises *its own* backend context on the same device (a real kernel
-# launch, so the runtime/context fully allocates (enumeration alone does not), announces it, then idles
-# until the probe kills it. Run via ``python -c`` from the probe (below), so it stays a plain source string.
+# A minimal second process that materialises *its own* backend context (a real kernel launch, so the
+# runtime/context fully allocates; enumeration alone does not), announces it, then idles until the probe
+# kills it. Run via ``python -c`` from the probe (below), so it stays a plain source string. It names no
+# device: the probe launches it under hordelib's device mask for the card being measured, so the card it
+# must land on is the only one it can see.
 _HOLDER_SOURCE = """
 import sys
 
@@ -78,30 +85,44 @@ except BaseException as exc:  # noqa: BLE001
     sys.exit(4)
 """
 
+_MAX_NVML_DEVICE_SCAN = 16
+"""How far the child walks NVML device indices when reading the pre-context baselines.
+
+hordelib's NVML wrapper exposes no device-count helper, so the child probes handles upward until one comes
+back unreadable. The cap keeps a driver that answers for absurd indices from turning the baseline sweep into
+an unbounded loop; no host the worker runs on has anything near this many accelerators."""
+
 _PROBE_SOURCE = f"""
 import json
+import os
 import subprocess
 import sys
 import threading
 
 try:
-    def _nvml_used_mb():
+    def _nvml_used_mb(_index):
         # NVML queries the driver without creating a CUDA context, and reports true device-wide usage on
         # every platform (including Windows WDDM, where the torch reading below is only this process's view).
         # Both properties are load-bearing for the before/after pair: a "before" reading taken through torch
         # would initialise CUDA and so already contain the context being measured, and a pair read on
-        # different bases would not subtract.
+        # different bases would not subtract. Indexed, so each card's pair is read on that card.
         try:
             from hordelib.utils.nvml import get_device_memory_mb
 
-            _memory = get_device_memory_mb(0)
+            _memory = get_device_memory_mb(_index)
             return None if _memory is None else int(_memory.used_mb)
         except BaseException:
             return None
 
-    # Read the device's pre-existing baseline FIRST, before anything can touch the GPU: enumeration and every
-    # torch memory helper initialise CUDA as a side effect.
-    _baseline_mb = _nvml_used_mb()
+    # Read every device's pre-existing baseline FIRST, before anything can touch any GPU: enumeration and
+    # every torch memory helper initialise CUDA as a side effect. The walk stops at the first unreadable
+    # handle, which is also how a host without NVML ends up with no baselines at all.
+    _baselines = {{}}
+    for _scan_index in range({_MAX_NVML_DEVICE_SCAN}):
+        _scanned_mb = _nvml_used_mb(_scan_index)
+        if _scanned_mb is None:
+            break
+        _baselines[_scan_index] = _scanned_mb
 
     from hordelib.utils.torch_memory import enumerate_accelerators
     # Device-wide free (mem_get_info), NOT comfy's per-process view (torch_memory.get_torch_free_vram_mb):
@@ -113,14 +134,17 @@ try:
     _accelerators = enumerate_accelerators()
 
     def _device_used_mb():
+        # Reports the *active* torch device only: these helpers take no index. It is therefore the fallback
+        # basis for the first enumerated card alone; every other card is measured through NVML or reported
+        # unmeasured.
         return max(0, int(get_torch_total_vram_mb()) - int(get_torch_device_free_vram_mb()))
 
-    def _materialize_context():
+    def _materialize_context(_index):
         import torch
         if torch.cuda.is_available():
-            _dev = "cuda"
+            _dev = "cuda:" + str(_index)
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            _dev = "xpu"
+            _dev = "xpu:" + str(_index)
         else:
             return
         # Match the holder: a matmul loads cuBLAS so this process's context materialises like a real
@@ -128,102 +152,141 @@ try:
         _block = torch.ones((512, 512), device=_dev)
         float((_block @ _block).sum().item())
 
-    # First/sole context: materialise this process's context, then read used again. The pair is reported raw
-    # and the parent takes the delta (see _first_context_overhead_mb): the subtraction is plain arithmetic that
-    # must stay directly testable, while this child only ever runs on real hardware. The NVML pair is used when
-    # both readings landed, so the two figures share a basis; otherwise the baseline is dropped and the torch
-    # reading stands alone (baseline-inclusive, over-counting in the safe direction, as before).
-    try:
-        _materialize_context()
-        _overhead_mb = _device_used_mb()
-        _context_nvml_mb = _nvml_used_mb()
-    except BaseException:
-        _overhead_mb = 0
-        _context_nvml_mb = None
-    if _baseline_mb is None or _context_nvml_mb is None:
-        _context_used_mb = _overhead_mb
-        _baseline_mb = None
-    else:
-        _context_used_mb = _context_nvml_mb
+    def _holder_env(_accelerator):
+        # Pin the holder to this one card through hordelib's single source of truth for device masking, so
+        # the sibling context lands on the card whose delta is being read. The holder source stays
+        # device-agnostic: under the mask the target card is the only one it can see. A backend that needs
+        # no masking (cpu, mps) yields an empty patch, leaving the holder where it would have run anyway.
+        _env = dict(os.environ)
+        try:
+            from hordelib.utils.device_pinning import device_pin_env
 
-    # Marginal cost of an *additional* sibling context: bring up a second process that materialises its own
-    # context, then measure the device-wide used delta. The one-time runtime (and any device baseline) is
-    # already counted, so the delta is what each extra inference process really costs (the per-context figure
-    # the forecast multiplies by (process count - 1) for free_after_model_evict, instead of charging the whole
-    # one-time-inclusive overhead per process. Best-effort: any failure leaves it 0 and the worker falls back.
-    _marginal_mb = 0
-    _marginal_note = "not attempted"
-    _holder = None
-    try:
-        _holder = subprocess.Popen(
-            [sys.executable, "-c", {_HOLDER_SOURCE!r}],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        _ready = {{"ok": False}}
+            _pin, _unused_args = device_pin_env(_accelerator.kind, int(_accelerator.index))
+            _env.update(_pin)
+        except BaseException:
+            return _env
+        return _env
 
-        def _await_ready():
-            # Scan the holder's stdout for the sentinel rather than reading one line: importing hordelib
-            # prints telemetry banners to stdout first. An empty read is EOF (the holder died).
-            while True:
-                line = _holder.stdout.readline()
-                if not line:
-                    return
-                if line.strip() == "HOLDER_READY":
-                    _ready["ok"] = True
-                    return
-
-        _waiter = threading.Thread(target=_await_ready, daemon=True)
-        _waiter.start()
-        _waiter.join(timeout=90)  # bound a hung holder so it never costs the basic device inventory
-        if not _ready["ok"]:
-            _marginal_note = "holder never signalled ready (timeout or early exit)"
-        else:
-            # Take the delta on the NVML basis, not the torch one. torch's device-free reading is
-            # per-process on Windows WDDM, so it cannot see the holder's context at all and the
-            # subtraction is structurally zero there; NVML queries the driver and is device-wide on
-            # every platform. Falls back to the torch pair only where NVML is unavailable, which is
-            # the reading that at least works on the platforms where it is device-wide.
-            _after_nvml_mb = _nvml_used_mb()
-            if _after_nvml_mb is not None and _context_nvml_mb is not None:
-                _marginal_mb = max(0, _after_nvml_mb - _context_nvml_mb)
-                _marginal_note = f"nvml delta {{_after_nvml_mb}}-{{_context_nvml_mb}}"
-            else:
-                _marginal_mb = max(0, _device_used_mb() - _overhead_mb)
-                _marginal_note = "torch delta (nvml unavailable); per-process on WDDM, may read 0"
-            if _marginal_mb == 0:
-                _marginal_note += "; measured zero"
-    except BaseException as _marginal_exc:
+    def _measure_marginal(_accelerator, _context_nvml_mb, _overhead_mb, _torch_basis):
+        # Marginal cost of an *additional* sibling context on this card: bring up a second process pinned to
+        # it that materialises its own context, then measure the device-wide used delta. The one-time runtime
+        # (and any device baseline) is already counted, so the delta is what each extra inference process
+        # really costs (the per-context figure the forecast multiplies by (process count - 1) for
+        # free_after_model_evict, instead of charging the whole one-time-inclusive overhead per process).
+        # Best-effort: any failure leaves it 0 and the worker falls back.
+        _index = int(_accelerator.index)
         _marginal_mb = 0
-        _marginal_note = "raised: " + repr(_marginal_exc)
-    finally:
-        if _holder is not None:
-            try:
-                _holder.kill()
-                # Drain both pipes after killing. stderr is a pipe so a holder failure is reportable
-                # rather than discarded, and an undrained pipe can block the writer once its buffer
-                # fills, which would turn a noisy holder into the hang the ready-timeout exists to bound.
-                _, _holder_err = _holder.communicate(timeout=10)
-                if _holder_err and _marginal_mb == 0:
-                    _marginal_note += " | holder stderr: " + _holder_err.strip().replace("\\n", " ")[-300:]
-            except BaseException:
-                pass
+        _marginal_note = "not attempted"
+        _holder = None
+        try:
+            _holder = subprocess.Popen(
+                [sys.executable, "-c", {_HOLDER_SOURCE!r}],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=_holder_env(_accelerator),
+            )
+            _ready = {{"ok": False}}
 
-    _payload = [
-        {{
-            "index": int(a.index),
-            "name": str(a.name),
-            "total_vram_mb": int(a.total_vram_mb),
-            "kind": str(a.kind),
+            def _await_ready():
+                # Scan the holder's stdout for the sentinel rather than reading one line: importing hordelib
+                # prints telemetry banners to stdout first. An empty read is EOF (the holder died).
+                while True:
+                    line = _holder.stdout.readline()
+                    if not line:
+                        return
+                    if line.strip() == "HOLDER_READY":
+                        _ready["ok"] = True
+                        return
+
+            _waiter = threading.Thread(target=_await_ready, daemon=True)
+            _waiter.start()
+            _waiter.join(timeout=90)  # bound a hung holder so it never costs the basic device inventory
+            if not _ready["ok"]:
+                _marginal_note = "holder never signalled ready (timeout or early exit)"
+            else:
+                # Take the delta on the NVML basis, not the torch one. torch's device-free reading is
+                # per-process on Windows WDDM, so it cannot see the holder's context at all and the
+                # subtraction is structurally zero there; NVML queries the driver and is device-wide on
+                # every platform. Falls back to the torch pair only where NVML is unavailable, and only on
+                # the active torch device, since those helpers cannot be pointed at another card.
+                _after_nvml_mb = _nvml_used_mb(_index)
+                if _after_nvml_mb is not None and _context_nvml_mb is not None:
+                    _marginal_mb = max(0, _after_nvml_mb - _context_nvml_mb)
+                    _marginal_note = f"nvml delta {{_after_nvml_mb}}-{{_context_nvml_mb}}"
+                elif _torch_basis:
+                    _marginal_mb = max(0, _device_used_mb() - _overhead_mb)
+                    _marginal_note = "torch delta (nvml unavailable); per-process on WDDM, may read 0"
+                else:
+                    _marginal_note = (
+                        "no device-wide reading for this card (nvml unavailable and it is not the "
+                        "active torch device)"
+                    )
+                if _marginal_mb == 0 and _marginal_note.startswith(("nvml delta", "torch delta")):
+                    _marginal_note += "; measured zero"
+        except BaseException as _marginal_exc:
+            _marginal_mb = 0
+            _marginal_note = "raised: " + repr(_marginal_exc)
+        finally:
+            if _holder is not None:
+                try:
+                    _holder.kill()
+                    # Drain both pipes after killing. stderr is a pipe so a holder failure is reportable
+                    # rather than discarded, and an undrained pipe can block the writer once its buffer
+                    # fills, which would turn a noisy holder into the hang the ready-timeout exists to bound.
+                    _, _holder_err = _holder.communicate(timeout=10)
+                    if _holder_err and _marginal_mb == 0:
+                        _marginal_note += " | holder stderr: " + _holder_err.strip().replace("\\n", " ")[-300:]
+                except BaseException:
+                    pass
+        return _marginal_mb, _marginal_note
+
+    def _measure_device(_accelerator):
+        # One card's measurement, run to completion before the next card starts. The marginal is a
+        # before/after pair around a sibling context, so two cards measured concurrently would let one
+        # card's holder start inside the other's window and pollute a shared-driver reading.
+        _index = int(_accelerator.index)
+        _baseline_mb = _baselines.get(_index)
+        # The torch memory helpers report the active device only, so they are a usable fallback basis for
+        # the first enumerated card alone. Other cards degrade to "unmeasured" rather than to another
+        # card's reading, which the parent turns into a worker-wide fallback.
+        _torch_basis = _index == 0
+        try:
+            _materialize_context(_index)
+            _overhead_mb = _device_used_mb() if _torch_basis else 0
+            _context_nvml_mb = _nvml_used_mb(_index)
+        except BaseException:
+            _overhead_mb = 0
+            _context_nvml_mb = None
+        # First/sole context: the pair is reported raw and the parent takes the delta (see
+        # _first_context_overhead_mb): the subtraction is plain arithmetic that must stay directly testable,
+        # while this child only ever runs on real hardware. The NVML pair is used when both readings landed,
+        # so the two figures share a basis; otherwise the baseline is dropped and the torch reading stands
+        # alone (baseline-inclusive, over-counting in the safe direction).
+        if _baseline_mb is None or _context_nvml_mb is None:
+            _context_used_mb = _overhead_mb
+            _baseline_mb = None
+        else:
+            _context_used_mb = _context_nvml_mb
+        _marginal_mb, _marginal_note = _measure_marginal(
+            _accelerator,
+            _context_nvml_mb,
+            _overhead_mb,
+            _torch_basis,
+        )
+        return {{
+            "index": _index,
+            "name": str(_accelerator.name),
+            "total_vram_mb": int(_accelerator.total_vram_mb),
+            "kind": str(_accelerator.kind),
             "context_device_used_mb": _context_used_mb,
             "device_baseline_mb": _baseline_mb,
             "marginal_overhead_mb": _marginal_mb,
             "marginal_note": _marginal_note,
         }}
-        for a in _accelerators
-    ]
+
+    _payload = [_measure_device(a) for a in _accelerators]
 except BaseException as exc:  # noqa: BLE001 - any failure means "no devices"; report and exit non-zero
     print("ACCEL_PROBE_ERR:" + repr(exc), file=sys.stderr)
     sys.exit(3)
@@ -294,6 +357,27 @@ def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_m
     return max(0, context_device_used_mb - device_baseline_mb)
 
 
+def _nvml_device_count() -> int:
+    """Return how many NVML-visible devices this host has, or 0 when NVML cannot answer.
+
+    Read through hordelib's torch-free NVML wrapper (which has no count helper, so the handles are walked
+    until one comes back unreadable), because the caller must stay torch-free and the only thing this figure
+    is used for is sizing the probe's subprocess timeout. A non-NVIDIA backend answers 0 and the caller
+    falls back to a single-device budget, which is what the timeout was before per-device measurement.
+    """
+    try:
+        from hordelib.utils.nvml import get_device_memory_mb
+    except ImportError as import_error:
+        logger.debug(f"NVML device count unavailable: {import_error}")
+        return 0
+    count = 0
+    while count < _MAX_NVML_DEVICE_SCAN:
+        if get_device_memory_mb(count) is None:
+            break
+        count += 1
+    return count
+
+
 def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelerator]:
     """Return the machine's accelerators by enumerating them in a short-lived subprocess.
 
@@ -301,13 +385,19 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
     exits. Never raises: any failure (no backend, subprocess error or timeout, malformed output) is
     logged at debug and yields an empty list, so the caller degrades to "no devices detected" rather than
     crashing. The subprocess reuses this interpreter (``sys.executable``), so it sees the same hordelib.
+
+    Args:
+        timeout_seconds (float): The budget for measuring *one* card. The child measures each card in turn
+            (a first context, then a pinned sibling context, per device), so the subprocess is given this
+            budget multiplied by the device count; a single-device host is bounded exactly as before.
     """
+    device_budget = max(1, _nvml_device_count())
     try:
         completed = subprocess.run(
             [sys.executable, "-c", _PROBE_SOURCE],
             capture_output=True,
             text=True,
-            timeout=timeout_seconds,
+            timeout=timeout_seconds * device_budget,
             check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as run_error:

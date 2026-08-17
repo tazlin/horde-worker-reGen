@@ -85,7 +85,7 @@ class TestMarginalDerivation:
         model.set_per_process_overhead_mb(1000)
         model.observe_idle_residency(context_total_mb=4000.0, context_count=3)
         model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
-        assert model._idle_context_residency_mb == pytest.approx(4000.0)
+        assert model._read_residency_scope(None).clean_total_mb == pytest.approx(4000.0)
 
     def test_effective_floor_keeps_worst_reading(self) -> None:
         """The effective floor keeps the worst (highest) used-VRAM reading at a process count."""
@@ -93,7 +93,7 @@ class TestMarginalDerivation:
         model.set_per_process_overhead_mb(1000)
         model.observe_idle_residency(context_total_mb=4000.0, context_count=3)
         model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
-        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
+        assert model._read_residency_scope(None).effective_total_mb == pytest.approx(9000.0)
 
     def test_sustained_idle_floor_supersedes_probe(self) -> None:
         """An uncontradicted (sustained) idle floor above the probe supersedes it, never under-counting."""
@@ -183,7 +183,7 @@ class TestEffectiveFloorInvalidation:
         assert model.marginal_breakdown(config_override_mb=None).source == "idle_floor"
         # The device later runs at only ~9 GB used with the same contexts live: the spike was reclaimable.
         model.observe_device_residency(context_total_mb=9000.0, context_count=4)
-        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
+        assert model._read_residency_scope(None).effective_total_mb == pytest.approx(9000.0)
         # The corrected floor (~1578/ctx) no longer dwarfs the 650 probe by a phantom margin.
         assert model.marginal_mb(config_override_mb=None) == pytest.approx((9000.0 - 4266.0) / 3)
 
@@ -193,7 +193,7 @@ class TestEffectiveFloorInvalidation:
         model.set_per_process_overhead_mb(1000)
         model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
         model.observe_device_residency(context_total_mb=12000.0, context_count=3)
-        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
+        assert model._read_residency_scope(None).effective_total_mb == pytest.approx(9000.0)
 
     def test_invalidation_ignores_fewer_live_contexts(self) -> None:
         """A lower reading with fewer contexts live is not comparable and must not lower the floor."""
@@ -201,11 +201,100 @@ class TestEffectiveFloorInvalidation:
         model.set_per_process_overhead_mb(1000)
         model.observe_idle_residency(context_total_mb=9000.0, context_count=4)
         model.observe_device_residency(context_total_mb=5000.0, context_count=2)
-        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
+        assert model._read_residency_scope(None).effective_total_mb == pytest.approx(9000.0)
 
     def test_invalidation_noop_without_a_latched_floor(self) -> None:
         """With no effective floor yet, an observation is a harmless no-op."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
         model.observe_device_residency(context_total_mb=5000.0, context_count=4)
-        assert model._effective_idle_context_total_mb is None
+        assert model._read_residency_scope(None).effective_total_mb is None
+
+
+class TestPerCardFigures:
+    """Each card's measured context cost is kept separately, with the worker-wide maximum as the fallback."""
+
+    def test_each_card_reads_its_own_measurement(self) -> None:
+        """A card the probe measured is priced from its own figure, not another card's."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1288, device_index=0)
+        model.set_per_process_overhead_mb(4266, device_index=1)
+        model.set_marginal_overhead_mb(455.0, device_index=0)
+        model.set_marginal_overhead_mb(650.0, device_index=1)
+        assert model.per_process_mb(config_override_mb=None, device_index=0) == pytest.approx(1288.0)
+        assert model.per_process_mb(config_override_mb=None, device_index=1) == pytest.approx(4266.0)
+        assert model.marginal_mb(config_override_mb=None, device_index=0) == pytest.approx(455.0)
+        assert model.marginal_mb(config_override_mb=None, device_index=1) == pytest.approx(650.0)
+
+    def test_worker_wide_is_the_maximum_across_cards(self) -> None:
+        """A caller with no card in hand keeps the conservative reduction: the largest card figure."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1288, device_index=0)
+        model.set_per_process_overhead_mb(4266, device_index=1)
+        model.set_marginal_overhead_mb(455.0, device_index=0)
+        model.set_marginal_overhead_mb(650.0, device_index=1)
+        assert model.per_process_mb(config_override_mb=None) == pytest.approx(4266.0)
+        assert model.marginal_mb(config_override_mb=None) == pytest.approx(650.0)
+
+    def test_unmeasured_card_falls_back_to_worker_wide(self) -> None:
+        """A card the probe could not measure prices exactly as it did before per-card figures existed."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1288, device_index=0)
+        model.set_marginal_overhead_mb(455.0, device_index=0)
+        assert model.per_process_mb(config_override_mb=None, device_index=3) == pytest.approx(1288.0)
+        assert model.marginal_mb(config_override_mb=None, device_index=3) == pytest.approx(455.0)
+
+    def test_worker_wide_measurement_alone_serves_every_card(self) -> None:
+        """A probe payload predating per-card figures leaves every card on the single worker-wide value."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1288)
+        model.set_marginal_overhead_mb(455.0)
+        assert model.per_process_mb(config_override_mb=None, device_index=1) == pytest.approx(1288.0)
+        assert model.marginal_mb(config_override_mb=None, device_index=1) == pytest.approx(455.0)
+
+    def test_config_override_still_wins_per_card(self) -> None:
+        """The operator override is worker-wide policy and outranks any card's measurement."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1288, device_index=0)
+        assert model.per_process_mb(config_override_mb=2000.0, device_index=0) == pytest.approx(2000.0)
+
+
+class TestPerCardIdleResidency:
+    """Idle bare-context readings are card-attributable, so each card derives its marginal from its own."""
+
+    def test_each_card_derives_from_its_own_readings(self) -> None:
+        """Two cards at different idle residencies yield two different per-context marginals."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1000, device_index=0)
+        model.set_per_process_overhead_mb(1000, device_index=1)
+        model.observe_idle_residency(context_total_mb=3000.0, context_count=3, device_index=0)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3, device_index=1)
+        assert model.marginal_mb(config_override_mb=None, device_index=0) == pytest.approx(1000.0)
+        assert model.marginal_mb(config_override_mb=None, device_index=1) == pytest.approx(4000.0)
+
+    def test_card_readings_still_feed_the_worker_wide_series(self) -> None:
+        """A card-less caller keeps the pooled behaviour it had before the readings were keyed per card."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1000)
+        model.observe_idle_residency(context_total_mb=3000.0, context_count=3, device_index=0)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3, device_index=1)
+        assert model._read_residency_scope(None).clean_total_mb == pytest.approx(3000.0)
+        assert model._read_residency_scope(None).effective_total_mb == pytest.approx(9000.0)
+
+    def test_card_without_readings_falls_back_to_the_pooled_series(self) -> None:
+        """A card whose readings never carried an index still derives from what the worker observed."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1000)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
+        assert model.marginal_mb(config_override_mb=None, device_index=2) == pytest.approx(4000.0)
+
+    def test_invalidation_lowers_only_the_cards_it_names(self) -> None:
+        """A card proving it runs lower corrects its own floor and the pooled one, never a sibling's."""
+        model = ContextOverheadModel()
+        model.set_per_process_overhead_mb(1000)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3, device_index=0)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3, device_index=1)
+        model.observe_device_residency(context_total_mb=4000.0, context_count=3, device_index=0)
+        assert model._read_residency_scope(0).effective_total_mb == pytest.approx(4000.0)
+        assert model._read_residency_scope(1).effective_total_mb == pytest.approx(9000.0)
+        assert model._read_residency_scope(None).effective_total_mb == pytest.approx(4000.0)

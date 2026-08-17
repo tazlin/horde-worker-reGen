@@ -206,8 +206,10 @@ class TestProbeOverheadTeardownWedge:
             device_index=0,
         )
 
-        assert scheduler._overhead._idle_context_residency_mb == pytest.approx(_IDLE_DEVICE_USED_ALL_CONTEXTS_MB)
-        assert scheduler._overhead._idle_residency_context_count == _NUM_INFERENCE_PROCESSES
+        assert scheduler._overhead._read_residency_scope(None).clean_total_mb == pytest.approx(
+            _IDLE_DEVICE_USED_ALL_CONTEXTS_MB
+        )
+        assert scheduler._overhead._read_residency_scope(None).clean_count == _NUM_INFERENCE_PROCESSES
         expected = (_IDLE_DEVICE_USED_ALL_CONTEXTS_MB - _PROBE_SINGLE_PROCESS_OVERHEAD_MB) / (
             _NUM_INFERENCE_PROCESSES - 1
         )
@@ -233,7 +235,7 @@ class TestProbeOverheadTeardownWedge:
         expected_residual = (
             _IDLE_DEVICE_USED_ALL_CONTEXTS_MB - baseline_mb - reserved_each_mb * _NUM_INFERENCE_PROCESSES
         )
-        assert scheduler._overhead._idle_context_residency_mb == pytest.approx(expected_residual)
+        assert scheduler._overhead._read_residency_scope(None).clean_total_mb == pytest.approx(expected_residual)
 
     def test_capture_skips_when_baseline_absorbed_contexts(self) -> None:
         """A non-positive residual (baseline captured with tenants already up) latches nothing.
@@ -247,7 +249,7 @@ class TestProbeOverheadTeardownWedge:
             baseline_mb=float(_IDLE_DEVICE_USED_ALL_CONTEXTS_MB),
             device_index=0,
         )
-        assert scheduler._overhead._idle_context_residency_mb is None
+        assert scheduler._overhead._read_residency_scope(None).clean_total_mb is None
 
     def test_marginal_falls_back_without_clean_baseline(self) -> None:
         """With no clean all-idle baseline observed, marginal is None so the forecast reuses the overhead."""
@@ -261,7 +263,7 @@ class TestProbeOverheadTeardownWedge:
             device_index=0,
         )
 
-        assert scheduler._overhead._idle_context_residency_mb is None
+        assert scheduler._overhead._read_residency_scope(None).clean_total_mb is None
         assert scheduler._marginal_process_overhead_mb() is None
 
     def test_probe_marginal_takes_precedence_over_idle_residency(self) -> None:
@@ -297,7 +299,9 @@ class TestProbeOverheadTeardownWedge:
             baseline_mb=0.0,
             device_index=0,
         )
-        assert scheduler._overhead._idle_context_residency_mb is None  # no idle-residency fallback available
+        assert (
+            scheduler._overhead._read_residency_scope(None).clean_total_mb is None
+        )  # no idle-residency fallback available
 
         scheduler.set_measured_marginal_overhead_mb(455.0)
         assert scheduler._marginal_process_overhead_mb() == pytest.approx(455.0)

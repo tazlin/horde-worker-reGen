@@ -1318,6 +1318,16 @@ It derives them from two measurements, preferring hard data and erring conservat
   refines the probe upward. The scheduler takes the **max** of the probe and the idle-floor derivation, so
   it never believes in headroom the device will not give back.
 
+Both figures are held **per card** as well as worker-wide. The probe measures each device in turn (its own
+first context on that device, then a sibling context pinned to it through hordelib's device mask), and the
+idle-floor readings already arrive scoped to one card, so a heterogeneous host prices each card from its own
+measurements instead of applying one card's context cost to all of them. Card-scoped consumers (the
+streaming forecast, the co-residency depth, the arbiter's per-card device snapshot, the whole-card retention
+grant, the post-processing co-residency gate) pass the card they are reasoning about. A card the probe could
+not measure, an older probe payload with no per-device figures, and every caller with no card in hand all
+read the worker-wide reduction, which is the **maximum** across the cards: the conservative direction for an
+overhead charge, and exactly what the model returned before the figures were separated.
+
 The risk in that `max` is a *transient* spike: a clean all-idle reading taken before a freed runtime
 allocation actually returned reads high and, kept as the worst-ever floor, would pin an inflated per-context
 cost for the whole session and route ordinary models into needless teardowns. The floor is therefore kept
