@@ -1,12 +1,18 @@
-"""The runtime safety-placement policy: keep safety off-GPU when its charge cannot fit beside sampling.
+"""The runtime safety-placement policy: keep safety off-GPU only while its own card is really short of memory.
 
-The policy generalises the whole-card safety-off lever to the ordinary case. Demotion prices a modeled worst
-case (device total, largest learned sampling peak, proportional noise buffer, the safety charge);
-re-promotion instead reads the chosen card's measured device-free between allocation peaks, so it stays
-satisfiable under sustained load rather than waiting for a sampling-free window that never comes. It only ever
-degrades the operator's placement (GPU to CPU) and back, never beyond the operator's grant, and its
-pause/restore is hysteresis-gated so a card oscillating around the fit boundary does not flap the safety
-process on and off the card. Placement is headroom-aware across cards, not a fixed device 0.
+The policy generalises the whole-card safety-off lever to the ordinary case, and every term it reads is about
+the card safety occupies (or the card it would land on while it is off). Demotion needs measured pressure there:
+the device-free governor off HEALTHY, or measured free below the marginal step the heaviest peak that card is
+committed to still has to make. The modeled non-fit is a forecast input and never a trigger on its own, because
+on a small card that arithmetic can fail by less than the noise buffer while the card is comfortably serving.
+Restoration needs the mirror-image forecast, measured free covering safety *beside* that same peak, so a restore
+does not immediately re-trip.
+
+Both sides are dwelt in seconds against what a flip actually costs (the measured safety readiness latency), not
+in control cycles: the loop runs several times a second, so a cycle count lets a fraction of a second of reading
+spend tens of seconds of safety unavailability. Evidence is frozen across an intentional rebuild and restarts
+from scratch after it, so the respawn window cannot decide the flip that follows it. Placement is headroom-aware
+across cards and is only re-chosen while a spawn could use it.
 """
 
 from __future__ import annotations
@@ -14,16 +20,22 @@ from __future__ import annotations
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from unittest.mock import Mock
 
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.messages import HordeImageResult, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
+    PauseOwner,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.vram_arbiter import VramRequest
 from horde_worker_regen.process_management.resources.vram_footprints import (
     SAFETY_PROCESS_BASELINE,
@@ -34,10 +46,10 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 from horde_worker_regen.process_management.scheduling import inference_scheduler as sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _SAFETY_GPU_LOAD_CHARGE_MB,
-    _SAFETY_PLACEMENT_PAUSE_STREAK,
-    _SAFETY_PLACEMENT_RESTORE_STREAK,
+    _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
     _SAFETY_RESTORE_PP_BACKLOG_DEPTH,
     _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS,
+    InferenceScheduler,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -47,8 +59,75 @@ from tests.process_management.conftest import (
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
+_READINESS_SECONDS = 30.0
+"""What the stand-in lifecycle reports one safety placement flip costs, and hence the demotion dwell.
 
-def _placement_scheduler(monkeypatch: pytest.MonkeyPatch, *, safety_on_gpu: bool = True):  # noqa: ANN202
+Held at the floor the real manager uses before it has timed a flip, so the rows read as the cold-start case an
+operator's first eviction of a session actually runs under."""
+
+
+class _TestClock:
+    """A hand-advanced clock, so a dwell measured in seconds is exercised without sleeping."""
+
+    def __init__(self) -> None:
+        self.now = 10_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward."""
+        self.now += seconds
+
+
+@dataclass
+class _PlacementHarness:
+    """A scheduler whose safety placement is policy-managed, with the clock and lifecycle the rows drive."""
+
+    scheduler: InferenceScheduler
+    clock: _TestClock
+    lifecycle: Mock
+
+    @property
+    def demotion_dwell_seconds(self) -> float:
+        """The seconds of sustained pressure a demotion has to outlast."""
+        return _READINESS_SECONDS
+
+    @property
+    def restore_dwell_seconds(self) -> float:
+        """The seconds of sustained forecast headroom a restore has to earn."""
+        return _READINESS_SECONDS * _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
+
+    def reconcile(self) -> None:
+        """Run one placement reconciliation at the current clock."""
+        self.scheduler._reconcile_runtime_safety_placement()
+
+    def reconcile_over(self, seconds: float, *, step_seconds: float = 2.0) -> None:
+        """Reconcile repeatedly across ``seconds`` of clock, the way the control loop samples a window.
+
+        The first reconciliation happens before the clock moves at all, so a window of zero is still one
+        observation: that is what makes "a single reading never actuates" expressible.
+        """
+        self.reconcile()
+        elapsed = 0.0
+        while elapsed < seconds:
+            self.clock.advance(step_seconds)
+            elapsed += step_seconds
+            self.reconcile()
+
+    def pause_and_settle(self, owner: PauseOwner) -> None:
+        """Put the world in the state a completed pause leaves it in: safety off-GPU, owned by ``owner``."""
+        self.lifecycle.is_safety_gpu_paused = True
+        self.lifecycle.safety_pause_owner = owner
+
+
+def _placement_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    safety_on_gpu: bool = True,
+    card_runtimes: dict[int, CardRuntime] | None = None,
+    device_free_mb: float | None = 24000.0,
+) -> _PlacementHarness:
     """A single-GPU scheduler whose safety process is placement-managed, with a mocked lifecycle.
 
     The CPU-only guard is patched off so the policy is active regardless of the test host: on a real CPU-only
@@ -56,15 +135,51 @@ def _placement_scheduler(monkeypatch: pytest.MonkeyPatch, *, safety_on_gpu: bool
     """
     monkeypatch.setattr(sched_mod, "is_cpu_only_install", lambda: False)
     bridge_data = make_mock_bridge_data(safety_on_gpu=safety_on_gpu)
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({}), bridge_data=bridge_data)
+    clock = _TestClock()
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({}),
+        bridge_data=bridge_data,
+        clock=clock,
+        card_runtimes=card_runtimes,
+        device_free_mb=device_free_mb,
+    )
     lifecycle = Mock()
     lifecycle.is_safety_gpu_paused = False
     lifecycle.safety_pause_owner = None
     lifecycle.safety_placement_transition_pending = False
-    lifecycle.pause_safety_on_gpu = Mock(return_value=True)
-    lifecycle.restore_safety_on_gpu = Mock(return_value=True)
+
+    def _mark_paused(*, owner: PauseOwner) -> bool:
+        lifecycle.is_safety_gpu_paused = True
+        lifecycle.safety_pause_owner = owner
+        return True
+
+    def _mark_restored(*, owner: PauseOwner) -> bool:
+        lifecycle.is_safety_gpu_paused = False
+        lifecycle.safety_pause_owner = None
+        return True
+
+    # The actuators move the placement state the way the real lifecycle manager does, so a row that keeps
+    # reconciling after a flip sees the world the flip produced rather than one stuck before it.
+    lifecycle.pause_safety_on_gpu = Mock(side_effect=_mark_paused)
+    lifecycle.restore_safety_on_gpu = Mock(side_effect=_mark_restored)
+    lifecycle.safety_readiness_latency_seconds = Mock(return_value=_READINESS_SECONDS)
     scheduler._process_lifecycle = lifecycle
-    return scheduler
+    return _PlacementHarness(scheduler=scheduler, clock=clock, lifecycle=lifecycle)
+
+
+def _pin_evidence(
+    harness: _PlacementHarness,
+    *,
+    pressured: bool = False,
+    headroom_fits: bool = False,
+) -> None:
+    """Pin both placement predicates, so a row states the state machine rather than the arithmetic.
+
+    The arithmetic has its own rows (:class:`TestPlacementEvidence`); pinning it here is what lets a dwell row
+    say exactly how long a given verdict was held for.
+    """
+    harness.scheduler._safety_placement_card_is_pressured = lambda device_index: pressured  # type: ignore[method-assign]
+    harness.scheduler._safety_restore_headroom_fits = lambda device_index: headroom_fits  # type: ignore[method-assign]
 
 
 async def _queue_safety_backlog(scheduler: object, depth: int) -> None:
@@ -79,19 +194,21 @@ async def _queue_safety_backlog(scheduler: object, depth: int) -> None:
 
 
 class TestSafetyFitArithmetic:
-    """The structural fit is arithmetic over the device total and the largest active sampling peak."""
+    """The structural fit is arithmetic over the device total and the largest peak the card is committed to."""
 
     def test_charge_fits_on_a_roomy_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A large card holds the safety charge beside a moderate peak, bare and with margin."""
-        scheduler = _placement_scheduler(monkeypatch)
+        harness = _placement_harness(monkeypatch)
+        scheduler = harness.scheduler
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24000.0)
         scheduler._largest_active_sampling_peak_mb = Mock(return_value=8192.0)
         assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
         assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=True) is True
 
     def test_tight_card_bare_fit_but_no_margin(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """On a tight card the charge bare-fits but fails the proportional restore margin (hysteresis band)."""
-        scheduler = _placement_scheduler(monkeypatch)
+        """On a tight card the charge bare-fits but fails the proportional margin."""
+        harness = _placement_harness(monkeypatch)
+        scheduler = harness.scheduler
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=16000.0)
         scheduler._largest_active_sampling_peak_mb = Mock(return_value=11500.0)
         # 16000 - 11500 - 800 (5% noise) - 3044 (the safety seed) = 656 >= 0 bare; a second 800 margin makes
@@ -101,16 +218,17 @@ class TestSafetyFitArithmetic:
 
     def test_nothing_sampling_fits_trivially(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With no active sampling peak the charge trivially fits (nothing to fit beside)."""
-        scheduler = _placement_scheduler(monkeypatch)
+        harness = _placement_harness(monkeypatch)
+        scheduler = harness.scheduler
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=16000.0)
         scheduler._largest_active_sampling_peak_mb = Mock(return_value=None)
         assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=True) is True
 
     def test_unknown_total_fits_trivially(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An unreported device total leaves the charge fitting (missing-telemetry admits)."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=None)
-        assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=None)
+        assert harness.scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
 
 
 def _observe_safety_footprint(scheduler: object, device_footprint_mb: float) -> None:
@@ -133,14 +251,14 @@ class TestLearnedSafetyPrice:
 
     def test_cold_store_prices_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With nothing measured (and with no store at all) the price is exactly the documented seed."""
-        scheduler = _placement_scheduler(monkeypatch)
+        scheduler = _placement_harness(monkeypatch).scheduler
         assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB
         scheduler.set_footprint_store(LearnedFootprintStore())
         assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB
 
     def test_measured_footprint_above_the_seed_raises_the_price(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A safety process measured heavier than the seed is priced at what it actually costs."""
-        scheduler = _placement_scheduler(monkeypatch)
+        scheduler = _placement_harness(monkeypatch).scheduler
         _observe_safety_footprint(scheduler, _SAFETY_GPU_LOAD_CHARGE_MB + 1500.0)
         assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB + 1500.0
 
@@ -149,20 +267,22 @@ class TestLearnedSafetyPrice:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The overlay is raise-only: a lighter measurement leaves the conservative seed standing."""
-        scheduler = _placement_scheduler(monkeypatch)
+        scheduler = _placement_harness(monkeypatch).scheduler
         _observe_safety_footprint(scheduler, _SAFETY_GPU_LOAD_CHARGE_MB - 1500.0)
         assert scheduler._safety_footprint_mb() == _SAFETY_GPU_LOAD_CHARGE_MB
 
-    def test_learned_price_evicts_safety_from_a_card_the_seed_fit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A measured footprint the seed under-stated turns a modeled fit into a modeled non-fit."""
-        scheduler = _placement_scheduler(monkeypatch)
+    def test_learned_price_raises_the_restore_requirement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A measured footprint the seed under-stated raises what a restore has to find on the card."""
+        harness = _placement_harness(monkeypatch, device_free_mb=None)
+        scheduler = harness.scheduler
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=16000.0)
-        scheduler._largest_active_sampling_peak_mb = Mock(return_value=11500.0)
-        assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is True
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=4000.0)
+        scheduler._safety_placement_marginal_need_mb = Mock(return_value=0.0)
+        assert scheduler._safety_restore_headroom_fits(None) is True
 
-        # The bare fit had 656 MB of slack at the seed; a measurement 1 GB above it consumes that slack.
+        # 4000 free covered 3044 + 800 with 156MB to spare; a measurement 1GB above the seed does not.
         _observe_safety_footprint(scheduler, _SAFETY_GPU_LOAD_CHARGE_MB + 1024.0)
-        assert scheduler._safety_fits_beside_largest_sampling_peak(None, require_margin=False) is False
+        assert scheduler._safety_restore_headroom_fits(None) is False
 
 
 class TestOneSafetyPrice:
@@ -191,7 +311,8 @@ class TestOneSafetyPrice:
                 ),
             },
         )
-        scheduler = _placement_scheduler(monkeypatch)
+        harness = _placement_harness(monkeypatch)
+        scheduler = harness.scheduler
         scheduler._process_map = process_map
         scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24000.0)
         if learned_footprint_mb is not None:
@@ -200,9 +321,9 @@ class TestOneSafetyPrice:
         expected_mb = learned_footprint_mb if learned_footprint_mb is not None else _SAFETY_GPU_LOAD_CHARGE_MB
 
         job = make_job_pop_response("Deliberate")
-        scheduler._process_lifecycle.is_safety_gpu_paused = False
+        harness.lifecycle.is_safety_gpu_paused = False
         on_gpu = scheduler._forecast_streaming(job, "stable_diffusion_1")
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        harness.lifecycle.is_safety_gpu_paused = True
         paused = scheduler._forecast_streaming(job, "stable_diffusion_1")
         assert on_gpu.free_after_model_evict_mb is not None
         assert paused.free_after_model_evict_mb is not None
@@ -219,91 +340,452 @@ class TestOneSafetyPrice:
         assert [request.candidate_delta_mb for request in requests] == [expected_mb]
 
 
-class TestPlacementHysteresis:
-    """The pause/restore latch turns on and off only after runs of consecutive non-fitting / fitting cycles."""
+class TestPlacementEvidence:
+    """What the policy reads about safety's own card: the marginal need, the pressure test, the forecast.
 
-    def test_pauses_only_after_consecutive_misses(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Safety is not evicted on a single miss; it takes the configured run of consecutive misses."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
+    Rewritten from the old modeled-non-fit contract. The predicate that used to demote (device total less the
+    *whole* peak, the noise buffer and safety's footprint) is unsatisfiable on a small card by less than the
+    noise buffer, so it was permanently armed while the card served its work; and the predicate that used to
+    promote priced only safety's own context, so a restore onto a card already committed to a peak re-tripped
+    it. Both are replaced by per-card measured evidence against the *marginal* step the committed peak still
+    has to make.
+    """
 
-        for _ in range(_SAFETY_PLACEMENT_PAUSE_STREAK - 1):
-            scheduler._reconcile_runtime_safety_placement()
-            scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
+    def _card_scheduler(self, monkeypatch: pytest.MonkeyPatch, *, total_mb: float = 8107.0) -> InferenceScheduler:
+        """A scheduler reporting one small card's total, with the device-truth ceiling out of the way."""
+        harness = _placement_harness(monkeypatch, device_free_mb=None)
+        harness.scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=total_mb)
+        return harness.scheduler
 
-        scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(
-            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
-        )
-        assert scheduler._safety_placement_wants_off is True
+    def test_marginal_need_nets_out_what_the_card_already_holds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A resident the peak samples through is already on the card, so only the step above it is needed."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._process_map = ProcessMap({1: make_mock_process_info(1, model_name="heavy-model")})
+        scheduler._process_map[1].process_reserved_mb = 3200
+        scheduler.resolved_context_constant_mb = Mock(return_value=500.0)  # type: ignore[method-assign]
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
 
-    def test_restores_only_after_consecutive_measured_headroom_cycles(
+        assert scheduler._safety_placement_marginal_need_mb(0) == pytest.approx(4600.0 - 3700.0)
+
+    def test_marginal_need_is_the_whole_peak_when_nothing_holds_the_model(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A paused-off safety is restored only after the longer run of measured-device-free-headroom cycles.
+        """With no priced process holding the model, the card has to find the whole peak."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
 
-        The modeled charge stays non-fitting throughout (sustained load), proving the re-promotion is driven by
-        the measured device-free signal, not the modeled one that is unsatisfiable while jobs flow.
+        assert scheduler._safety_placement_marginal_need_mb(0) == pytest.approx(4600.0)
+
+    def test_marginal_need_is_zero_without_a_committed_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card committed to no sampling needs nothing for a peak it does not have."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=None)
+
+        assert scheduler._safety_placement_marginal_need_mb(0) == 0.0
+
+    def test_modeled_non_fit_alone_is_not_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The 8GB card whose modeled margin fails by tens of megabytes is not under pressure.
+
+        8107 - 4600 - 512 - 3044 is negative by 49MB, well inside the buffer, so the modeled fit says safety
+        cannot be there and always will; the card is
+        nonetheless holding the resident its peak samples through and reporting free above the marginal step,
+        which is the whole distinction the policy now draws.
         """
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: True
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
-        scheduler._safety_placement_wants_off = True
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=1600.0)
+        scheduler._resident_committed_mb_for_model = Mock(return_value=3700.0)
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK - 1):
-            scheduler._reconcile_runtime_safety_placement()
-            scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+        assert scheduler._safety_fits_beside_largest_sampling_peak(0, require_margin=False) is False
+        assert scheduler._safety_placement_card_is_pressured(0) is False
 
-        scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
-            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
+    def test_measured_free_below_the_marginal_need_is_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Once the card cannot cover the step its committed peak still has to make, it is pressured."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
+        scheduler._resident_committed_mb_for_model = Mock(return_value=3700.0)
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=800.0)
+
+        assert scheduler._safety_placement_card_is_pressured(0) is True
+
+    def test_governor_off_healthy_is_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card the device-free governor has taken off HEALTHY is pressured whatever the arithmetic says."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=None)
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=6000.0)
+        scheduler.set_governor_state(0, GovernorState.PRESSURE)
+
+        assert scheduler._safety_placement_card_is_pressured(0) is True
+
+    def test_a_card_full_of_weights_with_nothing_left_to_find_is_not_pressure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A low free reading beside work whose memory the card already holds is not safety's problem.
+
+        The card can be almost entirely committed (one heavy resident kept warm between jobs) while every peak
+        it is committed to is already covered by what is resident. Evicting safety there buys the card nothing it
+        needs, and the eviction outlives the residency that caused the reading, because those weights are
+        exactly what the card then has no room beside.
+        """
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=None)
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=0.0)
+
+        assert scheduler._safety_placement_card_is_pressured(0) is False
+
+    def test_missing_measured_free_is_not_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without a measured reading the policy does not demote (missing telemetry admits)."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=None)
+
+        assert scheduler._safety_placement_card_is_pressured(0) is False
+
+    def test_restore_forecast_requires_room_for_safety_beside_the_committed_peak(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Room for safety's context alone is not enough: the peak the card is committed to takes it back."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
+        scheduler._resident_committed_mb_for_model = Mock(return_value=3700.0)
+        # 3044 (safety) + 900 (marginal need) + 512 (noise floor) = 4456 required.
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=4300.0)
+        assert scheduler._safety_restore_headroom_fits(0) is False
+
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=4600.0)
+        assert scheduler._safety_restore_headroom_fits(0) is True
+
+    def test_restore_forecast_refuses_an_unhealthy_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card hovering at the paging cliff never readmits safety however much free it reports."""
+        scheduler = self._card_scheduler(monkeypatch)
+        scheduler._largest_active_sampling_peak = Mock(return_value=None)
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=7000.0)
+        scheduler.set_governor_state(0, GovernorState.SATURATED)
+
+        assert scheduler._safety_restore_headroom_fits(0) is False
+
+
+def _pin_tracker_jobs(
+    scheduler: InferenceScheduler,
+    *,
+    in_progress: tuple[object, ...] = (),
+    pending_inference: tuple[object, ...] = (),
+) -> None:
+    """Pin what the tracker reports as running and queued, so a routing row states only the attribution."""
+    tracker = Mock()
+    tracker.jobs_in_progress = in_progress
+    tracker.jobs_pending_inference = pending_inference
+    scheduler._job_tracker = tracker
+
+
+class TestPerCardCommittedPeak:
+    """The peak the policy prices is the one its own card is committed to, not the worker's largest anywhere.
+
+    The old worker-wide figure is why an eviction on one card was armed by a job that could only ever run on
+    the other, and why merely queued work anywhere counted against safety's residency everywhere.
+    """
+
+    def _two_card_scheduler(self, monkeypatch: pytest.MonkeyPatch) -> InferenceScheduler:
+        return _placement_harness(
+            monkeypatch,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), mask_kind="cuda"),
+        ).scheduler
+
+    def test_in_progress_jobs_are_attributed_to_their_own_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A job sampling on card 1 is not part of what card 0 is committed to."""
+        scheduler = self._two_card_scheduler(monkeypatch)
+        on_card_zero = make_job_pop_response("model-a")
+        on_card_one = make_job_pop_response("model-b")
+        _pin_tracker_jobs(scheduler, in_progress=(on_card_zero, on_card_one))
+        jobs_by_card = {0: [on_card_zero], 1: [on_card_one]}
+        scheduler._jobs_in_progress_on_card = lambda device_index: jobs_by_card[device_index]  # type: ignore[method-assign]
+
+        assert scheduler._sampling_peak_jobs_for_card(0) == [on_card_zero]
+        assert scheduler._sampling_peak_jobs_for_card(1) == [on_card_one]
+
+    def test_queued_jobs_count_only_where_they_could_land(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A queued job only one card can serve is only that card's commitment."""
+        scheduler = self._two_card_scheduler(monkeypatch)
+        large_job = make_job_pop_response("model-a", width=1536, height=1536)
+        _pin_tracker_jobs(scheduler, pending_inference=(large_job,))
+        scheduler._jobs_in_progress_on_card = lambda device_index: []  # type: ignore[method-assign]
+        scheduler._eligible_card_indices = lambda job: {1}  # type: ignore[method-assign]
+
+        assert scheduler._sampling_peak_jobs_for_card(0) == []
+        assert scheduler._sampling_peak_jobs_for_card(1) == [large_job]
+
+    def test_single_gpu_keeps_the_whole_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On one card the per-card question has the worker-wide answer, so routing is a no-op."""
+        scheduler = _placement_harness(monkeypatch).scheduler
+        running = make_job_pop_response("model-a")
+        queued = make_job_pop_response("model-b")
+        _pin_tracker_jobs(scheduler, in_progress=(running,), pending_inference=(queued,))
+
+        assert scheduler._sampling_peak_jobs_for_card(0) == [running, queued]
+        assert scheduler._sampling_peak_jobs_for_card(None) == [running, queued]
+
+    def test_heaviest_priced_job_carries_the_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Among the jobs a card is committed to, the heaviest learned peak and its model are what is priced."""
+        scheduler = _placement_harness(monkeypatch).scheduler
+        light = make_job_pop_response("light-model")
+        heavy = make_job_pop_response("heavy-model")
+        _pin_tracker_jobs(scheduler, in_progress=(light, heavy))
+        peak_by_model = {"light-model": 1000.0, "heavy-model": 4600.0}
+        monkeypatch.setattr(
+            sched_mod,
+            "predict_job_sampling_vram_mb",
+            lambda job, baseline: peak_by_model[str(job.model)],
         )
-        assert scheduler._safety_placement_wants_off is False
-        assert scheduler._safety_placement_promotions == 1
+        scheduler._learned_sampling_peak_mb = (  # type: ignore[method-assign]
+            lambda job, baseline, *, static_seed_mb, stage: static_seed_mb
+        )
 
-    def test_config_false_never_promotes_to_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With ``safety_on_gpu`` off the policy is inert: it never restores safety to the GPU."""
-        scheduler = _placement_scheduler(monkeypatch, safety_on_gpu=False)
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._safety_placement_wants_off = True
-        scheduler._safety_restore_headroom_fits = lambda device_index: True
+        assert scheduler._largest_active_sampling_peak(0) == (4600.0, "heavy-model")
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
-            scheduler._reconcile_runtime_safety_placement()
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
-        assert scheduler._safety_placement_wants_off is False
+class TestDemotionDwell:
+    """A demotion is justified by pressure that persisted on the order of what relieving it costs.
 
-    def test_reconciled_restore_withheld_while_placement_wants_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A residency release does not fight the placement latch back on-GPU."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.WHOLE_CARD
-        scheduler._safety_placement_wants_off = True
+    Rewritten from ``TestPlacementHysteresis``: the old contract was a count of consecutive control cycles
+    (two to evict, five to readmit), which is a fraction of a second of wall clock against a rebuild measured
+    in tens of seconds, so a respawn window could decide the next flip. The band is now seconds.
+    """
 
-        scheduler._reconcile_runtime_safety_placement()
+    def test_a_short_transient_never_evicts_safety(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pressure that clears well inside the dwell costs nothing: no flip is spent on it."""
+        harness = _placement_harness(monkeypatch)
+        _pin_evidence(harness, pressured=True)
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+        harness.reconcile_over(harness.demotion_dwell_seconds / 3.0)
 
-    def test_unready_placement_transition_does_not_chain_a_restore(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A slow healthy off-GPU respawn reaches readiness before a contrary placement wish may replace it."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
-        scheduler._process_lifecycle.safety_placement_transition_pending = True
-        scheduler._safety_placement_wants_off = True
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: True
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 3):
-            scheduler._reconcile_runtime_safety_placement()
+    def test_sustained_pressure_past_the_dwell_evicts_safety_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pressure that outlasts the dwell earns exactly one eviction."""
+        harness = _placement_harness(monkeypatch)
+        _pin_evidence(harness, pressured=True)
 
-        assert scheduler._safety_placement_wants_off is False
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+        harness.reconcile_over(harness.demotion_dwell_seconds + 4.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        assert harness.scheduler._safety_placement_demotions == 1
+
+    def test_intermittent_pressure_restarts_the_dwell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card that recovers between readings never accumulates a dwell, however long the run is."""
+        harness = _placement_harness(monkeypatch)
+        readings = iter([True, False] * 200)
+        harness.scheduler._safety_placement_card_is_pressured = lambda device_index: next(readings)  # type: ignore[method-assign]
+        harness.scheduler._safety_restore_headroom_fits = lambda device_index: False  # type: ignore[method-assign]
+
+        harness.reconcile_over(harness.demotion_dwell_seconds * 4.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+
+    def test_modeled_non_fit_alone_never_evicts_safety(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The permanently-armed modeled non-fit is not a trigger: a healthy card keeps its safety process.
+
+        This is the incident in one row. With the modeled arithmetic failing every cycle for the whole run, a
+        HEALTHY governor and measured free above the marginal need leave safety exactly where the operator put
+        it.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._safety_fits_beside_largest_sampling_peak = (  # type: ignore[method-assign]
+            lambda device_index, *, require_margin: False
+        )
+        _pin_evidence(harness, pressured=False)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds * 6.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert harness.scheduler._safety_placement_demotions == 0
+
+    def test_config_false_leaves_the_policy_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With ``safety_on_gpu`` off the policy neither evicts nor promotes."""
+        harness = _placement_harness(monkeypatch, safety_on_gpu=False)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        _pin_evidence(harness, pressured=True, headroom_fits=True)
+
+        harness.reconcile_over(harness.restore_dwell_seconds * 2.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert harness.scheduler._safety_placement_pressure_since is None
+        assert harness.scheduler._safety_placement_headroom_since is None
+
+
+class TestRestoreForecastDwell:
+    """A restore needs the card to cover safety beside its committed peak, durably.
+
+    Rewritten from the old measured-headroom streak, which priced safety's context alone and counted cycles.
+    """
+
+    def test_restore_waits_out_the_longer_dwell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Forecast headroom short of the restore dwell does not readmit safety; past it, it does."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        _pin_evidence(harness, headroom_fits=True)
+
+        harness.reconcile_over(harness.restore_dwell_seconds - 4.0)
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+
+        harness.reconcile_over(8.0)
+        harness.lifecycle.restore_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        assert harness.scheduler._safety_placement_promotions == 1
+        assert harness.scheduler._safety_placement_headroom_since is None
+
+    def test_the_restore_dwell_is_longer_than_the_demotion_dwell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Leave promptly, come back slowly: the asymmetry is what stops a readmit re-tripping the evict."""
+        harness = _placement_harness(monkeypatch)
+        assert harness.restore_dwell_seconds > harness.demotion_dwell_seconds
+        assert harness.scheduler._safety_placement_restore_dwell_seconds() == pytest.approx(
+            harness.restore_dwell_seconds,
+        )
+        assert harness.scheduler._safety_placement_dwell_seconds() == pytest.approx(
+            harness.demotion_dwell_seconds,
+        )
+
+    def test_a_forecast_that_never_holds_never_restores(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card that cannot host safety beside its committed peak keeps the CPU placement, indefinitely."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        _pin_evidence(harness, headroom_fits=False)
+
+        harness.reconcile_over(harness.restore_dwell_seconds * 4.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    def test_intermittent_forecast_headroom_does_not_flap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A single passing reading inside a demoted run does not readmit safety."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        readings = iter([True, False] * 200)
+        harness.scheduler._safety_restore_headroom_fits = lambda device_index: next(readings)  # type: ignore[method-assign]
+        harness.scheduler._safety_placement_card_is_pressured = lambda device_index: True  # type: ignore[method-assign]
+
+        harness.reconcile_over(harness.restore_dwell_seconds * 4.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    def test_a_reclaim_pause_earns_the_same_forecast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ladder took the card for memory too, so its restore waits out the same forecast dwell.
+
+        Rewritten from the fit-streak clause the reclaim restore used to carry: the streak is gone and the
+        forecast dwell is what stands in its place, for the same reason it existed.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RECLAIM_LADDER)
+        _pin_evidence(harness, headroom_fits=True)
+
+        harness.reconcile_over(harness.restore_dwell_seconds - 4.0)
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+
+        harness.reconcile_over(8.0)
+        harness.lifecycle.restore_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
+        # The placement counters belong to the policy's own moves, not to the ladder's.
+        assert harness.scheduler._safety_placement_promotions == 0
+
+    def test_a_whole_card_pause_is_not_held_to_the_memory_forecast(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A residency's pause ends when its model drains, whatever the card then has room for.
+
+        Rewritten from ``TestResidencyRestoreRespectsPlacementWish``, which expressed a related rule through the
+        sticky off-GPU intent this change removes. The rule that survives is the liveness one: a card hosting one
+        heavy resident has little measured free by construction, so holding its safety restore to a memory
+        forecast would leave that worker running every safety check on the CPU for the session. The residency
+        owns safety's placement while it holds the card, and the placement policy accrues no pressure beside it.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.WHOLE_CARD)
+        _pin_evidence(harness, headroom_fits=False)
+
+        harness.reconcile()
+
+        harness.lifecycle.restore_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+
+    def test_a_held_residency_stops_the_pressure_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card a residency is deliberately filling does not also accrue a pressure-owned eviction.
+
+        The defect this encodes: a whole-card residency fills the card by design, so the placement policy read
+        it as pressure and took its own pause beside the residency's. That pause outlives the residency (its
+        weights are what the card has no room beside), so the worker ends the session with safety on the CPU.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        harness.scheduler._whole_card_ledger.record_grant(
+            None,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=harness.clock() + 10_000.0,
+            now=harness.clock(),
+        )
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds * 3.0)
+
+        assert harness.scheduler._safety_placement_pressure_since is None
+        assert harness.scheduler._safety_placement_demotions == 0
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+
+
+class TestTransitionFreeze:
+    """Evidence does not accrue across an intentional rebuild, and restarts from scratch after it.
+
+    The defect this encodes: the streaks advanced while a placement rebuild was still unready, so the pause
+    that had just been actuated was itself the window that earned the next decision. Pauses logged "after 0
+    consecutive cycles" because the intent latched during the respawn.
+    """
+
+    def test_no_dwell_accrues_while_a_rebuild_is_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pressure held for many dwells' worth of a pending rebuild earns no eviction."""
+        harness = _placement_harness(monkeypatch)
+        harness.lifecycle.safety_placement_transition_pending = True
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds * 5.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert harness.scheduler._safety_placement_pressure_since is None
+
+    def test_evidence_restarts_after_the_rebuild_clears(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The dwell is measured from the readiness edge, not from before the rebuild began."""
+        harness = _placement_harness(monkeypatch)
+        harness.lifecycle.safety_placement_transition_pending = True
+        _pin_evidence(harness, pressured=True)
+        harness.reconcile_over(harness.demotion_dwell_seconds * 3.0)
+
+        harness.lifecycle.safety_placement_transition_pending = False
+        harness.reconcile_over(harness.demotion_dwell_seconds / 3.0)
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+
+        harness.reconcile_over(harness.demotion_dwell_seconds)
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+
+    def test_a_pending_rebuild_does_not_chain_a_restore(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A slow healthy off-GPU respawn reaches readiness before a contrary wish may replace it."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        harness.lifecycle.safety_placement_transition_pending = True
+        _pin_evidence(harness, headroom_fits=True)
+
+        harness.reconcile_over(harness.restore_dwell_seconds * 3.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+        assert harness.scheduler._safety_placement_headroom_since is None
+
+    def test_an_actuated_pause_discards_the_evidence_that_bought_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The next decision starts from nothing, so one pressure episode cannot buy two flips."""
+        harness = _placement_harness(monkeypatch)
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds + 4.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once()
+        assert harness.scheduler._safety_placement_pressure_since is None
 
 
 class TestPlacementRequestOwnership:
@@ -314,9 +796,9 @@ class TestPlacementRequestOwnership:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A held residency becomes one owner-attributed pause when the recurring reconciler observes it."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
-        scheduler._whole_card_ledger.record_grant(
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        harness.scheduler._whole_card_ledger.record_grant(
             None,
             model="heavy-model",
             forecast=None,
@@ -324,23 +806,23 @@ class TestPlacementRequestOwnership:
             now=0.0,
         )
 
-        scheduler._reconcile_runtime_safety_placement()
+        harness.reconcile()
 
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
 
-    def test_reclaim_request_is_applied_without_advancing_fit_hysteresis(
+    def test_reclaim_request_is_applied_without_advancing_the_pressure_dwell(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The ladder's one-shot request is actuated by the reconciler and does not count as a fit miss."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
-        scheduler._safety_fits_beside_largest_sampling_peak = Mock(return_value=False)
+        """The ladder's one-shot request is actuated by the reconciler and starts no pressure clock."""
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        _pin_evidence(harness, pressured=True)
 
-        assert scheduler.safety_off_gpu(None) is True
+        assert harness.scheduler.safety_off_gpu(None) is True
 
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
-        assert scheduler._safety_placement_miss_streak == 0
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
+        assert harness.scheduler._safety_placement_pressure_since is None
 
 
 class TestPostProcessingRestoreBound:
@@ -351,15 +833,12 @@ class TestPostProcessingRestoreBound:
     however much room the card has.
     """
 
-    def _restorable_scheduler(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
-        """A paused-off scheduler whose every restore gate but the post-processing one is satisfied."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: True
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
-        scheduler._safety_placement_wants_off = True
-        return scheduler
+    def _restorable_harness(self, monkeypatch: pytest.MonkeyPatch) -> _PlacementHarness:
+        """A paused-off harness whose every restore gate but the post-processing one is satisfied."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        _pin_evidence(harness, headroom_fits=True)
+        return harness
 
     async def _queue_post_processing(self, scheduler: object, depth: int) -> list[HordeJobInfo]:
         """Place ``depth`` generated jobs in the pending post-processing stage; return them."""
@@ -381,291 +860,219 @@ class TestPostProcessingRestoreBound:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A one-deep backlog that never drains defers only until it has aged past the bound."""
-        scheduler = self._restorable_scheduler(monkeypatch)
-        await self._queue_post_processing(scheduler, 1)
+        harness = self._restorable_harness(monkeypatch)
+        await self._queue_post_processing(harness.scheduler, 1)
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
-            scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+        # Kept inside the backlog's own age bound, so what is under test is the defer and not the bound.
+        harness.reconcile_over(harness.restore_dwell_seconds + 4.0)
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
 
         # Age the unbroken backlog past the bound, leaving it just as deep and every other gate as it was.
-        scheduler._safety_restore_pp_backlog_since = time.time() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS + 1.0)
-        scheduler._reconcile_runtime_safety_placement()
+        harness.scheduler._safety_restore_pp_backlog_since = harness.clock() - (
+            _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS + 1.0
+        )
+        harness.reconcile()
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
+        harness.lifecycle.restore_safety_on_gpu.assert_called_once_with(
             owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
         )
 
     async def test_a_deep_backlog_defers_however_long_it_lasts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A lane under real load keeps the card, no matter how long it has been under load."""
-        scheduler = self._restorable_scheduler(monkeypatch)
-        await self._queue_post_processing(scheduler, _SAFETY_RESTORE_PP_BACKLOG_DEPTH + 1)
+        harness = self._restorable_harness(monkeypatch)
+        await self._queue_post_processing(harness.scheduler, _SAFETY_RESTORE_PP_BACKLOG_DEPTH + 1)
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
-            scheduler._reconcile_runtime_safety_placement()
-        scheduler._safety_restore_pp_backlog_since = time.time() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS * 10.0)
-        scheduler._reconcile_runtime_safety_placement()
+        harness.reconcile_over(harness.restore_dwell_seconds * 2.0)
+        harness.scheduler._safety_restore_pp_backlog_since = harness.clock() - (
+            _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS * 10.0
+        )
+        harness.reconcile()
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
 
     async def test_a_young_shallow_backlog_defers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The ordinary tail of post-processing after a batch of jobs still holds the restore off."""
-        scheduler = self._restorable_scheduler(monkeypatch)
-        await self._queue_post_processing(scheduler, 1)
+        harness = self._restorable_harness(monkeypatch)
+        await self._queue_post_processing(harness.scheduler, 1)
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK + 2):
-            scheduler._reconcile_runtime_safety_placement()
+        harness.reconcile_over(harness.restore_dwell_seconds + 4.0)
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
 
     async def test_a_drained_backlog_resets_the_age(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An emptying lane restarts the clock, so intermittent work never accumulates toward the bound."""
-        scheduler = self._restorable_scheduler(monkeypatch)
-        queued = await self._queue_post_processing(scheduler, 1)
-        scheduler._reconcile_runtime_safety_placement()
-        aged = time.time() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS - 1.0)
-        scheduler._safety_restore_pp_backlog_since = aged
+        harness = self._restorable_harness(monkeypatch)
+        queued = await self._queue_post_processing(harness.scheduler, 1)
+        harness.reconcile()
+        aged = harness.clock() - (_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS - 1.0)
+        harness.scheduler._safety_restore_pp_backlog_since = aged
 
-        await scheduler._job_tracker.abandon_pending_post_processing(queued[0])
-        scheduler._reconcile_runtime_safety_placement()
-        assert scheduler._safety_restore_pp_backlog_since is None
+        await harness.scheduler._job_tracker.abandon_pending_post_processing(queued[0])
+        harness.reconcile()
+        assert harness.scheduler._safety_restore_pp_backlog_since is None
 
-        await self._queue_post_processing(scheduler, 1)
-        scheduler._reconcile_runtime_safety_placement()
+        await self._queue_post_processing(harness.scheduler, 1)
+        harness.reconcile()
 
-        assert scheduler._safety_restore_pp_backlog_since is not None
-        assert scheduler._safety_restore_pp_backlog_since > aged
-
-
-class TestResidencyRestoreRespectsPlacementWish:
-    """Both owners of safety's placement must agree before safety goes back on the card.
-
-    The scheduler reconciler consumes both the residency veto and the runtime placement latch before it may put
-    safety back on the GPU. With a heavy job still pending, a restore the placement policy immediately
-    re-demotes would cost two full safety process rebuilds per residency.
-    """
-
-    def _drained_residency_scheduler(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
-        """A scheduler holding a fully-drained whole-card residency on the safety card, ready to restore."""
-        bridge_data = make_mock_bridge_data(
-            safety_on_gpu=True,
-            whole_card_residency_safety_off_gpu=True,
-            whole_card_residency_cooldown_seconds=0,
-        )
-        monkeypatch.setattr(sched_mod, "is_cpu_only_install", lambda: False)
-        scheduler = _make_inference_scheduler(process_map=ProcessMap({}), bridge_data=bridge_data)
-        lifecycle = Mock()
-        lifecycle.is_safety_gpu_paused = True
-        lifecycle.safety_pause_owner = PauseOwner.WHOLE_CARD
-        lifecycle.safety_placement_transition_pending = False
-        lifecycle.pause_safety_on_gpu = Mock(return_value=True)
-        lifecycle.restore_safety_on_gpu = Mock(return_value=True)
-        lifecycle.post_process_lane_enabled = Mock(return_value=False)
-        lifecycle.component_lane_enabled = Mock(return_value=False)
-        lifecycle.vae_lane_enabled = Mock(return_value=False)
-        scheduler._process_lifecycle = lifecycle
-        scheduler._whole_card_ledger.record_grant(
-            None,
-            model="heavy-model",
-            forecast=None,
-            cooldown_until=0.0,
-            now=0.0,
-        )
-        return scheduler
-
-    def test_residency_end_does_not_restore_safety_the_placement_policy_wants_off(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A drained residency leaves safety off the card while the placement latch still holds it off."""
-        scheduler = self._drained_residency_scheduler(monkeypatch)
-        # Drive the latch on through the policy itself: the modeled charge does not fit beside the peak the
-        # card is committed to, for the full run of cycles the hysteresis demands.
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: False
-        for _ in range(_SAFETY_PLACEMENT_PAUSE_STREAK):
-            scheduler._reconcile_runtime_safety_placement()
-        assert scheduler._safety_placement_wants_off is True, (
-            "precondition: the placement policy holds safety off the card"
-        )
-
-        scheduler._restore_siblings_after_whole_card()
-        scheduler._reconcile_runtime_safety_placement()
-
-        assert scheduler._residency_state(None).model is None, (
-            "precondition: the drained residency is released, so this is the restore path under test"
-        )
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
-
-    def test_residency_end_restores_safety_when_the_placement_policy_has_no_wish(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """With no off-GPU wish outstanding, the drained residency puts safety back on its card."""
-        scheduler = self._drained_residency_scheduler(monkeypatch)
-        assert scheduler._safety_placement_wants_off is False
-
-        scheduler._restore_siblings_after_whole_card()
-        scheduler._reconcile_runtime_safety_placement()
-
-        assert scheduler._residency_state(None).model is None
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
-
-
-class TestDemoteThenMeasuredRepromote:
-    """Demotion latches the policy off, and a later run of measured-headroom cycles re-promotes safety."""
-
-    def test_demotion_latches_and_measured_headroom_repromotes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The full timeline: modeled non-fit demotes, measured device-free headroom promotes, counters move."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: False
-
-        for _ in range(_SAFETY_PLACEMENT_PAUSE_STREAK):
-            scheduler._reconcile_runtime_safety_placement()
-
-        assert scheduler._safety_placement_wants_off is True
-        assert scheduler._safety_placement_demotions == 1
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with(
-            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
-        )
-
-        # The pause has taken effect; the card now reports durable measured free between sampling peaks even
-        # though the modeled peak (sustained load) still says it does not fit.
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
-        scheduler._safety_restore_headroom_fits = lambda device_index: True
-
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK - 1):
-            scheduler._reconcile_runtime_safety_placement()
-            scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
-
-        scheduler._reconcile_runtime_safety_placement()
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
-            owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
-        )
-        assert scheduler._safety_placement_wants_off is False
-        assert scheduler._safety_placement_promotions == 1
-
-    def test_transient_measured_headroom_does_not_flap(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A single measured-headroom cycle inside a demoted run does not re-promote (hysteresis)."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
-        scheduler._safety_placement_wants_off = True
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-
-        headroom_readings = iter([True, False, True, False, True, False])
-        scheduler._safety_restore_headroom_fits = lambda device_index: next(headroom_readings)
-
-        for _ in range(6):
-            scheduler._reconcile_runtime_safety_placement()
-
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
-        assert scheduler._safety_placement_wants_off is True
+        assert harness.scheduler._safety_restore_pp_backlog_since is not None
+        assert harness.scheduler._safety_restore_pp_backlog_since > aged
 
 
 class TestSafetyBacklogPriority:
     """A deep safety backlog makes safety placement more urgent, not less."""
 
-    async def test_deep_backlog_allows_repromotion_when_headroom_is_available(
+    async def test_deep_backlog_allows_repromotion_when_the_forecast_holds(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A paused safety process should return to GPU service while a backlog waits and headroom is proven."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
-        scheduler._safety_placement_wants_off = True
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: True
-        await _queue_safety_backlog(scheduler, depth=3)
+        """A paused safety process returns to GPU service while a backlog waits and the forecast holds."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        _pin_evidence(harness, headroom_fits=True)
+        await _queue_safety_backlog(harness.scheduler, depth=3)
 
-        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK):
-            scheduler._reconcile_runtime_safety_placement()
+        harness.reconcile_over(harness.restore_dwell_seconds + 4.0)
 
-        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with(
+        harness.lifecycle.restore_safety_on_gpu.assert_called_once_with(
             owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT,
         )
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
-        assert scheduler._safety_placement_wants_off is False
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
 
-    async def test_deep_backlog_does_not_demote_safety_that_is_already_on_gpu(
+    async def test_a_backlog_protects_safety_that_is_already_on_gpu(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A deep backlog protects an active GPU safety process from placement demotion."""
-        scheduler = _placement_scheduler(monkeypatch)
-        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
-        scheduler._safety_restore_headroom_fits = lambda device_index: False
-        await _queue_safety_backlog(scheduler, depth=3)
+        """Evicting safety while the worker is behind on safety checks stalls the stage it is behind on."""
+        harness = _placement_harness(monkeypatch)
+        _pin_evidence(harness, pressured=True)
+        await _queue_safety_backlog(harness.scheduler, depth=3)
 
-        for _ in range(_SAFETY_PLACEMENT_PAUSE_STREAK):
-            scheduler._reconcile_runtime_safety_placement()
+        harness.reconcile_over(harness.demotion_dwell_seconds * 3.0)
 
-        scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
-        assert scheduler._safety_placement_wants_off is False
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert harness.scheduler._safety_placement_pressure_since is None
 
 
 class TestHeadroomAwarePlacement:
-    """The placement identity chooses the card with the most verified headroom, not a fixed device 0."""
+    """The placement identity chooses the card with the most verified headroom, and only when a spawn can use it."""
 
-    def _two_card_scheduler(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
-        monkeypatch.setattr(sched_mod, "is_cpu_only_install", lambda: False)
-        bridge_data = make_mock_bridge_data(safety_on_gpu=True)
-        card_runtimes = make_test_card_runtimes(device_indices=(0, 1), mask_kind="cuda")
-        scheduler = _make_inference_scheduler(bridge_data=bridge_data, card_runtimes=card_runtimes)
-        scheduler._largest_active_sampling_peak_mb = Mock(return_value=4500.0)
-        return scheduler
+    def _two_card_harness(self, monkeypatch: pytest.MonkeyPatch) -> _PlacementHarness:
+        harness = _placement_harness(
+            monkeypatch,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), mask_kind="cuda"),
+        )
+        harness.scheduler._largest_active_sampling_peak_mb = Mock(return_value=4500.0)
+        return harness
 
     def test_chooses_card_with_more_measured_free(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With measured device-free reported per card, the roomier card wins."""
-        scheduler = self._two_card_scheduler(monkeypatch)
+        harness = self._two_card_harness(monkeypatch)
         free_by_device = {0: 2000.0, 1: 6000.0}
-        scheduler._process_map.get_free_vram_mb = Mock(
-            side_effect=lambda *, device_index: free_by_device[device_index]
+        harness.scheduler._process_map.get_free_vram_mb = Mock(
+            side_effect=lambda *, device_index: free_by_device[device_index],
         )
-        assert scheduler._choose_safety_gpu_card() == 1
+        assert harness.scheduler._choose_safety_gpu_card() == 1
 
     def test_falls_back_to_total_less_peak_without_measured_free(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without measured free, the choice is card total less the modeled sampling peak; the larger card wins."""
-        scheduler = self._two_card_scheduler(monkeypatch)
-        scheduler._process_map.get_free_vram_mb = Mock(return_value=None)
+        """Without measured free, the choice is card total less that card's committed peak; the larger wins."""
+        harness = self._two_card_harness(monkeypatch)
+        harness.scheduler._process_map.get_free_vram_mb = Mock(return_value=None)
         total_by_device = {0: 8000.0, 1: 24000.0}
-        scheduler._process_map.get_reported_total_vram_mb = Mock(
+        harness.scheduler._process_map.get_reported_total_vram_mb = Mock(
             side_effect=lambda *, device_index: total_by_device[device_index],
         )
-        assert scheduler._choose_safety_gpu_card() == 1
+        assert harness.scheduler._choose_safety_gpu_card() == 1
 
-    def test_reconcile_pushes_chosen_card_to_lifecycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Each reconcile cycle pushes the chosen card to the lifecycle manager so spawn and restore agree."""
-        scheduler = self._two_card_scheduler(monkeypatch)
-        scheduler._choose_safety_gpu_card = Mock(return_value=1)
-        scheduler._process_lifecycle.safety_gpu_card_index = Mock(return_value=None)
+    def test_reconcile_pushes_the_chosen_card_while_safety_is_off_gpu(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A spawn could use the choice, so it is pushed to the lifecycle manager."""
+        harness = self._two_card_harness(monkeypatch)
+        harness.scheduler._choose_safety_gpu_card = Mock(return_value=1)
+        harness.lifecycle.safety_gpu_card_index = Mock(return_value=None)
 
-        scheduler._reconcile_runtime_safety_placement()
+        harness.reconcile()
 
-        scheduler._process_lifecycle.set_desired_safety_card.assert_called_with(1)
+        harness.lifecycle.set_desired_safety_card.assert_called_with(1)
+
+    def test_the_desired_card_is_not_re_chosen_while_safety_is_resident(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A live safety process stays where it is pinned: re-choosing every cycle migrates it on any respawn.
+
+        The defect this encodes: the choice was pushed unconditionally, so a crash rebuild or a residency
+        restore landed safety on whichever card happened to read roomiest that cycle rather than back where it
+        was, and a restore could migrate the process for reasons unrelated to the restore.
+        """
+        harness = self._two_card_harness(monkeypatch)
+        harness.scheduler._choose_safety_gpu_card = Mock(return_value=1)
+        harness.lifecycle.safety_gpu_card_index = Mock(return_value=0)
+
+        harness.reconcile()
+
+        harness.lifecycle.set_desired_safety_card.assert_not_called()
+
+    def test_single_gpu_never_pushes_a_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One card keeps the historical fixed pin, so the spawn path is byte-identical."""
+        harness = _placement_harness(monkeypatch)
+        harness.lifecycle.safety_gpu_card_index = Mock(return_value=None)
+
+        harness.reconcile()
+
+        harness.lifecycle.set_desired_safety_card.assert_not_called()
 
     def test_residency_readiness_is_card_local_when_safety_lives_elsewhere(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A live safety process on card 1 is already clear of a residency on card 0."""
-        scheduler = self._two_card_scheduler(monkeypatch)
-        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
-        scheduler._process_lifecycle.is_safety_gpu_paused = False
-        scheduler._process_lifecycle.safety_gpu_card_index = Mock(return_value=1)
+        harness = self._two_card_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        harness.lifecycle.is_safety_gpu_paused = False
+        harness.lifecycle.safety_gpu_card_index = Mock(return_value=1)
 
-        assert scheduler._safety_clear_of_residency_card(0) is True
-        assert scheduler._safety_clear_of_residency_card(1) is False
+        assert harness.scheduler._safety_clear_of_residency_card(0) is True
+        assert harness.scheduler._safety_clear_of_residency_card(1) is False
 
     def test_paused_safety_is_clear_of_its_selected_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Once safety is off-GPU, the selected restore destination does not keep teardown open."""
-        scheduler = self._two_card_scheduler(monkeypatch)
-        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
-        scheduler._process_lifecycle.is_safety_gpu_paused = True
-        scheduler._process_lifecycle.safety_gpu_card_index = Mock(return_value=None)
-        scheduler._choose_safety_gpu_card = Mock(return_value=1)
+        harness = self._two_card_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        harness.lifecycle.is_safety_gpu_paused = True
+        harness.lifecycle.safety_gpu_card_index = Mock(return_value=None)
+        harness.scheduler._choose_safety_gpu_card = Mock(return_value=1)
 
-        assert scheduler._safety_clear_of_residency_card(1) is True
+        assert harness.scheduler._safety_clear_of_residency_card(1) is True
+
+
+class TestReadinessLatencyPricesTheDwell:
+    """The dwell is what a flip costs on this host, floored for a cold start, never a cycle count."""
+
+    def test_the_dwell_follows_the_lifecycle_measurement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host whose safety process takes longer to come up demands proportionally longer evidence."""
+        harness = _placement_harness(monkeypatch)
+        harness.lifecycle.safety_readiness_latency_seconds = Mock(return_value=90.0)
+
+        assert harness.scheduler._safety_placement_dwell_seconds() == pytest.approx(90.0)
+        assert harness.scheduler._safety_placement_restore_dwell_seconds() == pytest.approx(
+            90.0 * _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
+        )
+
+    def test_a_longer_measured_latency_holds_safety_through_a_transient(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pressure that would evict on a fast host does not on a slow one: the flip costs more there."""
+        harness = _placement_harness(monkeypatch)
+        harness.lifecycle.safety_readiness_latency_seconds = Mock(return_value=_READINESS_SECONDS * 4.0)
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(_READINESS_SECONDS + 4.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+
+    def test_the_floor_is_never_below_a_cold_start(self) -> None:
+        """The lifecycle's own floor is what an untimed host prices a flip at, so no flip is ever free."""
+        assert SAFETY_READINESS_LATENCY_FLOOR_SECONDS > 0.0

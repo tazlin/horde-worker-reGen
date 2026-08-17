@@ -449,6 +449,7 @@ class JobPopper:
     _post_processing_lane_commitments_provider: Callable[[], int]
     _extended_controlnet_ready_provider: Callable[[], bool]
     _post_processing_lane_paused_provider: Callable[[], bool]
+    _safety_off_gpu_provider: Callable[[], bool]
     _vram_pressure_provider: Callable[[], bool]
 
     def __init__(
@@ -474,6 +475,7 @@ class JobPopper:
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
         post_processing_lane_paused_provider: Callable[[], bool] | None = None,
+        safety_off_gpu_provider: Callable[[], bool] | None = None,
         vram_pressure_provider: Callable[[], bool] | None = None,
         staged_models_provider: Callable[[], frozenset[str]] | None = None,
         action_ledger: ActionLedger | None = None,
@@ -523,6 +525,11 @@ class JobPopper:
         held off the GPU. A paused lane cannot run an upscale or face-fix, so the pop stops advertising
         post-processing while it is down. It defaults to "never paused", which is the truth for a worker wired
         without a lifecycle manager (and for the tests).
+
+        `safety_off_gpu_provider` reports whether resource governance currently holds the safety process off
+        its card. It only shapes the safety-backlog diagnostic's advice, which otherwise tells an operator who
+        already set `safety_on_gpu` to set it. It defaults to "on the card", the truth for a worker wired
+        without a lifecycle manager.
 
         `vram_pressure_provider` reports whether every governed card is at or below the device-free governor's
         PRESSURE floor. It gates the very-large-model offer narrowing, which stops advertising models that want
@@ -587,6 +594,9 @@ class JobPopper:
             post_processing_lane_paused_provider
             if post_processing_lane_paused_provider is not None
             else (lambda: False)
+        )
+        self._safety_off_gpu_provider = (
+            safety_off_gpu_provider if safety_off_gpu_provider is not None else (lambda: False)
         )
         self._vram_pressure_provider = (
             vram_pressure_provider if vram_pressure_provider is not None else (lambda: False)
@@ -1344,6 +1354,24 @@ class JobPopper:
     _submit_backpressure_engaged: bool = False
     """Whether a deep pending-submit backlog is currently counted as post-inference backpressure (log latch)."""
 
+    def _safety_backlog_advice(self) -> str:
+        """Return the remediation clause for the safety-backlog diagnostic, given where safety is running.
+
+        Telling an operator to enable ``safety_on_gpu`` is only useful advice while it is off. With it on, the
+        stage is either already on the card (so the bottleneck is elsewhere) or resource governance has moved it
+        off to protect the card's memory, and in that case the backlog is the cost of that placement rather than
+        a configuration mistake.
+        """
+        if not self._runtime_config.bridge_data.safety_on_gpu:
+            return "enable safety_on_gpu or speed safety up"
+        if self._safety_off_gpu_provider():
+            return (
+                "note that safety_on_gpu is set but resource governance is holding safety off its card for "
+                "memory headroom, so the check is running on the CPU; give the card more room (a smaller "
+                "max_power, fewer threads, or a larger card) or speed safety up"
+            )
+        return "speed safety up (safety_on_gpu is already set), or reduce inference throughput"
+
     def _max_safe_safety_backlog(self) -> int:
         """How many jobs may wait for safety before a newly popped job would risk aging out.
 
@@ -1805,7 +1833,7 @@ class JobPopper:
                 logger.warning(
                     f"Withholding job pops: post-inference safety backlog {backlog} >= cap "
                     f"{self._max_safe_safety_backlog()} (oldest waiting safety job {oldest:.0f}s). The safety "
-                    "stage is slower than inference; if this persists, enable safety_on_gpu or speed safety up.",
+                    f"stage is slower than inference; if this persists, {self._safety_backlog_advice()}.",
                 )
             return
 

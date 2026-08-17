@@ -118,6 +118,9 @@ from horde_worker_regen.process_management.ipc.messages import HordeInferenceCon
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -125,7 +128,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import Recla
 from horde_worker_regen.process_management.scheduling.governance.whole_card import _GRACE_BUDGET_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _HEAD_PROTECTION_MAX_STARVE_SECONDS,
-    _SAFETY_PLACEMENT_RESTORE_STREAK,
+    _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
     _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
@@ -1068,6 +1071,20 @@ async def test_f_defect_reinjection_selection_outliving_its_cycle_wedges_the_rot
 # The slow release: a rung that is working is not graded a failure for landing after the next sample
 # --------------------------------------------------------------------------------------------------------
 
+_SAFETY_READINESS_SECONDS = 30.0
+"""How long one safety placement flip takes to reach readiness in these rows.
+
+A safety child has to import the inference stack and materialise the classifier weights before it can clear a
+single image, so a pause and its restore cost the pipeline this window twice. Modelling it is what makes an
+in-flight placement rebuild observable, rather than collapsing a flip to an instant nothing can happen during."""
+
+_SAFETY_LOAD_TRANSIENT_MB = 2000.0
+"""How much more than its at-rest footprint safety charges the card while a restore is materialising.
+
+The classifier weights are read and copied before the process settles, so the peak a restore imposes is above
+the figure a fit priced it at, and a restore onto a card with barely enough room re-trips whatever evicted
+safety in the first place."""
+
 _UNLOAD_RELEASE_SECONDS = 5.0
 """Seconds between the parent sending an unload and the card getting the memory back in these scenarios.
 
@@ -1147,6 +1164,8 @@ def _pressure_world(
         child_free_view_lie_mb=_CHILD_VIEW_LIE_MB,
         footprint_undershoot=_FOOTPRINT_UNDERSHOOT,
         unload_release_delay_seconds=unload_release_seconds,
+        safety_readiness_seconds=_SAFETY_READINESS_SECONDS,
+        safety_load_transient_mb=_SAFETY_LOAD_TRANSIENT_MB,
     )
 
 
@@ -1175,9 +1194,13 @@ async def _drive_pressure(
     The rotation is what keeps an idle resident on the lane that is not sampling, so the ladder has a resident
     rung to issue; refilling the queue for the whole run is what makes the card cross the cliff repeatedly.
     """
-    configured_models, configured_shape = _PRESSURE_WORKLOAD[world.card.label]
-    models = models or configured_models
-    width, height = shape or configured_shape
+    if models is None or shape is None:
+        # Only a caller that leaves the workload to the card class needs the per-card table; one that names both
+        # (a row about a card class the table does not cover) must not be held to having an entry there.
+        configured_models, configured_shape = _PRESSURE_WORKLOAD[world.card.label]
+        models = models or configured_models
+        shape = shape or configured_shape
+    width, height = shape
     popped = 0
     for _ in range(ticks):
         while len(world.job_tracker.jobs_pending_inference) < _QUEUE_DEPTH and popped < job_count:
@@ -1332,6 +1355,17 @@ async def test_g_defect_reinjection_a_sample_counted_window_escalates_past_a_wor
 # --------------------------------------------------------------------------------------------------------
 
 
+def _reinject_undwelt_safety_placement(monkeypatch: pytest.MonkeyPatch, world: _DispatchWorld) -> None:
+    """Price a safety placement flip at nothing, which is what counting control cycles amounted to.
+
+    The pre-fix band was a couple of control cycles to leave the card and a handful to come back. At a
+    sub-second control loop that is a fraction of a second of evidence against a rebuild measured in tens of
+    seconds, so the respawn window itself decided the next flip. Reinjected as a zero flip cost, which is the
+    same statement without depending on how fast the row's ticks are.
+    """
+    monkeypatch.setattr(world.lifecycle, "safety_readiness_latency_seconds", lambda: 0.0)
+
+
 def _safety_cycle_gaps(world: _DispatchWorld) -> list[float]:
     """Seconds between each pair of consecutive safety-off-GPU actuations in the run."""
     times = [when for _tick, when, _owner in world.safety_pause_events]
@@ -1364,9 +1398,13 @@ async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeyp
         f"{context}: the card saturated at most once, so nothing here would have asked for a second safety "
         f"cycle whatever the dwell was. {world.state_dump()}"
     )
-    assert world.reclaim_ladder.safety_rungs_refused > 0, (
-        f"{context}: the ladder never reached the safety rung a second time, so the run does not exercise the "
-        f"dwell it asserts. {world.state_dump()}"
+    assert world.safety_pause_events, (
+        f"{context}: safety was never taken off the card, so the run says nothing about how often that may "
+        f"happen. {world.state_dump()}"
+    )
+    assert world.safety_restore_events, (
+        f"{context}: safety never came back, so the run buys its dwell by leaving the worker without an "
+        f"on-GPU safety process rather than by pacing the cycle. {world.state_dump()}"
     )
     cooldown_seconds = reclaim_ladder_module._SAFETY_RUNG_COOLDOWN_SECONDS
     short_gaps = [gap for gap in _safety_cycle_gaps(world) if gap < cooldown_seconds]
@@ -1375,15 +1413,21 @@ async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeyp
         f"inside its {cooldown_seconds:.0f}s dwell. Pauses at "
         f"{[f'{when:.0f}' for _t, when, _o in world.safety_pause_events]}. {world.state_dump()}"
     )
-    for (pause_tick, _paused_at, _owner), (restore_tick, _restored_at) in zip(
+    restore_dwell_seconds = SAFETY_READINESS_LATENCY_FLOOR_SECONDS * _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
+    for (_pause_tick, paused_at, _owner), (_restore_tick, restored_at) in zip(
         world.safety_pause_events,
         world.safety_restore_events,
         strict=False,
     ):
-        assert restore_tick - pause_tick >= _SAFETY_PLACEMENT_RESTORE_STREAK, (
-            f"{context}: safety was put back on the card {restore_tick - pause_tick} cycle(s) after the ladder "
-            f"took it off, inside the {_SAFETY_PLACEMENT_RESTORE_STREAK}-cycle band of measured headroom a "
-            f"restore has to earn. {world.state_dump()}"
+        assert restored_at - paused_at >= _SAFETY_READINESS_SECONDS, (
+            f"{context}: safety was put back on the card {restored_at - paused_at:.0f}s after it was taken off, "
+            f"inside the {_SAFETY_READINESS_SECONDS:.0f}s the replacement process needs to reach readiness, so "
+            f"the flip was undone by the rebuild it was still waiting on. {world.state_dump()}"
+        )
+        assert restored_at - paused_at >= restore_dwell_seconds, (
+            f"{context}: safety was put back on the card {restored_at - paused_at:.0f}s after the ladder took "
+            f"it off, inside the {restore_dwell_seconds:.0f}s of forecast headroom a restore has to earn. "
+            f"{world.state_dump()}"
         )
     assert world.completed_jobs > 0, (
         f"{context}: the run completed no jobs, so the dwell above was bought by a worker that stopped serving. "
@@ -1396,16 +1440,17 @@ async def test_h_defect_reinjection_an_undwelt_safety_rung_thrashes_the_process(
 ) -> None:
     """With the dwell removed, the same workload ends and rebuilds the safety process every couple of minutes.
 
-    Reinjected at the dwell and the grading window together, because that is the pair that produced the
-    signature: the shorter window sends every episode to the deepest rung, and the absent dwell lets every
-    episode spend it. Everything else, including the restore band, is left as it is, so what fails is how often
-    the cycle happens rather than the fact that one ever does.
+    Reinjected at the dwells and the grading window together, because that is the set that produced the
+    signature: the shorter window sends every episode to the deepest rung, the absent rung cooldown lets every
+    episode spend it, and a restore that earns nothing hands the card straight back into the pressure that
+    evicted safety. What fails is how often the cycle happens rather than the fact that one ever does.
     """
     dwell_seconds = reclaim_ladder_module._SAFETY_RUNG_COOLDOWN_SECONDS
     _blind_children_to_device_truth(monkeypatch)
     monkeypatch.setattr(reclaim_ladder_module, "_SAFETY_RUNG_COOLDOWN_SECONDS", 0.0)
     _reinject_sample_counted_verification(monkeypatch)
     world = _pressure_world()
+    _reinject_undwelt_safety_placement(monkeypatch, world)
 
     await _drive_pressure(world, job_count=_THRASH_JOBS, ticks=_THRASH_TICKS)
 

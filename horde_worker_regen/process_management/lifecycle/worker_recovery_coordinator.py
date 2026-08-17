@@ -69,6 +69,21 @@ class WorkerRecoveryCoordinator:
     ORPHAN_PUNT_WINDOW_SECONDS = 300.0
     ORPHAN_PUNT_WEDGE_THRESHOLD = 3
     ORPHAN_SAFETY_GRACE_SECONDS = 45.0
+    """Baseline grace before a job stuck awaiting a safety verdict is requeued, sized for an on-GPU check.
+
+    Off-GPU the same check is CPU-bound and can legitimately run far longer than this, so the effective grace
+    is scaled to what checks are actually taking whenever safety is off its card (see
+    :meth:`_orphan_safety_grace_seconds`); a fixed baseline there discards real progress on a check that was
+    always going to finish, and the requeue costs the whole check again."""
+    SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE = 3.0
+    """Multiple of the measured average safety-check duration the off-GPU grace allows one check to take.
+
+    Above one so ordinary variance between checks (batch size, image count, a busy host) never reads as a lost
+    verdict, and small enough that a genuinely hung process is still caught within a few checks' worth of
+    time rather than sitting out a long deadline."""
+    SAFETY_GRACE_MAX_SECONDS = 300.0
+    """Ceiling on the scaled off-GPU safety grace, so a pathological average cannot leave a hung safety process
+    holding a job indefinitely: past this the job is requeued and the escalation ladder gets to see it."""
     SAFETY_REQUEUE_MAX = 3
     SAFETY_SOFT_PAUSE_SECONDS = 60.0
     ORPHAN_POST_PROCESS_GRACE_SECONDS = 90.0
@@ -493,9 +508,28 @@ class WorkerRecoveryCoordinator:
             "recovers, so the worker does not keep taking on work it cannot safety-check.",
         )
 
+    def _orphan_safety_grace_seconds(self) -> float:
+        """Return how long a job may await a safety verdict before it is treated as orphaned.
+
+        The baseline is sized for an on-GPU check. While safety is off its card the same check runs on the CPU
+        and legitimately takes several times longer, so with a live pool the grace is scaled to what checks are
+        actually measuring on this host (the average the post-inference backpressure model already maintains),
+        bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. An unready pool keeps the baseline: nothing is progressing
+        for the grace to be generous towards.
+        """
+        baseline_seconds = self.ORPHAN_SAFETY_GRACE_SECONDS
+        if not self._process_lifecycle.is_safety_gpu_paused or not self.is_safety_pool_ready():
+            return baseline_seconds
+        average_check_seconds = self._state.avg_safety_seconds
+        if average_check_seconds <= 0:
+            return baseline_seconds
+        scaled_seconds = average_check_seconds * self.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE
+        return min(max(baseline_seconds, scaled_seconds), self.SAFETY_GRACE_MAX_SECONDS)
+
     async def reconcile_orphaned_safety_jobs(self) -> None:
         """Recover jobs stranded in safety checking whose verdict will never return."""
         now = self._clock()
+        grace_seconds = self._orphan_safety_grace_seconds()
         checking = self._job_tracker.jobs_being_safety_checked
         current_ids = {info.sdk_api_job_info.id_ for info in checking if info.sdk_api_job_info.id_ is not None}
 
@@ -505,7 +539,7 @@ class WorkerRecoveryCoordinator:
         # failing rather than looping forever.
         for job_id in self._message_dispatcher.take_safety_verdicts_known_lost():
             if job_id in current_ids:
-                self.orphan_safety_since[job_id] = now - self.ORPHAN_SAFETY_GRACE_SECONDS
+                self.orphan_safety_since[job_id] = now - grace_seconds
 
         for job_id in list(self.orphan_safety_since):
             if job_id not in current_ids:
@@ -522,7 +556,7 @@ class WorkerRecoveryCoordinator:
             if job_id is None:
                 continue
             first_seen = self.orphan_safety_since.setdefault(job_id, now)
-            if (now - first_seen) < self.ORPHAN_SAFETY_GRACE_SECONDS:
+            if (now - first_seen) < grace_seconds:
                 continue
 
             requeues = self.safety_requeue_count.get(job_id, 0)
@@ -559,7 +593,11 @@ class WorkerRecoveryCoordinator:
             if await self._job_tracker.requeue_one_being_safety_checked(job_id):
                 self.safety_requeue_count[job_id] = requeues + 1
                 self.orphan_safety_since.pop(job_id, None)
-                if not self.is_safety_pool_ready():
+                if not self.is_safety_pool_ready() and not self._process_lifecycle.safety_placement_transition_pending:
+                    # A pool that is unready because a placement change is mid-rebuild is already being
+                    # replaced, deliberately, and forcing another replacement restarts that rebuild from the
+                    # beginning. The requeue above is the whole remedy the job needs; the rebuild finishes on
+                    # its own and checks it.
                     self._process_lifecycle.safety_processes_should_be_replaced = True
                 logger.warning(
                     f"Job {job_id} awaited a safety verdict for {now - first_seen:.0f}s with none returned; "

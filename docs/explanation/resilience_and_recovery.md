@@ -415,6 +415,21 @@ control-loop tick, with the same two-signal split as the in-progress case:
   window with no verdict is requeued for a fresh check, covering losses with no
   corresponding dropped message at all.
 
+The watchdog's grace **reads where safety is running**. Its baseline is sized for an
+on-GPU check; off-GPU the same check is CPU-bound and legitimately runs several times
+longer, so while safety is off its card with a live pool the grace scales to what
+checks are actually measuring on this host (the average the post-inference
+backpressure model already keeps), capped so a genuinely hung process is still caught.
+A fixed baseline there discards real progress on a check that was always going to
+finish, and the requeue then pays for the whole check again.
+
+A requeue that finds the safety pool unready normally forces a pool replacement. It
+does not do so while an **intentional placement rebuild** is in flight: that pool is
+already being replaced, deliberately, and forcing another replacement restarts the
+rebuild from the beginning, so a worker whose placement is flipping would rebuild
+safety for as long as the flipping lasted. The requeue alone is the remedy the job
+needs; the rebuild finishes on its own and checks it.
+
 Both routes share one bounded requeue/escalation counter, so a verdict that keeps
 being lost is requeued only a fixed number of times before the job is dropped with
 its images cleared (an image the safety check never cleared is **never** submitted)

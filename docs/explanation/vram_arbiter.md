@@ -627,8 +627,14 @@ hold safety's context beside the model that is sampling on it, that CUDA context
 needs. The scheduler-owned **runtime safety-placement policy**
 ([`_reconcile_runtime_safety_placement`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])
 generalises the whole-card safety-off lever to that ordinary case: it moves safety to a CPU-only process when
-its charge cannot fit, and re-promotes it to the GPU once a card proves durable room. `safety_on_gpu` remains
-the operator's maximum permission; the policy only degrades GPU to CPU and back, never beyond that grant.
+safety's own card is really short of the memory its work needs, and re-promotes it once that card proves durable
+room. `safety_on_gpu` remains the operator's maximum permission; the policy only degrades GPU to CPU and back,
+never beyond that grant.
+
+**Every term the policy reads is about safety's own card** (the card it occupies, or the card it would land on
+while it is off). Cards are independent VRAM domains, so the peak a sibling card is committed to says nothing
+about this one: the peak is taken over the jobs running on this card plus the queued jobs its effective config
+can serve, and on a single-GPU host that is the same set the worker-wide figure would give.
 
 GPU placement treats CLIP plus its CUDA context as the lane's fixed residency, not the last evaluation's
 high-water mark. DeepDanbooru stays in host RAM until an anime check calls it; BLIP and the aesthetic head are
@@ -636,28 +642,49 @@ offloaded after use; and transient allocator blocks are cleared before the child
 device-free reading therefore sees those allocations as reclaimable work, rather than evidence that the whole
 safety process must be replaced or that an ordinary SDXL-class dispatch needs exclusive residency.
 
-The two sides read **different signals**, which is what makes re-promotion satisfiable under sustained load.
-Demotion prices a *modeled* worst case: the charge must fail to fit beside the largest learned sampling peak
-(device total less that peak, a proportional noise buffer, and the safety charge), a predictive eviction that
-acts before the card reaches the paging cliff. Re-promotion instead reads the chosen card's *measured*
-device-free VRAM between allocation peaks (the governor's truthful NVML-derived figure) and requires the card
-to be governor-`HEALTHY`. The modeled peak is always populated while jobs flow, so a modeled restore predicate
-could never be satisfied under load; the measured free rises whenever the card genuinely has room, so it can.
-On a box where no card can host safety beside its sampler (two small cards, a large model on each) the measured
-streak never accrues, and **CPU safety is the correct steady state**, with the post-inference backpressure above
-bounding intake to CPU-safety throughput.
+Both sides forecast against the **marginal need**, not the whole peak. The process that will sample a peak
+already holds its weights and its context, and those bytes read as *used* in the card's measured free rather
+than as room the peak needs again, so the figure the policy compares against is
+`max(0, per-card peak - that process's committed device memory)`. Charging the whole peak instead is what makes
+a fit unsatisfiable on a small card for the entire session: on an 8GB card with a 4.6GB peak,
+`total - peak - noise - safety` is negative by a few tens of megabytes, a margin far inside the noise buffer
+and one no amount of good behaviour can close.
 
-Both runtime-policy sides are **hysteresis-gated**. The off-latch turns on only after a short run of
-modeled-non-fit cycles
-(`_SAFETY_PLACEMENT_PAUSE_STREAK`) and off only after a longer run of measured-headroom cycles
-(`_SAFETY_PLACEMENT_RESTORE_STREAK`), with a deadband (modeled fit but measured room not yet proven) that
-advances neither streak. The asymmetric streaks double as a demote-again cooldown: a promotion resets the miss
-streak, so a fresh run of non-fit cycles must pass before safety can be evicted again. Actuation is skipped
-while a safety check is pending or active (no mid-backlog churn), and re-promotion is additionally withheld
-while a whole-card residency still needs safety off its card, accepted post-processing needs the drain window,
-or the device-free governor is holding growth. Residency and reclaim bypass fit hysteresis when requesting a
-pause, but they still use this same reconciler and cannot start a second placement rebuild before the current
-one reaches readiness.
+**Demotion** therefore needs measured evidence about that card: the device-free governor has left `HEALTHY`
+there, or its measured free no longer covers the marginal need plus the proportional noise buffer. A card
+committed to no peak, or one whose residents already cover every peak it is committed to, is not pressured
+however little it reports free: a card full of weights is admission's and reclaim's subject. The **modeled**
+non-fit (`total - peak - noise - safety_footprint < 0`) is a forecast input and never a trigger on its own.
+
+**Re-promotion** is the mirror-image forecast: the chosen card's measured device-free (the governor's truthful
+NVML-derived figure) must cover safety's whole footprint *plus* the marginal need plus the buffer, with the
+governor `HEALTHY`. Safety has to survive the peak the card is already committed to, or one restore simply buys
+the next eviction. On a box where no card can host safety beside its sampler (two small cards, a large model on
+each) that forecast never holds, and **CPU safety is the correct steady state**, with the post-inference
+backpressure above bounding intake to CPU-safety throughput.
+
+Both sides are **dwelt in seconds**, never in control cycles. A flip ends the safety process and brings a
+replacement up, so it costs the worker that whole rebuild in safety unavailability; the dwell is that measured
+cost ([`safety_readiness_latency_seconds`][horde_worker_regen.process_management.lifecycle.process_lifecycle.ProcessLifecycleManager],
+floored for a cold start), and the restore dwell is a multiple of it (`_SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR`):
+leave a card that is genuinely short promptly, come back only once its room has proven durable. Counting control
+cycles instead prices the flip at a fraction of a second, which is how a respawn window comes to decide the flip
+that follows it.
+
+**Evidence is frozen across an intentional rebuild** and restarts from scratch after it, so a placement change
+cannot be decided by its own actuation window. Only one clock runs at a time: a resident safety process accrues
+pressure, an evicted one accrues forecast headroom, and each resets the moment its condition stops holding, so
+no off-GPU intent can outlive the evidence that produced it. A pending safety backlog resets the pressure clock
+(evicting safety while the worker is behind on safety checks stalls exactly the stage it is behind on), and so
+does a whole-card residency on safety's card, since filling that card is what the residency *is*.
+
+Re-promotion is additionally withheld while a whole-card residency still needs safety off its card, accepted
+post-processing needs the drain window, or the device-free governor is holding growth. Residency and reclaim
+bypass the demotion dwell when requesting a pause, but they still use this same reconciler and cannot start a
+second placement rebuild before the current one reaches readiness. A **reclaim-ladder** pause earns its restore
+with the same forecast dwell (the memory that pause returned is part of what the instantaneous gates then read).
+A **whole-card residency** pause does not: it ends when its own model drains, and holding it to a memory
+forecast would leave a card that hosts one heavy resident without an on-GPU safety process for the session.
 
 The verified reclaim ladder uses the same operator permission as whole-card safety movement: if
 `whole_card_residency_safety_off_gpu` is false, safety is not added as a reclaim rung even when it is on GPU.
@@ -665,9 +692,11 @@ The verified reclaim ladder uses the same operator permission as whole-card safe
 **Placement is headroom-aware across cards, not a fixed device 0.** One identity
 ([`_choose_safety_gpu_card`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])
 picks the driven card with the most verified headroom (measured device-free when reported, else card total less
-the modeled peak) and is pushed to the lifecycle manager each cycle, so both the spawn-time pin and every
-re-promotion respawn land on the same chosen card. Demotion, promotion, and the current placement card (or
-`None` for CPU) are surfaced in the run metrics.
+the peak that card is committed to) and is pushed to the lifecycle manager **only while a spawn could use it**,
+that is while safety is off-GPU or not yet placed. While safety is resident the desired card is the card it is
+pinned to, so a crash rebuild or a residency restore puts it back where it was rather than wherever read
+roomiest that cycle. Demotion, promotion, and the current placement card (or `None` for CPU) are surfaced in the
+run metrics.
 
 Reclaim stays single-owner across three seams: preload, dispatch reconciliation, and post-processing all run a
 `DEFER` verdict's actuations through the one reclaim engine (`execute_arbiter_commands`), which the governor's

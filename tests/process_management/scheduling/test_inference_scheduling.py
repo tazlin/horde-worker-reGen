@@ -25,6 +25,9 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
@@ -115,6 +118,10 @@ def _make_inference_scheduler(
         process_lifecycle=Mock(
             get_processes_with_model_for_queued_job=Mock(return_value=[]),
             is_model_load_quarantined=Mock(return_value=False),
+            # The safety-placement dwells are priced from this, so it must answer a number: a bare Mock makes
+            # any scheduler pass that reconciles safety placement fail on the arithmetic rather than on its
+            # own subject. The floor is what an untimed host reports.
+            safety_readiness_latency_seconds=Mock(return_value=SAFETY_READINESS_LATENCY_FLOOR_SECONDS),
         ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=model_metadata if model_metadata is not None else make_test_model_metadata(),

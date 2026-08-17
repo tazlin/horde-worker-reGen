@@ -190,6 +190,23 @@ Bounded well under the crash-loop window so a genuinely broken pool still accumu
 for both breakers to see it, and low enough that a pool whose external cause has cleared (a card a co-tenant
 released) comes back promptly rather than sitting out a long sleep."""
 
+SAFETY_READINESS_LATENCY_FLOOR_SECONDS: float = 30.0
+"""Floor (seconds) on the priced cost of one safety placement flip, used before any flip has been measured.
+
+Bringing safety up means a fresh child importing torch and materialising the classifier weights, which no host
+completes instantly, and placement policy prices how long evidence must persist against that cost. The floor
+keeps the first flip of a session from being priced at zero on a host that has not yet timed one; later flips
+are priced from what this host actually took (see
+:meth:`ProcessLifecycleManager.safety_readiness_latency_seconds`)."""
+
+SAFETY_READINESS_LATENCY_CEILING_SECONDS: float = 300.0
+"""Ceiling (seconds) on the measured safety readiness latency, so one pathological start cannot price a
+placement dwell so long that placement stops responding to the card for the rest of the run."""
+
+SAFETY_READINESS_LATENCY_ALPHA: float = 0.3
+"""Weight of the newest readiness measurement in the latency average, so the figure tracks a host that has
+warmed its model cache without being dominated by a single slow start."""
+
 INFERENCE_END_GRACE_SECONDS: float = 5.0
 """How long a single inference-slot end waits for the child to exit cleanly before killing it, when not
 shutting down. A busy child mid-sampling holds the GPU and cannot answer END_PROCESS until its current
@@ -461,6 +478,8 @@ class ProcessLifecycleManager:
     _safety_consecutive_start_failures: int
     _safety_intentional_window_rebuilds: int
     _safety_next_start_allowed_at: float
+    _safety_start_initiated_at: float | None
+    _safety_readiness_latency_seconds: float | None
     _last_safety_child_ever_reported: bool | None
     _safety_child_failure_in_streak: bool
     _model_incident_history: dict[str, list[ModelIncident]]
@@ -703,6 +722,11 @@ class ProcessLifecycleManager:
         self._safety_consecutive_start_failures = 0
         self._safety_intentional_window_rebuilds = 0
         self._safety_next_start_allowed_at = 0.0
+        # When the most recent safety start was launched (cleared once a pool reaches readiness), and the
+        # running average of how long a start takes to reach readiness. Placement policy reads the latter to
+        # price what one off-GPU/on-GPU flip costs in safety unavailability.
+        self._safety_start_initiated_at = None
+        self._safety_readiness_latency_seconds = None
         # Whether the safety child reaped most recently had ever reported to the parent; None before any
         # safety child has been reaped. Carried for the futility diagnostic, since the process info is gone
         # from the map by the time the rebuild completes.
@@ -1172,6 +1196,7 @@ class ProcessLifecycleManager:
             )
             self._register_owned(self._process_map[pid])
 
+            self._safety_start_initiated_at = time.time()
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
         return True
@@ -3188,11 +3213,43 @@ class ProcessLifecycleManager:
         """
         if self._safety_processes_should_be_replaced or self._process_map.num_loaded_safety_processes() == 0:
             return
+        initiated_at = self._safety_start_initiated_at
+        if initiated_at is not None:
+            self._safety_start_initiated_at = None
+            self._record_safety_readiness_latency(time.time() - initiated_at)
         self._safety_replacement_intentional_until_ready = False
         self._safety_intentional_window_rebuilds = 0
         self._safety_consecutive_start_failures = 0
         self._safety_next_start_allowed_at = 0.0
         self._safety_child_failure_in_streak = False
+
+    def _record_safety_readiness_latency(self, seconds: float) -> None:
+        """Fold one measured spawn-to-readiness interval into the average placement policy prices flips from."""
+        if seconds <= 0:
+            return
+        previous = self._safety_readiness_latency_seconds
+        if previous is None:
+            self._safety_readiness_latency_seconds = seconds
+            return
+        self._safety_readiness_latency_seconds = (
+            1 - SAFETY_READINESS_LATENCY_ALPHA
+        ) * previous + SAFETY_READINESS_LATENCY_ALPHA * seconds
+
+    def safety_readiness_latency_seconds(self) -> float:
+        """Return how long one safety placement flip costs in safety unavailability, in seconds.
+
+        Measured from the launch of a safety start to the first readiness the pool proves after it, averaged
+        across the session's starts. Bounded below by :data:`SAFETY_READINESS_LATENCY_FLOOR_SECONDS` (nothing
+        has been timed yet, or this host is faster than the floor and the policy should still not treat a flip
+        as free) and above by :data:`SAFETY_READINESS_LATENCY_CEILING_SECONDS`.
+
+        Callers use it as the actuation cost a placement flip must be justified against, so the evidence a flip
+        demands scales with what the flip costs on the host it runs on rather than a fixed number of cycles.
+        """
+        measured = self._safety_readiness_latency_seconds
+        if measured is None:
+            return SAFETY_READINESS_LATENCY_FLOOR_SECONDS
+        return min(max(measured, SAFETY_READINESS_LATENCY_FLOOR_SECONDS), SAFETY_READINESS_LATENCY_CEILING_SECONDS)
 
     def _record_safety_recovery(self) -> None:
         """Record that the safety pool was just rebuilt, pruning the history to the crash-loop window."""

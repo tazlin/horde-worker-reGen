@@ -20,6 +20,8 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Job
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SAFETY_READINESS_LATENCY_CEILING_SECONDS,
+    SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
     ModelIncidentKind,
     PauseOwner,
     ProcessLifecycleManager,
@@ -2244,3 +2246,61 @@ def test_scale_down_without_a_named_slot_is_unchanged() -> None:
     plm.scale_inference_processes(1, protected_model="flux_model")
 
     assert list(plm._process_map.keys()) == [1]
+
+
+class TestSafetyReadinessLatency:
+    """What one safety placement flip costs the worker, measured rather than assumed.
+
+    Placement policy prices its dwells from this: an eviction that leaves the worker without an on-GPU safety
+    process for the length of a rebuild has to be justified by pressure that lasted about that long, and the
+    only honest source for "about that long" is what this host's rebuilds actually take.
+    """
+
+    def test_an_untimed_host_prices_a_flip_at_the_floor(self) -> None:
+        """Before any rebuild has been timed the flip is priced at the cold-start floor, never at zero."""
+        plm = _make_plm()
+        assert plm.safety_readiness_latency_seconds() == SAFETY_READINESS_LATENCY_FLOOR_SECONDS
+
+    def test_a_slow_host_prices_its_own_rebuilds(self) -> None:
+        """A measured rebuild above the floor is what the flip costs from then on."""
+        plm = _make_plm()
+        plm._record_safety_readiness_latency(120.0)
+        assert plm.safety_readiness_latency_seconds() == pytest.approx(120.0)
+
+    def test_a_fast_host_still_pays_the_floor(self) -> None:
+        """A rebuild faster than the floor does not make a flip cheap enough to spend on a transient."""
+        plm = _make_plm()
+        plm._record_safety_readiness_latency(1.0)
+        assert plm.safety_readiness_latency_seconds() == SAFETY_READINESS_LATENCY_FLOOR_SECONDS
+
+    def test_one_pathological_rebuild_cannot_price_an_unbounded_dwell(self) -> None:
+        """The ceiling keeps a stuck start from leaving placement unable to respond to the card at all."""
+        plm = _make_plm()
+        plm._record_safety_readiness_latency(SAFETY_READINESS_LATENCY_CEILING_SECONDS * 10.0)
+        assert plm.safety_readiness_latency_seconds() == SAFETY_READINESS_LATENCY_CEILING_SECONDS
+
+    def test_the_average_tracks_successive_rebuilds(self) -> None:
+        """Later rebuilds move the figure, so a host that warms its caches is not priced at its cold start."""
+        plm = _make_plm()
+        plm._record_safety_readiness_latency(200.0)
+        first = plm.safety_readiness_latency_seconds()
+        plm._record_safety_readiness_latency(60.0)
+        assert plm.safety_readiness_latency_seconds() < first
+
+    def test_readiness_times_the_start_that_preceded_it(self) -> None:
+        """The interval measured is spawn to the first readiness after it, and it is consumed once."""
+        plm = _make_plm()
+        plm._process_map[0] = make_mock_process_info(
+            0,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+        plm._safety_start_initiated_at = time.time() - 75.0
+
+        plm._observe_safety_pool_readiness()
+        assert plm.safety_readiness_latency_seconds() == pytest.approx(75.0, abs=2.0)
+
+        # A second observation with no start in between measures nothing new.
+        plm._observe_safety_pool_readiness()
+        assert plm.safety_readiness_latency_seconds() == pytest.approx(75.0, abs=2.0)

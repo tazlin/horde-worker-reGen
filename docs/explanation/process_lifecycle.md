@@ -259,6 +259,15 @@ window. The window remains bounded for genuine crash-on-start churn; readiness
 clears both its unready-rebuild count and the independent consecutive-start-failure
 streak, after which later unexpected safety replacement counts normally.
 
+Readiness is also where the **cost of one placement flip** is measured. The manager
+times each safety start to the first readiness that follows it and keeps a running
+average (`safety_readiness_latency_seconds`), floored for a cold start and capped so
+one pathological start cannot distort it. That figure is what the scheduler's
+placement policy prices its dwells from: an eviction that leaves the worker without
+an on-GPU safety process for the length of a rebuild has to be justified by pressure
+that lasted about that long. See
+[VRAM arbiter](vram_arbiter.md#runtime-safety-placement).
+
 ## Model preloading lifecycle
 
 Model loading is a multi-step operation managed cooperatively by the inference

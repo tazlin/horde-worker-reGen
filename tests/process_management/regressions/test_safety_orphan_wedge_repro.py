@@ -501,3 +501,99 @@ class TestRetiredSafetyLaunchDropsUnownedVerdicts:
         assert job_info.job_image_results is None
         assert job_info.state == GENERATION_STATE.faulted
         assert pm._state.self_throttle_paused is True
+
+
+class TestOffGpuSafetyGraceAndPlacementRebuilds:
+    """The orphan watchdog reads where safety is running before it judges a late verdict.
+
+    Two failures this encodes. A check that legitimately takes over a minute on the CPU was requeued at the
+    on-GPU grace, discarding progress that was going to finish and paying for the whole check again. And a
+    requeue found the pool unready during a deliberate placement rebuild and forced another replacement, which
+    restarted that rebuild from the beginning, so the worker rebuilt safety for as long as the placement kept
+    flipping.
+    """
+
+    async def test_off_gpu_grace_scales_to_what_checks_are_taking(self) -> None:
+        """With safety on the CPU and a live pool, the grace follows the measured check duration."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        pm._process_lifecycle._safety_gpu_paused = True
+        pm._state.avg_safety_seconds = 40.0
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        # Well past the on-GPU baseline, and well inside what checks are actually taking off-GPU.
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 15.0)
+        await coordinator.reconcile_orphaned_safety_jobs()
+        assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING
+
+        coordinator.orphan_safety_since[job_id] = time.time() - (
+            40.0 * coordinator.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + 1.0
+        )
+        await coordinator.reconcile_orphaned_safety_jobs()
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+
+    async def test_on_gpu_safety_keeps_the_baseline_grace(self) -> None:
+        """A resident safety process is held to the on-GPU baseline however long its checks average."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        pm._state.avg_safety_seconds = 40.0
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+        await coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+
+    async def test_the_scaled_grace_is_capped(self) -> None:
+        """A pathological average cannot let a hung safety process hold a job indefinitely."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        pm._process_lifecycle._safety_gpu_paused = True
+        pm._state.avg_safety_seconds = 10_000.0
+
+        assert coordinator._orphan_safety_grace_seconds() == coordinator.SAFETY_GRACE_MAX_SECONDS
+
+    async def test_an_intentional_placement_rebuild_is_not_forced_to_restart(self) -> None:
+        """A requeue during a deliberate placement rebuild leaves that rebuild to finish on its own."""
+        pm = make_testable_process_manager()
+        coordinator = pm._recovery_coordinator
+        # No safety process: the pool is unready, which is the branch that forces a replacement.
+        pm._process_lifecycle._safety_replacement_intentional_until_ready = True
+        assert pm._process_lifecycle.safety_placement_transition_pending is True
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+
+        await coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+        assert pm._process_lifecycle.safety_processes_should_be_replaced is False
+
+    async def test_an_unready_pool_with_no_rebuild_in_flight_is_still_replaced(self) -> None:
+        """Absent a deliberate rebuild, an unready pool is still rebuilt: the remedy is not weakened."""
+        pm = make_testable_process_manager()
+        coordinator = pm._recovery_coordinator
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+
+        await coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._process_lifecycle.safety_processes_should_be_replaced is True

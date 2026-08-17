@@ -440,12 +440,14 @@ head coerced onto the co-resident path cannot win the card back at dispatch time
 allowance. The dwell state lives in the residency ledger and is shared by both paths.
 
 Only one reconciler may change safety placement. Whole-card residency contributes a persistent off-GPU veto,
-the reclaim ladder contributes a one-shot request, and runtime placement contributes its hysteretic fit wish;
-none calls lifecycle's safety pause or restore directly. The reconciler keeps the initiating `PauseOwner` for
-attribution, waits until the replacement reaches readiness, and restores only after every request and veto has
-cleared, the arbiter admits the safety load, and the device-free governor permits growth. A residency that ends
-under a runtime-policy wish therefore cannot promote safety only for the policy to demote it again, and two
-opposing wishes cannot chain intentional replacement windows.
+the reclaim ladder contributes a one-shot request, and runtime placement contributes a demand derived from
+sustained measured pressure on safety's own card; none calls lifecycle's safety pause or restore directly. The
+reconciler keeps the initiating `PauseOwner` for attribution, waits until the replacement reaches readiness, and
+restores only after every request and veto has cleared, the arbiter admits the safety load, and the device-free
+governor permits growth. Two opposing wishes cannot chain intentional replacement windows, and no placement
+evidence accrues while one is open, so a rebuild cannot decide the flip that follows it. The placement policy
+accrues no pressure at all while a residency holds safety's card, since filling that card is what the residency
+is; a residency that ends therefore does not promote safety into a demotion the residency itself caused.
 
 Whole-card residency is off unless its config flag resolves to true. A flag that never resolved at all is
 disclosed once at the scheduler, because a worker that quietly forgoes the residency simply loads heavy

@@ -94,6 +94,30 @@ become more precise without invalidating older logs, so the detector accepts bot
 format and the former free-after-commitments format. Repeated warnings for one job, with no later PP completion,
 surface as `post_processing_deferral_starvation` in the dashboard's Diagnostics tab.
 
+## Runtime safety-placement diagnostics
+
+Two info lines in `bridge.log` record every move of the safety process the runtime placement policy makes, and
+both state the evidence rather than a cycle count:
+
+```text
+Runtime safety placement: moving safety off card 0 after 34s of sustained memory pressure there (card 0:
+measured free 812MB, marginal need 1091MB, noise buffer 512MB, safety footprint 3044MB, governor HEALTHY).
+Restoring it costs about 30s of safety unavailability, which is the dwell this pressure had to outlast.
+
+Runtime safety placement: restoring safety to card 0 after 71s of measured free at or above the 4647MB it needs
+to survive the peak that card is committed to (card 0: measured free 5210MB, ...).
+```
+
+`marginal need` is what the card still has to find for the heaviest sampling peak it is committed to, net of
+what the process holding that model already has on the device; it is the figure both sides forecast against.
+A `Runtime safety placement inputs:` line at DEBUG carries the same evidence on every change to it, so a capture
+can attribute a flip to what the policy saw; unchanged repeats drop to TRACE. For the policy itself see
+[VRAM arbiter](../explanation/vram_arbiter.md#runtime-safety-placement).
+
+The `Withholding job pops: post-inference safety backlog` warning's closing advice depends on where safety is
+running: it suggests enabling `safety_on_gpu` only while that is off, and names resource governance when the
+setting is on but the placement policy has moved safety to the CPU.
+
 ## Supervisor stall forgiveness
 
 Two lines in `bridge_tui.log` / `bridge_host.log` describe the *supervisor's* own liveness rather than the

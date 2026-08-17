@@ -52,7 +52,11 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
+    PauseOwner,
+    ProcessLifecycleManager,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
@@ -532,6 +536,8 @@ class _DispatchWorld:
         child_free_view_lie_mb: float = 0.0,
         footprint_undershoot: float = 1.0,
         safety_off_gpu_allowed: bool = False,
+        safety_readiness_seconds: float = 0.0,
+        safety_load_transient_mb: float = 0.0,
         unload_release_delay_seconds: float = 0.0,
         child_evicts_granted_resident: bool = False,
         child_unload_leaks_mb: float = 0.0,
@@ -587,6 +593,16 @@ class _DispatchWorld:
             safety_off_gpu_allowed: Whether the operator permits safety to be moved off the card to reclaim it.
                 Off, the ladder has no safety rung at all, so a run says nothing about what reaching one costs;
                 on, the safety pause and its restore are modelled as the process cycle they are.
+            safety_readiness_seconds: How long a safety placement flip takes to reach readiness in world time.
+                A flip ends the safety process and brings a replacement up, so the card is mid-rebuild for that
+                whole window and the lifecycle reports a placement transition pending throughout it. Zero
+                collapses the flip to an instant, which no worker's safety process ever does, and leaves the
+                placement policy free to decide its next flip on the cycle after the last one.
+            safety_load_transient_mb: How much more than its at-rest footprint safety charges the card while a
+                restore is materialising. The classifier weights are read and copied before the process settles,
+                so the peak a restore imposes is above the figure a fit priced, and a restore onto a card with
+                barely enough room re-trips the pressure it just left. Zero prices the load at its at-rest
+                footprint.
             unload_release_delay_seconds: How long after the parent sends an unload the card actually gets the
                 memory back. An unload is an IPC the child services between its own allocations and the driver
                 then returns the block, so a multi-gigabyte release lands seconds after the command; at zero the
@@ -628,6 +644,8 @@ class _DispatchWorld:
         """
         self.card = card
         self.tick_seconds = tick_seconds
+        self.safety_readiness_seconds = safety_readiness_seconds
+        self.safety_load_transient_mb = safety_load_transient_mb
         self.closed_loop = closed_loop
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.footprint_undershoot = footprint_undershoot
@@ -717,6 +735,13 @@ class _DispatchWorld:
         """Every time the safety context left the card, as (tick, world clock, the owner that asked)."""
         self.safety_restore_events: list[tuple[int, float]] = []
         """Every time the safety context came back onto the card, as (tick, world clock)."""
+        self._safety_transition_until: float | None = None
+        """World-clock instant the safety placement rebuild in flight reaches readiness, or None when none is.
+
+        While one stands the lifecycle reports a placement transition pending, exactly as it does across a real
+        respawn, so a policy that gathers evidence through the rebuild window is visible here."""
+        self.safety_readiness_events: list[tuple[int, float]] = []
+        """Every time a safety placement rebuild reached readiness, as (tick, world clock)."""
         self.snapshot: MeasuredVramSnapshot | None = None
         """The most recent cycle-frozen device measurement, the surface a row reads obligations back from."""
         self.decision_records: list[_DecisionRecord] = []
@@ -897,6 +922,10 @@ class _DispatchWorld:
             charge += _MARGINAL_CONTEXT_MB
             if not self.safety_is_off_gpu():
                 charge += _SAFETY_GPU_LOAD_CHARGE_MB
+                if self._safety_transition_until is not None:
+                    # A restore is still materialising: the classifier weights are being read and copied, so the
+                    # card carries the load peak rather than the at-rest footprint until the process settles.
+                    charge += self.safety_load_transient_mb
         return charge
 
     def safety_is_off_gpu(self) -> bool:
@@ -909,11 +938,12 @@ class _DispatchWorld:
         Mirrors the lifecycle's single-owner pause: a context already off the card is not paused twice, and the
         owner is recorded so only that owner's restore can bring it back.
         """
-        if self.safety_is_off_gpu():
+        if self.safety_is_off_gpu() or self._safety_transition_until is not None:
             return False
         self._lifecycle.is_safety_gpu_paused = True
         self._lifecycle.safety_pause_owner = owner
         self.safety_pause_events.append((self.tick, self.now, owner))
+        self._begin_safety_placement_transition()
         self._sync_reported_vram()
         return True
 
@@ -921,11 +951,35 @@ class _DispatchWorld:
         """Put the safety context back on the card for ``owner``, returning whether this call did it."""
         if not self.safety_is_off_gpu() or self._lifecycle.safety_pause_owner is not owner:
             return False
+        if self._safety_transition_until is not None:
+            return False
         self._lifecycle.is_safety_gpu_paused = False
         self._lifecycle.safety_pause_owner = None
         self.safety_restore_events.append((self.tick, self.now))
+        self._begin_safety_placement_transition()
         self._sync_reported_vram()
         return True
+
+    def _begin_safety_placement_transition(self) -> None:
+        """Open the rebuild window one placement flip costs, if the row models one at all."""
+        if self.safety_readiness_seconds <= 0:
+            return
+        self._safety_transition_until = self.now + self.safety_readiness_seconds
+        self._lifecycle.safety_placement_transition_pending = True
+
+    def _advance_safety_placement_transition(self) -> None:
+        """Close the rebuild window once the replacement safety process has had time to reach readiness."""
+        until = self._safety_transition_until
+        if until is None or self.now < until:
+            return
+        self._safety_transition_until = None
+        self._lifecycle.safety_placement_transition_pending = False
+        self.safety_readiness_events.append((self.tick, self.now))
+        self._sync_reported_vram()
+
+    def safety_readiness_latency_seconds(self) -> float:
+        """What the lifecycle reports one placement flip costs, floored the way the real manager floors it."""
+        return max(self.safety_readiness_seconds, SAFETY_READINESS_LATENCY_FLOOR_SECONDS)
 
     def device_free_mb(self) -> float:
         """The truthful device-free reading: the card total less its contexts, weights, and live activation.
@@ -1968,6 +2022,7 @@ class _DispatchWorld:
         """Advance one scheduling tick, in the control loop's order."""
         self.tick += 1
         self.now += self.tick_seconds
+        self._advance_safety_placement_transition()
         self._apply_control_flags()
         self._materialise_preloads()
         self._advance_encode_windows()
@@ -2453,6 +2508,7 @@ def _make_mock_lifecycle(world: _DispatchWorld) -> Mock:
     lifecycle.safety_placement_transition_pending = False
     lifecycle.pause_safety_on_gpu = world.pause_safety_on_gpu
     lifecycle.restore_safety_on_gpu = world.restore_safety_on_gpu
+    lifecycle.safety_readiness_latency_seconds = world.safety_readiness_latency_seconds
     lifecycle.is_post_process_gpu_paused = False
     lifecycle.post_process_processes_should_be_replaced = False
     lifecycle.post_process_lane_enabled = Mock(return_value=False)

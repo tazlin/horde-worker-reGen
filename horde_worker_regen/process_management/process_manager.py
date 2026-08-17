@@ -1885,6 +1885,7 @@ class HordeWorkerProcessManager:
             admission_baseline_provider=self.latest_baseline_estimate_mb,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
             post_processing_lane_paused_provider=lambda: self._process_lifecycle.is_post_process_gpu_paused,
+            safety_off_gpu_provider=lambda: self._process_lifecycle.is_safety_gpu_paused,
             vram_pressure_provider=self._all_governed_cards_under_vram_pressure,
             staged_models_provider=self._staged_checkpoint_models,
             action_ledger=self._action_ledger,
