@@ -775,6 +775,14 @@ class WorkerRunMetrics:
                     phase_metrics=metrics,
                 ),
             )
+            # A disaggregated job emits no whole-job snapshot, so without this its completed record carries no
+            # phase metrics at all: no sampling rate, no measured VRAM footprint, nothing for an offline
+            # analysis to attribute its cost with. The sample stage is the one that answers for the job (it
+            # runs the sampler and measures the device), so it also fills the whole-job correlation slot. The
+            # other stages stay standalone: their snapshots describe an encode or a decode, and letting the
+            # last one to arrive land in the slot would put a VAE decode's numbers on the job's record.
+            if message.stage is PipelineStageTag.SAMPLE:
+                self._phase_metrics_by_job[message.job_id] = metrics
             return
 
         # Both image jobs and alchemy forms finalize later (the alchemy coordinator records the form's

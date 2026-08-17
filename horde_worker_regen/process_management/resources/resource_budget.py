@@ -325,6 +325,18 @@ class StreamForecast:
     this bounded threshold holds them independent of both the activation estimate and the operator margin. None
     falls back to ``reserve_mb`` so a directly-constructed forecast keeps its prior single-reserve behavior."""
 
+    measured_footprint_mb: float | None = None
+    """What this checkpoint measurably costs the card at rest, margined, in the same context-exclusive terms
+    as ``footprint_mb``; None until the store has enough observations to answer.
+
+    Distinct from the raise-only overlay already folded into ``footprint_mb``, and it does not replace it:
+    the static seeds still govern every fit decision. Its one job is to let a ``wants_whole_card`` baseline
+    give up its sole-residency claim on evidence (see :attr:`needs_exclusive_residency`), because a seed can
+    over-state a model by gigabytes and reserve a whole card for nothing."""
+    measured_observation_count: int = 0
+    """How many observations back ``measured_footprint_mb``, so a residency verdict can be logged with the
+    weight of the evidence behind it. Zero when there is no measured figure."""
+
     unreclaimable_charge_mb: float = 0.0
     """The share of the ``free_after_model_evict_mb`` deduction that stopping idle inference siblings cannot
     give back: the safety process's footprint, the service lanes' contexts, and the image lane's concurrent
@@ -449,6 +461,41 @@ class StreamForecast:
         ) >= _CORESIDENT_SIBLING_MODEL_FLOOR_MB
 
     @property
+    def _residency_is_intent_driven(self) -> bool:
+        """Whether the sole-residency claim comes from the baseline's declared intent rather than its weights.
+
+        The exact predicate :attr:`needs_exclusive_residency`'s first branch grants on, shared so the verdict
+        text and the grant can never drift apart. It is a property of the declaration and the room question,
+        not of the instantaneous free reading: a whole-card baseline claims the card for the same reason
+        whether the card currently reads full or empty.
+        """
+        return (
+            self.wants_whole_card
+            and not self._has_room_for_coresident_model
+            and not self.measured_retires_whole_card_intent
+        )
+
+    @property
+    def measured_retires_whole_card_intent(self) -> bool:
+        """Whether measurement has disproved this whole-card-intent model's need for the device.
+
+        ``wants_whole_card`` is a statement about a baseline, made before any of this worker's hardware was
+        measured, and :attr:`_has_room_for_coresident_model` judges it against a static seed that can
+        over-state the model by gigabytes. Where the store has actually watched the checkpoint run, that
+        seed is no longer the best evidence available: the test becomes whether the *measured*, margined
+        resident cost leaves the card room for another process's context at sole residency. It does not
+        promise room for a whole sibling model (the seed-based floor's much stronger claim); it only says
+        the card is not full, which is the entire premise of tearing the siblings down.
+
+        False without a measured figure or without a sized card, so an unmeasured or unsizable case keeps
+        the declared intent exactly as before.
+        """
+        measured_mb = self.measured_footprint_mb
+        if measured_mb is None or self.free_if_alone_mb is None:
+            return False
+        return (self.free_if_alone_mb - measured_mb) >= self._effective_marginal_overhead_mb
+
+    @property
     def fits_coresident(self) -> bool:
         """True when the model loads without streaming and without evicting or stopping anything.
 
@@ -515,6 +562,9 @@ class StreamForecast:
           (:attr:`_has_room_for_coresident_model`). On a genuinely roomy card (Flux fp8 on 24 GB) they co-reside
           like any other model; the "never shares well" contract is then upheld by the concurrency overlap gate
           (no co-*sampling*), not by reserving the device, which where the budget shows ample room only churns it.
+          Once the checkpoint has been measured enough times, :attr:`measured_retires_whole_card_intent`
+          answers the same room question from the measurement instead of the seed, so a seed that over-states
+          the model stops reserving a card the hardware shows is not full.
         - **Ordinary models** co-reside by default and need *sole* residency only when their persistent weights
           are too heavy to fit beside even one sibling context (:attr:`_persistent_weights_dominant`). A
           moderate-weight model with a large transient activation estimate (a 4.9 GB SDXL at a big batch) never
@@ -528,7 +578,7 @@ class StreamForecast:
         """
         if not (self.known and self.fits_alone):
             return False
-        if self.wants_whole_card and not self._has_room_for_coresident_model:
+        if self._residency_is_intent_driven:
             return True
         return not self.fits_coresident and self._persistent_weights_dominant
 
@@ -662,7 +712,11 @@ class StreamForecast:
         alone = f"{self.free_if_alone_mb:.0f}" if self.free_if_alone_mb is not None else "?"
         if not self.fits_alone:
             verdict = "weights overflow the card alone: streams unavoidably"
-        elif self.needs_exclusive_residency and self.wants_whole_card and self.fits_coresident:
+        elif self.needs_exclusive_residency and self._residency_is_intent_driven:
+            # The verdict names what actually granted the residency. An intent-driven claim is intent-driven
+            # whether or not the card happens to read full right now, and calling it "weight-dominant" sent a
+            # reader hunting for a weight estimate that was never the reason. The remaining branch is reached
+            # only through the weights test, so it can say so unconditionally.
             verdict = "whole-card baseline: sole residency on intent (evict sibling models)"
         elif self.needs_exclusive_residency:
             verdict = "weight-dominant: needs sole residency (evict sibling models)"
@@ -837,6 +891,8 @@ def forecast_weight_streaming(
     num_extra_resident_contexts: int = 0,
     safety_context_charge_mb: float = 0.0,
     learned_resident_footprint_mb: float | None = None,
+    measured_resident_footprint_mb: float | None = None,
+    measured_observation_count: int = 0,
     committed_reserve_mb: float = 0.0,
     marginal_process_overhead_mb: float | None = None,
     wants_whole_card: bool = False,
@@ -889,6 +945,12 @@ def forecast_weight_streaming(
     measurement to the core term would assert a split the measurement does not carry and could flip a model
     whose weights genuinely fit the drained card into reading as streaming-unavoidable. None (or a figure at
     or below the static estimate) leaves the forecast byte-identical to the static arithmetic.
+
+    ``measured_resident_footprint_mb`` is the same checkpoint's *margined measured* at-rest charge, which
+    unlike ``learned_resident_footprint_mb`` may sit below the static seed. It changes no fit arithmetic; it
+    is carried through to :attr:`StreamForecast.measured_footprint_mb` where it can retire a whole-card-intent
+    claim the measurements have disproved. ``measured_observation_count`` is how many observations back it,
+    for the residency log line.
 
     ``wants_whole_card`` flags a baseline the caller has classified as a sole-residency model on intent (the
     ``EXTRA_LARGE`` tier: Cascade/Flux/Qwen/Z-Image), so a conservative weight seed that happens to fit
@@ -1041,6 +1103,10 @@ def forecast_weight_streaming(
         per_process_overhead_mb=overhead,
         marginal_process_overhead_mb=marginal,
         wants_whole_card=wants_whole_card,
+        # Carried, never folded into the fit arithmetic above: a measured figure below the seed must not
+        # quietly lower a load-feasibility judgment, only retire a residency claim the seed alone made.
+        measured_footprint_mb=(None if disaggregated else measured_resident_footprint_mb),
+        measured_observation_count=(0 if disaggregated else max(0, measured_observation_count)),
         unreclaimable_charge_mb=unreclaimable_charge_mb,
     )
 

@@ -459,6 +459,42 @@ class TestStageMetrics:
         assert snapshot.jobs[0].stage is None
         assert snapshot.jobs[0].phase_metrics is not None
 
+    def test_sample_stage_metrics_reach_the_finalized_job_record(self) -> None:
+        """A disaggregated job emits no whole-job snapshot, so its sample stage answers for the job.
+
+        Without this the completed record of every disaggregated job carries no phase metrics at all: no
+        sampling rate and no measured VRAM footprint for an offline analysis to attribute its cost with.
+        """
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        job_id = str(job.id_)
+        metrics.on_job_metrics(self._stage_message(job_id, PipelineStageTag.TEXT_ENCODE))
+        metrics.on_job_metrics(self._stage_message(job_id, PipelineStageTag.SAMPLE))
+        metrics.on_job_metrics(self._stage_message(job_id, PipelineStageTag.VAE_DECODE))
+        _finalize_job_from(metrics, job)
+
+        snapshot = metrics.snapshot()
+        assert len(snapshot.jobs) == 1
+        assert snapshot.jobs[0].phase_metrics is not None
+        assert snapshot.jobs[0].stage is None
+        # The stage records are unaffected: each lane still answers for its own stage.
+        assert [record.stage for record in snapshot.stage_metrics] == [
+            PipelineStageTag.TEXT_ENCODE,
+            PipelineStageTag.SAMPLE,
+            PipelineStageTag.VAE_DECODE,
+        ]
+
+    def test_a_non_sampling_stage_never_fills_the_whole_job_slot(self) -> None:
+        """A decode's numbers must not land on the job's record just for arriving last."""
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        metrics.on_job_metrics(self._stage_message(str(job.id_), PipelineStageTag.VAE_DECODE))
+        _finalize_job_from(metrics, job)
+
+        assert metrics.snapshot().jobs[0].phase_metrics is None
+
     def test_reset_clears_stage_metrics(self) -> None:
         """A benchmark-level reset drops retained stage records alongside the other aggregates."""
         metrics = WorkerRunMetrics()

@@ -1542,6 +1542,7 @@ class InferenceScheduler:
             forecast.needs_exclusive_residency,
             forecast.needs_process_count_reduction,
             forecast.streams_unavoidably,
+            forecast.measured_retires_whole_card_intent,
         )
         suppressed_count = self._scheduler_diagnostic_suppressed_count(f"stream_forecast:{job_id}", state_key)
         if suppressed_count is None:
@@ -1555,8 +1556,16 @@ class InferenceScheduler:
         # first is the share of the after-model-evict deduction that stopping inference siblings cannot give
         # back, the second the context count the budget says already fits. A reduction demanded while
         # max_resident already covers the live processes is a deficit made of the unreclaimable charges.
+        # A whole-card baseline that stops claiming the card on measured evidence is a visible reversal of a
+        # declared policy, so the figure and the number of runs behind it are named where the reversal happens.
+        measured_note = ""
+        if forecast.measured_retires_whole_card_intent and forecast.measured_footprint_mb is not None:
+            measured_note = (
+                f" [whole-card intent retired: measured {forecast.measured_footprint_mb:.0f}MB over "
+                f"{forecast.measured_observation_count} observations fits beside a sibling context]"
+            )
         logger.debug(
-            f"Stream forecast for {job.model}: {forecast.reason()} "
+            f"Stream forecast for {job.model}: {forecast.reason()}{measured_note} "
             f"[free_now={forecast.free_now_mb}, after_model_evict={forecast.free_after_model_evict_mb}, "
             f"alone={forecast.free_if_alone_mb}, "
             f"unreclaimable={forecast.unreclaimable_charge_mb:.0f}MB, live_procs="
@@ -2139,6 +2148,7 @@ class InferenceScheduler:
         # dispatch predicate) is used so a job that will run disaggregated is charged sampler-only even during a
         # whole-card window when the lane is transiently paused.
         disaggregated = self._is_disaggregation_class_eligible(job)
+        measured_resident_mb, measured_observation_count = self._measured_resident_footprint_mb(job.model, baseline)
         return forecast_weight_streaming(
             job,
             str(baseline) if baseline is not None else None,
@@ -2150,6 +2160,8 @@ class InferenceScheduler:
             num_extra_resident_contexts=num_post_process_contexts,
             safety_context_charge_mb=safety_context_charge_mb,
             learned_resident_footprint_mb=self._learned_resident_footprint_mb(job.model, baseline),
+            measured_resident_footprint_mb=measured_resident_mb,
+            measured_observation_count=measured_observation_count,
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
             marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
             wants_whole_card=wants_whole_card,
@@ -5117,6 +5129,40 @@ class InferenceScheduler:
             return None
         return max(0.0, watermark_mb - self.resolved_context_constant_mb())
 
+    def _measured_resident_footprint_mb(
+        self,
+        model_name: str | None,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+    ) -> tuple[float | None, int]:
+        """The margined *measured* at-rest charge (MB) of this checkpoint and how many runs back it.
+
+        The bidirectional counterpart to :meth:`_learned_resident_footprint_mb`: where that one can only
+        raise the static seed, this one reports what the hardware actually did, which may be well below the
+        seed. It is returned separately rather than folded into the seed overlay because the fit arithmetic
+        must keep planning on the conservative figure; the measurement's only authority is to retire a
+        whole-card residency claim the seed alone was making (see
+        :attr:`~horde_worker_regen.process_management.resources.resource_budget.StreamForecast.measured_retires_whole_card_intent`).
+
+        The context constant is netted out for the same reason it is in the raise-only accessor: the store
+        keeps whole-device charges while the forecast charges contexts separately.
+
+        Returns ``(None, 0)`` for an under-observed key, an unkeyable model, or a store-less scheduler.
+        """
+        store = self._footprint_store
+        if store is None or model_name is None or baseline is None:
+            return (None, 0)
+        key = FootprintKey(
+            model_baseline=str(baseline),
+            resolution_bucket=None,
+            platform=sys.platform,
+            stage=FootprintStage.RESIDENT,
+            checkpoint=model_name,
+        )
+        measured_mb = store.measured_estimate_mb(key)
+        if measured_mb is None:
+            return (None, 0)
+        return (max(0.0, measured_mb - self.resolved_context_constant_mb()), store.observation_count(key))
+
     def _learned_sampling_peak_mb(
         self,
         job: ImageGenerateJobPopResponse,
@@ -5132,6 +5178,12 @@ class InferenceScheduler:
         sampling work routes through so a measured activation peak is never undershot. Callers pricing whole-job
         sampling pass :attr:`FootprintStage.SAMPLE`; callers pricing a disaggregated UNet-only sampler pass
         :attr:`FootprintStage.SAMPLE_ISOLATED` so a monolithic whole-job watermark never over-prices it.
+
+        The activation keys are fed from the child's reserved-peak reports, which include allocator cache, so
+        the margined measured estimate is deliberately not used here: pricing a sampling window at reserved
+        peak times margin plus context charges more than the seed for an ordinary SDXL job and refuses
+        co-residency the card can hold. Measured pricing is confined to the resident footprint, where the
+        backend measures weights alone.
         """
         store = self._footprint_store
         if store is None:

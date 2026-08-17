@@ -20,16 +20,89 @@ record steady device charges (a loaded checkpoint's weights, the safety process'
 nothing is running, and they live in the same store under the same raise-only watermark contract: a consumer
 pricing "what does this already cost the card" reads them exactly as it reads a sampling peak.
 
+Two estimate policies live here and are deliberately kept apart. :meth:`LearnedFootprintStore.estimate_mb`
+is the raise-only overlay described above, used wherever undershooting is the only failure that matters.
+:meth:`LearnedFootprintStore.measured_estimate_mb` is bidirectional: once a key carries at least
+:data:`_MIN_OBSERVATIONS_FOR_MEASURED` observations it answers from the measurements alone, so a seed that
+over-states the hardware (a Flux fp8 seed of 16.4 GB against a measured 13.5 GB device-used median) stops
+denying co-residency the card physically holds. Its conservatism is one explicit knob,
+:data:`_MEASURED_ESTIMATE_MARGIN` plus the platform context floor, rather than being smeared across the
+seeds: Linux OOM-kills and WDDM paging both punish an under-estimate far harder than an over-estimate, so
+the margin exists, but it is one number a reader can find and change.
+
 Thread-safety: the store is written and read from the parent's single-threaded control loop (the same
-loop that drains child memory reports), so no locking is required. It holds nothing across runs; every
-worker start begins with cold keys that fall back to the static seed until a peak is observed.
+loop that drains child memory reports), so no locking is required. Given a path it persists its
+observations to a schema-versioned JSON file beside the performance model, so calibration survives a
+restart; without one (or when the file is missing or corrupt) every worker start begins with cold keys
+that fall back to the static seed until a peak is observed.
 """
 
 from __future__ import annotations
 
+import contextlib
 import enum
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Protocol
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
+
+from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
+
+
+class MeasuredJobFootprint(Protocol):
+    """The measured per-job device footprint this store can learn from.
+
+    Structural rather than an import of ``hordelib.metrics.JobVramFootprint`` because the worker supports a
+    range of backend versions and the footprint is a newer addition: a backend that does not report one
+    simply never reaches this seam. Read-only properties, since the store only ever reads.
+    """
+
+    @property
+    def peak_resident_weights_mb(self) -> float | None:
+        """Largest the on-device weight set got at one instant during the run."""
+
+    @property
+    def peak_device_used_mb(self) -> float | None:
+        """Device-wide used high-water during the run (weights plus transient activation)."""
+
+    @property
+    def resident_weights_after_job_mb(self) -> float | None:
+        """Weights still on the device when the run finished."""
+
+    @property
+    def model_name(self) -> str | None:
+        """The horde model identifier the run used."""
+
+    @property
+    def baseline(self) -> str | None:
+        """The model's baseline family, when the backend resolved one."""
+
+    @property
+    def width(self) -> int | None:
+        """Request width in pixels."""
+
+    @property
+    def height(self) -> int | None:
+        """Request height in pixels."""
+
+    @property
+    def batch_size(self) -> int | None:
+        """Request batch size."""
+
+    @property
+    def stage(self) -> str | None:
+        """``whole_job`` for a monolithic run, ``sample_stage`` for a disaggregated sampler stage."""
+
+
+FOOTPRINT_STORE_SCHEMA_VERSION = 1
+"""Bumped when the persisted schema changes incompatibly; an older file is discarded on read."""
+
+FOOTPRINT_STORE_FILENAME = "vram_footprints.json"
+"""Name of the persisted store inside the worker's app-state directory (beside ``perf_model.json``)."""
 
 
 class ResolutionBucket(enum.StrEnum):
@@ -171,7 +244,43 @@ class _FootprintObservation(BaseModel):
     """The maximum peak ever observed for this key (the undershoot-proof figure the estimate returns)."""
     observation_count: int = Field(default=0)
     """How many peaks have been folded in (diagnostics)."""
+    recent_mb: list[float] = Field(default_factory=list)
+    """The most recent observations, oldest first, capped at :data:`_RECENT_WINDOW_SIZE`.
 
+    The basis of :meth:`LearnedFootprintStore.measured_estimate_mb`. A bounded window rather than the
+    all-time watermark because the measured estimate is allowed to fall: a driver update, a quantisation
+    change, or a different checkpoint of the same baseline can genuinely lower what the hardware needs,
+    and an all-time maximum would hold the old figure forever."""
+
+
+_RECENT_WINDOW_SIZE = 20
+"""How many recent observations back the measured estimate.
+
+Wide enough that one anomalous job cannot dominate the window's maximum for long, narrow enough that a
+genuine change in what a key costs works its way through within a few minutes of ordinary traffic."""
+
+_MIN_OBSERVATIONS_FOR_MEASURED = 5
+"""Observations a key needs before :meth:`LearnedFootprintStore.measured_estimate_mb` answers at all.
+
+Below this the key keeps the raise-only :meth:`LearnedFootprintStore.estimate_mb` contract, so a single
+unrepresentative run (a job that faulted mid-sample, a slot that never finished loading) can never talk a
+consumer into planning below the static seed."""
+
+_MEASURED_ESTIMATE_MARGIN = 1.10
+"""The single conservatism knob applied to a measured estimate.
+
+The measurements carry no safety margin of their own (a footprint is one observation of real hardware, not a
+budget), and the two failure modes of an under-estimate are severe and asymmetric: on
+Linux the OOM killer takes the process, on Windows/WDDM the driver pages to host RAM and the step rate
+collapses. Ten percent over the recent watermark buys headroom for the run-to-run variation the window
+already shows, without re-introducing the seed's multi-gigabyte over-statement. It is deliberately one
+constant applied at one seam rather than a fudge folded into every seed."""
+
+_PERSIST_EVERY_N_OBSERVATIONS = 10
+"""Throttle disk writes: persist after this many new observations (plus an explicit save on shutdown).
+
+Mirrors the performance model's cadence, for the same reason: the store is written from the control loop,
+so a write per observation would put a disk sync on the hot path."""
 
 _EWMA_ALPHA = 0.3
 """Weight given to the newest observation in the EWMA (``new = alpha*sample + (1-alpha)*prev``).
@@ -181,15 +290,45 @@ the smoothed average. The estimate does not depend on it (it uses the watermark)
 for calibration visibility only."""
 
 
-class LearnedFootprintStore:
-    """An in-memory store of measured VRAM peaks keyed by (baseline, resolution, platform, stage).
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write text to ``path`` atomically: a temp file in the same directory, then ``os.replace``.
 
-    Single-threaded use only (the parent control loop). Not persisted: cold at every worker start.
+    Mirrors the performance model's persistence so a half-written store can never be read back; kept
+    local rather than shared because ``resources`` must not depend on the scheduling package.
+    """
+    handle, temp_path_name = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    temp_path = Path(temp_path_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as temp_file:
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+        raise
+
+
+class LearnedFootprintStore:
+    """A store of measured VRAM peaks keyed by (baseline, resolution, platform, stage).
+
+    Single-threaded use only (the parent control loop). Given a path it loads any previously persisted
+    observations at construction and writes them back on a debounce, so a restart keeps its calibration;
+    without one it is purely in memory and cold at every worker start.
     """
 
-    def __init__(self) -> None:
-        """Initialise an empty store."""
+    def __init__(self, *, path: Path | None = None) -> None:
+        """Initialise the store, loading any persisted observations from ``path``.
+
+        Args:
+            path: Where to persist observations; ``None`` keeps the store purely in memory (tests).
+        """
         self._observations: dict[FootprintKey, _FootprintObservation] = {}
+        self._path = path
+        self._observations_since_save = 0
+        self._file_disabled = False
+        self._load()
 
     def observe_peak(self, key: FootprintKey, peak_reserved_mb: float) -> None:
         """Fold one observed device-memory figure into the running statistics for ``key``.
@@ -212,14 +351,76 @@ class LearnedFootprintStore:
                 ewma_mb=peak_reserved_mb,
                 watermark_mb=peak_reserved_mb,
                 observation_count=1,
+                recent_mb=[peak_reserved_mb],
             )
-            return
+        else:
+            self._observations[key] = _FootprintObservation(
+                ewma_mb=(_EWMA_ALPHA * peak_reserved_mb) + ((1.0 - _EWMA_ALPHA) * existing.ewma_mb),
+                watermark_mb=max(existing.watermark_mb, peak_reserved_mb),
+                observation_count=existing.observation_count + 1,
+                recent_mb=[*existing.recent_mb, peak_reserved_mb][-_RECENT_WINDOW_SIZE:],
+            )
 
-        self._observations[key] = _FootprintObservation(
-            ewma_mb=(_EWMA_ALPHA * peak_reserved_mb) + ((1.0 - _EWMA_ALPHA) * existing.ewma_mb),
-            watermark_mb=max(existing.watermark_mb, peak_reserved_mb),
-            observation_count=existing.observation_count + 1,
-        )
+        self._observations_since_save += 1
+        if self._observations_since_save >= _PERSIST_EVERY_N_OBSERVATIONS:
+            self.save()
+
+    def observe_job_footprint(
+        self,
+        footprint: MeasuredJobFootprint,
+        *,
+        baseline: str | None,
+        platform: str,
+        context_constant_mb: float = 0.0,
+    ) -> list[FootprintKey]:
+        """Fold a child's measured per-job footprint into every key it can be attributed to.
+
+        A footprint is one run measured against device truth, which is the only evidence the worker has that
+        its seeds are wrong in either direction. One key comes out of it: the resident weight set
+        (``peak_resident_weights_mb``, else ``resident_weights_after_job_mb``) is recorded under
+        :attr:`FootprintStage.RESIDENT` for this checkpoint, with ``context_constant_mb`` added so it is in the
+        whole-device terms the resident population is already kept in (the caller passes the same platform
+        context charge the reserve uses; the backend measures weights alone).
+
+        The footprint's ``peak_device_used_mb`` is deliberately not folded into the activation keys. It is a
+        device-wide high-water, so on a card holding other resident models it carries their weights too; fed
+        into a per-job SAMPLE key that admission then prices from, it makes an ordinary SDXL preload look like
+        it needs the whole card and defers it against room that is really there. The activation keys keep
+        their process-local source (the child's own reserved-peak report).
+
+        Anything the footprint cannot key (no baseline, a non-positive figure) is skipped rather than
+        guessed. Returns the keys actually written, for the caller's logging.
+
+        Args:
+            footprint: The measured footprint the child reported.
+            baseline: The model's baseline, resolved by the caller when the footprint does not carry one.
+            platform: The host platform token the observation belongs to (``sys.platform``).
+            context_constant_mb: The per-process CUDA-context charge to add to the resident figure.
+
+        Returns:
+            list[FootprintKey]: Every key this footprint was recorded under.
+        """
+        resolved_baseline = footprint.baseline or baseline
+        if resolved_baseline is None:
+            return []
+
+        written: list[FootprintKey] = []
+
+        resident_mb = footprint.peak_resident_weights_mb
+        if resident_mb is None:
+            resident_mb = footprint.resident_weights_after_job_mb
+        if resident_mb is not None and resident_mb > 0 and footprint.model_name is not None:
+            resident_key = FootprintKey(
+                model_baseline=str(resolved_baseline),
+                resolution_bucket=None,
+                platform=platform,
+                stage=FootprintStage.RESIDENT,
+                checkpoint=footprint.model_name,
+            )
+            self.observe_peak(resident_key, float(resident_mb) + max(0.0, context_constant_mb))
+            written.append(resident_key)
+
+        return written
 
     def estimate_mb(self, key: FootprintKey, *, static_seed_mb: float) -> float:
         """Return the footprint estimate for ``key``: the static seed raised by any learned watermark.
@@ -241,6 +442,43 @@ class LearnedFootprintStore:
             return static_seed_mb
         return max(static_seed_mb, observation.watermark_mb)
 
+    def measured_estimate_mb(self, key: FootprintKey) -> float | None:
+        """Return what the measurements alone say ``key`` costs, or None while it is under-observed.
+
+        This is the *bidirectional* counterpart to :meth:`estimate_mb`, and the two policies are kept apart
+        on purpose. ``estimate_mb`` answers "never plan below what the hardware has demonstrated"; this
+        answers "what does the hardware actually need", which a consumer uses to stop honouring a seed the
+        measurements have disproved in the other direction. A Flux fp8 seed of 16.4 GB against a measured
+        13.5 GB device-used median is the case in point: the seed reserved the whole card and bought
+        nothing.
+
+        The figure is the maximum of the recent window (:data:`_RECENT_WINDOW_SIZE` observations, so a
+        genuine downward shift eventually lands while one high job still counts), times
+        :data:`_MEASURED_ESTIMATE_MARGIN`, plus the platform's per-process context charge. The margin and
+        the floor are the whole of the conservatism, held here rather than folded into the estimate's
+        basis, so a reader can see and change what the worker is paying for safety. The floor is the same
+        charge the reserve prices a CUDA context at: a consumer sizing a device against this figure must
+        cover the context of the process holding it, and where an observation already carries its context
+        it is additional margin in the direction this store exists to fail in.
+
+        Returns None below :data:`_MIN_OBSERVATIONS_FOR_MEASURED` observations, which leaves the caller on
+        the raise-only path with the static seed intact.
+
+        Args:
+            key (FootprintKey): The footprint identity to estimate for.
+
+        Returns:
+            float | None: The margined measured estimate (MB), or None for an under-observed key.
+        """
+        observation = self._observations.get(key)
+        if observation is None or observation.observation_count < _MIN_OBSERVATIONS_FOR_MEASURED:
+            return None
+        if not observation.recent_mb:
+            return None
+        return (max(observation.recent_mb) * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(
+            platform=key.platform,
+        )
+
     def get_observation(self, key: FootprintKey) -> _FootprintObservation | None:
         """Return the raw running statistics for ``key`` (EWMA, watermark, count), or None if cold.
 
@@ -248,6 +486,70 @@ class LearnedFootprintStore:
         """
         return self._observations.get(key)
 
+    def observation_count(self, key: FootprintKey) -> int:
+        """Return how many observations ``key`` carries (0 when cold), for logging a measured verdict."""
+        observation = self._observations.get(key)
+        return observation.observation_count if observation is not None else 0
+
     def __len__(self) -> int:
         """Return how many distinct keys have at least one observation."""
         return len(self._observations)
+
+    # region persistence
+
+    def save(self) -> None:
+        """Persist the observations atomically. No-op without a path; never raises.
+
+        A footprint-store write must never take the worker down, so a failed write degrades the store to
+        memory-only for the rest of the run rather than retrying every debounce.
+        """
+        self._observations_since_save = 0
+        if self._path is None or self._file_disabled:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": FOOTPRINT_STORE_SCHEMA_VERSION,
+                "observations": [
+                    {"key": key.model_dump(mode="json"), "observation": observation.model_dump(mode="json")}
+                    for key, observation in self._observations.items()
+                ],
+            }
+            _atomic_write_text(self._path, json.dumps(payload))
+        except OSError as write_error:
+            logger.debug(
+                f"Could not persist learned VRAM footprints to {self._path} ({write_error}); continuing in memory.",
+            )
+            self._file_disabled = True
+
+    def _load(self) -> None:
+        """Load previously persisted observations, tolerating a missing, unreadable, or corrupt file.
+
+        A file the current build cannot parse is discarded rather than repaired: the store re-learns from
+        live traffic within a handful of jobs, so nothing is worth failing a worker start over.
+        """
+        if self._path is None or not self._path.exists():
+            return
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as read_error:
+            logger.debug(f"Could not read learned VRAM footprints at {self._path} ({read_error}); starting cold.")
+            return
+
+        if not isinstance(raw, dict) or raw.get("schema_version") != FOOTPRINT_STORE_SCHEMA_VERSION:
+            return
+        entries = raw.get("observations")
+        if not isinstance(entries, list):
+            return
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                key = FootprintKey.model_validate(entry.get("key"))
+                observation = _FootprintObservation.model_validate(entry.get("observation"))
+            except ValueError:
+                continue
+            self._observations[key] = observation
+
+    # endregion

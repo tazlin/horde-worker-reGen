@@ -4,6 +4,10 @@ Shadow-only. These exercise the observation seam (``MessageDispatcher._handle_me
 parent's message pump uses, confirming only cleanly-attributable figures produce a store entry and that
 ambiguous reports do not. Three footprints are attributable there: a running monolithic inference job's
 sampling peak, an idle slot's resident weights, and the safety process's at-rest residency.
+
+A fourth arrives on the per-job metrics seam, where the backend reports what the run measurably occupied
+rather than what the parent can infer from a memory report. That field is newer than the oldest backend the
+worker supports, so its test is skipped where the installed backend does not report one.
 """
 
 from __future__ import annotations
@@ -13,7 +17,9 @@ import sys
 import time
 from unittest.mock import Mock
 
+import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
+from hordelib.metrics import JobPhaseMetrics
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
@@ -22,6 +28,7 @@ from horde_worker_regen.process_management.ipc.message_dispatcher import (
     MessageDispatcher,
 )
 from horde_worker_regen.process_management.ipc.messages import (
+    HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordeProcessMemoryMessage,
     HordeProcessState,
@@ -414,4 +421,102 @@ def test_a_cpu_only_safety_process_records_nothing() -> None:
 
     dispatcher._handle_memory_report(_memory_message(2, allocated_mb=None))
 
+    assert len(store) == 0
+
+
+_BACKEND_REPORTS_FOOTPRINTS = "vram_footprint" in JobPhaseMetrics.model_fields
+
+
+@pytest.mark.skipif(not _BACKEND_REPORTS_FOOTPRINTS, reason="installed backend does not report a job VRAM footprint")
+def test_measured_job_footprint_is_recorded_from_the_metrics_message() -> None:
+    """A child's measured footprint lands under the store's resident and sampling keys for its own model."""
+    from hordelib.metrics import JobVramFootprint
+
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(
+        process_map=ProcessMap({}),
+        job_tracker=JobTracker(),
+        store=store,
+    )
+
+    dispatcher._observe_job_footprint(
+        HordeJobMetricsMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="Job metrics",
+            job_id="job-1",
+            phase_metrics=JobPhaseMetrics(
+                vram_footprint=JobVramFootprint(
+                    peak_resident_weights_mb=6000.0,
+                    peak_device_used_mb=9000.0,
+                    model_name=_MODEL,
+                    baseline=str(_BASELINE),
+                    width=1024,
+                    height=1024,
+                    batch_size=1,
+                    stage="whole_job",
+                ),
+            ),
+        ),
+    )
+
+    # The resident population is kept in whole-device terms, so the platform context charge is added.
+    assert store.estimate_mb(_resident_key(), static_seed_mb=0.0) == pytest.approx(
+        6000.0 + platform_context_constant_mb(),
+    )
+    # The device-wide high-water is not a per-job activation figure, so the SAMPLE key stays cold.
+    sampling_key = FootprintKey(
+        model_baseline=str(_BASELINE),
+        resolution_bucket=ResolutionBucket.LE_1024,
+        platform=sys.platform,
+        stage=FootprintStage.SAMPLE,
+    )
+    assert store.get_observation(sampling_key) is None
+
+
+@pytest.mark.skipif(not _BACKEND_REPORTS_FOOTPRINTS, reason="installed backend does not report a job VRAM footprint")
+def test_alchemy_metrics_are_not_learned_from() -> None:
+    """An alchemy form carries no image-generation baseline, so its footprint is not attributed to one."""
+    from hordelib.metrics import JobVramFootprint
+
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(
+        process_map=ProcessMap({}),
+        job_tracker=JobTracker(),
+        store=store,
+    )
+
+    dispatcher._observe_job_footprint(
+        HordeJobMetricsMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="Job metrics",
+            job_id="form-1",
+            is_alchemy=True,
+            phase_metrics=JobPhaseMetrics(
+                vram_footprint=JobVramFootprint(peak_resident_weights_mb=6000.0, model_name=_MODEL),
+            ),
+        ),
+    )
+    assert len(store) == 0
+
+
+def test_metrics_without_a_footprint_are_a_no_op() -> None:
+    """A backend that reports no footprint (an older one, or a dry run) leaves the store untouched."""
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(
+        process_map=ProcessMap({}),
+        job_tracker=JobTracker(),
+        store=store,
+    )
+
+    dispatcher._observe_job_footprint(
+        HordeJobMetricsMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="Job metrics",
+            job_id="job-1",
+            phase_metrics=JobPhaseMetrics(),
+        ),
+    )
     assert len(store) == 0

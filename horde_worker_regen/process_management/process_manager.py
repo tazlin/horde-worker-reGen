@@ -192,7 +192,10 @@ from horde_worker_regen.process_management.resources.vram_attribution import (
     DriftObservation,
     VramAttributionReconciler,
 )
-from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FOOTPRINT_STORE_FILENAME,
+    LearnedFootprintStore,
+)
 from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
@@ -1608,9 +1611,13 @@ class HordeWorkerProcessManager:
         self._performance_model = self._build_performance_model()
 
         # Learned VRAM footprints: the parent observes measured device-memory peaks per (baseline,
-        # resolution, platform, stage) so the future VRAM arbiter has a measured prior that only ever
-        # raises the static per-model seed. Populated from memory reports; feeds no decision path yet.
-        self._learned_footprint_store = LearnedFootprintStore()
+        # resolution, platform, stage) so admission has a measured prior instead of a static seed alone.
+        # Populated from memory reports and from the backend's per-job footprint, and persisted beside the
+        # performance model so a restart keeps its calibration rather than re-learning it from live traffic.
+        # In memory only under test, on the same terms as the performance model.
+        self._learned_footprint_store = LearnedFootprintStore(
+            path=None if os.environ.get("AI_HORDE_TESTING") else default_app_state_dir() / FOOTPRINT_STORE_FILENAME,
+        )
         self._message_dispatcher.set_footprint_store(self._learned_footprint_store)
 
         self._message_dispatcher.set_metrics_handlers(
@@ -8027,6 +8034,7 @@ class HordeWorkerProcessManager:
         # Flush the latest self-calibration before exit so the next run starts warm.
         self._note_session_end_reason("graceful_shutdown")
         self._performance_model.save()
+        self._learned_footprint_store.save()
         self._shutdown_manager.shutdown()
 
     def _abort(self) -> None:

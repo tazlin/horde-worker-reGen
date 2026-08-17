@@ -1,16 +1,45 @@
-"""Unit tests for the learned VRAM footprint store (Stage 1, shadow-only estimation provider)."""
+"""Unit tests for the learned VRAM footprint store: keying, both estimate policies, and persistence."""
 
 from __future__ import annotations
 
+import dataclasses
+import json
+from pathlib import Path
+
 import pytest
 
+from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    _MEASURED_ESTIMATE_MARGIN,
+    _MIN_OBSERVATIONS_FOR_MEASURED,
+    _PERSIST_EVERY_N_OBSERVATIONS,
+    _RECENT_WINDOW_SIZE,
+    FOOTPRINT_STORE_SCHEMA_VERSION,
     SAFETY_PROCESS_BASELINE,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _Footprint:
+    """A measured per-job footprint in the shape the backend reports one.
+
+    Stands in for ``hordelib.metrics.JobVramFootprint`` so these tests pin the store's own keying rather
+    than the backend version installed in the environment; the store consumes the shape structurally.
+    """
+
+    peak_resident_weights_mb: float | None = None
+    peak_device_used_mb: float | None = None
+    resident_weights_after_job_mb: float | None = None
+    model_name: str | None = "checkpoint-a"
+    baseline: str | None = "stable_diffusion_xl"
+    width: int | None = 1024
+    height: int | None = 1024
+    batch_size: int | None = 1
+    stage: str | None = "whole_job"
 
 
 def _key(
@@ -245,3 +274,207 @@ class TestResidentAndSafetyStages:
         assert store.estimate_mb(_key(), static_seed_mb=6158.0) == pytest.approx(6158.0)
         assert store.estimate_mb(_resident_key(), static_seed_mb=4900.0) == pytest.approx(4900.0)
         assert len(store) == 1
+
+
+class TestJobFootprintRecording:
+    """A backend-measured footprint lands under the store's own keys, or is dropped rather than guessed."""
+
+    def test_whole_job_footprint_writes_only_the_resident_key(self) -> None:
+        """A footprint answers what the slot holds; its device-wide high-water is not a per-job activation figure."""
+        store = LearnedFootprintStore()
+        written = store.observe_job_footprint(
+            _Footprint(peak_resident_weights_mb=11000.0, peak_device_used_mb=13500.0),
+            baseline=None,
+            platform="linux",
+            context_constant_mb=144.0,
+        )
+
+        assert [key.stage for key in written] == [FootprintStage.RESIDENT]
+        (resident,) = written
+        assert resident.checkpoint == "checkpoint-a"
+        assert resident.resolution_bucket is None
+        # The resident population is kept in whole-device terms; the backend measures weights alone.
+        assert store.estimate_mb(resident, static_seed_mb=0.0) == pytest.approx(11144.0)
+        sample = FootprintKey(
+            model_baseline="stable_diffusion_xl",
+            resolution_bucket=ResolutionBucket.LE_1024,
+            platform="linux",
+            stage=FootprintStage.SAMPLE,
+        )
+        assert store.get_observation(sample) is None
+
+    def test_sample_stage_footprint_without_resident_figure_records_nothing(self) -> None:
+        """A device-wide peak alone keys nothing: it would raise the activation population with siblings' weights."""
+        store = LearnedFootprintStore()
+        written = store.observe_job_footprint(
+            _Footprint(peak_device_used_mb=9000.0, stage="sample_stage"),
+            baseline=None,
+            platform="linux",
+        )
+
+        assert written == []
+        assert len(store) == 0
+
+    def test_resident_falls_back_to_the_after_job_figure(self) -> None:
+        """A run that reports only what it left resident still answers the residency question."""
+        store = LearnedFootprintStore()
+        written = store.observe_job_footprint(
+            _Footprint(resident_weights_after_job_mb=6000.0),
+            baseline=None,
+            platform="linux",
+        )
+        assert [key.stage for key in written] == [FootprintStage.RESIDENT]
+
+    def test_baseline_falls_back_to_the_callers_lookup(self) -> None:
+        """A backend that could not resolve a baseline is keyed from the parent's model metadata."""
+        store = LearnedFootprintStore()
+        written = store.observe_job_footprint(
+            _Footprint(peak_resident_weights_mb=9000.0, baseline=None),
+            baseline="flux_1",
+            platform="linux",
+        )
+        assert [key.model_baseline for key in written] == ["flux_1"]
+
+    def test_unkeyable_footprints_are_dropped(self) -> None:
+        """No baseline at all, or no positive resident figure, records nothing."""
+        store = LearnedFootprintStore()
+        assert store.observe_job_footprint(_Footprint(baseline=None), baseline=None, platform="linux") == []
+        assert (
+            store.observe_job_footprint(
+                _Footprint(peak_device_used_mb=9000.0, resident_weights_after_job_mb=0.0),
+                baseline=None,
+                platform="linux",
+            )
+            == []
+        )
+        assert len(store) == 0
+
+
+class TestMeasuredEstimate:
+    """The bidirectional estimate answers only once a key is observed enough, and carries one margin."""
+
+    def _observe(self, store: LearnedFootprintStore, key: FootprintKey, count: int, mb: float = 13500.0) -> None:
+        for _ in range(count):
+            store.observe_peak(key, mb)
+
+    def test_under_observed_key_keeps_the_raise_only_contract(self) -> None:
+        """One observation below the threshold must not talk a consumer below the static seed."""
+        store = LearnedFootprintStore()
+        key = _key()
+        self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED - 1)
+
+        assert store.measured_estimate_mb(key) is None
+        assert store.estimate_mb(key, static_seed_mb=16400.0) == pytest.approx(16400.0)
+
+    def test_threshold_observation_answers_below_the_seed(self) -> None:
+        """At the threshold the measurements answer outright, including well under an over-stated seed."""
+        store = LearnedFootprintStore()
+        key = _key(platform="win32")
+        self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED)
+
+        expected = (13500.0 * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform="win32")
+        assert store.measured_estimate_mb(key) == pytest.approx(expected)
+        assert store.measured_estimate_mb(key) < 16400.0
+        # The raise-only policy is untouched by the measured one: they are separate answers.
+        assert store.estimate_mb(key, static_seed_mb=16400.0) == pytest.approx(16400.0)
+
+    def test_estimate_tracks_the_recent_window_not_the_all_time_watermark(self) -> None:
+        """A figure that has aged out of the window stops holding the estimate up."""
+        store = LearnedFootprintStore()
+        key = _key(platform="linux")
+        store.observe_peak(key, 20000.0)
+        self._observe(store, key, _RECENT_WINDOW_SIZE, mb=10000.0)
+
+        expected = (10000.0 * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform="linux")
+        assert store.measured_estimate_mb(key) == pytest.approx(expected)
+        assert store.estimate_mb(key, static_seed_mb=0.0) == pytest.approx(20000.0)
+
+    def test_observation_count_is_reported(self) -> None:
+        """The count is readable so a decision made on measurement can be logged with its evidence."""
+        store = LearnedFootprintStore()
+        key = _key()
+        self._observe(store, key, 3)
+        assert store.observation_count(key) == 3
+        assert store.observation_count(_key(platform="win32")) == 0
+
+
+class TestPersistence:
+    """Observations survive a restart, and a missing or corrupt file never blocks one."""
+
+    def test_round_trip(self, tmp_path: Path) -> None:
+        """A saved store reloads its keys, counts and window, so a restart keeps its calibration."""
+        path = tmp_path / "vram_footprints.json"
+        store = LearnedFootprintStore(path=path)
+        key = _key()
+        for mb in (11000.0, 12000.0, 13500.0):
+            store.observe_peak(key, mb)
+        store.save()
+
+        reloaded = LearnedFootprintStore(path=path)
+        observation = reloaded.get_observation(key)
+        assert observation is not None
+        assert observation.observation_count == 3
+        assert observation.watermark_mb == pytest.approx(13500.0)
+        assert observation.recent_mb == pytest.approx([11000.0, 12000.0, 13500.0])
+
+    def test_observations_persist_on_the_debounce(self, tmp_path: Path) -> None:
+        """The store writes itself out on its own cadence, not only at shutdown."""
+        path = tmp_path / "vram_footprints.json"
+        store = LearnedFootprintStore(path=path)
+        key = _key()
+        for _ in range(_PERSIST_EVERY_N_OBSERVATIONS - 1):
+            store.observe_peak(key, 100.0)
+        assert not path.exists()
+
+        store.observe_peak(key, 100.0)
+        assert path.exists()
+        assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == FOOTPRINT_STORE_SCHEMA_VERSION
+
+    def test_missing_file_starts_cold(self, tmp_path: Path) -> None:
+        """A first run has nothing to read and must start empty rather than fail."""
+        assert len(LearnedFootprintStore(path=tmp_path / "absent.json")) == 0
+
+    @pytest.mark.parametrize(
+        "content",
+        ["not json at all", "{}", '{"schema_version": 999, "observations": []}', '{"schema_version": 1}'],
+    )
+    def test_unreadable_file_starts_cold(self, tmp_path: Path, content: str) -> None:
+        """Corrupt, empty and schema-mismatched files are discarded; the store re-learns from traffic."""
+        path = tmp_path / "vram_footprints.json"
+        path.write_text(content, encoding="utf-8")
+        assert len(LearnedFootprintStore(path=path)) == 0
+
+    def test_entries_the_current_build_cannot_parse_are_skipped(self, tmp_path: Path) -> None:
+        """One unreadable entry must not cost the file's other keys."""
+        path = tmp_path / "vram_footprints.json"
+        good = _key()
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": FOOTPRINT_STORE_SCHEMA_VERSION,
+                    "observations": [
+                        {"key": {"model_baseline": "x"}, "observation": {}},
+                        {
+                            "key": good.model_dump(mode="json"),
+                            "observation": {
+                                "ewma_mb": 100.0,
+                                "watermark_mb": 100.0,
+                                "observation_count": 1,
+                                "recent_mb": [100.0],
+                            },
+                        },
+                    ],
+                },
+            ),
+            encoding="utf-8",
+        )
+        store = LearnedFootprintStore(path=path)
+        assert len(store) == 1
+        assert store.get_observation(good) is not None
+
+    def test_a_pathless_store_never_writes(self, tmp_path: Path) -> None:
+        """The in-memory construction (tests, and any consumer that wants no file) writes nothing."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 100.0)
+        store.save()
+        assert list(tmp_path.iterdir()) == []

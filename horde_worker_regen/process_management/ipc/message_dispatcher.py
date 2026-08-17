@@ -615,6 +615,7 @@ class MessageDispatcher:
 
         if isinstance(message, HordeJobMetricsMessage):
             self._process_map.on_job_metrics(message.process_id, message.phase_metrics)
+            self._observe_job_footprint(message)
             if self._on_job_metrics is not None:
                 self._on_job_metrics(message)
             return
@@ -1058,6 +1059,41 @@ class MessageDispatcher:
             stage=FootprintStage.SAMPLE,
         )
         store.observe_peak(key, float(peak_mb))
+
+    def _observe_job_footprint(self, message: HordeJobMetricsMessage) -> None:
+        """Record a child's measured per-job VRAM footprint into the learned-footprint store.
+
+        The backend measures what the run actually occupied on the device and reports it with the geometry
+        and stage needed to bucket it, which is stronger evidence than anything the parent can infer from a
+        memory report: the parent has to bind a peak to a job by timing and slot state, while the footprint
+        arrives already attributed. The store's own keying is used (see
+        :meth:`~horde_worker_regen.process_management.resources.vram_footprints.LearnedFootprintStore.observe_job_footprint`),
+        so there is one bucketing rule rather than one per observation seam.
+
+        Alchemy forms carry no image-generation baseline and are skipped. A footprint that does not name its
+        baseline falls back to the parent's model metadata; one that cannot be keyed at all is dropped by the
+        store rather than guessed at here.
+        """
+        store = self._footprint_store
+        if store is None or message.is_alchemy:
+            return
+
+        # Read through getattr rather than the attribute: the supported backend range includes versions whose
+        # per-job metrics predate the measured footprint, and a missing field must leave the worker learning
+        # from memory reports alone rather than faulting the metrics seam.
+        footprint = getattr(message.phase_metrics, "vram_footprint", None)
+        if footprint is None:
+            return
+
+        baseline = self._model_metadata.get_baseline(footprint.model_name) if footprint.model_name else None
+        store.observe_job_footprint(
+            footprint,
+            baseline=str(baseline) if baseline is not None else None,
+            platform=sys.platform,
+            # The backend measures weights alone; the resident population the store keeps (and every consumer
+            # that nets it back out) is in whole-device terms, the process's context included.
+            context_constant_mb=platform_context_constant_mb(),
+        )
 
     def _model_residency_settled(self, process_id: int, *, sampled_at: float | None) -> bool:
         """Whether ``process_id``'s model residency has been stable long enough to be measured.

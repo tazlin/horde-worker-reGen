@@ -73,7 +73,7 @@ launches the headless worker as a child. Other console scripts: `download_models
 `horde-worker-host`, `horde-benchmark`. Full flag/env reference: [CLI](docs/reference/cli.md).
 
 **Durable state** lives in `.horde_worker_regen/` in the working directory (state.json,
-owned_pids.json, action_ledger.jsonl, perf_model.json), alongside `bridgeData.yaml`, `logs/`, and
+owned_pids.json, action_ledger.jsonl, perf_model.json, vram_footprints.json), alongside `bridgeData.yaml`, `logs/`, and
 `benchmark_results/`.
 
 ## Code quality

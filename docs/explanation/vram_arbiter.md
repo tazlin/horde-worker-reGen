@@ -154,6 +154,30 @@ The arbiter keeps four concerns deliberately separate:
   prices at the static seed unchanged, so a first-of-kind job and small-resolution buckets keep their
   smaller peaks and their concurrency.
 
+    The raise-only overlay is the *under-observed* policy, not the only one. Once a key carries at least
+    `_MIN_OBSERVATIONS_FOR_MEASURED` (5) observations, `measured_estimate_mb` answers from the measurements
+    alone and may sit well below the seed. The seeds are wrong in both directions: a Flux fp8 checkpoint
+    seeded at 16.4GB measures 13.5GB device-used on the card that was reserving itself entirely for it. The
+    measured answer is the maximum of a bounded recent window (so a genuine downward shift eventually lands
+    while one high job still counts), times a single explicit margin `_MEASURED_ESTIMATE_MARGIN` (1.10), plus
+    the platform's context charge. That margin is the whole of the conservatism and it is one constant at one
+    seam: an under-estimate is punished asymmetrically (the Linux OOM killer, WDDM paging to host RAM), which
+    is why the margin exists, but smearing that fear across the seeds is what produced the over-statement in
+    the first place.
+
+    The measurements have two sources. The parent infers peaks from child memory reports as described above,
+    and the backend reports a measured per-job footprint (`JobPhaseMetrics.vram_footprint`) that arrives
+    already attributed to a model, geometry, batch and execution shape. The second is the stronger evidence
+    and needs no inference: its resident figure feeds the `RESIDENT` key for its checkpoint. Its device-wide
+    high-water is deliberately not folded into `SAMPLE` or `SAMPLE_ISOLATED`: it carries every sibling's
+    resident weights, and an activation key priced from it makes an ordinary preload look like it needs the
+    whole card. The activation keys keep the memory-report path as their only source, and admission prices
+    them raise-only from the seed; the margined measured estimate is used for the resident footprint alone.
+    A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
+    only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
+    atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration
+    instead of re-learning it; a missing or corrupt file starts cold.
+
     Not every footprint is an activation peak. The same store also carries two at-rest stages under the same
     raise-only contract: `RESIDENT` (a loaded checkpoint's weights, keyed per checkpoint rather than per
     baseline, since two checkpoints of one architecture differ by gigabytes and weights do not move with the
@@ -190,6 +214,18 @@ The arbiter keeps four concerns deliberately separate:
     card this pricing is expected to stop the heaviest checkpoints from co-residing and to have them claim the
     card instead, which is the honest verdict for a file measured near the card's size; the residency churn
     limiter, not a buffer on the estimate, is what bounds the cost of that flip.
+
+    The measured resident figure additionally carries one authority the raise-only overlay does not: it can
+    **retire a whole-card residency claim**. A `wants_whole_card` baseline reserves the device unless the
+    forecast finds room for another full model beside it, and that room question is otherwise answered by a
+    seed that can over-state the model by gigabytes. Where the checkpoint has been measured enough times,
+    `StreamForecast.measured_retires_whole_card_intent` re-asks it of the measurement: if the margined
+    measured footprint leaves the card room for one more process context at sole residency, the intent branch
+    yields and the ordinary co-residency rules apply. It is a weaker claim than the seed-based floor makes
+    (room for a context, not for a whole sibling model), and deliberately so: the premise of tearing the
+    siblings down is that the card is full, and the measurement is what shows it is not. The retirement is
+    logged once per model, with the figure and the number of runs behind it, through the stream-forecast
+    diagnostic. Without measurements nothing changes.
 - **Arbitration** evaluates the
   [ledger-driven admission identity][horde_worker_regen.process_management.resources.admission_identity]
   plus the concurrent-sampling headroom, then resolves an actuator escalation ladder. It never overcommit-admits
