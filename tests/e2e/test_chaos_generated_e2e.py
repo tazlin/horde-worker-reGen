@@ -42,7 +42,13 @@ import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 
 from horde_worker_regen import harness as harness_module
-from horde_worker_regen.harness import HarnessConfig, HarnessResult, HarnessStageDeadlines, run_harness_async
+from horde_worker_regen.harness import (
+    HarnessConfig,
+    HarnessResult,
+    HarnessSimResources,
+    HarnessStageDeadlines,
+    run_harness_async,
+)
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager, SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -255,8 +261,12 @@ def _capture_manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[HordeWork
     built: list[HordeWorkerProcessManager] = []
     original = harness_module.build_harness_process_manager
 
-    def _recording(config: HarnessConfig) -> tuple[HordeWorkerProcessManager, int]:
-        manager, expected = original(config)
+    def _recording(
+        config: HarnessConfig,
+        *,
+        sim_resources: HarnessSimResources | None = None,
+    ) -> tuple[HordeWorkerProcessManager, int]:
+        manager, expected = original(config, sim_resources=sim_resources)
         built.append(manager)
         return manager, expected
 
@@ -387,6 +397,12 @@ def test_full_worker_corpus_spans_every_generated_payload_axis() -> None:
     assert {scenario.unload_models_from_vram_often for scenario in _SCENARIOS} == {
         scenario.unload_models_from_vram_often for scenario in candidates
     }
+    assert {scenario.disaggregation_class for scenario in _SCENARIOS} == {
+        scenario.disaggregation_class for scenario in candidates
+    }
+    assert any(scenario.disaggregation_class and scenario.heavy_job_count > 0 for scenario in _SCENARIOS), (
+        "the sweep never runs the pipeline beside a queue carrying the whole-card class"
+    )
     assert {event.kind for scenario in _SCENARIOS for event in scenario.events} == {
         event.kind for scenario in candidates for event in scenario.events
     }
@@ -438,6 +454,10 @@ async def test_generated_scenario_completes_against_real_children(
                     "high_performance_mode": scenario.performance.value == "high",
                     "moderate_performance_mode": scenario.performance.value == "moderate",
                     "unload_models_from_vram_often": scenario.unload_models_from_vram_often,
+                    # The axis is worker config here, not a pinned class: the manager's own predicate judges
+                    # each popped job, so a queue mixing an SDXL job with a whole-card head runs the first
+                    # through the encode/sample/decode lanes and the second whole, as production does.
+                    "enable_pipeline_disaggregation": scenario.disaggregation_class,
                 },
             ),
         )

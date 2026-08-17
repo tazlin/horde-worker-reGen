@@ -394,8 +394,11 @@ class ChaosScenario:
         sibling_residency: What a second lane holds beside the head's own starting state.
         service_topology: Which non-inference tenants hold a context on the card.
         activation_shape: How large a sampling activation the scenario's geometries ask for.
-        disaggregation_class: Whether the scenario's jobs run as UNet-only samplers, so the whole-card
-            decision meets a job whose own encode and decode lanes a claim would stop.
+        disaggregation_class: Whether the pipeline is enabled for the scenario, so its eligible jobs run as
+            UNet-only samplers and the whole-card decision meets a job whose own encode and decode lanes a
+            claim would stop. The scheduling-loop tier reads this as a pin over the whole queue; the
+            full-worker tier reads it as the worker config it is, leaving each job's eligibility to the
+            manager's own class predicate.
         probe_measured_marginal: Whether the host's startup probe measured the per-additional-context VRAM
             cost. Without that measurement a card-light head's teardown demand is declined as an
             over-counted-context phantom, so the process-count-reduction decision is unreachable however the
@@ -1011,10 +1014,6 @@ def _generate_scenario(
             if upgraded != jobs:
                 jobs = upgraded
                 activation_shape = ChaosActivationShape.HIRES_BATCH
-        # Disaggregation is a class the whole-card class is never eligible for, and a scenario's jobs are
-        # eligible together or not at all: the runner pins class-eligibility, not a per-job property.
-        if MODEL_HEAVY not in models and random.Random(f"{seed}:disaggregation-class").choice((False, True)):
-            disaggregation_class = True
         # A head already resident on an idle lane is the only state from which the dispatch-time whole-card
         # decision is reachable, and a free draw reaches it in a quarter of scenarios. Half the empty-card
         # draws are converted to it where the card carries more than one lane and has also been tightened,
@@ -1043,6 +1042,16 @@ def _generate_scenario(
         probe_measured_marginal = (
             initial_residency is ChaosInitialResidency.HEAD_IN_VRAM and tightened and topology.lanes >= 2
         )
+
+    # Disaggregation eligibility is a per-job property in production: an SDXL job runs UNet-only beside a
+    # whole-card head sitting in the same queue, and that combination is where the interaction between a
+    # whole-card claim and an in-flight staged job lives. The full-worker tier reproduces it directly,
+    # because the real manager judges each popped job's own model against the class predicate, so a queue
+    # carrying the whole-card class is generated with the axis on. The scheduling-loop tier instead pins
+    # class-eligibility for the whole queue, which would claim the whole-card class as eligible when it is
+    # not, so there the axis stays confined to queues without that class.
+    if full_worker or MODEL_HEAVY not in models:
+        disaggregation_class = random.Random(f"{seed}:disaggregation-class").choice((False, True))
 
     return ChaosScenario(
         seed=seed,
@@ -1292,12 +1301,13 @@ DISCLOSED_BOUNDS: tuple[tuple[str, str], ...] = (
         "values.",
     ),
     (
-        "disaggregation is expressible at the scheduling-loop tier only, and never beside the whole-card class",
-        "the scheduling runner pins the scheduler's own class-eligibility seam, which is what makes a job "
-        "priced, admitted, and dispatched UNet-only without standing up the orchestrator's encode and decode "
-        "lanes. The full-worker tier would have to run those lanes for real, so it generates the axis off "
-        "rather than faking eligibility over children that sample whole jobs. A queue carrying the whole-card "
-        "class is excluded because that class is not disaggregation-eligible in the first place.",
+        "disaggregation beside the whole-card class is generated at the full-worker tier only",
+        "eligibility is per job in production, so a queue may mix a disaggregated SDXL job with a whole-card "
+        "head. The full-worker tier generates that mix and its real children run the encode and decode lanes, "
+        "so each job is judged by the manager's own class predicate. The scheduling-loop tier pins "
+        "class-eligibility for the whole queue rather than judging per job, which is what lets it dispatch a "
+        "job UNet-only without those lanes; a queue carrying the whole-card class would therefore claim that "
+        "class as eligible when it is not, so that tier generates the axis only on queues without it.",
     ),
     (
         "a tightening axis is admitted only where the queue still prices as servable under it",
