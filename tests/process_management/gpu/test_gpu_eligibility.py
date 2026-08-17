@@ -16,11 +16,13 @@ from horde_sdk.generation_parameters.image.consts import KNOWN_IMAGE_CONTROLNETS
 from horde_sdk.generation_parameters.image.object_models import ControlnetFeatureFlags
 
 from horde_worker_regen.process_management.gpu.gpu_eligibility import (
+    CARD_NOT_CAPABLE_REASON,
     CardProfile,
     JobRequirements,
     card_can_serve,
     describe_job_requirements,
     eligible_cards,
+    reasons_card_cannot_serve,
 )
 from tests.process_management.conftest import make_job_pop_response, make_mock_bridge_data
 
@@ -65,6 +67,19 @@ class TestCardCanServe:
         job = make_job_pop_response(model="m", width=512, height=512)  # 262144 px > 1000
         assert card_can_serve(profile, describe_job_requirements(job, None, None)) is False
 
+    def test_batch_beyond_max_batch_excludes_card(self) -> None:
+        """A job asking for more images than the card's max_batch is ineligible there."""
+        profile = _profile(device_index=0, total_vram_mb=24576, served={"m"}, max_batch=2)
+        job = make_job_pop_response(model="m", n_iter=4)
+        reasons = reasons_card_cannot_serve(profile, describe_job_requirements(job, None, None))
+        assert CARD_NOT_CAPABLE_REASON.max_batch in reasons
+
+    def test_batch_at_the_cap_is_served(self) -> None:
+        """The ceiling is inclusive: a job exactly at max_batch still runs on the card."""
+        profile = _profile(device_index=0, total_vram_mb=24576, served={"m"}, max_batch=4)
+        job = make_job_pop_response(model="m", n_iter=4)
+        assert card_can_serve(profile, describe_job_requirements(job, None, None)) is True
+
     def test_feature_not_allowed_excludes_card(self) -> None:
         """A ControlNet job is ineligible on a card that disables ControlNet."""
         profile = _profile(device_index=0, total_vram_mb=24576, served={"m"}, allow_controlnet=False)
@@ -82,6 +97,7 @@ class TestCardCanServe:
             ),
             needs_nsfw=requirements.needs_nsfw,
             pixels=requirements.pixels,
+            batch=requirements.batch,
         )
         assert card_can_serve(profile, requirements) is False
 

@@ -724,6 +724,7 @@ def _workload_capability_bridge_fields(
     workload_features: Sequence[ImageGenerationFeatureFlags],
     *,
     max_pixels_needed: int,
+    max_batch_needed: int,
     needs_alchemist: bool,
 ) -> dict[str, object]:
     """The bridge-data fields a workload's *union* of requirements demands.
@@ -774,6 +775,11 @@ def _workload_capability_bridge_fields(
     # heavier template and the run degrades to its smallest jobs.
     if max_pixels_needed > 0:
         fields["max_power"] = max(8, -(-max_pixels_needed // (8 * 64 * 64)))
+    # max_batch is both the pop request's requested amount and a per-card dispatch gate, so a workload with
+    # batched jobs needs it raised or every batched template is refused at dispatch and the run measures only
+    # its single-image jobs.
+    if max_batch_needed > 1:
+        fields["max_batch"] = max_batch_needed
     return fields
 
 
@@ -794,15 +800,17 @@ def _scenario_representative_jobs(scenario: Scenario) -> list[ImageGenerateJobPo
 
 def _scenario_catalog_requirements(
     scenarios: Sequence[Scenario],
-) -> tuple[list[ImageGenerationFeatureFlags], int, bool]:
-    """The workload features, largest job in pixels, and alchemy need across a set of scenarios."""
+) -> tuple[list[ImageGenerationFeatureFlags], int, int, bool]:
+    """The workload features, largest job in pixels, largest batch, and alchemy need across a set of scenarios."""
     features: list[ImageGenerationFeatureFlags] = []
     max_pixels = 0
+    max_batch = 1
     needs_alchemist = False
     for scenario in scenarios:
         needs_alchemist = needs_alchemist or bool(scenario.alchemy_forms)
         for spec in scenario.image_jobs:
             max_pixels = max(max_pixels, spec.width * spec.height)
+            max_batch = max(max_batch, spec.n_iter)
         for job in _scenario_representative_jobs(scenario):
             features.append(
                 image_job_pop_response_to_feature_flags(
@@ -812,7 +820,7 @@ def _scenario_catalog_requirements(
                     ),
                 ),
             )
-    return features, max_pixels, needs_alchemist
+    return features, max_pixels, max_batch, needs_alchemist
 
 
 def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerateJobPopResponse]) -> reGenBridgeData:
@@ -860,10 +868,18 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
             0,
         ],
     )
+    max_batch_needed = max(
+        [
+            *(int(job.payload.n_iter or 1) for job in scenario),
+            *(template.n_iter for template in config.soak_image_templates),
+            1,
+        ],
+    )
     bridge_data_fields.update(
         _workload_capability_bridge_fields(
             workload_features,
             max_pixels_needed=max_pixels_needed,
+            max_batch_needed=max_batch_needed,
             needs_alchemist=bool(config.alchemy_forms or config.soak_alchemy_templates),
         ),
     )
@@ -2076,7 +2092,7 @@ def _warm_bridge_data_fields(
     base is therefore provisioned to the catalog's ceiling: every feature any scenario needs, and a
     ``max_power`` covering the largest job in any of them.
     """
-    catalog_features, catalog_max_pixels, _ = _scenario_catalog_requirements(scenarios)
+    catalog_features, catalog_max_pixels, catalog_max_batch, _ = _scenario_catalog_requirements(scenarios)
     fields: dict[str, object] = {
         "api_key": "0000000000",
         "dreamer_name": "warm-benchmark-worker",
@@ -2102,6 +2118,7 @@ def _warm_bridge_data_fields(
         _workload_capability_bridge_fields(
             catalog_features,
             max_pixels_needed=catalog_max_pixels,
+            max_batch_needed=catalog_max_batch,
             needs_alchemist=True,
         ),
     )

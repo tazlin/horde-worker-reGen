@@ -137,6 +137,21 @@ class TestUnionAdvertising:
 
         assert requires_card_scoped_pops({0: plain, 1: control}) is True
 
+    def test_max_batch_is_the_largest_any_card_accepts(self) -> None:
+        """The envelope's batch ceiling is the max across cards, like max_power."""
+        small = _card(device_index=0, max_concurrent=1, image_models_to_load=["shared"], max_batch=1)
+        large = _card(device_index=1, max_concurrent=1, image_models_to_load=["shared"], max_batch=6)
+
+        assert advertised_capabilities({0: small, 1: large}).max_batch == 6
+        assert advertised_capabilities({0: small}).max_batch == 1
+
+    def test_differing_max_batch_requires_card_scoped_pops(self) -> None:
+        """Batch size is a per-job field, so a union offering more than a card accepts must be scoped."""
+        small = _card(device_index=0, max_concurrent=1, image_models_to_load=["shared"], max_batch=1)
+        large = _card(device_index=1, max_concurrent=1, image_models_to_load=["shared"], max_batch=6)
+
+        assert requires_card_scoped_pops({0: small, 1: large}) is True
+
     def test_equivalent_card_offers_remain_safe_to_union(self) -> None:
         """Thread and hardware differences do not force scoping when every returned-job field is equivalent."""
         first = _card(device_index=0, max_concurrent=1, image_models_to_load=["shared"], max_power=8)

@@ -157,6 +157,9 @@ class _ModelClass:
 
 # stable_diffusion_1: 3200 MB weights. The small class that co-resides almost anywhere.
 _SD15 = _ModelClass("sd15", "sd15-checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_WORLD_MAX_BATCH = 20
+"""The AI Horde's per-request image ceiling: what a simulated card permits, so batch never gates dispatch."""
+
 _SD15_OTHER = _ModelClass("sd15_b", "sd15-checkpoint-b", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
 # stable_diffusion_xl: 4900 MB core weights (6600 MB with its support components).
 _SDXL = _ModelClass("sdxl", "sdxl-checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
@@ -850,6 +853,12 @@ class _DispatchWorld:
                     queue_size=queue_depth,
                     image_models_to_load=[model.name for model in _MODEL_CLASSES],
                     max_pixels=max_pixels,
+                    # safety_on_gpu is a per-card permission read off the effective card config, so a card
+                    # here carries the same answer the global config gives (no per-card delta in this world).
+                    safety_on_gpu=service_contexts,
+                    # Resolution is the only per-card eligibility axis these worlds vary; batch size is
+                    # scaffolding some rows use to size a peak, so every card accepts the protocol maximum.
+                    max_batch=_WORLD_MAX_BATCH,
                 )
                 lanes_on_card = sum(1 for card in self._lane_cards.values() if card == device_index)
                 card_runtimes.update(

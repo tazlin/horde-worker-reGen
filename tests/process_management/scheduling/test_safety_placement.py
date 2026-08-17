@@ -17,6 +17,7 @@ across cards and is only re-chosen while a spawn could use it.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import time
 import uuid
@@ -135,6 +136,13 @@ def _placement_harness(
     """
     monkeypatch.setattr(sched_mod, "is_cpu_only_install", lambda: False)
     bridge_data = make_mock_bridge_data(safety_on_gpu=safety_on_gpu)
+    # Production derives every card's effective config from the global one, so the plan's cards carry the
+    # bridge data under test: safety_on_gpu is a per-card permission read off that config.
+    if card_runtimes is not None:
+        card_runtimes = {
+            index: dataclasses.replace(card, config=bridge_data)  # pyrefly: ignore - a mock stands in
+            for index, card in card_runtimes.items()
+        }
     clock = _TestClock()
     scheduler = _make_inference_scheduler(
         process_map=ProcessMap({}),
@@ -951,6 +959,75 @@ class TestSafetyBacklogPriority:
 
         harness.lifecycle.pause_safety_on_gpu.assert_not_called()
         assert harness.scheduler._safety_placement_pressure_since is None
+
+
+class TestPerCardSafetyPermission:
+    """``safety_on_gpu`` is a per-card permission to host, so the chooser picks only among granting cards."""
+
+    def _harness(self, monkeypatch: pytest.MonkeyPatch, permissions: dict[int, bool]) -> _PlacementHarness:
+        """A harness whose cards carry the given per-card safety permissions."""
+        harness = _placement_harness(
+            monkeypatch,
+            card_runtimes=make_test_card_runtimes(
+                device_indices=tuple(sorted(permissions)),
+                mask_kind="cuda",
+            ),
+        )
+        harness.scheduler._card_runtimes = {
+            index: dataclasses.replace(
+                card,
+                config=make_mock_bridge_data(safety_on_gpu=permissions[index]),  # pyrefly: ignore - a mock
+            )
+            for index, card in harness.scheduler._card_runtimes.items()
+        }
+        harness.scheduler._largest_active_sampling_peak_mb = Mock(return_value=4500.0)
+        return harness
+
+    def test_the_roomiest_card_is_skipped_when_it_withholds_the_permission(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Headroom only decides among cards that permit safety; a card that forbids it is never chosen."""
+        harness = self._harness(monkeypatch, {0: False, 1: True})
+        free_by_device = {0: 6000.0, 1: 2000.0}
+        harness.scheduler._process_map.get_free_vram_mb = Mock(
+            side_effect=lambda *, device_index: free_by_device[device_index],
+        )
+
+        assert harness.scheduler._choose_safety_gpu_card() == 1
+
+    def test_no_permitted_card_runs_safety_off_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With every card withholding the permission there is no card to place safety on, and no policy."""
+        harness = self._harness(monkeypatch, {0: False, 1: False})
+
+        assert harness.scheduler._choose_safety_gpu_card() is None
+        assert harness.scheduler._runtime_safety_placement_enabled() is False
+
+    def test_single_gpu_follows_the_global_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One card and no per-card delta answers exactly what the global flag says, on and off."""
+        on = _placement_harness(monkeypatch, card_runtimes=make_test_card_runtimes(device_indices=(0,)))
+        assert on.scheduler._runtime_safety_placement_enabled() is True
+        assert on.scheduler._choose_safety_gpu_card() == 0
+
+        off = _placement_harness(
+            monkeypatch,
+            safety_on_gpu=False,
+            card_runtimes=make_test_card_runtimes(device_indices=(0,)),
+        )
+        assert off.scheduler._runtime_safety_placement_enabled() is False
+        assert off.scheduler._choose_safety_gpu_card() is None
+
+    def test_reconcile_asks_the_one_actuator_to_leave_an_unpermitted_card(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A card losing its permission is handled by the placement actuator, not a second path."""
+        harness = self._harness(monkeypatch, {0: False, 1: False})
+
+        harness.reconcile()
+
+        harness.lifecycle.demote_safety_from_unpermitted_card.assert_called()
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
 
 
 class TestHeadroomAwarePlacement:

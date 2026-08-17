@@ -18,6 +18,8 @@ from multiprocessing.synchronize import Semaphore
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 
@@ -52,3 +54,22 @@ class CardRuntime:
     None on a default single-GPU host (no env var written, behaviourally identical to before). Set to
     :attr:`kind` when the worker drives more than one card or the operator explicitly selected cards, so
     each process is masked to exactly its device."""
+
+
+def safety_permitted_card_indices(card_runtimes: Mapping[int, CardRuntime]) -> frozenset[int]:
+    """Return the driven cards whose effective config permits hosting the on-GPU safety process.
+
+    ``safety_on_gpu`` is a per-card permission to host, not a worker-wide switch: safety is a single process
+    occupying one card, so an operator who wants a card kept clear of its CUDA context turns the flag off
+    there. This is the sole definition of that permitted set, consumed by the lifecycle manager (which pins
+    the safety process) and the scheduler (which chooses its card and accounts for its context). An empty
+    result means safety runs off-GPU, exactly as a globally false flag does. On a card with no override the
+    permission is the global flag, so a single-GPU worker is unchanged.
+
+    Args:
+        card_runtimes: The driven cards keyed by stable device index.
+
+    Returns:
+        The stable device indices that permit an on-GPU safety process.
+    """
+    return frozenset(index for index, card in card_runtimes.items() if card.config.safety_on_gpu)

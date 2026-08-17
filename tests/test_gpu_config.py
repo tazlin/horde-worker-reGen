@@ -50,6 +50,19 @@ class TestGpuOverrideModel:
         with pytest.raises(ValidationError):
             GpuOverride(max_power=0)
 
+    def test_max_batch_constraints_mirror_parent(self) -> None:
+        """max_batch stays within the same 1..20 bound as the global field."""
+        with pytest.raises(ValidationError):
+            GpuOverride(max_batch=0)
+        with pytest.raises(ValidationError):
+            GpuOverride(max_batch=21)
+        assert GpuOverride(max_batch=8).max_batch == 8
+
+    def test_safety_on_gpu_is_overridable(self) -> None:
+        """safety_on_gpu is a per-card permission, so a card may withhold it from a permissive global."""
+        assert GpuOverride().safety_on_gpu is None
+        assert GpuOverride(safety_on_gpu=False).safety_on_gpu is False
+
 
 class TestResolveInheritance:
     """A card with no override resolves to the global config object itself."""
@@ -91,6 +104,31 @@ class TestResolveInheritance:
         assert resolved.queue_size == 4
         assert resolved._yaml_loader is None
         assert base._yaml_loader is not None
+
+
+class TestResolvePerCardLimits:
+    """The per-card batch ceiling and safety permission resolve as ordinary deltas."""
+
+    def test_max_batch_resolves_per_card(self) -> None:
+        """A card's max_batch overrides the global one and leaves the other cards on it."""
+        base = _make_base(max_batch=8, gpu_overrides={1: {"max_batch": 2}})
+        resolved = resolve_all_effective_gpu_configs(base, [0, 1])
+        assert resolved[0].max_batch == 8
+        assert resolved[1].max_batch == 2
+
+    def test_safety_on_gpu_resolves_per_card(self) -> None:
+        """A card may withhold the permission to host safety while its sibling keeps the global grant."""
+        base = _make_base(safety_on_gpu=True, gpu_overrides={1: {"safety_on_gpu": False}})
+        resolved = resolve_all_effective_gpu_configs(base, [0, 1])
+        assert resolved[0].safety_on_gpu is True
+        assert resolved[1].safety_on_gpu is False
+
+    def test_unknown_key_is_still_rejected(self) -> None:
+        """extra="forbid" survives the new fields: a near-miss spelling is a validation error."""
+        with pytest.raises(ValidationError):
+            GpuOverride.model_validate({"max_batches": 4})
+        with pytest.raises(ValidationError):
+            GpuOverride.model_validate({"safety_on_the_gpu": True})
 
 
 class TestBridgeDataTimeoutDefaults:

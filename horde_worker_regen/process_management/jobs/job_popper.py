@@ -22,6 +22,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopGate, WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import safety_permitted_card_indices
 from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_card_indices_for
 from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
     AdvertisedCapabilities,
@@ -1357,12 +1358,18 @@ class JobPopper:
     def _safety_backlog_advice(self) -> str:
         """Return the remediation clause for the safety-backlog diagnostic, given where safety is running.
 
-        Telling an operator to enable ``safety_on_gpu`` is only useful advice while it is off. With it on, the
-        stage is either already on the card (so the bottleneck is elsewhere) or resource governance has moved it
-        off to protect the card's memory, and in that case the backlog is the cost of that placement rather than
-        a configuration mistake.
+        Telling an operator to enable ``safety_on_gpu`` is only useful advice while no card permits it. Where
+        one does, the stage is either already on that card (so the bottleneck is elsewhere) or resource
+        governance has moved it off to protect the card's memory, and in that case the backlog is the cost of
+        that placement rather than a configuration mistake. A popper wired without card runtimes reads the
+        global flag, which is the same answer on the single-GPU worker that has no per-card deltas.
         """
-        if not self._runtime_config.bridge_data.safety_on_gpu:
+        safety_permitted = (
+            bool(safety_permitted_card_indices(self._card_runtimes))
+            if self._card_runtimes
+            else bool(self._runtime_config.bridge_data.safety_on_gpu)
+        )
+        if not safety_permitted:
             return "enable safety_on_gpu or speed safety up"
         if self._safety_off_gpu_provider():
             return (
@@ -1951,6 +1958,7 @@ class JobPopper:
         pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw
         pop_threads = advertised.threads if advertised is not None else self._max_concurrent_inference_processes
         pop_max_power = advertised.max_power if advertised is not None else bridge_data.max_power
+        pop_max_batch = advertised.max_batch if advertised is not None else bridge_data.max_batch
         pop_allow_img2img = advertised.allow_img2img if advertised is not None else bridge_data.allow_img2img
         pop_allow_painting = advertised.allow_inpainting if advertised is not None else bridge_data.allow_inpainting
         pop_allow_post_processing = (
@@ -2073,7 +2081,7 @@ class JobPopper:
                 extra_slow_worker=bridge_data.extra_slow_worker,
                 limit_max_steps=bridge_data.limit_max_steps,
                 allow_lora=pop_allow_lora,
-                amount=bridge_data.max_batch,
+                amount=pop_max_batch,
             )
             if advertised is not None:
                 job_pop_request = apply_image_worker_feature_flags_to_pop_request(

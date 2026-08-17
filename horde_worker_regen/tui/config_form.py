@@ -1563,7 +1563,7 @@ GPU_POP_BALANCE_THRESHOLD_KEY = "gpu_pop_balance_threshold"
 GPU_POP_BALANCE_THRESHOLD_DEFAULT = 0.5
 
 # Per-card subsection order within a card's collapsible block.
-GPU_OVERRIDE_SECTIONS = ("Concurrency", "Models", "Features", "VRAM budget")
+GPU_OVERRIDE_SECTIONS = ("Concurrency", "Models", "Features", "Safety", "VRAM budget")
 
 # Machine-wide multi-GPU coordination knobs, shown above the per-card sections.
 GPU_GLOBAL_FIELDS: list[ConfigField] = [
@@ -1707,6 +1707,24 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Max resolution for this card = 64*64*8*max_power px (8=512², 32=1024²).",
         minimum=1,
         maximum=512,
+    ),
+    ConfigField(
+        "max_batch",
+        "Max batch size",
+        FieldKind.INT,
+        "Features",
+        "Largest batched request this card accepts. Jobs asking for more images are refused here.",
+        minimum=1,
+        maximum=20,
+    ),
+    # -- Safety --
+    ConfigField(
+        "safety_on_gpu",
+        "Allow safety on this card",
+        FieldKind.BOOL,
+        "Safety",
+        "Whether the NSFW/CSAM check may hold a CUDA context on this card. Safety runs on one card at a "
+        "time, and off-GPU when no card allows it.",
     ),
     # -- VRAM / memory budget --
     ConfigField(

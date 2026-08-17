@@ -60,6 +60,7 @@ class CARD_NOT_CAPABLE_REASON(StrEnum):
     model_not_served = auto()
     nsfw_policy = auto()
     max_pixels = auto()
+    max_batch = auto()
 
 
 type CardNotCapableReason = IMAGE_WORKER_NOT_CAPABLE_REASON | CARD_NOT_CAPABLE_REASON
@@ -180,6 +181,7 @@ class JobRequirements:
     image_features: ImageGenerationFeatureFlags
     needs_nsfw: bool
     pixels: int
+    batch: int
 
 
 @dataclass(frozen=True)
@@ -215,6 +217,7 @@ def describe_job_requirements(
         image_features=image_job_pop_response_to_feature_flags(job, resolved_baseline=baseline),
         needs_nsfw=not job.payload.use_nsfw_censor,
         pixels=int(job.payload.width) * int(job.payload.height),
+        batch=int(job.payload.n_iter),
     )
 
 
@@ -255,6 +258,13 @@ def reasons_card_cannot_serve(card: CardProfile, requirements: JobRequirements) 
         and requirements.pixels > configured_max_pixels
     ):
         reasons.append(CARD_NOT_CAPABLE_REASON.max_pixels)
+    configured_max_batch = card.config.max_batch
+    if (
+        isinstance(configured_max_batch, int)
+        and not isinstance(configured_max_batch, bool)
+        and requirements.batch > configured_max_batch
+    ):
+        reasons.append(CARD_NOT_CAPABLE_REASON.max_batch)
     return tuple(reasons)
 
 

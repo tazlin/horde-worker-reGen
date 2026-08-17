@@ -9,6 +9,7 @@ device_index params default to None and behave exactly as before.
 
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -69,6 +70,13 @@ def _make_scheduler(
     bridge_data.safety_on_gpu = safety_on_gpu
     bridge_data.whole_card_exclusive_residency = True
     bridge_data.whole_card_residency_safety_off_gpu = True
+    # Production derives every card's effective config from the global one, so the plan's cards carry the
+    # bridge data under test: safety_on_gpu is a per-card permission read off that config.
+    if card_runtimes is not None:
+        card_runtimes = {
+            index: dataclasses.replace(card, config=bridge_data)  # pyrefly: ignore - a mock stands in
+            for index, card in card_runtimes.items()
+        }
     return InferenceScheduler(
         state=WorkerState(),
         process_map=process_map,

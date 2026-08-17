@@ -29,7 +29,7 @@ from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
-from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime, safety_permitted_card_indices
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.messages import (
     AuxModelRef,
@@ -1136,18 +1136,25 @@ class ProcessLifecycleManager:
             # off-GPU regardless of config (otherwise loading the safety models on "cuda" raises). The
             # runtime pause likewise overrides the configured placement: while a whole-card job holds the
             # device, the safety process must come up off-GPU so it does not re-take a CUDA context.
-            cpu_only = is_cpu_only_install() or (not bridge_data.safety_on_gpu) or self._safety_gpu_paused
+            cpu_only = is_cpu_only_install() or (not self.safety_on_gpu_permitted) or self._safety_gpu_paused
 
             # When the safety model runs on-GPU it lives on the scheduler-chosen card (the driven card with the
             # most verified headroom net of its expected sampling peak); its mask_kind is None on a default
             # single-GPU host (so no pin, byte-identical) and set on a masked multi-GPU host. Absent a chosen
             # card (single-GPU, or before the scheduler has placed one) this is the lowest-index driven card,
-            # the historical fixed pin.
+            # the historical fixed pin. Only a card whose effective config permits safety may be chosen;
+            # off-GPU the pin is irrelevant, so the lowest-index default stands there.
+            permitted = self.safety_permitted_card_indices
+            candidate_cards = (
+                self._card_runtimes
+                if cpu_only or not permitted
+                else {index: self._card_runtimes[index] for index in permitted}
+            )
             desired_card = self._desired_safety_card
-            if desired_card is not None and desired_card in self._card_runtimes:
-                safety_card = self._card_runtimes[desired_card]
+            if desired_card is not None and desired_card in candidate_cards:
+                safety_card = candidate_cards[desired_card]
             else:
-                safety_card = self._card_runtimes[min(self._card_runtimes)]
+                safety_card = candidate_cards[min(candidate_cards)]
             self._safety_pinned_card = None if cpu_only else safety_card.device_index
             key = self._pending_gpu_start_key(HordeProcessType.SAFETY, pid)
             if key in self._pending_gpu_starts:
@@ -1221,9 +1228,8 @@ class ProcessLifecycleManager:
         it takes the first configured card.
         """
         ordered_cards = [self._card_runtimes[index] for index in sorted(self._card_runtimes)]
-        bridge_data = self._runtime_config.bridge_data
         safety_holds_first_card = (
-            bridge_data.safety_on_gpu and not is_cpu_only_install() and not self._safety_gpu_paused
+            self.safety_on_gpu_permitted and not is_cpu_only_install() and not self._safety_gpu_paused
         )
         if safety_holds_first_card and len(ordered_cards) > 1:
             return ordered_cards[1]
@@ -2860,6 +2866,31 @@ class ProcessLifecycleManager:
         """How many reconciled safety-on-GPU placement changes this lifecycle manager initiated."""
         return self._safety_gpu_restore_count
 
+    @property
+    def safety_permitted_card_indices(self) -> frozenset[int]:
+        """The driven cards whose effective config permits hosting the on-GPU safety process."""
+        return safety_permitted_card_indices(self._card_runtimes)
+
+    @property
+    def safety_on_gpu_permitted(self) -> bool:
+        """Whether any driven card permits an on-GPU safety process.
+
+        The worker-wide answer to "may safety sit on a GPU at all": false means it runs off-GPU exactly as a
+        globally disabled ``safety_on_gpu`` does. Every placement and VRAM-accounting decision reads this
+        rather than the global flag, so a card that withholds the permission is never charged for (or handed)
+        a safety context.
+        """
+        return bool(self.safety_permitted_card_indices)
+
+    @property
+    def safety_gpu_placement_actionable(self) -> bool:
+        """Whether an off-GPU safety pause can still change anything.
+
+        True while some card permits safety on-GPU, and also while a card is still hosting it after that
+        permission was withdrawn by a config reload: the pause is the actuator that gets it off that card.
+        """
+        return self.safety_on_gpu_permitted or self._safety_pinned_card is not None
+
     def set_desired_safety_card(self, device_index: int | None) -> None:
         """Record the driven card the safety process should pin to when it next (re)spawns on-GPU.
 
@@ -2882,6 +2913,26 @@ class ProcessLifecycleManager:
             return None
         return self._safety_pinned_card
 
+    def demote_safety_from_unpermitted_card(self) -> bool:
+        """Move safety off-GPU when the card hosting it no longer permits an on-GPU safety process.
+
+        ``safety_on_gpu`` is a per-card permission, and a config reload can withdraw it from the card the
+        safety process is pinned to. The pause is the one actuator that ends an on-GPU safety process, so
+        this routes the withdrawal through it rather than adding a second path; the bring-up that follows
+        re-reads the permission, which is what keeps safety off the GPU until some card grants it again.
+
+        Returns:
+            True if a pause was initiated for this reason.
+        """
+        pinned_card = self._safety_pinned_card
+        if pinned_card is None or pinned_card in self.safety_permitted_card_indices:
+            return False
+        logger.info(
+            f"Card {pinned_card} no longer permits an on-GPU safety process (safety_on_gpu is off in its "
+            "effective config), so the safety process is moving off it.",
+        )
+        return self.pause_safety_on_gpu(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+
     def pause_safety_on_gpu(self, *, owner: PauseOwner) -> bool:
         """Move safety off-GPU for one reconciled resource-governance request.
 
@@ -2898,7 +2949,7 @@ class ProcessLifecycleManager:
             True if a pause was initiated, False if it was already paused or not applicable.
         """
         if (
-            not self._runtime_config.bridge_data.safety_on_gpu
+            not self.safety_gpu_placement_actionable
             or self._safety_gpu_paused
             or self.safety_placement_transition_pending
         ):

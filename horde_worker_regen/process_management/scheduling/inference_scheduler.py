@@ -20,7 +20,7 @@ from loguru import logger
 from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
-from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime, safety_permitted_card_indices
 from horde_worker_regen.process_management.gpu.gpu_eligibility import (
     CardEligibilityVerdict,
     card_eligibility_for,
@@ -2171,9 +2171,7 @@ class InferenceScheduler:
         # the model's demand forever and the whole-card branch would defer the model every tick without ever
         # loading it. The safety process is pinned to a single card, so on a per-card forecast it is charged
         # only against the card it actually sits on.
-        safety_on_gpu = self._runtime_config.bridge_data.safety_on_gpu and (
-            not self._process_lifecycle.is_safety_gpu_paused
-        )
+        safety_on_gpu = self._safety_on_gpu_permitted and (not self._process_lifecycle.is_safety_gpu_paused)
         num_safety_contexts = self._process_map.num_safety_processes(device_index=device_index) if safety_on_gpu else 0
         safety_context_charge_mb = num_safety_contexts * self._safety_footprint_mb()
         # The dedicated post-processing lane holds a CUDA context (and its resident post-processing models)
@@ -2353,6 +2351,24 @@ class InferenceScheduler:
         )
         return verdict.admits
 
+    @property
+    def _safety_permitted_cards(self) -> frozenset[int]:
+        """The driven cards whose effective config permits hosting the on-GPU safety process."""
+        return safety_permitted_card_indices(self._card_runtimes)
+
+    @property
+    def _safety_on_gpu_permitted(self) -> bool:
+        """Whether any driven card permits an on-GPU safety process.
+
+        The scheduler's placement and VRAM-accounting decisions read this rather than the global
+        ``safety_on_gpu``: a card that withholds the permission is never charged for (or handed) a safety
+        context, and no card permitting it is the same as the flag being globally off. A scheduler wired
+        without a card plan reads the global flag, which is the same answer a card with no override gives.
+        """
+        if not self._card_runtimes:
+            return bool(self._runtime_config.bridge_data.safety_on_gpu)
+        return bool(self._safety_permitted_cards)
+
     def _choose_safety_gpu_card(self) -> int | None:
         """Return the driven card safety should be placed on: the one with the most verified headroom.
 
@@ -2362,14 +2378,17 @@ class InferenceScheduler:
         device-free VRAM when reported (that figure already nets out whatever is resident and sampling on the
         card right now); absent a measured reading it falls back to the card total less the largest sampling
         peak that card is committed to. The card with the greatest headroom wins, ties resolving to
-        the lowest index so the choice is stable. On a single-GPU host this is the one card, and with no
-        headroom evidence at all it is the lowest-index card, both byte-identical to the historical fixed pin.
+        the lowest index so the choice is stable. Only cards whose effective config permits an on-GPU safety
+        process are candidates, and the result is None when no card permits it. On a single-GPU host this is
+        the one card, and with no headroom evidence at all it is the lowest-index card, both byte-identical to
+        the historical fixed pin.
         """
-        if not self._card_runtimes:
+        permitted = self._safety_permitted_cards
+        if not permitted:
             return None
         best_index: int | None = None
         best_headroom_mb = float("-inf")
-        for device_index in sorted(self._card_runtimes):
+        for device_index in sorted(permitted):
             measured_free_mb = self._measured_free_vram_mb(device_index=device_index)
             if measured_free_mb is not None:
                 headroom_mb = measured_free_mb
@@ -2381,7 +2400,7 @@ class InferenceScheduler:
             if headroom_mb > best_headroom_mb:
                 best_headroom_mb = headroom_mb
                 best_index = device_index
-        return best_index if best_index is not None else min(self._card_runtimes)
+        return best_index if best_index is not None else min(permitted)
 
     def _safety_gpu_card(self) -> int | None:
         """Return the card safety currently occupies, or the card it would be placed on when off-GPU.
@@ -2418,10 +2437,10 @@ class InferenceScheduler:
         """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
 
         The policy can only ever degrade the operator's placement (GPU to CPU), never promote it, so it is inert
-        unless ``safety_on_gpu`` grants the maximum permission. On a CPU-only install safety is always off-GPU
-        already, so there is nothing to place.
+        unless some driven card's effective ``safety_on_gpu`` grants the maximum permission. On a CPU-only
+        install safety is always off-GPU already, so there is nothing to place.
         """
-        return bool(self._runtime_config.bridge_data.safety_on_gpu) and not is_cpu_only_install()
+        return self._safety_on_gpu_permitted and not is_cpu_only_install()
 
     def _sampling_peak_jobs_for_card(self, device_index: int | None) -> list[ImageGenerateJobPopResponse]:
         """The jobs whose sampling peak a card is committed to: those running on it and those it may be given.
@@ -2675,6 +2694,13 @@ class InferenceScheduler:
             update_policy: Whether to advance the placement evidence clocks. Reclaim may ask this reconciler to
                 apply a freshly filed request immediately without manufacturing an extra policy observation.
         """
+        # A config reload can withdraw the permission of the card safety is sitting on. Getting it off that
+        # card is the same "safety must leave here" request as memory pressure, so it goes through the one
+        # placement actuator; the bring-up then re-reads the permission, which is what keeps safety off until
+        # a card grants it again. Checked ahead of the policy gate because withdrawing every card's
+        # permission is exactly what turns that gate off.
+        self._process_lifecycle.demote_safety_from_unpermitted_card()
+
         placement_enabled = self._runtime_safety_placement_enabled()
         if not placement_enabled:
             self._safety_placement_pressure_since = None
@@ -3414,7 +3440,7 @@ class InferenceScheduler:
         head will find by :meth:`_safety_footprint_mb`, so that charge is what a caller leaning on the
         figure must price back out. Zero once safety is off-GPU, or where this residency is going to move it.
         """
-        if not self._runtime_config.bridge_data.safety_on_gpu:
+        if not self._safety_on_gpu_permitted:
             return 0.0
         if self._residency_should_pause_safety(device_index):
             return 0.0
@@ -3781,8 +3807,7 @@ class InferenceScheduler:
 
     def _whole_card_safety_off_gpu_enabled(self) -> bool:
         """Whether a whole-card job should move the safety process off-GPU (config + safety actually on-GPU)."""
-        bridge_data = self._runtime_config.bridge_data
-        return bridge_data.whole_card_residency_safety_off_gpu and bridge_data.safety_on_gpu
+        return self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu and self._safety_on_gpu_permitted
 
     def _whole_card_cooldown_seconds(self) -> float:
         """Operator-configured seconds to hold a whole-card residency after its last job drains."""
@@ -5547,9 +5572,8 @@ class InferenceScheduler:
         marginal_mb = self._overhead.marginal_mb(config_override_mb=override_mb)
         if marginal_mb is None or marginal_mb <= 0:
             marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
-        bridge_data = self._runtime_config.bridge_data
         safety_contexts = (
-            1 if bridge_data.safety_on_gpu is True and not self._process_lifecycle.is_safety_gpu_paused else 0
+            1 if self._safety_on_gpu_permitted and not self._process_lifecycle.is_safety_gpu_paused else 0
         )
         post_process_contexts = (
             0
@@ -8621,10 +8645,9 @@ class InferenceScheduler:
 
     def _reclaim_safety_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
         """Build the safety-off-GPU rung when the operator allows safety to leave the GPU."""
-        bridge_data = self._runtime_config.bridge_data
         if (
-            not bridge_data.safety_on_gpu
-            or not bridge_data.whole_card_residency_safety_off_gpu
+            not self._safety_on_gpu_permitted
+            or not self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu
             or self._process_lifecycle.is_safety_gpu_paused
             or self._process_lifecycle.safety_placement_transition_pending is True
         ):
@@ -10922,8 +10945,7 @@ class InferenceScheduler:
         Both are static estimates: the gate must hold even when the driver's free figure cannot be
         trusted (WDDM demand-paging), so nothing here reads measured free VRAM.
         """
-        bridge_data = self._runtime_config.bridge_data
-        safety_on_gpu = bridge_data.safety_on_gpu is True and not self._process_lifecycle.is_safety_gpu_paused
+        safety_on_gpu = self._safety_on_gpu_permitted and not self._process_lifecycle.is_safety_gpu_paused
         sibling_contexts = 0
         for process_info in self._process_map.values():
             if process_info.process_id == process_with_model.process_id:
@@ -11242,10 +11264,7 @@ class InferenceScheduler:
             per_context_mb = self._overhead.per_process_mb(config_override_mb=override_mb)
         if per_context_mb <= 0:
             return True
-        bridge_data = self._runtime_config.bridge_data
-        safety_context = (
-            1 if bridge_data.safety_on_gpu is True and not self._process_lifecycle.is_safety_gpu_paused else 0
-        )
+        safety_context = 1 if self._safety_on_gpu_permitted and not self._process_lifecycle.is_safety_gpu_paused else 0
         extra_contexts = (
             max(0, self._process_map.num_loaded_inference_processes(device_index=device_index) - 1) + safety_context
         )

@@ -38,6 +38,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import Ladde
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from tests.process_management.conftest import (
     make_job_pop_response,
+    make_mock_bridge_data,
     make_mock_process_info,
     make_test_card_runtimes,
     make_test_runtime_config,
@@ -77,7 +78,7 @@ def _make_plm(
         horde_model_map=Mock(),
         job_tracker=job_tracker or JobTracker(),
         process_message_queue=Mock(),
-        card_runtimes=make_test_card_runtimes(target_process_count=2),
+        card_runtimes=make_test_card_runtimes(target_process_count=2, config=bridge_data),
         disk_lock=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
@@ -1314,6 +1315,65 @@ def test_safety_on_gpu_respected_on_gpu_install(monkeypatch: pytest.MonkeyPatch)
     plm._runtime_config.bridge_data.safety_on_gpu = True
 
     assert _captured_safety_cpu_only(plm) is False
+
+
+def _two_card_plm(*, permissions: dict[int, bool]) -> ProcessLifecycleManager:
+    """A two-card lifecycle manager whose cards carry the given per-card safety_on_gpu permissions."""
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = any(permissions.values())
+    plm._card_runtimes.clear()
+    for index, permitted in sorted(permissions.items()):
+        card_config = make_mock_bridge_data(safety_on_gpu=permitted)
+        plm._card_runtimes.update(
+            make_test_card_runtimes(device_indices=(index,), config=card_config, mask_kind="cuda"),
+        )
+    return plm
+
+
+def test_safety_comes_up_off_gpu_when_no_card_permits_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """safety_on_gpu is a per-card permission: with every card withholding it, safety runs off-GPU."""
+    monkeypatch.setattr(
+        "horde_worker_regen.process_management.lifecycle.process_lifecycle.is_cpu_only_install",
+        lambda: False,
+    )
+    plm = _two_card_plm(permissions={0: False, 1: False})
+
+    assert plm.safety_on_gpu_permitted is False
+    assert _captured_safety_cpu_only(plm) is True
+
+
+def test_safety_is_pinned_to_a_permitted_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A desired card that withholds the permission is not used; the permitted card hosts safety instead."""
+    monkeypatch.setattr(
+        "horde_worker_regen.process_management.lifecycle.process_lifecycle.is_cpu_only_install",
+        lambda: False,
+    )
+    plm = _two_card_plm(permissions={0: False, 1: True})
+    plm.set_desired_safety_card(0)
+
+    assert plm.safety_permitted_card_indices == frozenset({1})
+    assert _captured_safety_cpu_only(plm) is False
+    assert plm.safety_gpu_card_index() == 1
+
+
+def test_withdrawn_permission_moves_safety_off_its_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reload that takes the permission away from safety's own card pauses it off-GPU, once."""
+    monkeypatch.setattr(
+        "horde_worker_regen.process_management.lifecycle.process_lifecycle.is_cpu_only_install",
+        lambda: False,
+    )
+    plm = _two_card_plm(permissions={0: True})
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    plm._safety_pinned_card = 0
+
+    assert plm.demote_safety_from_unpermitted_card() is False  # still permitted: nothing to do
+
+    plm._card_runtimes[0].config.safety_on_gpu = False
+
+    assert plm.demote_safety_from_unpermitted_card() is True
+    assert plm.is_safety_gpu_paused is True
+    assert plm.safety_pause_owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT
+    assert plm.demote_safety_from_unpermitted_card() is False  # already off the card
 
 
 def test_intentional_safety_cycle_not_counted_as_recovery() -> None:

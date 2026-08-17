@@ -622,14 +622,19 @@ bring-up, before any heavy residency pressure) is not gated and always proceeds.
 
 ### Runtime safety placement
 
-The single safety process (slot 0) runs on-GPU only when `safety_on_gpu` is configured. On a card too tight to
+The single safety process (slot 0) runs on-GPU only where a driven card's effective `safety_on_gpu` permits
+it. The flag is a per-card permission to host rather than a worker-wide switch: the placement chooser
+considers only permitted cards, and with none permitting it safety runs off-GPU exactly as a globally
+disabled flag makes it. Withdrawing the permission from the card safety currently occupies goes through the
+same pause actuator every other placement request uses, so there is one path that ends an on-GPU safety
+process. On a card too tight to
 hold safety's context beside the model that is sampling on it, that CUDA context competes for VRAM the sampler
 needs. The scheduler-owned **runtime safety-placement policy**
 ([`_reconcile_runtime_safety_placement`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])
 generalises the whole-card safety-off lever to that ordinary case: it moves safety to a CPU-only process when
 safety's own card is really short of the memory its work needs, and re-promotes it once that card proves durable
-room. `safety_on_gpu` remains the operator's maximum permission; the policy only degrades GPU to CPU and back,
-never beyond that grant.
+room. The per-card permission remains the operator's maximum grant; the policy only degrades GPU to CPU and
+back, never beyond it.
 
 **Every term the policy reads is about safety's own card** (the card it occupies, or the card it would land on
 while it is off). Cards are independent VRAM domains, so the peak a sibling card is committed to says nothing

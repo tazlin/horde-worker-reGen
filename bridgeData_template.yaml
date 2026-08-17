@@ -860,9 +860,12 @@ capture_kudos_training_data: false
 # Per-card deltas over the global config, keyed by the same stable device index. Each card sets ONLY the
 # fields it wants to differ; everything else inherits the global value. A card with no entry inherits
 # wholesale. Overridable per card: max_threads, queue_size, high_performance_mode, moderate_performance_mode,
-# extra_slow_worker, preload_timeout, models_to_load, models_to_skip, allow_lora,
+# extra_slow_worker, preload_timeout, models_to_load, models_to_skip, dynamic_models, allow_lora,
 # allow_controlnet, allow_sdxl_controlnet, allow_post_processing, allow_painting, allow_img2img, nsfw,
-# max_power, enable_vram_budget, vram_reserve_mb, vram_to_leave_free, whole_card_exclusive_residency.
+# max_power, max_batch, safety_on_gpu, enable_vram_budget, vram_reserve_mb, vram_to_leave_free,
+# whole_card_exclusive_residency.
+# max_batch caps the images one request may ask this card for; safety_on_gpu is this card's permission to
+# host the safety process (the worker picks one permitted card, or runs safety off-GPU if none permits it).
 # gpu_overrides:
 #   0:
 #     max_threads: 2

@@ -469,6 +469,14 @@ class GpuOverride(BaseModel):
     allow_img2img: bool | None = None
     nsfw: bool | None = None
     max_power: int | None = Field(default=None, ge=1, le=512)
+    max_batch: int | None = Field(default=None, ge=1, le=20)
+
+    # -- Safety --
+    safety_on_gpu: bool | None = None
+    """This card's permission to host the on-GPU safety process, not a request that it do so.
+
+    Safety is a single process occupying one card, so the worker places it on a card that permits it (the one
+    with the most measured headroom) and runs it off-GPU when no card does."""
 
     # -- VRAM / memory budget --
     enable_vram_budget: bool | None = None

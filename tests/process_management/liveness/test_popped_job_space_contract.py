@@ -211,6 +211,7 @@ def _expected_requirements(case: _MaterializedPayload) -> JobRequirements:
         ),
         needs_nsfw=bool(row["uncensored"]),
         pixels=width * height,
+        batch=1,
     )
 
 

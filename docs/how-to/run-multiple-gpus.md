@@ -63,12 +63,20 @@ gpu_overrides:
 Overridable per card: `max_threads`, `queue_size`, `high_performance_mode`, `moderate_performance_mode`,
 `extra_slow_worker`, `preload_timeout`, `models_to_load`, `models_to_skip`, `dynamic_models`, `allow_lora`,
 `allow_controlnet`, `allow_sdxl_controlnet`, `allow_post_processing`, `allow_painting`, `allow_img2img`,
-`nsfw`, `max_power`, `enable_vram_budget`, `vram_reserve_mb`, `vram_to_leave_free`,
-`whole_card_exclusive_residency`. Global-only fields (API key, downloader settings, alchemy, …) cannot be
-overridden per card and are rejected if you try.
+`nsfw`, `max_power`, `max_batch`, `safety_on_gpu`, `enable_vram_budget`, `vram_reserve_mb`,
+`vram_to_leave_free`, `whole_card_exclusive_residency`. Global-only fields (API key, downloader settings,
+alchemy, …) cannot be overridden per card and are rejected if you try.
 
-When cards advertise different models, features, policy, or resolution ceilings, the worker rotates complete
-card-scoped offers. This preserves the relationship between those fields; separately unioning them could ask
+`max_batch` is a per-card ceiling on the images one request may ask for: the pop asks for the offered card's
+own ceiling, and a job arriving above a card's ceiling is not dispatched there.
+
+`safety_on_gpu` is a per-card *permission to host*, not a request. The safety check is one process on one
+card, so the worker places it on a card that permits it (the one with the most measured headroom) and runs it
+off-GPU when no card does. Turn it off for a card you want kept clear of safety's CUDA context; on a
+single-GPU worker with no override it means exactly what the global flag has always meant.
+
+When cards advertise different models, features, policy, resolution ceilings, or batch ceilings, the worker
+rotates complete card-scoped offers. This preserves the relationship between those fields; separately unioning them could ask
 for a model from one card with a feature or size supported only by another. `gpu_pop_balance_threshold`
 (default `0.5`) lets local queue imbalance prioritize the most under-fed card ahead of that fair rotation.
 Cards with equivalent externally visible offers can safely share a combined request.

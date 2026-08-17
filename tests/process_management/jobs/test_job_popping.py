@@ -515,6 +515,33 @@ class TestHeterogeneousCardPopRotation:
         assert [request.max_pixels for request in requests] == [2 * 8 * 64 * 64, 8 * 8 * 64 * 64] * 2
         assert [request.threads for request in requests] == [1, 2, 1, 2]
 
+    async def test_requested_amount_follows_the_scoped_card(self) -> None:
+        """The requested batch is the offered card's own ceiling, never the global or the other card's."""
+        small_batch = make_mock_bridge_data(image_models_to_load=["plain-model"], max_batch=1)
+        large_batch = make_mock_bridge_data(image_models_to_load=["feature-model"], max_batch=6)
+        card_runtimes = {
+            0: make_test_card_runtimes(device_indices=(0,), config=small_batch)[0],
+            1: make_test_card_runtimes(device_indices=(1,), config=large_batch)[1],
+        }
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                image_models_to_load=["plain-model", "feature-model"],
+                max_batch=3,
+            ),
+            card_runtimes=card_runtimes,
+        )
+
+        for _ in range(2):
+            popper._state.last_pop_no_jobs_available = False
+            await popper.api_job_pop(urgent=True)
+
+        requests = [call.args[0] for call in session.submit_request.call_args_list]
+        assert [request.amount for request in requests] == [1, 6]
+
 
 _SERVER_SUPPORTS_EXTENDED_CONTROLNET = (
     "horde_worker_regen.process_management.jobs.job_popper.server_supports_extended_controlnet"

@@ -59,6 +59,8 @@ class AdvertisedCapabilities:
     """The canonical union of portable image features supported by at least one card."""
     max_power: int
     """The largest ``max_power`` across cards (the biggest resolution any card will accept)."""
+    max_batch: int
+    """The largest ``max_batch`` across cards (the biggest batch any card will accept)."""
     threads: int
     """The summed concurrent-inference ceiling across cards (the worker's total advertised thread count)."""
 
@@ -111,10 +113,10 @@ class AdvertisedCapabilities:
 def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> AdvertisedCapabilities:
     """Build an independently aggregated capability envelope from a card runtime plan.
 
-    Portable feature values are unioned; NSFW is OR-ed, ``max_power`` is max-ed, threads are summed, and
-    models are unioned. The result is directly safe to emit only for a singleton or externally equivalent
-    cards. Empty input is rejected because the SDK image profile requires at least one supported baseline;
-    the caller handles an absent card plan before invoking this function.
+    Portable feature values are unioned; NSFW is OR-ed, ``max_power`` and ``max_batch`` are max-ed, threads
+    are summed, and models are unioned. The result is directly safe to emit only for a singleton or
+    externally equivalent cards. Empty input is rejected because the SDK image profile requires at least one
+    supported baseline; the caller handles an absent card plan before invoking this function.
 
     Args:
         card_runtimes: The driven cards keyed by stable device index.
@@ -127,6 +129,7 @@ def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> Adverti
     nsfw = False
     feature_profiles: list[ImageWorkerFeatureFlags] = []
     max_power = 0
+    max_batch = 0
     threads = 0
 
     for card in card_runtimes.values():
@@ -135,6 +138,7 @@ def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> Adverti
         nsfw = nsfw or bool(config.nsfw)
         feature_profiles.append(image_worker_feature_flags(config))
         max_power = max(max_power, int(config.max_power))
+        max_batch = max(max_batch, int(config.max_batch))
         threads += int(card.max_concurrent_inference)
 
     if not feature_profiles:
@@ -145,6 +149,7 @@ def advertised_capabilities(card_runtimes: Mapping[int, CardRuntime]) -> Adverti
         nsfw=nsfw,
         image_worker_features=union_image_worker_feature_flags(feature_profiles),
         max_power=max_power,
+        max_batch=max_batch,
         threads=threads,
     )
 
@@ -155,8 +160,10 @@ def requires_card_scoped_pops(card_runtimes: Mapping[int, CardRuntime]) -> bool:
     The AI Horde pop shape carries independent model, feature, policy and resolution fields. Unioning
     heterogeneous cards loses the correlations between those fields: a model from one card can be combined
     with a feature or resolution contributed by another. A union remains rectangular and safe only when every
-    card exposes the same models, feature profile, NSFW policy and power ceiling. Thread counts may differ
-    because they affect capacity rather than the shape of an individual returned job.
+    card exposes the same models, feature profile, NSFW policy, power ceiling and batch ceiling. Batch size
+    is a per-job field, so a union that raised it above a card's own ceiling would describe jobs that card
+    must refuse. Thread counts may differ because they affect capacity rather than the shape of an individual
+    returned job.
 
     Args:
         card_runtimes: The driven cards keyed by stable device index.
@@ -173,6 +180,7 @@ def requires_card_scoped_pops(card_runtimes: Mapping[int, CardRuntime]) -> bool:
         or capability.nsfw != first.nsfw
         or capability.image_worker_features != first.image_worker_features
         or capability.max_power != first.max_power
+        or capability.max_batch != first.max_batch
         for capability in per_card[1:]
     )
 
