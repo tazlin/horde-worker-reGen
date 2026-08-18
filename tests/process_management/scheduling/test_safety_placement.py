@@ -1153,3 +1153,59 @@ class TestReadinessLatencyPricesTheDwell:
     def test_the_floor_is_never_below_a_cold_start(self) -> None:
         """The lifecycle's own floor is what an untimed host prices a flip at, so no flip is ever free."""
         assert SAFETY_READINESS_LATENCY_FLOOR_SECONDS > 0.0
+
+
+class TestReclaimableIdleResidents:
+    """Idle retained residents are room the card can produce on demand, not memory it lacks."""
+
+    def _card_scheduler(self, monkeypatch: pytest.MonkeyPatch, *, total_mb: float = 8107.0) -> InferenceScheduler:
+        harness = _placement_harness(monkeypatch, device_free_mb=None)
+        harness.scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=total_mb)
+        return harness.scheduler
+
+    def _idle_retained_slot(self, scheduler: InferenceScheduler, *, reserved_mb: int) -> None:
+        slot = make_mock_process_info(1, model_name="warm-model")
+        slot.retained_resident_model = "warm-model"
+        slot.process_reserved_mb = reserved_mb
+        slot.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        scheduler._process_map = ProcessMap({1: slot})
+
+    def test_an_idle_retained_resident_counts_as_room_against_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A low free reading beside an idle retained resident is not pressure: the resident is evictable."""
+        scheduler = self._card_scheduler(monkeypatch)
+        self._idle_retained_slot(scheduler, reserved_mb=3200)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
+        scheduler._resident_committed_mb_for_model = Mock(return_value=0.0)
+        # 800 free alone is pressure against a 4600 need; 800 + 3200 reclaimable is not against 4600 + 512.
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=800.0)
+        assert scheduler._safety_placement_card_is_pressured(0) is True
+
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=2000.0)
+        assert scheduler._safety_placement_card_is_pressured(0) is False
+
+    def test_a_busy_slot_is_not_reclaimable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Weights a sampling slot holds are in use, so they add no room."""
+        scheduler = self._card_scheduler(monkeypatch)
+        self._idle_retained_slot(scheduler, reserved_mb=3200)
+        scheduler._process_map[1].last_process_state = HordeProcessState.INFERENCE_STARTING
+        assert scheduler._idle_retained_resident_mb(0) == 0.0
+
+    def test_a_retained_slot_without_a_reservation_reading_adds_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Missing telemetry never inflates the room."""
+        scheduler = self._card_scheduler(monkeypatch)
+        self._idle_retained_slot(scheduler, reserved_mb=3200)
+        scheduler._process_map[1].process_reserved_mb = None
+        assert scheduler._idle_retained_resident_mb(0) == 0.0
+
+    def test_the_restore_forecast_counts_reclaimable_room(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card retaining a resident between jobs can still earn its safety process back."""
+        scheduler = self._card_scheduler(monkeypatch)
+        self._idle_retained_slot(scheduler, reserved_mb=3200)
+        scheduler._largest_active_sampling_peak = Mock(return_value=(4600.0, "heavy-model"))
+        scheduler._resident_committed_mb_for_model = Mock(return_value=3700.0)
+        # 3044 (safety) + 900 (marginal need) + 512 (noise floor) = 4456 required; 1400 free + 3200 reclaimable.
+        scheduler._process_map.get_free_vram_mb = Mock(return_value=1400.0)
+        assert scheduler._safety_restore_headroom_fits(0) is True
+
+        scheduler._process_map[1].retained_resident_model = None
+        assert scheduler._safety_restore_headroom_fits(0) is False

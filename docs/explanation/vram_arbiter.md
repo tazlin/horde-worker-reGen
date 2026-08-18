@@ -504,7 +504,12 @@ acts on the single verdict: a `FITS` admits and runs the marginal RAM verdict, a
 described actuations and re-asks. There is no second, parallel admission arithmetic: the
 ledger-driven identity is the only gate. Because the reserve is a sampling-headroom term and never a
 load-feasibility floor, a preload is never denied by `vram_reserve_mb`; a model whose weights fit the drained
-card admits even when the operator's reserve would have read it as unloadable.
+card admits even when the operator's reserve would have read it as unloadable. Under the clearance lease a
+preload only stages the job in system RAM (the diffusion weights load inside the leased sample call), so its
+candidate charge is capped at the staging encode footprint, the same figure a staged dispatch books, and the
+full fit-or-evict runs at clearance; without the lease the preload is the VRAM moment and is priced at the
+job's full marginal sampling charge. Pricing a lease-staged preload at the full peak parked the next model's
+disk read behind the running sample on every model switch, which is the work the stage exists to overlap.
 
 **Overlap.** The scheduler's overlap adapter runs its non-memory guards first (the whole-card tier's
 no-co-sampling contract, and the size-scaled sampling headway that keeps a newcomer off a running job's

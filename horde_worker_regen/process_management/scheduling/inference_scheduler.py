@@ -802,16 +802,30 @@ class _SafetyPlacementInputs:
     noise_buffer_mb: float
     governor_state: GovernorState
     safety_footprint_mb: float
+    reclaimable_idle_mb: float = 0.0
+    """Device memory (MB) idle inference processes on the card hold as retained residents.
+
+    Those weights are kept warm between jobs on a grant the reclaim ladder and the clearance gate revoke the
+    moment a peak needs the room, so for a placement decision they are room the card can produce within a
+    tick, not room it lacks. Counting them as used is what armed a demotion for as long as retention held a
+    resident, and what kept the restore forecast from ever passing on a card that retains between jobs."""
+
+    def available_mb(self) -> float | None:
+        """The measured free plus what idle retained residents would return; None without a measurement."""
+        if self.measured_free_mb is None:
+            return None
+        return self.measured_free_mb + self.reclaimable_idle_mb
 
     def restore_requirement_mb(self) -> float:
-        """The measured free the card must show for safety to survive the peak it is committed to."""
+        """The available room the card must show for safety to survive the peak it is committed to."""
         return self.safety_footprint_mb + self.marginal_need_mb + self.noise_buffer_mb
 
     def describe(self) -> str:
         """Return the evidence as one diagnostic clause, for the placement log lines."""
         free_display = "unreported" if self.measured_free_mb is None else f"{self.measured_free_mb:.0f}MB"
         return (
-            f"card {self.device_index}: measured free {free_display}, marginal need "
+            f"card {self.device_index}: measured free {free_display}, reclaimable idle residents "
+            f"{self.reclaimable_idle_mb:.0f}MB, marginal need "
             f"{self.marginal_need_mb:.0f}MB, noise buffer {self.noise_buffer_mb:.0f}MB, safety footprint "
             f"{self.safety_footprint_mb:.0f}MB, governor {self.governor_state.name}"
         )
@@ -2468,9 +2482,10 @@ class InferenceScheduler:
         free) does not restore: the policy promotes only on positive, measured evidence.
         """
         inputs = self._safety_placement_inputs(device_index)
-        if inputs.measured_free_mb is None or inputs.governor_state is not GovernorState.HEALTHY:
+        available_mb = inputs.available_mb()
+        if available_mb is None or inputs.governor_state is not GovernorState.HEALTHY:
             return False
-        return inputs.measured_free_mb >= inputs.restore_requirement_mb()
+        return available_mb >= inputs.restore_requirement_mb()
 
     def _runtime_safety_placement_enabled(self) -> bool:
         """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
@@ -2576,7 +2591,28 @@ class InferenceScheduler:
             noise_buffer_mb=admission_noise_buffer_mb(total_vram_mb),
             governor_state=self.governor_state(device_index),
             safety_footprint_mb=self._safety_footprint_mb(),
+            reclaimable_idle_mb=self._idle_retained_resident_mb(device_index),
         )
+
+    def _idle_retained_resident_mb(self, device_index: int | None) -> float:
+        """Device memory (MB) idle inference processes on a card hold under a retention grant.
+
+        Priced by each process's measured allocator reservation, which is what an eviction returns to the card;
+        a slot with a retained resident but no reservation reading contributes nothing (missing telemetry
+        never inflates the room). Busy slots are excluded: their weights are in use, not reclaimable.
+        """
+        reclaimable_mb = 0.0
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.retained_resident_model is None or process_info.is_process_busy():
+                continue
+            if process_info.process_reserved_mb is None:
+                continue
+            reclaimable_mb += float(process_info.process_reserved_mb)
+        return reclaimable_mb
 
     def _safety_placement_card_is_pressured(self, device_index: int | None) -> bool:
         """Whether safety's own card is short of memory right now, as measured evidence rather than a model.
@@ -2594,9 +2630,10 @@ class InferenceScheduler:
         inputs = self._safety_placement_inputs(device_index)
         if inputs.governor_state is not GovernorState.HEALTHY:
             return True
-        if inputs.measured_free_mb is None or inputs.marginal_need_mb <= 0.0:
+        available_mb = inputs.available_mb()
+        if available_mb is None or inputs.marginal_need_mb <= 0.0:
             return False
-        return inputs.measured_free_mb < (inputs.marginal_need_mb + inputs.noise_buffer_mb)
+        return available_mb < (inputs.marginal_need_mb + inputs.noise_buffer_mb)
 
     def _safety_fits_beside_largest_sampling_peak(
         self,
@@ -2660,6 +2697,7 @@ class InferenceScheduler:
             inputs.device_index,
             None if free_mb is None else round(free_mb / 64.0),
             round(inputs.marginal_need_mb / 64.0),
+            round(inputs.reclaimable_idle_mb / 64.0),
             inputs.governor_state,
             self._process_lifecycle.is_safety_gpu_paused,
         )
@@ -6774,6 +6812,7 @@ class InferenceScheduler:
                     will_load_loras=will_load_loras,
                     seamless_tiling_enabled=seamless_tiling_enabled,
                     sdk_api_job_info=job,
+                    diffusion_model_only=self._is_disaggregation_class_eligible(job),
                 ),
             )
 
@@ -6813,11 +6852,10 @@ class InferenceScheduler:
             # baseline is the target's reserved right now, so the charge decays one-for-one as this process's
             # own reservation materialises the load. The per-cycle reconcile then prunes it once the process
             # leaves the loading set (finished, faulted, or dead), with no explicit release on those paths.
-            planned_charge_mb = self._measured_admission_candidate_delta_mb(
+            planned_charge_mb = self._preload_candidate_delta_mb(
                 job,
                 model_baseline,
                 process_id=available_process.process_id,
-                disaggregated=self._is_disaggregation_class_eligible(job),
             )
             self._reserve_ledger.set_planned(
                 PRELOAD_ADMISSION_FLOW,
@@ -7953,11 +7991,10 @@ class InferenceScheduler:
             baseline=baseline,
             device_index=target_device_index,
             target_process_id=available_process.process_id,
-            candidate_delta_mb=self._measured_admission_candidate_delta_mb(
+            candidate_delta_mb=self._preload_candidate_delta_mb(
                 job,
                 baseline,
                 process_id=available_process.process_id,
-                disaggregated=self._is_disaggregation_class_eligible(job),
             ),
             candidate_weights_mb=predict_job_weight_mb(job, baseline),
             accepted_work=job.id_ is not None and self._job_tracker.get_tracked_job(job.id_) is not None,
@@ -7984,6 +8021,33 @@ class InferenceScheduler:
             can_reduce_live_contexts=can_reduce_live_contexts,
             idle_contexts_teardownable=idle_contexts_teardownable,
         )
+
+    def _preload_candidate_delta_mb(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        process_id: int | None,
+    ) -> float | None:
+        """Return the VRAM (MB) a preload of ``job`` charges the card at admission.
+
+        Without the clearance lease a preload is the VRAM moment (the child loads the weights when the job
+        starts), so it is priced at the job's full marginal sampling charge. Under the lease a preload only
+        stages the job in system RAM and the weights load inside the leased sample call, so the charge is
+        capped at the staging encode footprint, the same figure a staged dispatch books; the full fit-or-evict
+        runs at clearance. Pricing the stage at the full peak parks the next model's disk read behind the
+        current sample on every model switch, since a second peak almost never fits beside a running one, and
+        that read is exactly the work the stage exists to overlap.
+        """
+        delta_mb = self._measured_admission_candidate_delta_mb(
+            job,
+            baseline,
+            process_id=process_id,
+            disaggregated=self._is_disaggregation_class_eligible(job),
+        )
+        if delta_mb is None or not self._clearance_lease_active():
+            return delta_mb
+        return min(delta_mb, _STAGING_ENCODE_VRAM_MB)
 
     def _own_planned_charge_mb(self, *, device_index: int | None, target_process_id: int | None) -> float:
         """Return the planned-overlay charge (MB) attributable to a request's own target process.

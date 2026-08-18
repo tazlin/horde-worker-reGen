@@ -165,6 +165,34 @@ class TestMeasuredOverlayDeltaPricing:
         assert raised == _WATERMARK_MB
 
 
+class TestPreloadCandidatePricing:
+    """A preload is priced at its full marginal charge without the lease and at the staging charge under it."""
+
+    def test_full_charge_without_the_lease(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without the lease the preload is the VRAM moment, so it carries the whole sampling charge."""
+        _pin_static_predictors(monkeypatch)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        pm.bridge_data.gpu_sampling_lease_enabled = False
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+
+        assert scheduler._preload_candidate_delta_mb(job, baseline, process_id=None) == _SEED_MB
+
+    def test_staging_charge_under_the_lease(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Under the lease the preload only stages in RAM, so it carries the staging encode charge."""
+        _pin_static_predictors(monkeypatch)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        pm.bridge_data.gpu_sampling_lease_enabled = True
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+
+        assert (
+            scheduler._preload_candidate_delta_mb(job, baseline, process_id=None) == _sched_mod._STAGING_ENCODE_VRAM_MB
+        )
+
+
 class TestStageIsolation:
     """Monolithic (SAMPLE) and disaggregated (SAMPLE_ISOLATED) peaks never cross-contaminate.
 
