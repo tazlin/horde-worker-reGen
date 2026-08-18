@@ -56,6 +56,13 @@ processing state stands as the active-decode signal. Separately, the orchestrato
 conditioning, sampling, awaiting decode) and its current dispatch target are exported on the supervisor
 snapshot, so the dashboard can show where each in-flight disaggregated job sits in its pipeline.
 
+The decode dispatch carries the parent's NVML device-free reading (`HordeVaeDecodeControlMessage.device_free_mb`),
+and the VAE lane clamps ComfyUI's free-VRAM view to it for the decode, as the sampler does for its sample stage.
+ComfyUI sizes each decode pass by the free VRAM it reads, and a process-local reading under WDDM shows the card
+as nearly empty however full it is, so an unclamped batch decode allocated its whole activation set at once
+beside the resident UNet and the next job's staging and drove the card into demand-paging (and the reclaim
+ladder into evicting safety off the GPU); clamped, a batch decodes in as many passes as actually fit.
+
 When safety runs on GPU, only CLIP remains resident while the lane is idle. DeepDanbooru stages from CPU for a
 conditional anime check; BLIP captioning and the aesthetic head are also offloaded after use, and completion
 trims the allocator before `WAITING_FOR_JOB`. This bounds the lane's fixed card cost without making every

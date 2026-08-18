@@ -690,6 +690,7 @@ class HordeInferenceProcess(HordeProcess):
         will_load_loras: bool,
         seamless_tiling_enabled: bool,
         job_info: ImageGenerateJobPopResponse,
+        diffusion_model_only: bool = False,
     ) -> None:
         """Preload a model into RAM.
 
@@ -698,6 +699,8 @@ class HordeInferenceProcess(HordeProcess):
             will_load_loras (bool): Whether or not the model will be loaded into VRAM.
             seamless_tiling_enabled (bool): Whether or not seamless tiling is enabled.
             job_info (ImageGenerateJobPopResponse): The job the model is being preloaded for.
+            diffusion_model_only (bool): Load only the diffusion model; the job's encoders and decoder run on
+                the component and VAE lanes.
         """
         logger.debug(f"Currently active model is {self._active_model_name}. Requested model is {horde_model_name}")
 
@@ -746,11 +749,20 @@ class HordeInferenceProcess(HordeProcess):
         if not self._dry_run_skip_inference:
             with contextlib.nullcontext():  # self.disk_lock:
                 try:
-                    self._horde.preload_model(
-                        horde_model_name,
-                        will_load_loras=will_load_loras,
-                        seamless_tiling_enabled=seamless_tiling_enabled,
-                    )
+                    try:
+                        self._horde.preload_model(
+                            horde_model_name,
+                            will_load_loras=will_load_loras,
+                            seamless_tiling_enabled=seamless_tiling_enabled,
+                            diffusion_model_only=diffusion_model_only,
+                        )
+                    except TypeError:
+                        # An older horde-engine predates the component-only preload; load the full checkpoint.
+                        self._horde.preload_model(
+                            horde_model_name,
+                            will_load_loras=will_load_loras,
+                            seamless_tiling_enabled=seamless_tiling_enabled,
+                        )
                 except Exception as preload_error:
                     # A load failure is a property of the *model* (an unsupported/corrupt checkpoint the
                     # backend cannot load), not of this process, but the backend may have left torch/ComfyUI
@@ -1619,6 +1631,7 @@ class HordeInferenceProcess(HordeProcess):
                 will_load_loras=message.will_load_loras,
                 seamless_tiling_enabled=message.seamless_tiling_enabled,
                 job_info=message.sdk_api_job_info,
+                diffusion_model_only=message.diffusion_model_only,
             )
         elif isinstance(message, HordeSampleControlMessage):
             self._run_sample_stage(message)

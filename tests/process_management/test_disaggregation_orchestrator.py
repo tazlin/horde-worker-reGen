@@ -1569,6 +1569,22 @@ async def test_a_sample_dispatch_carries_the_parents_device_reading() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_decode_dispatch_carries_the_parents_device_reading() -> None:
+    """The image lane is told what the card really holds, so its decode passes are sized to the measured room."""
+    h = _make_harness(measured_device_free_mb=lambda _device_index: 4321.0)
+    job = _job()
+    job_id = job.sdk_api_job_info.id_
+
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+    h.orchestrator.tick()
+    await h.orchestrator.handle_stage_result(_sample_ok(job_id, _SAMPLER_PID))
+    h.orchestrator.tick()
+
+    assert len(h.image_lane.sent) == 1
+    assert h.image_lane.sent[-1].device_free_mb == 4321.0
+
+
+@pytest.mark.asyncio
 async def test_a_granted_sampler_is_recorded_as_retaining_its_unet_when_its_stage_ends() -> None:
     """The grant settles on the sampler at the end of its stage, marked as the component residency it is.
 

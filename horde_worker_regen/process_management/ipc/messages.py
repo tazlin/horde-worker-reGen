@@ -822,6 +822,11 @@ class HordePreloadInferenceModelMessage(HordeControlModelMessage):
 
     sdk_api_job_info: ImageGenerateJobPopResponse
 
+    diffusion_model_only: bool = False
+    """Load only the checkpoint's diffusion model: the job is disaggregation-class, so this process will run its
+    sample stage while the component and VAE lanes serve the encoders and decoder. A monolithic run of the same
+    model later reloads the full checkpoint on a cache miss."""
+
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
 
@@ -1306,6 +1311,11 @@ class HordeVaeDecodeControlMessage(HordeControlMessage, HordeStageModelMixin):
     """The job as sent by the API (the VAE identity and output dimensions are derived from it)."""
     latent_bytes: bytes
     """The serialized LATENT to decode."""
+    device_free_mb: float | None = None
+    """The parent's NVML device-level free VRAM (MB) measured when the decode was dispatched.
+
+    The lane clamps ComfyUI's free-VRAM view to it so a batch decode is split into passes that fit the card
+    as it stands, rather than sized from the process-local reading that under WDDM shows the whole card free."""
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
 

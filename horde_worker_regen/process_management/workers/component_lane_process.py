@@ -119,7 +119,14 @@ class HordeComponentLaneProcess(HordeProcess):
 
         ensure_offline_reference_manager()
         SharedModelManager(do_not_load_model_mangers=True)
-        SharedModelManager.load_model_managers(multiprocessing_lock=self.disk_lock, lora_reference_backups=False)
+        # The dedicated download process is the sole fetcher of ad-hoc LoRA/TI weights; this lane resolves
+        # already-present files only. A lane that fetched for itself would block its text encode for the
+        # transfer (tens of seconds per file against a slow or failing upstream) and be judged hung.
+        SharedModelManager.load_model_managers(
+            multiprocessing_lock=self.disk_lock,
+            lora_reference_backups=False,
+            adhoc_read_only=True,
+        )
         # Held across jobs (no per-job reload); the text encoders are the components it keeps resident.
         self._horde = HordeLib(aggressive_unloading=False)
 

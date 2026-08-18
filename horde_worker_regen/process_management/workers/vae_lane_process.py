@@ -141,6 +141,7 @@ class HordeVaeLaneProcess(HordeProcess):
             SharedModelManager.load_model_managers(
                 multiprocessing_lock=self.disk_lock,
                 lora_reference_backups=False,
+                adhoc_read_only=True,
             )
 
         logger.info("HordeVaeLaneProcess initialised")
@@ -338,11 +339,21 @@ class HordeVaeLaneProcess(HordeProcess):
                 params = self._job_generation_parameters(message.sdk_api_job_info)
 
                 def _decode() -> list[HordeImageResult]:
-                    results, _faults = self._horde.decode_stage(
-                        params,
-                        latent_bytes=message.latent_bytes,
-                        progress_callback=self._emit_decode_progress,
-                    )
+                    try:
+                        results, _faults = self._horde.decode_stage(
+                            params,
+                            latent_bytes=message.latent_bytes,
+                            progress_callback=self._emit_decode_progress,
+                            device_free_truth_mb=message.device_free_mb,
+                        )
+                    except TypeError:
+                        # An older horde-engine predates the device-free clamp on the decode stage; decode
+                        # unclamped rather than fail the job.
+                        results, _faults = self._horde.decode_stage(
+                            params,
+                            latent_bytes=message.latent_bytes,
+                            progress_callback=self._emit_decode_progress,
+                        )
                     return [
                         HordeImageResult(image_bytes=r.rawpng.getvalue(), generation_faults=r.faults)
                         for r in results

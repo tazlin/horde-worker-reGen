@@ -150,6 +150,7 @@ class HordePostProcessProcess(HordeProcess):
             SharedModelManager.load_model_managers(
                 multiprocessing_lock=self.disk_lock,
                 lora_reference_backups=False,
+                adhoc_read_only=True,
             )
 
         logger.info("HordePostProcessProcess initialised")

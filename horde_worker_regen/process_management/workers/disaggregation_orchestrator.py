@@ -1208,6 +1208,7 @@ class DisaggregationOrchestrator:
             job_id=state.job_info.sdk_api_job_info.id_,
             sdk_api_job_info=state.job_info.sdk_api_job_info,
             latent_bytes=latent,
+            device_free_mb=self._measured_device_free_mb(lane.device_index),
         )
         return _DispatchOutcome.DISPATCHED if self._send(lane, message, state) else _DispatchOutcome.NO_ROLE
 
