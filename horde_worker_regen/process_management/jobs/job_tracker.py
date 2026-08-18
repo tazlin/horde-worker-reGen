@@ -1093,6 +1093,17 @@ class JobTracker:
         return tuple(t.sdk_api_job_info for t in self._jobs_in_stage(JobStage.INFERENCE_IN_PROGRESS))
 
     @property
+    def jobs_disaggregation_decoding(self) -> tuple[ImageGenerateJobPopResponse, ...]:
+        """Return the pop responses for disaggregated jobs whose latent is being decoded on the VAE lane.
+
+        Deliberately separate from :attr:`jobs_in_progress`, which sizes the inference concurrency cap and so
+        must exclude a job that has already released its sampler. A caller asking whether any accepted work is
+        still in flight (rather than how many samplers are busy) has to count this stage too: the decode owns
+        the job's only copy of its images, so a lane torn down here loses them.
+        """
+        return tuple(t.sdk_api_job_info for t in self._jobs_in_stage(JobStage.DISAGGREGATION_DECODING))
+
+    @property
     def job_faults(self) -> dict[GenerationID, list[GenMetadataEntry]]:
         """Return a copy of the job faults dictionary."""
         return {k: list(v) for k, v in self._job_faults.items()}

@@ -232,6 +232,18 @@ the job into the same failure. The coordinator also
 pushes a pins-only eviction update whenever the set of still-referenced auxiliary files
 changes (for example when a job completes), coalesced so an unchanged set is never re-sent.
 
+Two caps sit above that budget, whichever binds first. A job the horde gave a ttl has its
+deadline anchored at `time_popped + 0.35 * ttl`, so a job whose files cannot land in time is
+served without them while its result can still be submitted, rather than after the horde has
+already given up on it. While the worker is winding down, the deadline is capped a few seconds
+past the shutdown request: the ordinary budget is sized for a worker with other work behind the
+hold, and once the popper has stopped the held job is the only work left, so the remainder of
+that budget is an idle card and a shutdown the operator is waiting on. Deadlines armed before
+the request are clamped down to that window as well, and a deferral the caps would swallow is
+declined rather than spent. An expiry the wind-down cap produced arms no class backoff: it ends
+the hold on the operator's schedule, not on evidence that the download path is sick, so a
+healthy transfer that simply had not finished leaves no strike behind it.
+
 ## Model availability and the pop gate
 
 [`ModelAvailability`][horde_worker_regen.process_management.models.model_availability.ModelAvailability]

@@ -92,6 +92,35 @@ class TestControlLoopTick:
         await process_manager._control_loop_tick()
         process_manager._process_lifecycle.end_inference_processes.assert_called()
 
+    async def test_shutdown_keeps_lanes_up_while_a_disaggregated_decode_is_in_flight(self) -> None:
+        """A job that released its sampler for the image lane's decode still holds the drain open.
+
+        The decode stage is deliberately excluded from ``jobs_in_progress`` (that count sizes the inference
+        concurrency cap), so a drain reading only that count would wind the lanes down while the VAE lane
+        holds the job's only copy of its images, and the job would never be safety-checked or submitted.
+        """
+        process_manager = _make_tickable_manager()
+        process_manager._state.shutting_down = True
+        process_manager._process_lifecycle.end_inference_processes = Mock()  # type: ignore[method-assign]
+        vae_proc = make_mock_process_info(
+            11,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.VAE_LANE,
+        )
+        process_manager._process_map.update({11: vae_proc})
+
+        job = await track_popped_job_async(process_manager._job_tracker, make_mock_job())
+        await process_manager._job_tracker.mark_inference_started(job)
+        assert process_manager._job_tracker.mark_disaggregation_decoding(job) is True
+        assert len(process_manager._job_tracker.jobs_in_progress) == 0
+
+        assert await process_manager._control_loop_tick() is True
+
+        process_manager._process_lifecycle.end_inference_processes.assert_not_called()
+        assert vae_proc.end_intended is False
+        vae_proc.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_shutdown_ends_starting_safety_process_once_safety_queue_drained(self) -> None:
         """A shutdown tick should send END_PROCESS to safety even if it is still starting."""
         process_manager = _make_tickable_manager()

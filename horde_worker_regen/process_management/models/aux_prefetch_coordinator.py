@@ -10,11 +10,12 @@ download process:
 - the completion/failure wiring, which marks each cached file, clears a job's dispatch gate once its full
   auxiliary set is present, requeues a job for a re-fetch on a retryable failure, and salvage-dispatches it
   without a reference the fetch terminally cannot satisfy; and
-- a per-job deadline (derived from the configured download timeout, capped TTL-coherently) that bounds how
-  long a job waits on its prefetch: at expiry the job is served without its outstanding references, whether
-  they never started or their in-flight transfer stalled (the inference child performs its own ad-hoc fetch,
-  and a degraded delivery always beats a dropped job), so aux prefetch never faults a job and never leaves
-  one pending forever; and
+- a per-job deadline (derived from the configured download timeout, capped against the job's ttl and,
+  while the worker winds down, against a short grace window) that bounds how long a job waits on its
+  prefetch: at expiry the job is served without its outstanding references, whether they never started or
+  their in-flight transfer stalled (the inference child performs its own ad-hoc fetch, and a degraded
+  delivery always beats a dropped job), so aux prefetch never faults a job and never leaves one pending
+  forever; and
 - a periodic reconcile-and-pin-refresh step that re-requests any aux-bearing pending job left without an
   in-flight request (a retryable requeue, a lost result message, a restarted downloader) and sends a
   pins-only update whenever the set of still-referenced files changes, coalesced so an unchanged set is never
@@ -73,6 +74,16 @@ downloading would only be salvaged after the horde has already given up on the j
 without the missing file while its result can still be submitted in time. Sized well below the post-inference
 tail budget so the freed remainder of the ttl still covers the job's own inference and submission."""
 
+
+_AUX_SHUTDOWN_GRACE_SECONDS = 10.0
+"""How long an auxiliary hold may outlive the shutdown request before the job is dispatched without its files.
+
+The ordinary hold budget is sized for a worker that has other work to run: an inference lane idle on one job's
+LoRA is still earning on the rest of the queue, so waiting out a large fraction of the job's ttl costs nothing.
+Once the worker is winding down the popper has stopped, so the held job is the only work left and every second
+of the hold is a fully idle card and a shutdown the operator is waiting on. This window keeps the trade the
+right way round: a transfer within seconds of landing still lands (the job renders with its files), while a
+cold or slow one no longer holds the exit open for the rest of the ordinary budget."""
 
 _AUX_HOLD_ANNOUNCE_SECONDS = 5.0
 """How long a job may wait on its auxiliary files before the hold is named once in the log.
@@ -209,7 +220,7 @@ class AuxPrefetchCoordinator:
 
         if entries:
             base_deadline = now + max(0.0, self._download_timeout_provider())
-            self._deadlines[job_id] = self._ttl_coherent_deadline(job, base_deadline, now=now)
+            self._deadlines[job_id] = self._bounded_deadline(job, base_deadline, now=now)
             # A fresh request is a fresh attempt: forget any deferral/cooling bookkeeping a prior attempt left.
             self._forget_deferral_state(job_id)
             pins = self._current_pins()
@@ -227,7 +238,7 @@ class AuxPrefetchCoordinator:
             # scan_deadlines still faults it if the cooldown-plus-refetch cycle never resolves it. The deadline
             # is armed once and not pushed forward on later reconcile passes, so the bound is real.
             base_deadline = now + max(0.0, self._download_timeout_provider())
-            self._deadlines.setdefault(job_id, self._ttl_coherent_deadline(job, base_deadline, now=now))
+            self._deadlines.setdefault(job_id, self._bounded_deadline(job, base_deadline, now=now))
             self._cooling_deadline_jobs.add(job_id)
             return
 
@@ -236,28 +247,55 @@ class AuxPrefetchCoordinator:
         self._cooling_deadline_jobs.discard(job_id)
         self._job_tracker.mark_job_aux_prepared_if_ready(job_id)
 
-    def _ttl_coherent_deadline(
+    def _bounded_deadline(
         self,
         job: ImageGenerateJobPopResponse,
         base_deadline: float,
         *,
         now: float,
     ) -> float:
-        """Return the prefetch deadline capped so salvage stays inside a winnable fraction of the job's ttl.
+        """Return the prefetch deadline capped so salvage stays inside a winnable, non-blocking window.
 
-        The download-timeout-derived ``base_deadline`` can outlast the job's whole horde ttl (its SLA), so an
-        auxiliary file that never starts downloading would only be salvaged after the horde has already given up
-        and the result is worthless. Anchoring the cap at ``time_popped + _AUX_SALVAGE_TTL_FRACTION * ttl``
-        guarantees a job whose aux cannot land in time dispatches without the missing file while its result can
-        still be submitted. A job the horde gave no ttl (or one not yet tracked) keeps ``base_deadline``.
+        Two caps apply, whichever binds first:
+
+        - The download-timeout-derived ``base_deadline`` can outlast the job's whole horde ttl (its SLA), so an
+          auxiliary file that never starts downloading would only be salvaged after the horde has already given
+          up and the result is worthless. Anchoring at ``time_popped + _AUX_SALVAGE_TTL_FRACTION * ttl``
+          guarantees a job whose aux cannot land in time dispatches without the missing file while its result
+          can still be submitted. A job the horde gave no ttl (or one not yet tracked) has no ttl cap.
+        - Once the worker is winding down, ``_AUX_SHUTDOWN_GRACE_SECONDS`` past the shutdown request, because
+          the ordinary budget assumes other work is running behind the hold and there no longer is any.
         """
+        capped = base_deadline
         ttl = job.ttl
-        if ttl is None or ttl <= 0:
-            return base_deadline
-        tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
-        time_popped = tracked.time_popped if tracked is not None and tracked.time_popped is not None else now
-        ttl_cap = time_popped + _AUX_SALVAGE_TTL_FRACTION * float(ttl)
-        return min(base_deadline, ttl_cap)
+        if ttl is not None and ttl > 0:
+            tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
+            time_popped = tracked.time_popped if tracked is not None and tracked.time_popped is not None else now
+            capped = min(capped, time_popped + _AUX_SALVAGE_TTL_FRACTION * float(ttl))
+        shutdown_cap = self._shutdown_deadline_cap()
+        if shutdown_cap is not None:
+            capped = min(capped, shutdown_cap)
+        return capped
+
+    def _shutdown_deadline_cap(self) -> float | None:
+        """The latest a hold may run to while the worker winds down, or None when it is not shutting down."""
+        if not self._state.shutting_down:
+            return None
+        return self._state.shutting_down_time + _AUX_SHUTDOWN_GRACE_SECONDS
+
+    def _apply_shutdown_grace_cap(self) -> None:
+        """Clamp deadlines armed before the shutdown request down to the wind-down grace window.
+
+        :meth:`_bounded_deadline` applies the cap to deadlines armed or extended after shutdown begins; a job
+        whose hold was already running when the request arrived would otherwise keep its full pre-shutdown
+        budget and idle the card for the remainder of it.
+        """
+        cap = self._shutdown_deadline_cap()
+        if cap is None:
+            return
+        for job_id, deadline in list(self._deadlines.items()):
+            if deadline > cap:
+                self._deadlines[job_id] = cap
 
     def on_prefetch_result(self, message: HordeAuxPrefetchResultMessage) -> None:
         """Consume per-entry prefetch outcomes: mark cached files, prepare ready jobs, requeue or salvage failures."""
@@ -293,14 +331,16 @@ class AuxPrefetchCoordinator:
           missing references recorded skipped, exactly as the rejection and terminal-plain-failure paths serve a
           job the fetch could not satisfy.
         - A job whose reference is present in the downloader's in-flight set defers while that transfer advances
-          (bounded at ``_MAX_DEADLINE_DEFERRALS`` extra download-timeout budgets and by the job's TTL-coherent
-          cap). Once the transfer's reported bytes stop advancing or the budget is spent, the job is served
+          (bounded at ``_MAX_DEADLINE_DEFERRALS`` extra download-timeout budgets and by the caps
+          :meth:`_bounded_deadline` applies). Once the transfer's reported bytes stop advancing or the budget
+          is spent, the job is served
           without the stuck reference (recorded skipped incident-scoped) while the class backoff arms; the
           transfer itself continues for future jobs. Aux prefetch therefore never faults a job at a deadline.
         """
         reference = self._clock() if now is None else now
         in_flight = self._in_flight_provider()
         self._prune_inflight_memory()
+        self._apply_shutdown_grace_cap()
         expired = [job_id for job_id, deadline in self._deadlines.items() if reference >= deadline]
         for job_id in expired:
             tracked = self._job_tracker.get_tracked_job(job_id)
@@ -322,14 +362,19 @@ class AuxPrefetchCoordinator:
                 continue
             # Only a stalled in-flight transfer reaches here. The stall is real evidence of a sick download
             # path, so the class backoff still arms (protecting the CDN from hammering), but the JOB is served
-            # without the stuck reference rather than faulted: with TTL-coherent deadlines the expiry lands
+            # without the stuck reference rather than faulted: with bounded deadlines the expiry lands
             # while most of the job's completion budget remains, and a degraded delivery always beats a
             # dropped job. The transfer itself continues in the downloader for future jobs.
-            payload = tracked.sdk_api_job_info.payload
-            if payload.loras:
-                self._arm_lora_backoff(now=reference)
-            if payload.tis:
-                self._arm_ti_backoff(now=reference)
+            #
+            # A wind-down expiry is exempt: the grace window ends the hold on the operator's schedule, not on
+            # evidence the download is sick, so a healthy transfer that simply had not finished must not leave
+            # a backoff strike (and its warning) behind it.
+            if not self._state.shutting_down:
+                payload = tracked.sdk_api_job_info.payload
+                if payload.loras:
+                    self._arm_lora_backoff(now=reference)
+                if payload.tis:
+                    self._arm_ti_backoff(now=reference)
             self._salvage_stalled_in_flight(tracked.sdk_api_job_info, now=reference)
 
     def _defer_deadline_if_in_flight(
@@ -346,6 +391,11 @@ class AuxPrefetchCoordinator:
         expiry. A file whose reported bytes have not moved since the previous expiry is treated as stalled and no
         longer defers. The deferral is capped per job so a download that neither completes nor reports movement
         cannot postpone the fault indefinitely.
+
+        A deferral the caps swallow is declined rather than performed. Once the TTL or wind-down cap binds, the
+        extended deadline clamps to a time already past, so consuming a deferral would spend budget on no extra
+        waiting and announce a hold the very next scan ends anyway. Declining leaves the salvage paths to run in
+        the same scan, which is what the capped deadline is asking for.
         """
         job_id = job.id_
         if job_id is None:
@@ -357,9 +407,12 @@ class AuxPrefetchCoordinator:
             return False
         if not any(self._file_still_progressing(name, in_flight) for name in matched):
             return False
-        self._deferrals[job_id] = self._deferrals.get(job_id, 0) + 1
         base_deadline = now + max(0.0, self._download_timeout_provider())
-        self._deadlines[job_id] = self._ttl_coherent_deadline(job, base_deadline, now=now)
+        deferred_deadline = self._bounded_deadline(job, base_deadline, now=now)
+        if deferred_deadline <= now:
+            return False
+        self._deferrals[job_id] = self._deferrals.get(job_id, 0) + 1
+        self._deadlines[job_id] = deferred_deadline
         for name in matched:
             self._last_inflight_bytes[name] = in_flight[name][0]
         if job_id not in self._deferral_logged:

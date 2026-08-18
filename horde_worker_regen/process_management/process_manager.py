@@ -4354,6 +4354,11 @@ class HordeWorkerProcessManager:
                 and not self._state.last_pop_recently()
                 and len(self._job_tracker.jobs_pending_inference) == 0
                 and len(self._job_tracker.jobs_in_progress) == 0
+                # A disaggregated job that has released its sampler is still in flight: the VAE lane holds the
+                # only copy of its images until the decode result arrives. That stage is excluded from
+                # jobs_in_progress (which sizes the concurrency cap), so it has to be counted separately here
+                # or the drain tears down the lane mid-decode and the job is never safety-checked or submitted.
+                and len(self._job_tracker.jobs_disaggregation_decoding) == 0
                 # A parked annotation job resolves back into inference, so keep the inference pool up until
                 # none remain, or a released controlnet job would find no process to run on.
                 and len(self._job_tracker.jobs_pending_annotation) == 0

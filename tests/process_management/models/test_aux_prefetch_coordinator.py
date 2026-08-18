@@ -513,6 +513,69 @@ async def test_no_ttl_keeps_download_timeout_deadline() -> None:
     assert tracker.are_job_aux_models_prepared(job) is True
 
 
+async def test_wind_down_caps_a_hold_armed_before_the_shutdown_request() -> None:
+    """A hold running when the operator asks the worker to stop ends within the wind-down grace window.
+
+    The ordinary hold budget assumes other work is running behind the hold; once the popper has stopped the
+    held job is the only work left, so the remainder of that budget is a fully idle card and a shutdown the
+    operator is waiting on. The cap is applied to deadlines armed before the request as well, or a hold that
+    predates it would keep its full pre-shutdown budget.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    job = _job(loras=[_lora("styleA")])  # no ttl: only the timeout and wind-down caps apply
+    await track_popped_job_async(tracker, job, time_popped=clock.now)
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=600.0)
+    coordinator.on_job_popped(job)
+
+    clock.now += 30.0  # 1030: deep inside the 1600 download-timeout deadline, still waiting.
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is False
+
+    # The shutdown request lands. The coordinator reads wall-clock time, which the injected clock stands in for.
+    state.shutting_down = True
+    state.shutting_down_time = clock.now
+
+    clock.now += 5.0  # 1035: inside the grace window, so a transfer about to land still gets to land.
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is False
+
+    clock.now += 6.0  # 1041: past the grace window, far short of the raw 1600 deadline.
+    coordinator.scan_deadlines()
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
+    assert coordinator.has_live_deadline(job.id_) is False
+
+
+async def test_wind_down_expiry_of_a_live_transfer_leaves_no_backoff_strike() -> None:
+    """A hold the wind-down cap ends does not record a download-path strike, and does not defer past the cap.
+
+    The grace expiry fires on the operator's schedule, not on evidence that the download path is sick: the
+    transfer here is advancing normally and would ordinarily defer. Serving the job without the file is still
+    right (the card is otherwise idle), but arming the class backoff off that expiry would blame a healthy
+    CDN and carry a spurious warning into the next session.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    job = _job(loras=[_lora("styleA")])
+    await track_popped_job_async(tracker, job, time_popped=clock.now)
+    in_flight = _InFlightSpy()
+    coordinator, _sender, state, _clock = _make(tracker, clock=clock, timeout=600.0, in_flight=in_flight)
+    coordinator.on_job_popped(job)
+
+    state.shutting_down = True
+    state.shutting_down_time = clock.now
+
+    in_flight.map = {"styleA": (2_000, 10_000)}
+    clock.now += 11.0  # past the grace window; the transfer is live and advancing.
+    coordinator.scan_deadlines()
+
+    assert tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+    assert tracker.are_job_aux_models_prepared(job) is True
+    assert tracker.is_lora_skipped(_lora("styleA")) is True
+    assert state.lora_download_backoff.strikes == 0
+
+
 async def test_ti_job_gates_and_prepares_like_loras() -> None:
     """A textual-inversion job sends a TI entry and is prepared when it lands."""
     tracker = JobTracker()
