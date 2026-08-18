@@ -115,7 +115,7 @@ Several long-lived asyncio tasks are started by `HordeWorkerProcessManager._main
 
 | Task                          | Cadence | Role                                                                                      |
 | ----------------------------- | ------- | ----------------------------------------------------------------------------------------- |
-| `_process_control_loop()`     | 0.2 s   | Drain IPC messages, schedule inference, dispatch safety, manage processes                 |
+| `_process_control_loop()`     | 0.1 s   | Drain IPC messages, schedule inference, dispatch safety, manage processes (a tick sleeps the interval two and a half times, so a child's message waits at most that long before the parent acts on it) |
 | `_api_get_user_info_loop()`   | 15 s    | Fetch user/kudos info                                                                     |
 | `_periodic_update_check_loop()` | -     | Check for a newer worker release                                                          |
 | `ImageGenerationCoordinator.run()` | -  | Supervise the image `JobPopper` (1 s) and `JobSubmitter` (0.02 s) loops                   |

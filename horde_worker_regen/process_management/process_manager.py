@@ -1119,8 +1119,13 @@ class HordeWorkerProcessManager:
     _device_map: TorchDeviceMap
     """A mapping (dict) of device IDs to TorchDeviceInfo objects. Contains some helper methods."""
 
-    _loop_interval: float = 0.20
-    """The number of seconds to wait between each loop of the main process (inter process management) loop."""
+    _loop_interval: float = 0.10
+    """The number of seconds to wait between each loop of the main process (inter process management) loop.
+
+    A tick sleeps this interval twice plus a half, so a child's message waits up to two and a half intervals
+    before the parent acts on it, and a sampler handoff crosses several such hops (result in, next dispatch,
+    primed, cleared). The interval is the floor on that hop latency; the loop's own work is small beside it.
+    """
 
     _ELIGIBLE_MAX_TICK_DT_SECONDS: float = 5.0
     """Upper bound on the wall-time a single control tick may credit to the eligible-seconds clock.
