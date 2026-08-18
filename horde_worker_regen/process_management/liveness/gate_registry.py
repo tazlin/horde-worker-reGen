@@ -512,7 +512,9 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         bound_source="",
         backstop=(
             "the safety respawn ladder and its futility check, which escalate a safety pool that will not "
-            "come up rather than leaving intake held on a process nothing is rebuilding"
+            "come up rather than leaving intake held on a process nothing is rebuilding; on a first run the "
+            "held-gate escalation stands down while the safety models are still arriving, since its remedy "
+            "restarts the very transfer the hold waits on"
         ),
         observable_at="the process map's safety slot state, and the last_pop_gate stamp",
     ),

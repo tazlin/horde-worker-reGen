@@ -6,6 +6,8 @@ Public members:
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import ADHOC_PREFETCH_FEATURES
@@ -14,6 +16,13 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadStatusSnapshot
 
 _DOWNLOADING_PHASE_VALUE = "downloading"
+
+DOWNLOAD_PROGRESS_STALL_SECONDS = 180.0
+"""Seconds without a single byte of movement after which an in-flight download stops counting as advancing.
+
+Progress is reported per chunk, so a transfer at any usable rate updates far inside this window; only one
+that has genuinely stopped moving falls outside it. That makes the bound independent of link speed, which is
+what lets a very slow but live download be told apart from a dead one without encoding either machine."""
 
 
 class ModelAvailability:
@@ -40,9 +49,18 @@ class ModelAvailability:
     _post_processing_present: bool | None
     _controlnet_failed: bool
     _downloader_lost: bool
+    _download_high_water_bytes: int
+    _download_advanced_at: float | None
 
-    def __init__(self) -> None:
-        """Initialise with availability unknown (no report received yet)."""
+    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+        """Initialise with availability unknown (no report received yet).
+
+        Args:
+            clock: Wall-clock provider used to stamp when in-flight downloads last moved.
+        """
+        self._clock = clock
+        self._download_high_water_bytes = 0
+        self._download_advanced_at = None
         self._present = None
         self._currently_downloading = None
         self._pending = ()
@@ -127,6 +145,37 @@ class ModelAvailability:
             for download in in_flight
         )
 
+    def _note_download_progress(self, status: DownloadStatusSnapshot | None) -> None:
+        """Stamp the moment the in-flight download set last gained bytes, for :meth:`download_advancing`.
+
+        Tracked as a high-water mark over the summed in-flight bytes rather than per download: tasks come and
+        go inside one provisioning pass, and a per-task view would read every handover as a regression. The
+        mark resets when nothing is in flight, so the next download starts its own liveness window instead of
+        inheriting a predecessor's total and reading as stalled until it exceeds it.
+        """
+        in_flight = [] if status is None else (status.active or ([status.current] if status.current else []))
+        transferring = [item for item in in_flight if item.feature not in ADHOC_PREFETCH_FEATURES]
+        if not transferring:
+            self._download_high_water_bytes = 0
+            self._download_advanced_at = None
+            return
+        total = sum(item.downloaded_bytes for item in transferring)
+        if self._download_advanced_at is None or total > self._download_high_water_bytes:
+            self._download_high_water_bytes = total
+            self._download_advanced_at = self._clock()
+
+    def download_advancing(self, *, stall_seconds: float = DOWNLOAD_PROGRESS_STALL_SECONDS) -> bool:
+        """Return whether a non-prefetch download is in flight and has gained bytes recently.
+
+        This is the difference between a worker that cannot make progress and one whose first-run
+        provisioning is simply slow. A download that is still moving is capacity arriving, however slowly; a
+        download that has moved nothing for ``stall_seconds`` is not, and is reported as such so the
+        watchdogs that read this are never held off by a transfer that has died.
+        """
+        if self._download_advanced_at is None:
+            return False
+        return (self._clock() - self._download_advanced_at) < stall_seconds
+
     @property
     def downloader_lost(self) -> bool:
         """Whether the background download process is currently known to be gone (dead, not restarting).
@@ -196,6 +245,7 @@ class ModelAvailability:
         self._sdxl_controlnet_present = sdxl_controlnet_present
         self._post_processing_present = post_processing_present
         self._controlnet_failed = controlnet_failed
+        self._note_download_progress(status)
 
     def is_present(self, model_name: str) -> bool:
         """Return whether ``model_name`` is present on disk.

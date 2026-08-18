@@ -86,6 +86,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ADHOC_PREFETCH_FEATURES,
+    FEATURE_SAFETY,
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
@@ -1857,6 +1858,7 @@ class HordeWorkerProcessManager:
             unbound_disaggregated_job_ids=self._disaggregation_orchestrator.unbound_job_ids,
             head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
             head_block_reason=self._head_block_reason,
+            provisioning_download_advancing=self._model_availability.download_advancing,
         )
 
         self._job_submitter = JobSubmitter(
@@ -7810,9 +7812,33 @@ class HordeWorkerProcessManager:
         return FeatureInfoRow(label="LoRA", status="enabled (fetched per job)", ok=True)
 
     def _safety_info_row(self) -> FeatureInfoRow:
-        """Read-only safety-model readiness: present (image jobs can run) or still being fetched."""
+        """Read-only safety-model readiness: present, downloading (with progress), or failed (with the reason).
+
+        No image job can be submitted without these models, so a row reading "unavailable (see logs)" sends
+        the operator to a subprocess log to learn something the parent already has. The download process
+        records both the live transfer and the reason an attempt failed against the ``safety models``
+        feature; both are read back here so the readiness table states what is happening.
+        """
         if self._model_availability.safety_present:
             return FeatureInfoRow(label="Safety models", status="present", ok=True)
+
+        status = self._model_availability.status
+        if status is not None:
+            in_flight = status.active or ([status.current] if status.current is not None else [])
+            for item in in_flight:
+                if item.feature != FEATURE_SAFETY:
+                    continue
+                percent = item.percent
+                progress = f"downloading ({percent:.0f}%)" if percent is not None else "downloading"
+                return FeatureInfoRow(label="Safety models", status=progress, ok=False)
+            for failure in status.failures:
+                if failure.feature == FEATURE_SAFETY:
+                    return FeatureInfoRow(
+                        label="Safety models",
+                        status=f"download failed: {failure.reason}",
+                        ok=False,
+                    )
+
         if self._model_availability.safety_attempted:
             return FeatureInfoRow(label="Safety models", status="unavailable (see logs)", ok=False)
         return FeatureInfoRow(label="Safety models", status="verifying / downloading", ok=False)

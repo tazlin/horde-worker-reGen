@@ -540,6 +540,30 @@ manager-side **actions**:
   other: an episode opens, the remedies run in order, and the give-up reaches the
   terminal rung if nothing restores work flow.
 
+### A first-run download is not a wedge
+
+  The one hold this backstop must not act on is a worker that has never served a
+  job because the models it needs are still arriving. Its remedy is a pool
+  teardown, and a teardown restarts the transfer the gate is waiting on, so on a
+  link slow enough that a large weight (the ~640 MB safety model is the usual one)
+  outlasts `POP_GATE_HELD_WEDGE_SECONDS`, the escalation becomes the reason the
+  worker never comes up: every window ends in a rebuild, and every rebuild starts
+  the download again from nothing.
+
+  So while `total_num_completed_jobs` is zero and the download process reports a
+  non-prefetch transfer that has gained bytes within
+  `DOWNLOAD_PROGRESS_STALL_SECONDS`, the held-gate check stands down and says so
+  once per hold. Both halves matter. Movement, not the mere existence of a
+  download, is what defers: a transfer that has stopped gaining bytes escalates
+  exactly as before, so a dead download cannot hold recovery off. And the deferral
+  ends with the first completed job: once the worker has served, a held gate is a
+  fault in a working pool, and a background download running beside it says nothing
+  about that.
+
+  Progress is reported per chunk, so a transfer at any usable rate refreshes the
+  window far inside it. That is what makes the bound independent of link speed
+  rather than a figure tuned to one machine.
+
   A pending post-processing drain can deliberately hold new inference sampling,
   so admission gets one bounded chance to reclaim ordinary idle memory and, only
   after a fresh non-fitting measurement, borrow one verified-idle VAE or component

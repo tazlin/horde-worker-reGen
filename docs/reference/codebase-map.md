@@ -35,6 +35,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Dashboard state channel                | `process_management/ipc/supervisor_channel.py`                     |
 | What runs inside a child process       | `process_management/workers/inference_process.py`, `safety_process.py`, `post_process_process.py`, `download_process.py` |
 | Model availability and downloads       | `process_management/models/` (`ModelDownloadCoordinator`), `process_management/workers/download_process.py` |
+| Required safety-model fetch            | `process_management/workers/safety_model_prefetch.py` (resumable, checksum-verified DeepDanbooru weight) |
 | VRAM/RAM budgeting and metrics         | `process_management/resources/`, especially `vram_arbiter.py` and `resource_budget.py` |
 | Host-resource governance               | `process_management/scheduling/governance/` (`ResourceGovernor`)   |
 | Multi-GPU routing                      | `process_management/gpu/`                                          |

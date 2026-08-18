@@ -202,6 +202,7 @@ class WorkerRecoveryCoordinator:
         unbound_disaggregated_job_ids: Callable[[], set[str]] = set,
         head_aux_prefetch_in_flight: Callable[[], bool] = lambda: False,
         head_block_reason: Callable[[], str | None] = lambda: None,
+        provisioning_download_advancing: Callable[[], bool] = lambda: False,
         recovery_supervisor: RecoverySupervisor | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -239,6 +240,12 @@ class WorkerRecoveryCoordinator:
                 queue, or None when it names none. The constructive remedy ladder judges its own relevance
                 against this: a rung that leaves the named constraint unchanged did not address it. An
                 unwired caller reports None, which leaves the ladder's budgets the only bound on it.
+            provisioning_download_advancing: Report whether a non-prefetch model download is in flight and
+                still gaining bytes. The pop-gate wedge defers to it while the worker has yet to complete a
+                job: a first run whose weights are still arriving is provisioning, and tearing the pool down
+                over it restarts the transfer rather than fixing anything. It is self-bounding, reporting
+                False once a download stops moving, so a dead transfer escalates as it always did. Defaults
+                to "never advancing" for an unwired caller.
             recovery_supervisor: Optional recovery policy object for tests.
             clock: Wall-clock provider for grace windows and rolling recovery counts.
         """
@@ -258,6 +265,7 @@ class WorkerRecoveryCoordinator:
         self._unbound_disaggregated_job_ids = unbound_disaggregated_job_ids
         self._head_aux_prefetch_in_flight = head_aux_prefetch_in_flight
         self._head_block_reason = head_block_reason
+        self._provisioning_download_advancing = provisioning_download_advancing
         self._clock = clock
 
         self.recovery_supervisor = recovery_supervisor or RecoverySupervisor()
@@ -322,6 +330,8 @@ class WorkerRecoveryCoordinator:
         self.pop_gate_hold_baseline: tuple[float, int] | None = None
         # Edge latch so one held-gate wedge is disclosed once per hold rather than on every assessment tick.
         self.pop_gate_wedge_disclosed_since: float | None = None
+        # The same latch for the provisioning stand-down, so a long first-run download says so once.
+        self.pop_gate_provisioning_disclosed_since: float | None = None
 
     @property
     def bridge_data(self) -> reGenBridgeData:
@@ -722,11 +732,18 @@ class WorkerRecoveryCoordinator:
         completed since the hold was first observed. The last two are what keep ordinary backpressure out: a
         worker whose queue is full holds a gate continuously and attempts no pops while doing so, and its
         completions are the proof that the hold is capacity management rather than a wedge.
+
+        A worker that has never served a job and is still receiving the weights it needs is the one hold this
+        cannot act on. Its remedy is a pool teardown, and every teardown restarts the transfer the hold is
+        waiting for, so on a link slow enough that a large weight outlasts the wedge window the escalation
+        becomes the reason the worker never comes up. That defers only while bytes keep arriving; a transfer
+        that has stopped moving is a wedge like any other and escalates unchanged.
         """
         gate = self._state.last_pop_gate
         if gate is None:
             self.pop_gate_hold_baseline = None
             self.pop_gate_wedge_disclosed_since = None
+            self.pop_gate_provisioning_disclosed_since = None
             return False
 
         held_since = self._state.last_pop_gate_since
@@ -739,6 +756,15 @@ class WorkerRecoveryCoordinator:
         if self._job_tracker.total_num_completed_jobs > self.pop_gate_hold_baseline[1]:
             return False
         if (now - self._state.last_pop_attempt_completed_at) < self.POP_GATE_HELD_WEDGE_SECONDS:
+            return False
+        if self._job_tracker.total_num_completed_jobs == 0 and self._provisioning_download_advancing():
+            if self.pop_gate_provisioning_disclosed_since != held_since:
+                self.pop_gate_provisioning_disclosed_since = held_since
+                logger.warning(
+                    f"Job pops have been held at gate '{gate}' for {now - held_since:.0f}s, but this worker "
+                    "has yet to serve a job and its model downloads are still arriving. Recovery is standing "
+                    "down until they finish or stop advancing; the downloads view shows what is left.",
+                )
             return False
 
         if self.pop_gate_wedge_disclosed_since != held_since:

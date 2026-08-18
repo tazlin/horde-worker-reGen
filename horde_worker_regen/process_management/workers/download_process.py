@@ -73,6 +73,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     FEATURE_LORA_ADHOC,
+    FEATURE_SAFETY,
     FEATURE_TI_ADHOC,
     CurrentDownloadStatus,
     DownloadFailure,
@@ -126,7 +127,6 @@ FEATURE_LORA = "LoRa (default set)"
 FEATURE_CONTROLNET = "ControlNet"
 FEATURE_CONTROLNET_ANNOTATORS = "ControlNet annotators"
 FEATURE_MISCELLANEOUS = "miscellaneous (SDXL)"
-FEATURE_SAFETY = "safety models"
 
 
 def _aux_sub_manager(manager: ModelManager, manager_key: str) -> BaseModelManager | None:
@@ -1166,17 +1166,30 @@ class HordeDownloadProcess(HordeProcess):
             self._scheduler.enqueue_many(tasks)
 
     def _enqueue_safety_task(self) -> None:
-        """Enqueue the one-shot required-safety-models task (its source host is opaque, so 'unknown')."""
+        """Enqueue the one-shot required-safety-models task, tagged with where it lands and what serves it."""
         if self._safety_present:
             with self._lock:
                 self._safety_ensured = True
             return
+        host = UNKNOWN_DOWNLOAD_HOST
+        target_dir = ""
+        try:
+            from horde_worker_regen.process_management.workers.safety_model_prefetch import (
+                deep_danbooru_model_path,
+                deep_danbooru_source_url,
+            )
+
+            host = download_host_for_url(deep_danbooru_source_url())
+            target_dir = str(deep_danbooru_model_path().parent)
+        except Exception as e:  # noqa: BLE001 - labelling is cosmetic; the task must be enqueued regardless
+            logger.debug(f"Download process: could not label the safety task's source: {type(e).__name__} {e}")
         self._scheduler.enqueue(
             DownloadTask(
                 kind=DownloadKind.SAFETY,
                 model_name="safety models",
-                host=UNKNOWN_DOWNLOAD_HOST,
+                host=host,
                 feature=FEATURE_SAFETY,
+                target_dir=target_dir,
             ),
         )
 
@@ -1616,7 +1629,7 @@ class HordeDownloadProcess(HordeProcess):
                     connections=self._connections_per_file,
                 )
         if task.kind is DownloadKind.SAFETY:
-            return self._ensure_safety_models()
+            return self._ensure_safety_models(callback)
         if task.kind is DownloadKind.DEFAULT_LORAS:
             self._download_default_loras(manager)
             return True
@@ -1773,51 +1786,65 @@ class HordeDownloadProcess(HordeProcess):
     # region per-kind download helpers
 
     def _safety_models_present_on_disk(self) -> bool:
-        """Existence-only probe for the required safety models, mirroring ``model_download_plan``'s style.
+        """Probe whether the required safety models are on disk and usable.
 
-        DeepDanbooru exposes a clean default path; CLIP is fetched by ``open_clip`` into
-        ``CACHE_FOLDER_PATH`` (as an ``open_clip_*`` weights file) with no presence API, so it is probed by
-        existence. A false negative only costs an idempotent re-ensure (no re-download when the file is
-        already there); integrity remains the safety process's responsibility when it loads them.
+        DeepDanbooru is judged by its verified marker rather than by existence: an interrupted transfer
+        leaves a truncated file at the real filename, and calling that present starts a safety process that
+        can only fail deserializing it. CLIP is fetched by ``open_clip`` into ``CACHE_FOLDER_PATH`` (as an
+        ``open_clip_*`` weights file) with no presence API, so it is probed by existence; a false negative
+        there costs only an idempotent re-ensure.
         """
         try:
             from pathlib import Path
 
             from horde_safety import CACHE_FOLDER_PATH
-            from horde_safety.deep_danbooru_model import default_deep_danbooru_model_path
 
-            deep_danbooru_present = Path(default_deep_danbooru_model_path).exists()
+            from horde_worker_regen.process_management.workers.safety_model_prefetch import (
+                deep_danbooru_verified_on_disk,
+            )
+
             clip_present = any(Path(CACHE_FOLDER_PATH).rglob("open_clip*"))
-            return deep_danbooru_present and clip_present
+            return deep_danbooru_verified_on_disk() and clip_present
         except Exception as e:  # noqa: BLE001 - a probe failure must never crash the download process
             logger.warning(f"Download process: could not probe safety-model presence: {type(e).__name__} {e}")
             return False
 
-    def _ensure_safety_models(self) -> bool:
+    def _ensure_safety_models(self, callback: Callable[[int, int], None]) -> bool:
         """Ensure the required safety models (DeepDanbooru + CLIP) are on disk; return whether they are.
 
         Routing this through the download process (instead of letting the safety process fetch them in its
         constructor) means the TUI/console shows a labelled ``safety models`` download with a phase instead
-        of a frozen, hung-looking startup. Set ``_safety_ensured`` even on failure so the attempt is
-        one-shot; the parent's grace fallback then starts the safety process, which surfaces the real error.
+        of a frozen, hung-looking startup.
+
+        DeepDanbooru is fetched through this process's own resumable, checksum-verified transfer so it
+        reports live bytes through *callback* and picks up where an interrupted attempt stopped; a link too
+        slow to finish ~640 MB inside one worker session would otherwise restart from zero forever. CLIP
+        keeps horde_safety's own fetch, which resumes through the huggingface cache and reports only coarse
+        progress.
+
+        A failure leaves ``_safety_ensured`` set so the attempt is one-shot per pass, and records the reason
+        against the ``safety models`` feature so the downloads view names what went wrong.
         """
         if self._safety_present:
             with self._lock:
                 self._safety_ensured = True
             return True
         try:
-            from horde_safety.deep_danbooru_model import download_deep_danbooru_model
             from horde_safety.interrogate import get_interrogator_no_blip
 
-            download_deep_danbooru_model()
+            from horde_worker_regen.process_management.workers.safety_model_prefetch import (
+                ensure_deep_danbooru_present,
+            )
+
+            ensure_deep_danbooru_present(callback=callback)
             # No download-only API for CLIP: this downloads it (when absent) and loads it transiently into
             # this process's RAM; the local interrogator is dropped on return, so the RAM is reclaimed.
-            # These helpers use their own progress bars (not our chunk callback), so the task runs to
-            # completion rather than being interruptible mid-file.
             get_interrogator_no_blip()
             self._safety_present = True
             logger.success("Download process: required safety models are present")
             return True
+        except DownloadAborted:
+            raise
         except Exception as e:  # noqa: BLE001 - record and let the safety process surface the real failure
             self._record_failure("safety models", FEATURE_SAFETY, f"{type(e).__name__}: {e}")
             logger.error(f"Download process: failed to ensure safety models: {type(e).__name__} {e}")

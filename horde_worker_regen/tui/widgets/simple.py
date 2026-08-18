@@ -32,6 +32,7 @@ from textual.widgets import Button, Collapsible, Static
 from horde_worker_regen.app_state import OverviewTrendWindow
 from horde_worker_regen.process_management.ipc.supervisor_channel import RECENT_JOBS_IN_SNAPSHOT, DownloadPhase
 from horde_worker_regen.tui.formatters import (
+    human_bytes,
     human_duration,
     is_low_fidelity,
     mini_bar,
@@ -43,6 +44,7 @@ from horde_worker_regen.tui.trends import fixed_counter_deltas, fixed_ratio_delt
 
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.supervisor_channel import (
+        CurrentDownloadStatus,
         ProcessSnapshot,
         WorkerConfigSummary,
         WorkerStateSnapshot,
@@ -131,6 +133,35 @@ def titled(title: str, body: RenderableType) -> Table:
     wrapper.add_row(Text(title, "bold"))
     wrapper.add_row(body)
     return wrapper
+
+
+def _transfer_detail(item: CurrentDownloadStatus) -> str:
+    """Render one transfer's bytes, rate, and remaining time as a single plain-language line.
+
+    These figures are what separate a slow download from a stopped one, which a bar alone cannot say, and
+    they are the only reading at all for a source that never declared the file's size.
+    """
+    if item.total_bytes > 0:
+        size = f"{human_bytes(item.downloaded_bytes)} of {human_bytes(item.total_bytes)}"
+    else:
+        size = f"{human_bytes(item.downloaded_bytes)} so far"
+    rate = f"{human_bytes(item.speed_bps)}/s" if item.speed_bps else "measuring speed"
+    if item.eta_seconds is None:
+        return f"{size} - {rate}"
+    return f"{size} - {rate} - about {human_duration(item.eta_seconds)} left"
+
+
+def _download_impact(snapshot: WorkerStateSnapshot) -> str:
+    """State whether the worker can serve requests while these downloads run.
+
+    Telling a contributor the worker keeps contributing is only true once a model is loaded. Said during a
+    first run, when nothing can be served until the downloads land, it turns a long wait into an apparent
+    fault, so the claim is made only when a loaded model backs it.
+    """
+    serving = any(process.loaded_horde_model_name for process in snapshot.processes)
+    if serving:
+        return "Models download in the background; the worker keeps contributing meanwhile."
+    return "The worker starts contributing once the first of these finishes. Leaving it running is enough."
 
 
 def job_progress_fraction(process: ProcessSnapshot) -> float | None:
@@ -954,7 +985,12 @@ class SimpleModelStatusView(VerticalScroll):
         """Posted when the contributor asks to change which models are configured."""
 
     def compose(self) -> ComposeResult:
-        """Lay out the readiness summary, download progress, and the link to configuration."""
+        """Lay out any problem banner, the readiness summary, download progress, and the config link."""
+        # Bordered and padded, so it must start hidden or an empty card sits above the page whenever
+        # nothing is wrong (which is nearly always).
+        problem = Static(id="simple-models-problem", classes="horde-card horde-problem")
+        problem.display = False
+        yield problem
         yield Static("Models and downloads", classes="horde-hero horde-card-title")
         yield Static(id="simple-models-state", classes="horde-card")
         yield Static(id="simple-models-downloads", classes="horde-card")
@@ -962,15 +998,58 @@ class SimpleModelStatusView(VerticalScroll):
             yield Button("Change which models to run", id="simple-models-manage", variant="primary")
 
     def update_view(self, snapshot: WorkerStateSnapshot | None) -> None:
-        """Refresh readiness and download progress."""
+        """Refresh the problem banner, readiness, and download progress."""
+        problem = self.query_one("#simple-models-problem", Static)
         state = self.query_one("#simple-models-state", Static)
         downloads = self.query_one("#simple-models-downloads", Static)
         if snapshot is None:
+            problem.update(Text(""))
+            problem.display = False
             state.update(Text("Model status appears once the worker starts.", "grey70"))
             downloads.update(Text(""))
             return
+        banner = self._render_problem(snapshot)
+        problem.display = banner is not None
+        problem.update(banner if banner is not None else Text(""))
         state.update(titled("Model status", self._render_state(snapshot)))
         downloads.update(titled("Downloads", self._render_downloads(snapshot)))
+
+    @staticmethod
+    def _render_problem(snapshot: WorkerStateSnapshot) -> RenderableType | None:
+        """Render the banner for a download that has gone wrong, or None when nothing has.
+
+        A first-time contributor reads this page to answer one question: is this working or is it stuck?
+        Failures buried as a count in the readiness grid answer neither, so anything that stops a model
+        arriving is lifted to the top of the page with its reason and what it costs.
+        """
+        activity = snapshot.downloads
+        if activity is None:
+            return None
+        lines: list[Text] = []
+        if activity.phase is DownloadPhase.ERROR:
+            detail = activity.error_message or "The download service stopped and cannot fetch models."
+            lines.append(Text(detail, "red"))
+        for failure in activity.failures:
+            line = Text()
+            line.append(f"{failure.model_name} ", "bold red")
+            line.append(f"({failure.feature}) could not be downloaded: ", "red")
+            line.append(failure.reason, "grey70")
+            lines.append(line)
+        if not lines:
+            return None
+
+        body = Table.grid()
+        body.add_column()
+        for line in lines:
+            body.add_row(line)
+        body.add_row(
+            Text(
+                "\nThe worker keeps retrying. If this does not clear, check that this computer can reach "
+                "the internet and has free disk space, then restart the worker.",
+                "grey70",
+            ),
+        )
+        return titled("Something needs attention", body)
 
     @staticmethod
     def _render_state(snapshot: WorkerStateSnapshot) -> RenderableType:
@@ -1012,34 +1091,49 @@ class SimpleModelStatusView(VerticalScroll):
             names = Text()
             names.append("\nFailed: ", "bold red")
             names.append(", ".join(failed), "grey70")
+            names.append("  (the reason is at the top of this page)", "grey62")
             body.add_row(names)
         return body
 
     @staticmethod
     def _render_downloads(snapshot: WorkerStateSnapshot) -> RenderableType:
-        """Render live download progress, or say plainly that nothing is downloading."""
+        """Render live download progress, or say plainly what the download service is doing instead.
+
+        Every in-flight transfer gets a bar, the bytes behind it, its rate and its estimate. Those figures
+        are what separate "slow" from "stuck": a bar alone cannot, and a model whose size the source never
+        declared has no bar at all, which is precisely when the byte counter has to carry the answer.
+        """
         activity = snapshot.downloads
-        if activity is None or activity.phase is DownloadPhase.IDLE or not activity.active:
-            return Text("Nothing is downloading right now.", "grey70")
-        table = Table.grid(padding=(0, 1))
+        if activity is None:
+            return Text("This worker does not manage model downloads.", "grey70")
+
+        wrapper = Table.grid()
+        wrapper.add_column()
+
+        if not activity.active:
+            detail = _DOWNLOAD_PHASE_DETAIL.get(activity.phase)
+            wrapper.add_row(Text(detail or "Nothing is downloading right now.", "grey70"))
+            if activity.pending:
+                wrapper.add_row(Text(f"\n{len(activity.pending)} more queued to download.", "grey62"))
+            return wrapper
+
+        table = Table.grid(padding=(0, 2))
         table.add_column(no_wrap=True)
-        table.add_column(no_wrap=True)
+        table.add_column()
         table.add_column(justify="right", no_wrap=True)
         for item in activity.active:
             percent = item.percent
-            if percent is None:
-                table.add_row(Text("fetching", "yellow"), Text(item.model_name, "grey70"), Text(""))
-                continue
-            table.add_row(
-                Text(mini_bar(percent / 100.0, 16), "yellow"),
-                Text(item.model_name, "grey70"),
-                Text(f"{percent:.0f}%", "bold"),
-            )
-        note = Text("\nModels download in the background; the worker keeps contributing meanwhile.", "grey70")
-        wrapper = Table.grid()
-        wrapper.add_column()
+            bar = Text(mini_bar(percent / 100.0, 16), "yellow") if percent is not None else Text("fetching", "yellow")
+            share = f"{percent:.0f}%" if percent is not None else "size unknown"
+            table.add_row(bar, Text(item.model_name, "grey70"), Text(share, "bold"))
+            table.add_row(Text(""), Text(_transfer_detail(item), "grey62"), Text(""))
+
         wrapper.add_row(table)
-        wrapper.add_row(note)
+        if activity.paused:
+            wrapper.add_row(Text("\nDownloads are paused.", "yellow"))
+        if activity.pending:
+            wrapper.add_row(Text(f"\n{len(activity.pending)} more queued after these.", "grey62"))
+        wrapper.add_row(Text("\n" + _download_impact(snapshot), "grey70"))
         return wrapper
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

@@ -307,6 +307,45 @@ inversion prefetch (fetched per job by the download process, see
 [pop-time auxiliary prefetch](#pop-time-auxiliary-prefetch)) and the safety models
 keep their own gating and appear as read-only rows.
 
+## The required safety models
+
+Every image job is screened before it is submitted, so a worker cannot serve
+anything until the two safety models are on disk: the DeepDanbooru weight
+(roughly 640 MB) and the CLIP interrogator. Until they are, job pops are held at
+the `no_safety_process` gate.
+
+The download process fetches them as a labelled `safety models` task rather than
+letting the safety process fetch them from its constructor, so the wait is a
+visible download with a phase instead of a startup that appears frozen. The
+DeepDanbooru half goes through
+[`safety_model_prefetch.py`][horde_worker_regen.process_management.workers.safety_model_prefetch],
+which owns the transport that `horde_safety`'s own helper does not provide:
+
+- **A range resume.** The upstream helper writes straight to the final `.pt` path
+  and restarts from zero on the next attempt, so a link too slow to move 640 MB
+  inside one worker session can never finish the file however many times it
+  retries. The prefetch resumes from whatever bytes are already there.
+- **A progress callback.** The bytes flow into the task's normal chunk callback,
+  so the transfer reports size, rate and estimate like any other download. That
+  is also what the recovery backstop reads to tell a slow first run from a wedged
+  one (see
+  [Resilience and recovery](resilience_and_recovery.md#a-first-run-download-is-not-a-wedge)).
+- **A verified-presence verdict.** An interrupted transfer leaves a truncated file
+  at the real filename, which an existence probe cannot tell from a complete one;
+  starting the safety process on it produces a deserialization failure that
+  repeats on every respawn. A completed download is hash-checked against the
+  digest `horde_safety` publishes, and its byte size recorded in a
+  `.verified` sidecar. Presence is judged from that sidecar, so a partial file
+  reads as absent and is resumed rather than trusted. A complete file predating
+  the sidecar is hash-checked once and recorded, never re-fetched.
+
+The safety process keeps the last word on integrity. If it still cannot read the
+weight, it deletes the file and its sidecar and says so plainly, so the next start
+downloads it again instead of crash-looping on a file that will never load.
+
+The CLIP half stays with `horde_safety`'s own fetch, which resumes through the
+HuggingFace cache and reports only coarse progress.
+
 ## Planning: what a config implies for disk
 
 [`model_download_plan.py`][horde_worker_regen.model_download_plan] answers, without

@@ -1564,3 +1564,99 @@ class TestDownloadMessageRoundTrips:
         restored = SupervisorControlMessage.model_validate(message.model_dump())
         assert restored.command is SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT
         assert restored.download_rate_limit_kbps == 3000
+
+
+class TestSafetyModelDownloadReporting:
+    """The required-safety-model fetch is a reported download, not an opaque block of dead time.
+
+    It was routed through a helper that took no progress callback, so the download view named a transfer
+    with no bytes, no rate and no estimate for as long as it ran, while job pops stayed gated on it. Whether
+    the bytes reach the status is what separates "this is slow" from "this is stuck" for the operator, and
+    it is also what a recovery backstop reads to tell a live first run from a wedged one.
+    """
+
+    def _make_process(self) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+        )
+
+    @staticmethod
+    def _stub_clip(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stand in for the CLIP fetch, whose real import pulls torch into the test process."""
+        horde_safety = types.ModuleType("horde_safety")
+        interrogate = types.ModuleType("horde_safety.interrogate")
+        interrogate.get_interrogator_no_blip = lambda *_args, **_kwargs: object()  # type: ignore[attr-defined]
+        horde_safety.interrogate = interrogate  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "horde_safety", horde_safety)
+        monkeypatch.setitem(sys.modules, "horde_safety.interrogate", interrogate)
+
+    def test_the_transfer_reports_its_bytes_through_the_task_callback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bytes reported by the fetch land on the task's status, so the download view can render them."""
+        process = self._make_process()
+        self._stub_clip(monkeypatch)
+        task = DownloadTask(
+            kind=DownloadKind.SAFETY,
+            model_name="safety models",
+            host="h",
+            feature=FEATURE_SAFETY,
+        )
+        runtime = _TaskRuntime(
+            status=CurrentDownloadStatus(model_name=task.model_name, feature=task.feature, target_dir=""),
+            pacer=ChunkPacer(),
+        )
+        process._active[task.dedup_key] = runtime
+
+        def fake_fetch(*, callback: object) -> None:
+            assert callable(callback)
+            callback(0, 1_000)
+            callback(400, 1_000)
+
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.safety_model_prefetch.ensure_deep_danbooru_present",
+            fake_fetch,
+        )
+
+        assert process._ensure_safety_models(process._make_callback(task, runtime)) is True
+        assert runtime.status.downloaded_bytes == 400
+        assert runtime.status.total_bytes == 1_000
+        assert process._safety_present is True
+
+    def test_a_failed_fetch_records_the_reason_against_the_safety_feature(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reason the models did not arrive is reported, not left in a subprocess log."""
+        process = self._make_process()
+        self._stub_clip(monkeypatch)
+
+        def fake_fetch(*, callback: object) -> None:
+            raise RuntimeError("checksum mismatch")
+
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.safety_model_prefetch.ensure_deep_danbooru_present",
+            fake_fetch,
+        )
+
+        assert process._ensure_safety_models(lambda _done, _total: None) is False
+        assert process._safety_present is False
+        assert process._safety_ensured is True
+        reasons = [f.reason for f in process._failures if f.feature == FEATURE_SAFETY]
+        assert reasons == ["RuntimeError: checksum mismatch"]
+
+    def test_an_unverified_weight_is_not_reported_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A truncated weight must not read as present, or the safety process is started on a corrupt file."""
+        process = self._make_process()
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.safety_model_prefetch.deep_danbooru_verified_on_disk",
+            lambda: False,
+        )
+
+        assert process._safety_models_present_on_disk() is False

@@ -54,6 +54,11 @@ Footer {
     background: $surface;
 }
 
+/* A card carrying something the contributor has to act on, so it reads apart from the neutral cards. */
+.horde-problem {
+    border: round $error;
+}
+
 .horde-card-title {
     text-style: bold;
     color: $foreground;

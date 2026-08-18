@@ -84,6 +84,44 @@ def resolve_safety_device(*, cpu_only: bool, cuda_available: bool) -> str:
     return "cuda"
 
 
+_UNREADABLE_CHECKPOINT_MARKERS = (
+    "PytorchStreamReader",
+    "central directory",
+    "invalid load key",
+)
+"""Fragments torch raises when a checkpoint file is not a readable archive (truncated or corrupt)."""
+
+
+def _discard_unreadable_deep_danbooru_weight(error: BaseException) -> None:
+    """Delete a DeepDanbooru weight torch could not open, so the next start re-fetches it.
+
+    A weight left half-written by an interrupted transfer fails deserialization identically on every
+    restart, and the parent can only see a child that exits nonzero: the pool is respawned until it is
+    declared unrecoverable, with the unreadable file still on disk to fail the same way afterwards.
+    Removing it (and the download process's verified marker) converts a permanent crash loop into a
+    re-download. Nothing here may raise: this runs while another exception is propagating.
+    """
+    if not any(marker in str(error) for marker in _UNREADABLE_CHECKPOINT_MARKERS):
+        return
+    try:
+        from horde_worker_regen.process_management.workers.safety_model_prefetch import (
+            DEEP_DANBOORU_MARKER_SUFFIX,
+            deep_danbooru_model_path,
+        )
+
+        weight_path = deep_danbooru_model_path()
+        marker_path = weight_path.with_name(weight_path.name + DEEP_DANBOORU_MARKER_SUFFIX)
+        marker_path.unlink(missing_ok=True)
+        weight_path.unlink(missing_ok=True)
+        logger.error(
+            f"The DeepDanbooru safety weight at {weight_path} is not a readable checkpoint (an interrupted "
+            "or corrupt download). It has been deleted so the worker downloads it again on the next start; "
+            "the safety check cannot run until it is present.",
+        )
+    except Exception as cleanup_error:  # noqa: BLE001 - cleanup must never mask the original failure
+        logger.warning(f"Could not discard the unreadable DeepDanbooru weight: {type(cleanup_error).__name__}")
+
+
 def _clear_safety_accelerator_cache() -> None:
     """Return cached safety allocations to the device without importing torch in the parent."""
     from hordelib.api import clear_accelerator_cache
@@ -230,6 +268,7 @@ class HordeSafetyProcess(HordeProcess):
                 self._interrogator = get_interrogator_no_blip(device=device)
             except Exception as e:
                 logger.error(f"Failed to initialise horde_safety: {type(e).__name__} {e}")
+                _discard_unreadable_deep_danbooru_weight(e)
                 raise
 
             try:

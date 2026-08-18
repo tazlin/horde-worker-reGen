@@ -578,6 +578,12 @@ class DownloadItem(BaseModel):
     size_bytes: int | None = None
 
 
+FEATURE_SAFETY = "safety models"
+"""The ``feature`` label (and synthetic model name) of the required-safety-model download.
+
+Declared with the IPC types rather than in the download process because the parent matches on it to read
+that download's progress and failure reason back out of a reported status."""
+
 FEATURE_LORA_ADHOC = "LoRa (job)"
 """The ``feature`` label a job-driven ad-hoc LoRA prefetch download carries."""
 FEATURE_TI_ADHOC = "textual inversion (job)"
@@ -923,6 +929,11 @@ class CardSnapshot(BaseModel):
     """Models currently treated as locally unservable on this card (its over-budget circuit-breaker tripped)."""
     worst_fault_streak: int = 0
     """The worst per-model consecutive over-budget fault streak on this card (0 when none)."""
+    unserviceable_models: list[str] = Field(default_factory=list)
+    """Configured models whose smallest legal job cannot fit this card; they are never offered."""
+    constrained_models: dict[str, int] = Field(default_factory=dict)
+    """Configured models this card can only run below the configured ``max_power``, mapped to the largest
+    ``max_power`` that fits. Pops that include one of them ask for jobs no larger than that."""
 
     @property
     def vram_headroom_fraction(self) -> float | None:

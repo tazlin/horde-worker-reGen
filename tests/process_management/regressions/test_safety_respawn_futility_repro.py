@@ -25,9 +25,17 @@ child that dies on every start, indefinitely, while every signal that would esca
    assessment keys on a held gate. Contract: a pop gate held past a threshold with zero job flow is a wedge
    regardless of which gate it is, since the gate's own cause cannot satisfy a completed-work signal.
 
+4. A backstop that recreates its own trigger. The remedy for a held gate is a pool teardown, and a worker on
+   its first run is held at ``no_safety_process`` precisely because its safety models are still downloading.
+   Tearing the pool down restarts that transfer, so on a link slow enough that the download outlasts the
+   wedge window the escalation is the reason the worker never comes up. Contract: while the worker has never
+   served a job and its downloads are still gaining bytes, the held-gate escalation stands down; a transfer
+   that has stopped moving escalates unchanged.
+
 The controls pin the behavior the fixes must not break: an intentional cycle that does reach readiness stays
 uncounted, one crash on a healthy pool is not a loop, the sliding-window threshold still trips without an
-intentional window, and a rebuild streak broken by a successful load is not structural.
+intentional window, a rebuild streak broken by a successful load is not structural, and a worker that has
+served before is not excused by a download running beside it.
 """
 
 from __future__ import annotations
@@ -38,6 +46,12 @@ from typing import Any
 import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    FEATURE_SAFETY,
+    CurrentDownloadStatus,
+    DownloadPhase,
+    DownloadStatusSnapshot,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
@@ -47,6 +61,10 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SAFETY_RESPAWN_BACKOFF_MAX_SECONDS,
     PauseOwner,
     ProcessLifecycleManager,
+)
+from horde_worker_regen.process_management.models.model_availability import (
+    DOWNLOAD_PROGRESS_STALL_SECONDS,
+    ModelAvailability,
 )
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
@@ -79,6 +97,9 @@ _STARTUP_HANG_TIMEOUT_SECONDS = 60.0
 
 _STARTUP_HANG_SECONDS = _STARTUP_HANG_TIMEOUT_SECONDS * 10
 """How long a wedged safety child has sat in its startup state: far past any plausible timeout."""
+
+_SAFETY_MODEL_BYTES = 675_000_000
+"""A stand-in size for the safety weight, only large enough that a quarter of it is plainly a partial file."""
 
 
 class _AdvanceableTime:
@@ -542,3 +563,141 @@ class TestHeldPopGateBackstop:
         pm._state.last_pop_attempt_completed_at = clock.now
 
         assert pm._recovery_coordinator.assess_wedge() is False
+
+
+def _safety_download_status(downloaded_bytes: int) -> DownloadStatusSnapshot:
+    """A download-process report with the safety-model transfer in flight at ``downloaded_bytes``."""
+    return DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        active=[
+            CurrentDownloadStatus(
+                model_name="safety models",
+                feature=FEATURE_SAFETY,
+                target_dir="/models/clip_blip",
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=_SAFETY_MODEL_BYTES,
+            ),
+        ],
+    )
+
+
+def _report_download(availability: ModelAvailability, downloaded_bytes: int) -> None:
+    """Push one download-process report through the availability holder's single writer."""
+    availability.update(
+        present=set(),
+        currently_downloading="safety models",
+        pending=(),
+        failed=(),
+        status=_safety_download_status(downloaded_bytes),
+        scan_complete=True,
+    )
+
+
+class TestProvisioningDownloadDefersTheHeldGateBackstop:
+    """A first run whose weights are still arriving is provisioning, and its remedy would restart them."""
+
+    def test_advancing_first_run_download_is_not_a_wedge(self) -> None:
+        """A worker that has never served, held at the safety gate with bytes still arriving, is not wedged.
+
+        The escalation's remedy is a pool teardown, which restarts the transfer the gate is waiting on. On a
+        link slow enough that the download outlasts the wedge window, escalating is what stops the worker
+        ever coming up.
+        """
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        pm._recovery_coordinator._clock = clock
+        pm._model_availability._clock = clock
+        _report_download(pm._model_availability, _SAFETY_MODEL_BYTES // 4)
+        _hold_pop_gate(pm, clock, "no_safety_process", _GATE_HELD_SECONDS)
+
+        assert pm._model_availability.download_advancing() is True
+        assert pm._recovery_coordinator.assess_wedge() is False, (
+            "a first-run worker was called wedged while its safety models were still downloading; the "
+            "teardown that follows restarts the transfer, so the escalation is what prevents the worker "
+            "from ever finishing its first download"
+        )
+
+    def test_stalled_download_still_escalates(self) -> None:
+        """A transfer that has stopped gaining bytes is a wedge like any other hold.
+
+        The deferral is keyed on movement, not on a download merely being registered, so a dead transfer
+        cannot hold recovery off indefinitely.
+        """
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        pm._recovery_coordinator._clock = clock
+        pm._model_availability._clock = clock
+        _report_download(pm._model_availability, _SAFETY_MODEL_BYTES // 4)
+
+        clock.advance(DOWNLOAD_PROGRESS_STALL_SECONDS * 2)
+        _report_download(pm._model_availability, _SAFETY_MODEL_BYTES // 4)
+        _hold_pop_gate(pm, clock, "no_safety_process", _GATE_HELD_SECONDS)
+
+        assert pm._model_availability.download_advancing() is False
+        assert pm._recovery_coordinator.assess_wedge() is True
+
+    def test_a_worker_that_has_served_is_not_excused_by_a_download(self) -> None:
+        """A download running beside a wedged, previously-serving worker is not provisioning.
+
+        The deferral covers the first run only: once the worker has served, a held gate is a fault in a
+        working pool and a background download says nothing about it.
+        """
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        pm._recovery_coordinator._clock = clock
+        pm._model_availability._clock = clock
+        _report_download(pm._model_availability, _SAFETY_MODEL_BYTES // 4)
+        pm._job_tracker._total_num_completed_jobs += 5
+        _hold_pop_gate(pm, clock, "no_safety_process", _GATE_HELD_SECONDS)
+
+        assert pm._model_availability.download_advancing() is True
+        assert pm._recovery_coordinator.assess_wedge() is True
+
+
+class TestDownloadProgressLiveness:
+    """``download_advancing`` separates a slow transfer from a stopped one, at any link speed."""
+
+    def test_a_download_that_gains_bytes_keeps_advancing(self) -> None:
+        """Reports that each carry more bytes keep the transfer live however far apart they are."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_download(availability, 1)
+        for step in range(2, 6):
+            clock.advance(DOWNLOAD_PROGRESS_STALL_SECONDS * 0.9)
+            _report_download(availability, step)
+            assert availability.download_advancing() is True
+
+    def test_an_empty_report_ends_the_window(self) -> None:
+        """With nothing in flight there is no transfer to call advancing."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_download(availability, 1)
+        availability.update(
+            present={"a"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(phase=DownloadPhase.IDLE),
+            scan_complete=True,
+        )
+
+        assert availability.download_advancing() is False
+
+    def test_a_later_download_starts_its_own_window(self) -> None:
+        """A fresh transfer is judged on its own bytes, not against a predecessor's larger total."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_download(availability, _SAFETY_MODEL_BYTES // 2)
+        availability.update(
+            present={"a"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(phase=DownloadPhase.IDLE),
+            scan_complete=True,
+        )
+
+        clock.advance(DOWNLOAD_PROGRESS_STALL_SECONDS * 10)
+        _report_download(availability, 1)
+
+        assert availability.download_advancing() is True

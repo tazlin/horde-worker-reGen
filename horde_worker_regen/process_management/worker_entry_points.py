@@ -583,15 +583,29 @@ def start_safety_process(
             f"process_launch_identifier={process_launch_identifier}, "
             f"cpu_only={cpu_only} and amd_gpu={amd_gpu}",
         )
-        worker_process = HordeSafetyProcess(
-            process_id=process_id,
-            process_message_queue=process_message_queue,
-            pipe_connection=pipe_connection,
-            disk_lock=disk_lock,
-            process_launch_identifier=process_launch_identifier,
-            cpu_only=cpu_only,
-            dry_run_skip_safety=dry_run_skip_safety,
-        )
+        try:
+            # The safety models are deserialized in the constructor, so this is where a truncated or
+            # corrupt weight fails. Without the startup-crash backstop that traceback reaches only the
+            # inherited stderr, and the parent (which sees a bare nonzero exit) respawns the slot until the
+            # pool is declared unrecoverable, never disclosing the file that cannot be read.
+            worker_process = HordeSafetyProcess(
+                process_id=process_id,
+                process_message_queue=process_message_queue,
+                pipe_connection=pipe_connection,
+                disk_lock=disk_lock,
+                process_launch_identifier=process_launch_identifier,
+                cpu_only=cpu_only,
+                dry_run_skip_safety=dry_run_skip_safety,
+            )
+        except Exception as e:
+            logger.critical(f"Failed to start the safety process: {type(e).__name__} {e}")
+            write_startup_crash(
+                f"safety_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
+            sys.exit(1)
 
         worker_process.main_loop()
 
