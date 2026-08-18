@@ -50,6 +50,8 @@ jobs:
         # The file list is the single source of truth in packaging/bundle-include.txt (kept honest by
         # tests/test_bundle_manifest.py), so adding/removing a launcher does not silently drift from what
         # ships. The horde_worker_regen/ package is copied separately.
+        env:
+          RELEASE_ORIGIN: ${{ vars.HORDE_WORKER_RELEASE_ORIGIN }}
         run: |
           set -eu
           stage="stage"
@@ -66,6 +68,11 @@ jobs:
           cp -r horde_worker_regen "$stage/"
           # The stdlib-only bootstrap brain bootstrap.py imports (copied as a package, like the worker).
           cp -r worker_bootstrap "$stage/"
+          # Bake the release origin the self-updater follows (env > this file > bin/install-info > default).
+          # It rides inside worker_bootstrap/ so each update refreshes it. Defaults to the repo cutting the
+          # release; the HORDE_WORKER_RELEASE_ORIGIN repository variable overrides it so a fork's final
+          # release can point every install back at production.
+          echo "${RELEASE_ORIGIN:-$GITHUB_REPOSITORY}" > "$stage/worker_bootstrap/release-origin"
           # The image-utilities capability venv is provisioned with `uv sync --locked` against the
           # self-contained uv project at requirements/utilities/ (pyproject.toml + uv.lock). Copied as a
           # directory (not via the manifest, which flattens entries to the bundle root) so the project layout

@@ -14,20 +14,26 @@ to students, artists, researchers, and anyone who cannot or prefers not to pay c
 
 ## Get started
 
+> **Beta channel.** This is the `tazlin/horde-worker-reGen` beta of the worker. The links and one-liners
+> below install from this repository and record it as the update origin, so `./update.sh` / `update.cmd`
+> pull beta releases. When the beta graduates, a release from here will point installs back at
+> `Haidra-Org/horde-worker-reGen` automatically; nothing to reinstall. See
+> [Where releases are pulled from](docs/how-to/update-the-worker.md#where-releases-are-pulled-from).
+
 You do not need Python or any other software installed first.
 
 **Windows:** Download
-**[HordeWorker-Setup.exe](https://github.com/Haidra-Org/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**
+**[HordeWorker-Setup.exe](https://github.com/tazlin/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**
 and double-click it.
 
 **Linux / macOS:** Paste this into a terminal:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/tazlin/horde-worker-reGen/main/install.sh | HORDE_WORKER_REPO=tazlin/horde-worker-reGen sh
 ```
 
 **Windows (command line):** paste
-`irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex`
+`$env:HORDE_WORKER_REPO="tazlin/horde-worker-reGen"; irm https://raw.githubusercontent.com/tazlin/horde-worker-reGen/main/install.ps1 | iex`
 into PowerShell.
 
 On first run the installer downloads its own Python and PyTorch, opens a dashboard in your

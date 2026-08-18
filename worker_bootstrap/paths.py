@@ -146,6 +146,18 @@ def consent_marker(root: Path | None = None) -> Path:
     return bin_dir(root) / "install-consent"
 
 
+def release_origin_file(root: Path | None = None) -> Path:
+    """Return the bundle's baked release origin (``worker_bootstrap/release-origin``).
+
+    A single ``owner/repo`` line written by the release workflow when it stages the bundle, naming the
+    GitHub repository whose releases the self-updater should follow. It sits inside the mirrored
+    ``worker_bootstrap/`` package so an update replaces it together with the updater itself, which is what
+    lets one release redirect later ones (a fork handing its installs back to production). Absent in a
+    developer checkout.
+    """
+    return (root or install_root()) / "worker_bootstrap" / "release-origin"
+
+
 def install_info_file(root: Path | None = None) -> Path:
     """Return the marker recording how this worker was installed (``bin/install-info``).
 

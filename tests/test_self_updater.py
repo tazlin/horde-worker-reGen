@@ -95,6 +95,45 @@ def test_resolve_repo_default_when_no_file(tmp_path: Path, monkeypatch: pytest.M
     assert resolve_update_repo(tmp_path) == _DEFAULT_REPO
 
 
+def _bake_origin(root: Path, repo: str) -> None:
+    """Write the bundle's release-origin file as the release workflow would, BOM included to prove tolerance."""
+    (root / "worker_bootstrap").mkdir(exist_ok=True)
+    (root / "worker_bootstrap" / "release-origin").write_text(f"\ufeff{repo}\n", encoding="utf-8")
+
+
+def test_resolve_repo_bundled_origin_wins_over_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The origin baked into the bundle outranks the install marker, so a release can redirect its installs."""
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "install-info").write_text(f"method=exe\nrepo={_FORK_REPO}\n", encoding="utf-8")
+    _bake_origin(tmp_path, _OFFICIAL_REPO)
+    monkeypatch.delenv("HORDE_WORKER_UPDATE_REPO", raising=False)
+    assert resolve_update_repo(tmp_path) == _OFFICIAL_REPO
+
+
+def test_resolve_repo_bundled_origin_rescues_unmarked_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hand-extracted zip has no marker; the baked origin still points it at the repo it came from."""
+    _bake_origin(tmp_path, _FORK_REPO)
+    monkeypatch.delenv("HORDE_WORKER_UPDATE_REPO", raising=False)
+    assert resolve_update_repo(tmp_path) == _FORK_REPO
+
+
+def test_resolve_repo_env_var_wins_over_bundled_origin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The env override remains the top of the chain."""
+    _bake_origin(tmp_path, _OFFICIAL_REPO)
+    monkeypatch.setenv("HORDE_WORKER_UPDATE_REPO", _FORK_REPO)
+    assert resolve_update_repo(tmp_path) == _FORK_REPO
+
+
+def test_resolve_repo_malformed_bundled_origin_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A baked value that is not owner/repo falls through to the marker."""
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "install-info").write_text(f"repo={_FORK_REPO}\n", encoding="utf-8")
+    (tmp_path / "worker_bootstrap").mkdir()
+    (tmp_path / "worker_bootstrap" / "release-origin").write_text("not a repo slug\n", encoding="utf-8")
+    monkeypatch.delenv("HORDE_WORKER_UPDATE_REPO", raising=False)
+    assert resolve_update_repo(tmp_path) == _FORK_REPO
+
+
 def test_resolve_repo_default_when_file_has_no_repo_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A bin/install-info that has 'method' but no 'repo' still falls back to the default.
 

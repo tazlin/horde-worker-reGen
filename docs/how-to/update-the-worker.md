@@ -80,9 +80,21 @@ Channel handling is version-aware, so:
 
 ## Where releases are pulled from
 
-The self-updater pulls future releases from the same repository you originally installed from (recorded in
-`bin/install-info` at install time), so a fork or staging install updates itself from the right place. Set
-`HORDE_WORKER_UPDATE_REPO=owner/repo` to override the origin explicitly.
+The self-updater resolves the GitHub repository it pulls releases from in this order:
+
+1. `HORDE_WORKER_UPDATE_REPO=owner/repo` in the environment (an explicit override).
+2. The origin baked into the release bundle itself (`worker_bootstrap/release-origin`, written by the release
+   workflow). This is refreshed by every update, so a fork or beta channel can hand its installs back to the
+   production repository just by cutting a release whose baked origin names it: every install follows on its
+   next update with no user action.
+3. The repository recorded in `bin/install-info` by the installer that set up this worker (`repo=`; also
+   written by `update --repo owner/repo`).
+4. `Haidra-Org/horde-worker-reGen`.
+
+A hand-extracted zip has no `bin/install-info`, so without the baked origin it would silently follow the
+production repository even when it came from a fork. `./update.sh --repo owner/repo` (or `update.cmd`)
+switches origin for one run and records it in `bin/install-info`; when the baked origin disagrees it wins on
+the following run, so use `HORDE_WORKER_UPDATE_REPO` to pin an origin permanently.
 
 ## Download preview and managing disk use
 

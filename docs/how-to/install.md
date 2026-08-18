@@ -16,7 +16,7 @@ through install and first run end to end. This page is the reference for each in
 ### Download and double-click (easiest)
 
 No command line needed. Download
-**[HordeWorker-Setup.exe](https://github.com/Haidra-Org/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**,
+**[HordeWorker-Setup.exe](https://github.com/tazlin/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**,
 double-click it, and click through the installer. It shows what it will install and the third-party
 licenses and asks you to accept, then installs per-user (no administrator rights) and opens the dashboard
 when it finishes. A **Start Menu** shortcut is created by default (untick it to skip it); a **desktop**
@@ -31,7 +31,7 @@ If Windows SmartScreen shows "Windows protected your PC", the installer is not c
 Prefer the command line, or want an unattended install? Paste the one-liner into PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex
+$env:HORDE_WORKER_REPO="tazlin/horde-worker-reGen"; irm https://raw.githubusercontent.com/tazlin/horde-worker-reGen/main/install.ps1 | iex
 ```
 
 The `irm ... | iex` one-liner may trigger SmartScreen ("Windows protected your PC"). Click
@@ -42,7 +42,7 @@ The `irm ... | iex` one-liner may trigger SmartScreen ("Windows protected your P
 Paste into a terminal:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/tazlin/horde-worker-reGen/main/install.sh | HORDE_WORKER_REPO=tazlin/horde-worker-reGen sh
 ```
 
 On macOS this installs a CPU-only build, which is not practical for serving real jobs. For usable
@@ -70,7 +70,7 @@ you ever delete or reinstall the worker folder, so a fresh install never re-down
 No) before creating any shortcut.
 
 - Accept the install notice without the prompt with `HORDE_WORKER_ASSUME_YES=1` (required when piped with
-  no terminal, e.g. `curl -LsSf .../install.sh | HORDE_WORKER_ASSUME_YES=1 sh`).
+  no terminal, e.g. `curl -LsSf .../install.sh | HORDE_WORKER_REPO=tazlin/horde-worker-reGen HORDE_WORKER_ASSUME_YES=1 sh`).
 - Create shortcuts without being asked with `HORDE_WORKER_SHORTCUTS=1`, or skip them entirely with
   `HORDE_WORKER_NO_SHORTCUTS`.
 - Skip the auto-launch with `HORDE_WORKER_NO_LAUNCH`.

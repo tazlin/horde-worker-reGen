@@ -131,17 +131,35 @@ def write_repo_to_install_info(root: Path, repo: str) -> None:
         pass
 
 
-def resolve_update_repo(root: Path | None = None) -> str:
-    """Return the ``owner/repo`` to pull releases from (env override > install marker > default).
+def _read_bundled_origin(root: Path) -> str:
+    """Return the ``owner/repo`` the release workflow baked into the bundle, or ``""`` when absent or malformed.
 
-    Following the recorded install origin is what lets a fork or staging install update itself from where
-    it actually came from instead of a hardcoded production repo.
+    The file lives inside ``worker_bootstrap/`` so every overlay refreshes it along with the code it
+    describes; a developer checkout never carries one.
+    """
+    try:
+        text = paths.release_origin_file(root).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    value = text.replace(_BOM, "").strip()
+    return value if re.fullmatch(r"[^/\s]+/[^/\s]+", value) else ""
+
+
+def resolve_update_repo(root: Path | None = None) -> str:
+    """Return the ``owner/repo`` to pull releases from.
+
+    Precedence: the ``HORDE_WORKER_UPDATE_REPO`` env override, then the origin baked into the bundle by
+    the release workflow, then the ``repo`` recorded in ``bin/install-info`` by the installing front-end,
+    then the production default. The baked origin outranks the install marker because it travels with the
+    code: a bundle that names a different origin (a fork whose final release points back at production)
+    redirects every install on its next update without any user action, and a hand-extracted zip, which no
+    front-end ever marked, still updates from where it came. The env override remains the escape hatch.
     """
     override = os.environ.get("HORDE_WORKER_UPDATE_REPO", "").strip()
     if override:
         return override
-    recorded = _read_install_info(root or default_root()).get("repo", "")
-    return recorded or _DEFAULT_REPO
+    root = root or default_root()
+    return _read_bundled_origin(root) or _read_install_info(root).get("repo", "") or _DEFAULT_REPO
 
 
 def _has_local_path_source(pyproject: Path) -> bool:

@@ -22,7 +22,7 @@ it downloads anything it shows a notice of what it will install and from where, 
 ## Step 1: Install
 
 **Windows:** download
-**[HordeWorker-Setup.exe](https://github.com/Haidra-Org/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**,
+**[HordeWorker-Setup.exe](https://github.com/tazlin/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**,
 double-click it, and click through the wizard. It shows what it will install (and the third-party
 licenses) and asks you to accept. A **Start Menu** shortcut is created by default (untick it if you would
 rather not); the **desktop** shortcut is offered unticked. If Windows shows "Windows protected your PC",
@@ -31,12 +31,12 @@ click **More info**, then **Run anyway**; the installer simply is not code-signe
 **Linux:** paste this into a terminal and press Enter:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/tazlin/horde-worker-reGen/main/install.sh | HORDE_WORKER_REPO=tazlin/horde-worker-reGen sh
 ```
 
 It prints what it will install and asks you to confirm (answer `y`). If you run it somewhere with no
 terminal to answer (a script or pipe with no console), re-run it as
-`curl -LsSf .../install.sh | HORDE_WORKER_ASSUME_YES=1 sh` to accept up front.
+`curl -LsSf .../install.sh | HORDE_WORKER_REPO=tazlin/horde-worker-reGen HORDE_WORKER_ASSUME_YES=1 sh` to accept up front.
 
 Other ways to install (a scripted PowerShell command, a manual clone) are in the
 [install guide](../how-to/install.md), but the two above are the easiest.
