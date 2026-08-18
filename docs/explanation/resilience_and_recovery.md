@@ -204,6 +204,13 @@ A generation that has genuinely stopped doing work stops reporting altogether,
 and that silence is what `inference_step_timeout` proves. The repeat count only
 ever sees a slot that is still calling back.
 
+Blocking alchemy backends publish periodic child heartbeats too, but heartbeats prove only that the process
+is alive. A safety or post-processing child that remains in `ALCHEMY_STARTING` longer than
+`post_process_timeout + 3 * max_batch` is replaced on **state duration**, regardless of fresh heartbeats.
+This closes the paging/deadlock shape where every other child stays healthy, so the worker-wide silence
+fallback can never fire, while the one in-flight alchemy form would otherwise occupy its concurrency slot
+forever. The coordinator observes the retired launch, faults the lost form, and releases its resource reserve.
+
 An overtime reap is **terminal for its job**, unlike every other slot
 replacement. The two reaps carry different verdicts: a mid-run repeat loop says
 nothing about the payload, so its job takes the ordinary Layer 1 retry, but a

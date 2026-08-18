@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import pytest
+
 from horde_worker_regen.benchmark.capabilities.capability import Capability, CapabilityKind
 from horde_worker_regen.benchmark.capabilities.catalog import (
     CatalogOptions,
     build_capability_catalog,
     build_sustained_probe,
 )
-from horde_worker_regen.benchmark.capabilities.plan import build_plan
+from horde_worker_regen.benchmark.capabilities.plan import build_plan, select_probe_with_dependencies
 from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
 
@@ -77,6 +79,51 @@ def test_controlnet_is_sd15_only_and_qr_code_is_on_both() -> None:
     assert CapabilityKind.CONTROLNET not in _kinds(probes, BenchTier.SDXL)
     assert CapabilityKind.QR_CODE in _kinds(probes, BenchTier.SD15)
     assert CapabilityKind.QR_CODE in _kinds(probes, BenchTier.SDXL)
+
+
+def test_heavy_alchemy_models_are_separate_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """High-working-set graph forms do not share the ordinary graph probe's resident process state."""
+    from horde_worker_regen.benchmark.capabilities import catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "_graph_alchemy_form_names",
+        lambda *, include_strip_background: [
+            "RealESRGAN_x4plus",
+            "4xNomos2_hq_dat2",
+            "GFPGAN",
+            "CodeFormers",
+        ],
+    )
+    probes = build_capability_catalog(CatalogOptions(tiers=[BenchTier.SD15]))
+    graph_probes = [probe for probe in probes if probe.capability.kind is CapabilityKind.ALCHEMY_GRAPH]
+    by_name = {probe.scenario.name: probe for probe in graph_probes}
+
+    assert "alchemy-graph" in by_name
+    assert "alchemy-graph-heavy-upscaler" in by_name
+    assert "alchemy-graph-facefixers" in by_name
+    assert [spec.form for spec in by_name["alchemy-graph-heavy-upscaler"].scenario.alchemy_forms] == [
+        "4xNomos2_hq_dat2",
+    ]
+    assert all(spec.form != "4xNomos2_hq_dat2" for spec in by_name["alchemy-graph"].scenario.alchemy_forms)
+    graph_anchor = Capability(tier=BenchTier.SD15, kind=CapabilityKind.ALCHEMY_GRAPH)
+    assert by_name["alchemy-graph-heavy-upscaler"].requires == (graph_anchor,)
+    assert by_name["alchemy-graph-facefixers"].requires == (graph_anchor,)
+
+    selected = select_probe_with_dependencies(probes, "sd15-alchemy_graph-1")
+    assert [probe.probe_id for probe in selected] == [
+        "sd15-baseline",
+        "sd15-alchemy_graph",
+        "sd15-alchemy_graph-1",
+    ]
+
+
+def test_only_probe_rejects_an_unknown_slug() -> None:
+    """A typo cannot silently produce an empty successful benchmark report."""
+    probes = build_capability_catalog(CatalogOptions(tiers=[BenchTier.SD15]))
+
+    with pytest.raises(ValueError, match="Unknown probe"):
+        select_probe_with_dependencies(probes, "sd15-alchemy-typo")
 
 
 def test_sustained_probe_carries_requires_and_a_soak_scenario() -> None:

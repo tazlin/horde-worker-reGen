@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import enum
 import os
 import queue
@@ -11,6 +12,7 @@ import sys
 import threading
 import time
 from abc import abstractmethod
+from collections.abc import Iterator
 from enum import auto
 
 try:
@@ -201,6 +203,38 @@ class HordeProcess(abc.ABC):
         from hordelib.api import get_torch_device_free_vram_mb, get_torch_total_vram_mb
 
         return get_torch_total_vram_mb() - get_torch_device_free_vram_mb()
+
+    @contextlib.contextmanager
+    def periodic_heartbeat(
+        self,
+        *,
+        heartbeat_type: HordeHeartbeatType = HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+        interval_seconds: float = 5.0,
+    ) -> Iterator[None]:
+        """Emit heartbeats while a blocking child operation owns the process loop.
+
+        Model calls are synchronous and can spend minutes inside one backend operation, where the ordinary
+        process loop cannot publish liveness. The heartbeat is observational only: state-duration watchdogs
+        still bound an operation that remains alive but never completes.
+        """
+        stop = threading.Event()
+
+        def _report() -> None:
+            while not stop.wait(interval_seconds):
+                self.send_heartbeat_message(heartbeat_type=heartbeat_type)
+
+        self.send_heartbeat_message(heartbeat_type=heartbeat_type)
+        reporter = threading.Thread(
+            target=_report,
+            name=f"process-{self.process_id}-operation-heartbeat",
+            daemon=True,
+        )
+        reporter.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            reporter.join(timeout=max(0.1, interval_seconds))
 
     def get_process_vram_stats(self) -> tuple[int, int, int, int] | None:
         """Return this process's own ``(allocated_mb, reserved_mb, peak_reserved_mb, aimdo_mb)``, or None off-GPU.

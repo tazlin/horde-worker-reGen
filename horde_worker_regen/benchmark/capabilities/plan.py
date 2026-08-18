@@ -73,4 +73,31 @@ def build_plan(probes: list[CapabilityProbe]) -> CapabilityPlan:
     return CapabilityPlan(probes=ordered)
 
 
-__all__ = ["CapabilityPlan", "build_plan"]
+def select_probe_with_dependencies(probes: list[CapabilityProbe], probe_id: str) -> list[CapabilityProbe]:
+    """Return the requested probe and its transitive prerequisite providers in catalog order."""
+    by_id = {probe.probe_id: probe for probe in probes}
+    target = by_id.get(probe_id)
+    if target is None:
+        known = ", ".join(sorted(by_id))
+        raise ValueError(f"Unknown probe {probe_id!r}; known probe slugs: {known}")
+
+    by_capability = {probe.capability: probe for probe in probes}
+    selected: set[Capability] = set()
+
+    def include(probe: CapabilityProbe) -> None:
+        if probe.capability in selected:
+            return
+        for requirement in probe.requires:
+            provider = by_capability.get(requirement)
+            if provider is None:
+                raise ValueError(
+                    f"Probe {probe.probe_id!r} requires capability {requirement.slug!r}, which no probe provides",
+                )
+            include(provider)
+        selected.add(probe.capability)
+
+    include(target)
+    return [probe for probe in probes if probe.capability in selected]
+
+
+__all__ = ["CapabilityPlan", "build_plan", "select_probe_with_dependencies"]

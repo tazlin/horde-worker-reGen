@@ -16,7 +16,11 @@ import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec, HordeAlchemyResultMessage
+from horde_worker_regen.process_management.ipc.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyResultMessage,
+    HordeControlFlag,
+)
 from horde_worker_regen.process_management.jobs import alchemy_popper as alchemy_popper_module
 from horde_worker_regen.process_management.jobs.alchemy_popper import AlchemyCoordinator, AlchemyHeadroomEstimator
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
@@ -404,6 +408,7 @@ class _DispatchProcessInfo:
         self.process_id = process_id
         self.process_launch_identifier = launch
         self.device_index = device_index
+        self.last_control_flag: HordeControlFlag | None = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
         self.sent: list[object] = []
 
     def safe_send_message(self, message: object) -> bool:
@@ -499,6 +504,7 @@ class TestLostFormReaping:
         )
         assert "form-a" in coordinator._in_flight
         assert coordinator._in_flight_owner["form-a"] == (7, 3)
+        assert process.last_control_flag == HordeControlFlag.START_ALCHEMY
 
     def test_reserve_released_when_owning_process_dies(self) -> None:
         """When the owning launch is gone, the reaper drops the form so its reserve self-heals to zero."""

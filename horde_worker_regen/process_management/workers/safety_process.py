@@ -38,6 +38,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAlchemyResultMessage,
     HordeControlFlag,
     HordeControlMessage,
+    HordeHeartbeatType,
     HordeProcessState,
     HordeSafetyControlMessage,
     HordeSafetyEvaluation,
@@ -505,32 +506,33 @@ class HordeSafetyProcess(HordeProcess):
         result_payload: dict | None = None
 
         try:
-            image = PIL.Image.open(BytesIO(form.source_image_bytes))
+            with self.periodic_heartbeat(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE):
+                image = PIL.Image.open(BytesIO(form.source_image_bytes))
 
-            if is_caption_form(form.form):
-                self._ensure_caption_model()
-                caption = self._interrogator.generate_caption(image)  # type: ignore[attr-defined]
-                result_payload = {"caption": caption}
-            elif is_interrogator_form(form.form):
-                result_payload = {"interrogation": self._interrogate_image(image)}
-            elif is_nsfw_detector_form(form.form):
-                nsfw_result = self._nsfw_checker.check_for_nsfw(image=image)  # type: ignore[attr-defined]
-                if nsfw_result is None:
-                    raise RuntimeError("NSFW check returned no result")
-                result_payload = {"nsfw": nsfw_result.is_nsfw}
-            elif is_vectorize_form(form.form):
-                result_payload = {"vectorize": self._vectorize_image(image)}
-            elif is_palette_form(form.form):
-                result_payload = {"palette": self._extract_palette(image)}
-            elif is_describe_form(form.form):
-                result_payload = {"describe": self._describe_image(image)}
-            elif is_aesthetic_form(form.form):
-                aesthetic_score = self._score_aesthetic(image)
-                if aesthetic_score is None:
-                    raise RuntimeError("Aesthetic predictor is unavailable")
-                result_payload = {"aesthetic": aesthetic_score}
-            else:
-                raise ValueError(f"Unknown alchemy form for safety process: {form.form}")
+                if is_caption_form(form.form):
+                    self._ensure_caption_model()
+                    caption = self._interrogator.generate_caption(image)  # type: ignore[attr-defined]
+                    result_payload = {"caption": caption}
+                elif is_interrogator_form(form.form):
+                    result_payload = {"interrogation": self._interrogate_image(image)}
+                elif is_nsfw_detector_form(form.form):
+                    nsfw_result = self._nsfw_checker.check_for_nsfw(image=image)  # type: ignore[attr-defined]
+                    if nsfw_result is None:
+                        raise RuntimeError("NSFW check returned no result")
+                    result_payload = {"nsfw": nsfw_result.is_nsfw}
+                elif is_vectorize_form(form.form):
+                    result_payload = {"vectorize": self._vectorize_image(image)}
+                elif is_palette_form(form.form):
+                    result_payload = {"palette": self._extract_palette(image)}
+                elif is_describe_form(form.form):
+                    result_payload = {"describe": self._describe_image(image)}
+                elif is_aesthetic_form(form.form):
+                    aesthetic_score = self._score_aesthetic(image)
+                    if aesthetic_score is None:
+                        raise RuntimeError("Aesthetic predictor is unavailable")
+                    result_payload = {"aesthetic": aesthetic_score}
+                else:
+                    raise ValueError(f"Unknown alchemy form for safety process: {form.form}")
 
             state = GENERATION_STATE.ok
         except Exception as e:
@@ -580,10 +582,38 @@ class HordeSafetyProcess(HordeProcess):
         _clear_safety_accelerator_cache()
         self.send_memory_report_message(include_vram=True)
 
+    @logger.catch(reraise=True)
+    def unload_transient_models_from_ram(self) -> None:
+        """Discard optional alchemy companions while retaining the safety lane's base models."""
+        if not self._dry_run_skip_safety:
+            caption_model = self._interrogator.caption_model  # type: ignore[attr-defined]
+            if caption_model is not None:
+                self._interrogator.caption_model = None  # type: ignore[attr-defined]
+                del caption_model
+            self._interrogator.caption_offloaded = False  # type: ignore[attr-defined]
+            self._caption_model_loaded = False
+            self._label_tables.clear()
+            self._ranking_lists = None
+            self._aesthetic_scorer = None
+            gc.collect()
+            if self._safety_device != "cpu":
+                _clear_safety_accelerator_cache()
+
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+            info="Unloaded transient safety/alchemy models from RAM",
+        )
+        self.send_memory_report_message(include_vram=self._safety_device != "cpu")
+        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
+
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
             self.release_allocator_cache()
+            return
+
+        if message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
+            self.unload_transient_models_from_ram()
             return
 
         if isinstance(message, HordeAlchemyControlMessage):

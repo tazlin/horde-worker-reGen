@@ -170,6 +170,12 @@ live config change before it runs, over the session's base rather than over the 
 replaced before the next one. So a probe proves the configuration named in its result, and a value it
 never mentions is the session default rather than whatever an earlier probe left behind.
 
+It also does not mean sharing alchemy's transient model residency. Before each probe the warm driver asks
+the idle safety and post-processing processes to unload optional models from RAM and waits for their child
+acknowledgements. The probe's own warm-up then loads exactly the models it needs before the measured pass.
+If that warm-up cannot drain within its bounded budget, the probe is reported timed out immediately; the
+driver does not reset the source and install a measured copy over forms that may still be running.
+
 A **capability** is a `(tier, kind, magnitude)` triple, e.g. "SD1.5 can run batch size 4". Each probe's
 verdict is `PROVEN`, `DISPROVEN`, `SKIPPED` (a prerequisite was unproven or the machine cannot host it),
 or `CRASHED`. A probe runs only when every capability it `requires` is already proven, so "a tier
@@ -191,7 +197,7 @@ Key `run` options:
 | `--out PATH` | `benchmark_results/<timestamp>` | Output directory (`report.json`, `report.md`, `progress.jsonl`). |
 | `--jobs-per-level N` | `4` | Jobs run per probe. |
 | `--probe-timeout SECONDS` | `900` | Per-probe timeout. |
-| `--only SLUG` | — | Run a single probe by its capability slug (e.g. `sd15-controlnet`), for a remediation loop. |
+| `--only SLUG` | — | Run one probe by capability slug plus its minimal prerequisite closure; an unknown slug is an error. |
 | `--no-validate` | off | Skip the post-run sustained-load soak (`--soak-minutes` sets its length). |
 | `--strict-duty` | off | Make the soak's 90% GPU-duty target a hard gate (advisory by default). |
 | `--exclude-capability KIND` | — | Drop a single capability kind (repeatable; choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`). |
@@ -216,8 +222,11 @@ run's log names how many of each the sweep offered, so a sweep that only holds b
 was reachable reads differently from one the canonical reference supports on its own. A form with no
 record in either would fault rather than skip, so it is left out.
 Alchemy is probed on both lanes independently, the CLIP lane (caption/interrogation/NSFW, on the safety
-process) and the graph lane (upscalers/face-fixers/strip-background, on the inference processes), plus a
-concurrent-with-image probe. Heavy tiers (`flux`/`qwen`/`zimage`) are opt-in and self-skip when the
+process) and the graph lane (upscalers/face-fixers/strip-background, on the dedicated post-processing
+process), plus a concurrent-with-image probe. The graph sweep has separate warm probes for ordinary forms,
+the high-working-set `4xNomos2_hq_dat2` upscaler (`sd15-alchemy_graph-1`), and the face-fixer group
+(`sd15-alchemy_graph-2`). This identifies a heavyweight failure without letting its resident set contaminate
+the rest of the sweep. Heavy tiers (`flux`/`qwen`/`zimage`) are opt-in and self-skip when the
 machine cannot hold them or the checkpoint is absent; `qwen`/`zimage` are beta models from the pending
 reference (need `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`; the beta opt-in env is set automatically).
 

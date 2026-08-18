@@ -995,6 +995,7 @@ class AlchemyCoordinator:
                 ),
             )
             if sent:
+                process_info.last_control_flag = HordeControlFlag.START_ALCHEMY
                 self._in_flight[spec.form_id] = spec
                 self._in_flight_card[spec.form_id] = process_info.device_index
                 self._in_flight_owner[spec.form_id] = (

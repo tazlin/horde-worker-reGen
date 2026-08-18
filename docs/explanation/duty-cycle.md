@@ -170,6 +170,13 @@ warmup-versus-inference cost is visible at a glance. The lesson the numbers teac
 warm-session driver acts on: amortise the boot by reusing a worker across probes rather than paying
 startup once per capability.
 
+Warm reuse retains process startup, not arbitrary feature-model state. At a capability boundary the benchmark
+unloads optional safety and post-processing residents, waits for the children to acknowledge, and then runs
+the next probe's full scenario once as warm-up. The measured pass therefore stays warm for its own models
+without inheriting the previous probe's high-water resident set. An undrained warm-up is terminal for that
+probe; installing a second copy would mix old in-flight work with reset counters and turn one bounded failure
+into two long waits.
+
 ## Where to read it
 
 The same [`DutyCycleSummary`][horde_worker_regen.process_management.resources.duty_cycle.DutyCycleSummary]

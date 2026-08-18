@@ -6345,6 +6345,26 @@ class HordeWorkerProcessManager:
         # would inherit a non-zero count and be failed for a recovery it never had.
         self._process_lifecycle.reset_recovery_counter()
 
+    def request_benchmark_memory_cleanup(self) -> dict[int, float]:
+        """Ask idle alchemy service lanes to discard transient RAM before the next warm probe.
+
+        Returns each targeted process id mapped to its last parent-receive timestamp before the request. The
+        warm harness uses that marker to wait for a newer child message, proving the asynchronous unload was
+        handled before it installs the next scenario.
+        """
+        if self._alchemy_coordinator.num_in_flight:
+            raise RuntimeError("cannot clean benchmark alchemy lanes while forms are still pending or in flight")
+
+        requested: dict[int, float] = {}
+        for process_info in self._process_map.values():
+            if process_info.process_type not in (HordeProcessType.SAFETY, HordeProcessType.POST_PROCESS):
+                continue
+            if not process_info.is_process_alive() or not process_info.can_accept_job():
+                continue
+            requested[process_info.process_id] = process_info.last_received_timestamp
+            self._inference_scheduler.unload_from_ram(process_info.process_id)
+        return requested
+
     def _supervisor_state_signature(self) -> tuple[object, ...]:
         """A cheap fingerprint of the display-relevant worker state.
 

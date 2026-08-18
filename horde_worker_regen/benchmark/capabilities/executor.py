@@ -29,7 +29,7 @@ from horde_worker_regen.benchmark.capabilities.catalog import (
     build_capability_catalog,
     build_sustained_probe,
 )
-from horde_worker_regen.benchmark.capabilities.plan import build_plan
+from horde_worker_regen.benchmark.capabilities.plan import build_plan, select_probe_with_dependencies
 from horde_worker_regen.benchmark.capabilities.plan_preview import build_capability_plan_rows
 from horde_worker_regen.benchmark.capabilities.probe_runner import run_capability_probe_async
 from horde_worker_regen.benchmark.capabilities.recommendation import synthesize_bridge_data, synthesize_capabilities
@@ -156,11 +156,8 @@ class ProbeExecutor:
         """Run the catalog and return the assembled (and, if ``out_dir`` is set, persisted) report."""
         machine = self._machine or detect_machine_info(probe_devices=self._process_mode == "real")
 
-        probes = [
-            probe
-            for probe in build_capability_catalog(self._catalog_options)
-            if self._only_probe is None or probe.probe_id == self._only_probe
-        ]
+        catalog = build_capability_catalog(self._catalog_options)
+        probes = catalog if self._only_probe is None else select_probe_with_dependencies(catalog, self._only_probe)
         plan = build_plan(probes)
         supervisor = CapabilitySupervisor()
         tier_baselines: dict[BenchTier, TierBaseline] = {}
@@ -367,7 +364,6 @@ class ProbeExecutor:
             probes,
             machine=machine,
             process_mode=self._process_mode,
-            only_probe=self._only_probe,
         )
         self._progress.emit(RampPlanned(run_id=self._run_id, rows=rows))
 

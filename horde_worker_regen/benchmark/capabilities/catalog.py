@@ -49,6 +49,8 @@ from horde_worker_regen.benchmark.soak import build_soak_scenario
 _SUSTAINED_DRAIN_TIMEOUT_SECONDS = 60.0
 _SUSTAINED_START_MARGIN_SECONDS = 180.0
 _DUTY_CYCLE_TARGET_PERCENT = 90.0
+_ALCHEMY_HEAVY_UPSCALERS: frozenset[str] = frozenset({"4xNomos2_hq_dat2"})
+"""Upscalers with an observed working set large enough to merit an isolated warm benchmark boundary."""
 
 
 class CatalogOptions(BaseModel):
@@ -328,16 +330,46 @@ def _add_alchemy_probes(add: _ProbeAdder, *, tier: BenchTier, opts: CatalogOptio
     )
 
     graph_forms = _graph_alchemy_form_names(include_strip_background=_strip_background_available())
+    facefixers = {member.value for member in KNOWN_FACEFIXERS if member is not KNOWN_FACEFIXERS.BACKEND_DEFAULT}
+    heavy_upscalers = [form for form in graph_forms if form in _ALCHEMY_HEAVY_UPSCALERS]
+    heavy_facefixers = [form for form in graph_forms if form in facefixers]
+    isolated_forms = set(heavy_upscalers + heavy_facefixers)
+    ordinary_graph_forms = [form for form in graph_forms if form not in isolated_forms]
+    if not ordinary_graph_forms and graph_forms:
+        # Keep magnitude zero as the graph-lane capability anchor even on an unusual reference containing
+        # only one of the isolated forms. Higher isolated probes depend on this stable anchor.
+        ordinary_graph_forms = [graph_forms[0]]
+        heavy_upscalers = [form for form in heavy_upscalers if form != graph_forms[0]]
+        heavy_facefixers = [form for form in heavy_facefixers if form != graph_forms[0]]
+
+    graph_capability = Capability(tier=tier, kind=CapabilityKind.ALCHEMY_GRAPH)
     add(
-        capability=Capability(tier=tier, kind=CapabilityKind.ALCHEMY_GRAPH),
+        capability=graph_capability,
         scenario=Scenario(
             name="alchemy-graph",
-            alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in graph_forms],
+            alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in ordinary_graph_forms],
         ),
         requires=(baseline,),
         bridge_data_overrides={"alchemist": True, "models_to_load": [tier_model]},
         criteria=no_fault_criteria,
     )
+
+    for magnitude, name, forms in (
+        (1, "alchemy-graph-heavy-upscaler", heavy_upscalers),
+        (2, "alchemy-graph-facefixers", heavy_facefixers),
+    ):
+        if not forms:
+            continue
+        add(
+            capability=Capability(tier=tier, kind=CapabilityKind.ALCHEMY_GRAPH, magnitude=magnitude),
+            scenario=Scenario(
+                name=name,
+                alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in forms],
+            ),
+            requires=(graph_capability,),
+            bridge_data_overrides={"alchemist": True, "models_to_load": [tier_model]},
+            criteria=no_fault_criteria,
+        )
 
     add(
         capability=Capability(tier=tier, kind=CapabilityKind.ALCHEMY_CONCURRENT),

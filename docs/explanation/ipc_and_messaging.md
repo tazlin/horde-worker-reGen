@@ -45,6 +45,12 @@ dedicated reader thread so a read that cannot return never freezes the loop (see
 | `HordeEvictComponentsControlMessage` | Evict specific staged components from RAM (`EVICT_COMPONENTS`) | A list of component `identities` (a checkpoint's identity is its bare model name) |
 | `HordeControlMessage`               | Generic control (flag only)         | A `HordeControlFlag` (e.g. `END_PROCESS`, `UNLOAD_MODELS_FROM_RAM`)                                |
 
+`UNLOAD_MODELS_FROM_RAM` is implemented by every resident model owner. On the post-processing lane it
+frees the complete backend RAM/VRAM cache; on safety it drops optional alchemy companions (BLIP,
+interrogation embedding tables, and the aesthetic head) while retaining the base safety models. Both report
+memory and return to `WAITING_FOR_JOB`, which lets pressure recovery and warm benchmark boundaries wait for
+an acknowledged release rather than assuming an asynchronous send already took effect.
+
 The inference, preload, and alchemy control messages also carry an optional
 `trace_context` (W3C traceparent) so the child's work spans correlate with the
 parent's job span in logfire.

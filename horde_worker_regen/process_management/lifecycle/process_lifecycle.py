@@ -4501,6 +4501,13 @@ class ProcessLifecycleManager:
                         False,
                     ),
                     (
+                        bridge_data.post_process_timeout + (3 * bridge_data.max_batch),
+                        HordeProcessState.ALCHEMY_STARTING,
+                        "seems to be stuck running an alchemy form",
+                        True,
+                        False,
+                    ),
+                    (
                         bridge_data.process_timeout,
                         HordeProcessState.WAITING_FOR_JOB,
                         "seems to be stuck idle (silent) while there is work to do",

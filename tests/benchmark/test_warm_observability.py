@@ -21,6 +21,7 @@ from horde_worker_regen.harness import (
     WarmHarnessSession,
     _summarize_worker_processes,
 )
+from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, RunMetricsSnapshot
@@ -76,6 +77,19 @@ class _StubJobTracker:
 class _StubAlchemy:
     num_canned_forms_completed = 0
     num_canned_forms_faulted = 0
+    num_forms_pending = 0
+    num_forms_in_flight = 0
+    num_forms_awaiting_submit = 0
+
+
+class _StubJobPopper:
+    _canned_job_source = None
+
+
+class _StubScheduler:
+    @staticmethod
+    def latest_host_memory_governance_snapshot() -> None:
+        return None
 
 
 class _StubManager:
@@ -85,13 +99,20 @@ class _StubManager:
         self._process_map = _StubProcessMap(infos)
         self._job_tracker = _StubJobTracker()
         self._alchemy_coordinator = _StubAlchemy()
+        self._job_popper = _StubJobPopper()
+        self._state = WorkerState()
+        self._inference_scheduler = _StubScheduler()
         self.set_concurrency_calls: list[tuple[int | None, int | None]] = []
+        self.install_calls = 0
 
     def _apply_set_concurrency(self, target_threads: int | None, target_processes: int | None) -> None:
         self.set_concurrency_calls.append((target_threads, target_processes))
 
     def install_benchmark_scenario(self, *, jobs: object, alchemy_forms: object = None) -> None:
-        return None
+        self.install_calls += 1
+
+    def request_benchmark_memory_cleanup(self) -> dict[int, float]:
+        return {}
 
     async def receive_and_handle_process_messages(self) -> None:
         return None
@@ -176,6 +197,22 @@ async def test_warm_level_abandons_dead_worker_before_full_timeout(monkeypatch: 
     assert result.timed_out is True
     assert elapsed < 10.0, f"dead-worker fast-fail should abandon quickly (took {elapsed:.1f}s)"
     assert result.diagnostics
+
+
+async def test_undrained_alchemy_warmup_is_not_reinstalled_as_measured_work() -> None:
+    """A stalled warmup remains the failed result instead of leaking its forms across a counter reset."""
+    session = _make_session([_StubProcessInfo(process_id=0, process_type=HordeProcessType.INFERENCE, alive=True)])
+
+    result = await session.run_level(
+        jobs=[],
+        alchemy_forms=[object()],  # type: ignore[list-item]  # the stub never inspects the form
+        threads=1,
+        timeout_seconds=0.2,
+        warmup=True,
+    )
+
+    assert result.timed_out is True
+    assert session.manager.install_calls == 1  # type: ignore[attr-defined]
 
 
 class _AllFaultedStubManager(_StubManager):

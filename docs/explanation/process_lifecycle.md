@@ -92,6 +92,7 @@ timeout:
 | Preloading a model / starting up | `preload_timeout`                      | `150s`                                 |
 | Downloading an auxiliary model   | `download_timeout`                     | LoRA download budget + 1s              |
 | Post-processing                  | `post_process_timeout + 3 × max_batch` | `120s + 3 × max_batch`                 |
+| Running an alchemy form          | `post_process_timeout + 3 × max_batch` | `120s + 3 × max_batch`                 |
 (`process_timeout` and these timeouts are affected by performance modes.)
 
 The mid-inference timeout is not a single flat value. Before a job's first
@@ -120,8 +121,12 @@ not from dispatch, so a long cold start or feature-heavy startup is never
 mislabelled as slow sampling; it only logs and feeds the widened timeout above,
 and never replaces a slot itself.
 
-Every timeout above measures *silence*, the time since the last message or
-heartbeat. That misses one wedge: a generation that loops on a single sampling
+Most timeouts above measure *silence*, the time since the last message or
+heartbeat. Alchemy is the exception: its synchronous backends emit periodic
+heartbeats to distinguish a live call from a dead child, while the watchdog
+measures total time in `ALCHEMY_STARTING` so a live but paging/deadlocked backend
+still has a hard bound. A silence-only timeout also misses another wedge: a
+generation that loops on a single sampling
 step without ever returning. ComfyUI keeps invoking the progress callback at
 that step, so the child keeps emitting heartbeats; the slot is never silent, and
 the per-step timeout never fires. The slot would sit in `INFERENCE_STARTING`

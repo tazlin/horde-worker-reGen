@@ -325,10 +325,11 @@ class HordePostProcessProcess(HordeProcess):
         image_bytes: bytes | None = None
 
         try:
-            image_bytes = self._run_with_oom_retry(
-                lambda: self._run_alchemy_form_bytes(form),
-                context=f"alchemy form {form.form} ({form.form_id})",
-            )
+            with self.periodic_heartbeat():
+                image_bytes = self._run_with_oom_retry(
+                    lambda: self._run_alchemy_form_bytes(form),
+                    context=f"alchemy form {form.form} ({form.form_id})",
+                )
             state = GENERATION_STATE.ok
         except Exception as e:
             logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")

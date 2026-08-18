@@ -1693,6 +1693,48 @@ def test_silence_timeout_still_uses_recent_liveness_by_default() -> None:
     plm._replace_inference_process.assert_not_called()
 
 
+def test_alchemy_state_timeout_replaces_a_live_heartbeating_lane() -> None:
+    """A backend wedged in alchemy is bounded by state age even while its heartbeat thread stays alive."""
+    lane = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.ALCHEMY_STARTING,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    lane.last_process_state_started_at = time.time() - 600.0
+    lane.last_received_timestamp = time.time()
+    lane.last_heartbeat_timestamp = time.time()
+    plm = _make_plm(process_map=ProcessMap({0: lane}))
+    plm._initiate_post_process_replacement = Mock()  # type: ignore[method-assign]
+    plm._replace_all_post_process_process = Mock()  # type: ignore[method-assign]
+
+    assert plm.replace_hung_processes() is True
+
+    plm._initiate_post_process_replacement.assert_called_once_with()
+    plm._replace_all_post_process_process.assert_called_once_with()
+
+
+def test_alchemy_state_timeout_replaces_a_live_heartbeating_safety_lane() -> None:
+    """The same hard form bound applies to CLIP/caption alchemy hosted by the safety child."""
+    lane = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.ALCHEMY_STARTING,
+        process_type=HordeProcessType.SAFETY,
+    )
+    lane.last_process_state_started_at = time.time() - 600.0
+    lane.last_received_timestamp = time.time()
+    lane.last_heartbeat_timestamp = time.time()
+    plm = _make_plm(process_map=ProcessMap({0: lane}))
+    plm._initiate_safety_replacement = Mock()  # type: ignore[method-assign]
+    plm._replace_all_safety_process = Mock()  # type: ignore[method-assign]
+
+    assert plm.replace_hung_processes() is True
+
+    plm._initiate_safety_replacement.assert_called_once_with()
+    plm._replace_all_safety_process.assert_called_once_with()
+
+
 def test_reap_if_crashed_recovers_dead_inference() -> None:
     """A dead inference child (no longer alive) is recovered without waiting on a state timer."""
     dead = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)

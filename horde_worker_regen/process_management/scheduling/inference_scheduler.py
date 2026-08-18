@@ -4941,8 +4941,24 @@ class InferenceScheduler:
         crossed the per-process ceiling. The decision logic lives in
         [`decide_degrade_response`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_degrade_response].
         """
+        self._reclaim_idle_alchemy_lanes_under_pressure()
         snapshot = self._build_host_memory_snapshot(verdict)
         self._execute_governance_actions(decide_degrade_response(snapshot))
+
+    def _reclaim_idle_alchemy_lanes_under_pressure(self) -> None:
+        """Unload idle safety/post-process alchemy residents during a host-RAM pressure episode."""
+        for process_info in self._process_map.values():
+            if process_info.process_type not in (HordeProcessType.SAFETY, HordeProcessType.POST_PROCESS):
+                continue
+            if not process_info.is_process_alive() or not process_info.can_accept_job():
+                continue
+            if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
+                continue
+            logger.opt(colors=True).info(
+                f"<fg #ff8c69>Host RAM pressure: unloading idle {process_info.process_type.name} lane "
+                f"{process_info.process_id} from RAM.</>",
+            )
+            self.unload_from_ram(process_info.process_id)
 
     def _govern_ram_pressure_if_pressured(self) -> bool:
         """Evaluate the absolute RAM danger floor and degrade the worker if it is breached.
@@ -13180,12 +13196,14 @@ class InferenceScheduler:
 
         process_info = self._process_map[process_id]
 
-        if process_info.process_type == HordeProcessType.POST_PROCESS:
+        if process_info.process_type in (HordeProcessType.POST_PROCESS, HordeProcessType.SAFETY):
             if process_info.is_process_busy():
-                logger.warning(f"Post-processing process {process_id} is busy, not unloading models from RAM")
+                logger.warning(
+                    f"{process_info.process_type.name} process {process_id} is busy, not unloading models from RAM",
+                )
                 return
 
-            logger.debug(f"Unloading post-processing models from RAM on process {process_id}")
+            logger.debug(f"Unloading {process_info.process_type.name} models from RAM on process {process_id}")
             process_info.safe_send_message(
                 HordeControlMessage(
                     control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_RAM,
@@ -13212,7 +13230,7 @@ class InferenceScheduler:
 
         if process_info.process_type != HordeProcessType.INFERENCE:
             logger.warning(
-                f"Process {process_id} is not an inference, post-processing, or service-lane process, "
+                f"Process {process_id} is not an inference, safety, post-processing, or service-lane process, "
                 "not unloading models"
             )
             return

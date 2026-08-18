@@ -8,6 +8,9 @@ when CUDA is genuinely unavailable, or horde_safety raises during deserializatio
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.workers.safety_process import (
     HordeSafetyProcess,
     _OnDemandDeepDanbooruModel,
@@ -94,3 +97,36 @@ def test_idle_safety_offloads_lazy_companions_without_moving_clip() -> None:
     assert caption.moves == ["cpu"]
     assert aesthetic.moves == ["cpu"]
     assert process._interrogator.caption_offloaded is True  # type: ignore[attr-defined]
+
+
+def test_ram_unload_discards_optional_cpu_alchemy_models_but_keeps_clip() -> None:
+    """The RAM-pressure/boundary control drops BLIP and label tables without rebuilding base safety."""
+    clip = _MovableModel()
+    caption = _MovableModel()
+    process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+    process._dry_run_skip_safety = False
+    process._safety_device = "cpu"
+    process._caption_model_loaded = True
+    process._interrogator = type(
+        "FakeInterrogator",
+        (),
+        {"clip_model": clip, "caption_model": caption, "caption_offloaded": True},
+    )()
+    process._label_tables = {"mediums": object()}
+    process._ranking_lists = {"mediums": ["photo"]}
+    process._aesthetic_scorer = Mock()
+    process.send_process_state_change_message = Mock()  # type: ignore[method-assign]
+    process.send_memory_report_message = Mock()  # type: ignore[method-assign]
+
+    process.unload_transient_models_from_ram()
+
+    assert process._interrogator.clip_model is clip  # type: ignore[attr-defined]
+    assert process._interrogator.caption_model is None  # type: ignore[attr-defined]
+    assert process._caption_model_loaded is False
+    assert process._label_tables == {}
+    assert process._ranking_lists is None
+    assert process._aesthetic_scorer is None
+    process.send_process_state_change_message.assert_any_call(  # type: ignore[attr-defined]
+        process_state=HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+        info="Unloaded transient safety/alchemy models from RAM",
+    )

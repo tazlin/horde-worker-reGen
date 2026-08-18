@@ -1815,6 +1815,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         _collect_run_diagnostics(
             manager=manager,
             num_jobs_expected=num_jobs_expected,
+            num_forms_expected=num_forms_expected,
             elapsed=time.time() - time_started,
         ),
     )
@@ -1973,6 +1974,7 @@ def _collect_run_diagnostics(
     *,
     manager: HordeWorkerProcessManager,
     num_jobs_expected: int,
+    num_forms_expected: int = 0,
     elapsed: float,
 ) -> list[str]:
     """Collect non-fatal diagnostic messages about the run for debugging failures."""
@@ -1990,17 +1992,37 @@ def _collect_run_diagnostics(
 
     completed = manager._job_tracker.total_num_completed_jobs
     faulted = manager._job_tracker.num_jobs_faulted
-    if completed == 0 and faulted == 0 and elapsed > 2.0:
+    if num_jobs_expected > 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
         diags.append(
             f"No jobs completed or faulted after {elapsed:.1f}s "
             f"(expected {num_jobs_expected}); check for stale .abort file or blocked job pop"
         )
 
-    job_popper = getattr(manager, "_job_popper", None)
-    source = getattr(job_popper, "_canned_job_source", None)
+    source = manager._job_popper._canned_job_source
     jobs_ever_popped = source.jobs_emitted if source is not None else len(manager._job_tracker.jobs_lookup)
-    if jobs_ever_popped == 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
+    if num_jobs_expected > 0 and jobs_ever_popped == 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
         diags.append("No jobs were ever popped; check canned_job_source or process availability")
+
+    if num_forms_expected > 0:
+        coordinator = manager._alchemy_coordinator
+        diags.append(
+            "Alchemy progress: "
+            f"completed={coordinator.num_canned_forms_completed}, "
+            f"faulted={coordinator.num_canned_forms_faulted}, "
+            f"pending={coordinator.num_forms_pending}, "
+            f"in_flight={coordinator.num_forms_in_flight}, "
+            f"awaiting_submit={coordinator.num_forms_awaiting_submit}, expected={num_forms_expected}",
+        )
+        if manager._state.self_throttle_paused or manager._state.ram_pressure_pop_hold:
+            reason = manager._state.self_throttle_pause_reason or "RAM-pressure pop hold"
+            diags.append(f"Workload intake is paused: {reason}")
+        ram_snapshot = manager._inference_scheduler.latest_host_memory_governance_snapshot()
+        if ram_snapshot is not None:
+            diags.append(
+                f"Host RAM: available={ram_snapshot.verdict.available_mb}, "
+                f"danger_floor={ram_snapshot.verdict.floor_mb:.0f} MB, "
+                f"under_pressure={ram_snapshot.verdict.under_pressure}",
+            )
 
     return diags
 
@@ -2151,8 +2173,9 @@ make the next level cold-load them back. The session's superset already covers e
 
 
 _WARMUP_DRAIN_TIMEOUT_SECONDS = 300.0
+_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS = 30.0
 """Bound on a level's pre-warm pass: enough for a cold heavy-model load plus one recovery-and-reload
-cycle, after which the warm pass is abandoned and the measured pass runs anyway."""
+cycle, after which the level times out without installing a second copy of the scenario."""
 
 _WARM_PROGRESS_INTERVAL_SECONDS = 1.0
 """How often the warm session samples the live worker metrics for the progress hook. Snappier than the
@@ -2439,6 +2462,36 @@ class WarmHarnessSession:
             else:
                 dead_since = None
 
+    async def _prepare_level_boundary(self) -> None:
+        """Unload idle alchemy residents and wait for each child to acknowledge before a new level."""
+        manager = self.manager
+        requested = manager.request_benchmark_memory_cleanup()
+        if not requested:
+            return
+
+        deadline = time.time() + _WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS
+        while requested and time.time() < deadline:
+            with contextlib.suppress(Exception):
+                await manager.receive_and_handle_process_messages()
+            acknowledged: list[int] = []
+            for process_id, prior_timestamp in requested.items():
+                process_info = manager._process_map.get(process_id)
+                if process_info is None or (
+                    process_info.last_received_timestamp > prior_timestamp
+                    and process_info.last_process_state == HordeProcessState.WAITING_FOR_JOB
+                ):
+                    acknowledged.append(process_id)
+            for process_id in acknowledged:
+                requested.pop(process_id, None)
+            if requested:
+                await asyncio.sleep(0.1)
+
+        if requested:
+            raise RuntimeError(
+                f"benchmark memory cleanup was not acknowledged within "
+                f"{_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS:.0f}s by process ids {sorted(requested)}",
+            )
+
     async def _settle_level_metrics(
         self,
         *,
@@ -2536,6 +2589,8 @@ class WarmHarnessSession:
         num_jobs_expected = len(scenario_jobs)
         num_forms_expected = len(alchemy_forms or [])
 
+        await self._prepare_level_boundary()
+
         # Before the concurrency call, which is the authority on the live cap: a config reload re-derives
         # the effective cap from the new max_threads, so applying the delta afterwards would undo it.
         self.apply_bridge_data_overrides(bridge_data_overrides or {})
@@ -2591,21 +2646,29 @@ class WarmHarnessSession:
                     logger.warning(
                         f"Warm-up pass did not drain within its {warmup_budget:.0f}s budget "
                         f"({warm_completed} completed, {warm_faulted} faulted of {num_jobs_expected} expected "
-                        f"job(s) and {num_forms_expected} alchemy form(s)); running the measured pass against a "
-                        f"worker that may still be cold. Process states: {_summarize_worker_processes(manager)}",
+                        f"job(s) and {num_forms_expected} alchemy form(s)); skipping the measured pass so "
+                        "unfinished warm-up work cannot leak into a reset scenario. "
+                        f"Process states: {_summarize_worker_processes(manager)}",
                     )
+                    measured_pass_skipped = True
+                    base_completed = warmup_base_completed
+                    base_faulted = warmup_base_faulted
+                    time_started = warmup_started
+                    warmup_seconds = 0.0
+                    timed_out = True
                 # Nothing warmed and nothing can: the worker refused every job outright, and it will refuse
                 # the identical generation ids again. Re-running them would only spend another pass earning
                 # the same faults, walking the consecutive-failure pause and the fault-rate breaker a second
                 # time, so the warm pass stands as the level's own (faulted) result.
-                measured_pass_skipped = (
+                all_warmup_jobs_faulted = (
                     warmup_drained
                     and num_jobs_expected > 0
                     and num_forms_expected == 0
                     and warm_completed == 0
                     and warm_faulted >= num_jobs_expected
                 )
-                if measured_pass_skipped:
+                if all_warmup_jobs_faulted:
+                    measured_pass_skipped = True
                     logger.warning(
                         f"Warm-up pass faulted all {num_jobs_expected} of the level's jobs; scoring the level "
                         "on that pass rather than serving the same jobs again.",
@@ -2660,6 +2723,7 @@ class WarmHarnessSession:
             diagnostics = _collect_run_diagnostics(
                 manager=manager,
                 num_jobs_expected=num_jobs_expected,
+                num_forms_expected=num_forms_expected,
                 elapsed=elapsed,
             )
             diagnostics.append(f"worker process states at timeout: {_summarize_worker_processes(manager)}")

@@ -179,3 +179,42 @@ class TestUnloadFromRamLaneTargeting:
         scheduler.unload_from_ram(0)
 
         assert _unload_ram_message_count(lane) == 0
+
+
+class TestAlchemyLaneRamPressureReclaim:
+    """Host pressure reaches the safety/post-process residents that alchemy grows."""
+
+    def test_idle_alchemy_lanes_receive_ram_unload(self) -> None:
+        """Pressure unloads both idle alchemy service processes regardless of the generic lane ceiling."""
+        safety = _lane(
+            0,
+            process_type=HordeProcessType.SAFETY,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            ram_usage_bytes=6 * 1024 * 1024 * 1024,
+        )
+        post_process = _lane(
+            1,
+            process_type=HordeProcessType.POST_PROCESS,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            ram_usage_bytes=5 * 1024 * 1024 * 1024,
+        )
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: safety, 1: post_process}))
+
+        scheduler._reclaim_idle_alchemy_lanes_under_pressure()
+
+        assert _unload_ram_message_count(safety) == 1
+        assert _unload_ram_message_count(post_process) == 1
+
+    def test_busy_alchemy_lane_is_not_interrupted(self) -> None:
+        """A form currently executing keeps its models until it returns to an idle state."""
+        post_process = _lane(
+            1,
+            process_type=HordeProcessType.POST_PROCESS,
+            state=HordeProcessState.ALCHEMY_STARTING,
+            ram_usage_bytes=5 * 1024 * 1024 * 1024,
+        )
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({1: post_process}))
+
+        scheduler._reclaim_idle_alchemy_lanes_under_pressure()
+
+        assert _unload_ram_message_count(post_process) == 0

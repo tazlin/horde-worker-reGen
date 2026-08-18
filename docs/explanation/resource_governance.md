@@ -134,6 +134,14 @@ before the floor is threatened as well as under active pressure: the lanes parti
 response rather than being exempt from it. Lane processes are deliberately left out of the creep-cycling
 path (which only cycles inference slots); the in-process unload is the whole containment for a lane.
 
+Alchemy has two additional resident owners that do not cross the generic 10 GB service-lane ceiling reliably:
+the post-processing lane retains each upscaler/face-fixer backend, and CPU safety can retain optional BLIP,
+interrogation tables, and the aesthetic head. Whenever the host is actually below its RAM danger floor, the
+pressure response therefore sends `UNLOAD_MODELS_FROM_RAM` to either owner as soon as it is idle. The
+post-processing process calls the backend's full RAM free; safety discards only those optional companions and
+keeps its base CLIP/NSFW stack ready. A busy alchemy form is never interrupted by this control—the serial child
+handles it after returning to idle—and the state-duration watchdog remains the bound if it never returns.
+
 A complementary release happens inside `hordelib`: when the component cache drops an entry (a budget
 eviction or a single-slot replacement), it issues a throttled, best-effort `gc.collect()` plus host trim
 so the displaced component's cold pages return to the OS. That trim reclaims only components the comfy
