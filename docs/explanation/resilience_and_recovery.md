@@ -564,6 +564,15 @@ manager-side **actions**:
   window far inside it. That is what makes the bound independent of link speed
   rather than a figure tuned to one machine.
 
+  Not every provisioning step can report bytes. Fetching the CLIP interrogator has
+  no download-only API (horde_safety fetches and loads it in a single call), so
+  from the parent it is a task at zero bytes for its whole duration, which the
+  movement signal cannot tell from a stalled transfer. Such a step is taken on
+  trust for one `POP_GATE_HELD_WEDGE_SECONDS` window from when it started, and no
+  longer: it can delay the escalation once, never cancel it. The grace is supplied
+  by the caller rather than held in `ModelAvailability`, so the window has one
+  definition.
+
   A pending post-processing drain can deliberately hold new inference sampling,
   so admission gets one bounded chance to reclaim ordinary idle memory and, only
   after a fresh non-fitting measurement, borrow one verified-idle VAE or component

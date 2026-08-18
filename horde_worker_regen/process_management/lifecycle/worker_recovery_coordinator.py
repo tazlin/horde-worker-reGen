@@ -241,11 +241,12 @@ class WorkerRecoveryCoordinator:
                 against this: a rung that leaves the named constraint unchanged did not address it. An
                 unwired caller reports None, which leaves the ladder's budgets the only bound on it.
             provisioning_download_advancing: Report whether a non-prefetch model download is in flight and
-                still gaining bytes. The pop-gate wedge defers to it while the worker has yet to complete a
-                job: a first run whose weights are still arriving is provisioning, and tearing the pool down
-                over it restarts the transfer rather than fixing anything. It is self-bounding, reporting
-                False once a download stops moving, so a dead transfer escalates as it always did. Defaults
-                to "never advancing" for an unwired caller.
+                still getting somewhere. The pop-gate wedge defers to it while the worker has yet to complete
+                a job: a first run whose weights are still arriving is provisioning, and tearing the pool
+                down over it restarts the transfer rather than fixing anything. It is self-bounding: a
+                transfer that stops moving, or a byte-less provisioning step past the grace its caller
+                granted, reports False and escalates as it always did. Defaults to "never advancing" for an
+                unwired caller.
             recovery_supervisor: Optional recovery policy object for tests.
             clock: Wall-clock provider for grace windows and rolling recovery counts.
         """
@@ -737,7 +738,9 @@ class WorkerRecoveryCoordinator:
         cannot act on. Its remedy is a pool teardown, and every teardown restarts the transfer the hold is
         waiting for, so on a link slow enough that a large weight outlasts the wedge window the escalation
         becomes the reason the worker never comes up. That defers only while bytes keep arriving; a transfer
-        that has stopped moving is a wedge like any other and escalates unchanged.
+        that has stopped moving is a wedge like any other and escalates unchanged. A provisioning step that
+        cannot report bytes at all is taken on trust for one wedge window from its start and no longer, so
+        it can delay this once but never hold it off.
         """
         gate = self._state.last_pop_gate
         if gate is None:

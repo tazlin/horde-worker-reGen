@@ -9,6 +9,7 @@ import threading
 import time
 import types
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol
 from unittest.mock import Mock
@@ -1586,9 +1587,10 @@ class TestSafetyModelDownloadReporting:
         )
 
     @staticmethod
-    def _stub_clip(monkeypatch: pytest.MonkeyPatch) -> None:
-        """Stand in for the CLIP fetch, whose real import pulls torch into the test process."""
+    def _stub_clip(monkeypatch: pytest.MonkeyPatch, cache_dir: Path) -> None:
+        """Stand in for the CLIP fetch and its cache, whose real import pulls torch into the test process."""
         horde_safety = types.ModuleType("horde_safety")
+        horde_safety.CACHE_FOLDER_PATH = str(cache_dir)  # type: ignore[attr-defined]
         interrogate = types.ModuleType("horde_safety.interrogate")
         interrogate.get_interrogator_no_blip = lambda *_args, **_kwargs: object()  # type: ignore[attr-defined]
         horde_safety.interrogate = interrogate  # type: ignore[attr-defined]
@@ -1598,10 +1600,11 @@ class TestSafetyModelDownloadReporting:
     def test_the_transfer_reports_its_bytes_through_the_task_callback(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """Bytes reported by the fetch land on the task's status, so the download view can render them."""
         process = self._make_process()
-        self._stub_clip(monkeypatch)
+        self._stub_clip(monkeypatch, tmp_path)
         task = DownloadTask(
             kind=DownloadKind.SAFETY,
             model_name="safety models",
@@ -1632,10 +1635,11 @@ class TestSafetyModelDownloadReporting:
     def test_a_failed_fetch_records_the_reason_against_the_safety_feature(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """The reason the models did not arrive is reported, not left in a subprocess log."""
         process = self._make_process()
-        self._stub_clip(monkeypatch)
+        self._stub_clip(monkeypatch, tmp_path)
 
         def fake_fetch(*, callback: object) -> None:
             raise RuntimeError("checksum mismatch")
@@ -1660,3 +1664,71 @@ class TestSafetyModelDownloadReporting:
         )
 
         assert process._safety_models_present_on_disk() is False
+
+
+class TestSafetyHalvesAreEnsuredIndependently:
+    """Needing one safety model must not re-do the work for the other.
+
+    The two are placed by completely different means: DeepDanbooru by a plain file fetch, CLIP only by
+    constructing the interrogator, which also loads it into RAM and contacts the model hub. Treating them
+    as one unit means a DeepDanbooru re-check drags the CLIP work along, and that work reports no bytes,
+    so the worker sits at the ``no_safety_process`` gate showing a download at zero for minutes with
+    everything it needs already on disk.
+    """
+
+    def _make_process(self) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+        )
+
+    @staticmethod
+    def _stub_clip_fetch(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
+        """Record whether the interrogator was constructed, without importing torch into the test."""
+        horde_safety = types.ModuleType("horde_safety")
+        interrogate = types.ModuleType("horde_safety.interrogate")
+
+        def fetch(*_args: object, **_kwargs: object) -> object:
+            calls.append("clip")
+            return object()
+
+        interrogate.get_interrogator_no_blip = fetch  # type: ignore[attr-defined]
+        horde_safety.interrogate = interrogate  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "horde_safety", horde_safety)
+        monkeypatch.setitem(sys.modules, "horde_safety.interrogate", interrogate)
+
+    def test_a_cached_clip_is_not_refetched_for_a_deep_danbooru_pass(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A DeepDanbooru-only reason to run must leave an already-cached CLIP untouched."""
+        process = self._make_process()
+        calls: list[str] = []
+        self._stub_clip_fetch(monkeypatch, calls)
+        monkeypatch.setattr(process, "_clip_present_on_disk", lambda: True)
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.safety_model_prefetch.ensure_deep_danbooru_present",
+            lambda *, callback: calls.append("deep_danbooru"),
+        )
+
+        assert process._ensure_safety_models(lambda _done, _total: None) is True
+        assert calls == ["deep_danbooru"]
+        assert process._safety_present is True
+
+    def test_an_absent_clip_is_fetched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The skip is conditional on the cache, so a cold worker still gets its CLIP weights."""
+        process = self._make_process()
+        calls: list[str] = []
+        self._stub_clip_fetch(monkeypatch, calls)
+        monkeypatch.setattr(process, "_clip_present_on_disk", lambda: False)
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.safety_model_prefetch.ensure_deep_danbooru_present",
+            lambda *, callback: calls.append("deep_danbooru"),
+        )
+
+        assert process._ensure_safety_models(lambda _done, _total: None) is True
+        assert calls == ["deep_danbooru", "clip"]

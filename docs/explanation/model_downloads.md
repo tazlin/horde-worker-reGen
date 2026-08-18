@@ -343,8 +343,17 @@ The safety process keeps the last word on integrity. If it still cannot read the
 weight, it deletes the file and its sidecar and says so plainly, so the next start
 downloads it again instead of crash-looping on a file that will never load.
 
-The CLIP half stays with `horde_safety`'s own fetch, which resumes through the
-HuggingFace cache and reports only coarse progress.
+The two halves are ensured **independently**, because they are placed by
+completely different means and only one of them is cheap to re-check. CLIP has no
+download-only API: the only way to place it is to construct the interrogator,
+which also loads roughly 1.7 GB into the download process's RAM, reads the
+precomputed label tables, and contacts the model hub for metadata. None of that
+reports bytes, so while it runs the downloads view shows a named transfer at zero
+and job pops stay held at `no_safety_process`. Folding both models into one
+verdict meant a DeepDanbooru re-check dragged that work along on a worker whose
+CLIP was already cached: minutes of a fully gated worker with everything it needed
+already on disk. So the CLIP step is skipped outright when an `open_clip*` file is
+already in the cache, and only a genuinely cold worker pays for it.
 
 ## Planning: what a config implies for disk
 

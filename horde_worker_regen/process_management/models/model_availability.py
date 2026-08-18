@@ -51,6 +51,7 @@ class ModelAvailability:
     _downloader_lost: bool
     _download_high_water_bytes: int
     _download_advanced_at: float | None
+    _download_started_at: float | None
 
     def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
         """Initialise with availability unknown (no report received yet).
@@ -61,6 +62,7 @@ class ModelAvailability:
         self._clock = clock
         self._download_high_water_bytes = 0
         self._download_advanced_at = None
+        self._download_started_at = None
         self._present = None
         self._currently_downloading = None
         self._pending = ()
@@ -158,23 +160,45 @@ class ModelAvailability:
         if not transferring:
             self._download_high_water_bytes = 0
             self._download_advanced_at = None
+            self._download_started_at = None
             return
+        if self._download_started_at is None:
+            self._download_started_at = self._clock()
         total = sum(item.downloaded_bytes for item in transferring)
-        if self._download_advanced_at is None or total > self._download_high_water_bytes:
+        if total > self._download_high_water_bytes:
             self._download_high_water_bytes = total
             self._download_advanced_at = self._clock()
 
-    def download_advancing(self, *, stall_seconds: float = DOWNLOAD_PROGRESS_STALL_SECONDS) -> bool:
-        """Return whether a non-prefetch download is in flight and has gained bytes recently.
+    def download_advancing(
+        self,
+        *,
+        stall_seconds: float = DOWNLOAD_PROGRESS_STALL_SECONDS,
+        opaque_grace_seconds: float = 0.0,
+    ) -> bool:
+        """Return whether a non-prefetch download is in flight and still getting somewhere.
 
         This is the difference between a worker that cannot make progress and one whose first-run
         provisioning is simply slow. A download that is still moving is capacity arriving, however slowly; a
         download that has moved nothing for ``stall_seconds`` is not, and is reported as such so the
         watchdogs that read this are never held off by a transfer that has died.
+
+        Not every provisioning step can report bytes. Fetching the CLIP interrogator has no download-only
+        API: horde_safety fetches and loads it in one call, so from here it is an in-flight task at zero
+        bytes for its whole duration, indistinguishable from a stalled transfer. ``opaque_grace_seconds``
+        is how long such a step is taken on trust from when it started; past that it reports as not
+        advancing, so it can delay an escalation but never cancel one. A caller that leaves the grace at
+        zero gets the movement signal alone.
+
+        Args:
+            stall_seconds: How long without a gained byte before a reporting transfer reads as stopped.
+            opaque_grace_seconds: How long a step that has never reported a byte is trusted from its start.
         """
-        if self._download_advanced_at is None:
-            return False
-        return (self._clock() - self._download_advanced_at) < stall_seconds
+        now = self._clock()
+        if self._download_advanced_at is not None and (now - self._download_advanced_at) < stall_seconds:
+            return True
+        if self._download_advanced_at is None and self._download_started_at is not None:
+            return (now - self._download_started_at) < opaque_grace_seconds
+        return False
 
     @property
     def downloader_lost(self) -> bool:

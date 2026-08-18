@@ -1785,26 +1785,35 @@ class HordeDownloadProcess(HordeProcess):
 
     # region per-kind download helpers
 
+    def _clip_present_on_disk(self) -> bool:
+        """Probe whether the CLIP interrogator weights are already in the safety cache.
+
+        CLIP is fetched by ``open_clip`` into ``CACHE_FOLDER_PATH`` (as an ``open_clip_*`` weights file)
+        with no presence API of its own, so existence is all there is to go on. A false negative costs a
+        re-ensure, which is why this is probed separately from DeepDanbooru rather than folded into one
+        verdict: the only way to place CLIP is to construct the interrogator, which loads it into RAM and
+        contacts the model hub, and doing that because the *other* model needed attention is minutes of a
+        gated worker for nothing.
+        """
+        from pathlib import Path
+
+        from horde_safety import CACHE_FOLDER_PATH
+
+        return any(Path(CACHE_FOLDER_PATH).rglob("open_clip*"))
+
     def _safety_models_present_on_disk(self) -> bool:
         """Probe whether the required safety models are on disk and usable.
 
         DeepDanbooru is judged by its verified marker rather than by existence: an interrupted transfer
         leaves a truncated file at the real filename, and calling that present starts a safety process that
-        can only fail deserializing it. CLIP is fetched by ``open_clip`` into ``CACHE_FOLDER_PATH`` (as an
-        ``open_clip_*`` weights file) with no presence API, so it is probed by existence; a false negative
-        there costs only an idempotent re-ensure.
+        can only fail deserializing it.
         """
         try:
-            from pathlib import Path
-
-            from horde_safety import CACHE_FOLDER_PATH
-
             from horde_worker_regen.process_management.workers.safety_model_prefetch import (
                 deep_danbooru_verified_on_disk,
             )
 
-            clip_present = any(Path(CACHE_FOLDER_PATH).rglob("open_clip*"))
-            return deep_danbooru_verified_on_disk() and clip_present
+            return deep_danbooru_verified_on_disk() and self._clip_present_on_disk()
         except Exception as e:  # noqa: BLE001 - a probe failure must never crash the download process
             logger.warning(f"Download process: could not probe safety-model presence: {type(e).__name__} {e}")
             return False
@@ -1830,16 +1839,12 @@ class HordeDownloadProcess(HordeProcess):
                 self._safety_ensured = True
             return True
         try:
-            from horde_safety.interrogate import get_interrogator_no_blip
-
             from horde_worker_regen.process_management.workers.safety_model_prefetch import (
                 ensure_deep_danbooru_present,
             )
 
             ensure_deep_danbooru_present(callback=callback)
-            # No download-only API for CLIP: this downloads it (when absent) and loads it transiently into
-            # this process's RAM; the local interrogator is dropped on return, so the RAM is reclaimed.
-            get_interrogator_no_blip()
+            self._ensure_clip_present()
             self._safety_present = True
             logger.success("Download process: required safety models are present")
             return True
@@ -1852,6 +1857,28 @@ class HordeDownloadProcess(HordeProcess):
         finally:
             with self._lock:
                 self._safety_ensured = True
+
+    def _ensure_clip_present(self) -> None:
+        """Place the CLIP interrogator weights on disk, skipping the work entirely when they already are.
+
+        horde_safety exposes no download-only API for CLIP: the only way to fetch it is to construct the
+        interrogator, which also loads roughly 1.7 GB into this process's RAM, reads the precomputed label
+        tables, and contacts the model hub for metadata. None of that reports bytes, so while it runs the
+        downloads view shows a named transfer at zero and job pops stay held at ``no_safety_process`` with
+        nothing to show for the wait. Skipping it on an existing cache is what keeps that cost to the one
+        start that genuinely has to pay it. The local interrogator is dropped on return, so its RAM is
+        reclaimed.
+        """
+        if self._clip_present_on_disk():
+            logger.debug("Download process: CLIP interrogator weights are already cached")
+            return
+        from horde_safety.interrogate import get_interrogator_no_blip
+
+        logger.info(
+            "Download process: fetching the CLIP interrogator weights. This reports no byte progress "
+            "(horde_safety fetches and loads them in one step) and can take several minutes.",
+        )
+        get_interrogator_no_blip()
 
     def _download_default_loras(self, manager: ModelManager) -> None:
         """Fetch the curated default-LoRa set via the CivitAI ad-hoc engine (coarse progress only)."""

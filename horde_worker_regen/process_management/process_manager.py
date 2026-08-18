@@ -1862,7 +1862,9 @@ class HordeWorkerProcessManager:
             unbound_disaggregated_job_ids=self._disaggregation_orchestrator.unbound_job_ids,
             head_aux_prefetch_in_flight=self._head_aux_prefetch_in_flight,
             head_block_reason=self._head_block_reason,
-            provisioning_download_advancing=self._model_availability.download_advancing,
+            provisioning_download_advancing=lambda: self._model_availability.download_advancing(
+                opaque_grace_seconds=WorkerRecoveryCoordinator.POP_GATE_HELD_WEDGE_SECONDS,
+            ),
         )
 
         self._job_submitter = JobSubmitter(

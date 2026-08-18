@@ -101,6 +101,9 @@ _STARTUP_HANG_SECONDS = _STARTUP_HANG_TIMEOUT_SECONDS * 10
 _SAFETY_MODEL_BYTES = 675_000_000
 """A stand-in size for the safety weight, only large enough that a quarter of it is plainly a partial file."""
 
+_OPAQUE_GRACE_SECONDS = 900.0
+"""The window a caller grants a provisioning step that cannot report bytes; the wedge passes its own."""
+
 
 class _AdvanceableTime:
     """Stand-in for the ``time`` module whose ``time()`` the test can advance.
@@ -701,3 +704,73 @@ class TestDownloadProgressLiveness:
         _report_download(availability, 1)
 
         assert availability.download_advancing() is True
+
+
+def _report_opaque_step(availability: ModelAvailability) -> None:
+    """Push a report for a provisioning step that is in flight but can report no bytes.
+
+    The CLIP interrogator fetch is the real one: horde_safety fetches and loads it in a single call, so
+    from the parent it is a task at zero bytes for its whole duration.
+    """
+    availability.update(
+        present=set(),
+        currently_downloading="safety models",
+        pending=(),
+        failed=(),
+        status=DownloadStatusSnapshot(
+            phase=DownloadPhase.DOWNLOADING,
+            active=[
+                CurrentDownloadStatus(
+                    model_name="safety models",
+                    feature=FEATURE_SAFETY,
+                    target_dir="/models/clip_blip",
+                    downloaded_bytes=0,
+                    total_bytes=0,
+                ),
+            ],
+        ),
+        scan_complete=True,
+    )
+
+
+class TestOpaqueProvisioningStep:
+    """A provisioning step with no byte signal is trusted for a bounded window, then treated as any hold."""
+
+    def test_a_byte_less_step_defers_the_backstop_within_its_grace(self) -> None:
+        """The CLIP fetch reports nothing, so movement cannot excuse it; its start is all there is to go on."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_opaque_step(availability)
+
+        clock.advance(_OPAQUE_GRACE_SECONDS / 2)
+
+        assert availability.download_advancing(opaque_grace_seconds=_OPAQUE_GRACE_SECONDS) is True
+
+    def test_the_grace_expires_so_the_step_cannot_hold_recovery_off(self) -> None:
+        """A byte-less step delays the escalation once; it must never cancel it."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_opaque_step(availability)
+
+        clock.advance(_OPAQUE_GRACE_SECONDS * 2)
+
+        assert availability.download_advancing(opaque_grace_seconds=_OPAQUE_GRACE_SECONDS) is False
+
+    def test_no_grace_leaves_the_movement_signal_alone(self) -> None:
+        """A caller that grants no grace judges on gained bytes only, as it did before the grace existed."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_opaque_step(availability)
+
+        assert availability.download_advancing() is False
+
+    def test_a_step_that_starts_reporting_bytes_switches_to_the_movement_signal(self) -> None:
+        """Once bytes arrive, the transfer is judged on movement and outlives the start-based grace."""
+        clock = _FakeClock()
+        availability = ModelAvailability(clock=clock)
+        _report_opaque_step(availability)
+
+        clock.advance(_OPAQUE_GRACE_SECONDS * 2)
+        _report_download(availability, _SAFETY_MODEL_BYTES // 4)
+
+        assert availability.download_advancing(opaque_grace_seconds=_OPAQUE_GRACE_SECONDS) is True
