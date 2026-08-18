@@ -125,7 +125,7 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import (
     AlchemyFormStatus,
 )
 from horde_worker_regen.process_management.jobs.image_coordinator import ImageGenerationCoordinator
-from horde_worker_regen.process_management.jobs.job_popper import JobPopper
+from horde_worker_regen.process_management.jobs.job_popper import JobPopper, _model_serviceability_verdicts
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -170,6 +170,10 @@ from horde_worker_regen.process_management.resources.device_free_governor import
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
+from horde_worker_regen.process_management.resources.model_serviceability import (
+    ModelServiceabilityTier,
+    max_power_to_pixels,
+)
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRungKind,
     VerifiedReclaimLadder,
@@ -7408,6 +7412,24 @@ class HordeWorkerProcessManager:
             if total_vram_mb is None:
                 total_vram_mb = card_runtime.total_vram_mb
 
+            unserviceable_models: list[str] = []
+            constrained_models: dict[str, int] = {}
+            for model in card_runtime.config.image_models_to_load:
+                for _, verdict in _model_serviceability_verdicts(
+                    model,
+                    card_runtimes={device_index: card_runtime},
+                    model_metadata=self._model_metadata,
+                    admission_baseline_provider=self.latest_baseline_estimate_mb,
+                    max_pixels=max_power_to_pixels(card_runtime.config.max_power),
+                ):
+                    if verdict.tier is ModelServiceabilityTier.UNSERVICEABLE:
+                        unserviceable_models.append(model)
+                    elif (
+                        verdict.tier is ModelServiceabilityTier.CONSTRAINED
+                        and verdict.largest_fitting_max_power is not None
+                    ):
+                        constrained_models[model] = verdict.largest_fitting_max_power
+
             cards.append(
                 CardSnapshot(
                     device_index=device_index,
@@ -7424,6 +7446,8 @@ class HordeWorkerProcessManager:
                     residency_phase=residency_phase,
                     unservable_models=unservable_models,
                     worst_fault_streak=worst_fault_streak,
+                    unserviceable_models=unserviceable_models,
+                    constrained_models=constrained_models,
                 ),
             )
         return cards

@@ -112,3 +112,37 @@ def test_multi_gpu_projects_each_card_independently() -> None:
     assert card1.worst_fault_streak == 3
     # The streak is keyed to card 1 only: card 0 still serves m1.
     assert card0.worst_fault_streak == 0
+
+
+def test_card_snapshot_reports_model_fit_tiers() -> None:
+    """A card reports the configured models it cannot fit at all and those it fits only below ``max_power``."""
+    from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
+    from tests.process_management.conftest import make_mock_model_reference_record, make_test_model_metadata
+
+    config = make_mock_bridge_data(image_models_to_load=["flux_model", "sdxl_model", "sd15_model"], max_power=64)
+    pm = make_testable_process_manager(bridge_data=config)
+    pm._card_runtimes = make_test_card_runtimes(config=config, total_vram_mb=8192.0)
+    pm._model_metadata = make_test_model_metadata(
+        {
+            "flux_model": make_mock_model_reference_record(
+                "flux_model",
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+            ),
+            "sdxl_model": make_mock_model_reference_record(
+                "sdxl_model",
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+            "sd15_model": make_mock_model_reference_record(
+                "sd15_model",
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+            ),
+        },
+    )
+    pm._last_baseline_estimate_mb_by_device[0] = 2048.0
+
+    card = pm._build_card_snapshots()[0]
+
+    assert card.unserviceable_models == ["flux_model"]
+    assert set(card.constrained_models) == {"sdxl_model"}
+    assert 8 <= card.constrained_models["sdxl_model"] < 64

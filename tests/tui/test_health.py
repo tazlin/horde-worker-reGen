@@ -504,3 +504,27 @@ def test_per_card_duty_survives_a_snapshot_round_trip() -> None:
     assert restored.gpu_utilization_busy_fraction_per_card == {0: 0.9, 1: 0.1}
     assert restored.gpu_utilization_samples_per_card == {0: 4, 1: 4}
     assert restored.gpu_utilization_mean_percent == 45.0
+
+
+def test_model_fit_rows_name_unserviceable_and_constrained_models() -> None:
+    """A model the card cannot fit is an ERROR row; one offered at reduced size is a WARN naming the cap."""
+    from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
+
+    snapshot = _snapshot(
+        per_card=[
+            CardSnapshot(
+                device_index=0,
+                kind="cuda",
+                unserviceable_models=["Flux.1-Schnell fp8 (Compact)"],
+                constrained_models={"AlbedoBase XL (SDXL)": 40},
+            ),
+        ],
+    )
+
+    report = derive(snapshot, snapshot_age=1.0, supervisor_status=SupervisorStatus.RUNNING)
+    rows = {check.name: check for check in report.checks if check.name == "Models"}
+    statuses = [(check.status, check.detail) for check in report.checks if check.name == "Models"]
+
+    assert rows
+    assert any(status is HealthStatus.ERROR and "Flux.1-Schnell" in detail for status, detail in statuses)
+    assert any(status is HealthStatus.WARN and "max_power 40" in detail for status, detail in statuses)

@@ -1031,8 +1031,12 @@ class SimpleModelStatusView(VerticalScroll):
             lines.append(Text(detail, "red"))
         for failure in activity.failures:
             line = Text()
-            line.append(f"{failure.model_name} ", "bold red")
-            line.append(f"({failure.feature}) could not be downloaded: ", "red")
+            line.append(failure.model_name, "bold red")
+            # The coarse downloads (the safety models among them) label the whole task with its feature
+            # name, so naming both would read as a stutter.
+            if failure.feature != failure.model_name:
+                line.append(f" ({failure.feature})", "red")
+            line.append(" could not be downloaded: ", "red")
             line.append(failure.reason, "grey70")
             lines.append(line)
         if not lines:

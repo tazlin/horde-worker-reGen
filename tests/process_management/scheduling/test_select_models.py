@@ -503,11 +503,13 @@ class TestModelServiceabilityFiltering:
     """Model serviceability filters the offered model set before popping."""
 
     def test_unserviceable_model_excluded_from_offer(self) -> None:
-        """A model whose minimum footprint exceeds the scoped card is not offered."""
+        """A model whose smallest job exceeds the card is not offered; one that fits at some size stays."""
+        flux = "flux_model"
         sdxl = "sdxl_model"
         sd15 = "sd15_model"
-        bridge_data = make_mock_bridge_data(image_models_to_load=[sdxl, sd15])
+        bridge_data = make_mock_bridge_data(image_models_to_load=[flux, sdxl, sd15])
         reference = {
+            flux: make_mock_model_reference_record(flux, baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1),
             sdxl: make_mock_model_reference_record(
                 sdxl,
                 baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
@@ -532,7 +534,7 @@ class TestModelServiceabilityFiltering:
             serviceability_logged=set(),
         )
 
-        assert result == {sd15}
+        assert result == {sdxl, sd15}
 
     def test_fitting_model_is_never_excluded_from_offer(self) -> None:
         """A model whose minimum footprint fits the card remains in the offer."""

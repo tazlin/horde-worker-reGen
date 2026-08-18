@@ -172,13 +172,13 @@ class TestModelServiceabilityAdmission:
     """Scheduler guards stale model offers before child VRAM work starts."""
 
     async def test_unserviceable_late_arrival_faults_before_preload(self) -> None:
-        """A stale SDXL job on an 8GB card is faulted without sending a child preload."""
-        model = "sdxl_model"
+        """A stale Flux job on an 8GB card is faulted without sending a child preload."""
+        model = "flux_model"
         bridge_data = make_mock_bridge_data(image_models_to_load=[model])
         reference = {
             model: make_mock_model_reference_record(
                 model,
-                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
             ),
         }
         metadata = make_test_model_metadata(reference)

@@ -137,12 +137,16 @@ def _residency_cell(row: _CardRow) -> Text:
 
 
 def _faults_cell(row: _CardRow) -> Text:
-    """The Faults cell: models gone locally unservable on this card and the worst over-budget streak."""
+    """The Faults cell: locally unservable models, the worst over-budget streak, then models that do not fit."""
     card = row.card
     if card.unservable_models:
         return Text(f"{len(card.unservable_models)} unservable ×{card.worst_fault_streak}", style="bold red")
     if card.worst_fault_streak > 0:
         return Text(f"streak {card.worst_fault_streak}", style="yellow")
+    if card.unserviceable_models:
+        return Text(f"{len(card.unserviceable_models)} cannot fit", style="bold red")
+    if card.constrained_models:
+        return Text(f"{len(card.constrained_models)} reduced size", style="yellow")
     return Text("-", style="grey50")
 
 

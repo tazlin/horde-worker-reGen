@@ -426,6 +426,7 @@ def _build_checks(
             )
         )
     checks.extend(_per_card_checks(snapshot))
+    checks.extend(_model_fit_checks(snapshot))
     checks.append(_disk_check(snapshot))
     if snapshot.lora_pops_blocked_by_disk:
         checks.append(
@@ -519,6 +520,32 @@ def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     if problems:
         return problems
     return [HealthCheck("GPUs", HealthStatus.OK, f"{len(cards)} cards healthy")]
+
+
+def _model_fit_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
+    """Per-card model-fit rows: models the card cannot run at all, and models it runs only at reduced size.
+
+    Silent when every configured model fits at the configured ``max_power``. An unserviceable model is an
+    ERROR because the operator configured something the worker silently never offers; a constrained model is
+    a WARN because it is still served, only with pops asking for smaller jobs.
+    """
+    rows: list[HealthCheck] = []
+    for card in snapshot.per_card:
+        name = f"Models GPU {card.device_index}" if len(snapshot.per_card) > 1 else "Models"
+        if card.unserviceable_models:
+            names = ", ".join(card.unserviceable_models[:3])
+            more = f" (+{len(card.unserviceable_models) - 3})" if len(card.unserviceable_models) > 3 else ""
+            rows.append(HealthCheck(name, HealthStatus.ERROR, f"Not offered, cannot fit this card: {names}{more}"))
+        if card.constrained_models:
+            lowest = min(card.constrained_models.values())
+            names = ", ".join(f"{model} (max_power {cap})" for model, cap in list(card.constrained_models.items())[:3])
+            more = f" (+{len(card.constrained_models) - 3})" if len(card.constrained_models) > 3 else ""
+            rows.append(
+                HealthCheck(
+                    name, HealthStatus.WARN, f"Offered at reduced size, pops capped at {lowest}: {names}{more}"
+                ),
+            )
+    return rows
 
 
 def gpu_duty_low_cards(snapshot: WorkerStateSnapshot) -> list[int]:

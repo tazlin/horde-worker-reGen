@@ -132,3 +132,62 @@ class TestReentryDurationResolution:
         )
         popper = _make_popper(bridge_data=bridge_data)
         assert popper._resolve_large_model_pop_durations(bridge_data) == (0.0, 20.0)
+
+
+class TestServiceabilityMaxPowerCap:
+    """A model the card fits only at reduced size lowers the pop's ``max_power`` instead of leaving the offer."""
+
+    def _popper_with_card(self, *, total_vram_mb: float, baseline_mb: float, max_power: int) -> JobPopper:
+        from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
+        from tests.process_management.conftest import (
+            make_mock_model_reference_record,
+            make_test_card_runtimes,
+            make_test_model_metadata,
+        )
+
+        bridge_data = make_mock_bridge_data(image_models_to_load=["sdxl_model", "sd15_model"], max_power=max_power)
+        metadata = make_test_model_metadata(
+            {
+                "sdxl_model": make_mock_model_reference_record(
+                    "sdxl_model",
+                    baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+                ),
+                "sd15_model": make_mock_model_reference_record(
+                    "sd15_model",
+                    baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+                ),
+            },
+        )
+        popper = JobPopper(
+            state=WorkerState(),
+            process_map=ProcessMap({}),
+            job_tracker=JobTracker(),
+            shutdown_manager=Mock(),
+            runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+            api_sessions=make_test_api_sessions(horde_client_session=Mock(), aiohttp_session=Mock()),
+            max_inference_processes=2,
+            max_concurrent_inference_processes=1,
+            model_metadata=metadata,
+            admission_baseline_provider=lambda _device: baseline_mb,
+        )
+        popper._card_runtimes = make_test_card_runtimes(config=bridge_data, total_vram_mb=total_vram_mb)
+        return popper
+
+    def test_constrained_model_caps_pop_max_power_and_logs_once(self) -> None:
+        """SDXL on a tight 8GB card lowers max_power to the largest fitting size; the cap is logged once."""
+        popper = self._popper_with_card(total_vram_mb=8192.0, baseline_mb=2048.0, max_power=64)
+
+        capped = popper._serviceability_max_power_cap({"sdxl_model", "sd15_model"}, 64, popper._card_runtimes)
+
+        assert 8 <= capped < 64
+        assert popper._serviceability_cap_logged == {"sdxl_model": capped}
+        again = popper._serviceability_max_power_cap({"sdxl_model", "sd15_model"}, 64, popper._card_runtimes)
+        assert again == capped
+
+    def test_fitting_models_leave_max_power_alone(self) -> None:
+        """A card with room for the max_power job keeps the configured max_power."""
+        popper = self._popper_with_card(total_vram_mb=24576.0, baseline_mb=1024.0, max_power=64)
+
+        assert popper._serviceability_max_power_cap({"sdxl_model", "sd15_model"}, 64, popper._card_runtimes) == 64
+        assert popper._serviceability_cap_logged == {}

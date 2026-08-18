@@ -64,7 +64,12 @@ allow_post_processing: false  # If using SDXL/Flux, else can be true
 allow_sdxl_controlnet: false
 ```
 
-Minimise other VRAM-consuming apps while the worker runs.
+Minimise other VRAM-consuming apps while the worker runs. SDXL fits an 8 GB card at these settings (its
+UNet plus a 1024x1024 sampling activation is around 6.2 GB), but only if the desktop and other apps leave that
+much free: the worker checks each configured model against the card at pop time and, when the full
+`max_power` job would not fit, still offers the model with the pop's `max_power` lowered to what does fit and
+says so in the log and the Health tab. A model whose 512x512 job cannot fit is not offered at all. See
+[Troubleshooting](troubleshoot.md#common-problems).
 
 ### Lower-end or under-performing GPUs
 

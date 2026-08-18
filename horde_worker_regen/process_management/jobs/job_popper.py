@@ -64,7 +64,10 @@ from horde_worker_regen.process_management.models.model_sizing import (
     model_size_tier,
 )
 from horde_worker_regen.process_management.resources.model_serviceability import (
+    ModelServiceabilityTier,
+    ModelServiceabilityVerdict,
     assess_model_serviceability,
+    max_power_to_pixels,
     model_footprint_figures_for_baseline,
 )
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -374,6 +377,48 @@ def _baseline_value_for_model(model_metadata: ModelMetadata | None, model_name: 
     return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
 
 
+def _model_serviceability_verdicts(
+    model: str,
+    *,
+    card_runtimes: dict[int, CardRuntime],
+    model_metadata: ModelMetadata,
+    admission_baseline_provider: Callable[[int | None], float | None] | None,
+    max_pixels: int | None,
+) -> list[tuple[CardRuntime, ModelServiceabilityVerdict]]:
+    """Return one serviceability verdict per card that serves ``model``.
+
+    Empty when no card serves the model. Each verdict abstains (reads as serviceable) when the model's
+    footprint or the card's total is unknown.
+    """
+    serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
+    if not serving_cards:
+        return []
+    figures = model_footprint_figures_for_baseline(_baseline_value_for_model(model_metadata, model))
+    verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
+    for card in serving_cards:
+        baseline_mb = (
+            admission_baseline_provider(card.device_index) if admission_baseline_provider is not None else None
+        )
+        verdicts.append(
+            (
+                card,
+                assess_model_serviceability(
+                    total_vram_mb=card.total_vram_mb,
+                    baseline_mb=0.0 if baseline_mb is None else baseline_mb,
+                    noise_buffer_mb=None,
+                    figures=figures,
+                    max_pixels=max_pixels,
+                ),
+            ),
+        )
+    return verdicts
+
+
+def _serviceability_arithmetic(verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]]) -> str:
+    """Render every card's serviceability arithmetic on one line."""
+    return "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
+
+
 def _serviceability_held_back_models(
     models: set[str],
     *,
@@ -382,44 +427,37 @@ def _serviceability_held_back_models(
     admission_baseline_provider: Callable[[int | None], float | None] | None,
     serviceability_logged: set[str] | None,
 ) -> set[str]:
-    """Return models whose minimum footprint cannot fit any card in this pop scope."""
+    """Return models whose smallest legal job cannot fit any card in this pop scope.
+
+    A model that fits at some size but not at the operator's ``max_power`` is not held back here; the pop's
+    ``max_power`` is lowered for it instead (see :meth:`JobPopper._serviceability_max_power_cap`).
+    """
     if model_metadata is None or card_runtimes is None or len(card_runtimes) == 0:
         return set()
 
     held_back: set[str] = set()
     for model in models:
-        serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
-        if not serving_cards:
-            continue
-        baseline = _baseline_value_for_model(model_metadata, model)
-        figures = model_footprint_figures_for_baseline(baseline)
-        verdicts = []
-        for card in serving_cards:
-            baseline_mb = (
-                admission_baseline_provider(card.device_index) if admission_baseline_provider is not None else None
-            )
-            verdicts.append(
-                assess_model_serviceability(
-                    total_vram_mb=card.total_vram_mb,
-                    baseline_mb=0.0 if baseline_mb is None else baseline_mb,
-                    noise_buffer_mb=None,
-                    figures=figures,
-                ),
-            )
-        if any(verdict.serviceable for verdict in verdicts):
+        verdicts = _model_serviceability_verdicts(
+            model,
+            card_runtimes=card_runtimes,
+            model_metadata=model_metadata,
+            admission_baseline_provider=admission_baseline_provider,
+            max_pixels=None,
+        )
+        if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
             continue
         held_back.add(model)
         if serviceability_logged is None:
             continue
-        key = f"{model}:{','.join(str(card.device_index) for card in serving_cards)}"
+        key = f"{model}:{','.join(str(card.device_index) for card, _ in verdicts)}"
         if key in serviceability_logged:
             continue
         serviceability_logged.add(key)
-        arithmetic = "; ".join(
-            f"device {card.device_index}: {verdict.reason()}"
-            for card, verdict in zip(serving_cards, verdicts, strict=True)
+        logger.warning(
+            f"Not offering {model}: its smallest legal job (512x512) does not fit any card that serves it, so it "
+            f"is removed from every pop. Remove it from your models or free VRAM on the card. "
+            f"{_serviceability_arithmetic(verdicts)}",
         )
-        logger.info(f"Not offering unserviceable model {model}: {arithmetic}")
     return held_back
 
 
@@ -575,6 +613,7 @@ class JobPopper:
         self._model_metadata = model_metadata
         self._admission_baseline_provider = admission_baseline_provider
         self._serviceability_exclusion_logged: set[str] = set()
+        self._serviceability_cap_logged: dict[str, int] = {}
         self._whole_card_residency_active = (
             whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
         )
@@ -756,6 +795,51 @@ class JobPopper:
     def _is_large_model(self, model_name: str | None) -> bool:
         """Whether a model is in the EXTRA_LARGE ('very large') tier the pop limiters govern."""
         return model_name is not None and is_extra_large_model(model_name, self._baseline_value_for(model_name))
+
+    def _serviceability_max_power_cap(
+        self,
+        models: set[str],
+        pop_max_power: int,
+        card_runtimes: dict[int, CardRuntime] | None,
+    ) -> int:
+        """Return ``pop_max_power`` lowered to what every offered model can host on some serving card.
+
+        For each model whose smallest job fits but whose ``pop_max_power`` job does not fit any serving card,
+        the cap is the best (largest) fitting ``max_power`` across those cards. The pop takes the smallest cap
+        over its models. Each model's cap is logged once per value so an operator sees, at model-pick time,
+        which models the card can only run reduced and to what size.
+        """
+        if self._model_metadata is None or card_runtimes is None or len(card_runtimes) == 0:
+            return pop_max_power
+        capped = pop_max_power
+        for model in sorted(models):
+            verdicts = _model_serviceability_verdicts(
+                model,
+                card_runtimes=card_runtimes,
+                model_metadata=self._model_metadata,
+                admission_baseline_provider=self._admission_baseline_provider,
+                max_pixels=max_power_to_pixels(pop_max_power),
+            )
+            if not verdicts or any(v.tier is ModelServiceabilityTier.SERVICEABLE for _, v in verdicts):
+                continue
+            fitting = [
+                v.largest_fitting_max_power
+                for _, v in verdicts
+                if v.tier is ModelServiceabilityTier.CONSTRAINED and v.largest_fitting_max_power is not None
+            ]
+            if not fitting:
+                continue
+            model_cap = max(fitting)
+            if self._serviceability_cap_logged.get(model) != model_cap:
+                self._serviceability_cap_logged[model] = model_cap
+                logger.warning(
+                    f"Offering {model} at reduced max_power {model_cap} (configured {pop_max_power}): the card "
+                    f"cannot host it at full size, so pops that include it ask for smaller jobs. Lower max_power, "
+                    f"free VRAM on the card, or remove the model to silence this. "
+                    f"{_serviceability_arithmetic(verdicts)}",
+                )
+            capped = min(capped, model_cap)
+        return capped
 
     def _apply_idle_fill_ladder(
         self,
@@ -1965,6 +2049,10 @@ class JobPopper:
         pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw
         pop_threads = advertised.threads if advertised is not None else self._max_concurrent_inference_processes
         pop_max_power = advertised.max_power if advertised is not None else bridge_data.max_power
+        # A model whose smallest job fits the card but whose max_power job does not is still offered; the
+        # pop's max_power is lowered to the largest size that fits so the horde never returns a job the card
+        # cannot host. The cap applies to the whole pop (max_pixels is one figure for every model in it).
+        pop_max_power = self._serviceability_max_power_cap(models, pop_max_power, advertised_card_runtimes)
         pop_max_batch = advertised.max_batch if advertised is not None else bridge_data.max_batch
         pop_allow_img2img = advertised.allow_img2img if advertised is not None else bridge_data.allow_img2img
         pop_allow_painting = advertised.allow_inpainting if advertised is not None else bridge_data.allow_inpainting
