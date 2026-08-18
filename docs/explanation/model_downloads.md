@@ -31,7 +31,11 @@ The worker downloads two distinct things, owned by different places:
   [`reference_helper`][horde_worker_regen.reference_helper] hands every subprocess
   an *offline* (read-only, never-download) reference manager so a child can never
   trigger a network fetch (which would otherwise be possible under a `fork` start
-  method). All canonical on-disk knowledge (the weights root, per-category
+  method). A child reads references on the hot path of every stage, and the
+  reference manager can report a category as absent for one call when its cache
+  expires between the manager's reload list and the backend's own expiry check,
+  so the offline manager re-asks once on an empty read before a stage faults on
+  it. All canonical on-disk knowledge (the weights root, per-category
   folders, component routing) lives in `horde_model_reference.on_disk_layout`,
   not in a worker-local bridge.
 - **The model weights**: the actual checkpoints. These are fetched by a dedicated
