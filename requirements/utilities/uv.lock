@@ -526,7 +526,7 @@ wheels = [
 
 [[package]]
 name = "horde-image-utilities"
-version = "0.2.2"
+version = "
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pillow" },
@@ -616,11 +616,11 @@ cu132 = [
 
 [package.metadata]
 requires-dist = [
-    { name = "horde-image-utilities", extras = ["rembg-cpu"], marker = "extra == 'cpu'", specifier = "==0.2.2" },
-    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu126'", specifier = "==0.2.2" },
-    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu130'", specifier = "==0.2.2" },
-    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu132'", specifier = "==0.2.2" },
-    { name = "horde-image-utilities", extras = ["server", "annotators"], specifier = "==0.2.2" },
+    { name = "horde-image-utilities", extras = ["rembg-cpu"], marker = "extra == 'cpu'", specifier = "== },
+    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu126'", specifier = "== },
+    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu130'", specifier = "== },
+    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu132'", specifier = "== },
+    { name = "horde-image-utilities", extras = ["server", "annotators"], specifier = "== },
     { name = "onnxruntime-gpu", marker = "extra == 'cu126'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/", conflict = { package = "horde-worker-utilities", extra = "cu126" } },
     { name = "onnxruntime-gpu", marker = "extra == 'cu130'" },
     { name = "onnxruntime-gpu", marker = "extra == 'cu132'" },
