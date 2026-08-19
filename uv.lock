@@ -1276,7 +1276,7 @@ dependencies = [
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/15/94/598cdf56ee5feaff7f60dea4bffb8b7247d107c9d5fe109151194cd71a36/horde_image_utilities-0.2.4.tar.gz", hash = "sha256:20e9bff03de409380c10b437199fb27c6568f8593f91e2d2e0ecdb224c4cdf33", size = 3203447, upload-time = "2026-08-05T15:22:48.413Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ce/13/eb188022852eefd57223adbfb789b5e538411bb5d2d474c03cabfa237d70/horde_image_utilities-0.2.4-py3-none-any.whl", hash = "sha256:46ca717fc08b6e04b068e9308edb3cde410a3738239064b541f29d55c2cbf6b5", size = 82521, upload-time = "2026-08-05T15:22:46.085Z" },
+    { url = "https://files.pythonhosted.org/packages/33/7f/44153319c7b13f29226702779fc1dc13c95366844f0ef84e3dc0b9f9ccdc/horde_image_utilities-0.2.4-py3-none-any.whl", hash = "sha256:46ca717fc08b6e04b068e9308edb3cde410a3738239064b541f29d55c2cbf6b5", size = 82521, upload-time = "2026-08-05T15:22:46.085Z" },
 ]
 
 [[package]]
