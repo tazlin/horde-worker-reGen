@@ -18,6 +18,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopRequest,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.generation_parameters.image.sampler_work import SamplerExecutionContractVersion
 from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_feature_flags_to_pop_request
 from loguru import logger
 
@@ -159,6 +160,9 @@ for dropping too many jobs, where an owner-set pause carries the owner's (or the
 worker treats a reason it does not recognise as operator intent and leaves it alone, so a phrasing change on
 the horde costs an auto-clear, never an unwanted one.
 """
+
+_SUPPORTED_SAMPLER_EXECUTION_CONTRACT_VERSION = SamplerExecutionContractVersion.V1
+"""Sampler execution contract version the worker supports."""
 
 
 def _is_server_forced_maintenance(message_lower: str) -> bool:
@@ -2177,6 +2181,7 @@ class JobPopper:
                 limit_max_steps=bridge_data.limit_max_steps,
                 allow_lora=pop_allow_lora,
                 amount=pop_max_batch,
+                sampler_execution_contract_version=_SUPPORTED_SAMPLER_EXECUTION_CONTRACT_VERSION,
             )
             if advertised is not None:
                 job_pop_request = apply_image_worker_feature_flags_to_pop_request(
