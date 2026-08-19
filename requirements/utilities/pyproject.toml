@@ -22,7 +22,7 @@ dependencies = [
     # Accelerator-neutral core of the capability service. The rembg accelerator and torch build come from
     # the per-build extras below. Do NOT add mediapipe: the current release declares an OpenCV wheel
     # conflict between the mediapipe and annotator extras.
-    "horde-image-utilities[server,annotators]==0.2.3",
+    "horde-image-utilities[server,annotators]==0.2.4",
 ]
 
 [project.optional-dependencies]
@@ -33,10 +33,10 @@ dependencies = [
 # transitive pull because a [tool.uv.sources] route only applies to a project's own dependencies. Its CUDA
 # major MUST match torch's or its native library cannot open libcudart: PyPI ships the CUDA-13 build (right
 # for cu130/cu132), while cu126 is CUDA 12 and needs the CUDA-12 build from onnxruntime's own index.
-cu126 = ["horde-image-utilities[rembg_cuda]==0.2.3", "torch", "torchvision", "onnxruntime-gpu"]
-cu130 = ["horde-image-utilities[rembg_cuda]==0.2.3", "torch", "torchvision", "onnxruntime-gpu"]
-cu132 = ["horde-image-utilities[rembg_cuda]==0.2.3", "torch", "torchvision", "onnxruntime-gpu"]
-cpu = ["horde-image-utilities[rembg_cpu]==0.2.3", "torch", "torchvision"]
+cu126 = ["horde-image-utilities[rembg_cuda]==0.2.4", "torch", "torchvision", "onnxruntime-gpu"]
+cu130 = ["horde-image-utilities[rembg_cuda]==0.2.4", "torch", "torchvision", "onnxruntime-gpu"]
+cu132 = ["horde-image-utilities[rembg_cuda]==0.2.4", "torch", "torchvision", "onnxruntime-gpu"]
+cpu = ["horde-image-utilities[rembg_cpu]==0.2.4", "torch", "torchvision"]
 
 [tool.uv]
 package = false
