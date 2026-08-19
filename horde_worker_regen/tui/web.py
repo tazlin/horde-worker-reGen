@@ -994,7 +994,7 @@ def _await_host_socket(
         if stop_event is not None and stop_event.is_set():
             return None
         try:
-            return socket.create_connection(address, timeout=_HOST_WATCH_CONNECT_TIMEOUT_SECONDS)
+            sock = socket.create_connection(address, timeout=_HOST_WATCH_CONNECT_TIMEOUT_SECONDS)
         except OSError:
             # Interruptible wait: a set stop_event ends the retry immediately, otherwise pause and retry.
             if stop_event is not None:
@@ -1002,6 +1002,13 @@ def _await_host_socket(
                     return None
             else:
                 time.sleep(0.5)
+        else:
+            # The short timeout is for finding the host quickly; a connected host may legitimately go quiet
+            # (a slow supervisor tick, a broadcast stalled on another client), and the watcher must wait
+            # that out rather than read a receive timeout as the host being gone. Only a closed socket or
+            # an explicit farewell frame says that.
+            sock.settimeout(None)
+            return sock
     return None
 
 

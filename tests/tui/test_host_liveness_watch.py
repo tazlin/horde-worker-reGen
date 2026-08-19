@@ -100,6 +100,45 @@ def test_watch_fires_on_explicit_farewell_frame() -> None:
         server.close()
 
 
+def test_watch_holds_through_a_silent_but_connected_host() -> None:
+    """A host that stays connected yet sends nothing for longer than the connect timeout is not "gone".
+
+    The watcher connects with a short timeout so an absent host is noticed quickly; that timeout must not
+    carry over into the read loop, where a control loop paused by a slow tick or a stalled broadcast would
+    otherwise be mistaken for a dead host and take the dashboard down under a healthy worker.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    gone = threading.Event()
+    release = threading.Event()
+
+    def serve_one_silently() -> None:
+        conn, _ = server.accept()
+        sp.send_frame(conn, sp.hello_message())
+        release.wait(timeout=30.0)
+        conn.close()
+
+    holder = threading.Thread(target=serve_one_silently, daemon=True)
+    holder.start()
+    watcher = threading.Thread(
+        target=web._watch_host_liveness,
+        args=(("127.0.0.1", port), gone.set),
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        silence = web._HOST_WATCH_CONNECT_TIMEOUT_SECONDS * 3
+        assert not gone.wait(timeout=silence), "watcher treated a silent, still-connected host as gone"
+        release.set()
+        assert gone.wait(timeout=10.0), "watcher did not notice the host closing after the silence"
+    finally:
+        release.set()
+        holder.join(timeout=10.0)
+        server.close()
+
+
 def test_watch_fires_when_host_never_comes_up() -> None:
     """A host that never binds (nothing on the port) winds the launcher down once the grace elapses."""
     gone = threading.Event()
@@ -132,5 +171,34 @@ def test_host_sends_farewell_frame_on_shutdown() -> None:
         sock.close()
         assert saw_farewell, "host did not announce its shutdown before closing"
     finally:
+        host.stop()
+        thread.join(timeout=10.0)
+
+
+def test_stalled_client_is_dropped_instead_of_blocking_broadcast() -> None:
+    """A client that stops reading is dropped from the broadcast set; the control thread is never held.
+
+    Without a bound on the send, one dashboard session whose browser has stopped draining its socket
+    would block ``sendall`` on the control thread forever, starving the supervisor tick and every other
+    client (including the launcher's liveness watcher).
+    """
+    from horde_worker_regen.tui import worker_host as wh
+
+    host, thread = _running_host()
+    stalled = None
+    try:
+        stalled = socket.create_connection(("127.0.0.1", host.port), timeout=2.0)
+        assert _wait_for(lambda: len(host._clients) >= 1, timeout=5.0), "client did not attach"
+        # Never read from `stalled`. Drive broadcasts directly until the send buffers fill; each call must
+        # return within the client socket timeout, and the client must end up dropped.
+        deadline = time.time() + 60.0
+        while time.time() < deadline and host._clients:
+            started = time.time()
+            host._broadcast()
+            assert time.time() - started < wh._CLIENT_SOCKET_TIMEOUT_SECONDS + 2.0, "broadcast blocked"
+        assert not host._clients, "stalled client was never dropped"
+    finally:
+        if stalled is not None:
+            stalled.close()
         host.stop()
         thread.join(timeout=10.0)

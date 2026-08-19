@@ -40,6 +40,13 @@ from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupe
 _ACCEPT_TIMEOUT_SECONDS = 0.5
 """How often the accept loop wakes to check for shutdown."""
 
+_CLIENT_SOCKET_TIMEOUT_SECONDS = 5.0
+"""Bound on any single send or receive on a client socket.
+
+Generous over the control interval so a healthy client never trips it, yet short enough that a peer which
+has stopped reading is dropped from the broadcast set before the stall is felt as a starved supervisor tick.
+"""
+
 HOST_OWNED_PIDS_FILENAME = "host_owned_pids.json"
 """Where the host records the worker pid it owns, kept distinct from the worker's own child registry.
 
@@ -161,7 +168,12 @@ class WorkerHost:
         Only ``hello`` is sent here; the first status and snapshot arrive on the control thread's next
         broadcast (within one control interval). Keeping every supervisor read on the control thread
         avoids racing its start/stop/tick mutations from this per-client thread.
+
+        The client socket carries a timeout so a peer that stops reading (a suspended browser tab behind a
+        dashboard session) cannot block the control thread's broadcast indefinitely; the reader loop here
+        simply waits out its own receive timeouts, since a quiet client is not a dead one.
         """
+        client.settimeout(_CLIENT_SOCKET_TIMEOUT_SECONDS)
         try:
             sp.send_frame(client, sp.hello_message())
         except OSError:
@@ -173,7 +185,10 @@ class WorkerHost:
 
         try:
             while not self._stop.is_set():
-                message = sp.recv_frame(client)
+                try:
+                    message = sp.recv_frame(client)
+                except TimeoutError:
+                    continue
                 if message is None:
                     break
                 self._enqueue_request(message)
@@ -272,7 +287,12 @@ class WorkerHost:
         )
 
     def _broadcast(self) -> None:
-        """Send the latest status (and snapshot, if any) to every connected client; drop dead ones."""
+        """Send the latest status (and snapshot, if any) to every connected client; drop dead ones.
+
+        A send that times out means the peer has stopped draining its socket; that client is dropped like a
+        dead one so a single stalled dashboard cannot hold the control loop (and with it the supervisor's
+        tick) hostage.
+        """
         with self._clients_lock:
             clients = list(self._clients)
         if not clients:
