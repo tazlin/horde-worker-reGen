@@ -142,6 +142,28 @@ forever. Counting consecutive start-failures regardless of spacing catches exact
 streak resets the moment the slot reaches any later state (it did initialise, then failed differently).
 """
 
+ENVIRONMENT_FATAL_CRASH_MARKERS: tuple[tuple[str, str], ...] = (
+    (
+        "Found no NVIDIA driver",
+        "torch cannot find an NVIDIA driver: the driver has been unloaded or removed from the host (a driver "
+        "update or the GPU dropping off the bus). No respawn can succeed until it is back; reboot the host or "
+        "reinstall the driver, then restart the worker.",
+    ),
+    (
+        "CUDA driver initialization failed",
+        "torch cannot initialise the CUDA driver even though one is present; the driver is in a broken state "
+        "(often after a driver update without a reboot, or a device reset). Reboot the host, then restart "
+        "the worker.",
+    ),
+)
+"""Child startup-crash fragments that identify a host-environment failure no respawn can fix, with the
+operator-facing remedy for each.
+
+The breakers and the recovery ladder still run (they bound the futile respawns and end in the abandon-ship
+exit), but their logs describe the mechanism, not the cause; without this the operator is left to dig the
+real reason out of a per-slot startup log. Matching a fragment here surfaces that cause, and its remedy,
+as a single CRITICAL line the first time it is seen."""
+
 SAFETY_CRASH_LOOP_MAX: int = 3
 """Safety-pool replacements within ``CRASH_LOOP_WINDOW_SECONDS`` before the pool is reported as failing.
 
@@ -563,6 +585,9 @@ class ProcessLifecycleManager:
         # The ledger is always present (an in-memory ring by default) so diagnostics work under test;
         # the parent manager injects a file-backed one in a real run.
         self._action_ledger = action_ledger if action_ledger is not None else ActionLedger()
+        # Environment-fatal crash causes already surfaced to the operator, so a crash loop repeats its
+        # cause as one CRITICAL line rather than once per respawn.
+        self._reported_environment_fatal_markers: set[str] = set()
         # Returns the fresh WDDM paging-victim map (os_pid -> shared MB) from the scheduler, or an empty
         # map when the parent has no current paging attribution. Injected lazily (the scheduler is built
         # after this manager), so a bare default here keeps the manager usable standalone in tests.
@@ -3914,6 +3939,7 @@ class ProcessLifecycleManager:
             crash_signature = read_last_startup_crash(f"inference_{process_info.process_id}")
             if crash_signature is not None:
                 detail["crash_signature"] = crash_signature
+                self._surface_environment_fatal_crash(crash_signature)
         self._action_ledger.record(
             LedgerEventType.PROCESS_REPLACED,
             process_id=process_info.process_id,
@@ -3938,6 +3964,19 @@ class ProcessLifecycleManager:
             device_index=process_info.device_index,
             reason=recovery_reason,
         )
+
+    def _surface_environment_fatal_crash(self, crash_signature: str) -> None:
+        """Name the host-environment cause (and remedy) behind a child crash, once per cause.
+
+        See :data:`ENVIRONMENT_FATAL_CRASH_MARKERS` for why: the breakers and the recovery ladder bound
+        the respawns but narrate only the mechanism, leaving the actual cause buried in a per-slot
+        startup log.
+        """
+        for marker, remedy in ENVIRONMENT_FATAL_CRASH_MARKERS:
+            if marker not in crash_signature or marker in self._reported_environment_fatal_markers:
+                continue
+            self._reported_environment_fatal_markers.add(marker)
+            logger.critical(f"Worker child processes are crashing on a host-environment failure: {remedy}")
 
     def get_processes_with_model_for_queued_job(self) -> list[int]:
         """Get the processes that have the model for any queued job."""

@@ -2406,3 +2406,53 @@ class TestSafetyReadinessLatency:
         # A second observation with no start in between measures nothing new.
         plm._observe_safety_pool_readiness()
         assert plm.safety_readiness_latency_seconds() == pytest.approx(75.0, abs=2.0)
+
+
+class TestEnvironmentFatalCrashSurfacing:
+    """A child crash whose cause is a host-environment failure is named to the operator, once.
+
+    The breakers and the recovery ladder bound the respawns and end in the abandon-ship exit, but their
+    logs narrate the mechanism (replacements, quarantines, soft resets); the actual cause sits in a
+    per-slot startup log. Matching a known environment-fatal fragment surfaces the cause and its remedy
+    as a single CRITICAL line instead.
+    """
+
+    def _critical_lines(self) -> tuple[list[str], int]:
+        from loguru import logger
+
+        captured: list[str] = []
+        handler_id = logger.add(lambda message: captured.append(str(message)), level="CRITICAL")
+        return captured, handler_id
+
+    def test_driver_loss_is_named_once_with_its_remedy(self) -> None:
+        """A missing-driver crash logs the cause and remedy once, however many respawns repeat it."""
+        from loguru import logger
+
+        plm = _make_plm()
+        captured, handler_id = self._critical_lines()
+        try:
+            signature = (
+                "RuntimeError: Found no NVIDIA driver on your system. Please check that you have an "
+                "NVIDIA GPU and installed a driver"
+            )
+            plm._surface_environment_fatal_crash(signature)
+            plm._surface_environment_fatal_crash(signature)
+        finally:
+            logger.remove(handler_id)
+
+        remedy_lines = [line for line in captured if "host-environment failure" in line]
+        assert len(remedy_lines) == 1
+        assert "reboot the host or reinstall the driver" in remedy_lines[0]
+
+    def test_an_ordinary_crash_signature_is_not_escalated(self) -> None:
+        """A crash that is not a known host-environment failure gets no operator-facing escalation."""
+        from loguru import logger
+
+        plm = _make_plm()
+        captured, handler_id = self._critical_lines()
+        try:
+            plm._surface_environment_fatal_crash("ModuleNotFoundError: No module named 'made_up_dependency'")
+        finally:
+            logger.remove(handler_id)
+
+        assert [line for line in captured if "host-environment failure" in line] == []
