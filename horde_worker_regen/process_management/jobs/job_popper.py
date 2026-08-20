@@ -2105,6 +2105,20 @@ class JobPopper:
                 self._note_pop_gate(PopGate.WHOLE_CARD_POP_CLAIM)
                 return
 
+        # Backstop floor over every narrowing stage above: an empty offer must never be sent. To the server
+        # an empty models list is not "no preference"; it matches unconstrained requests and leaves the
+        # match with no declared list to record a model from, so the job can come back with a blank model
+        # name that this worker would then reject and fault. Skip the pop instead; whichever stage emptied
+        # the offer has its own release beneath it.
+        if len(models) == 0:
+            if self._state.last_pop_gate != str(PopGate.EMPTY_OFFER):
+                logger.warning(
+                    "Every advertisable model was narrowed out of this pop's offer; skipping the pop rather "
+                    "than sending an empty model list.",
+                )
+            self._note_pop_gate(PopGate.EMPTY_OFFER)
+            return
+
         # The effective allow_lora is now settled for this pop; surface it (and, when withheld, why) so a
         # LoRA-download-backoff incident is verifiable from the logs. Edge-triggered, so steady state is quiet.
         self._log_lora_advertising(bridge_data, pop_allow_lora=pop_allow_lora, idle_fill=idle_fill_wanted)

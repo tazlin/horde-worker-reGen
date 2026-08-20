@@ -2961,6 +2961,20 @@ class TestPopGateStamping:
 
         assert popper._state.last_pop_gate == "large_model_limits"
 
+    async def test_an_offer_emptied_by_narrowing_is_stamped_and_never_sent(self) -> None:
+        """An empty offer must end the cycle at the floor, stamped and unsent.
+
+        The server matches an empty model list to unconstrained requests and can answer with a job carrying
+        no model name, which this worker would then reject and fault.
+        """
+        popper = self._popper_past_the_early_gates()
+        popper._apply_residency_advertising_bias = Mock(return_value=set())  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == "empty_offer"
+        assert popper._state.last_pop_attempt_completed_at == 0.0
+
     async def test_the_gate_stamp_is_only_moved_when_the_gate_changes(self) -> None:
         """The stamp measures how long this gate has held, so a repeat tick must not refresh it."""
         popper = self._popper_past_the_early_gates()

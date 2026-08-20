@@ -57,6 +57,9 @@ class PopGate(enum.StrEnum):
     """The large-model switch throttle and re-entry cooldown emptied the offer for this cycle."""
     WHOLE_CARD_POP_CLAIM = "whole_card_pop_claim"
     """A whole-card residency claims the offer and its model is not currently offerable, so nothing is left."""
+    EMPTY_OFFER = "empty_offer"
+    """The narrowing stages left no model to advertise; an empty offer is never sent, since the server matches
+    it to unconstrained requests and can answer with a job carrying no model name."""
 
 
 class PopPauseOwner(enum.StrEnum):

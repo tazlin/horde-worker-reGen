@@ -627,6 +627,26 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
             "the release reason; InferenceScheduler.whole_card_pop_claim, and the last_pop_gate stamp"
         ),
     ),
+    GateEntry(
+        key="empty_offer",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.jobs.job_popper",
+        engaged_by=(
+            "the offer-narrowing stages (quarantine, VRAM pressure, pool lane, residency bias, idle-fill "
+            "ladder) collectively left no model to advertise, and an empty offer must never be sent: the "
+            "server matches it to unconstrained requests and can answer with a job carrying no model name"
+        ),
+        released_by=(
+            "the narrowing inputs changing on a later cycle: a lane or bias re-admitting models, a download "
+            "finishing, VRAM pressure lifting, or a residency releasing. Each stage that can empty the offer "
+            "has its own release beneath it"
+        ),
+        bound_seconds=None,
+        bound_source="",
+        backstop=_POP_GATE_WEDGE_BACKSTOP,
+        observable_at="the edge-triggered empty-offer warning line, and the last_pop_gate stamp",
+    ),
     # endregion
     # region whole-card churn governors
     GateEntry(
