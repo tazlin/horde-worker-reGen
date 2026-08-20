@@ -317,6 +317,66 @@ class TestSafetyResultInvariant:
         assert job_info in pm._job_tracker.jobs_pending_submit
 
 
+class TestLateVerdictForRequeuedJob:
+    """A verdict that arrives after the orphan watchdog requeued its job still resolves that job.
+
+    A slow (not lost) check means the verdict lands while the job sits in PENDING_SAFETY_CHECK awaiting a
+    duplicate re-check. Discarding it stranded finished work behind another full check on an already
+    overloaded safety stage: every re-check's verdict was in turn late, so jobs cycled requeue -> duplicate
+    check -> late verdict until they were faulted and their finished images thrown away.
+    """
+
+    async def test_late_verdict_resolves_a_requeued_job(self) -> None:
+        """The verdict is applied, the job moves to submit, and the pending re-check is cancelled."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm)
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        # The watchdog gives up waiting and requeues the job for a fresh check.
+        pm._recovery_coordinator.orphan_safety_since[job_id] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1
+        )
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+
+        # The verdict the watchdog presumed lost was only slow; it arrives now.
+        await pm._message_dispatcher._handle_safety_result(
+            Mock(job_id=job_id, safety_evaluations=[_safety_eval()], time_elapsed=50.0),
+        )
+
+        assert job_info.safety_evaluated is True
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+        assert pm._job_tracker.jobs_pending_safety_check == ()
+
+
+class TestSafetyDurationAlwaysFeedsTheAverage:
+    """Every verdict's wall-clock feeds the safety-duration average, whatever became of its job.
+
+    The orphan grace scales off this average; a safety stage slow enough that every verdict arrives after
+    its job was requeued or faulted is exactly the one the scaling needs to see, so recording only
+    verdicts that land on a waiting job locks the grace at the baseline and the requeue loop feeds itself.
+    """
+
+    async def test_duration_recorded_when_no_job_awaits_the_verdict(self) -> None:
+        """A verdict for an already-resolved job still folds its wall-clock into the average."""
+        pm = make_testable_process_manager()
+        orphan_verdict_job = _safety_job_info()
+        assert pm._state.avg_safety_seconds == 0.0
+
+        await pm._message_dispatcher._handle_safety_result(
+            Mock(
+                job_id=orphan_verdict_job.sdk_api_job_info.id_,
+                safety_evaluations=[_safety_eval()],
+                time_elapsed=14.0,
+            ),
+        )
+
+        assert pm._state.avg_safety_seconds == 14.0
+
+
 def _deliver_one_message(pm: object, message: object) -> None:
     """Feed a single message through the dispatcher's real receive loop (mock queue: one item, then empty)."""
     dispatcher = pm._message_dispatcher  # type: ignore[attr-defined]
@@ -531,11 +591,41 @@ class TestOffGpuSafetyGraceAndPlacementRebuilds:
         await coordinator.reconcile_orphaned_safety_jobs()
         assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING
 
+        # The one stranded job is itself the whole backlog, so the grace is the slack multiple plus one
+        # queue slot's worth of the measured average.
         coordinator.orphan_safety_since[job_id] = time.time() - (
-            40.0 * coordinator.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + 1.0
+            40.0 * (coordinator.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + 1) + 1.0
         )
         await coordinator.reconcile_orphaned_safety_jobs()
         assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+
+    async def test_off_gpu_grace_widens_with_the_safety_backlog(self) -> None:
+        """The lane is single-serial, so each queued job adds one average check to the grace.
+
+        A verdict's latency includes draining every check ahead of it; a grace that ignores queue wait
+        requeues jobs whose checks were always going to finish, and each requeue queues a duplicate check
+        that deepens the very backlog making verdicts late.
+        """
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        pm._process_lifecycle._safety_gpu_paused = True
+        pm._state.avg_safety_seconds = 14.0
+
+        job_infos = [_safety_job_info() for _ in range(6)]
+        for job_info in job_infos:
+            await _strand_in_safety_checking(pm, job_info)
+
+        expected = 14.0 * (coordinator.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + 6)
+        assert coordinator._orphan_safety_grace_seconds() == expected
+
+        # A job waiting out the queue (past the old per-check-only grace, inside the backlog-aware one)
+        # is left alone rather than requeued into a duplicate check.
+        job_id = job_infos[0].sdk_api_job_info.id_
+        assert job_id is not None
+        coordinator.orphan_safety_since[job_id] = time.time() - (expected - 10.0)
+        await coordinator.reconcile_orphaned_safety_jobs()
+        assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING
 
     async def test_on_gpu_safety_keeps_the_baseline_grace(self) -> None:
         """A resident safety process is held to the on-GPU baseline however long its checks average."""

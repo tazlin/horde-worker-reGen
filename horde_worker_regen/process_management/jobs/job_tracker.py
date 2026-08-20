@@ -1935,6 +1935,23 @@ class JobTracker:
         tracked.safety_launch_identifier = None
         return tracked.job_info
 
+    async def take_pending_safety_check(self, job_id: GenerationID) -> HordeJobInfo | None:
+        """Take a job awaiting (re-)dispatch to safety by its ID, detaching it.
+
+        A verdict can arrive for a job the orphan watchdog has already moved back to
+        ``PENDING_SAFETY_CHECK``: the check was slow, not lost, and the requeue only queued a duplicate.
+        Taking the job here lets the caller apply the verdict and cancel the pending re-check instead of
+        discarding finished work while safety re-does the identical check. Returns None unless the job is
+        in ``PENDING_SAFETY_CHECK``.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_SAFETY_CHECK:
+            return None
+        self._set_stage(tracked, JobStage.DETACHED)
+        tracked.safety_process_id = None
+        tracked.safety_launch_identifier = None
+        return tracked.job_info
+
     async def record_source_image_fault(self, job_id: GenerationID, entry: GenMetadataEntry) -> None:
         """Record a fault for a job."""
         self._job_faults.setdefault(job_id, []).append(entry)

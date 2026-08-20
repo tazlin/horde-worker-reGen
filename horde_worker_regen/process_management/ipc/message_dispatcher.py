@@ -1818,7 +1818,29 @@ class MessageDispatcher:
 
     async def _handle_safety_result(self, message: HordeSafetyResultMessage) -> None:
         """Handle a safety check result message."""
+        # Feed the post-inference backpressure model: the popper throttles new pops when the safety
+        # backlog can no longer clear within the job ttl, so a safety stage that is slower than inference
+        # cannot grow an unbounded backlog that ages jobs out into horde-forced maintenance. Recorded
+        # before any early return: the measurement describes the safety stage's wall-clock regardless of
+        # whether its job is still waiting, and a stage slow enough that every verdict arrives late is
+        # exactly the one whose average the orphan-grace scaling needs to see.
+        safety_elapsed = message.time_elapsed
+        if safety_elapsed is not None:
+            self._state.record_safety_duration(safety_elapsed)
+
         completed_job_info = await self._job_tracker.take_being_safety_checked(message.job_id)
+
+        if completed_job_info is None:
+            # The orphan watchdog requeued this job because its verdict seemed lost, but the check was
+            # only slow and the verdict is now here. Accept it and cancel the pending re-check; the
+            # duplicate request the requeue queued (if safety already holds one) resolves to a discard
+            # here when its verdict returns for a job that is no longer waiting.
+            completed_job_info = await self._job_tracker.take_pending_safety_check(message.job_id)
+            if completed_job_info is not None:
+                logger.info(
+                    f"Job {message.job_id} received its safety verdict after being requeued for a fresh "
+                    "check; accepting the verdict and cancelling the re-check.",
+                )
 
         if completed_job_info is None or completed_job_info.job_image_results is None:
             logger.error(
@@ -1873,15 +1895,7 @@ class MessageDispatcher:
         elif job_fault_entries:
             await self._job_tracker.clear_faults_for_job(completed_job_info.sdk_api_job_info.id_)
 
-        # Feed the post-inference backpressure model: the popper throttles new pops when the safety
-        # backlog can no longer clear within the job ttl, so a safety stage that is slower than inference
-        # cannot grow an unbounded backlog that ages jobs out into horde-forced maintenance.
-        safety_elapsed = message.time_elapsed
-        if safety_elapsed is not None:
-            self._state.record_safety_duration(safety_elapsed)
-            safety_elapsed_display = f"{safety_elapsed:.2f}"
-        else:
-            safety_elapsed_display = "unknown"
+        safety_elapsed_display = f"{safety_elapsed:.2f}" if safety_elapsed is not None else "unknown"
 
         logger.debug(
             f"Job {message.job_id} had {num_images_censored} images censored and took "

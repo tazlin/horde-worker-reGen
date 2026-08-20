@@ -80,7 +80,11 @@ class WorkerRecoveryCoordinator:
 
     Above one so ordinary variance between checks (batch size, image count, a busy host) never reads as a lost
     verdict, and small enough that a genuinely hung process is still caught within a few checks' worth of
-    time rather than sitting out a long deadline."""
+    time rather than sitting out a long deadline. The safety lane is single-serial, so the effective grace
+    adds one further average check per job in the safety backlog on top of this slack: a job's verdict
+    latency includes draining every check queued ahead of it, and a grace that ignores queue wait requeues
+    jobs whose checks were always going to finish (each requeue then queues a duplicate check, growing the
+    very backlog that made the verdict late)."""
     SAFETY_GRACE_MAX_SECONDS = 300.0
     """Ceiling on the scaled off-GPU safety grace, so a pathological average cannot leave a hung safety process
     holding a job indefinitely: past this the job is requeued and the escalation ladder gets to see it."""
@@ -524,9 +528,10 @@ class WorkerRecoveryCoordinator:
 
         The baseline is sized for an on-GPU check. While safety is off its card the same check runs on the CPU
         and legitimately takes several times longer, so with a live pool the grace is scaled to what checks are
-        actually measuring on this host (the average the post-inference backpressure model already maintains),
-        bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. An unready pool keeps the baseline: nothing is progressing
-        for the grace to be generous towards.
+        actually measuring on this host (the average the post-inference backpressure model already maintains)
+        plus one average check per job in the safety backlog (the lane is single-serial, so a job's verdict
+        latency includes every check queued ahead of it), bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. An
+        unready pool keeps the baseline: nothing is progressing for the grace to be generous towards.
         """
         baseline_seconds = self.ORPHAN_SAFETY_GRACE_SECONDS
         if not self._process_lifecycle.is_safety_gpu_paused or not self.is_safety_pool_ready():
@@ -534,7 +539,10 @@ class WorkerRecoveryCoordinator:
         average_check_seconds = self._state.avg_safety_seconds
         if average_check_seconds <= 0:
             return baseline_seconds
-        scaled_seconds = average_check_seconds * self.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE
+        backlog_depth = len(self._job_tracker.jobs_pending_safety_check) + len(
+            self._job_tracker.jobs_being_safety_checked,
+        )
+        scaled_seconds = average_check_seconds * (self.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + backlog_depth)
         return min(max(baseline_seconds, scaled_seconds), self.SAFETY_GRACE_MAX_SECONDS)
 
     async def reconcile_orphaned_safety_jobs(self) -> None:
