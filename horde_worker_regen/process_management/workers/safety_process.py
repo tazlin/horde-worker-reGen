@@ -88,8 +88,13 @@ _UNREADABLE_CHECKPOINT_MARKERS = (
     "PytorchStreamReader",
     "central directory",
     "invalid load key",
+    "does not match expected hash",
 )
-"""Fragments torch raises when a checkpoint file is not a readable archive (truncated or corrupt)."""
+"""Fragments raised when a checkpoint file on disk is unusable and only a re-fetch can help.
+
+The first three are torch deserialization failures on a file that is not a readable archive (truncated
+or corrupt); the last is horde_safety's hash-verification failure, which likewise leaves the offending
+file on disk to fail identically on every relaunch until it is removed."""
 
 
 def _discard_unreadable_deep_danbooru_weight(error: BaseException) -> None:

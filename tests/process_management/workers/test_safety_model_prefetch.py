@@ -219,3 +219,49 @@ def test_an_aborting_callback_leaves_the_partial_file_for_the_next_attempt(
 
     assert 0 < weight_path.stat().st_size < len(_BODY)
     assert prefetch.deep_danbooru_verified_on_disk() is False
+
+
+class TestUnusableWeightDiscard:
+    """A weight the safety process cannot use is deleted so the next start re-fetches it.
+
+    Both a truncated archive and a hash-verification failure leave the offending file on disk to fail
+    identically on every relaunch; the parent only sees a child exiting nonzero, so without the discard
+    the pool respawns against the same bad file until it is declared unrecoverable.
+    """
+
+    def _discard(self, error: Exception) -> None:
+        from horde_worker_regen.process_management.workers.safety_process import (
+            _discard_unreadable_deep_danbooru_weight,
+        )
+
+        _discard_unreadable_deep_danbooru_weight(error)
+
+    def test_a_truncated_archive_error_removes_the_weight_and_marker(self, weight_path: Path) -> None:
+        """A torch deserialization failure on a truncated archive discards the file and its marker."""
+        weight_path.write_bytes(b"partial")
+        marker = weight_path.with_name(weight_path.name + prefetch.DEEP_DANBOORU_MARKER_SUFFIX)
+        marker.write_text("7")
+
+        self._discard(RuntimeError("PytorchStreamReader failed reading zip archive: failed finding central directory"))
+
+        assert weight_path.exists() is False
+        assert marker.exists() is False
+
+    def test_a_hash_mismatch_error_removes_the_weight_and_marker(self, weight_path: Path) -> None:
+        """A hash-verification failure discards the file and its marker just like a truncated one."""
+        weight_path.write_bytes(b"wrong content")
+        marker = weight_path.with_name(weight_path.name + prefetch.DEEP_DANBOORU_MARKER_SUFFIX)
+        marker.write_text("13")
+
+        self._discard(Exception("SHA256 hash of downloaded file (b536...) does not match expected hash (3841...)."))
+
+        assert weight_path.exists() is False
+        assert marker.exists() is False
+
+    def test_an_unrelated_error_leaves_the_weight_alone(self, weight_path: Path) -> None:
+        """An error that does not implicate the file on disk never deletes a good weight."""
+        weight_path.write_bytes(b"fine")
+
+        self._discard(RuntimeError("CUDA out of memory"))
+
+        assert weight_path.exists() is True
