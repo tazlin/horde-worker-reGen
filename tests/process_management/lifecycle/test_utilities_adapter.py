@@ -666,3 +666,20 @@ def test_unresponsive_but_alive_service_is_recycled(http_service: tuple[_Service
     finally:
         adapter.stop()
         parent_conn.close()
+
+
+def test_servable_excludes_cold_detectors_and_trusts_payloads_without_the_flag() -> None:
+    """A detector the service reports cold (``warmed: false``) is withheld from the servable set.
+
+    The service primes every detector at startup; until a detector is warm, a request for it would land
+    inside a cold weight load that can outrun the per-request budget and then hold the service's
+    processing slot against the forms behind it, so the lane does not offer the type yet. A payload
+    without the ``warmed`` field (a service predating it) keeps the availability-only predicate.
+    """
+    payload: list[dict[str, object]] = [
+        {"name": "canny", "available": True, "weights_present": "present", "warmed": True},
+        {"name": "normal", "available": True, "weights_present": "unknown", "warmed": False},
+        {"name": "depth", "available": True, "weights_present": "present"},
+    ]
+
+    assert UtilitiesProcessAdapter._servable_from_annotators(payload) == frozenset({"canny", "depth"})

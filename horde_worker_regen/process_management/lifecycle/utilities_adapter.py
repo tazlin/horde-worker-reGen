@@ -594,17 +594,23 @@ class UtilitiesProcessAdapter:
     def _servable_from_annotators(annotators: list[dict[str, object]]) -> frozenset[str]:
         """Reduce the ``GET /annotators`` payload to the set of control types the lane can serve now.
 
-        A control type is servable when its heavy backend is importable (``available``) and its weights are
+        A control type is servable when its heavy backend is importable (``available``), its weights are
         not reported missing (a weightless detector reports ``present``/``unknown``, so only a genuinely
-        absent checkpoint excludes it). This is the availability-driven predicate the job flow keys
-        pre-annotation on: anything not in this set falls through to hordelib's in-graph preprocessor.
+        absent checkpoint excludes it), and its cold start has been paid (``warmed``: the service primes
+        every detector at startup, so a request never lands inside a cold weight load that can outrun the
+        per-request budget and then hold the service's processing slot against the forms behind it). A
+        payload without the ``warmed`` field (a service predating it) is treated as warmed, preserving
+        the availability-only predicate there. This is the predicate the job flow keys pre-annotation
+        and alchemy-form offers on: anything not in this set falls through to hordelib's in-graph
+        preprocessor, and types re-enter the set on the periodic re-probe as the service warms them.
         """
         servable: set[str] = set()
         for entry in annotators:
             name = entry.get("name")
             available = entry.get("available")
             weights_present = entry.get("weights_present")
-            if isinstance(name, str) and available is True and weights_present != "missing":
+            warmed = entry.get("warmed", True)
+            if isinstance(name, str) and available is True and weights_present != "missing" and warmed is not False:
                 servable.add(name)
         return frozenset(servable)
 
