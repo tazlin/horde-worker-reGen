@@ -150,6 +150,28 @@ def main(
         max_total_gb=bridge_data.stats_purge_max_total_gb,
     )
 
+    # Materialize the shared ComfyUI environment once, from the orchestrator, before any child is
+    # spawned. Every child still verifies it (cheaply, against the completion marker) inside
+    # hordelib.initialise(), but a cold start otherwise has the whole pool installing the same
+    # directory at the same time, serialised only by advisory locks that some filesystems (network
+    # and FUSE-backed mounts among others) ignore; the losers then clone over and sweep aside each
+    # other's half-written trees. Running it here also keeps a slow cold clone outside the children's
+    # pre-readiness watchdog window. Skipped when inference is dry-run, matching the children. A
+    # failure is deliberately not fatal: children re-run the ensure themselves, so a transient
+    # failure surfaces through the existing crash-on-start handling instead of blocking startup.
+    if not bridge_data.dry_run_skip_inference:
+        from hordelib.config_path import get_comfyui_path
+        from hordelib.installation import EnvironmentInstaller, load_packaged_manifest
+
+        try:
+            logger.info("Ensuring the ComfyUI environment is installed and at its pinned versions...")
+            EnvironmentInstaller(load_packaged_manifest()).ensure(get_comfyui_path())
+        except Exception as ensure_error:  # noqa: BLE001 - children re-run the ensure; see above
+            logger.warning(
+                f"Pre-spawn ComfyUI environment ensure failed ({type(ensure_error).__name__}: {ensure_error}); "
+                "child processes will retry it themselves.",
+            )
+
     start_working(
         ctx=ctx,
         bridge_data=bridge_data,
