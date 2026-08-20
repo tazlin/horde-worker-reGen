@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 22
+SUPERVISOR_PROTOCOL_VERSION = 23
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -79,6 +79,12 @@ resident-hit counts, allowing the TUI to report observed load avoidance rather t
 v22 added ``RecentJobRecord.kudos_reward``: what the horde's submit response paid for that job, so the
 recent-jobs views can attribute earnings per job rather than only in the session total. None when the reward
 is unknown (a faulted job, or one never delivered to the horde).
+v23 added :class:`SamplerSummary` plus the ``sampler``/``batch_size`` fields on ``WorkLedgerEntry`` and
+``RecentJobRecord``, so a job row can state what its sampler asks the model for per step and how many
+images it produces. The worker resolves the sampler's published work profile and measured cost ratio
+(it owns the ``horde_sdk`` import); a dashboard only formats what it is handed. v23 also dropped
+``WorkLedgerEntry.raw_reason``: it carried the worker-wide pop-block reason on every row, which says
+nothing about the job the row is for, and the same text is already on ``orchestration_intent.raw_gate``.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -89,6 +95,29 @@ PENDING_JOBS_IN_SNAPSHOT = 8
 
 WORK_LEDGER_ENTRIES_IN_SNAPSHOT = 18
 """How many active/recent job rows to carry for the Overview work ledger (bounds payload size)."""
+
+
+class SamplerSummary(BaseModel):
+    """One job's sampler and what a step of it costs, for compact display.
+
+    The worker fills this in from the SDK's published sampler tables, because this module is imported by
+    the TUI and the fake worker and stays free of the heavy ``horde_sdk`` import chain.
+    """
+
+    name: str
+    """The sampler as the horde asked for it (e.g. ``k_dpmpp_sde``), not canonicalized to a backend name."""
+    work_per_step: int | None = None
+    """First-order-equivalent model evaluations one schedule step costs: the sampler's order.
+
+    None when the sampler picks its own iteration count (see :attr:`adaptive`) or the SDK publishes no
+    profile for it."""
+    adaptive: bool = False
+    """Whether the sampler decides its own iteration count instead of running the requested steps."""
+    cost_ratio: float | None = None
+    """Measured per-step wall-clock cost relative to ``k_euler`` on the job's model family.
+
+    One card's evidence, published by the SDK; it is neither a price nor a promise about this machine.
+    None where the SDK states no ratio."""
 
 
 class JobFeatureSummary(BaseModel):
@@ -180,6 +209,10 @@ class WorkLedgerEntry(BaseModel):
     width: int | None = None
     height: int | None = None
     steps: int | None = None
+    batch_size: int = 1
+    """How many images the job asks for (the request's ``n``); 1 for an ordinary single-image job."""
+    sampler: SamplerSummary | None = None
+    """The job's sampler and what a step of it costs; None for alchemy rows and jobs with no payload."""
     features: JobFeatureSummary | None = None
     queue_order: int | None = None
     """1-based order among currently tracked image jobs by pop order; None for recent/alchemy rows."""
@@ -188,7 +221,6 @@ class WorkLedgerEntry(BaseModel):
     safety_seconds: float | None = None
     e2e_seconds: float | None = None
     intent: str | None = None
-    raw_reason: str | None = None
     faulted: bool = False
 
 
@@ -414,16 +446,25 @@ class RecentJobRecord(BaseModel):
     steps: int | None = None
     width: int | None = None
     height: int | None = None
+    batch_size: int = 1
+    """How many images the job asked for (the request's ``n``); 1 for an ordinary single-image job."""
+    sampler: SamplerSummary | None = None
+    """The sampler the job ran and what a step of it costs; None for alchemy forms and stage records."""
     features: JobFeatureSummary | None = None
     kudos_reward: float | None = None
     """What the horde paid for this job, or None when no reward is known (faulted, or never delivered)."""
 
     @classmethod
-    def from_metrics_record(cls, record: JobMetricsRecord, baseline: str | None = None) -> RecentJobRecord:
+    def from_metrics_record(
+        cls,
+        record: JobMetricsRecord,
+        baseline: str | None = None,
+        sampler: SamplerSummary | None = None,
+    ) -> RecentJobRecord:
         """Project a worker-side ``JobMetricsRecord`` into the lean wire form.
 
-        ``baseline`` is resolved by the caller (the process manager, which owns the model metadata) since
-        ``JobMetricsRecord`` does not itself carry one.
+        ``baseline`` and ``sampler`` are resolved by the caller (the process manager, which owns the model
+        metadata and the SDK's sampler tables) since ``JobMetricsRecord`` carries neither.
         """
         features: JobFeatureSummary | None = None
         has_features = bool(
@@ -453,6 +494,8 @@ class RecentJobRecord(BaseModel):
             steps=record.steps,
             width=record.width,
             height=record.height,
+            batch_size=record.batch_count,
+            sampler=sampler,
             features=features,
             kudos_reward=record.kudos_reward,
         )

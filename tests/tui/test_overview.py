@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     RamGovernanceSnapshot,
     RecentJobRecord,
+    SamplerSummary,
     SchedulingGovernanceSnapshot,
     StatsHistoryBackfill,
     StatsSample,
@@ -36,7 +37,7 @@ from horde_worker_regen.process_management.models.feature_readiness import (
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.health import derive
-from horde_worker_regen.tui.widgets.overview import OverviewView
+from horde_worker_regen.tui.widgets.overview import _WORK_LEDGER_COLUMNS, OverviewView
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
 
@@ -546,6 +547,103 @@ def test_work_ledger_shows_job_id_progress_and_size() -> None:
     assert "14/28" in text
     assert "832×1216" in text
     assert "sampling" in text
+
+
+def test_work_ledger_columns_lead_with_pop_order_and_carry_no_reason() -> None:
+    """The ledger is read in pop order, and the pop-block reason it used to carry was worker-wide."""
+    headers = [column.header for column in _WORK_LEDGER_COLUMNS]
+
+    assert headers == [
+        "Order",
+        "Age",
+        "Job",
+        "Stage",
+        "Intent",
+        "Model",
+        "Proc/GPU",
+        "Progress",
+        "it/s",
+        "Size",
+        "Features",
+    ]
+
+
+def _size_entry(**overrides: object) -> WorkLedgerEntry:
+    """A work-ledger row carrying only what the Size cell reads."""
+    fields: dict[str, object] = {
+        "job_id": "7f3a1c9e-4b2c-4d6e-8a1f-0c2b07d49abc",
+        "stage": WorkLedgerStage.INFERENCE,
+        "model": "AlbedoBase XL",
+    }
+    fields.update(overrides)
+    return WorkLedgerEntry(**fields)  # pyrefly: ignore - kwargs are validated by pydantic
+
+
+def test_size_cell_states_resolution_steps_batch_and_what_the_sampler_costs() -> None:
+    """Size carries everything that scales a job's work, so two same-resolution jobs are told apart."""
+    cell = OverviewView._work_size_cell(
+        _size_entry(
+            width=832,
+            height=1216,
+            steps=28,
+            batch_size=4,
+            sampler=SamplerSummary(name="k_dpmpp_sde", work_per_step=2, cost_ratio=2.22),
+        ),
+    )
+
+    assert cell.plain == "832×1216 · 28s · n4 · dpmpp_sde² 2.22×"
+
+
+def test_size_cell_leaves_a_first_order_sampler_unmarked() -> None:
+    """A first-order sampler is the case a reader assumes, so only its measured cost is worth the space."""
+    cell = OverviewView._work_size_cell(
+        _size_entry(
+            width=1024,
+            height=1024,
+            steps=8,
+            sampler=SamplerSummary(name="k_dpmpp_2m", work_per_step=1, cost_ratio=0.98),
+        ),
+    )
+
+    assert cell.plain == "1024×1024 · 8s · dpmpp_2m 0.98×"
+
+
+def test_size_cell_marks_an_adaptive_sampler_without_an_order_or_a_rate() -> None:
+    """An adaptive sampler runs its own iteration count, so the cell claims neither figure for it."""
+    cell = OverviewView._work_size_cell(
+        _size_entry(width=512, height=512, steps=20, sampler=SamplerSummary(name="k_dpm_adaptive", adaptive=True)),
+    )
+
+    assert cell.plain == "512×512 · 20s · dpm_adaptive"
+
+
+def test_size_cell_is_a_plain_resolution_for_an_alchemy_row() -> None:
+    """An alchemy form has no steps, batch, or sampler, so its cell reads as the source resolution alone."""
+    cell = OverviewView._work_size_cell(_size_entry(model="⚗ caption", width=1024, height=1024))
+
+    assert cell.plain == "1024×1024"
+
+
+def test_work_ledger_explains_the_size_cell_under_the_table() -> None:
+    """The cell has no room to name its own parts, so the panel carries the legend beneath the rows."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        work_ledger=[
+            _size_entry(
+                width=832,
+                height=1216,
+                steps=28,
+                batch_size=4,
+                sampler=SamplerSummary(name="k_dpmpp_sde", work_per_step=2, cost_ratio=2.22),
+            ),
+        ],
+    )
+
+    text = _render(OverviewView()._render_work_ledger(snapshot, detailed=True, available_width=200), width=200)
+
+    assert "832×1216 · 28s · n4 · dpmpp_sde² 2.22×" in text
+    assert "Size: resolution · steps · n images · sampler" in text
+    assert "measured per-step cost against k_euler" in text
 
 
 def test_work_ledger_can_summarize_recent_jobs_without_hiding_active_work() -> None:

@@ -43,6 +43,12 @@ from horde_sdk.ai_horde_api.apimodels.status import (
     HordeStatusModelsAllRequest,
     HordeStatusModelsAllResponse,
 )
+from horde_sdk.generation_parameters.image.constraints import SAMPLER_CONSTRAINTS
+from horde_sdk.generation_parameters.image.consts import KNOWN_IMAGE_SAMPLERS
+from horde_sdk.generation_parameters.image.sampler_work import (
+    AdaptiveSamplerWorkProfile,
+    FixedRateSamplerWorkProfile,
+)
 from horde_sdk.utils.image_utils import base64_str_to_bytes
 from horde_sdk.worker.dispatch.ai_horde.image.source_image import (
     job_requires_source_image_input,
@@ -107,6 +113,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     RamGovernanceSnapshot,
     RecentJobRecord,
+    SamplerSummary,
     SchedulingGovernanceSnapshot,
     StatsSample,
     SupervisorChannel,
@@ -6526,6 +6533,48 @@ class HordeWorkerProcessManager:
             return None
         return str(baseline) if baseline is not None else None
 
+    _SD15_COST_RATIO_BASELINES: frozenset[str] = frozenset(
+        {
+            str(KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1),
+            str(KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_512),
+            str(KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_768),
+        },
+    )
+    """Baselines whose per-step cost is read from the SDK's 512x512 ratio column rather than its 1024x1024
+    one. The SDK publishes both because per-step host work is a visible fraction of a small step and is
+    swamped by a large one, so the two columns disagree for the same sampler."""
+
+    @classmethod
+    def _sampler_summary(cls, sampler_name: str | None, baseline: str | None) -> SamplerSummary | None:
+        """Project a job's sampler onto its published work profile and measured per-step cost.
+
+        A sampler the SDK has no record of still yields a summary carrying its name: the horde asked for it,
+        so the operator should see it, with the cost fields left unstated rather than guessed. An unresolved
+        baseline reads the 1024x1024 column, which is the SDK's own guidance for what a sampler itself costs.
+        """
+        if not sampler_name:
+            return None
+        try:
+            constraints = SAMPLER_CONSTRAINTS[KNOWN_IMAGE_SAMPLERS(sampler_name)]
+        except (KeyError, ValueError):
+            return SamplerSummary(name=sampler_name)
+
+        profile = constraints.work_profile
+        return SamplerSummary(
+            name=sampler_name,
+            work_per_step=(
+                profile.marginal_work_units_per_trajectory_step
+                if isinstance(profile, FixedRateSamplerWorkProfile)
+                else None
+            ),
+            adaptive=isinstance(profile, AdaptiveSamplerWorkProfile),
+            cost_ratio=(
+                constraints.measured_cost_ratio_sd15
+                if baseline in cls._SD15_COST_RATIO_BASELINES
+                else constraints.measured_cost_ratio_sdxl
+            ),
+        )
+
     @staticmethod
     def _job_id_text(job_id: object | None) -> str:
         """Return a stable string form for Horde generation IDs and SDK job IDs."""
@@ -6593,6 +6642,8 @@ class HordeWorkerProcessManager:
         payload = sdk_job.payload
         features = JobFeatureSummary.from_payload(payload)
         job_id = self._job_id_text(tracked.job_id)
+        model_name = str(sdk_job.model) if sdk_job.model is not None else None
+        baseline = self._safe_model_baseline(model_name)
         stage = self._ledger_stage(tracked.stage)
         process = self._process_for_job(job_id, stage)
         intent = {
@@ -6606,8 +6657,8 @@ class HordeWorkerProcessManager:
         return WorkLedgerEntry(
             job_id=job_id,
             stage=stage,
-            model=str(sdk_job.model) if sdk_job.model is not None else None,
-            baseline=self._safe_model_baseline(str(sdk_job.model) if sdk_job.model is not None else None),
+            model=model_name,
+            baseline=baseline,
             process_id=process.process_id if process is not None else None,
             device_index=process.device_index if process is not None else tracked.last_dispatched_device_index,
             progress_current=process.last_current_step if process is not None else None,
@@ -6616,10 +6667,11 @@ class HordeWorkerProcessManager:
             width=payload.width,
             height=payload.height,
             steps=payload.ddim_steps,
+            batch_size=payload.n_iter,
+            sampler=self._sampler_summary(str(payload.sampler_name) if payload.sampler_name else None, baseline),
             features=features if not features.is_empty() else None,
             age_seconds=max(0.0, now - tracked.current_stage_since) if tracked.current_stage_since else None,
             intent=intent,
-            raw_reason=self._head_block_reason(),
             queue_order=queue_order_by_job_id.get(job_id),
         )
 
@@ -6633,6 +6685,8 @@ class HordeWorkerProcessManager:
             width=job.width,
             height=job.height,
             steps=job.steps,
+            batch_size=job.batch_size,
+            sampler=job.sampler,
             features=job.features,
             queue_wait_seconds=job.queue_wait_seconds,
             safety_seconds=job.safety_seconds,
@@ -6654,7 +6708,7 @@ class HordeWorkerProcessManager:
         return WorkLedgerEntry(
             job_id=status.form_id,
             stage=self._ALCHEMY_STAGE_TO_LEDGER.get(status.stage, WorkLedgerStage.INFERENCE),
-            model=f"⚗ {status.form}",
+            model=f"⚗ {status.form} ({status.additional_info})" if status.additional_info else f"⚗ {status.form}",
             baseline=None,
             process_id=status.process_id,
             width=status.width,
@@ -6664,19 +6718,25 @@ class HordeWorkerProcessManager:
     def _build_work_ledger(self, recent_jobs: list[RecentJobRecord]) -> list[WorkLedgerEntry]:
         """Build active rows first, then recent completed/faulted rows for the Overview work ledger.
 
-        Active image jobs come first, then an alchemist worker's active forms (each shown with the form as
-        its model and the source-image resolution as its size), then recent finished work, all capped.
+        Active image jobs come first and in pop order, so the ledger reads in the order the worker will
+        serve the jobs rather than in tracker insertion order. Then come an alchemist worker's active forms
+        (each shown with the form as its model and the source-image resolution as its size), then recent
+        finished work, all capped. A job the tracker holds but has no pop order for sorts after the ordered
+        ones rather than displacing them.
         """
         now = time.time()
         queue_order_by_job_id = self._queue_order_by_job_id()
-        rows = [
-            self._tracked_job_to_ledger_entry(
-                tracked,
-                now=now,
-                queue_order_by_job_id=queue_order_by_job_id,
-            )
-            for tracked in self._job_tracker.tracked_jobs()
-        ]
+        rows = sorted(
+            (
+                self._tracked_job_to_ledger_entry(
+                    tracked,
+                    now=now,
+                    queue_order_by_job_id=queue_order_by_job_id,
+                )
+                for tracked in self._job_tracker.tracked_jobs()
+            ),
+            key=lambda row: (row.queue_order is None, row.queue_order or 0),
+        )
         rows.extend(
             self._alchemy_status_to_ledger_entry(status) for status in self._alchemy_coordinator.active_form_statuses()
         )
@@ -6974,7 +7034,9 @@ class HordeWorkerProcessManager:
             entries.append(
                 JobQueueEntry(
                     job_id=status.form_id,
-                    model=f"⚗ {status.form}",
+                    model=f"⚗ {status.form} ({status.additional_info})"
+                    if status.additional_info
+                    else f"⚗ {status.form}",
                     baseline=None,
                     steps=None,
                     width=status.width,
@@ -7642,10 +7704,16 @@ class HordeWorkerProcessManager:
             if api_message.message_text:
                 api_messages.append(api_message.message_text)
 
-        recent_jobs = [
-            RecentJobRecord.from_metrics_record(job, baseline=self._safe_model_baseline(job.model_name))
-            for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
-        ]
+        recent_jobs: list[RecentJobRecord] = []
+        for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]:
+            job_baseline = self._safe_model_baseline(job.model_name)
+            recent_jobs.append(
+                RecentJobRecord.from_metrics_record(
+                    job,
+                    baseline=job_baseline,
+                    sampler=self._sampler_summary(job.sampler_name, job_baseline),
+                ),
+            )
         orchestration_intent = self._build_orchestration_intent()
         process_state_summary = " ".join(
             f"{process.process_type.lower()}#{process.process_id}={process.last_process_state}"

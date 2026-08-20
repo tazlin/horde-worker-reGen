@@ -144,6 +144,7 @@ class AlchemyFormStatus:
     width: int | None
     height: int | None
     process_id: int | None
+    additional_info: str | None = None
 
 
 def required_capability(form: str) -> WorkerCapability:
@@ -529,13 +530,31 @@ class AlchemyCoordinator:
 
         for spec in self._pending_forms:
             width, height = self._form_resolution.get(spec.form_id) or (None, None)
-            statuses.append(AlchemyFormStatus(spec.form_id, spec.form, "pending", width, height, None))
+            statuses.append(
+                AlchemyFormStatus(
+                    spec.form_id,
+                    spec.form,
+                    "pending",
+                    width,
+                    height,
+                    None,
+                    additional_info=spec.control_type,
+                )
+            )
 
         for form_id, spec in self._in_flight.items():
             width, height = self._form_resolution.get(form_id) or (None, None)
             owner = self._in_flight_owner.get(form_id)
             statuses.append(
-                AlchemyFormStatus(form_id, spec.form, "in_flight", width, height, owner[0] if owner else None),
+                AlchemyFormStatus(
+                    form_id,
+                    spec.form,
+                    "in_flight",
+                    width,
+                    height,
+                    owner[0] if owner else None,
+                    additional_info=spec.control_type,
+                ),
             )
 
         for submit in self._pending_submits:
@@ -548,6 +567,7 @@ class AlchemyCoordinator:
                     width,
                     height,
                     None,
+                    additional_info=submit.result_message.control_type,
                 ),
             )
 

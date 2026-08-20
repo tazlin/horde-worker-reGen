@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PopGovernorsSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
+    SamplerSummary,
     SchedulingGovernanceSnapshot,
     WholeCardResidencyStatus,
     WorkerStateSnapshot,
@@ -1673,13 +1674,55 @@ class OverviewView(Vertical):
             return Text(human_duration(entry.e2e_seconds), style="grey62")
         return Text("-", style="grey50")
 
-    @staticmethod
-    def _work_size_cell(entry: WorkLedgerEntry) -> str:
-        """Render a job's resolution and steps."""
+    _SIZE_LEGEND = (
+        "Size: resolution · steps · n images · sampler "
+        "(² = model evaluations per step, 2.22× = measured per-step cost against k_euler)"
+    )
+    """What the Size cell's parts mean, shown under the table because the cell has no room to say it.
+
+    The sampler figures are the two an operator cannot infer from the job: how many evaluations a step
+    asks for, and what that measured out as. Both come from the SDK's published sampler tables."""
+
+    _SAMPLER_ORDER_MARKS: dict[int, str] = {2: "²", 3: "³", 4: "⁴"}
+    """Superscript marks for a higher-order sampler. A first-order one carries no mark: it is the case an
+    operator reading the column assumes, and marking it would put a symbol on nearly every row."""
+
+    @classmethod
+    def _sampler_label(cls, sampler: SamplerSummary) -> str:
+        """Render a sampler as its name, its order above first, and its measured cost against ``k_euler``.
+
+        The order and the ratio answer different questions and can disagree: the order is how many model
+        evaluations a step asks for, the ratio is what that measured out as on real hardware. An adaptive
+        sampler has neither, since it chooses its own iteration count from the requested steps.
+        """
+        name = shorten(sampler.name.removeprefix("k_"), 14)
+        if sampler.adaptive:
+            # Every adaptive sampler the SDK publishes is named for it, so the word is only worth spending
+            # a column on when the name does not already carry it.
+            return name if "adaptive" in name else f"{name} adaptive"
+        order = sampler.work_per_step or 1
+        label = name + (cls._SAMPLER_ORDER_MARKS.get(order, f"^{order}") if order > 1 else "")
+        if sampler.cost_ratio is not None:
+            label += f" {sampler.cost_ratio:.2f}×"
+        return label
+
+    @classmethod
+    def _work_size_cell(cls, entry: WorkLedgerEntry) -> Text:
+        """Render what a job asks for: its resolution, steps, batch count, and what its sampler costs.
+
+        Steps alone understate a job: a batch multiplies every step, and a higher-order sampler asks the
+        model for more than one evaluation per step, so two jobs with the same size and step count can be
+        several times apart in work.
+        """
         size = f"{entry.width}×{entry.height}" if entry.width and entry.height else "-"
         if entry.steps:
-            return f"{size} · {entry.steps}s"
-        return size
+            size += f" · {entry.steps}s"
+        if entry.batch_size > 1:
+            size += f" · n{entry.batch_size}"
+        cell = Text(size)
+        if entry.sampler is not None:
+            cell.append(f" · {cls._sampler_label(entry.sampler)}", style="grey50")
+        return cell
 
     @staticmethod
     def _work_age_cell(entry: WorkLedgerEntry) -> str:
@@ -1736,6 +1779,8 @@ class OverviewView(Vertical):
         disagg_line = self._disagg_stage_line(snapshot)
         if disagg_line is not None:
             extra_lines.append(disagg_line)
+        if visible_entries and any(column.header == "Size" for column in layout.columns):
+            extra_lines.append(Text(self._SIZE_LEGEND, style="grey50"))
         body: RenderableType = Group(table, *extra_lines) if extra_lines else table
         # Surface the active/finished tally in the title so the ledger's scale reads without scanning rows.
         active_count = sum(1 for entry in snapshot.work_ledger if entry.stage not in recent_stages)
@@ -2505,12 +2550,12 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
 
 
 _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
-    ColumnSpec("Stage", DensityTier.CRITICAL, OverviewView._work_stage_cell, width=9, no_wrap=True),
-    ColumnSpec("Job", DensityTier.CRITICAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
     ColumnSpec("Order", DensityTier.NORMAL, lambda e: _queue_order_cell(e.queue_order), width=6, no_wrap=True),
-    ColumnSpec("Model", DensityTier.ESSENTIAL, OverviewView._work_model_cell, min_width=18, no_wrap=True),
-    ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, width=12, no_wrap=True),
+    ColumnSpec("Age", DensityTier.WIDE, OverviewView._work_age_cell, justify="right", width=8),
+    ColumnSpec("Job", DensityTier.CRITICAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Stage", DensityTier.CRITICAL, OverviewView._work_stage_cell, width=9, no_wrap=True),
     ColumnSpec("Intent", DensityTier.NORMAL, lambda e: shorten(e.intent, 28) if e.intent else "-", min_width=16),
+    ColumnSpec("Model", DensityTier.ESSENTIAL, OverviewView._work_model_cell, min_width=18, no_wrap=True),
     ColumnSpec(
         "Proc/GPU",
         DensityTier.NORMAL,
@@ -2522,18 +2567,15 @@ _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
         width=8,
         no_wrap=True,
     ),
-    ColumnSpec("Size", DensityTier.WIDE, OverviewView._work_size_cell, width=15, no_wrap=True),
+    ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, width=12, no_wrap=True),
     ColumnSpec("it/s", DensityTier.WIDE, lambda e: format_its(e.iterations_per_second), justify="right", width=6),
-    ColumnSpec("Age", DensityTier.WIDE, OverviewView._work_age_cell, justify="right", width=8),
+    ColumnSpec("Size", DensityTier.WIDE, OverviewView._work_size_cell, min_width=22, max_width=38, no_wrap=True),
     ColumnSpec("Features", DensityTier.DETAILS, OverviewView._work_features_cell, min_width=10, no_wrap=True),
-    ColumnSpec(
-        "Reason",
-        DensityTier.DETAILS,
-        lambda e: shorten(e.raw_reason, 32) if e.raw_reason else "-",
-        min_width=16,
-    ),
 ]
-"""The work-ledger columns, tagged by the density tier at which each appears."""
+"""The work-ledger columns, in display order and tagged by the density tier at which each appears.
+
+Rows arrive in pop order, so ``Order`` leads: the column and the row order say the same thing, and a
+reader scanning down the table is following the order the worker will serve the jobs in."""
 
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
     ColumnSpec("ID", DensityTier.CRITICAL, lambda r: str(r.process.process_id), justify="right", width=3),
