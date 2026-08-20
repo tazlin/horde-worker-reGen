@@ -544,16 +544,16 @@ wheels = [
 
 [[package]]
 name = "horde-image-utilities"
-version = "0.2.4"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f6/b7/a0508a1a721c28f64ef9e663fe918b868690184e7056d96e929fcb515011/horde_image_utilities-0.2.4.tar.gz", hash = "sha256:41a52cd1b43e7085736c17b2e0fb9860e741793f6fc0dfc768fff345f5507d63", size = 3202969, upload-time = "2026-08-19T21:22:12.707Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9e/47/3fb7c330937e7997888139e6d06f0bff7bd77f24f97a1a90ed466b098190/horde_image_utilities-0.3.0.tar.gz", hash = "sha256:6a3186714b8dfe8e44221a3f02389e5c15461df75c711ff4c344d0dd6f135977", size = 3206342, upload-time = "2026-08-20T00:54:02.605Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/7f/44153319c7b13f29226702779fc1dc13c95366844f0ef84e3dc0b9f9ccdc/horde_image_utilities-0.2.4-py3-none-any.whl", hash = "sha256:a10a12f5df5602dbfbfdd1922942bc37f4f54a764fdd145fd664182d67e64af6", size = 82382, upload-time = "2026-08-19T21:22:11.044Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/94/f1b8137e1764bcafe4005416ed2f1fbb721267b6034d3358bb895ed6b411/horde_image_utilities-0.3.0-py3-none-any.whl", hash = "sha256:a8573af2a20c7f89362aef9d42329d09d52ac7e0beeae12dd2ec3536b8597b65", size = 84644, upload-time = "2026-08-20T00:54:01.352Z" },
 ]
 
 [package.optional-dependencies]
@@ -633,11 +633,11 @@ cu132 = [
 
 [package.metadata]
 requires-dist = [
-    { name = "horde-image-utilities", extras = ["rembg-cpu"], marker = "extra == 'cpu'", specifier = "==0.2.4" },
-    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu126'", specifier = "==0.2.4" },
-    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu130'", specifier = "==0.2.4" },
-    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu132'", specifier = "==0.2.4" },
-    { name = "horde-image-utilities", extras = ["server", "annotators"], specifier = "==0.2.4" },
+    { name = "horde-image-utilities", extras = ["rembg-cpu"], marker = "extra == 'cpu'", specifier = "==0.3.0" },
+    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu126'", specifier = "==0.3.0" },
+    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu130'", specifier = "==0.3.0" },
+    { name = "horde-image-utilities", extras = ["rembg-cuda"], marker = "extra == 'cu132'", specifier = "==0.3.0" },
+    { name = "horde-image-utilities", extras = ["server", "annotators"], specifier = "==0.3.0" },
     { name = "onnxruntime-gpu", marker = "extra == 'cu126'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/", conflict = { package = "horde-worker-utilities", extra = "cu126" } },
     { name = "onnxruntime-gpu", marker = "extra == 'cu130'" },
     { name = "onnxruntime-gpu", marker = "extra == 'cu132'" },
