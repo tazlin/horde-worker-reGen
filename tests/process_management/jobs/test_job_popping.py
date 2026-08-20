@@ -3065,3 +3065,81 @@ class TestPopGateStamping:
 
 
 # endregion
+
+
+class TestIntakeBudget:
+    """The intake cap (running plus buffered jobs) is per card, summed across every driven card.
+
+    ``jobs_pending_inference`` includes in-progress jobs, so a worker-wide cap sized for one card lets a
+    single running job stop the intake that feeds its siblings: on a 4-card host the original flat
+    ``queue_size + max_threads`` paused pops with two jobs in flight while two cards idled.
+    """
+
+    def test_no_card_plan_keeps_the_single_card_formula(self) -> None:
+        """Without a card plan, the budget is exactly the original queue_size + max_threads."""
+        for queue_size, max_threads in [(0, 1), (1, 1), (1, 2), (2, 2)]:
+            bridge_data = make_mock_bridge_data(queue_size=queue_size, max_threads=max_threads)
+            popper = _make_popper(bridge_data=bridge_data)
+            assert popper._intake_budget(bridge_data) == queue_size + max_threads
+
+    def test_single_card_plan_matches_the_no_plan_formula(self) -> None:
+        """One driven card with no overrides is byte-identical to the legacy worker-wide cap."""
+        bridge_data = make_mock_bridge_data(queue_size=1, max_threads=1)
+        popper = _make_popper(
+            bridge_data=bridge_data,
+            card_runtimes=make_test_card_runtimes(device_indices=(0,), config=bridge_data),
+        )
+        assert popper._intake_budget(bridge_data) == 2
+
+    def test_four_cards_sum_their_budgets(self) -> None:
+        """Four cards at queue_size 1 / max_threads 1 hold 8 jobs, not 2."""
+        bridge_data = make_mock_bridge_data(queue_size=1, max_threads=1)
+        popper = _make_popper(
+            bridge_data=bridge_data,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1, 2, 3), config=bridge_data),
+        )
+        assert popper._intake_budget(bridge_data) == 8
+
+    def test_per_card_effective_configs_shape_each_contribution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each card contributes its own effective (override-applied) budget, not the global one."""
+        import horde_worker_regen.process_management.jobs.job_popper as job_popper_module
+
+        bridge_data = make_mock_bridge_data(queue_size=1, max_threads=1)
+        card0 = make_mock_bridge_data(queue_size=1, max_threads=1)
+        card1 = make_mock_bridge_data(queue_size=2, max_threads=2)
+        monkeypatch.setattr(
+            job_popper_module,
+            "resolve_all_effective_gpu_configs",
+            lambda _base, _indices: {0: card0, 1: card1},
+        )
+        popper = _make_popper(
+            bridge_data=bridge_data,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), config=bridge_data),
+        )
+        assert popper._intake_budget(bridge_data) == 6
+
+    def test_budget_follows_a_config_snapshot_swap(self) -> None:
+        """A new config snapshot recomputes the budget; the cache is per snapshot, not forever."""
+        first = make_mock_bridge_data(queue_size=1, max_threads=1)
+        popper = _make_popper(
+            bridge_data=first,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), config=first),
+        )
+        assert popper._intake_budget(first) == 4
+        second = make_mock_bridge_data(queue_size=2, max_threads=1)
+        assert popper._intake_budget(second) == 6
+
+    async def test_queue_full_opens_one_slot_per_card_budget(self) -> None:
+        """_is_queue_full trips at the summed budget: 7 held jobs fit a 4-card budget of 8, 8 do not."""
+        bridge_data = make_mock_bridge_data(queue_size=1, max_threads=1)
+        job_tracker = JobTracker()
+        popper = _make_popper(
+            bridge_data=bridge_data,
+            job_tracker=job_tracker,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1, 2, 3), config=bridge_data),
+        )
+        for index in range(7):
+            await job_tracker.record_popped_job(make_job_pop_response(model=f"held_{index}"))
+        assert popper._is_queue_full(bridge_data) is False
+        await job_tracker.record_popped_job(make_job_pop_response(model="held_7"))
+        assert popper._is_queue_full(bridge_data) is True

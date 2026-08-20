@@ -9765,7 +9765,7 @@ class InferenceScheduler:
                 self._job_tracker.handle_job_fault_now(job, retryable=False)
             return self._preload_outcome(AdmissionDecision.QUARANTINED, job=job, reason="model load quarantined")
 
-        if self._model_loaded_for_job(job, loaded_models):
+        if self._model_loaded_for_job(job, loaded_models) and not self._duplicate_copy_may_serve(job):
             return self._preload_outcome(
                 AdmissionDecision.ALREADY_LOADED, job=job, reason="model already resident or loading"
             )
@@ -10349,6 +10349,39 @@ class InferenceScheduler:
         # An entry whose owning process is gone records a residency that no longer exists; counting it would
         # suppress the preload that replaces it.
         return owner is not None and owner.device_index in allowed
+
+    def _duplicate_copy_may_serve(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether a second copy of ``job``'s already-resident model may be preloaded onto another card.
+
+        The single-copy rule (a model that is resident or loading is never preloaded again) is load and
+        VRAM economy, and on one card a duplicate is pure waste. Across cards it inverts when every copy
+        is busy running other work: the queued job then waits a whole sampling window for weights an idle
+        card could be given instead, and a pending queue dominated by such jobs leaves those cards doing
+        nothing at all. A duplicate is therefore considered only when the worker routes across multiple
+        cards, at least one eligible copy exists, every such copy is busy, and no copy is still loading
+        (a load in flight is about to provide a serving copy; doubling it is the waste the rule exists to
+        stop). Whether the duplicate actually lands stays the preload pipeline's decision: the displacement
+        guards, the preload concurrency gate, VRAM admission, and the growth hold all apply to it unchanged,
+        and the target selection already excludes the slots holding the existing copies.
+        """
+        if not self._multi_gpu_routing_active or job.model is None:
+            return False
+        model_info = self._horde_model_map.root.get(job.model)
+        if model_info is not None and model_info.horde_model_load_state == ModelLoadState.LOADING:
+            return False
+        allowed = self._eligible_card_indices(job)
+        if not allowed:
+            return False
+        copies = self._process_map.get_processes_by_horde_model_name(
+            job.model,
+            allowed_cards=allowed,
+            include_reserved=True,
+        )
+        if not copies:
+            # Resident only per the model map, with no live process holding it; the missing-model
+            # recovery owns that inconsistency, not a duplicate load.
+            return False
+        return all(not copy.can_accept_job() for copy in copies)
 
     def _resident_only_on_ineligible_cards(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job``'s model is resident somewhere, but on no card eligible to serve this job.

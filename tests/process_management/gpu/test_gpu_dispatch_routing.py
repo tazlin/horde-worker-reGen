@@ -10,7 +10,12 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
+    HordeProcessState,
+    ModelInfo,
+    ModelLoadState,
+)
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -486,3 +491,91 @@ class TestCardConfigTracksConfigReload:
         assert after.max_concurrent_inference == before.max_concurrent_inference
         assert after.total_vram_mb == before.total_vram_mb
         assert after.mask_kind == before.mask_kind
+
+
+class TestDuplicateCopyEscape:
+    """A model whose every resident copy is busy may earn a second copy on another card.
+
+    The single-copy rule (a resident or loading model is never preloaded again) is load and VRAM economy;
+    across cards it starves: a pending queue dominated by models resident on busy processes leaves idle
+    cards doing nothing. The escape only *considers* a duplicate; the preload pipeline's guards still
+    decide whether it lands.
+    """
+
+    def _scheduler(self, process_map: ProcessMap) -> InferenceScheduler:
+        return _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
+        )
+
+    def test_all_copies_busy_allows_a_duplicate(self) -> None:
+        """Every eligible copy busy sampling: the queued job may seek a second copy on the idle card."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0, model_name="stable_diffusion", device_index=0, state=HordeProcessState.INFERENCE_STARTING
+                ),
+                1: make_mock_process_info(1, model_name=None, device_index=1),
+            },
+        )
+        scheduler = self._scheduler(process_map)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert scheduler._duplicate_copy_may_serve(job) is True
+
+    def test_a_free_copy_forbids_a_duplicate(self) -> None:
+        """An accepting resident copy serves the job without any load; the single-copy rule holds."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0, model_name="stable_diffusion", device_index=0, state=HordeProcessState.WAITING_FOR_JOB
+                ),
+                1: make_mock_process_info(1, model_name=None, device_index=1),
+            },
+        )
+        scheduler = self._scheduler(process_map)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert scheduler._duplicate_copy_may_serve(job) is False
+
+    def test_a_loading_copy_forbids_a_duplicate(self) -> None:
+        """A load in flight is about to provide a serving copy; doubling it is the waste the rule stops."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0, model_name="stable_diffusion", device_index=0, state=HordeProcessState.INFERENCE_STARTING
+                ),
+                1: make_mock_process_info(1, model_name=None, device_index=1),
+            },
+        )
+        scheduler = self._scheduler(process_map)
+        scheduler._horde_model_map.root["stable_diffusion"] = ModelInfo(
+            horde_model_name="stable_diffusion",
+            horde_model_load_state=ModelLoadState.LOADING,
+            process_id=0,
+        )
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert scheduler._duplicate_copy_may_serve(job) is False
+
+    def test_single_gpu_never_duplicates(self) -> None:
+        """On one card a duplicate is pure waste; the escape is multi-GPU only."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0, model_name="stable_diffusion", device_index=0, state=HordeProcessState.INFERENCE_STARTING
+                ),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=None)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert scheduler._duplicate_copy_may_serve(job) is False
+
+    def test_no_resident_copy_defers_to_the_ordinary_preload(self) -> None:
+        """With no copy anywhere the ordinary preload path owns the job; the escape stays out of it."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=None, device_index=0),
+                1: make_mock_process_info(1, model_name=None, device_index=1),
+            },
+        )
+        scheduler = self._scheduler(process_map)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert scheduler._duplicate_copy_may_serve(job) is False

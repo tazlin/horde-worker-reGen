@@ -141,9 +141,10 @@ most effectively on a small-VRAM card.
 
 `queue_size` controls how many jobs the worker will hold in its internal
 pipeline at once (pending + in-progress + pending-safety + pending-submit). The
-pop gate checks `queue_size + 1 + (max_threads - 1)` as the ceiling; the extra
-headroom accounts for the fact that jobs "in progress" briefly occupy two stages
-(pending_inference + in_progress).
+pop gate checks `queue_size + max_threads`, summed across every driven card's
+effective config, as the ceiling; the `max_threads` share accounts for the fact
+that jobs "in progress" still occupy the pending stage (dual presence), so the
+budget reads as "running plus buffered" per card.
 
 ### Process count
 

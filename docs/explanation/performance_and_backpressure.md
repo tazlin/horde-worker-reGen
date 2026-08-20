@@ -42,8 +42,10 @@ call, it runs a series of gates:
    recovery action with its own escalation ladder, so the submit path excludes it
    from this counter: a give-up batch must not manufacture the pop pause on top of
    the recovery it is already performing, compounding one outage into a longer one.
-3. **Queue full**: if `queue_size + 1 + (max_threads - 1)` jobs are in the
-   pipeline, skip.
+3. **Queue full**: if the intake budget's worth of jobs is in the pipeline,
+   skip. The budget is `queue_size + max_threads` summed over every driven
+   card's effective config; a single card with no overrides reduces to the
+   original `queue_size + 1 + (max_threads - 1)`.
 4. **Hold-back gate**: if jobs are pending inference but no jobs have been
    completed yet this session, skip. This is a warm-up guard: let the very first
    job complete before pulling more.
@@ -74,10 +76,12 @@ model is treated as present. See
 [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] sums the megapixelsteps of
 pending jobs; when that sum exceeds a threshold,
 [`PopThrottler`][horde_worker_regen.process_management.scheduling.pop_throttler.PopThrottler] pauses popping
-until the backlog drains. The threshold is **not** a config field; it is
-derived from the active performance mode: `15` (normal), `60`
-(`moderate_performance_mode`), or `80` (`high_performance_mode`). How long
-popping pauses also scales with the backlog and performance mode.
+until the backlog drains. The threshold is **not** a config field; each driven
+card contributes its effective performance mode's figure, `15` (normal), `60`
+(`moderate_performance_mode`), or `80` (`high_performance_mode`), and the
+worker-wide threshold is the sum, so one card's backlog cannot pause the intake
+that feeds its siblings. A single card with no overrides keeps the flat figure.
+How long popping pauses also scales with the backlog and performance mode.
 
 When local queueing is enabled, the megapixelstep gate preserves the first
 standby inference slot before it starts pausing pops. Pending megapixelsteps
@@ -278,15 +282,17 @@ time grows too large, the worker logs a diagnostic.
 The hold-back gate (`_is_queue_full` logic) deserves special attention:
 
 ```python
-queue_size + 1 + (max_threads - 1)
+sum(queue_size + max_threads for each driven card)   # per-card effective configs
 ```
 
-The `+ 1` accounts for the fact that one job can be "in flight" during the pop
-itself (not yet recorded in the tracker). The `+ (max_threads - 1)` accounts for
-jobs that are in `INFERENCE_IN_PROGRESS` but also still counted in
-`PENDING_INFERENCE` (the [dual-presence
-rule](job_state_machine.md#the-stage-dual-presence-rule)). Without this headroom,
-the queue would appear full when it still has capacity.
+Each card's term is "running plus buffered": the card may run its `max_threads`
+while `queue_size` more jobs wait behind them (jobs in `INFERENCE_IN_PROGRESS`
+still count in `PENDING_INFERENCE`, the [dual-presence
+rule](job_state_machine.md#the-stage-dual-presence-rule)). On a single card with
+no overrides this is exactly the original `queue_size + 1 + (max_threads - 1)`;
+summing per card is what lets an N-card worker keep popping while one card's
+jobs run, instead of one running job counting against a budget sized for the
+whole worker.
 
 ## Inference scheduling priorities
 

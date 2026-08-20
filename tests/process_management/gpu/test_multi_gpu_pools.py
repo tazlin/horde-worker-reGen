@@ -124,3 +124,31 @@ class TestProcessCountCapIntegration:
         )
         assert manager._card_runtimes[0].target_process_count == 2
         assert manager.max_inference_processes == 2
+
+
+class TestMegapixelstepBudgetScaling:
+    """The megapixelstep intake budget is per card, summed across the driven cards.
+
+    The flat per-mode values were tuned when the worker was one card; on an N-card worker the same flat
+    figure pauses intake while most cards idle. Each card contributes its own effective mode's budget, and
+    a single card with no overrides keeps the original figure exactly.
+    """
+
+    def test_single_card_keeps_the_flat_normal_budget(self) -> None:
+        """One card, normal mode: the original 15 MPS budget, unchanged."""
+        manager = make_testable_process_manager()
+        assert manager._job_tracker._max_pending_megapixelsteps == 15
+
+    def test_single_card_keeps_the_flat_high_performance_budget(self) -> None:
+        """One card, high performance mode: the original 80 MPS budget, unchanged."""
+        manager = make_testable_process_manager(high_performance_mode=True)
+        assert manager._job_tracker._max_pending_megapixelsteps == 80
+
+    def test_four_cards_sum_their_budgets(self) -> None:
+        """Four high-performance cards hold 4 x 80 MPS, so one card's backlog cannot pause the rest."""
+        manager = make_testable_process_manager(
+            system_resources=_system_resources((0, 12, "cuda"), (1, 12, "cuda"), (2, 12, "cuda"), (3, 12, "cuda")),
+            mp_primitives=make_test_mp_primitives(device_indices=(0, 1, 2, 3)),
+            high_performance_mode=True,
+        )
+        assert manager._job_tracker._max_pending_megapixelsteps == 320

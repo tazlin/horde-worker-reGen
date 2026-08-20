@@ -473,6 +473,19 @@ def _resolve_inference_concurrency(
     return max_concurrent_inference_processes, lease_slots
 
 
+def _performance_mode_megapixelsteps(config: reGenBridgeData) -> int:
+    """Return one card's megapixelstep intake budget for its effective performance mode.
+
+    The flat values predate multi-GPU: they were tuned as a whole worker's budget when the worker was one
+    card, so per card they carry the same meaning. High performance mode trumps moderate when both are set.
+    """
+    if config.high_performance_mode:
+        return 80
+    if config.moderate_performance_mode:
+        return 60
+    return 15
+
+
 @dataclasses.dataclass(frozen=True)
 class CardConcurrency:
     """Resolved concurrency sizes for one card, mirroring the pre-multi-GPU single-pool computation.
@@ -2154,6 +2167,25 @@ class HordeWorkerProcessManager:
                 mask_kind=(kind if should_mask else None),
             )
 
+        if len(card_runtimes) > 1:
+            # Multi-GPU intake is sized per card: max_threads/queue_size (and the performance modes) apply
+            # to EACH driven card, every card runs its own inference process pool, and the worker-wide
+            # intake budget is the per-card sum. Stated once at plan time so an operator reading the log can
+            # see how their per-card figures compose into the whole worker's appetite.
+            per_card_summary = ", ".join(
+                f"card {index}: {target_process_counts[index]} process(es), "
+                f"intake {effective_configs[index].queue_size + effective_configs[index].max_threads}"
+                for index in device_indices
+            )
+            total_intake = sum(
+                effective_configs[index].queue_size + effective_configs[index].max_threads for index in device_indices
+            )
+            logger.info(
+                f"Driving {len(card_runtimes)} cards, each with its own inference process pool; "
+                f"max_threads/queue_size apply per card. Worker-wide intake budget: {total_intake} job(s) "
+                f"held at once ({per_card_summary}).",
+            )
+
         # Build a GPU denoise clearance controller for each card whose lease is enabled. It holds no shared
         # permit (each inference child owns its own clearance proxy, created and registered at spawn), so it is
         # constructed here before any process spawns and populated as children register. The controller's
@@ -2762,20 +2794,33 @@ class HordeWorkerProcessManager:
         # effect without a restart, alongside the other performance-related thresholds.
         self._job_tracker.set_retry_policy(self.bridge_data.max_inference_attempts)
 
+        # The megapixelstep budget bounds how much work-in-magnitude the worker holds at once, so it must
+        # scale with how many cards are chewing on it: a flat budget sized for one card pauses intake on an
+        # N-card worker while N-1 cards idle. Each driven card contributes the budget its own effective
+        # (per-card override applied) performance mode names; one card with no overrides reproduces the
+        # original flat value exactly.
+        card_budgets: dict[int, int] = {}
+        if self._card_runtimes:
+            effective = resolve_all_effective_gpu_configs(self.bridge_data, sorted(self._card_runtimes))
+            card_budgets = {index: _performance_mode_megapixelsteps(config) for index, config in effective.items()}
+            threshold = sum(card_budgets.values())
+        else:
+            threshold = _performance_mode_megapixelsteps(self.bridge_data)
+        self._job_tracker.set_performance_mode_thresholds(threshold)
+
         if self.bridge_data.high_performance_mode:
-            self._job_tracker.set_performance_mode_thresholds(80)
             logger.info("High performance mode enabled")
             if not self.bridge_data.safety_on_gpu:
                 logger.warning(
                     "If you have a high-end GPU, you should enable safety on GPU (safety_on_gpu in the config).",
                 )
-
         elif self.bridge_data.moderate_performance_mode:
-            self._job_tracker.set_performance_mode_thresholds(60)
             logger.info("Moderate performance mode enabled")
         else:
-            self._job_tracker.set_performance_mode_thresholds(15)
             logger.info("Normal performance mode enabled")
+        if len(card_budgets) > 1:
+            per_card = ", ".join(f"card {index}: {budget}" for index, budget in sorted(card_budgets.items()))
+            logger.info(f"Megapixelstep intake budget across {len(card_budgets)} cards: {threshold} ({per_card})")
 
         if self.bridge_data.high_performance_mode and self.bridge_data.moderate_performance_mode:
             logger.warning("Both high and moderate performance modes are enabled. Using high performance mode.")

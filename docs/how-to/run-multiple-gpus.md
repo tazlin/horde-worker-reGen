@@ -85,6 +85,26 @@ for a model from one card with a feature or size supported only by another. `gpu
 (default `0.5`) lets local queue imbalance prioritize the most under-fed card ahead of that fair rotation.
 Cards with equivalent externally visible offers can safely share a combined request.
 
+## Concurrency and intake are per card
+
+Every driven card runs **its own pool of inference processes**: the plan is `queue_size + max_threads`
+processes per card (VRAM-fit and RAM-fit sizing may reduce a card's count, never below one). `max_threads`,
+`queue_size`, and the performance modes are therefore per-card values, and the worker-wide intake scales as
+their sum:
+
+- The **job intake budget** (how many jobs the worker holds at once, running jobs included) is the sum of
+  every driven card's `queue_size + max_threads`. Four cards at `queue_size: 1` / `max_threads: 1` hold 8
+  jobs, not 2.
+- The **megapixelstep budget** (how much work-in-magnitude may be pending before pops pause) is the sum of
+  every card's performance-mode figure (15 normal / 60 moderate / 80 high), each card contributing per its
+  own effective mode.
+- A model busy sampling on one card may be **loaded a second time onto an idle card** when queued demand
+  warrants it; the VRAM budget and displacement guards still gate the load.
+
+At startup the worker logs how the per-card figures compose ("Driving N cards, each with its own inference
+process pool …" and the megapixelstep budget line), so the effective worker-wide appetite is always stated
+rather than inferred.
+
 ## Memory
 
 Driving several cards needs plenty of RAM (32 to 64 GB+). Both `queue_size` and `max_threads` multiply

@@ -22,6 +22,7 @@ from horde_sdk.generation_parameters.image.sampler_work import SamplerExecutionC
 from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_feature_flags_to_pop_request
 from loguru import logger
 
+from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopGate, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import safety_permitted_card_indices
@@ -1406,11 +1407,32 @@ class JobPopper:
                 immediately rather than buffer, so the normal depth cap would otherwise strand the GPU while
                 the head waits on its load.
         """
-        max_jobs_in_queue = bridge_data.queue_size + 1
-        if bridge_data.max_threads > 1:
-            max_jobs_in_queue += bridge_data.max_threads - 1
-        max_jobs_in_queue += extra_allowance
+        max_jobs_in_queue = self._intake_budget(bridge_data) + extra_allowance
         return len(self._job_tracker.jobs_pending_inference) >= max_jobs_in_queue
+
+    _intake_budget_cache: tuple[reGenBridgeData, int] | None = None
+    """The (config snapshot, budget) pair last computed by :meth:`_intake_budget`. The snapshot reference
+    is held so identity comparison is safe; a config reload swaps in a new snapshot object, invalidating it."""
+
+    def _intake_budget(self, bridge_data: reGenBridgeData) -> int:
+        """Return the worker-wide cap on jobs held in intake (running jobs included).
+
+        ``jobs_pending_inference`` counts in-progress jobs too, so this cap means "running plus buffered":
+        a card may run its ``max_threads`` while ``queue_size`` more jobs wait behind them. That budget is
+        per card: on one card this is the original ``queue_size + max_threads``, and on N cards it is the
+        sum of every driven card's effective (per-card override applied) budget, because one card's running
+        job must not stop the intake that feeds its idle siblings. Without a card plan (direct construction,
+        CPU paths) the global config stands in as a single card's budget.
+        """
+        if self._intake_budget_cache is not None and self._intake_budget_cache[0] is bridge_data:
+            return self._intake_budget_cache[1]
+        if self._card_runtimes:
+            configs = resolve_all_effective_gpu_configs(bridge_data, sorted(self._card_runtimes))
+            budget = sum(config.queue_size + config.max_threads for config in configs.values())
+        else:
+            budget = bridge_data.queue_size + bridge_data.max_threads
+        self._intake_budget_cache = (bridge_data, budget)
+        return budget
 
     _SAFETY_BACKLOG_LOG_INTERVAL_SECONDS = 30.0
     """Minimum gap between repeats of the "withholding pops: safety backlog" line, so the sub-second pop

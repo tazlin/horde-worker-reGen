@@ -115,7 +115,8 @@ gauntlet of gates before any network call, so the worker never pulls work it can
 
 1. Not shutting down; not in consecutive-failure backoff (`_handle_consecutive_failures`, 3 failures →
    pause `CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS`).
-2. Queue not full (`_is_queue_full`: `queue_size + 1 + (max_threads - 1)`).
+2. Queue not full (`_is_queue_full`: `queue_size + max_threads` summed over the driven cards' effective
+   configs; one card with no overrides reduces to the original `queue_size + 1 + (max_threads - 1)`).
 3. Hold-back gate: while jobs are pending inference but none has completed its generation stage yet this
    session, skip. This is a warm-up guard, letting the first output finish before pulling more. A
    `return_control_map` output produced by the annotation lane counts as generation-stage completion even
