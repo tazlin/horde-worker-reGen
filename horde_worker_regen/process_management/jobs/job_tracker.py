@@ -2593,14 +2593,12 @@ class JobTracker:
             self._count_job_faulted(tracked)
 
         # Announced last, so the tracker's own bookkeeping for this job is complete before any observer
-        # reads it back. A generation fault is a job the horde will count as dropped, whatever produced it,
-        # which is what the worker's fault-rate breaker needs to see. A malformed-pop rejection is handed back
-        # the same way and counted the same way by the horde, so it feeds the breaker too even though it is
-        # kept out of the generation-verdict pause.
-        if (
-            fault_origin in (JobFaultOrigin.GENERATION, JobFaultOrigin.MALFORMED_POP)
-            and self._terminal_fault_observer is not None
-        ):
+        # reads it back. Only a generation fault feeds the fault-rate breaker: it proves a slot ran the job
+        # and still dropped it, the stream the breaker's worker-wide pop pause can actually stem. A
+        # malformed-pop rejection is reported to the horde the same way but consumes no slot, and its rate
+        # is bounded by the pop cadence, so it is answered at the pop boundary with the error backoff;
+        # letting it feed the breaker would idle every card over pops the worker never could have served.
+        if fault_origin is JobFaultOrigin.GENERATION and self._terminal_fault_observer is not None:
             self._terminal_fault_observer(faulted_job.model)
         return InferenceFailureResolution.FAULTED
 

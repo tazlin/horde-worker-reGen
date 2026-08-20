@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ModelIncidentKind
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -37,8 +38,8 @@ from tests.process_management.jobs.test_job_popping import (
 )
 
 
-async def _pop_once(pop_response: object) -> tuple[JobTracker, list[str | None]]:
-    """Drive one pop that the horde answers with ``pop_response``; return the tracker and observed faults."""
+async def _pop_once(pop_response: object) -> tuple[JobTracker, list[str | None], JobPopper]:
+    """Drive one pop that the horde answers with ``pop_response``; return the tracker, observed faults, popper."""
     job_tracker = JobTracker()
     await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
     observed_faults: list[str | None] = []
@@ -55,7 +56,7 @@ async def _pop_once(pop_response: object) -> tuple[JobTracker, list[str | None]]
     await popper.api_job_pop()
 
     session.submit_request.assert_awaited_once()
-    return job_tracker, observed_faults
+    return job_tracker, observed_faults, popper
 
 
 class TestPopBoundaryValidation:
@@ -64,13 +65,13 @@ class TestPopBoundaryValidation:
     @pytest.mark.parametrize("model", ["", "   "])
     async def test_blank_model_pop_is_never_queued(self, model: str) -> None:
         """A blank model name is refused at the boundary rather than queued for dispatch."""
-        job_tracker, _faults = await _pop_once(make_job_pop_response(model=model))
+        job_tracker, _faults, _popper = await _pop_once(make_job_pop_response(model=model))
 
         assert list(job_tracker.jobs_pending_inference) == []
 
     async def test_blank_model_pop_is_faulted_for_reissue(self) -> None:
         """The refused job is faulted terminally, so the horde reissues it instead of waiting on its ttl."""
-        job_tracker, _faults = await _pop_once(make_job_pop_response(model=""))
+        job_tracker, _faults, _popper = await _pop_once(make_job_pop_response(model=""))
 
         tracked_jobs = job_tracker.tracked_jobs()
         assert len(tracked_jobs) == 1
@@ -80,24 +81,36 @@ class TestPopBoundaryValidation:
 
     async def test_blank_model_fault_is_attributed_to_the_pop_not_a_model(self) -> None:
         """The fault carries the malformed-pop origin, keeping it out of the generation-verdict pause."""
-        job_tracker, _faults = await _pop_once(make_job_pop_response(model=""))
+        job_tracker, _faults, _popper = await _pop_once(make_job_pop_response(model=""))
 
         tracked = job_tracker.tracked_jobs()[0]
         assert tracked.fault_origin is JobFaultOrigin.MALFORMED_POP
         assert job_tracker.was_faulted_by_non_generation_action(tracked.job_id) is True
 
-    async def test_blank_model_fault_still_feeds_the_fault_rate_breaker(self) -> None:
-        """The horde counts the returned job as dropped, so intake's own fault-rate breaker must see it too."""
-        _job_tracker, observed_faults = await _pop_once(make_job_pop_response(model=""))
+    async def test_blank_model_fault_is_kept_out_of_the_fault_rate_breaker(self) -> None:
+        """The rejection consumes no slot, so it must not feed the breaker whose pause idles every card.
 
-        assert observed_faults == [""]
+        The breaker exists to stem fault streams the worker's own generation produces; a malformed pop is the
+        horde's defect, its rate is bounded by the pop cadence, and the boundary answers it with the pop error
+        backoff instead. Feeding it to the breaker starves all cards over pops that cost nothing to reject.
+        """
+        _job_tracker, observed_faults, _popper = await _pop_once(make_job_pop_response(model=""))
+
+        assert observed_faults == []
+
+    async def test_blank_model_pop_engages_the_pop_error_backoff(self) -> None:
+        """A malformed pop slows the pop cadence like any other unusable API answer, until a clean pop resets it."""
+        _job_tracker, _faults, popper = await _pop_once(make_job_pop_response(model=""))
+
+        assert popper._pop_throttler.is_in_error_backoff is True
 
     async def test_named_model_pop_is_queued_as_before(self) -> None:
-        """A well-formed pop is unaffected: it reaches the pending-inference queue."""
-        job_tracker, observed_faults = await _pop_once(make_job_pop_response(model="stable_diffusion"))
+        """A well-formed pop is unaffected: it reaches the pending-inference queue with no backoff engaged."""
+        job_tracker, observed_faults, popper = await _pop_once(make_job_pop_response(model="stable_diffusion"))
 
         assert [job.model for job in job_tracker.jobs_pending_inference] == ["stable_diffusion"]
         assert observed_faults == []
+        assert popper._pop_throttler.is_in_error_backoff is False
 
 
 class TestAdvertisedModelObservability:

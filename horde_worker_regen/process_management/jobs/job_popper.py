@@ -1785,7 +1785,9 @@ class JobPopper:
         counted against that empty string as if it were a model, poisoning the per-model incident and quarantine
         state with an identity no job can ever satisfy. The job is therefore faulted terminally at the boundary
         so the horde reissues it immediately, and the fault is attributed to the malformed pop rather than to a
-        model, keeping it out of the per-model breakers.
+        model, keeping it out of the per-model breakers and the worker-wide fault-rate breaker alike: the
+        rejection consumes no slot, so a stream of them is answered by slowing the pop cadence (the error
+        backoff below), never by pausing the cards.
         """
         model = job_pop_response.model
         if model is not None and model.strip():
@@ -1798,6 +1800,10 @@ class JobPopper:
             fault_reason="malformed pop: no model name",
             fault_origin=JobFaultOrigin.MALFORMED_POP,
         )
+        # A malformed pop is an API answer the worker cannot use, the same class as an error response: back
+        # off the pop cadence so a sustained stream of them self-limits, and so the horde is not hammered
+        # with pop/fault round-trips. The next well-formed pop resets the cadence.
+        self._pop_throttler.on_pop_error()
         logger.error(
             f"Popped job {job_pop_response.id_} carries no model name (got {model!r}); returning it to the horde "
             "for reissue without queueing it. This is a malformed pop response, not a model failure.",
