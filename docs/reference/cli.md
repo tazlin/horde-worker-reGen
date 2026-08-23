@@ -81,7 +81,7 @@ On Windows the worker host also shows a **system-tray icon** while it runs, with
 *Stop worker & exit* actions. The host remembers the launcher's resolved web port, so *Open dashboard*
 does not assume 8000 when `--port`, the environment, or bridge data selected another one. A detached
 or orphaned worker therefore stays visible and stoppable. See
-[Use the dashboard](../how-to/use-the-dashboard.md#closing-and-reattaching).
+[Keep the worker running when you close the dashboard](../how-to/use-the-dashboard.md#keep-the-worker-running-when-you-close-the-dashboard).
 
 ## `horde-duty-report`
 

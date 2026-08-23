@@ -50,7 +50,7 @@ repeatedly or sending `SIGKILL`.
 A persistent **worker host** (`horde-worker-host`, the process the browser dashboard normally attaches
 to) is a middle ground: it runs the worker with no attached UI but can be inspected and stopped at any
 time with `horde-worker-web --status` / `--stop`, and on Windows it shows a tray icon. See
-[Closing and reattaching](use-the-dashboard.md#closing-and-reattaching).
+[Keep the worker running when you close the dashboard](use-the-dashboard.md#keep-the-worker-running-when-you-close-the-dashboard).
 
 ## Configure from environment variables (containers)
 

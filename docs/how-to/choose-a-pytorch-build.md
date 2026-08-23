@@ -1,16 +1,25 @@
 # Install from scratch and choose a PyTorch build
 
-Most people should use the [installer](install.md), which detects your GPU and picks the right PyTorch
-build automatically. This page is for power users who manage their own virtualenv, or who need to
-force a specific build (a particular CUDA version, CPU-only, or ROCm).
+Most people should use the [installer](install.md), which reads your GPU and installs the right PyTorch
+build without being asked. This page is for driving that yourself: managing the environment by hand, or
+forcing a particular build (a specific CUDA version, CPU-only, or ROCm).
 
-## Prerequisites
+In brief:
+
+- The build has to carry kernels for your GPU's **architecture**, not merely satisfy your driver's CUDA
+  version. Get it wrong and every job dies at the first CUDA call.
+- `cu126` covers `sm_50` to `sm_90` (Maxwell through Hopper). `cu130` and `cu132` cover `sm_75` to
+  `sm_120` (Turing through Blackwell). A Blackwell card needs CUDA 13; a pre-Turing card cannot use it.
+- `HORDE_WORKER_BACKEND=<build>` forces the choice, and the worker corrects a build that cannot run the
+  card that is present.
+- `cu126`, `cu130`, `cu132`, and `cpu` are installed from the lockfile. ROCm, Intel XPU, and older torch
+  lines are installed ad hoc.
+
+## Before you start
 
 - Install [git](https://git-scm.com/).
 - Install your GPU stack (CUDA or ROCm) if you have not already.
-- Install Python 3.12. If you use the official Python installer and do not already use Python
-  regularly, tick **Add python.exe to PATH** on the first screen.
-- Configure at least 8 GB (preferably 16 GB+) of swap. This applies to Linux too.
+- Configure at least 8 GB of swap, 16 GB or more preferred. This applies to Linux too.
 - Clone the worker:
 
   ```bash
@@ -18,140 +27,197 @@ force a specific build (a particular CUDA version, CPU-only, or ROCm).
   cd horde-worker-reGen
   ```
 
-## Set up a virtualenv
+You do not need to install Python for the script path: `runtime.sh` and `runtime.cmd` fetch `uv`, and
+`uv` fetches its own managed CPython. Install Python 3.12 yourself only if you intend to point `uv` at
+an environment you built (see [Install into an environment you manage](#install-into-an-environment-you-manage)).
 
-```bash
-python -m venv regen          # first time only
-# certain Windows setups: py -3.11 -m venv regen
-```
+## Pick the build that matches your GPU
 
-Activate it:
+Your driver's CUDA version is only the upper bound. The wheel also has to contain kernels for your GPU
+architecture, or every job dies at the first CUDA call with `no kernel image is available for execution
+on the device`, which ComfyUI reports as a generic "no images produced" fault.
 
-- Windows (cmd): `regen\Scripts\activate.bat`
-- Windows (PowerShell): `regen\Scripts\Activate.ps1`
-- Linux/macOS: `source regen/bin/activate`
-
-You should now see `(regen)` at the start of your shell prompt. If you do not, activation did not work;
-try again or ask for help before continuing.
-
-## Install dependencies
-
-Match the PyTorch wheel index to your driver's CUDA version:
-
-```bash
-# CUDA 13.0/13.1 driver
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
-
-# AMD ROCm 6.4
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/rocm6.4
-```
-
-Use `cu132` for a CUDA 13.2+ driver, `cu130` for CUDA 13.0/13.1, and `cu126` for a CUDA 12.6+ driver
-(the only CUDA 12 build of torch 2.12.0). Always install `torch` **and** `torchvision` from the same
-index; they must share one CUDA build.
-
-Your driver's CUDA version is only the upper bound. The build also has to contain kernels for your
-**GPU architecture**, or every job dies at the first CUDA call with `no kernel image is available for
-execution on the device` (which ComfyUI hides behind a generic "no images produced" fault). The two
-build families cover different, overlapping architecture ranges:
+The two build families cover overlapping but different architecture windows:
 
 | Build | Architectures (compute capability) | GPUs |
 | --- | --- | --- |
-| `cu126` | `sm_50`–`sm_90` | Maxwell through Hopper (incl. Ada/Ampere) |
-| `cu130` / `cu132` | `sm_75`–`sm_120` | Turing through Blackwell |
+| `cu126` | `sm_50` to `sm_90` | Maxwell through Hopper, including Ampere and Ada |
+| `cu130` / `cu132` | `sm_75` to `sm_120` | Turing through Blackwell |
 
-So a **Blackwell** card (RTX 50-series, `sm_120`) must use `cu130`+ even though it would otherwise accept
-a CUDA 12 build, and a **pre-Turing** card (Maxwell/Pascal/Volta, e.g. GTX 10-series) must stay on
-`cu126` because CUDA 13 dropped those architectures. The installer handles this for you (it reads the
-GPU's compute capability via `nvidia-smi --query-gpu=compute_cap`, not just the driver version); only
-override the build by hand if you have confirmed your card is in the range above. A Blackwell card on a
-CUDA 12.x driver needs a **driver update** (to a CUDA 13 driver) before `cu130` can load.
+Two consequences:
 
-This check is not one-time. Every `update-runtime` / sync re-reads the live GPU and clamps the resolved
-build into the card's architecture window before installing, so a build that cannot run is never put on
-disk. A worker that recorded `cu126` before a Blackwell card was installed (or before this clamp
-existed) therefore self-heals to `cu130` on its next update, and even a hand-forced
-`HORDE_WORKER_BACKEND=cu126` on a Blackwell card is corrected upward (an unrunnable build helps nobody)
-with a note explaining the swap. The corrected build is re-recorded so the fix sticks.
+- A **Blackwell** card (RTX 50-series, `sm_120`) must use `cu130` or newer, even though its driver would
+  accept a CUDA 12 build. On a CUDA 12.x driver it needs a driver update first.
+- A **pre-Turing** card (Maxwell, Pascal, Volta, for example the GTX 10-series) must stay on `cu126`.
+  CUDA 13 dropped those architectures.
 
-Launch is a backstop for the same problem. A matching lockfile proves the right package *versions* are
-installed, not that the installed torch has kernels for the card actually present (a GPU swap, or a build
-carried over from a different machine, leaves an up-to-date venv whose torch still cannot launch a
-kernel). So a launch verifies the installed wheel's architecture list against the live GPU once per
-lock + card (stamped, so a healthy start stays instant) and, when the wheel cannot run the card and a
-different locked build can, re-syncs to install the runnable one before the worker starts. Every backend
-selection (detect and the clamp) is recorded to `bin/backend-decision.json` so a support bundle can show
-why a given build was chosen.
-
-Build selection is still a *prediction* (the installer must choose a wheel before torch exists, so it
-maps your GPU's compute capability onto a build from a table). As a backstop, the sync re-checks that
-prediction against reality once torch is on disk: it reads the installed wheel's actual kernel list and,
-if it still cannot run your GPU, prints a warning asking you to report it. That message means the
-selection table is out of date for your card (a worker bug), not that your hardware is unsupported, so a
-plain reinstall will not fix it: please file an issue, and try forcing a newer build with
-`HORDE_WORKER_BACKEND` as a stopgap.
-
-> **Audio (torchaudio) is not installed.** It has no `+cu132` wheel and audio generation is currently
-> unsupported, so the worker omits it (a missing torchaudio is stubbed at runtime; image/video work is
-> unaffected). If you specifically need it, install a build matching your torch index ad hoc, e.g.
-> `pip install torchaudio --extra-index-url https://download.pytorch.org/whl/cu130` (cu126/cu130/cpu
-> only; there is no cu132 build).
-
-## Selecting a PyTorch build
-
-The worker locks the latest torch (2.12.0) as one thin `uv` extra per build: `cu126`, `cu130`,
-`cu132`, or `cpu`. You normally never set this by hand; the build is detected from your GPU driver and
-the `update-runtime` / `install` scripts run `uv sync --locked --extra <build>` for you.
-
-To force one, set `HORDE_WORKER_BACKEND`:
+Find your card's compute capability, which is what the choice turns on:
 
 ```bash
-HORDE_WORKER_BACKEND=cu132 ./update-runtime.sh   # CUDA 13.2+ build (auto-selected on 13.2+)
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+```
+
+Then see what the worker would pick for this machine:
+
+```bash
+./runtime.sh detect      # Windows: runtime.cmd detect
+```
+
+These are the build names it can resolve to:
+
+| Build | For |
+| --- | --- |
+| `cu132` | An NVIDIA driver at CUDA 13.2 or newer. Auto-selected there. |
+| `cu130` | An NVIDIA driver at CUDA 13.0 or 13.1. |
+| `cu126` | An NVIDIA driver at CUDA 12.6 or newer. The only CUDA 12 build of the locked torch line, and it also runs on CUDA 13. |
+| `cpu` | No usable GPU. Roughly 100x slower; for testing and alchemist-only work. |
+| `rocm` | Linux with a detected or installed ROCm runtime. |
+| `rocm-windows` | Windows with a supported Radeon or Ryzen AI device, using AMD's official ROCm Windows wheels. |
+
+There is no `cu128` wheel in the locked torch line, so a CUDA 12.x driver uses `cu126` and a legacy
+`cu128` request is remapped to it. The extras themselves are declared in `pyproject.toml`.
+
+## Install it
+
+### With the worker's scripts
+
+`update-runtime.sh` (or `update-runtime.cmd`) installs and updates the environment. Set
+`HORDE_WORKER_BACKEND` to override what detection would have chosen:
+
+```bash
+HORDE_WORKER_BACKEND=cu132 ./update-runtime.sh   # CUDA 13.2+ build
 HORDE_WORKER_BACKEND=cu130 ./update-runtime.sh   # CUDA 13.0/13.1 build
 HORDE_WORKER_BACKEND=cu126 ./update-runtime.sh   # CUDA 12.6+ build
 HORDE_WORKER_BACKEND=cpu   ./update-runtime.sh   # no GPU
-HORDE_WORKER_BACKEND=rocm  ./update-runtime.sh   # Linux ROCm runtime detected/installed
+HORDE_WORKER_BACKEND=rocm  ./update-runtime.sh   # Linux ROCm
 ```
 
-torch 2.12.0 has no `cu128` wheel, so a CUDA 12.x driver uses `cu126` (a legacy `cu128` request is
-remapped to `cu126` automatically). The full list of build extras is in `pyproject.toml`.
-
-Only the CUDA and CPU builds are locked. **ROCm** and **older torch versions** are installed ad hoc
-(not from the lockfile), which is easy to mix in but not pinned:
-
-```bash
-./update-runtime-rocm.sh                                            # torch 2.9.1 on ROCm 6.4 (override: HORDE_WORKER_ROCM_TORCH)
-UV_TORCH_BACKEND=auto uv pip install torch torchvision              # let uv auto-detect your GPU
-uv pip install torch==2.11.0 --extra-index-url https://download.pytorch.org/whl/cu128   # an older line
-```
-
-On Windows AMD, the installer detects supported Radeon/Ryzen AI devices and installs the `rocm-windows`
-profile with AMD's official ROCm Windows wheels:
+On Windows AMD:
 
 ```powershell
 $env:HORDE_WORKER_BACKEND = "rocm-windows"
 .\update-runtime.cmd
 ```
 
+To go back to automatic selection, run the script again without the variable set.
+
+### Install into an environment you manage
+
+The project is a `uv` project with a committed lockfile. There is no `requirements.txt`. What the
+scripts run, and what you can run directly, is:
+
+```bash
+uv sync --locked --extra cu130
+```
+
+Swap `cu130` for the build you picked. `--locked` installs exactly the wheels the lockfile names, which
+is what keeps `torch` and `torchvision` on the same CUDA build. Add `--extra controlnet` and
+`--extra post-processing` for the optional feature dependencies.
+
+To put the environment somewhere other than `.venv`, point `uv` at it:
+
+```bash
+UV_PROJECT_ENVIRONMENT=/path/to/env uv sync --locked --extra cu130
+```
+
+### Verify the build can run your card
+
+```bash
+./runtime.sh run python -c "import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_arch_list())"
+```
+
+The first line names the installed build (for example `2.12.1+cu132 13.2`). The second is the list of
+architectures the wheel was compiled for:
+
+```
+2.12.1+cu132 13.2
+['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']
+```
+
+Your card can run that wheel if the list holds an `sm_<n>` of the same major version as your compute
+capability with a minor at or below it (a `sm_89` card is served by `sm_86`, because binary kernels are
+forward-compatible within a major version), or any `compute_<n>` at or below your capability, which is
+JIT-compiled at load. An `sm_120` card against the list above is fine; an `sm_61` card is not. When
+nothing matches, install a build from the right family above rather than reinstalling the same one.
+
+> **torchaudio is not installed.** It has no `+cu132` wheel and audio generation is unsupported, so the
+> worker omits it and stubs it at runtime. Image and video work are unaffected. If you specifically need
+> it, install a build matching your torch index ad hoc, for example
+> `pip install torchaudio --extra-index-url https://download.pytorch.org/whl/cu130`. Only `cu126`,
+> `cu130`, and `cpu` have one.
+
+## Why the worker may override your build
+
+Build selection is a prediction: the installer has to choose a wheel before torch exists, so it maps
+your GPU's compute capability onto a build. Two backstops check that prediction against reality, and
+either one can change what gets installed.
+
+**Every sync clamps the build into your card's architecture window.** A resolved or hand-forced build
+that has no kernels for the card present is corrected before anything is installed, so an unrunnable
+wheel never reaches disk. This is why `HORDE_WORKER_BACKEND=cu126` on a Blackwell card installs `cu130`
+instead, with a note explaining the swap, and why a worker that recorded `cu126` before a Blackwell card
+was fitted moves itself to `cu130` on its next update. The corrected build is re-recorded, so the fix
+sticks.
+
+**Every launch checks the installed wheel against the live GPU.** A matching lockfile proves the right
+package versions are installed, not that the installed torch has kernels for the card actually in the
+machine: a GPU swap, or an environment copied from another machine, leaves an up-to-date venv whose
+torch still cannot launch a kernel. The check is stamped per lock and card, so a healthy start stays
+instant, and when the installed wheel cannot run the card and a different locked build can, the launch
+re-syncs to the runnable one first.
+
+Every selection and clamp is recorded to `bin/backend-decision.json`, so a support bundle shows why a
+given build was chosen.
+
+If a sync warns that the installed wheel still cannot run your GPU, the selection table is out of date
+for your card. That is a worker bug rather than unsupported hardware, and reinstalling will not fix it:
+please [file an issue](https://github.com/Haidra-Org/horde-worker-reGen/issues), and force a newer build
+with `HORDE_WORKER_BACKEND` as a stopgap.
+
+## ROCm, Intel XPU, and older torch lines
+
+Only the CUDA and CPU builds are locked. The others pull a triton sidecar
+(`pytorch-triton-rocm`, `pytorch-triton-xpu`) that has no wheel under the locked torch range, so they
+are installed ad hoc: easy to mix in, and not pinned.
+
+```bash
+./update-runtime-rocm.sh                                 # ROCm 6.4 (override the torch version with HORDE_WORKER_ROCM_TORCH)
+UV_TORCH_BACKEND=auto uv pip install torch torchvision   # let uv detect your GPU
+uv pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/xpu   # Intel XPU
+```
+
+Install `torch` and `torchvision` from the same index every time. They must share one build.
+
+For the AMD path end to end, see [Run on AMD ROCm](run-on-amd-rocm.md).
+
 ## Run the worker
 
 ```bash
-# Copy the template and set at least an API key and worker name
-cp bridgeData_template.yaml bridgeData.yaml
-
-python download_models.py    # critical: run before the worker, every time
-python run_worker.py
+cp bridgeData_template.yaml bridgeData.yaml   # then set at least an API key and worker name
+./preload-models.sh                           # download and verify models before the first run
+./horde-bridge.sh                             # start the headless worker
 ```
 
-`Ctrl+C` stops the worker after it finishes any in-progress jobs.
+On Windows use `preload-models.cmd` and `horde-bridge.cmd`. `Ctrl+C` stops the worker once it finishes
+any in-progress jobs. For the dashboard instead, run `horde-worker.sh` or `horde-worker.cmd` (see
+[Use the dashboard](use-the-dashboard.md)).
 
 ## Keep it updated
 
-If you manage the venv yourself, re-run the install command every time you `git pull`, with `-U`:
+Re-run the install command after every `git pull`, so the environment matches the lockfile the release
+expects:
 
 ```bash
-python -m pip install -r requirements.txt -U --extra-index-url https://download.pytorch.org/whl/cu130
+./update-runtime.sh      # Windows: update-runtime.cmd
 ```
 
-Swap the index URL to match your build (`cu132`, `cu126`, or `rocm6.4`). See
+It reuses the recorded build, and re-checks it against the card as described above. Set
+`HORDE_WORKER_BACKEND` again only when you want to change build. See
 [Update the worker](update-the-worker.md).
+
+## See also
+
+- [Compute backends](../explanation/compute_backends.md): which accelerators the worker supports, the
+  optional feature extras, the utilities venv, and CPU-only mode.
+- [Command line](../reference/cli.md): every script, verb, and environment variable.
+- [Troubleshoot](troubleshoot.md): what a failed start usually means.

@@ -1,10 +1,33 @@
 # Use the dashboard (`horde-worker`)
 
-`horde-worker` is an optional [Textual](https://textual.textualize.io/) frontend that launches and
-supervises the worker and shows its live state. It runs in your terminal or, unchanged, in a web
-browser. The headless `run_worker` path is untouched and remains the right choice for unattended,
-containerised, and remote deployments (see [Run headless](run-headless.md)); the dashboard is a
-convenience layer on top.
+`horde-worker` launches the worker and shows you what it is doing, either in a browser tab or in your
+terminal, from the same command. It is optional: on a server, in a container, or anywhere unattended,
+[run headless](run-headless.md) instead.
+
+In brief:
+
+- `horde-worker.cmd` (Windows) or `./horde-worker.sh` opens the dashboard in a browser and leaves the
+  worker running when you close the tab. `--terminal` draws it in the terminal instead, and
+  `--headless` runs the worker with no UI at all.
+- A worker whose `bridgeData.yaml` is not filled in gets a setup page on first launch, so you never
+  have to hand-edit YAML to start.
+- `F3` starts and stops the worker, `?` lists every key, and `Ctrl+P` searches every tab and command.
+- The dashboard opens in its **Simple** level. Advanced and Developer add detail to the same tabs.
+- Binding the dashboard to anything other than loopback hands full control of your worker to anyone
+  who can reach the port. Read [what a network-bound dashboard exposes](#what-a-network-bound-dashboard-exposes)
+  before you do it.
+
+## Before you start
+
+You need the worker installed ([install](install.md)) and, to earn kudos, an
+[AI Horde](https://aihorde.net/) API key. Models are not required up front: the setup page picks them
+and downloads them for you.
+
+To try the whole interface with no GPU, no models, and no API key, run a synthetic worker:
+
+```bash
+horde-worker --process-mode fake
+```
 
 ## Launch it
 
@@ -14,7 +37,7 @@ The launcher scripts offer three peer interfaces:
 # Windows
 horde-worker.cmd            # web dashboard in your browser (default)
 horde-worker.cmd --terminal # the dashboard in this terminal (no browser)
-horde-worker.cmd --headless # no UI: run the worker in the foreground, printing to this console
+horde-worker.cmd --headless # no UI: the worker runs in the foreground, printing to this console
 
 # Linux / macOS
 ./horde-worker.sh
@@ -22,295 +45,404 @@ horde-worker.cmd --headless # no UI: run the worker in the foreground, printing 
 ./horde-worker.sh --headless
 ```
 
-The window you launch from is the worker. In the in-terminal and headless modes, closing that window
-(or pressing `Ctrl+C`) stops the worker. In the default browser mode the worker runs in a persistent
-background **host**, so closing the browser tab leaves it running and reopening the dashboard
-reconnects. See [Closing and reattaching](#closing-and-reattaching) for exactly what keeps the worker
-alive, how to reattach to a running one, and the Windows tray icon.
+| Mode | Where the UI is | What closing it does |
+|------|-----------------|----------------------|
+| default | A browser tab, served from `127.0.0.1:8000` | The worker keeps running in a background host. Reopen to reconnect. |
+| `--terminal` | The terminal you launched from | Stops the worker. |
+| `--headless` | No UI. The worker prints to the console | Stops the worker. |
 
-`--headless` is the no-UI path: it downloads/verifies your models and then runs the worker directly
-(equivalent to `run_worker`; see [Run headless](run-headless.md)), so a server or service sees the
-worker's own log output rather than a UI. On a machine with no graphical display, the default
-(browser) mode detects that a browser cannot be opened and automatically falls back to the in-terminal
-dashboard; with no terminal either, it tells you to use `--headless` (or `--host` to serve a browser
-on another machine).
+`--headless` is the same path as `run_worker`: it verifies your models, then runs the worker directly,
+so a service or a log collector sees the worker's own output. See [Run headless](run-headless.md).
 
-To try the whole interface without a GPU, models, or an API key, run a synthetic worker:
+On a machine with no graphical display, the default mode notices that no browser can be opened and
+falls back to the in-terminal dashboard. With no terminal either, it tells you to use `--headless`, or
+`--host` to serve the dashboard to another machine.
 
-```bash
-horde-worker --process-mode fake
-```
+You should see the status bar name your worker and show a lifecycle badge within a few seconds. If the
+worker is not started yet, press `F3`.
 
-## First run: Getting started
+## Set up a new worker
 
-The first time you start a real worker whose `bridgeData.yaml` is not yet filled in, the dashboard
-opens the **Getting started** page. It explains what the AI Horde is and what a worker needs (a public
-worker name, an API key so the kudos you earn are kept, and models on disk so requests can be served),
-then collects those inline, so you never have to visit the Config tab to get running.
+The first launch of a worker whose `bridgeData.yaml` is not yet filled in opens the **Getting started**
+page. It says what the AI Horde is and what a worker needs (a public worker name, an API key so your
+kudos are kept, and models on disk), then collects all three inline.
 
-The page offers three presets, each a model selection plus a stance on which kinds of work you accept:
+Pick one of three presets. Each is a model selection plus a stance on which kinds of work you accept:
 
-- **Essentials** serves the single most-requested model, with the smallest download. Post-processing
-  (upscaling, face fixing) is on; LoRA and ControlNet are off.
-- **Recommended** (the suggested choice) serves the most-requested models your card can hold, and
-  accepts LoRA work as well. LoRA files download on demand and build up their own cache over time.
-- **Showcase** adds larger SDXL models and ControlNet requests. It is the largest download.
+| Preset | Models | Accepts |
+|--------|--------|---------|
+| **Essentials** | The single most-requested model. Smallest download. | Post-processing (upscaling, face fixing). No LoRA, no ControlNet. |
+| **Recommended** | The most-requested models your card can hold. | Post-processing and LoRA work. LoRA files download as jobs ask for them. |
+| **Showcase** | Adds larger SDXL models. Largest download. | Post-processing, LoRA, and ControlNet. |
 
-Each preset states what it will download and how much room there is where models are kept. A preset
-that will not fit stays visible but cannot be chosen, and says how much more space it would need.
-"Choose my own models instead" opens the same model picker the Config tab uses.
+Each preset states what it downloads and how much room is left where models are kept. A preset that
+does not fit stays visible but cannot be chosen, and says how much more space it needs. **Choose my own
+models instead** opens the same model picker the Config tab uses.
 
-The presets that accept LoRA work also ask for an optional **Civitai token**. LoRA files are fetched
-from Civitai as jobs ask for them and some downloads refuse anonymous requests, so a token from a free
-Civitai account gets those. Leaving the field empty never removes a token you already have.
+The LoRA presets also ask for an optional **Civitai token**. Some Civitai downloads refuse anonymous
+requests, and a token from a free account gets those. Leaving the field empty never removes a token you
+already have.
 
-Setup is not one-time: the **Getting started** action stays on the Simple home, so you can revisit the
-explanations or move to a different preset later. Existing installs whose config is already complete
-are not sent to the page on launch, and it is skipped entirely for the synthetic worker and for
-env-var config (`-e`), both of which are power-user paths.
+Saving writes only the settings this page owns and leaves the rest of `bridgeData.yaml` alone. Press
+`F3`, or **Start contributing** on the home screen, when you are ready.
 
-Saving writes only the settings the page owns and leaves the rest of your config alone. Start the
-worker with `F3` (or **Start contributing** on the home screen) when you are ready. Your selected
-models download in the background; on first run this can take 30 to 60 minutes depending on your
-selection and connection, and you can watch progress on the **Downloads** tab. The worker serves each
-model as soon as it finishes, so keep the window open.
+Verify it worked: the **Downloads** tab lists your selected models with live progress. A first run of
+30 to 60 minutes is normal, depending on the preset and your connection. The worker serves each model
+as it finishes, so leave the window open. Once one is done, the Overview shows a job in flight.
 
-## Experience levels
+To change any of this later, the **Getting started** action stays on the Simple home screen. Existing
+installs with complete config are never sent to the page, and it is skipped entirely for the synthetic
+worker and for env-var config (`-e`).
 
-The dashboard opens in **Simple**, which leads with plain-language status and live progress. Two fuller
-levels are available:
+## Choose how much detail you see
 
 | Level | What it is for |
 |-------|----------------|
-| **Simple** | Contributing without needing to understand the worker. Plain wording, live per-request progress, and the settings most contributors change. |
-| **Advanced** | The complete operator surface: queues, per-process state, scheduler behaviour, download detail, and the whole configuration. |
-| **Developer** | Advanced plus the worker's internal safety levers: hung-process timeouts, the VRAM and RAM budget, and the fault breakers. Entering it once asks you to confirm. |
+| **Simple** (default) | Contributing without needing to understand the worker: plain wording, live per-request progress, and the settings most contributors change. |
+| **Advanced** | The full operator surface: queues, per-process state, scheduler behaviour, download detail, and the whole configuration. |
+| **Developer** | Advanced plus the worker's internal safety levers: hung-process timeouts, the VRAM and RAM budgets, and the fault breakers. Entering it asks you to confirm once. |
 
-Change level in the **Dashboard** section of the Config tab, or press `Ctrl+P` and search for the level
-you want. The choice is remembered between runs.
+Change level on the Config tab's **Dashboard** page, or press `Ctrl+P` and search for the level. The
+choice is remembered between runs.
 
-Every tab exists at every level. The level changes how much detail each tab shows, never which tabs you
-have, so anything you learn to find in Simple is in the same place in Developer.
+Every tab exists at every level. The level changes how much each tab shows, never which tabs you have,
+so anything you learn to find in Simple is in the same place in Developer.
 
-Simple leaves out three things. The Config tab offers its Dashboard, Essentials, Models, Content,
-Features, Alchemy, and LoRA & Downloads pages, holding back the tuning pages whose settings only mean
-something next to the measurements that would justify changing them. The GPU table drops its tuning
-columns. And the three shortcuts that act on the Advanced Overview (`c` customize, `h` reveal hidden,
-`F6` view mode) do nothing, since the view they act on is not the one Simple shows.
+Simple holds back three things:
 
-Advanced adds the tuning pages. Developer adds one further group: the settings the worker uses to police
-itself. Timeouts that decide when a process counts as hung, the VRAM and RAM budget the arbiter enforces
-against, whole-card residency, and the circuit breakers for post-processing faults, unservable models,
-and self-maintenance. Set carelessly, these remove a protection without saying so or trip on healthy
-work, which is why they sit behind a level you have to choose on purpose.
+- The Config tab's tuning pages, whose settings only mean something beside the measurements that would
+  justify changing them. Simple keeps Dashboard, Essentials, Models, Content, Features, Alchemy, and
+  LoRA & Downloads.
+- The GPU table's tuning columns.
+- The three shortcuts that act on the Advanced Overview (`C`, `H`, `F6`), since Simple shows a
+  different view.
+
+Developer adds the settings the worker uses to police itself: the timeouts that decide when a process
+counts as hung, the VRAM and RAM budgets the arbiter enforces, whole-card residency, and the breakers
+for post-processing faults, unservable models, and self-maintenance. Set carelessly, these remove a
+protection without saying so, or trip on healthy work. That is why they sit behind a level you choose
+on purpose.
 
 Settings you cannot see are still preserved. Saving from any level writes back everything already in
 `bridgeData.yaml`, so moving between levels never rewrites a tuned config.
 
-If you upgraded from a version without levels, the dashboard tells you the default changed on first
-launch and offers to keep the full view.
-
 ### The Simple home screen
 
-Simple's Overview opens on a status line naming what the worker is doing, followed by which worker this
-is: its name, version, and the horde account it is contributing for, how long it has been contributing
-this session, what it offers requesters (LoRA styles, ControlNet guidance, image-to-image,
-post-processing, alchemy), how many models it serves, and how many requests it takes at once. Under that
-sit the session totals, requests completed and kudos earned, with the kudos figure carrying the hourly
-rate the worker measures while it is working (or saying the rate is not known yet rather than showing a
-zero).
+Simple's Overview opens with a line naming what the worker is doing, then which worker this is: its
+name and version, the horde account it contributes for, how long this session has run, what it offers
+requesters, how many models it serves, and how many requests it takes at once. Under that sit the
+session totals, requests completed and kudos earned, with the hourly rate the worker measures while it
+works. The rate reads as unknown rather than zero until there is enough to measure.
 
-The small chart under each total is a **rate**, not the total drawn again: it shows how much was
-finished in each slice of the last fifteen minutes. A worker that stops earning flattens to the baseline
-within a couple of minutes, which is the point of showing it. Below that are the requests in flight with
-their progress, and the last few finished requests.
+The small chart under each total is a rate rather than the total drawn again: it shows how much
+finished in each slice of the last fifteen minutes, so a worker that stops earning flattens to the
+baseline within a couple of minutes. Below it are the requests in flight with their progress, and the
+last few finished.
 
 One card appears only when something is off: a health finding, maintenance holding new requests back,
-the worker waiting after repeated trouble reaching the horde, or worker processes it had to restart on
-its own during this session. A worker running normally shows no such card, so seeing one is itself the
-signal.
+the worker waiting after repeated trouble reaching the horde, or processes it restarted on its own this
+session. A healthy worker shows no such card, so seeing one is itself the signal.
 
 ### Appearance
 
-The same Dashboard section chooses a theme (**Horde Dark**, **Horde Light**, or **Terminal colours**,
-which follows your terminal's own 16-colour palette and suits low-colour or high-contrast setups) and a
-spacing density (comfortable or compact) for the Advanced and Developer surfaces.
+The Config tab's **Dashboard** page also chooses a theme (**Horde Dark**, **Horde Light**, or
+**Terminal colours**, which follows your terminal's own 16-colour palette and suits low-colour or
+high-contrast setups) and a spacing density for the Advanced and Developer surfaces.
 
-## Tabs
+## The tabs
 
-The descriptions below are the **Advanced** presentation of each tab. In Simple, Overview, Live, and
-Downloads show plain-language equivalents instead. The remaining tabs keep these widgets, with a
-one-line explanation of what the page is for above them. On Stats, Control, Logs, and Insights a **What
-these numbers say right now** panel joins it whenever the live figures are worth a comment: a share of
-requests faulting, restarts the worker made on its own, failures in a row, a session spent mostly
-waiting for work. Each sentence quotes your worker's own numbers and says what, if anything, to do. When
-there is nothing to comment on the panel is absent entirely, so its presence is the signal. Fold it away
-with its ▼ once you have read it; on a short terminal it can be longer than the screen, so collapsing it
-is how you get the table back.
+| Tab | What it answers |
+|-----|-----------------|
+| [**Overview**](#overview) | What is the worker doing right now, and is anything wrong? |
+| [**Stats**](#stats) | What has this session produced, by model and by baseline? |
+| **GPUs** | How is each card doing: VRAM headroom, contexts, throughput, and duty? |
+| [**Live**](#live) | What is each worker process doing, and where is the RAM going? |
+| **Downloads** | How far along are the model downloads? Pause, resume, or cap the bandwidth here. |
+| **Control** | Start, stop, pause, restart, auto-start on launch, and horde-side maintenance. |
+| **Logs** | What did the worker write? Tail any log with level and substring filters. |
+| [**Config**](#config) | Everything in `bridgeData.yaml`, as a form. |
+| [**Insights**](#insights) | What should I change, given what this worker has measured? |
+| [**Benchmark**](#benchmark) | What can this machine actually sustain? |
 
-| Tab | What it shows |
-|-----|---------------|
-| **Overview** | Headline metrics (jobs submitted/faulted, queue depth, GPU duty cycle, kudos/hr), health, and a **Now / Next / Why** strip that explains the scheduler's current intent. Job-owned facts live in a **Work ledger** (pop order, age, state, model, process/GPU target, progress, and size), listed in pop order so the table reads in the order the worker will serve the jobs. The **Size** cell states everything that decides how much work a job is, and a legend under the table names its parts: resolution, steps, the batch count as `n4` when the job asks for more than one image, and the sampler with its order (`²` marks a sampler that asks the model for two evaluations per step) and the SDK's measured per-step cost against `k_euler` (`2.22×`). An adaptive sampler shows neither figure, since it chooses its own iteration count. Press `J` to collapse recently finished rows into a one-line count while keeping in-progress work visible. Alchemy forms appear in the Work ledger and the Queue as their own rows, with the form shown where a model name goes (prefixed `⚗`) and the source-image resolution as the size, so an alchemist worker's work is as visible as a dreamer's. Worker identity/model settings and enabled alchemy are visible in normal mode. The process table stays process-owned (slot state, resident model, GPU, memory, heartbeat, completed count). Trends show their configured time window and can be cycled across 5m / 15m / 30m / 60m / 120m / All; changing the window filters retained session history rather than resetting it. Each finite window is rendered as fixed buckets from `now - window` to `now`, so a warming-up worker shows early empty buckets instead of shrinking the graph to only the samples seen so far. Config changes and explicit resets mark the trends as stabilizing. The **Kudos/hr** trend is a windowed active rate: kudos earned in the window divided by the *productive* time within it (wall-time the pipeline actually held work), so it reads steadily rather than sawtoothing on each submit, and it charges neither the cold start before your first job nor any idle/maintenance stretch (a pause still counts while it drains queued work, since kudos keep landing). The session headline shown in the hero line and the status bar is the same measure taken over the whole session. An alchemist worker adds a **Forms/hr** trend row alongside Jobs/hr. If the GPU is near-idle while a job is in flight, the Trends panel border and its GPU-duty row turn orange with a `(!)` marker, so the one duty-cycle condition worth attention is flagged where the duty figure already lives rather than as a separate health row. On a multi-GPU worker the GPU-duty row states each card's own duty and the alert names the card it means, because the headline figure is a mean across the driven cards; the GPUs panel's `Duty` column shows each card's measured duty (a busy-context proxy where no utilization telemetry exists). When post-processing is enabled, the Job pipeline includes the dedicated post-processing lane between inference and safety, and the Queue/Work ledger show each active image job's current pop-order so a job can be followed across stages. In pipeline-disaggregation mode the Work ledger also carries a compact per-job stage line (prefixed `Disagg:`) showing where each in-flight disaggregated job sits in its pipeline (awaiting conditioning, sampling, awaiting decode) and the process its current stage is dispatched to. Multi-GPU workers also get a compact per-card strip (one row per GPU: VRAM bar, contexts, active jobs). Pop governors and the scheduler's RAM/preload diagnostics are consolidated into a single **Governance** panel (its title shows how many governors are actively holding); the scheduling half of it appears in details density. The **Health** checklist folds API reachability and horde registration into one **API** row and carries the loaded-model count in its title (e.g. `Health · 2 models`); process count lives in the Processes panel title and whole-card residency is explained in the hero and process table, so neither repeats as a health row. Panel titles carry at-a-glance counts (e.g. `Health · 2 models`, `Processes · 3/4 alive · 2 hot`, `Queue · 5 pending · 1,234 MP`, `GPUs · 2 cards · 41% duty`), so scale reads without expanding rows. The layout is width-driven in every density: below ~100 columns everything stacks in one column (an 80-column terminal is first-class and tables shed their least-important columns rather than truncating); at ~100 columns Health sits beside GPUs + Job pipeline with Trends as a full-width band underneath; and on a very wide terminal (~165+ columns) the worker/alchemy/residency panels additionally spread three-up. |
-| **Stats** | Session statistics owned by the worker: submitted/faulted jobs, kudos/hr, GPU duty (with each card's own figure beside it on a multi-GPU worker), recoveries, slowdowns, no-work time, pipeline depth, and alchemy totals when alchemy is enabled. The tables roll finalized image jobs up by model and by baseline, with jobs, MPxsteps (`width x height / 1,000,000 x steps x batch`), sampling time, end-to-end time, and batch>1 job counts. An alchemist worker also gets a **by alchemy form** table (per form: kind (graph vs CLIP), forms completed, faulted count, average and total pop-to-submit time, and peak VRAM), its headline Alchemy row breaks completed forms into a graph/CLIP split, and its finished forms appear in the Overview's recent-jobs view with their end-to-end time, giving alchemy the same per-job observability. The **JSONL export** button toggles session-scoped stats export under `.horde_worker_regen/stats/`; export is off by default, rotates at 5 MiB per file, and warns once retained stats JSONL files exceed 50 MiB. Retained files can be compressed or downsampled with `horde-stats` or the importable `stats_operations` helpers. |
-| **GPUs** | A per-card breakdown for multi-GPU operators (a single-GPU host shows one collapsed card): each GPU's VRAM headroom with a near-OOM pressure flag, its inference contexts against their target, throughput (combined it/s and a jobs/hr trend), its concurrency ceiling and a busy-context duty proxy, and (in the details density (`F6`)) the whole-card residency it is holding and any models gone *locally unservable* on that card. |
-| **Live** | A compact **Scheduling** strip, a **Worker RAM by role** panel (the worker's resident RAM broken down by role: inference, the component/VAE/post-processing/utilities lanes, safety, orchestrator, and download, with the overall system figure in its title and everything else left as a genuine *Other (OS + apps)* remainder), then one panel per inference process. The strip shows RAM-governor status and the latest preload-admission decision; details density adds the active pop hold/pause, reclaim target, and gate reason. Process panels show state (and its temperature phrase, e.g. *sampling*, *primed*, *loading*), current model and job, a sampling progress bar, iterations/second, VRAM/RAM (current and peak), and heartbeat freshness. A GPU-bearing process that holds model components in RAM also shows a **Resident** listing (each cached component's name, kind, and approximate MB) and a **Retained** line (its RSS minus the listed approximation): the residency is the component cache's own view, so the Retained figure is the allocator-retained or otherwise-unlisted remainder the cache does not account for. In pipeline-disaggregation mode the pinned sampler shows the same per-step progress bar while it samples, and the VAE lane shows a progress bar during a tiled decode (a single-shot decode has no intermediate steps, so it just reads as active). |
-| **Downloads** | Model download progress, with pause/resume and an optional bandwidth cap. |
-| **Control** | Worker lifecycle and lower-frequency controls: start/stop, local pause/resume, auto-start on launch, restart, and horde-side maintenance. |
-| **Logs** | Tail `logs/bridge.log` or any subprocess `logs/bridge_n.log`, with level and substring filters. These are the same files the worker already writes (see [Logs](../reference/logs.md)). |
-| **Config** | A form over `bridgeData.yaml`, grouped by operator workflow with inline help, enforced bounds, masked secrets, explicit option controls for mode fields, and checkboxes for alchemy forms (including vectorize, palette, describe, and aesthetic). Comments and untouched keys are preserved. The editor keeps an always-visible summary of what the form serves, including whether the pool is off or its effective seat/pin/ranker/download-admission state, names unsaved changes and restart-only edits, runs live interlock checks before the worker starts, surfaces blocking conflicts on the relevant tab, and offers built-in hardware presets whose grouped setting changes can be unchecked before applying. Includes a dedicated models editor and a searchable model picker: search across name/description/tags/triggers, filter by baseline/SFW/NSFW/inpainting and by on-disk status, sort by any column, mark models to add to or remove from the load/skip lists, see which list each model is already in, and inspect a model's full record. A dedicated **Model pool** sub-tab configures the fixed model pool: the **Demand-following pool preset (50 GB admission)** plus every pool knob (enable, seats, structured-YAML pins with affinity validation, ranker, rotation and dwell windows, rescue, demand poll interval, and automatic-download admission). When the legacy `max_throughput_mode` key supplies an absent pool value, the form displays that effective value; editing it creates an explicit nested override, while saving the switch alone leaves the inherited values absent from YAML. The form blocks pins excluded by the explicit load/skip rules and warns about ineffective preset/pool combinations. Clear actions ask for confirmation before dropping staged work. |
-| **Insights** | Live, actionable recommendations (low GPU duty cycle, VRAM pressure, fault rate, idle time, configuration mismatches, and model-pool guidance) and a recent-activity rollup. A **Model pool** panel is always shown: with the pool off it reads `Model pool: off` and notes the throughput-versus-variety trade; with the pool on it lists each logical seat, its measured readiness (`resident`, `cold`, or `empty`), dwell, last pop-match age and whether that match was resident, empty pops, rescue countdown, the most recent routed lane and demand-snapshot age, and the benched models. With the pool off, a recommendation appears only after measured `model_swap` churn. With the pool on, it flags stale demand and seats that keep taking empty pops, and notes recent resident pop matches without claiming job completion. |
-| **Benchmark** | A guided, plan-first flow: **Preview plan** shows what each level needs and what will run on this machine (no GPU), **Run benchmark** measures it, and **Apply suggested config** writes the recommendation. Model tiers are individual toggles (sd15/sdxl on by default; flux/qwen opt-in). Advanced options are collapsed by default with inline explanations, and each capability is separately selectable: queue depth / thread count / batch size, hires-fix / post-processing / controlnet / QR-code, and the alchemy CLIP / graph / concurrent lanes, so you can measure exactly the features you run. The suggested config shows per-setting **provenance** (proven / untested / failed / capped), and **History** browses and compares past runs. For the full benchmark CLI, see [`horde-benchmark`](../reference/cli.md#horde-benchmark). |
+**GPUs** shows one collapsed card on a single-GPU host, and flags a card under near-OOM pressure.
+Details density (`F6`) adds the whole-card residency each card holds and any models gone locally
+unservable on it. **Logs** reads the same `logs/bridge.log` and `logs/bridge_n.log` files the worker
+already writes; see [Logs](../reference/logs.md) for what is in them.
 
-The Config tab offers *Reload from disk*, *Apply preset*, *Save*, and *Save + restart worker*. A plain *Save* is enough
-to apply most changes: the running worker watches `bridgeData.yaml` and hot-reloads it on its own. Only
-fields marked with ⟳ need a restart, which is what *Save + restart worker* is for.
+The descriptions below are the Advanced presentation. Simple shows plain-language equivalents on
+Overview, Live, and Downloads, and puts a one-line explanation above the other tabs' widgets.
 
-Saving only writes the fields you actually changed: values you never touched (including settings the
-form merely shows at their default) are left exactly as they are on disk, so a fresh Save adds nothing
-surprising and a no-op Save changes nothing at all. If an edited value is out of range, the save is
-blocked, every problem is listed at once, and the editor jumps to the first offending field; a value
-that was already invalid on disk but that you did not touch will not block an unrelated change.
+On Stats, Control, Logs, and Insights, a **What these numbers say right now** panel appears whenever
+the live figures are worth a comment: a share of requests faulting, restarts the worker made on its
+own, failures in a row, a session spent mostly waiting for work. Each sentence quotes your worker's own
+numbers and says what to do, if anything. It is absent when there is nothing to say, so its presence is
+the signal. Fold it away with its ▼ once you have read it.
 
-### Deciding whether to enable the model pool
+### Overview
 
-The **Model pool** sub-tab controls a deliberate trade-off, so decide it on purpose rather than flipping it by
-reflex. Left off (the default), the worker advertises its normal eligible model set without a persistent seat
-bias. Turned on, it commits to a small set of logical "seats" and shapes its pops toward that set. A seat may
-be resident or cold; the runtime panels show which. This can reduce swap time when model churn is the bottleneck, at the
-cost of serving a narrower model mix; demand still decides which jobs arrive, so the gain is not guaranteed.
+The Overview carries the headline metrics (jobs submitted and faulted, queue depth, GPU duty cycle,
+kudos/hr), the **Health** checklist, and a **Now / Next / Why** strip stating what the scheduler is
+doing and what it is waiting on. Panel titles carry counts (`Health · 2 models`,
+`Processes · 3/4 alive · 2 hot`, `Queue · 5 pending · 1,234 MP`, `GPUs · 2 cards · 41% duty`), so the
+scale of things reads without expanding a row.
 
-Enable it when the worker either sits idle waiting for rare-model demand or records model-swap churn (the
-Insights tab uses the measured swap counter rather than inferring churn from model variety). Reach for
-**Demand-following pool preset (50 GB admission)** for the aggressive one-switch version, or set the individual
-knobs for tighter control. The form immediately shows the effective pool values inherited from the switch;
-editing one makes it an explicit override, while saving only the switch keeps those values inherited. `seats`
-at or below your inference-process count gives every seat the possibility of a resident home process, the
-demand `ranker` fills the seats you do not pin, and the rotation and dwell windows decide how fast the seat set
-re-contests. Watch the result on the Insights **Model pool** panel: a recent resident match proves that pop
-avoided a cold model load, while rising empty pops mean the horde has little demand for that model on this card.
-Edit pins in the same tab as a validated `{name, affinity}` YAML list; affinity biases seating and rotation.
+Two tables split the same worker along different axes. The **Work ledger** is job-owned: one row per
+job, listed in the order the worker will serve them. The process table is process-owned: slot state,
+resident model, GPU, memory, heartbeat, and completed count.
+
+A **Governance** panel consolidates the pop governors and the scheduler's RAM and preload diagnostics;
+its title says how many governors are actively holding work back. Multi-GPU workers also get a
+per-card strip (one row per GPU: VRAM bar, contexts, active jobs).
+
+#### Reading a work-ledger row
+
+Each row names the job's pop order, age, stage, model, the process and GPU it is dispatched to, and its
+progress. `J` collapses finished rows into a one-line count while keeping in-progress work visible.
+
+The **Size** cell states everything that decides how much work a job is, and a legend under the table
+names its parts:
+
+| Part | Example | Meaning |
+|------|---------|---------|
+| resolution | `832×1216` | The image size the request asks for. |
+| steps | `28s` | Denoising steps. |
+| batch | `n4` | Images per job. Absent when the job asks for one. |
+| sampler | `dpmpp_sde` | The sampler the request names. |
+| order | `²` | Model evaluations one step costs. Absent for a first-order sampler. |
+| cost | `2.22×` | Measured per-step cost against `k_euler`, published by `horde_sdk`. |
+
+An adaptive sampler shows neither an order nor a cost, since it chooses its own iteration count from
+the requested steps.
+
+Alchemy forms appear in the ledger and the Queue as their own rows, with the form where a model name
+goes (prefixed `⚗`) and the source image's resolution as the size. In pipeline-disaggregation mode the
+ledger also carries a per-job stage line (prefixed `Disagg:`) showing where each in-flight job sits in
+its pipeline and which process holds its current stage.
+
+#### Trends
+
+`T` cycles the trend window across 5m, 15m, 30m, 60m, 120m, and All; `R` resets the buffers without
+touching session totals. Changing the window filters retained history rather than resetting it, and
+each finite window draws fixed buckets from `now - window` to `now`, so a warming-up worker shows empty
+early buckets instead of a graph that only covers the samples it has. Config changes and explicit
+resets mark the trends as stabilizing.
+
+**Kudos/hr** is an active rate: kudos earned in the window divided by the time the pipeline actually
+held work. It therefore reads steadily instead of sawtoothing on each submit, and it charges neither
+the cold start before your first job nor an idle or maintenance stretch. A pause still counts while it
+drains queued work, since kudos keep landing. The session figure in the hero line and the status bar is
+the same measure over the whole session. An alchemist worker gets a **Forms/hr** row beside Jobs/hr.
+
+If the GPU is near-idle while a job is in flight, the Trends border and its GPU-duty row turn orange
+with a `(!)`. On a multi-GPU worker the row states each card's own duty and the alert names the card it
+means, because the headline figure is a mean across the driven cards.
+
+#### Layout and customization
+
+The Overview is built from individually hideable panels. `C` opens the customize overlay (`A` hides
+all, `N` shows all, `Esc` saves), and the choice persists across restarts. `H` temporarily reveals
+everything you have hidden, so you can glance at a demoted panel without editing the layout again.
+Nothing is lost by hiding: the per-role RAM breakdown lives on the **Live** tab, and health and overall
+RAM are always in the status bar.
+
+The layout follows the width in every density. Below about 100 columns everything stacks in one column,
+and tables shed their least-important columns rather than truncating (an 80-column terminal is
+first-class). At about 100 columns Health sits beside GPUs and the job pipeline. At about 165 columns
+the worker, alchemy, and residency panels spread three-up.
+
+### Stats
+
+Session statistics the worker owns: submitted and faulted jobs, kudos/hr, GPU duty (each card's own
+figure beside it on a multi-GPU worker), recoveries, slowdowns, no-work time, pipeline depth, and
+alchemy totals when alchemy is on.
+
+The tables roll finalized image jobs up by model and by baseline, carrying jobs, MPxsteps
+(`width x height / 1,000,000 x steps x batch`), sampling time, end-to-end time, and how many jobs ran a
+batch above one. An alchemist worker also gets a per-form table: kind (graph or CLIP), forms completed,
+faults, average and total pop-to-submit time, and peak VRAM.
+
+**JSONL export** toggles session-scoped stats export under `.horde_worker_regen/stats/`. It is off by
+default, rotates at 5 MiB per file, and warns once retained files exceed 50 MiB. Compress or downsample
+them with `horde-stats` or the importable `stats_operations` helpers.
+
+### Live
+
+A **Scheduling** strip, a **Worker RAM by role** panel, then one panel per inference process.
+
+The strip shows RAM-governor status and the latest preload-admission decision. Details density (`F6`)
+adds the active pop hold or pause, the reclaim target, and the gate reason.
+
+**Worker RAM by role** breaks the worker's resident RAM into inference, the component, VAE,
+post-processing, and utilities lanes, safety, orchestrator, and download, with the machine-wide figure
+in its title and everything else left as a genuine *Other (OS + apps)* remainder.
+
+Each process panel shows its state and temperature phrase (*sampling*, *primed*, *loading*), current
+model and job, a sampling progress bar, iterations per second, VRAM and RAM (current and peak), and
+heartbeat freshness. A GPU-bearing process holding model components in RAM also lists them under
+**Resident** (name, kind, approximate MB) with a **Retained** line for the remainder its component
+cache does not account for. In pipeline-disaggregation mode the pinned sampler shows the same per-step
+bar, and the VAE lane shows one during a tiled decode.
+
+### Config
+
+A form over `bridgeData.yaml`, grouped by operator workflow, with inline help, enforced bounds, masked
+secrets, and checkboxes for the alchemy forms. Comments and keys you never touch are preserved.
+
+The tab offers *Reload from disk*, *Apply preset*, *Save*, and *Save + restart worker*. A plain *Save*
+is enough for most changes: the running worker watches `bridgeData.yaml` and hot-reloads it. Only
+fields marked ⟳ need a restart.
+
+Saving writes only the fields you changed. Values you never touched, including settings the form shows
+at their default, are left exactly as they are on disk, so a no-op Save changes nothing at all. An
+out-of-range value blocks the save, lists every problem at once, and jumps to the first offending
+field. A value that was already invalid on disk and that you did not touch never blocks an unrelated
+change.
+
+The tab also holds a models editor and a searchable model picker: search across name, description,
+tags, and triggers, filter by baseline, by SFW/NSFW/inpainting, and by on-disk status, sort by any
+column, mark models for the load or skip lists, and inspect a model's full record. Clear actions
+confirm before dropping staged work.
+
+#### Deciding whether to turn the model pool on
+
+The **Model pool** sub-tab controls a trade-off worth deciding on purpose. Left off (the default), the
+worker advertises its normal eligible model set. Turned on, it commits to a small set of logical seats
+and shapes its pops toward them. That can cut swap time when model churn is the bottleneck, at the cost
+of serving a narrower mix. Demand still decides which jobs arrive, so the gain is not guaranteed.
+
+Turn it on when the worker either sits idle waiting for rare-model demand or records model-swap churn.
+The Insights tab reads the measured swap counter rather than inferring churn from model variety.
+
+**Demand-following pool preset (50 GB admission)** is the one-switch aggressive version; the individual
+knobs give tighter control. The form shows the effective values inherited from the switch. Editing one
+makes it an explicit override, while saving the switch alone leaves them inherited.
+
+- `seats` at or below your inference-process count gives every seat the possibility of a resident home
+  process.
+- The demand `ranker` fills the seats you do not pin.
+- The rotation and dwell windows decide how fast the seat set re-contests.
+- Pins are a validated `{name, affinity}` YAML list, edited in the same tab. Affinity biases seating
+  and rotation. A pin excluded by your load or skip rules is refused.
+
+Verify the result on the Insights **Model pool** panel: a recent resident match proves that pop avoided
+a cold load, while rising empty pops mean the horde has little demand for that model on this card. To
+undo, switch the pool off. The worker returns to advertising its normal eligible set on the next
+config reload.
+
+### Insights
+
+Live recommendations drawn from what this worker measured: low GPU duty cycle, VRAM pressure, fault
+rate, idle time, configuration mismatches, and model-pool guidance, plus a recent-activity rollup.
+
+The **Model pool** panel is always present. With the pool off it reads `Model pool: off` and notes the
+throughput-versus-variety trade, and a recommendation appears only after measured `model_swap` churn.
+With the pool on it lists each seat, its measured readiness (`resident`, `cold`, or `empty`), dwell,
+last pop-match age and whether that match was resident, empty pops, rescue countdown, the most recent
+routed lane, the demand-snapshot age, and the benched models. It flags stale demand and seats that keep
+taking empty pops.
+
+### Benchmark
+
+A plan-first flow: **Preview plan** shows what each level needs and what will run on this machine (no
+GPU required), **Run benchmark** measures it, and **Apply suggested config** writes the recommendation.
+
+Model tiers are individual toggles, with sd15 and sdxl on by default and flux and qwen opt-in. Advanced
+options are collapsed with inline explanations, and each capability is separately selectable: queue
+depth, thread count, and batch size; hires-fix, post-processing, controlnet, and QR-code; and the
+alchemy CLIP, graph, and concurrent lanes. Measure exactly the features you run.
+
+The suggested config shows per-setting provenance (proven, untested, failed, or capped), and
+**History** browses and compares past runs. For the command-line equivalent, see
+[`horde-benchmark`](../reference/cli.md#horde-benchmark).
 
 ## The status bar
 
-A one-line status bar sits above the tabs and stays visible from every tab, so the essentials are legible
-no matter which tab you are on. It leads with the worker's lifecycle phase (a coloured badge) and a
-one-glance health summary (the worst outstanding check, or an `N/N ok` tally when all is well), then the
-live vitals: the job pipeline (`q▸inf▸post▸saf▸sub` when post-processing is enabled), GPU duty, system RAM, kudos/hr, jobs done and faulted, and
-the worker name. On a narrow terminal the lowest-priority segments drop from the right rather than wrap, so
-the phase and health are never pushed off the line.
-
-## Customize the Overview
-
-The Overview is built from individually hideable panels. Press `C` to open the customize overlay, tick the
-panels you want gone (`A` hides all, `N` shows all), and press `Esc` to save; your choice persists across
-restarts. Press `H` at any time to temporarily reveal everything you have hidden (press it again to
-re-hide) for a quick glance at a demoted panel without re-editing the layout. Detail that leaves the
-Overview is not lost, only relocated: the per-role worker RAM breakdown lives on the **Live** tab, and the
-health summary and overall RAM are always in the status bar.
+A one-line status bar sits above the tabs and stays visible everywhere. It leads with the worker's
+lifecycle phase as a coloured badge and a health summary (the worst outstanding check, or an `N/N ok`
+tally), then the live vitals: the job pipeline (`q▸inf▸post▸saf▸sub` when post-processing is enabled),
+GPU duty, system RAM, kudos/hr, jobs done and faulted, and the worker name. On a narrow terminal the
+lowest-priority segments drop from the right rather than wrap, so the phase and health are never pushed
+off the line.
 
 ## Keyboard shortcuts
 
-The bar at the bottom of the screen shows as many shortcuts as the terminal is wide enough to hold, so
-on a narrow window it shows only the first few. The full list is always available two ways: press `?`
-for help, or `Ctrl+P` for the command palette, which lists every tab and every shortcut by name and
-shows the key beside each one. Both of those keys stay visible even at 80 columns.
+The bar at the bottom shows as many shortcuts as the terminal is wide enough to hold. The full list is
+always two keys away: `?` for help, or `Ctrl+P` for the command palette, which lists every tab and
+shortcut by name with its key beside it. Both stay visible at 80 columns.
 
 | Key | Action |
 |-----|--------|
-| `F3` | Start / stop the worker without quitting |
+| `F3` | Start or stop the worker without quitting |
 | `?` | Help for the level you are using, and the complete shortcut list |
 | `Ctrl+P` | Command palette: jump to any tab, run any shortcut, or change level |
 | `F6` | Cycle dashboard density: normal, details, thin |
-| `C` | Open the customize-layout overlay to show/hide individual Overview panels |
-| `H` | Reveal all hidden Overview panels (press again to re-hide them) |
-| `F7` | Pause / resume model downloads |
+| `C` | Open the customize-layout overlay for the Overview panels |
+| `H` | Reveal all hidden Overview panels (press again to re-hide) |
+| `J` | Collapse or show finished rows in the Work ledger |
+| `F7` | Pause or resume model downloads |
 | `F11` | Restart the worker process |
 | `M` | Toggle horde-side maintenance |
 | `T` | Cycle the Overview trend window: 5m, 15m, 30m, 60m, 120m, All |
 | `R` | Reset the Overview trend buffers (view-only; session totals keep running) |
 | `Ctrl+Q` / `Ctrl+C` | Stop the worker and quit |
 
-## Closing and reattaching
+## Keep the worker running when you close the dashboard
 
-Browser mode (the default) splits the dashboard from the worker: a persistent **host** process owns
-the worker, and each browser tab is just a viewer attached to it over a loopback socket. That is why a
-closed tab does not stop the worker, but it also makes "is it still running?" a fair question. What
-each kind of close does:
+Browser mode splits the dashboard from the worker: a persistent **host** process owns the worker, and
+each browser tab is a viewer attached to it over a loopback socket. That is why a closed tab does not
+stop the worker, and it is also why "is it still running?" is a fair question.
 
-| You close... | In this mode | The worker... |
-|--------------|--------------|---------------|
-| The browser tab | browser (default) | keeps running on the host; reopen to reconnect |
-| The launcher window, cleanly | browser (default) | stops (the launcher tells the host to drain and exit) |
-| The launcher window, hard-killed | browser (default) | keeps running, now orphaned (use the tray icon or `--stop`) |
-| The terminal, or `Ctrl+C` | `--terminal` / `--headless` | stops |
+| You close | In this mode | The worker |
+|-----------|--------------|------------|
+| The browser tab | browser (default) | Keeps running on the host. Reopen to reconnect. |
+| The launcher window, cleanly | browser (default) | Stops. The launcher tells the host to drain and exit. |
+| The launcher window, hard-killed | browser (default) | Keeps running, now orphaned. Use the tray icon or `--stop`. |
+| The terminal, or `Ctrl+C` | `--terminal` / `--headless` | Stops. |
 
 ### Reattach to a running worker
 
-- **Browser:** run `horde-worker` again. It detects the running host and opens a fresh dashboard tab
-  attached to it (it does not start a second worker).
+- **Browser:** run `horde-worker` again. It finds the running host and opens a fresh tab attached to
+  it, rather than starting a second worker.
 - **Terminal:** `horde-worker --terminal --attach` attaches an in-terminal dashboard to the running
-  host (defaults to `127.0.0.1:7717`; pass `--attach HOST:PORT` for another). Closing it detaches
+  host, defaulting to `127.0.0.1:7717`. Pass `--attach HOST:PORT` for another. Closing it detaches
   without stopping the worker.
-- **Inspect or stop from a terminal, with no UI:**
+- **No UI at all:**
 
   ```bash
   horde-worker-web --status   # is a worker host running here, and is its worker working?
-  horde-worker-web --stop     # ask it to drain in-flight jobs and exit cleanly
+  horde-worker-web --stop     # drain in-flight jobs and exit cleanly
   ```
 
   `--status` exits non-zero when nothing is running, so scripts can branch on it.
 
 ### The tray icon (Windows)
 
-On Windows the worker host shows a **system-tray icon** while it runs, so a worker is never invisible,
-even after the browser and the launcher window are gone. Its menu offers:
+The worker host shows a system-tray icon while it runs, so a worker is never invisible even after the
+browser and the launcher window are gone. The line at the top of its menu says whether the worker is
+running. The menu offers:
 
-- **Open dashboard**: reopen the browser dashboard attached to this worker (reusing a running web
-  server if there is one).
+- **Open dashboard**: reopen the browser dashboard attached to this worker, reusing a running web
+  server if there is one.
 - **Stop worker & exit**: drain in-flight jobs, then stop the worker and host cleanly. A still-running
-  launcher notices the host going away and closes its own dashboard sessions too. It does not terminate
-  the browser process, so other windows and tabs in the user's normal browser remain open. A bounded,
-  session-only fallback prevents a stuck dashboard TUI subprocess from being left behind.
+  launcher notices the host going away and closes its own dashboard sessions. Your browser and its
+  other tabs are left alone.
 
-The line at the top of the menu shows whether the worker is currently running. The icon is the simplest
-way to find and stop an orphaned worker after a hard-closed launcher window; the `--stop` command above
-does the same from a terminal. (Linux and macOS have no tray icon yet; use `--status` / `--stop`.)
+The icon is the simplest way to find and stop an orphaned worker after a hard-closed launcher window.
+`horde-worker-web --stop` does the same from a terminal. Linux and macOS have no tray icon yet; use
+`--status` and `--stop`.
 
-## Command-line options
+## Serve the dashboard to another machine
 
-These are options for the `horde-worker` program itself. The wrapper-script flags above (`--terminal`,
-`--host`) are handled before this program runs.
-
-| Flag | Meaning |
-|------|---------|
-| `--process-mode {real,fake}` | `real` runs the GPU worker (default); `fake` runs a synthetic worker. |
-| `-e`, `--load-config-from-env-vars` | Configure the worker from `AIWORKER_*` env vars instead of `bridgeData.yaml`. |
-| `-n`, `--worker-name NAME` | Override the worker name. |
-| `--amd`, `--amd-gpu` | Enable AMD GPU optimisations. |
-| `--config PATH` | Path to the `bridgeData.yaml` the config editor reads and writes (default `bridgeData.yaml`). |
-| `--no-auto-restart` | Do not relaunch the worker if it crashes. |
-| `--attach [HOST:PORT]` | Attach to a running worker host instead of owning the worker; the worker survives this session closing. With no value, attaches to `127.0.0.1:7717`. |
-| `--remote-exposed` | Treat this session as reachable from other machines, withholding the credential fields from the config editor. Set for you by the web launcher when it binds a non-loopback address; you would not normally pass it by hand. |
-| `--directml N` | Select a DirectML device index. DirectML is currently unavailable (see [Run on AMD ROCm](run-on-amd-rocm.md)), so this flag has no working backend at present. |
-
-When it owns the worker, the dashboard relaunches it automatically if it crashes (bounded by a restart
-budget, which `--no-auto-restart` disables) and stops it cleanly on exit.
-Manual Stop, Restart, Save + restart, and dashboard exit are non-blocking lifecycle intents: the UI remains
-responsive while accepted work drains. Restart stays labelled **Restarting** and launches the replacement only
-after the previous worker PID has exited, so two worker trees never overlap on the GPU. Pressing quit again
-during a graceful exit escalates to an immediate process-tree kill.
-
-## Serve the dashboard over the web yourself
-
-Because it is a Textual app, the same UI can be served over the web. The launcher does this for you in
-the default (browser) mode, binding `127.0.0.1:8000` so only this machine can reach it. To reach the
-dashboard from another machine, bind an address other than loopback:
+The default mode binds `127.0.0.1:8000`, so only this machine can reach it. To reach the dashboard from
+elsewhere, bind an address other than loopback:
 
 ```bash
 ./horde-worker.sh --host 0.0.0.0 --port 8000
 ```
 
-The address and port come from the first of these that is set, so pick whichever suits you:
+Run this on the machine the worker runs on: it serves that machine's worker.
+
+The address and port come from the first of these that is set:
 
 | Source | Example |
 |--------|---------|
@@ -318,17 +450,16 @@ The address and port come from the first of these that is set, so pick whichever
 | Environment variables | `HORDE_WORKER_WEB_HOST=0.0.0.0`, `HORDE_WORKER_WEB_PORT=8080` |
 | `bridgeData.yaml` | `dashboard_web_host: 0.0.0.0`, `dashboard_web_port: 8080` |
 
-The `bridgeData.yaml` keys are also on the Config tab's **Dashboard** page (at the Advanced experience
-level or above), so the binding survives between launches without a flag. They are read by the
-dashboard launcher, not by the worker, and take effect the next time you start the dashboard.
-
-Run this on the machine the worker runs on: it serves that machine's worker.
+The `bridgeData.yaml` keys are on the Config tab's **Dashboard** page at the Advanced level or above,
+so the binding survives between launches without a flag. The dashboard launcher reads them, not the
+worker, and they take effect the next time you start the dashboard. To go back to loopback, clear them
+and launch without `--host`.
 
 ### What a network-bound dashboard exposes
 
 **There is no authentication and no encryption.** Anyone who can reach the port can start and stop your
-worker, change every setting, and read your worker's logs. Only bind the network on a network you
-trust, and never expose the port to the internet.
+worker, change every setting, and read your logs. Bind the network only on a network you trust, and
+never expose the port to the internet.
 
 When the bind is not loopback, the dashboard withholds the **API key** and **Civitai token** fields
 from the config editor, so a visitor can neither read nor replace your credentials. That is the only
@@ -337,108 +468,110 @@ protection it adds. It does not cover:
 - The keys themselves, which stay in `bridgeData.yaml` on the worker machine.
 - Anything already written to the logs, which the Logs tab shows in full.
 - The **Getting started** page's key fields on a worker that is not yet configured. They are masked as
-  you type but are not withheld, because withholding them would block first-run setup.
+  you type but not withheld, because withholding them would block first-run setup.
 
-The launcher prints this same summary when it binds a non-loopback address, so the exposure is never
-silent.
+The launcher prints this same summary whenever it binds a non-loopback address, so the exposure is
+never silent.
 
-## Use the basic native overview
+### The lightweight `/native` page
 
-Open `http://<worker-machine>:<dashboard-port>/native` for a lightweight, browser-native status page. It
-uses ordinary responsive HTML rather than the terminal canvas, so it is the practical quick-check surface
-on a phone. It shows worker identity and uptime, lifecycle and maintenance state, pipeline depth, session
-job/kudos totals, GPU duty, active models, recent Horde messages, active-job stage and progress, compact
-per-process liveness/model/VRAM/heartbeat state, and alchemy totals when enabled. The **At a glance** sentence
-prioritizes the condition most likely to explain what the worker is doing now.
+`http://<worker-machine>:<dashboard-port>/native` is a browser-native status page built from ordinary
+responsive HTML rather than the terminal canvas, which makes it the practical quick-check surface on a
+phone. It shows worker identity and uptime, lifecycle and maintenance state, pipeline depth, session
+job and kudos totals, GPU duty, active models, recent horde messages, active-job stage and progress,
+per-process liveness, model, VRAM and heartbeat state, and alchemy totals when enabled. Its **At a
+glance** sentence leads with whatever best explains what the worker is doing now.
 
-The available controls are intentionally limited: start, graceful stop, local pause/resume, and Horde
-maintenance on/off. **Pause** stops this worker from accepting new work locally; **Horde maintenance**
-changes the worker's advertised maintenance state at the Horde. They are independent controls. Use the
-**Full terminal dashboard** link for configuration, downloads, logs, diagnostics, and detailed process or
-job views.
+Its controls are deliberately few: start, graceful stop, local pause/resume, and horde maintenance.
+**Pause** stops this worker from accepting new work locally; **Horde maintenance** changes the worker's
+advertised state at the horde. They are independent. The **Full terminal dashboard** link goes to
+everything else.
 
-Choose **Glance view** to keep lifecycle controls, four headline metrics, the pipeline, active jobs, and all
-process states in one viewport. On a phone it behaves like a compact application rather than a long page:
-the page itself does not scroll, metrics form a 2×2 dashboard, and the pipeline stays on one row. Active jobs
-and processes use compact two- or three-line cards, switching to a two-column matrix as the inventory grows.
-The page divides the remaining height according to each panel's actual row count, keeping every entry visible
-instead of putting state behind another swipe or nested scroller. Safe-area padding accounts for notches and
-home indicators. The preference is remembered in that browser;
-bookmark `/native?view=glance` to request it directly on a dedicated device or home-screen shortcut.
+**Glance view** keeps lifecycle controls, four headline metrics, the pipeline, active jobs, and all
+process states in one viewport. On a phone the page itself does not scroll: metrics form a 2×2 grid,
+the pipeline stays on one row, and jobs and processes use compact cards that become a two-column matrix
+as the inventory grows. The preference is remembered in that browser, and `/native?view=glance`
+requests it directly for a home-screen shortcut.
 
-The page polls the same persistent worker host used by the full browser dashboard, so closing or refreshing
-it does not restart the worker or reset worker-owned session statistics. It has no separate daemon or build
-step. The native overview intentionally omits config, credentials, logs, and full snapshot internals, but it
-is not an authentication boundary: its controls are unauthenticated, and the complete dashboard remains at
-`/` on the same port. Apply the same trusted-network restriction described above.
+The page polls the same host the full browser dashboard uses, so refreshing or closing it neither
+restarts the worker nor resets session statistics. It omits config, credentials, logs, and snapshot
+internals, but it is not an authentication boundary: its controls are unauthenticated, and the full
+dashboard is still at `/` on the same port. The trusted-network rule above applies to both.
 
-## Use the dashboard from a phone
+### On a phone
 
-The web dashboard works on a phone or tablet browser: bind the network as above, then open
-`http://<worker-machine>:<dashboard-port>` on the device (8000 unless you configured another port).
-For a conventional mobile overview and the core lifecycle controls, prefer the
-[`/native` companion](#use-the-basic-native-overview); use the terminal view when you need its full operator
-surface.
-Three things adapt automatically.
+Bind the network as above, then open `http://<worker-machine>:<dashboard-port>` on the device (port
+8000 unless you configured another). Prefer [`/native`](#the-lightweight-native-page) for a
+conventional mobile overview and the core controls; use the terminal view when you need the full
+operator surface.
 
-The page sizes the terminal's text so the dashboard gets enough columns to lay itself out, rather than
-rendering a desktop-width page scaled down to nothing. It targets about 52 terminal columns and will not
-automatically shrink below 12px.
-Append `?fontsize=N` to the URL to override it (`?fontsize=14` for larger text and fewer columns,
-`?fontsize=8` only if you deliberately prefer more columns to readability).
+Three things adapt on their own:
 
-The dashboard is drawn into a terminal canvas, so the browser cannot tell a painted tab from
-a painted text field. On touch devices the terminal's hidden keyboard input is therefore disabled
-by default: tapping tabs and buttons does not summon the software keyboard. Tap the keyboard button in
-the bottom browser dock when you intend to type into the currently selected dashboard field;
-tap it again to return to navigation-only taps.
+- **Text size.** The page sizes the terminal's text to give the dashboard enough columns to lay itself
+  out, targeting about 52 columns and never shrinking below 12px. Append `?fontsize=N` to override it:
+  `?fontsize=14` for larger text and fewer columns, `?fontsize=8` only if you would rather have columns
+  than readability.
+- **Typing.** The dashboard is painted into a terminal canvas, so the browser cannot tell a tab from a
+  text field. Touch keyboard input is therefore off by default, and tapping around does not summon the
+  software keyboard. Tap the keyboard button in the bottom dock when you mean to type into the selected
+  field, and again to return to navigation-only taps.
+- **Layout.** Below the 80-column terminal floor, cards lose their side padding and borders, action
+  bars become two-column touch grids, form rows stack, buttons and tabs gain taller touch targets, tab
+  labels shorten, dialogs clamp to the viewport, Logs wrap, and tables shed down to the columns that
+  identify a row. The terminal follows the browser's visual viewport, so the bottom stays reachable as
+  the address bar moves and while the keyboard is open.
 
-The dashboard itself has a layout for screens narrower than the 80-column terminal floor. Cards lose
-their side padding and borders, desktop action bars become two-column touch grids, form rows stack instead
-of sitting side by side, primary
-action buttons and tabs gain taller touch targets, tab labels shorten, fixed-width dialogs clamp to the
-viewport, Logs wrap long lines, and tables shed columns down to the ones that identify each row.
-The terminal follows the browser's *visual* viewport rather than legacy `100vh`, so the bottom remains
-reachable as the address bar expands or collapses and while the software keyboard is open. The decorative
-title/clock header is omitted on phones. Overview's headline scrolls with the rest of that page, and its
-dense trend, pipeline, GPU, worker, alchemy, health, and residency grids become stacked readable facts
-while the desktop layouts remain unchanged. Swipe
-vertically anywhere in the terminal to scroll; you do not need to catch Textual's narrow scrollbar.
-When the keyboard substantially reduces the viewport, the dashboard scrolls the focused field to the top
-of its remaining scroller so the value being edited remains visible; short dialogs scroll instead of
-clipping their final actions. A 52-pixel browser dock below the terminal holds three controls: the hamburger
-button (`☰`) opens the command palette, the up/down triangle hides or restores the main tab strip without
-changing the current page, and the keyboard button enables typing. The terminal shortcut Footer and its
-built-in affordances are hidden on phones; the dock replaces the useful palette entry point without covering
-content or toast notifications.
+Gestures and the dock:
 
-Swipe sideways directly over the main or Config tab strip to move to the adjacent tab; Textual reveals
-the newly active tab in its strip. The gesture
-locks to its dominant axis after a short movement, so a mostly vertical drag continues to scroll the page
-and one mostly horizontal drag produces one focus-independent tab change through the terminal's keyboard
-input path. Start the gesture on the relevant strip. Two-finger pinch zoom remains available.
-
-On phones, the Config page uses one page-level scroller. Its action bar, status summaries, and sub-tab
-strip therefore move out of the way as you scroll through fields instead of remaining pinned and
-consuming most of the reduced viewport. Desktop Config keeps its existing fixed controls and independently
-scrolling field panel.
+- Swipe vertically anywhere in the terminal to scroll; you do not need to catch the narrow scrollbar.
+- Swipe sideways over the main or Config tab strip to move to the adjacent tab. The gesture locks to
+  its dominant axis after a short movement, so a mostly vertical drag still scrolls. Two-finger pinch
+  zoom stays available.
+- The 52-pixel dock below the terminal holds three controls: `☰` opens the command palette, the
+  up/down triangle hides or restores the tab strip without changing page, and the keyboard button
+  enables typing.
 
 Two rough edges worth knowing:
 
 - Benchmark **History** scrolls sideways rather than shedding columns.
-- Typing requires enabling the keyboard button first, and modifier shortcuts (including `Ctrl+P` for
-  the command palette) remain awkward with a phone's software keyboard.
+- Modifier shortcuts, including `Ctrl+P`, stay awkward with a software keyboard.
+
+## Command-line options
+
+These are options for the `horde-worker` program. The wrapper-script flags above (`--terminal`,
+`--host`) are handled before it runs.
+
+| Flag | Meaning |
+|------|---------|
+| `--process-mode {real,fake}` | `real` runs the GPU worker (default); `fake` runs a synthetic worker. |
+| `-e`, `--load-config-from-env-vars` | Configure the worker from `AIWORKER_*` env vars instead of `bridgeData.yaml`. |
+| `-n`, `--worker-name NAME` | Override the worker name. |
+| `--amd`, `--amd-gpu` | Enable AMD GPU optimisations. |
+| `--config PATH` | The `bridgeData.yaml` the config editor reads and writes (default `bridgeData.yaml`). |
+| `--no-auto-restart` | Do not relaunch the worker if it crashes. |
+| `--attach [HOST:PORT]` | Attach to a running worker host instead of owning the worker, so the worker survives this session closing. Defaults to `127.0.0.1:7717`. |
+| `--remote-exposed` | Treat this session as reachable from other machines, withholding the credential fields from the config editor. The web launcher sets it for you when it binds a non-loopback address. |
+| `--directml N` | Select a DirectML device index. DirectML has no working backend at present (see [Run on AMD ROCm](run-on-amd-rocm.md)). |
+
+When it owns the worker, the dashboard relaunches it after a crash, bounded by a restart budget that
+`--no-auto-restart` disables, and stops it cleanly on exit.
+
+Stop, Restart, Save + restart, and dashboard exit are non-blocking: the UI stays responsive while
+accepted work drains. Restart stays labelled **Restarting** and launches the replacement only after the
+previous worker's PID has exited, so two worker trees never overlap on the GPU. Pressing quit again
+during a graceful exit escalates to an immediate process-tree kill.
 
 ## How it works
 
 When the dashboard owns the worker, it spawns the worker as a child process and talks to it over a
 duplex pipe, with no on-disk state file. The worker pushes compact state snapshots and accepts control
-commands (pause/resume, maintenance, restart). State publishing never blocks the worker's control
-loop, so a slow or closed UI can never stall job processing. In browser mode a separate host process
-owns the worker and the served dashboard attaches to it over a socket, which is why closing the tab
-leaves the worker running. Uptime, cumulative totals, and the worker-owned trend-history backfill therefore
-continue across browser sessions; only a real worker restart begins a new session.
+commands. Publishing never blocks the worker's control loop, so a slow or closed UI cannot stall job
+processing.
+
+In browser mode a separate host process owns the worker and the served dashboard attaches to it over a
+socket. Uptime, cumulative totals, and the trend-history backfill therefore continue across browser
+sessions; only a real worker restart begins a new session.
 
 See also: [Frontend and durable state](../explanation/frontend_and_state.md) for the supervisor
-channel, served/attached modes, and persisted state; [Architecture](../explanation/architecture.md);
+channel, served and attached modes, and persisted state; [Architecture](../explanation/architecture.md);
 and [IPC and messaging](../explanation/ipc_and_messaging.md).

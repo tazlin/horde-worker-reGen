@@ -111,7 +111,7 @@ first run and opens the dashboard. To run without a UI instead, use the non-inte
 `update-runtime.cmd` to install, copy `bridgeData_template.yaml` to `bridgeData.yaml` and fill in your
 details, then `horde-bridge.cmd`. See [Run headless](run-headless.md).
 
-For a from-scratch virtualenv install (your own Python, manual `uv`/`pip`), see
+To drive the environment yourself, or to force a particular PyTorch build, see
 [Choose a PyTorch build](choose-a-pytorch-build.md).
 
 ## Next steps
