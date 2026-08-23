@@ -30,12 +30,12 @@ dependencies = [
     "horde_safety~=0.3.0",
     # We don't include all of the horde-engine extras here because some of them pull native deps that have no wheels for some
     # accelerators (Intel XPU / Apple MPS / Ascend), so they are NOT in the base install: a base worker runs on every backend ComfyUI supports
-    "horde_engine[layerdiffuse,upscale-extra]>=7.2.2,<8.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=7.2.4,<8.0.0",
     "horde_model_reference>=7.6.1,<8.0.0",
     # Base package only (pillow/pydantic deps): the parent-side lane adapter and entry points import its
     # client and launcher in THIS venv. The heavy annotator/server stacks stay out of this resolution; they
     # are provisioned into the separate utilities venv from requirements/utilities/uv.lock.
-    "horde-image-utilities~=0.3.0",
+    "horde-image-utilities~=0.3.1",
     "python-dotenv",
     "ruamel.yaml",
     "semver",
