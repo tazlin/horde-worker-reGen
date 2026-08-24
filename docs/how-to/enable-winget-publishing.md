@@ -56,9 +56,8 @@ disabled, so re-enabling is just reversing each item below.
    - `docs/how-to/install.md`: the `winget` scripted-install block, and the two "to another drive with
      winget" notes (install path + disk space sections).
    - `docs/tutorials/getting-started.md`: "Other ways to install (winget, ...)".
-   - `docs/how-to/update-the-worker.md`: the `winget` row in the update table, the "winget and git-clone
-     installs never self-update" sentence, and "(one-line installer, `.exe`, or winget)" in the download
-     preview section.
+   - `docs/how-to/update-the-worker.md`: add the winget operator procedure, and
+     `docs/reference/cli.md`: describe winget ownership in the update reference.
    - `docs/how-to/troubleshoot.md`: the SmartScreen note's "`winget install` avoids the prompt."
    - `install.ps1`: the closing "To update later" message's `winget upgrade Haidra.HordeWorker` option.
    - In-app update notices: `horde_worker_regen/run_worker.py`, `horde_worker_regen/tui/app.py`,

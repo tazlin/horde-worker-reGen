@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -53,64 +56,96 @@ def test_compatible_versioned_sidecar_is_reused(monkeypatch: pytest.MonkeyPatch,
     assert uvbin.ensure_compatible_uv(tmp_path) == str(sidecar)
 
 
-def test_stale_bundled_uv_is_repaired_through_verified_copy(
+def _uv_zip(payload: bytes = b"downloaded-uv") -> bytes:
+    """Return a minimal uv release ZIP for the host executable name."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        executable_name = "uv.exe" if os.name == "nt" else "uv"
+        archive.writestr(f"uv-test/{executable_name}", payload)
+    return buffer.getvalue()
+
+
+def test_stale_bundled_uv_is_repaired_through_verified_download(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A stale private uv updates a sidecar, never the binary hosting the current bootstrap."""
+    """A stale private uv downloads a verified sidecar without invoking that uv's self-updater."""
     _write_project(tmp_path)
     bundled = _bundled_path(tmp_path)
     bundled.parent.mkdir()
     bundled.write_bytes(b"old-private-uv")
-    updated_copies: set[Path] = set()
-    commands: list[list[str]] = []
+    archive_payload = _uv_zip()
+    archive_name = "uv-x86_64-pc-windows-msvc.zip"
+    checksum_payload = f"{hashlib.sha256(archive_payload).hexdigest()}  {archive_name}\n".encode()
+    downloads: list[str] = []
     command_directories: list[Path] = []
 
     def fake_reported_version(executable: str, *, cwd: Path) -> str | None:
         command_directories.append(cwd)
         path = Path(executable)
-        if path in updated_copies:
+        if path.read_bytes() == b"downloaded-uv":
             return "0.12.1"
         return "0.11.21" if path.exists() else None
 
-    class _Completed:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    def fake_download(url: str) -> bytes:
+        downloads.append(url)
+        return checksum_payload if url.endswith(".sha256") else archive_payload
 
-    def fake_run(command: list[str], **kw: object) -> _Completed:
-        commands.append(command)
-        command_directory = Path(str(kw["cwd"]))
-        command_directories.append(command_directory)
-        assert command_directory.exists()
-        assert not command_directory.is_relative_to(tmp_path)
-        candidate = Path(command[0])
-        assert candidate != bundled
-        assert candidate.read_bytes() == b"old-private-uv"
-        assert command[1:] == ["self", "update", "0.12.1"]
-        updated_copies.add(candidate)
-        return _Completed()
-
+    monkeypatch.setattr(uvbin, "_release_archive_name", lambda: archive_name)
+    monkeypatch.setattr(uvbin, "_download", fake_download)
     monkeypatch.setattr(uvbin, "_reported_version", fake_reported_version)
-    monkeypatch.setattr(uvbin.subprocess, "run", fake_run)
 
     repaired = Path(uvbin.ensure_compatible_uv(tmp_path))
 
-    assert commands
+    assert downloads == [
+        f"https://github.com/astral-sh/uv/releases/download/0.12.1/{archive_name}.sha256",
+        f"https://github.com/astral-sh/uv/releases/download/0.12.1/{archive_name}",
+    ]
     assert command_directories
     assert all(not directory.is_relative_to(tmp_path) for directory in command_directories)
     assert repaired.name == ("uv-0.12.1.exe" if os.name == "nt" else "uv-0.12.1")
-    assert repaired.read_bytes() == b"old-private-uv"
+    assert repaired.read_bytes() == b"downloaded-uv"
     assert bundled.read_bytes() == b"old-private-uv"
 
 
-def test_incompatible_path_uv_is_not_modified(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Developer-owned PATH tooling remains outside the managed install's repair boundary."""
+def test_incompatible_path_uv_gets_private_sidecar_without_modification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A git checkout gets a compatible private sidecar without modifying developer-owned PATH tooling."""
     _write_project(tmp_path)
     path_uv = tmp_path / "developer-uv"
     path_uv.write_bytes(b"developer-owned")
-    monkeypatch.setattr(uvbin, "_reported_version", lambda executable, **kw: "0.11.21")
+    sidecar = _bundled_path(tmp_path).parent / ("uv-0.12.1.exe" if os.name == "nt" else "uv-0.12.1")
 
-    with pytest.raises(uvbin.UvCompatibilityError, match="PATH-provided"):
-        uvbin.ensure_compatible_uv(tmp_path, str(path_uv))
+    def fake_reported_version(executable: str, **kw: object) -> str:
+        return "0.12.1" if Path(executable) == sidecar else "0.11.21"
+
+    def fake_download(version: str, target: Path, **kw: object) -> None:
+        assert version == "0.12.1"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"private-sidecar")
+
+    monkeypatch.setattr(uvbin, "_reported_version", fake_reported_version)
+    monkeypatch.setattr(uvbin, "_download_verified_uv", fake_download)
+
+    assert uvbin.ensure_compatible_uv(tmp_path, str(path_uv)) == str(sidecar)
     assert path_uv.read_bytes() == b"developer-owned"
+    assert sidecar.read_bytes() == b"private-sidecar"
+
+
+def test_checksum_mismatch_never_publishes_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A corrupt or intercepted archive cannot replace the last sidecar."""
+    target = _bundled_path(tmp_path).parent / ("uv-0.12.1.exe" if os.name == "nt" else "uv-0.12.1")
+    target.parent.mkdir()
+    target.write_bytes(b"last-runnable-sidecar")
+    archive_name = "uv-x86_64-pc-windows-msvc.zip"
+    monkeypatch.setattr(uvbin, "_release_archive_name", lambda: archive_name)
+    monkeypatch.setattr(
+        uvbin,
+        "_download",
+        lambda url: (b"0" * 64 + b"  " + archive_name.encode()) if url.endswith(".sha256") else b"corrupt",
+    )
+
+    with pytest.raises(uvbin.UvCompatibilityError, match="failed SHA-256 verification"):
+        uvbin._download_verified_uv("0.12.1", target, probe_directory=tmp_path)
+    assert target.read_bytes() == b"last-runnable-sidecar"

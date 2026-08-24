@@ -76,6 +76,22 @@ def test_sync_calls_uv_sync(env: tuple[Path, list]) -> None:
     assert calls == [("sync", "cu126")]
 
 
+def test_uv_repair_failure_stops_before_environment_or_worker(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Launch never enters a stale venv when the exact private uv cannot be established."""
+    _, calls = env
+    monkeypatch.setattr(
+        cli.uvbin,
+        "ensure_compatible_uv",
+        lambda *args, **kwargs: (_ for _ in ()).throw(cli.uvbin.UvCompatibilityError("download blocked")),
+    )
+
+    assert cli.main(["launch", "web"]) == 1
+    assert calls == []
+    assert "ERROR: download blocked" in capsys.readouterr().err
+
+
 def test_sync_backend_flag_overrides(env: tuple[Path, list]) -> None:
     """`sync --backend cu130` forces that build."""
     _, calls = env
@@ -387,6 +403,55 @@ def test_update_applies_then_resyncs(env: tuple[Path, list], monkeypatch: pytest
     assert cli.main(["update", "--yes"]) == 0
     assert applied == [True]
     assert calls == [("sync", "cu126")]  # reconcile after the overlay
+
+
+def test_update_retries_sync_when_source_is_already_current(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A prior overlay with a failed sync can be repaired by running the same update command again."""
+    _, calls = env
+    current = cli.updater.UpdateInfo(
+        current="18.0.2",
+        latest="v18.0.2",
+        available=False,
+        bundle_url=None,
+        checksums_url=None,
+    )
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root, **kw: current)
+
+    assert cli.main(["update", "--yes", "--cpu", "--no-sync-preview"]) == 0
+    assert calls == [("sync", "cpu")]
+    assert "Already up to date (18.0.2)" in capsys.readouterr().out
+
+
+def test_update_after_legacy_git_pull_syncs_without_overlay(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A v10-era `git pull && update.cmd` habit converges deps without overwriting git-owned source."""
+    root, calls = env
+    (root / ".git").mkdir()
+    (root / "conda").mkdir()  # representative legacy runtime; the new uv environment ignores it
+    (root / "micromamba.exe").write_bytes(b"legacy")
+    monkeypatch.setattr(
+        cli.updater,
+        "check_for_update",
+        lambda *args, **kwargs: pytest.fail("git checkout must not query or apply a release overlay"),
+    )
+    monkeypatch.setattr(
+        cli.updater,
+        "perform_update",
+        lambda *args, **kwargs: pytest.fail("git checkout must not apply a release overlay"),
+    )
+
+    assert cli.main(["update", "--yes", "--cpu", "--no-sync-preview"]) == 0
+    assert calls == [("sync", "cpu")]
+    output = capsys.readouterr().out
+    assert "Git checkout detected" in output
+    assert "dependencies are up to date" in output
 
 
 def test_update_repairs_uv_again_after_overlay(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:

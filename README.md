@@ -18,7 +18,7 @@ to students, artists, researchers, and anyone who cannot or prefers not to pay c
 > below install from this repository and record it as the update origin, so `./update.sh` / `update.cmd`
 > pull beta releases. When the beta graduates, a release from here will point installs back at
 > `Haidra-Org/horde-worker-reGen` automatically; nothing to reinstall. See
-> [Where releases are pulled from](docs/how-to/update-the-worker.md#where-releases-are-pulled-from).
+> [Update and dependency sync](docs/reference/cli.md#update-and-dependency-sync).
 
 You do not need Python or any other software installed first.
 

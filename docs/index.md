@@ -29,7 +29,8 @@ as needed.
     - [update](how-to/update-the-worker.md)
     - [troubleshoot](how-to/troubleshoot.md)
 - **Reference** (look something up): [command line](reference/cli.md),
-  [logs](reference/logs.md), [codebase map](reference/codebase-map.md).
+  [update bootstrap](reference/update_bootstrap.md), [logs](reference/logs.md),
+  [codebase map](reference/codebase-map.md).
 
 ## Understanding the worker
 
@@ -81,6 +82,9 @@ Want to know how it works under the hood, or contribute a change? The
 17. **[Image utilities lane](explanation/image_utilities_lane.md)**: the
     out-of-venv capability service, the parent-side adapter that bridges it into
     the ordinary child contract, its control verbs, and how it is supervised.
+18. **[Updates and bootstrap](explanation/updates_and_bootstrap.md)**: how source,
+    dependencies, and operator data converge safely across managed, git, and
+    legacy installations.
 
 The **[codebase map](reference/codebase-map.md)** is a file-to-responsibility
 quick reference, and the auto-generated API reference for every module lives

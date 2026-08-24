@@ -768,8 +768,9 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Check for, and (unless ``--check``) apply, the latest release in place, then re-sync dependencies.
 
     Unlike the launch-time offer, this ignores the skip/throttle state (running ``update`` is itself the
-    intent to update now). It refuses to overlay an install whose updates are owned elsewhere (winget, a
-    git checkout), but ``--check`` still reports availability for those.
+    intent to update now). It refuses to overlay an install whose files are owned by winget. In a git
+    checkout it performs the dependency-sync half of an update, so the historical ``git pull`` followed by
+    ``update.cmd`` workflow remains safe even though git—not the self-updater—owns the source files.
     """
     repo_override: str | None = getattr(args, "repo", None) or None
 
@@ -785,8 +786,20 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
             print(f"Up to date ({info.current}){channel_note}.")
         return 0
 
-    # Gate before the network call on the apply path: an install whose updates are owned elsewhere is
-    # refused regardless of what is available.
+    # A git pull has already performed the source half of the update. Converge its environment instead of
+    # refusing `update`: old operators were historically taught `git pull` followed by the update script,
+    # and that path must remain a valid migration from pre-bootstrap releases.
+    method = updater.resolve_install_method(root)
+    if method == "dev":
+        print("Git checkout detected; leaving source updates to git and syncing dependencies.")
+        rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
+        if rc != 0:
+            print("The dependency sync did not complete; re-run update after resolving the error.", file=sys.stderr)
+            return rc
+        print("Git checkout dependencies are up to date.")
+        return 0
+
+    # Gate before the network call on the remaining apply path: winget owns both source and version state.
     allowed, reason = updater.self_update_allowed(root)
     if not allowed:
         print(reason, file=sys.stderr)
@@ -808,6 +821,13 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
         msg = f"Already up to date ({info.current}){channel_note}."
         if repo_override:
             msg += f" Update origin set to {repo_override}."
+        rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
+        if rc != 0:
+            print(
+                f"{msg} The dependency sync did not complete; re-run update after resolving the error.",
+                file=sys.stderr,
+            )
+            return rc
         print(msg)
         return 0
 
@@ -837,7 +857,7 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
         return 1
     # Hold the success line until the reconcile lands so a failed sync is not reported as a clean update
     # (the overlay invalidated the sync stamp, so the next launch retries the sync regardless).
-    rc = _sync(uv, root, cli_flag=None, options=_sync_options(args))
+    rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
     if rc != 0:
         print(
             f"{result.message} The dependency sync did not complete; the next launch will retry it.",
@@ -999,6 +1019,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("bundle", help="Path to the extracted release bundle directory.")
 
     p_update = sub.add_parser("update", help="Update the worker to the latest release in place, then re-sync.")
+    add_backend_flag(p_update)
+    add_sync_flags(p_update)
     p_update.add_argument("--check", action="store_true", help="Only report whether an update is available.")
     p_update.add_argument("--yes", action="store_true", help="Apply without prompting (for non-interactive use).")
     p_update.add_argument(

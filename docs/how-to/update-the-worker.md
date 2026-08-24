@@ -1,149 +1,119 @@
 # Update the worker
 
-Updating matches how you installed. In every case: stop the worker first, update, then start it again.
-Announcements for new versions go out on [Discord](https://discord.gg/3DxrhksKzn).
+Stop the worker before updating. When you finish, the worker source and dependencies are current while
+your configuration, downloaded models, and runtime cache remain in place.
 
-The worker checks for new releases in the background and tells you when one is available: the
-dashboard shows a notification, and a headless/console worker logs it at startup and in its periodic
-status report. Set `HORDE_WORKER_NO_UPDATE_CHECK=1` to disable the check.
+Use the procedure that matches how you installed the worker. If you are unsure, open the worker folder:
+a `.git` entry means you have a git installation. Most other Windows installations use the managed
+installer procedure. These procedures update the existing folder and have no automatic undo; see
+[Go back to an earlier version](#go-back-to-an-earlier-version) before continuing if you may need a rollback.
 
-## Steps
+## Update a managed installation
 
-1. **Stop** the worker (`Ctrl+C`, or Quit in the dashboard).
-2. **Update**, matching how you installed:
+Use these steps for a worker installed by the Windows installer, the one-line installer, or a previous
+managed release.
 
-   | Installed with | Update with |
-   |----------------|-------------|
-   | One-line installer or `.exe` | Run `update.cmd` (Windows) or `update.sh` (Linux/macOS) in your worker folder, or re-run the same installer. Both download the latest release and update in place, leaving your peered `<worker>-data` folder (models, cache, Python) untouched. |
-   | Git clone | `git pull`, then `update-runtime.cmd` (or the `.sh` / `-rocm` variant). The self-updater detects a git checkout and stays out of the way, so it never overlays your working tree. |
-   | Zip | Download the [latest zip](https://github.com/Haidra-Org/horde-worker-reGen/archive/refs/heads/main.zip), extract over the existing folder, then `update-runtime.cmd` |
+1. Stop the worker with **Quit** in the dashboard or `Ctrl+C` in its terminal. Continue when the dashboard
+   closes or the terminal returns to its prompt.
+2. Run `update.cmd` on Windows or `./update.sh` on Linux/macOS from the worker folder. Continue when it
+   reports `Updated to <version>` or `Already up to date (<version>)` and finishes dependency sync.
+3. Start the worker normally. Confirm the new version in the dashboard or the startup log.
 
-3. **Start** the worker again.
+You can also re-run the installer over the same folder. It preserves `bridgeData.yaml` and the sibling
+`<worker>-data` folder that holds models, managed Python, and caches.
 
-Script names above assume Windows and NVIDIA. For Linux use the `.sh` scripts; for AMD use the `-rocm`
-variants.
+## Update a git installation
 
-### When an update requires a newer uv
+1. Stop the worker with **Quit** in the dashboard or `Ctrl+C` in its terminal. Continue when the dashboard
+   closes or the terminal returns to its prompt.
+2. Open a terminal in the worker folder and update the checkout:
 
-Managed updates preserve the launcher scripts and private `bin/uv` executable so the process applying an
-update is never overwritten while it is running. If a release raises the exact uv version required by
-`pyproject.toml`, the platform launcher first checks an existing private uv instead of assuming that its
-presence makes it compatible. A mismatch is explicitly replaced with the launcher's pinned version before
-the Python bootstrap starts. This also lets the one-line installer repair a preserved `bin/uv` from an older
-installation.
+    ```bash
+    git pull --ff-only
+    ```
 
-During an already-running managed update, the Python bootstrap also detects a version change after the
-release bundle is overlaid. It copies the still-working private executable, self-updates the copy, verifies
-the reported version, and atomically publishes it as a versioned `bin/uv-<version>` sidecar before dependency
-preview or sync. The original executable remains available to host the stdlib-only bootstrap, including on
-Windows where it may still be locked by the parent process. Compatibility probes and the explicit
-`uv self update` run from a temporary directory outside the worker project, so the old uv does not reject the
-new `required-version` before it can update itself.
+   Continue when git reports a fast-forward or says the checkout is already up to date. If git reports
+   local changes or a divergent branch, keep those changes and resolve the git state before continuing.
 
-This repair also runs at the beginning of every bootstrap invocation. An installation where the source
-update already succeeded but dependency sync stopped with `Required uv version ... does not match` therefore
-self-heals on its next `update-runtime`, `update`, or worker launch; deleting the environment or downloading
-models again is unnecessary. The sidecar is kept in the managed `bin/` directory and reused on later runs.
+3. Synchronize the worker environment:
 
-If the uv download itself is blocked by a proxy or firewall, restore network access and retry. As a manual
-fallback, run `bin/uv self update <required-version>` (or `bin\uv.exe ...` on Windows) from a working
-directory outside the worker project, using an absolute path to the binary. The bootstrap error names the
-exact required version.
+    ```bat
+    update.cmd
+    ```
 
-## When the worker offers to update itself
+   On Linux/macOS, run `./update.sh`. `update-runtime.cmd` and `./update-runtime.sh` remain equivalent
+   dependency-only alternatives after the pull.
 
-A worker installed by the one-line installer or the `.exe` checks for a newer release on launch and, by
-default, asks before applying it. You can answer:
+   Continue when the command reports `Git checkout dependencies are up to date`.
 
-- **Yes** (the default): download, verify, and apply the update, then continue starting.
-- **No**: skip it for this launch only. You will be asked again next time.
-- **skip**: skip this specific version and don't ask again until a *newer* one is released.
+4. Start the worker. Confirm the new version in the dashboard or startup log.
 
-Tune the behaviour with `HORDE_WORKER_AUTO_UPDATE`: `prompt` (default, ask interactively / notify when
-headless), `auto` (apply without asking), or `off` (never check or self-update). To check or apply manually
-at any time, run `update.cmd --check` (report only) or `update.cmd` (apply). Git-clone installs never
-self-update (see the table above).
+This procedure also supports old installations that used micromamba. The new environment is created
+alongside the old files; you do not need to delete the old environment before updating.
 
-## Release channels (stable and beta)
+## Update an extracted zip
 
-By default the worker follows the **stable** channel and only ever sees stable `vX.Y.Z` releases. Betas are
-published as GitHub pre-releases tagged `vX.Y.Z-beta.N` and are hidden from stable users.
+1. Stop the worker. Continue when the dashboard closes or the terminal returns to its prompt.
+2. Download the [latest source zip](https://github.com/Haidra-Org/horde-worker-reGen/archive/refs/heads/main.zip).
+   Continue when the browser reports that the download completed.
+3. Extract it over the existing worker folder and allow matching files to be replaced. Keep
+   `bridgeData.yaml` and the sibling `<worker>-data` folder. Confirm that
+   `horde_worker_regen/__init__.py` contains the version from the downloaded archive.
+4. Run `update-runtime.cmd` on Windows or `./update-runtime.sh` on Linux/macOS. Continue when dependency
+   synchronization completes without an error.
+5. Start the worker and confirm the new version in the dashboard or startup log.
 
-To opt into betas, set `HORDE_WORKER_UPDATE_CHANNEL=beta`; set it back to `stable` (or unset it) to leave.
-Channel handling is version-aware, so:
+## Respond to an update prompt
 
-- A stable worker is never offered a beta.
-- If you are already running a beta build, the worker automatically follows the beta channel, keeps you on
-  the newest beta, and moves you onto the matching stable release once it ships.
-- A beta is **never** rolled back to an older stable: the worker only ever moves you to a strictly newer
-  version.
+A managed worker can offer an update when it starts:
 
-## Where releases are pulled from
+- **Yes** applies the update and continues starting.
+- **No** skips it for this launch.
+- **skip** hides that specific version. A newer release is still offered later.
 
-The self-updater resolves the GitHub repository it pulls releases from in this order:
+You can always update later by running `update.cmd` or `./update.sh`.
 
-1. `HORDE_WORKER_UPDATE_REPO=owner/repo` in the environment (an explicit override).
-2. The origin baked into the release bundle itself (`worker_bootstrap/release-origin`, written by the release
-   workflow). This is refreshed by every update, so a fork or beta channel can hand its installs back to the
-   production repository just by cutting a release whose baked origin names it: every install follows on its
-   next update with no user action.
-3. The repository recorded in `bin/install-info` by the installer that set up this worker (`repo=`; also
-   written by `update --repo owner/repo`).
-4. `Haidra-Org/horde-worker-reGen`.
+## Control a large dependency download
 
-A hand-extracted zip has no `bin/install-info`, so without the baked origin it would silently follow the
-production repository even when it came from a fork. `./update.sh --repo owner/repo` (or `update.cmd`)
-switches origin for one run and records it in `bin/install-info`; when the baked origin disagrees it wins on
-the following run, so use `HORDE_WORKER_UPDATE_REPO` to pin an origin permanently.
+The updater previews large dependency changes before downloading them. PyTorch is usually the largest
+item. When prompted, choose **Upgrade** to continue, **Hold** to keep the installed PyTorch when compatible,
+or **Cancel** to leave the environment unchanged.
 
-## Download preview and managing disk use
+To request the compatible hold directly, run:
 
-A managed install (one-line installer or `.exe`) previews what a dependency sync would
-download before fetching anything, and prunes superseded wheels afterwards so the cache does not grow
-without bound. The defaults are safe and need no configuration; the knobs below are for tuning.
-
-PyTorch is the bulk of the download (~1.5 GB+). It only changes version when a new *release* ships a new
-lockfile, so most updates download little. When a release does bump torch, the worker shows a short table
-(what changes, to which versions, and an approximate download size) before proceeding.
-
-**Limping along on the installed torch.** If you would rather not pull a fresh ~1.5 GB torch, you can
-keep the version you already have, *as long as nothing in the new release actually requires the newer
-torch*. The worker checks this with uv: if the older torch still resolves, the upgrade is "optional" and
-can be held; if a dependency genuinely needs the newer one, it is "mandatory" and cannot be skipped.
-
-- `update-runtime.cmd --hold-torch` (or `update.sh ... --hold-torch`) holds torch/torchvision for this
-  run and updates everything else. Equivalent env var: `HORDE_WORKER_SYNC_HOLD=1`.
-- On an interactive terminal, a torch download above the confirm threshold (default 1500 MB) prompts you
-  to **[U]pgrade / [H]old / [C]ancel**. Tune with `--confirm-above-mb N`.
-- Non-interactive runs (the installer, CI) default to taking the upgrade. Set
-  `HORDE_WORKER_SYNC_HEADLESS_POLICY=hold` (or `--headless-policy hold`) to hold instead.
-- `--no-sync-preview` (or `HORDE_WORKER_SYNC_PREVIEW=0`) skips the preview entirely and always installs
-  exactly the locked versions, as before.
-
-**Cache disk management.** By default the worker keeps a private uv cache in the peered `<worker>-data`
-folder and runs `uv cache prune` after a successful sync to reclaim old wheels. This never touches
-anything outside the worker.
-
-- If you already use `uv` for other projects and do not want a second multi-GB cache, set
-  `HORDE_WORKER_UV_CACHE_MODE=shared` (or `--cache-mode shared`). The worker then uses uv's normal
-  system cache and **never auto-prunes it** (it is not ours to clean), so your other projects are safe.
-- Disable pruning entirely with `--no-prune` or `HORDE_WORKER_SYNC_PRUNE=0`.
-- Point the cache anywhere by setting `UV_CACHE_DIR` yourself; a cache you set is never auto-pruned.
-
-## If you manage your own virtualenv
-
-If you installed into your own environment (see [Choose a PyTorch build](choose-a-pytorch-build.md)),
-re-sync your dependencies every time you `git pull`, matching your GPU's CUDA version. For example, for
-a CUDA 13.0/13.1 driver:
-
-```bash
-python -m pip install -r requirements.txt -U --extra-index-url https://download.pytorch.org/whl/cu130
+```bat
+update.cmd --hold-torch
 ```
 
-Use `cu132` for a CUDA 13.2+ driver, `cu126` for a CUDA 12.6+ driver, or `rocm6.4` for AMD.
+On Linux/macOS, use `./update.sh --hold-torch`. The worker refuses the hold when the new release requires a
+newer PyTorch, so this option cannot create an incompatible environment. See the
+[update and dependency-sync command reference](../reference/cli.md#update-and-dependency-sync) for all
+backend, cache, non-interactive, and release-channel controls.
 
-## Antivirus note
+## Recover from an interrupted update
 
-Some antivirus software (for example Avast) can interfere with downloads. If you see
-`CRYPT_E_NO_REVOCATION_CHECK` errors during an update, temporarily disable it. More fixes are in
-[Troubleshooting](troubleshoot.md).
+Run the same update command again. Every launch and update verifies the private package manager and checks
+whether the environment matches the current lockfile before importing worker code. A source update that
+stopped before dependency synchronization therefore resumes safely on the next attempt.
+
+If retrying fails:
+
+- For a download or connection error, restore access to GitHub Releases and retry.
+- For a disk-space error, free space on the worker-data drive and retry.
+- For `CRYPT_E_NO_REVOCATION_CHECK`, temporarily disable the antivirus download inspection that produced
+  it, retry, then re-enable protection.
+- If the same bootstrap error repeats, re-run the latest installer over the same folder or ask in
+  [#local-workers on Discord](https://discord.com/channels/781145214752129095/1076124012305993768).
+
+Do not delete `bridgeData.yaml`, the sibling `<worker>-data` folder, or downloaded models to repair a
+dependency update.
+
+## Go back to an earlier version
+
+Updates have no automatic rollback. If you must return to an older release, install that release into a
+separate folder and copy your `bridgeData.yaml` into it. Point its `cache_home` at the existing model cache
+if you want to avoid downloading models again. Keep the current folder until the older worker starts
+successfully.
+
+For the design and failure guarantees behind these procedures, see
+[Updates and bootstrap](../explanation/updates_and_bootstrap.md).

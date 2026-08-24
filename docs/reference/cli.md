@@ -11,16 +11,84 @@ Windows, `.sh` on Linux/macOS, and the `-rocm` variants on AMD Linux.
 | Script | Purpose |
 |--------|---------|
 | `install.ps1` / `install.sh` | One-line installer (download release, bootstrap runtime, launch). |
+| `update` | Update managed source and dependencies. In a git checkout, sync dependencies without changing source. |
 | `update-runtime` | Install or update dependencies into the managed environment. |
 | `horde-worker` | Launch the worker: web browser dashboard by default, `--terminal` for the in-terminal UI, or `--headless` for no UI (foreground worker, downloads models first). |
 | `horde-bridge` | Run the headless worker (downloads/verifies models first). |
 
 `horde-worker` and `horde-bridge` pass any extra arguments through to the underlying program.
 
-All managed launcher paths enter the stdlib-only bootstrap before touching the project environment. The
-bootstrap validates the private uv against `[tool.uv] required-version` and repairs a verified versioned
-sidecar when an in-place release update preserved an older `bin/uv`; this happens before dependency sync or
-application launch. See [Update the worker](../how-to/update-the-worker.md#when-an-update-requires-a-newer-uv).
+All managed launcher paths verify the private uv and synchronize stale dependencies before importing worker
+code. See [Updates and bootstrap](../explanation/updates_and_bootstrap.md) for the update model and its
+failure guarantees, or [Update the worker](../how-to/update-the-worker.md) for the operator procedure.
+
+## Update and dependency sync
+
+`update` checks for a release, applies it when the installation is managed, then synchronizes dependencies.
+In a git checkout, an applying `update` skips release discovery and synchronizes the checkout produced by
+`git pull`. `update --check` remains a release query and does not synchronize dependencies.
+`update-runtime` performs only the dependency synchronization.
+
+### Update-only flags
+
+| Flag | Effect |
+|------|--------|
+| `--check` | Report whether a release is available without applying or synchronizing it. |
+| `--yes` | Apply an available release without prompting. |
+| `--repo OWNER/REPO` | Use and record a different GitHub release repository for this update. |
+
+### Shared update and sync flags
+
+These flags work with both `update` and `update-runtime`.
+
+| Flag | Effect |
+|------|--------|
+| `--backend BUILD` | Select `cu126`, `cu130`, `cu132`, `cpu`, `rocm`, or `rocm-windows`. |
+| `--cu126`, `--cu130`, `--cu132`, `--cpu`, `--rocm`, `--rocm-windows` | Shortcuts for `--backend BUILD`. |
+| `--hold-torch` | Keep the installed torch and torchvision when the new dependency graph permits it. |
+| `--no-hold-torch` | Take the locked torch and torchvision versions. |
+| `--no-sync-preview` | Skip the dependency-change preview. |
+| `--confirm-above-mb N` | Prompt before an optional download larger than `N` MB. The default is 1500 MB. |
+| `--headless-policy proceed\|hold` | Choose whether a non-interactive optional torch update proceeds or is held. |
+| `--no-prune` | Keep superseded files in the worker-owned uv cache after a successful sync. |
+| `--skip-utilities` | Skip provisioning the separate image-utilities environment. |
+| `--cache-mode isolated\|shared` | Use the worker-owned cache or uv's system cache. Shared caches are never pruned automatically. |
+
+The normal sync uses the locked dependency versions. A requested torch hold drops the lock only for the
+held resolution and succeeds only when all current dependency requirements still resolve.
+
+### Release channels
+
+The default `stable` channel considers final `vX.Y.Z` releases. The `beta` channel also considers
+pre-releases. A beta installation continues receiving newer betas and advances to the corresponding final
+release when it becomes available. Version comparison never offers an older release.
+
+The release repository is resolved in this order:
+
+1. `HORDE_WORKER_UPDATE_REPO`;
+2. the origin baked into `worker_bootstrap/release-origin` by the release workflow;
+3. `repo=` in `bin/install-info`, written by the installer or `update --repo`; and
+4. `Haidra-Org/horde-worker-reGen`.
+
+The baked origin travels with a release and can redirect an installed channel on its next update. Use the
+environment override when an installation must remain pinned to a repository.
+
+### Update and sync environment variables
+
+| Variable | Values and effect |
+|----------|-------------------|
+| `HORDE_WORKER_AUTO_UPDATE` | `prompt` (default), `auto`, or `off` for launch-time managed updates. |
+| `HORDE_WORKER_UPDATE_CHANNEL` | `stable` (default) or `beta`. An installed prerelease implies `beta`. |
+| `HORDE_WORKER_UPDATE_REPO` | `OWNER/REPO` release-origin override. |
+| `HORDE_WORKER_SYNC_PREVIEW` | Set to `0` to disable the dependency preview. |
+| `HORDE_WORKER_SYNC_HOLD` | Set to `1` to request a compatible torch hold. |
+| `HORDE_WORKER_SYNC_CONFIRM_MB` | Optional-download confirmation threshold in MB. Default: `1500`. |
+| `HORDE_WORKER_SYNC_HEADLESS_POLICY` | `proceed` (default) or `hold`. |
+| `HORDE_WORKER_SYNC_PRUNE` | Set to `0` to retain superseded files in a worker-owned cache. |
+| `HORDE_WORKER_SKIP_UTILITIES` | Set to `1` to skip the image-utilities environment. |
+| `HORDE_WORKER_UV_CACHE_MODE` | `isolated` (default) or `shared`. |
+| `UV_CACHE_DIR` | Explicit uv cache location. An explicitly selected cache is never pruned automatically. |
+| `HORDE_WORKER_UV_VERSION` | Override the launcher's pinned uv version for bootstrap maintenance. It must satisfy `[tool.uv] required-version`. |
 
 ## Console entry points
 
