@@ -28,7 +28,7 @@ def _configure_worker_event_loop_policy() -> None:
         return
     import asyncio
 
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore
 
 
 def main(
