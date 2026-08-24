@@ -562,12 +562,12 @@ class AlchemyCoordinator:
             statuses.append(
                 AlchemyFormStatus(
                     submit.form_id,
-                    str(submit.result_message.form),
+                    submit.result_message.form,
                     "awaiting_submit",
                     width,
                     height,
                     None,
-                    additional_info=submit.result_message.control_type,
+                    additional_info=spec.control_type,
                 ),
             )
 
