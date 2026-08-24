@@ -360,7 +360,7 @@ def _maintenance_detail(
             "registers the change."
         )
     note_on_maintenance = (
-        "NOTE: This happening expectedly means your worker dropped or timed out performing several jobs."
+        "NOTE: This happening unexpectedly means your worker faulted or timed out performing several jobs."
         "Please check your diagnostics and logs to see what the issue is and fix it before clearing maintenance"
         " mode, otherwise the horde will just set it again."
     )
