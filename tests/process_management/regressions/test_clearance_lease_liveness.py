@@ -254,6 +254,7 @@ class TestTrailingActiveStateIsNotTheNewJobsGrant:
     """
 
     def test_active_state_older_than_the_ownership_is_not_an_active_grant(self) -> None:
+        """The active state reported after the ownership was taken is not read as an active grant for the new job."""
         import time
 
         scheduler = _make_inference_scheduler(

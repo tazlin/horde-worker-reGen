@@ -825,7 +825,7 @@ def _manifest_vocabularies() -> tuple[str, dict[str, tuple[str, ...]]]:
             vocabulary for one of the census axes.
     """
     try:
-        from hordelib.kudos_training.manifest import default_manifest
+        from hordelib.kudos_training.manifest import default_manifest  # type: ignore
     except ImportError as error:
         raise PricingCorpusError(
             "the census tier derives its vocabularies from the kudos feature manifest, which the "
