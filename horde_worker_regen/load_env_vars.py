@@ -47,6 +47,7 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
         data_dir = os.getenv("HORDE_WORKER_DATA_DIR")
         if data_dir:
             os.environ["AIWORKER_CACHE_HOME"] = os.path.join(data_dir, "models")
+    apply_huggingface_cache_isolation()
 
     if "max_lora_cache_size" in config:
         if os.getenv("AIWORKER_LORA_CACHE_SIZE") is None:
@@ -129,6 +130,37 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
             os.environ["AIWORKER_LIMITED_CONSOLE_MESSAGES"] = "1"
 
     apply_beta_model_env_defaults(config.get("api_key"))
+
+
+def apply_huggingface_cache_isolation() -> None:
+    """Point the HuggingFace stack at the isolated cache under ``AIWORKER_CACHE_HOME``, process-wide.
+
+    ``AIWORKER_CACHE_HOME`` is the operator's promise that every model file the worker fetches lands under one
+    root. The transformers-backed ControlNet annotators (MiDaS, ZoeDepth, depth-anything, OneFormer) fetch
+    through the HuggingFace hub cache, which defaults to the home drive and is outranked by an ambient
+    ``HF_HUB_CACHE``/``HUGGINGFACE_HUB_CACHE``, so those variables are replaced rather than merely warned
+    about. Applied here, before any child spawns, so the download, inference, safety and utilities processes
+    all share the one cache ``horde_image_utilities`` isolates for itself; a process that resolved its own
+    would keep a second cache on another volume, and an annotator verified in one process would then be
+    fetched again by the next.
+
+    A no-op when isolation cannot resolve (no ``AIWORKER_CACHE_HOME``, or the utilities settings turn
+    isolation off), in which case the hub stack keeps its own defaults.
+    """
+    from horde_image_utilities.config import HUGGING_FACE_CACHE_ENV_VARS, get_huggingface_home
+
+    huggingface_home = get_huggingface_home()
+    if huggingface_home is None:
+        return
+    overridden = [name for name in HUGGING_FACE_CACHE_ENV_VARS if os.environ.get(name) not in (None, huggingface_home)]
+    for name in HUGGING_FACE_CACHE_ENV_VARS:
+        os.environ.pop(name, None)
+    os.environ["HF_HOME"] = huggingface_home
+    if overridden:
+        logger.warning(
+            f"Overriding ambient {', '.join(overridden)}: AIWORKER_CACHE_HOME isolation owns the HuggingFace "
+            f"cache location ({huggingface_home}).",
+        )
 
 
 def apply_beta_model_env_defaults(api_key: str | None = None) -> None:

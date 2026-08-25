@@ -1652,9 +1652,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     def load_env_vars(self) -> None:
         """Load the environment variables into the config model."""
+        from horde_worker_regen.load_env_vars import apply_huggingface_cache_isolation
+
         # See load_env_vars.py's `def load_env_vars(self) -> None:`
         if self.models_folder_parent and os.getenv("AIWORKER_CACHE_HOME") is None:
             os.environ["AIWORKER_CACHE_HOME"] = self.models_folder_parent
+        apply_huggingface_cache_isolation()
         if self.extra_model_directories and os.getenv("AIWORKER_EXTRA_MODEL_DIRECTORIES") is None:
             os.environ["AIWORKER_EXTRA_MODEL_DIRECTORIES"] = os.pathsep.join(self.extra_model_directories)
         if self.horde_url:

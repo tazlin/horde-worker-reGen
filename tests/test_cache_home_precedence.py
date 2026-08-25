@@ -93,3 +93,33 @@ def test_plain_yaml_windows_paths_do_not_abort_startup(tmp_path: Path, monkeypat
     load_env_vars_from_config()
 
     assert os.getenv("AIWORKER_CACHE_HOME") is None
+
+
+def test_huggingface_cache_follows_the_cache_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hub cache lands under AIWORKER_CACHE_HOME and an ambient HF_HUB_CACHE no longer outranks it."""
+    _write_bridge_data(tmp_path, cache_home=tmp_path / "configmodels")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AIWORKER_CACHE_HOME", raising=False)
+    monkeypatch.delenv("HORDE_WORKER_DATA_DIR", raising=False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "elsewhere"))
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+
+    load_env_vars_from_config()
+
+    expected = Path(os.environ["AIWORKER_CACHE_HOME"], "horde", "image-utilities", "huggingface")
+    assert Path(os.environ["HF_HOME"]) == expected
+    assert "HF_HUB_CACHE" not in os.environ
+
+
+def test_huggingface_cache_untouched_without_a_cache_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no cache root to isolate into, the hub stack keeps whatever the environment said."""
+    _write_bridge_data(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AIWORKER_CACHE_HOME", raising=False)
+    monkeypatch.delenv("HORDE_WORKER_DATA_DIR", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "ambient"))
+
+    load_env_vars_from_config()
+
+    assert os.environ["HF_HOME"] == str(tmp_path / "ambient")

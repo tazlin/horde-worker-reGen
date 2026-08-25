@@ -109,6 +109,10 @@ is dropped rather than downloaded. This pins the worker to what you already have
 without curating an explicit list, and guarantees a config edit never triggers a
 large download. Presence is resolved against the configured weights root
 (`cache_home` / `AIWORKER_CACHE_HOME`), the same location the worker downloads to.
+The HuggingFace hub cache follows it too: once the cache root is known, the worker sets `HF_HOME` to
+`<cache_home>/horde/image-utilities/huggingface` (replacing any ambient `HF_HUB_CACHE` /
+`HUGGINGFACE_HUB_CACHE`) before spawning children, so the transformers-backed ControlNet annotators
+resolve through one cache shared by the download, inference and utilities processes.
 
 #### The `disagg_optimized N` model rule
 
