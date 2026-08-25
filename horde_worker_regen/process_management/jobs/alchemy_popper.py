@@ -559,6 +559,8 @@ class AlchemyCoordinator:
 
         for submit in self._pending_submits:
             width, height = self._form_resolution.get(submit.form_id) or (None, None)
+            # The result message carries no control type, and the form's spec left the tracking maps when
+            # its result arrived; the row states only what the submit record itself knows.
             statuses.append(
                 AlchemyFormStatus(
                     submit.form_id,
@@ -567,7 +569,6 @@ class AlchemyCoordinator:
                     width,
                     height,
                     None,
-                    additional_info=spec.control_type,
                 ),
             )
 

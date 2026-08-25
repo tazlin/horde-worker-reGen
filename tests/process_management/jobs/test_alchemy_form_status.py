@@ -133,6 +133,31 @@ def test_active_form_statuses_projects_each_stage_with_resolution() -> None:
     assert "stale" not in coordinator._form_resolution
 
 
+def test_active_form_statuses_with_only_awaiting_submit_forms() -> None:
+    """An awaiting-submit form projects on its own; it does not depend on a pending or in-flight form existing."""
+    coordinator = _bare_coordinator()
+    coordinator._pending_submits.append(
+        PendingAlchemySubmitJob(
+            result_message=HordeAlchemyResultMessage(
+                process_id=3,
+                process_launch_identifier=0,
+                info="",
+                form_id="s1",
+                form="nsfw",
+                state=GENERATION_STATE.ok,
+            ),
+            r2_upload=None,
+            time_popped=0.0,
+        ),
+    )
+
+    statuses = coordinator.active_form_statuses()
+
+    assert [status.form_id for status in statuses] == ["s1"]
+    assert statuses[0].stage == "awaiting_submit"
+    assert statuses[0].additional_info is None
+
+
 def test_work_ledger_and_queue_include_alchemy_forms() -> None:
     """The process manager surfaces alchemy forms into the work ledger and queue with form-as-model + size."""
     manager = make_testable_process_manager()

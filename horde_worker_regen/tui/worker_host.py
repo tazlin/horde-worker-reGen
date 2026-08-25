@@ -223,11 +223,20 @@ class WorkerHost:
     # region control thread
 
     def _control_loop(self) -> None:
-        """The single owner of the supervisor: apply requests, tick, and broadcast, on an interval."""
+        """The single owner of the supervisor: apply requests, tick, and broadcast, on an interval.
+
+        A tick that raises is logged and the next one runs: this thread is the only thing supervising the
+        worker (liveness, restarts, the tray and dashboard feeds), so letting one failure end it would leave
+        the worker running unsupervised for the rest of the host's life. A failed allocation on a
+        memory-starved host is the reachable case; it is transient, and the next tick's frame is as good.
+        """
         while not self._stop.is_set():
-            self._drain_requests()
-            self._supervisor.tick()
-            self._broadcast()
+            try:
+                self._drain_requests()
+                self._supervisor.tick()
+                self._broadcast()
+            except Exception:
+                logger.exception("Worker host control tick failed; the host keeps supervising.")
             time.sleep(self._control_interval)
 
     def _drain_requests(self) -> None:

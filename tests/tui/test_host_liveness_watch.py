@@ -12,6 +12,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable
+from unittest.mock import Mock
 
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui import socket_protocol as sp
@@ -173,6 +174,24 @@ def test_host_sends_farewell_frame_on_shutdown() -> None:
     finally:
         host.stop()
         thread.join(timeout=10.0)
+
+
+def test_control_loop_survives_a_failing_tick() -> None:
+    """One tick raising (a failed allocation, say) does not end the host's only supervising thread."""
+    supervisor = Mock()
+    supervisor.tick.side_effect = [MemoryError(), None, None, None, None, None]
+    host = WorkerHost(supervisor, host="127.0.0.1", port=0, control_interval=0.01)
+
+    thread = threading.Thread(target=host._control_loop, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while supervisor.tick.call_count < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    host._stop.set()
+    thread.join(timeout=5.0)
+
+    assert supervisor.tick.call_count >= 3, "the loop must keep ticking after a tick raised"
+    assert not thread.is_alive()
 
 
 def test_stalled_client_is_dropped_instead_of_blocking_broadcast() -> None:
