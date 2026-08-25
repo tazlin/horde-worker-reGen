@@ -3308,6 +3308,11 @@ class InferenceScheduler:
             if forecast is not None:
                 self._pause_post_process_for_residency_if_idle(device_index, model_name=model, forecast=forecast)
             self._pause_vae_lane_for_residency_if_drained(device_index)
+            # The teardown gate holds the head until the component lane has left the card, so the pause has to
+            # be ordered here as well as at establishment: a pre-staged head only ever claims the card through
+            # this loop, and a leg nobody acts on never passes, which keeps the drain backstop from starting.
+            if self._residency_should_pause_component_lane(device_index):
+                self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
     def _whole_card_residency_has_holder(self, model: str, device_index: int | None) -> bool:
         """Whether a held whole-card model is staged or resident on a live process.

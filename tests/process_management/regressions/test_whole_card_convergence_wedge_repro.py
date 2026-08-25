@@ -41,6 +41,7 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -524,6 +525,77 @@ class TestConvergenceLoopWedge:
             scheduler._converge_whole_card_residency()
 
         assert process_map.num_loaded_inference_processes() == forecast.max_resident_processes()
+        assert scheduler._whole_card_teardown_exhausted(forecast) is True
+
+
+class TestConvergenceStopsComponentLane:
+    """The pre-stage convergence must issue every pause the teardown gate waits on.
+
+    ``teardown_complete`` holds the head until the component lane's process is gone whenever the lane sits on
+    the residency's card. The establish path requests that pause when it claims the card; a pre-staged head
+    claims the card through ``_converge_whole_card_residency`` instead, so the same request has to come from
+    there. Without it the gate waits on a departure nobody ordered, the drain backstop never starts (it is
+    measured from the moment the structural legs first all pass) and the head parks until the recovery ladder
+    happens to stop the lane for its own reasons.
+    """
+
+    _COMPONENT_LANE_ID = 7
+
+    def _staged_with_component_lane(self) -> tuple[InferenceScheduler, ProcessMap, StreamForecast]:
+        """Post-pre-stage state: Flux held on one process, the component lane live on the same card."""
+        flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
+        component_lane = make_mock_process_info(
+            self._COMPONENT_LANE_ID,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.COMPONENT,
+        )
+        for proc in (flux_holder, component_lane):
+            proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+            proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
+        process_map = ProcessMap({proc.process_id: proc for proc in (flux_holder, component_lane)})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            horde_model_name=_FLUX_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=4
+        )
+        scheduler = _wire_scheduler_with_real_plm(
+            process_map=process_map,
+            job_tracker=JobTracker(),
+            horde_model_map=horde_model_map,
+            bridge_data=_wedge_bridge_data(enable_pipeline_disaggregation=True),
+        )
+        forecast = _flux_whole_card_forecast(free_now_mb=15007.0)
+        scheduler._whole_card_forecast = forecast
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        return scheduler, process_map, forecast
+
+    def test_gate_waits_on_the_component_lane(self) -> None:
+        """Control: with the lane live on the card the head's teardown is not exhausted."""
+        scheduler, _process_map, forecast = self._staged_with_component_lane()
+        assert scheduler._residency_should_pause_component_lane(None) is True
+        assert scheduler._whole_card_teardown_exhausted(forecast) is False
+
+    def test_convergence_requests_the_component_lane_pause(self) -> None:
+        """Convergence ticks must order the lane off the card, the way the establish path does."""
+        scheduler, _process_map, _forecast = self._staged_with_component_lane()
+
+        for _ in range(30):
+            scheduler._converge_whole_card_residency()
+
+        assert scheduler._process_lifecycle.is_component_gpu_paused is True, (
+            "the teardown gate waits for the component lane to leave the card, so convergence must request it"
+        )
+
+    def test_head_dispatches_once_the_lane_has_left(self) -> None:
+        """End to end: the requested pause takes effect, the lane exits, and the gate reads exhausted."""
+        scheduler, process_map, forecast = self._staged_with_component_lane()
+
+        for _ in range(30):
+            scheduler._converge_whole_card_residency()
+        assert scheduler._process_lifecycle.is_component_gpu_paused is True
+        # The lane replacement state machine ends the process on the control loop; model that exit here.
+        del process_map[self._COMPONENT_LANE_ID]
+
         assert scheduler._whole_card_teardown_exhausted(forecast) is True
 
 

@@ -790,9 +790,11 @@ residency from costing two full safety process rebuilds.
 post-processing lane, holds a permanent CUDA context plus resident weights that a sibling teardown cannot
 reclaim. On a card too tight to host a whole-card model beside that context, the lane must vacate the card
 exactly as safety does. Each of these lanes is therefore stopped wholesale (context and models freed) when a
-whole-card residency is established on its card, is a member of the residency's teardown-complete gate (the
-heavy model is not admitted until the lane's process has actually exited, not merely been asked to), and is
-restarted once the residency drains. Stopping the component lane also drops it from the disaggregation liveness
+whole-card residency claims its card, whether at establishment or through the convergence loop a pre-staged
+head claims the card with, is a member of the residency's teardown-complete gate (the heavy model is not
+admitted until the lane's process has actually exited, not merely been asked to), and is restarted once the
+residency drains. Every pause the gate waits on is ordered on both paths: a leg nothing acts on never passes,
+and the gate's drain backstop only starts once every structural leg has. Stopping the component lane also drops it from the disaggregation liveness
 predicate, so while it is down new jobs route through the monolithic path rather than dispatching encodes into a
 card reserved for the heavy model; the demotion is automatic and a job never faults for the paused lane.
 
