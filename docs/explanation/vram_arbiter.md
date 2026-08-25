@@ -263,7 +263,12 @@ never wedge on state it alone produced. First, the request nets its own target p
 charge out of the overlay before the inequality: that charge is the same load the candidate delta already
 represents, so leaving it in would count the load twice and let a re-ask (whose earlier plan lingered after a
 reclaim or a target death) defer forever on its own weight. Only the target process's own charge is removed;
-every other process's planned load stays fully charged, so genuinely-concurrent admissions still stack. Second,
+every other process's planned load stays fully charged, so genuinely-concurrent admissions still stack. The
+same netting covers the dispatch flow at clearance: a leased job's encode-only staging reservation is still
+outstanding when the job is re-priced at its full peak, and that peak already covers it, so the job's own
+staging entry is subtracted as well (`own_dispatch_unmaterialized_mb`). Without it a lone staged child on a
+card with room for its peak reads as short by exactly the encode charge and waits out its lease-acquire
+timeout for room the card had all along. Second,
 a candidate whose weights already occupy VRAM on the target process is admitted directly as a no-op: dispatching
 (or preloading) onto an already-resident idle model materialises nothing, its weights are already in the
 committed floor, and its next activation is the monolithic status quo the card has already served. The ledger

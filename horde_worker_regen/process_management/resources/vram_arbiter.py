@@ -311,6 +311,13 @@ class VramRequest:
     lingers, the unnetted identity would subtract the load's own reservation from its own available room and
     defer forever on its own footprint. Subtracting the target's own outstanding reservation makes the request's
     load count at most once, while every other unit's reservation stays fully charged."""
+    own_dispatch_unmaterialized_mb: float = 0.0
+    """The portion (MB) of the device's outstanding reservations that is this request's own dispatch-flow
+    entry: the staging charge booked when the job was dispatched under the clearance lease, still outstanding
+    when the same job is re-priced at its full peak at clearance. The candidate delta already carries that
+    job's whole materialisation, so its own staging entry is netted out the same way its own preload plan is;
+    it is carried separately because it is not part of the preload share and so must not be folded into that
+    share's single netting. Zero for every request that is not re-pricing its own dispatched job."""
     is_head_of_queue: bool = False
     head_job_id: str | None = None
     """The head job's stable unique id, paired with the device index to key the measured-attempt one-shot.
@@ -675,7 +682,8 @@ class VramArbiter:
         )
         if nets_preload_share:
             own_mb = max(own_mb, state.preload_planned_unmaterialized_mb)
-        net_reservations_mb = max(0.0, overlay_mb - own_mb)
+        own_dispatch_mb = max(0.0, request.own_dispatch_unmaterialized_mb)
+        net_reservations_mb = max(0.0, overlay_mb - own_mb - own_dispatch_mb)
         return evaluate_admission(
             candidate_outstanding_mb=candidate_delta_mb,
             device_free_mb=state.device_free_mb,

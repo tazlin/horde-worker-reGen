@@ -114,6 +114,14 @@ The failures encoded here:
   dwell was met within seconds, and the safety process was ended on a card comfortably serving its own traffic;
   the restore forecast read the same phantom, so the eviction never reversed. That is the ``per-card safety
   placement`` scenario, and its reinjection is the worker-wide peak.
+- **A staged child charged its own staging reservation at its clearance.** Under the GPU denoise clearance
+  lease a dispatch only stages a job: it books an encode-only reservation and the diffusion weights land at
+  clearance, which is where the job is re-priced at its full peak against measured device truth net of every
+  outstanding reservation. That netting left the job's own staging entry standing, so the waiter was charged
+  twice and a card with room for the peak read as short by the whole encode charge. Nothing on the card
+  changes while a lone waiter waits, so the hold only ended when the child sampled through its bounded
+  lease-acquire timeout: every such job paid the full timeout in dead card time for room the card had all
+  along. That is the ``own staging charge`` scenario, and its reinjection is the unnetted re-price.
 """
 
 from __future__ import annotations
@@ -133,6 +141,9 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+)
 from horde_worker_regen.process_management.scheduling.governance.whole_card import _GRACE_BUDGET_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _HEAD_PROTECTION_MAX_STARVE_SECONDS,
@@ -2765,4 +2776,148 @@ async def test_q_defect_reinjection_a_worker_wide_peak_evicts_safety_from_a_heal
     assert not world.safety_restore_events, (
         f"safety came back at {world.safety_restore_events}, so this defect is a cycle rather than the "
         f"permanent eviction the restore forecast's own phantom peak produces. {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Own staging charge: a staged job's own encode reservation is not an obstacle to its own clearance
+# --------------------------------------------------------------------------------------------------------
+
+_CLEARANCE_JOB_SHAPE = (1024, 1024)
+"""The staged job's resolution: a megapixel SDXL job, so its activation peak is worth several gigabytes and
+the fit at clearance turns on real terms rather than on rounding."""
+
+_CLEARANCE_CARD = _CardClass("clearance_fit", 7784.0)
+"""A card sized so the clearance fit is decided by exactly one term: the waiter's own staging charge.
+
+Its total covers the lane's CUDA context (1354 MB), the encode working set a staged job holds (2048 MB), the
+activation the clearance re-price actually asks for on top of the staged weights (3358 MB), the admission
+noise buffer (512 MB), and 512 MB of margin. The job therefore fits at clearance with room to spare, and
+would not fit if a second copy of its own 2048 MB encode charge were counted against it."""
+
+_CLEARANCE_TICK_CEILING = 5
+"""Ticks the staged job may take to reach sampling. A preload is commanded on one pass, reported on the next
+and dispatched after that, and the clearance follows on the tick after the dispatch, so a handful of ticks is
+the floor. What this excludes is a waiter held for anything approaching its lease-acquire timeout."""
+
+_CLEARANCE_TIMEOUT_TICKS = int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS / _TICK_SECONDS)
+"""Ticks of world time a child blocked on its clearance waits before sampling unpriced."""
+
+_CLEARANCE_TICKS = _CLEARANCE_TIMEOUT_TICKS + 10
+"""Ticks each of these rows runs: past the timeout, so a held waiter's degraded sampling is observable rather
+than merely absent."""
+
+
+def _clearance_world() -> _DispatchWorld:
+    """One lane under the clearance lease, on a card with room for one SDXL job's full materialisation.
+
+    A single sampling slot and a queue of one: the lone-waiter shape, where nothing else on the card can
+    account for a hold and nothing can free anything while the waiter waits.
+    """
+    return _DispatchWorld(
+        card=_CLEARANCE_CARD,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        tick_seconds=_TICK_SECONDS,
+    )
+
+
+async def _drive_lone_staged_waiter(world: _DispatchWorld) -> ImageGenerateJobPopResponse:
+    """Queue one SDXL job and run the row until it samples or the row runs out of ticks."""
+    width, height = _CLEARANCE_JOB_SHAPE
+    job = make_job_pop_response(_SDXL.name, width=width, height=height, ddim_steps=20)
+    await world.pop(job)
+    for _ in range(_CLEARANCE_TICKS):
+        await world.step()
+        if world.dispatch_tick(job) is not None:
+            break
+    return job
+
+
+async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has() -> None:
+    """A lone staged job is cleared as soon as its full peak fits, not once its lease has run out.
+
+    The failure this encodes: dispatch under the lease books the job an encode-only staging reservation, and
+    the clearance re-price then charges the job's full peak against measured free net of every outstanding
+    reservation. The job's own staging entry was left in that overlay, so the waiter was priced at its peak
+    *plus* its own encode charge and a card with room for the peak read as short by the whole 2 GB. Nothing on
+    the card changes while a lone waiter waits, so no eviction and no completion could release it: the hold
+    stood until the child sampled through its bounded lease-acquire timeout, and every job of that shape paid
+    a full minute of dead card time for room the card had all along.
+
+    Read as one statement: a job's own staging reservation is not an obstacle to its own clearance. Its
+    consequences are that the waiter is cleared within a few ticks of being staged, and that no lane in the run
+    reaches its lease-acquire timeout, which is the only other way a staged job ever samples.
+    """
+    world = _clearance_world()
+
+    job = await _drive_lone_staged_waiter(world)
+
+    context = "own staging charge"
+    dispatch_tick = world.dispatch_tick(job)
+    assert dispatch_tick is not None, (
+        f"{context}: the job never sampled, though the only lane on the card was staged with it and the card "
+        f"had room for its whole materialisation. {world.state_dump()}"
+    )
+    assert dispatch_tick <= _CLEARANCE_TICK_CEILING, (
+        f"{context}: the job took {dispatch_tick} ticks to reach sampling, past the "
+        f"{_CLEARANCE_TICK_CEILING}-tick ceiling a clearance onto a card that already fits it comes in under. "
+        f"{world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so the card "
+        f"was dark for {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s per job and the window that ran was "
+        f"unpriced. {world.state_dump()}"
+    )
+    assert [job_id for _tick, _lane, job_id in world.clearance_grants] == [str(job.id_)], (
+        f"{context}: the job entered its load-and-sample window without a grant "
+        f"({world.clearance_grants}), so nothing here was decided by the clearance gate at all. "
+        f"{world.state_dump()}"
+    )
+
+
+async def test_r_defect_reinjection_a_waiter_charged_its_own_staging_waits_out_its_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the job's own staging entry charged against it again, the lone waiter samples only on the timeout.
+
+    Reinjected at the netting alone: the same card, the same dispatch and the same staging reservation, and the
+    only difference is that the clearance re-price counts the job's own encode charge as room somebody else is
+    owed. What comes back is the pre-fix signature: no grant is ever issued, the card sits with a staged lane
+    and its memory largely free, and the job reaches its denoise loop only because hordelib's lease-acquire
+    timeout puts it there unpriced.
+    """
+    original = InferenceScheduler._evaluate_materialization_admission
+
+    def unnetted(
+        self: InferenceScheduler,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        **kwargs: object,
+    ) -> object:
+        kwargs["nets_own_dispatch_reservation"] = False
+        return original(self, next_job, process_with_model, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(InferenceScheduler, "_evaluate_materialization_admission", unnetted)
+    world = _clearance_world()
+
+    job = await _drive_lone_staged_waiter(world)
+
+    assert not world.clearance_grants, (
+        "an unnetted re-price must withhold the grant for as long as the waiter holds its own staging charge, "
+        f"which is the whole of this defect; the gate cleared it anyway ({world.clearance_grants}). "
+        f"{world.state_dump()}"
+    )
+    assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(job.id_)], (
+        "the job must reach its denoise loop through the lease-acquire timeout rather than through a grant; "
+        f"the run recorded {world.clearance_timeouts}. {world.state_dump()}"
+    )
+    dispatch_tick = world.dispatch_tick(job)
+    assert dispatch_tick is not None and dispatch_tick >= _CLEARANCE_TIMEOUT_TICKS, (
+        f"the wedge costs a full {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s of dead card time per job; "
+        f"this run reached sampling on tick {dispatch_tick}, inside the timeout. {world.state_dump()}"
     )

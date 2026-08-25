@@ -832,6 +832,26 @@ class _SafetyPlacementInputs:
 
 
 @dataclass(frozen=True)
+class KeepSingleDispatchVerdict:
+    """How many inferences one scheduling cycle may start under the worker-wide keep-single hold.
+
+    The hold bounds concurrency to one, never to zero: it stands only while an inference is running and more
+    work waits behind it. With nothing running the head is dispatched alone, because withholding on queue
+    depth alone parks an idle pool behind a hold it re-derives unchanged every cycle. Returned by
+    :meth:`InferenceScheduler.keep_single_dispatch_hold` so every driver of the dispatch fill (the scheduling
+    cycle and the closed-loop simulator alike) reads one decision rather than a restatement of it.
+    """
+
+    dispatch_limit: int | None
+    """The most inferences this cycle may start: zero while the hold stands, one under a keep-single that is
+    not holding, and None (unbounded, the slot count is the only cap) when nothing engages it."""
+    holding: bool
+    """Whether the hold is standing, so the caller reports a blocked cycle rather than an empty one."""
+    reason: str
+    """What engaged the keep-single rule, for the operator-facing hold line; ``"None"`` when nothing did."""
+
+
+@dataclass(frozen=True)
 class _MaterializationOutcome:
     """The result of pricing a job's VRAM materialisation through the MONOLITHIC_DISPATCH arbiter identity.
 
@@ -6506,6 +6526,7 @@ class InferenceScheduler:
             process_info,
             is_head_of_queue=True,
             head_outstanding_mb=None,
+            nets_own_dispatch_reservation=True,
         )
         if outcome.verdict.admits:
             self._resolve_clearance_hold(job)
@@ -12515,6 +12536,7 @@ class InferenceScheduler:
         is_head_of_queue: bool,
         head_outstanding_mb: float | None,
         candidate_delta_override_mb: float | None = None,
+        nets_own_dispatch_reservation: bool = False,
     ) -> _MaterializationOutcome:
         """Price a job's VRAM materialisation through the single MONOLITHIC_DISPATCH arbiter identity.
 
@@ -12529,11 +12551,23 @@ class InferenceScheduler:
         encode-only staging charge under the clearance lease, where the weights have not yet loaded); ``None``
         prices the full activation-inclusive peak (the non-lease dispatch VRAM moment and the clearance moment).
 
+        ``nets_own_dispatch_reservation`` is set by the clearance re-price of an already-dispatched job: its
+        encode-only staging reservation is still outstanding in the dispatch flow, and the full peak priced
+        here already covers it, so that entry is netted out of the overlay rather than counted against the
+        job's own room. Left False at dispatch, where the job holds no reservation yet.
+
         Both callers guarantee a non-None model before pricing (an unmodelled job is not materialisable).
         """
         if next_job.model is None:
             raise ValueError("materialisation admission requires a job with a model")
         device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        own_dispatch_mb = 0.0
+        if nets_own_dispatch_reservation and next_job.id_ is not None:
+            own_dispatch_mb = self._reserve_ledger.planned_charge_for_unit(
+                DISPATCH_ADMISSION_FLOW,
+                str(next_job.id_),
+                self._committed_process_reserved_by_pid(device_index),
+            )
         baseline = self._model_metadata.get_baseline(next_job.model)
         has_reclaimable_idle_model = self._has_reclaimable_idle_model(
             process_with_model,
@@ -12606,6 +12640,7 @@ class InferenceScheduler:
                 device_index=device_index,
                 target_process_id=process_with_model.process_id,
             ),
+            own_dispatch_unmaterialized_mb=own_dispatch_mb,
             is_head_of_queue=is_head_of_queue,
             head_job_id=str(next_job.id_) if next_job.id_ is not None else None,
             measured_attempt_in_progress=self._job_tracker.is_measured_attempt_on_device(
@@ -13608,6 +13643,37 @@ class InferenceScheduler:
         """
         self._pending_line_skip = None
 
+    def keep_single_dispatch_hold(
+        self,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
+    ) -> KeepSingleDispatchVerdict:
+        """Decide how many inferences this cycle may start under the worker-wide keep-single rule.
+
+        The rule itself is :meth:`ProcessMap.keep_single_inference`: a workflow that cannot coexist with any
+        concurrent inference at all. What this adds is the bound it implies. The hold stands only while an
+        inference is running *and* more work waits behind it; then nothing starts. Engaged with nothing
+        running, the allowance is exactly one dispatch, so the head is served alone rather than parked behind
+        a hold every later cycle re-derives unchanged, whose only exit is the recovery supervisor faulting
+        the backlog. With the rule disengaged the fill is unbounded and the slot count is the only cap.
+
+        Args:
+            stable_diffusion_reference: The image model reference the rule reads baselines from.
+
+        Returns:
+            The verdict every driver of the dispatch fill bounds itself by.
+        """
+        keep_single_inference, reason = self._process_map.keep_single_inference(
+            stable_diffusion_model_reference=stable_diffusion_reference,
+        )
+        if not keep_single_inference:
+            return KeepSingleDispatchVerdict(dispatch_limit=None, holding=False, reason=reason)
+
+        inference_running = len(self._job_tracker.jobs_in_progress) > 0
+        work_waiting = len(self._job_tracker.jobs_pending_inference) > 0
+        if inference_running and work_waiting:
+            return KeepSingleDispatchVerdict(dispatch_limit=0, holding=True, reason=reason)
+        return KeepSingleDispatchVerdict(dispatch_limit=1, holding=False, reason=reason)
+
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Run a single scheduling cycle: preload, start inference, unload.
 
@@ -13623,17 +13689,12 @@ class InferenceScheduler:
         # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh
         # for this cycle regardless of whether any preload or dispatch happens.
         if not self.preload_models():
-            keep_single_inference, single_inf_reason = self._process_map.keep_single_inference(
-                stable_diffusion_model_reference=stable_diffusion_reference,
-            )
+            keep_single = self.keep_single_dispatch_hold(stable_diffusion_reference)
 
-            pending_and_active = len(self._job_tracker.jobs_pending_inference) + len(
-                self._job_tracker.jobs_in_progress,
-            )
-            if keep_single_inference and pending_and_active > 1:
+            if keep_single.holding:
                 if (self._clock() - self._batch_wait_log_time > 10) and bridge_data.max_threads > 1:
                     logger.opt(ansi=True).info(
-                        f"<fg #7b7d7d><i>Blocking further inference due to {single_inf_reason}.</i></>",
+                        f"<fg #7b7d7d><i>Blocking further inference due to {keep_single.reason}.</i></>",
                     )
                     self._batch_wait_log_time = self._clock()
 
@@ -13642,12 +13703,16 @@ class InferenceScheduler:
                 # tick: when several jobs complete close together, dispatching them one tick apart
                 # leaves the GPU underfed. start_inference() returns False once no more can start
                 # (its own concurrency gate: jobs_in_progress >= max_concurrent, no free process,
-                # or no eligible job, stops the loop), so this cannot over-subscribe.
-                started_any = False
+                # or no eligible job, stops the loop), so this cannot over-subscribe. Under a
+                # keep-single that is not holding the fill stops at the first dispatch: that one
+                # inference is the whole allowance.
+                started = 0
                 while await self.start_inference():
-                    started_any = True
+                    started += 1
+                    if keep_single.dispatch_limit is not None and started >= keep_single.dispatch_limit:
+                        break
 
-                if not started_any:
+                if not started:
                     # Nothing dispatched this cycle though the queue has work: if the head has been parked
                     # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
                     # dispatching. Throttled, read-only; it never changes scheduling.

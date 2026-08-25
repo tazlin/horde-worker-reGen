@@ -169,8 +169,10 @@ depend on this queue-gated cycle running; see
    model is still loading, or filling a slot whose process is busy sampling) are cached in
    `_pending_line_skip` to keep the two calls consistent.
 3. **Blocking rules**: `ProcessMap.keep_single_inference` (a resident ControlNet-XL slot that must
-   stay exclusive) can defer launch. Batch and card-demanding serialization is not held here: it is
-   priced per-card against measured headroom by the scheduler's size-tier overlap gate.
+   stay exclusive) can defer launch. The hold bounds concurrency to one inference, never to zero: it
+   withholds a second lane while one inference runs, and with nothing running the cycle dispatches the
+   head alone, so an idle pool is never parked behind it. Batch and card-demanding serialization is not
+   held here: it is priced per-card against measured headroom by the scheduler's size-tier overlap gate.
 4. **Auxiliary preparation**: a job carrying LoRAs or textual inversions must have those files on disk
    before it may claim sampling admission. The pop-time prefetch pipeline is the only preparation path: at
    pop the parent asks the dedicated download process to place the job's not-yet-cached auxiliary files on

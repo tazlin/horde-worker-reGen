@@ -31,10 +31,13 @@ Assertion helpers over a completed run live in ``_world_assertions.py``.
 
 from __future__ import annotations
 
+import multiprocessing
 from dataclasses import dataclass
+from multiprocessing import synchronize
 from unittest.mock import Mock
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -80,9 +83,15 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     FlatScalarMap,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    ClearanceController,
+    ClearanceLeaseProxy,
+)
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _SAFETY_GPU_LOAD_CHARGE_MB,
+    _STAGING_ENCODE_VRAM_MB,
     InferenceScheduler,
 )
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
@@ -543,6 +552,7 @@ class _DispatchWorld:
         service_contexts: bool = False,
         disaggregated: bool = False,
         closed_loop: bool = False,
+        clearance_lease: bool = False,
         legacy_comfy_vram_unload: bool = False,
         child_free_view_lie_mb: float = 0.0,
         footprint_undershoot: float = 1.0,
@@ -590,6 +600,14 @@ class _DispatchWorld:
                 decide whether a finished job leaves its weights on the device. Off, a dispatch occupies its
                 lane for one tick and weights stay put, which is the fidelity the admission-ordering suites
                 state their tick bounds against.
+            clearance_lease: Whether the per-process GPU denoise clearance lease governs sampling. Under it a
+                dispatch only *stages* a job: the lane goes to ``INFERENCE_PRIMED`` carrying its encode working
+                set alone, and the diffusion weights land on the card at clearance, which is when sampling
+                starts. Each tick builds the scheduler's own clearance snapshot and steps a real
+                :class:`ClearanceController` over it, so the admission that decides the VRAM moment is
+                production's. A lane the controller holds for the whole lease-acquire timeout samples anyway
+                (liveness over pricing) and the world records the degradation. Off, dispatch is the VRAM
+                moment, which is what every row that does not vary this runs against.
             legacy_comfy_vram_unload: Whether the escape hatch that restores the old flag-based child regime
                 is configured. Under it the child's executor returns the card at the end of every prompt below
                 anything a grant can suppress, so a closed-loop run evicts on every completion whatever the
@@ -662,6 +680,9 @@ class _DispatchWorld:
         self.safety_readiness_seconds = safety_readiness_seconds
         self.safety_load_transient_mb = safety_load_transient_mb
         self.closed_loop = closed_loop
+        self.clearance_lease = clearance_lease
+        if clearance_lease and not closed_loop:
+            raise ValueError("the clearance lease is a claim about time, so it needs the closed-loop fidelity")
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.footprint_undershoot = footprint_undershoot
         self.unload_release_delay_seconds = unload_release_delay_seconds
@@ -684,6 +705,11 @@ class _DispatchWorld:
         """The model whose weights each lane most recently committed to the device."""
         self._loading: dict[int, _PendingPreload] = {}
         """Per-lane preloads the parent has commanded and the child has not finished, keyed by lane."""
+        self._clearance_waiting_since: dict[str, float] = {}
+        """Per staged job, the world-clock instant its child began waiting on its clearance permit.
+
+        What the bounded lease-acquire timeout is measured from: a child held past it samples unpriced rather
+        than waiting forever, so this is also the clock a starved lease's cost is read off."""
         self._encode_until: dict[int, float] = {}
         """Per-lane instant a pinned disaggregated sampler stops waiting on the encode lane and starts sampling.
 
@@ -693,6 +719,12 @@ class _DispatchWorld:
         """Every retirement of a lane the parent had already committed to, as the structural oracle read it."""
         self._transient_mb: dict[int, float] = {}
         """Per-lane sampling activation charged to the card for the window a lane is sampling in."""
+        self._encode_staging_mb: dict[int, float] = {}
+        """Per-lane encode working set a staged, not-yet-cleared job holds on the card under the lease.
+
+        The whole of what a dispatched job costs the device until the parent clears it: its diffusion weights
+        are still in the child's RAM cache and land at clearance. Subsumed by the job's full peak the moment
+        the weights are committed, so it comes off the card in the same step that charges them."""
         self._offloaded_mb: dict[int, float] = {}
         """Per-lane weights the child kept in host RAM rather than commit, to relieve its own shortfall."""
         self._held_component_mb: dict[int, float] = {}
@@ -815,10 +847,13 @@ class _DispatchWorld:
         self._scale_down_selector._process_map = self._process_map
         self._scale_down_selector._job_tracker = self._job_tracker
 
-        reference: dict[str, object] = {
+        reference: dict[str, ImageGenerationModelRecord] = {
             model.name: make_mock_model_reference_record(model.name, baseline=model.baseline)
             for model in _MODEL_CLASSES
         }
+        self._reference = reference
+        """The image model reference the scheduler prices from, kept so the world can hand it to the
+        production decisions that take it as an argument (the keep-single dispatch bound)."""
         bridge_data = make_mock_bridge_data(
             max_threads=max_threads,
             queue_size=queue_depth,
@@ -835,6 +870,7 @@ class _DispatchWorld:
             moderate_performance_mode=moderate_performance_mode,
             unload_models_from_vram_often=unload_models_from_vram_often,
             legacy_comfy_vram_unload=legacy_comfy_vram_unload,
+            gpu_sampling_lease_enabled=clearance_lease,
             image_models_to_load=[model.name for model in _MODEL_CLASSES],
         )
         self.offers: dict[int, frozenset[str]] = {}
@@ -899,6 +935,42 @@ class _DispatchWorld:
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
         self._sync_reported_vram()
+
+        self._clearance_controllers: dict[int, ClearanceController] = {}
+        """One real clearance controller per card, when the lease is on; empty otherwise (the tick is a no-op).
+
+        The parent's own object, stepped over the scheduler's own snapshot with the scheduler's own admission
+        as its ``admit_fn``, so what decides a staged child's VRAM moment here is production's decision."""
+        self._clearance_semaphores: dict[int, synchronize.Semaphore] = {}
+        """Per lane, the clearance permit the parent grants and the world's child model consumes.
+
+        Held empty (its single permit taken at creation), exactly as the parent holds a child's."""
+        self.clearance_timeouts: list[tuple[int, int, str]] = []
+        """Every lane that sampled unpriced because its clearance never came, as (tick, lane, job).
+
+        A child blocked on its lease for the acquire timeout samples anyway: liveness over pricing. Each entry
+        is one job that paid the whole timeout in dead card time, which is the cost a clearance that holds a
+        waiter for room the card already had imposes on every job."""
+        self.clearance_grants: list[tuple[int, int, str]] = []
+        """Every lane the controller cleared into its load-and-sample window, as (tick, lane, job)."""
+        if clearance_lease:
+            for device_index in self._card_totals:
+                self._clearance_controllers[device_index] = ClearanceController(
+                    device_index=device_index,
+                    slot_cap=max_threads,
+                    tail_overlap=False,
+                    clock=lambda: self.now,
+                )
+            mp_context = multiprocessing.get_context()
+            for lane_id in range(lane_count):
+                clearance = mp_context.BoundedSemaphore(1)
+                clearance.acquire()
+                done = mp_context.Semaphore(0)
+                self._clearance_semaphores[lane_id] = clearance
+                self._clearance_controllers[self._lane_cards[lane_id]].register(
+                    lane_id,
+                    ClearanceLeaseProxy(clearance=clearance, done=done),
+                )
 
         self.first_dispatch: dict[str, int] = {}
         self._dispatched_at: dict[str, int] = {}
@@ -1038,7 +1110,7 @@ class _DispatchWorld:
         """
         held = sum(
             charge_mb
-            for charges in (self._resident_mb, self._transient_mb, self._held_component_mb)
+            for charges in (self._resident_mb, self._transient_mb, self._held_component_mb, self._encode_staging_mb)
             for lane_id, charge_mb in charges.items()
             if self._card_of(lane_id) == device_index
         )
@@ -1079,11 +1151,12 @@ class _DispatchWorld:
         return None
 
     def _lane_charge_mb(self, lane_id: int) -> float:
-        """What one lane holds on the card: committed weights, live activation, and device-warm components."""
+        """What one lane holds on the card: weights, live activation, components, and any staged encode."""
         return (
             self._resident_mb.get(lane_id, 0.0)
             + self._transient_mb.get(lane_id, 0.0)
             + self._held_component_mb.get(lane_id, 0.0)
+            + self._encode_staging_mb.get(lane_id, 0.0)
         )
 
     def _child_believed_free_mb(self, lane_id: int, job_id: str) -> float:
@@ -1225,12 +1298,21 @@ class _DispatchWorld:
         return True
 
     def _sync_reported_vram(self) -> None:
-        """Publish the derived card state through the children's VRAM reports, as a live worker would."""
+        """Publish the derived card state through the children's VRAM reports, as a live worker would.
+
+        The device figure is the parent's own reading and is immediate. The per-process allocator reservation
+        is not: it reaches the parent through the child's next VRAM report, and a staged job's encode working
+        set is allocated and consumed inside the staging window itself, so a lane still waiting for clearance
+        has not published that charge. Reporting it the instant the card carries it would make the planned
+        overlay decay against a growth the parent cannot yet see, which is precisely the reading the clearance
+        re-price of a staged job is made against.
+        """
         for lane in self._process_map.values():
             total_mb = self._card_totals[lane.device_index]
             lane.total_vram_mb = int(total_mb)
             lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
-            lane.process_reserved_mb = int(self._lane_charge_mb(lane.process_id))
+            reported_mb = self._lane_charge_mb(lane.process_id) - self._encode_staging_mb.get(lane.process_id, 0.0)
+            lane.process_reserved_mb = int(max(0.0, reported_mb))
 
     # -- seeding ------------------------------------------------------------------------------------------
 
@@ -1349,6 +1431,7 @@ class _DispatchWorld:
         self._staged_mb.pop(lane.process_id, None)
         self._loading.pop(lane.process_id, None)
         self._transient_mb.pop(lane.process_id, None)
+        self._encode_staging_mb.pop(lane.process_id, None)
         self._offloaded_mb.pop(lane.process_id, None)
         # Device-warm components are returned by the same actuation and by nothing else: they outlive every
         # job boundary, so an unload the parent ordered is the only thing that gives the card them back.
@@ -1383,6 +1466,7 @@ class _DispatchWorld:
         self._staged_mb.pop(lane.process_id, None)
         self._loading.pop(lane.process_id, None)
         self._transient_mb.pop(lane.process_id, None)
+        self._encode_staging_mb.pop(lane.process_id, None)
         self._offloaded_mb.pop(lane.process_id, None)
         self._held_component_mb.pop(lane.process_id, None)
         lane.held_components = None
@@ -1534,8 +1618,17 @@ class _DispatchWorld:
             await self._job_tracker.queue_for_safety_post_processed(job_info)
 
     async def _dispatch_until_full(self) -> None:
-        """Dispatch onto free lanes, recording the tick each job first reached sampling."""
-        for _attempt in range(max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))):
+        """Dispatch onto free lanes, recording the tick each job first reached sampling.
+
+        The fill is bounded by the scheduler's own keep-single decision rather than by a restatement of it, so
+        a pool the worker-wide hold serialises is serialised here on the same verdict the control loop's cycle
+        acts on: nothing while the hold stands, one dispatch under a keep-single that is not holding.
+        """
+        keep_single = self._scheduler.keep_single_dispatch_hold(self._reference)
+        attempts = max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))
+        if keep_single.dispatch_limit is not None:
+            attempts = min(attempts, keep_single.dispatch_limit)
+        for _attempt in range(attempts):
             before = {str(job.id_) for job in self._job_tracker.jobs_in_progress}
             started = await self._scheduler.start_inference()
             newly = [job for job in self._job_tracker.jobs_in_progress if str(job.id_) not in before]
@@ -1552,9 +1645,12 @@ class _DispatchWorld:
                 and lane.last_control_flag == HordeControlFlag.START_INFERENCE
             ]
             assert lanes, "an admitted job must have been dispatched onto a lane holding its model"
-            self._dispatched_at[job_id] = self.tick
             self._lane_of[job_id] = lanes[0]
-            self.first_dispatch.setdefault(job_id, self.tick)
+            if not self.clearance_lease:
+                # Sampling starts here only when dispatch is the VRAM moment; under the lease the job is
+                # merely staged, and the tick it reaches sampling is the tick the parent clears it.
+                self._dispatched_at[job_id] = self.tick
+                self.first_dispatch.setdefault(job_id, self.tick)
             # The child reports the model IN_USE and its slot busy the moment it starts sampling: the first
             # takes the load out of the in-flight-admitted set (releasing its planned charge), the second
             # keeps the sampling lane out of the idle pool a shrink or a second dispatch could take.
@@ -1577,7 +1673,7 @@ class _DispatchWorld:
                 self._process_map.reserve_for_disaggregation(lanes[0])
                 self._encode_until[lanes[0]] = self.now + encode_seconds
                 self._process_map[lanes[0]].last_process_state = HordeProcessState.WAITING_FOR_JOB
-            else:
+            elif not self.clearance_lease:
                 self._process_map[lanes[0]].last_process_state = HordeProcessState.INFERENCE_STARTING
             if admitted.model is not None:
                 self._model_map.update_entry(admitted.model, load_state=ModelLoadState.IN_USE, process_id=lanes[0])
@@ -1586,37 +1682,114 @@ class _DispatchWorld:
             # is then indistinguishable from a worker that never populated it.
             self._dispatch_device_truth_mb[job_id] = self._dispatched_device_truth_mb(self._process_map[lanes[0]])
             self._lane_charge_at_dispatch[job_id] = self._lane_charge_mb(lanes[0])
-            # Dispatch is the moment staged weights commit to VRAM, so this is where the card is charged.
-            staged_mb = self._staged_mb.pop(lanes[0], None)
-            loaded_now = staged_mb is not None
-            if staged_mb is not None:
-                if admitted.model is not None:
-                    # The load is the child's first allocation for this job, so it passes the child's own
-                    # shortfall arithmetic and commits only what that arithmetic let it bring onto the card.
-                    staged_mb = self._child_admit_charge(
-                        lane_id=lanes[0],
-                        job_id=job_id,
-                        model=admitted.model,
-                        charge_mb=staged_mb,
-                        weight_load=True,
-                    )
-                if self.closed_loop and self._resident_model.get(lanes[0]) not in (None, admitted.model):
-                    # Weights the slot is still holding for a previous model are not displaced by a new load:
-                    # the card carries both until something explicitly returns the old ones. Modelling the
-                    # load as a replacement would make the eviction that runs ahead of a cross-model dispatch
-                    # unfalsifiable, since the double residency it exists to prevent could never occur.
-                    self._resident_mb[lanes[0]] = self._resident_mb.get(lanes[0], 0.0) + staged_mb
-                else:
-                    self._resident_mb[lanes[0]] = staged_mb
-                self._resident_model[lanes[0]] = admitted.model
+            if self.clearance_lease:
+                # Under the lease a dispatch only stages the job: the lane holds its encode working set and
+                # nothing else, and the weights land when the parent clears it. The slot stays in the primed
+                # state production stamped on it at dispatch, which is what makes it a clearance waiter.
+                self._encode_staging_mb[lanes[0]] = _STAGING_ENCODE_VRAM_MB
+                self._clearance_waiting_since[job_id] = self.now
                 self._sync_reported_vram()
-            if self.closed_loop:
-                self._begin_occupancy(
-                    admitted,
-                    lane_id=lanes[0],
-                    loaded_now=loaded_now,
-                    encode_seconds=encode_seconds,
+                continue
+            # Dispatch is the moment staged weights commit to VRAM, so this is where the card is charged.
+            self._commit_staged_weights(admitted, lane_id=lanes[0], encode_seconds=encode_seconds)
+
+    def _commit_staged_weights(
+        self,
+        admitted: ImageGenerateJobPopResponse,
+        *,
+        lane_id: int,
+        encode_seconds: float,
+    ) -> None:
+        """Commit a lane's staged weights to the card and open the job's occupancy.
+
+        The VRAM moment: without the clearance lease it is the dispatch, and under the lease it is the
+        clearance. Both charge the card the same way, which is why it is one step here rather than two
+        descriptions of one.
+        """
+        job_id = str(admitted.id_)
+        staged_mb = self._staged_mb.pop(lane_id, None)
+        loaded_now = staged_mb is not None
+        if staged_mb is not None:
+            if admitted.model is not None:
+                # The load is the child's first allocation for this job, so it passes the child's own
+                # shortfall arithmetic and commits only what that arithmetic let it bring onto the card.
+                staged_mb = self._child_admit_charge(
+                    lane_id=lane_id,
+                    job_id=job_id,
+                    model=admitted.model,
+                    charge_mb=staged_mb,
+                    weight_load=True,
                 )
+            if self.closed_loop and self._resident_model.get(lane_id) not in (None, admitted.model):
+                # Weights the slot is still holding for a previous model are not displaced by a new load:
+                # the card carries both until something explicitly returns the old ones. Modelling the
+                # load as a replacement would make the eviction that runs ahead of a cross-model dispatch
+                # unfalsifiable, since the double residency it exists to prevent could never occur.
+                self._resident_mb[lane_id] = self._resident_mb.get(lane_id, 0.0) + staged_mb
+            else:
+                self._resident_mb[lane_id] = staged_mb
+            if admitted.model is not None:
+                self._resident_model[lane_id] = admitted.model
+            self._sync_reported_vram()
+        if self.closed_loop:
+            self._begin_occupancy(
+                admitted,
+                lane_id=lane_id,
+                loaded_now=loaded_now,
+                encode_seconds=encode_seconds,
+            )
+
+    # -- clearance lease ----------------------------------------------------------------------------------
+
+    def _advance_clearance(self) -> None:
+        """Step every card's clearance controller, then move the lanes it cleared into their windows.
+
+        The parent's own advance: the scheduler builds the snapshot, the controller decides, and the
+        scheduler's full-price admission is what each chosen waiter is put through. A no-op when the lease is
+        off, exactly as the manager's is when no card has a controller.
+        """
+        for device_index, controller in self._clearance_controllers.items():
+            controller.step(
+                self._scheduler.build_clearance_inputs(device_index=device_index),
+                admit_fn=self._scheduler.clearance_admit_process,
+            )
+        self._open_cleared_windows()
+
+    def _open_cleared_windows(self) -> None:
+        """Start the load-and-sample window of every staged lane whose permit arrived, or whose wait ran out.
+
+        The child's side of the handshake. It takes the permit the parent released and its weights then land
+        on the card; if none has come by the time its bounded lease-acquire timeout is up, it samples anyway
+        (hordelib's degraded path) and the window is unpriced. The world records that, because a lease that
+        holds a waiter for room the card already had costs every such job the whole timeout in dead card time,
+        and nothing else in a run distinguishes that from a merely slow schedule.
+        """
+        for lane in list(self._process_map.values()):
+            if lane.last_process_state != HordeProcessState.INFERENCE_PRIMED:
+                continue
+            job = lane.current_inference_job()
+            if job is None or job.id_ is None:
+                continue
+            job_id = str(job.id_)
+            semaphore = self._clearance_semaphores.get(lane.process_id)
+            if semaphore is None:
+                continue
+            waiting_since = self._clearance_waiting_since.get(job_id, self.now)
+            if semaphore.acquire(False):
+                self.clearance_grants.append((self.tick, lane.process_id, job_id))
+            elif (self.now - waiting_since) < CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - _CLOCK_EPSILON:
+                continue
+            else:
+                self.clearance_timeouts.append((self.tick, lane.process_id, job_id))
+            self._clearance_waiting_since.pop(job_id, None)
+            self._encode_staging_mb.pop(lane.process_id, None)
+            self._process_map.on_process_state_change(
+                process_id=lane.process_id,
+                new_state=HordeProcessState.INFERENCE_STARTING,
+            )
+            self._dispatched_at[job_id] = self.tick
+            self.first_dispatch.setdefault(job_id, self.tick)
+            self._commit_staged_weights(job, lane_id=lane.process_id, encode_seconds=0.0)
 
     # -- closed-loop occupancy ----------------------------------------------------------------------------
 
@@ -1886,6 +2059,7 @@ class _DispatchWorld:
         self._staged_mb.pop(lane_id, None)
         self._loading.pop(lane_id, None)
         self._transient_mb.pop(lane_id, None)
+        self._encode_staging_mb.pop(lane_id, None)
         self._offloaded_mb.pop(lane_id, None)
         self._held_component_mb.pop(lane_id, None)
         self._granted_resident_evicted.discard(lane_id)
@@ -1967,6 +2141,7 @@ class _DispatchWorld:
         self._staged_mb.pop(victim, None)
         self._loading.pop(victim, None)
         self._transient_mb.pop(victim, None)
+        self._encode_staging_mb.pop(victim, None)
         self._offloaded_mb.pop(victim, None)
         self._held_component_mb.pop(victim, None)
         self._granted_resident_evicted.discard(victim)
@@ -2127,6 +2302,9 @@ class _DispatchWorld:
             # before the pass that would grow the card acts on it.
             self._evaluate_device_free_governor()
         self._scheduler.run_governance_tick()
+        # The parent drives the clearance controllers every control-loop iteration, independent of queue
+        # depth, so a staged child is cleared as a slot frees whether or not new work is pending.
+        self._advance_clearance()
         self._discharge_context_reductions()
         # The tick drives the cycle's stages directly rather than through run_scheduling_cycle, so the cycle
         # boundary is opened here: selection state scoped to one cycle must not survive the child reports this

@@ -15,6 +15,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState
+from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ActiveSampler,
@@ -460,4 +461,77 @@ class TestClearanceResidentWeightCredit:
             device_free_mb=600.0,  # under the activation delta too
             retained_model="stable_diffusion",
         )
+        assert scheduler.clearance_admit_process(0) is False
+
+
+class TestClearanceNetsTheWaiterOwnStagingCharge:
+    """A staged child's own encode reservation must not be counted against its own clearance.
+
+    Dispatch under the lease books the job an encode-only staging reservation in the dispatch flow. At
+    clearance the same job is priced at its full peak against measured device truth net of every outstanding
+    reservation. If that netting leaves the job's own staging entry in the overlay, the waiter is charged
+    twice (its staging charge as "outstanding", its full peak as the candidate) and a card with room for the
+    peak is read as short by the whole encode charge. Nothing on the card changes while it waits, so the hold
+    only ends when the child samples through its lease-acquire timeout: every such job pays the full timeout
+    for room the card had all along. The preload flow already nets a request's own planned charge for exactly
+    this reason; the dispatch flow must net it too.
+    """
+
+    _WEIGHTS_MB = 5000.0
+    _PEAK_MB = 6000.0
+    _TOTAL_VRAM_MB = 16000
+
+    async def _lone_staged_waiter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        room_beyond_peak_mb: float,
+    ) -> _sched_mod.InferenceScheduler:
+        """One staged child, nothing else on the card, device free set relative to the priced peak.
+
+        ``room_beyond_peak_mb`` is the free VRAM left over once the full peak and the noise buffer are seated:
+        positive means the peak fits outright, negative means it does not even with nothing else outstanding.
+        The staging reservation is booked exactly as dispatch books it.
+        """
+        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: self._PEAK_MB)
+        monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", lambda _job, _baseline: self._WEIGHTS_MB)
+        noise_mb = admission_noise_buffer_mb(float(self._TOTAL_VRAM_MB))
+        job_tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            bridge_data=make_mock_bridge_data(
+                gpu_sampling_lease_enabled=True,
+                enable_vram_budget=True,
+                vram_reserve_mb=2048,
+                ram_reserve_mb=4096,
+            ),
+            job_tracker=job_tracker,
+            device_free_mb=self._PEAK_MB + noise_mb + room_beyond_peak_mb,
+        )
+        waiter = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_PRIMED)
+        waiter.total_vram_mb = self._TOTAL_VRAM_MB
+        scheduler._process_map = ProcessMap({0: waiter})
+
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(job_tracker, job)
+        assert job.id_ is not None
+        assert job_tracker.mark_job_aux_prepared_if_ready(job.id_) is True
+        await job_tracker.mark_inference_started(job)
+        waiter.last_job_referenced = job
+        scheduler._record_dispatch_reservation(job, waiter, baseline=None, staging_only=True)
+        outstanding = scheduler._reserve_ledger.effective_planned_vram_mb_for_flow(DISPATCH_ADMISSION_FLOW, {})
+        assert outstanding == _ENCODE_MB, "precondition: the waiter's own encode charge is the only reservation"
+        return scheduler
+
+    async def test_a_card_with_room_for_the_peak_clears_the_lone_waiter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Free covers the full peak plus noise with margin to spare, but not a second copy of the encode charge."""
+        scheduler = await self._lone_staged_waiter(monkeypatch, room_beyond_peak_mb=_ENCODE_MB / 4)
+
+        assert scheduler.clearance_admit_process(0) is True, (
+            "the waiter's own staging reservation was priced against its own clearance"
+        )
+
+    async def test_a_card_short_of_the_peak_still_holds_the_lone_waiter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The netting is bounded to the waiter's own entry: a peak the card cannot seat is still held."""
+        scheduler = await self._lone_staged_waiter(monkeypatch, room_beyond_peak_mb=-_ENCODE_MB / 4)
+
         assert scheduler.clearance_admit_process(0) is False

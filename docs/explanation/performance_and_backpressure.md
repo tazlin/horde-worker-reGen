@@ -320,10 +320,13 @@ response stay live even when the queue is empty.
    a job whose model is resident on a card its resolution or features exclude is
    staged its own copy on a card that can serve it. A single-GPU worker keeps the
    card-blind membership test.
-2. **Single-inference hold**: defer launch while `keep_single_inference` is
-   active, such as an idle ControlNet-XL resident that must keep its slot
-   exclusive. A batch is not held here; its multiplied activation peak is priced
-   per-card by the concurrent-overlap gate below.
+2. **Single-inference hold**: defer a *second* launch while `keep_single_inference`
+   is active and an inference is already running, such as an idle ControlNet-XL
+   resident that must keep its slot exclusive. With nothing running the cycle
+   dispatches the head alone (the fill loop stops at one), so the hold caps
+   concurrency at one rather than parking an idle pool. A batch is not held here;
+   its multiplied activation peak is priced per-card by the concurrent-overlap
+   gate below.
 3. **Start inference**: send `START_INFERENCE` with the job payload. The
    dispatch path applies the concurrent-overlap gate below, so heavy models,
    batches, and extra-large models are serialized only when their progress,

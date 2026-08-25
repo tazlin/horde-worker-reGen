@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from unittest.mock import Mock
 
+import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -376,3 +377,133 @@ class TestSchedulingCycleOverlapComposition:
         await scheduler.run_scheduling_cycle(reference)
 
         assert candidate_job in job_tracker.jobs_in_progress
+
+
+class TestKeepSingleInferenceLiveness:
+    """The keep-single-inference hold serialises inference; it must never leave an idle pool undispatched.
+
+    ``ProcessMap.keep_single_inference`` engages while an idle slot still references a ControlNet-XL job
+    (its preload intent, before the job runs). The scheduling cycle reads that as "run at most one
+    inference", which is only a hold when something is already running. With nothing in progress and more
+    than one job queued, skipping dispatch outright serves no job at all: the head stays parked on the slot
+    that holds its model, every later cycle re-derives the same hold, and the only exit is the recovery
+    supervisor faulting the backlog. That is a queue deadlock the hold itself manufactured.
+    """
+
+    @staticmethod
+    def _sdxl_reference() -> dict[str, object]:
+        return {
+            _SDXL_A: make_mock_model_reference_record(
+                _SDXL_A,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+            _SDXL_B: make_mock_model_reference_record(
+                _SDXL_B,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+        }
+
+    async def _keep_single_scheduler(
+        self,
+        job_tracker: JobTracker,
+        *,
+        max_concurrent: int,
+        sibling_state: HordeProcessState = HordeProcessState.PRELOADED_MODEL,
+    ) -> tuple[InferenceScheduler, dict[str, object], ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
+        """An idle slot holding the head's model with a ControlNet-XL preload intent, plus a second slot.
+
+        The head is the ControlNet-XL job (the shape that engages the hold); the follower is an ordinary job
+        for the sibling slot's model, so the queue holds more than one job while nothing runs.
+        """
+        head_slot = make_mock_process_info(1, model_name=_SDXL_A, state=HordeProcessState.PRELOADED_MODEL)
+        sibling_slot = make_mock_process_info(2, model_name=_SDXL_B, state=sibling_state)
+        process_map = ProcessMap({1: head_slot, 2: sibling_slot})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name=_SDXL_A, load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        horde_model_map.update_entry(horde_model_name=_SDXL_B, load_state=ModelLoadState.LOADED_IN_RAM, process_id=2)
+
+        reference = self._sdxl_reference()
+        head = make_job_pop_response(_SDXL_A, ddim_steps=20, workflow=_SLOW_WORKFLOW)
+        follower = make_job_pop_response(_SDXL_B, ddim_steps=20)
+        await job_tracker.record_popped_job(head)
+        await job_tracker.record_popped_job(follower)
+        # The preload that staged the head's model records the head as the slot's intent; the slot is idle.
+        head_slot.last_job_referenced = head
+        head_slot.loaded_horde_model_baseline = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(max_threads=max_concurrent, gpu_sampling_lease_enabled=False),
+            max_concurrent=max_concurrent,
+            max_inference=2,
+            model_metadata=make_test_model_metadata(reference),
+        )
+        scheduler.preload_models = Mock(return_value=False)  # type: ignore[method-assign]
+        scheduler._should_keep_model_resident = Mock(return_value=False)  # type: ignore[method-assign]
+        keep, reason = process_map.keep_single_inference(stable_diffusion_model_reference=reference)  # type: ignore[arg-type]
+        assert (keep, reason) == (True, "ControlNet XL"), "precondition: the hold is engaged by the idle head slot"
+        return scheduler, reference, head, follower
+
+    @pytest.mark.parametrize("max_concurrent", [1, 2])
+    async def test_an_idle_pool_under_the_hold_still_dispatches_the_head(
+        self,
+        job_tracker: JobTracker,
+        max_concurrent: int,
+    ) -> None:
+        """Nothing running and more than one job queued: the cycle starts exactly one inference, the head.
+
+        Positive liveness: the hold bounds concurrency to one, it does not bound it to zero. Both thread caps
+        are covered because a single-thread worker never logs the hold, so a silent zero-dispatch there is
+        the worst variant of the wedge.
+        """
+        scheduler, reference, head, _follower = await self._keep_single_scheduler(
+            job_tracker,
+            max_concurrent=max_concurrent,
+        )
+
+        await scheduler.run_scheduling_cycle(reference)  # type: ignore[arg-type]
+
+        assert head in job_tracker.jobs_in_progress, "the head must be dispatched onto the slot holding its model"
+        assert len(job_tracker.jobs_in_progress) == 1, "the hold serialises: exactly one inference starts"
+
+    async def test_the_hold_withholds_a_second_lane_while_one_inference_runs(self, job_tracker: JobTracker) -> None:
+        """The serialisation the hold exists for: a running inference keeps the second lane idle.
+
+        The sibling is already sampling its own job, so the head (whose idle slot engages the hold) waits
+        even though its lane is free and the thread cap would admit it.
+        """
+        scheduler, reference, head, follower = await self._keep_single_scheduler(
+            job_tracker,
+            max_concurrent=2,
+            sibling_state=HordeProcessState.INFERENCE_STARTING,
+        )
+        await mark_job_in_progress_async(job_tracker, follower)
+
+        await scheduler.run_scheduling_cycle(reference)  # type: ignore[arg-type]
+
+        assert head not in job_tracker.jobs_in_progress, "a second inference must not start under the hold"
+        assert len(job_tracker.jobs_in_progress) == 1
+
+    async def test_a_head_held_behind_a_running_inference_dispatches_once_it_finishes(
+        self,
+        job_tracker: JobTracker,
+    ) -> None:
+        """Engage-has-reachable-release at the cycle level: the running job finishing frees the head's dispatch."""
+        scheduler, reference, head, follower = await self._keep_single_scheduler(
+            job_tracker,
+            max_concurrent=2,
+            sibling_state=HordeProcessState.INFERENCE_STARTING,
+        )
+        await mark_job_in_progress_async(job_tracker, follower)
+        await scheduler.run_scheduling_cycle(reference)  # type: ignore[arg-type]
+        assert head not in job_tracker.jobs_in_progress
+
+        assert follower.id_ is not None
+        await job_tracker.discard_job(follower.id_)
+        scheduler._process_map[2].last_process_state = HordeProcessState.WAITING_FOR_JOB
+
+        await scheduler.run_scheduling_cycle(reference)  # type: ignore[arg-type]
+
+        assert head in job_tracker.jobs_in_progress, "the hold lifts with the running inference, so the head runs"
