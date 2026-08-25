@@ -110,6 +110,9 @@ def test_huggingface_cache_follows_the_cache_home(tmp_path: Path, monkeypatch: p
     expected = Path(os.environ["AIWORKER_CACHE_HOME"], "horde", "image-utilities", "huggingface")
     assert Path(os.environ["HF_HOME"]) == expected
     assert "HF_HUB_CACHE" not in os.environ
+    legacy = os.environ["AIWORKER_HF_LEGACY_HUB_CACHES"].split(os.pathsep)
+    assert str(tmp_path / "elsewhere") in legacy, "the ambient hub cache is recorded for migration"
+    assert str(expected / "hub") not in legacy
 
 
 def test_huggingface_cache_untouched_without_a_cache_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

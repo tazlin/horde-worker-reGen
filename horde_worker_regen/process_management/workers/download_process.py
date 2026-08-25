@@ -32,6 +32,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, override
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ from multiprocessing.synchronize import Lock, Semaphore
 from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
+from horde_worker_regen.load_env_vars import LEGACY_HUB_CACHES_ENV_VAR
 from horde_worker_regen.model_download_core import (
     UNKNOWN_DOWNLOAD_HOST,
     ChunkPacer,
@@ -57,6 +59,7 @@ from horde_worker_regen.model_download_core import (
     download_host_for_url,
     download_one_model,
     ensure_aux_model_present,
+    migrate_hub_annotator_repos,
     validate_present_file,
 )
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
@@ -128,6 +131,9 @@ FEATURE_LORA = "LoRa (default set)"
 FEATURE_CONTROLNET = "ControlNet"
 FEATURE_CONTROLNET_ANNOTATORS = "ControlNet annotators"
 _ANNOTATOR_VERIFY_MODULE = "horde_worker_regen.process_management.workers.annotator_verify"
+HUB_CACHE_MIGRATION_STAMP = ".hub-cache-migration-settled"
+"""Written under the isolated HuggingFace cache once :meth:`HordeDownloadProcess._migrate_hub_cache` has
+decided, for this install, whether anything needed carrying across; its presence ends the question."""
 """The module :meth:`HordeDownloadProcess._run_annotator_preload` runs in a child interpreter."""
 
 FEATURE_MISCELLANEOUS = "miscellaneous (SDXL)"
@@ -958,6 +964,7 @@ class HordeDownloadProcess(HordeProcess):
             return
 
         self._send_status(DownloadPhase.SCANNING, scan_complete=False, force=True)
+        self._migrate_hub_cache()
         self._refresh_present()
         # Cheap existence probe so a warm worker reports the safety models present in its first
         # authoritative report; the safety process then starts immediately instead of being deferred.
@@ -1912,6 +1919,54 @@ class HordeDownloadProcess(HordeProcess):
         except Exception as e:  # noqa: BLE001 - an older hordelib without the helper just runs the verify
             logger.debug(f"Download process: annotator marker pre-check unavailable: {type(e).__name__}: {e}")
             return None
+
+    def _migrate_hub_cache(self) -> None:
+        """Carry annotator hub entries from a pre-isolation hub cache into the isolated one, once per install.
+
+        Before the worker isolated the HuggingFace cache, the transformers-backed detectors fetched into
+        the hub's own default (or an ambient ``HF_HOME``); after isolation they resolve under the cache
+        root, so without this the first ControlNet job on an upgraded worker would fetch gigabytes it
+        already has. Runs before the annotator verify is enqueued, so the verify sees the copied entries.
+
+        Two guards keep this to the upgrade it exists for. It runs only on the first start under the
+        isolated cache: a stamp under that cache records that the question was settled, whatever the answer,
+        so a later start never revisits the ambient caches (an entry appearing there afterwards belongs to
+        whatever put it). And it copies only when this install's own verify marker predates the location
+        key, the one durable sign that this worker fetched detectors into an ambient cache; a fresh install
+        has no such marker and takes nothing from caches it never populated.
+        """
+        hf_home = os.environ.get("HF_HOME")
+        if not hf_home:
+            return
+        stamp = Path(hf_home) / HUB_CACHE_MIGRATION_STAMP
+        if stamp.exists():
+            return
+        try:
+            from hordelib.preload import (
+                TRANSFORMERS_ANNOTATOR_REPOS,  # pyrefly: ignore[missing-module-attribute]
+                annotator_verify_marker_predates_location_key,  # pyrefly: ignore[missing-module-attribute]
+            )
+        except ImportError:
+            # A hordelib predating the repo list; the question cannot be settled yet, so leave it open.
+            return
+        legacy = os.environ.get(LEGACY_HUB_CACHES_ENV_VAR, "")
+        copied: list[str] = []
+        if legacy and annotator_verify_marker_predates_location_key():
+            copied = migrate_hub_annotator_repos(
+                target_hub_dir=Path(hf_home) / "hub",
+                legacy_hub_dirs=[Path(entry) for entry in legacy.split(os.pathsep) if entry],
+                repos=TRANSFORMERS_ANNOTATOR_REPOS,
+            )
+            if copied:
+                logger.info(
+                    f"Download process: copied {len(copied)} annotator hub cache "
+                    f"entr{'y' if len(copied) == 1 else 'ies'} into the isolated HuggingFace cache: {copied}",
+                )
+        try:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.write_text(f"copied: {copied}\n", encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Download process: could not record the hub cache migration stamp at {stamp}: {e}")
 
     def _run_annotator_preload(self) -> bool:
         """Run each ControlNet preprocessor once in a helper process; return whether they all loaded.

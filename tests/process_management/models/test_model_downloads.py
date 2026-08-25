@@ -1124,6 +1124,57 @@ class TestFirstClassAnnotators:
 
         assert process._run_annotator_preload() is True
 
+    def _isolated_hub(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, marker_is_old: bool) -> Path:
+        """An isolated HF_HOME, a legacy hub holding one annotator repo, and a fake hordelib.preload."""
+        hf_home = tmp_path / "isolated"
+        legacy = tmp_path / "legacy" / "hub"
+        repo_dir = legacy / "models--Intel--zoedepth-nyu-kitti" / "snapshots" / "abc"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / "config.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        monkeypatch.setenv("AIWORKER_HF_LEGACY_HUB_CACHES", str(legacy))
+        fake_preload = types.ModuleType("hordelib.preload")
+        fake_preload.TRANSFORMERS_ANNOTATOR_REPOS = ("Intel/zoedepth-nyu-kitti",)  # type: ignore[attr-defined]
+        fake_preload.annotator_verify_marker_predates_location_key = lambda: marker_is_old  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hordelib.preload", fake_preload)
+        return hf_home
+
+    def test_hub_cache_migration_copies_for_a_pre_isolation_install(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A pin-only verify marker means this install fetched into the ambient cache: its entries are copied."""
+        hf_home = self._isolated_hub(monkeypatch, tmp_path, marker_is_old=True)
+
+        self._process()._migrate_hub_cache()
+
+        assert (hf_home / "hub" / "models--Intel--zoedepth-nyu-kitti" / "snapshots" / "abc" / "config.json").is_file()
+        assert (hf_home / ".hub-cache-migration-settled").is_file()
+
+    def test_hub_cache_migration_takes_nothing_for_a_fresh_install(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """No pre-isolation marker: the ambient cache was never this worker's, so nothing is copied, ever."""
+        hf_home = self._isolated_hub(monkeypatch, tmp_path, marker_is_old=False)
+
+        self._process()._migrate_hub_cache()
+
+        assert not (hf_home / "hub").exists()
+        assert (hf_home / ".hub-cache-migration-settled").is_file()
+
+    def test_hub_cache_migration_never_runs_twice(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Once the stamp exists, a later start does not look at the ambient caches again."""
+        hf_home = self._isolated_hub(monkeypatch, tmp_path, marker_is_old=True)
+        hf_home.mkdir()
+        (hf_home / ".hub-cache-migration-settled").write_text("copied: []\n", encoding="utf-8")
+
+        self._process()._migrate_hub_cache()
+
+        assert not (hf_home / "hub").exists()
+
     def test_run_annotator_preload_runs_in_a_helper_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A due verify runs the preload in a child interpreter and reads its exit status as the verdict."""
         process = self._process()

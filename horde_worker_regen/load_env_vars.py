@@ -132,6 +132,42 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
     apply_beta_model_env_defaults(config.get("api_key"))
 
 
+LEGACY_HUB_CACHES_ENV_VAR = "AIWORKER_HF_LEGACY_HUB_CACHES"
+"""Where the HuggingFace hub cache resolved before isolation took over, ``os.pathsep``-joined.
+
+Set by :func:`apply_huggingface_cache_isolation` for the download process, which moves the annotator
+entries a worker fetched into one of these locations before the cache was isolated."""
+
+
+def _legacy_hub_cache_dirs(*, target_hub_dir: str) -> list[str]:
+    """The hub cache directories a pre-isolation worker may have populated, excluding the target itself.
+
+    An ambient ``HF_HUB_CACHE``/``HUGGINGFACE_HUB_CACHE`` names the hub directory outright; an ambient
+    ``HF_HOME`` holds it under ``hub``; and with none of them set the hub used its own default under the
+    user's cache directory (``XDG_CACHE_HOME`` or ``~/.cache``).
+    """
+    candidates: list[str] = []
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.environ.get(name)
+        if value:
+            candidates.append(value)
+    ambient_home = os.environ.get("HF_HOME")
+    if ambient_home:
+        candidates.append(os.path.join(ambient_home, "hub"))
+    user_cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    candidates.append(os.path.join(user_cache, "huggingface", "hub"))
+    target = os.path.normcase(os.path.normpath(target_hub_dir))
+    seen: set[str] = set()
+    legacy: list[str] = []
+    for candidate in candidates:
+        key = os.path.normcase(os.path.normpath(candidate))
+        if key == target or key in seen:
+            continue
+        seen.add(key)
+        legacy.append(candidate)
+    return legacy
+
+
 def apply_huggingface_cache_isolation() -> None:
     """Point the HuggingFace stack at the isolated cache under ``AIWORKER_CACHE_HOME``, process-wide.
 
@@ -153,9 +189,11 @@ def apply_huggingface_cache_isolation() -> None:
     if huggingface_home is None:
         return
     overridden = [name for name in HUGGING_FACE_CACHE_ENV_VARS if os.environ.get(name) not in (None, huggingface_home)]
+    legacy_hub_dirs = _legacy_hub_cache_dirs(target_hub_dir=os.path.join(huggingface_home, "hub"))
     for name in HUGGING_FACE_CACHE_ENV_VARS:
         os.environ.pop(name, None)
     os.environ["HF_HOME"] = huggingface_home
+    os.environ[LEGACY_HUB_CACHES_ENV_VAR] = os.pathsep.join(legacy_hub_dirs)
     if overridden:
         logger.warning(
             f"Overriding ambient {', '.join(overridden)}: AIWORKER_CACHE_HOME isolation owns the HuggingFace "

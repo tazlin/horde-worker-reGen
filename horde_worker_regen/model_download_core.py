@@ -17,11 +17,16 @@ from a stdin control channel.
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
+
+from loguru import logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -437,3 +442,39 @@ def ensure_models_present(
             on_model_finish(name, index, total, succeeded)
 
     return outcome
+
+
+def migrate_hub_annotator_repos(
+    *,
+    target_hub_dir: Path,
+    legacy_hub_dirs: Iterable[Path],
+    repos: Iterable[str],
+) -> list[str]:
+    """Copy named hub repos from a legacy hub cache into ``target_hub_dir``; return the repo ids copied.
+
+    A hub repo is a self-contained ``models--<org>--<name>`` directory, so a copy of it resolves in the new
+    location without a download. It is a copy and never a move: a legacy cache is the machine's, shared
+    with whatever else uses the hub, and an entry there may be another application's. Only ``repos`` are
+    considered, and only when the target lacks them. A copy that fails is logged and its partial target
+    removed; the entry is then fetched like a cold one.
+    """
+    copied: list[str] = []
+    for repo in repos:
+        dirname = "models--" + repo.replace("/", "--")
+        target = target_hub_dir / dirname
+        if target.exists():
+            continue
+        for legacy_dir in legacy_hub_dirs:
+            source = legacy_dir / dirname
+            if not source.is_dir():
+                continue
+            try:
+                target_hub_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(source, target, symlinks=True)
+            except OSError as e:
+                logger.warning(f"Could not copy hub cache entry {repo} from {legacy_dir} to {target_hub_dir}: {e}")
+                shutil.rmtree(target, ignore_errors=True)
+                break
+            copied.append(repo)
+            break
+    return copied

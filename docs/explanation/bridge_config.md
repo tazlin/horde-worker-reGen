@@ -112,7 +112,15 @@ large download. Presence is resolved against the configured weights root
 The HuggingFace hub cache follows it too: once the cache root is known, the worker sets `HF_HOME` to
 `<cache_home>/horde/image-utilities/huggingface` (replacing any ambient `HF_HUB_CACHE` /
 `HUGGINGFACE_HUB_CACHE`) before spawning children, so the transformers-backed ControlNet annotators
-resolve through one cache shared by the download, inference and utilities processes.
+resolve through one cache shared by the download, inference and utilities processes. The locations the
+hub cache resolved to before (an ambient `HF_HUB_CACHE`/`HF_HOME`, or the hub's own default under the
+user's cache directory) are handed to the download process. On its first start under the isolated cache,
+and only when this install's annotator verify marker predates the location key (the sign that it fetched
+detectors into an ambient cache), it copies the annotators' hub entries from there into the isolated
+cache; the ambient cache is left intact because other applications may share it. A stamp under the
+isolated cache records that the question was settled, so it is never revisited, and a fresh install
+settles it without copying anything. hordelib's verify marker is keyed on the cache location, so the
+verify re-runs once against the new location before any job can need a detector from it.
 
 #### The `disagg_optimized N` model rule
 
