@@ -107,7 +107,7 @@ def test_huggingface_cache_follows_the_cache_home(tmp_path: Path, monkeypatch: p
 
     load_env_vars_from_config()
 
-    expected = Path(os.environ["AIWORKER_CACHE_HOME"], "horde", "image-utilities", "huggingface")
+    expected = Path(os.environ["AIWORKER_CACHE_HOME"], "hf_transformers")
     assert Path(os.environ["HF_HOME"]) == expected
     assert "HF_HUB_CACHE" not in os.environ
     legacy = os.environ["AIWORKER_HF_LEGACY_HUB_CACHES"].split(os.pathsep)

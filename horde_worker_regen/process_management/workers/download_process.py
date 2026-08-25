@@ -1929,32 +1929,45 @@ class HordeDownloadProcess(HordeProcess):
         already has. Runs before the annotator verify is enqueued, so the verify sees the copied entries.
 
         Two guards keep this to the upgrade it exists for. It runs only on the first start under the
-        isolated cache: a stamp under that cache records that the question was settled, whatever the answer,
-        so a later start never revisits the ambient caches (an entry appearing there afterwards belongs to
-        whatever put it). And it copies only when this install's own verify marker predates the location
-        key, the one durable sign that this worker fetched detectors into an ambient cache; a fresh install
-        has no such marker and takes nothing from caches it never populated.
+        current cache: a stamp under that cache records that the question was settled, whatever the answer,
+        so a later start never revisits other caches (an entry appearing there afterwards belongs to whatever
+        put it). And the source is what this install's own verify marker says: a marker predating the
+        location key means the detectors were fetched into whatever cache was ambient at the time, so the
+        ambient candidates are searched; a marker naming another location means a previous worker version
+        kept its hub there, so that directory alone is searched. A fresh install has no marker and takes
+        nothing from caches it never populated.
         """
         hf_home = os.environ.get("HF_HOME")
         if not hf_home:
             return
+        target_hub_dir = Path(hf_home) / "hub"
         stamp = Path(hf_home) / HUB_CACHE_MIGRATION_STAMP
         if stamp.exists():
             return
         try:
             from hordelib.preload import (
                 TRANSFORMERS_ANNOTATOR_REPOS,  # pyrefly: ignore[missing-module-attribute]
+                annotator_verify_marker_hub_cache_dir,  # pyrefly: ignore[missing-module-attribute]
                 annotator_verify_marker_predates_location_key,  # pyrefly: ignore[missing-module-attribute]
             )
         except ImportError:
-            # A hordelib predating the repo list; the question cannot be settled yet, so leave it open.
+            # A hordelib predating the marker helpers; the question cannot be settled yet, so leave it open.
             return
-        legacy = os.environ.get(LEGACY_HUB_CACHES_ENV_VAR, "")
+        sources: list[Path] = []
+        if annotator_verify_marker_predates_location_key():
+            legacy = os.environ.get(LEGACY_HUB_CACHES_ENV_VAR, "")
+            sources = [Path(entry) for entry in legacy.split(os.pathsep) if entry]
+        else:
+            marker_hub_dir = annotator_verify_marker_hub_cache_dir()
+            if marker_hub_dir and os.path.normcase(os.path.normpath(marker_hub_dir)) != os.path.normcase(
+                os.path.normpath(target_hub_dir),
+            ):
+                sources = [Path(marker_hub_dir)]
         copied: list[str] = []
-        if legacy and annotator_verify_marker_predates_location_key():
+        if sources:
             copied = migrate_hub_annotator_repos(
-                target_hub_dir=Path(hf_home) / "hub",
-                legacy_hub_dirs=[Path(entry) for entry in legacy.split(os.pathsep) if entry],
+                target_hub_dir=target_hub_dir,
+                legacy_hub_dirs=sources,
                 repos=TRANSFORMERS_ANNOTATOR_REPOS,
             )
             if copied:

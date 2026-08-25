@@ -110,17 +110,21 @@ without curating an explicit list, and guarantees a config edit never triggers a
 large download. Presence is resolved against the configured weights root
 (`cache_home` / `AIWORKER_CACHE_HOME`), the same location the worker downloads to.
 The HuggingFace hub cache follows it too: once the cache root is known, the worker sets `HF_HOME` to
-`<cache_home>/horde/image-utilities/huggingface` (replacing any ambient `HF_HUB_CACHE` /
-`HUGGINGFACE_HUB_CACHE`) before spawning children, so the transformers-backed ControlNet annotators
-resolve through one cache shared by the download, inference and utilities processes. The locations the
-hub cache resolved to before (an ambient `HF_HUB_CACHE`/`HF_HOME`, or the hub's own default under the
-user's cache directory) are handed to the download process. On its first start under the isolated cache,
-and only when this install's annotator verify marker predates the location key (the sign that it fetched
-detectors into an ambient cache), it copies the annotators' hub entries from there into the isolated
-cache; the ambient cache is left intact because other applications may share it. A stamp under the
-isolated cache records that the question was settled, so it is never revisited, and a fresh install
-settles it without copying anything. hordelib's verify marker is keyed on the cache location, so the
-verify re-runs once against the new location before any job can need a detector from it.
+`<cache_home>/hf_transformers` (replacing any ambient `HF_HUB_CACHE` / `HUGGINGFACE_HUB_CACHE`) before
+spawning children, so the transformers-backed ControlNet annotators resolve through one cache shared by
+the download, inference and safety processes. The directory is the one `horde_safety` has always used
+for the safety models' transformers cache, so existing workers already hold those weights there; the
+CLIP/BLIP folder (`<cache_home>/clip_blip`) is fixed by the cache root and never follows `HF_HOME`. The
+utilities process keeps its own isolated location under its own policy.
+
+The download process carries the annotators' hub entries across once, on its first start under the
+current cache, from wherever this install's annotator verify marker says they were fetched: an ambient
+cache (`HF_HUB_CACHE`/`HF_HOME`, or the hub's default under the user's cache directory) when the marker
+predates the location key, or the directory a previous worker version named. It copies rather than
+moves, because an ambient cache may be shared with other applications. A stamp under the cache records
+that the question was settled, so it is never revisited, and a fresh install settles it without copying
+anything. hordelib's verify marker is keyed on the cache location, so the verify re-runs once against the
+new location before any job can need a detector from it.
 
 #### The `disagg_optimized N` model rule
 

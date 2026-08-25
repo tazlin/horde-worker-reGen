@@ -168,26 +168,41 @@ def _legacy_hub_cache_dirs(*, target_hub_dir: str) -> list[str]:
     return legacy
 
 
+HUGGING_FACE_CACHE_ENV_VARS: tuple[str, ...] = ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")
+"""The variables the HuggingFace stack reads its cache location from; the later two outrank ``HF_HOME``."""
+
+HUGGINGFACE_HOME_DIRNAME = "hf_transformers"
+"""The worker-wide HuggingFace home under ``AIWORKER_CACHE_HOME``.
+
+The name is ``horde_safety``'s: it has always put the safety models' transformers cache there when it found a
+cache root and no ``HF_HOME``, so every existing worker already holds those weights at this location. Sharing
+it, rather than naming a second isolated directory, is what lets the whole worker use one hub cache without
+any process fetching again what another already has."""
+
+
+def huggingface_home_for(cache_home: str) -> str:
+    """The worker-wide ``HF_HOME`` for a cache root."""
+    return os.path.join(cache_home, HUGGINGFACE_HOME_DIRNAME)
+
+
 def apply_huggingface_cache_isolation() -> None:
-    """Point the HuggingFace stack at the isolated cache under ``AIWORKER_CACHE_HOME``, process-wide.
+    """Point the HuggingFace stack at the worker-wide cache under ``AIWORKER_CACHE_HOME``, process-wide.
 
     ``AIWORKER_CACHE_HOME`` is the operator's promise that every model file the worker fetches lands under one
     root. The transformers-backed ControlNet annotators (MiDaS, ZoeDepth, depth-anything, OneFormer) fetch
     through the HuggingFace hub cache, which defaults to the home drive and is outranked by an ambient
     ``HF_HUB_CACHE``/``HUGGINGFACE_HUB_CACHE``, so those variables are replaced rather than merely warned
-    about. Applied here, before any child spawns, so the download, inference, safety and utilities processes
-    all share the one cache ``horde_image_utilities`` isolates for itself; a process that resolved its own
-    would keep a second cache on another volume, and an annotator verified in one process would then be
-    fetched again by the next.
+    about. Applied here, before any child spawns, so the download, inference and safety processes share one
+    cache (:data:`HUGGINGFACE_HOME_DIRNAME`); a process that resolved its own would keep a second cache on
+    another volume, and an annotator verified in one process would then be fetched again by the next. The
+    utilities process keeps its own isolated location by its own policy.
 
-    A no-op when isolation cannot resolve (no ``AIWORKER_CACHE_HOME``, or the utilities settings turn
-    isolation off), in which case the hub stack keeps its own defaults.
+    A no-op without ``AIWORKER_CACHE_HOME``, in which case the hub stack keeps its own defaults.
     """
-    from horde_image_utilities.config import HUGGING_FACE_CACHE_ENV_VARS, get_huggingface_home
-
-    huggingface_home = get_huggingface_home()
-    if huggingface_home is None:
+    cache_home = os.environ.get("AIWORKER_CACHE_HOME")
+    if not cache_home:
         return
+    huggingface_home = huggingface_home_for(cache_home)
     overridden = [name for name in HUGGING_FACE_CACHE_ENV_VARS if os.environ.get(name) not in (None, huggingface_home)]
     legacy_hub_dirs = _legacy_hub_cache_dirs(target_hub_dir=os.path.join(huggingface_home, "hub"))
     for name in HUGGING_FACE_CACHE_ENV_VARS:

@@ -1124,20 +1124,50 @@ class TestFirstClassAnnotators:
 
         assert process._run_annotator_preload() is True
 
-    def _isolated_hub(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, marker_is_old: bool) -> Path:
-        """An isolated HF_HOME, a legacy hub holding one annotator repo, and a fake hordelib.preload."""
+    def _isolated_hub(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        marker_is_old: bool,
+        marker_hub_dir: str | None = None,
+    ) -> Path:
+        """An isolated HF_HOME, a legacy hub holding one annotator repo, and a fake hordelib.preload.
+
+        ``marker_hub_dir`` is what the fake marker names as the hub it was written against (None for a
+        pin-only or missing marker); the repo is seeded there too when it points somewhere.
+        """
         hf_home = tmp_path / "isolated"
-        legacy = tmp_path / "legacy" / "hub"
-        repo_dir = legacy / "models--Intel--zoedepth-nyu-kitti" / "snapshots" / "abc"
-        repo_dir.mkdir(parents=True)
-        (repo_dir / "config.json").write_text("{}", encoding="utf-8")
+        for hub in (tmp_path / "legacy" / "hub", *([Path(marker_hub_dir)] if marker_hub_dir else [])):
+            repo_dir = hub / "models--Intel--zoedepth-nyu-kitti" / "snapshots" / "abc"
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            (repo_dir / "config.json").write_text("{}", encoding="utf-8")
         monkeypatch.setenv("HF_HOME", str(hf_home))
-        monkeypatch.setenv("AIWORKER_HF_LEGACY_HUB_CACHES", str(legacy))
+        monkeypatch.setenv("AIWORKER_HF_LEGACY_HUB_CACHES", str(tmp_path / "legacy" / "hub"))
         fake_preload = types.ModuleType("hordelib.preload")
         fake_preload.TRANSFORMERS_ANNOTATOR_REPOS = ("Intel/zoedepth-nyu-kitti",)  # type: ignore[attr-defined]
         fake_preload.annotator_verify_marker_predates_location_key = lambda: marker_is_old  # type: ignore[attr-defined]
+        fake_preload.annotator_verify_marker_hub_cache_dir = lambda: marker_hub_dir  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "hordelib.preload", fake_preload)
         return hf_home
+
+    def test_hub_cache_migration_copies_from_the_hub_the_marker_names(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A marker naming another hub (a previous worker version's location) is the source; ambient caches are not."""
+        previous = tmp_path / "previous" / "hub"
+        hf_home = self._isolated_hub(monkeypatch, tmp_path, marker_is_old=False, marker_hub_dir=str(previous))
+        (
+            tmp_path / "legacy" / "hub" / "models--Intel--zoedepth-nyu-kitti" / "snapshots" / "abc" / "config.json"
+        ).write_text('{"from": "ambient"}', encoding="utf-8")
+
+        self._process()._migrate_hub_cache()
+
+        copied = hf_home / "hub" / "models--Intel--zoedepth-nyu-kitti" / "snapshots" / "abc" / "config.json"
+        assert copied.read_text(encoding="utf-8") == "{}", "the marker's hub supplied the entry, not the ambient one"
+        assert (hf_home / ".hub-cache-migration-settled").is_file()
 
     def test_hub_cache_migration_copies_for_a_pre_isolation_install(
         self,
