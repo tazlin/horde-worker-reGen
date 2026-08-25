@@ -228,6 +228,23 @@ that would relieve the pressure it is waiting on.
 - No narrowing happens while the worker holds no work locally, mirroring the large-model pop
   limiters' idle escape.
 
+## Serviceability: what a card can host, and the constrained lane
+
+Before any of the narrowings above, each offered model is judged against the card it would run on
+(`resources/model_serviceability.py`). A model whose smallest legal job cannot fit `total - baseline -
+noise` is never advertised. A model whose smallest job fits but whose `max_power` job does not is
+*constrained*: it is still offered, at the largest `max_power` it fits. A baseline whose core weights
+alone exceed the card's capacity is never resident on that card at any size (ComfyUI streams it and the
+worker gives it the whole card), so it is judged by the baseline's recommended minimum card instead of the
+resident inequality, and its job size is left to runtime admission.
+
+The horde's pop carries one `max_pixels` for every model in it, so a constrained model cannot share a pop
+with the others without capping them all. The popper lanes it instead
+(`decide_constrained_offer`): a bounded run of full-size pops carries the unconstrained models at the
+configured `max_power`, then one pop carries only the constrained models at their shared cap, and the
+cadence repeats. An offer made only of constrained models goes out capped as one pop, and an idle-fill
+pop is capped rather than laned, since its job is the quickest work of any model.
+
 ## Model stickiness
 
 When the worker has more configured models than inference processes, every new

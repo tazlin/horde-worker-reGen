@@ -1949,3 +1949,30 @@ class TestRecommendationIsNotAPeakFloor:
         )
         assert small_mb is not None and large_mb is not None
         assert large_mb > small_mb
+
+
+class TestControlnetWorkflowPricing:
+    """A named controlnet workflow is priced as a controlnet job, so the gates carry its extra weights."""
+
+    def test_a_qr_code_workflow_counts_as_a_controlnet_feature(self) -> None:
+        """The feature list a qr_code job implies includes controlnet even with no control_type set."""
+        from hordelib.feature_impact import FEATURE_KIND
+
+        plain = make_job_pop_response("sdxl", width=1024, height=1024, workflow=None)
+        qr = make_job_pop_response("sdxl", width=1024, height=1024, workflow="qr_code")
+        assert qr.payload.control_type is None
+
+        assert FEATURE_KIND.controlnet not in resource_budget._job_feature_kinds(plain)
+        assert FEATURE_KIND.controlnet in resource_budget._job_feature_kinds(qr)
+
+    def test_a_qr_code_job_is_priced_above_the_same_plain_job(self) -> None:
+        """The sampling peak the admission and overlap gates read rises by the controlnet burden."""
+        baseline = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value
+        plain = make_job_pop_response("sdxl", width=1024, height=1024, workflow=None)
+        qr = make_job_pop_response("sdxl", width=1024, height=1024, workflow="qr_code")
+
+        plain_mb = resource_budget.predict_job_sampling_vram_mb(plain, baseline)
+        qr_mb = resource_budget.predict_job_sampling_vram_mb(qr, baseline)
+
+        assert plain_mb is not None and qr_mb is not None
+        assert qr_mb > plain_mb

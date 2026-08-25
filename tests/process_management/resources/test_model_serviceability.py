@@ -6,9 +6,11 @@ import pytest
 
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.model_serviceability import (
+    ConstrainedLaneState,
     ModelFootprintFigures,
     ModelServiceabilityTier,
     assess_model_serviceability,
+    decide_constrained_offer,
     max_power_to_pixels,
 )
 
@@ -111,3 +113,144 @@ def test_unserviceable_when_smallest_job_does_not_fit() -> None:
     assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
     assert verdict.serviceable is False
     assert verdict.largest_fitting_max_power is None
+
+
+# A streaming baseline: core weights that no consumer card can hold resident, with hordelib's recommended
+# minimum card carried alongside (the qwen_image seed shape).
+_STREAMING = ModelFootprintFigures(
+    weights_mb=19500.0,
+    activation_per_megapixel_mb=1500.0,
+    min_recommended_card_mb=16000.0,
+)
+
+
+class TestStreamingBaselineServiceability:
+    """A model whose core weights cannot be resident is judged by its recommended minimum card."""
+
+    def test_a_card_meeting_the_recommended_minimum_serves_a_streaming_model_at_full_size(self) -> None:
+        """24 GB minus a desktop baseline: the weights overflow, the recommended card fits, no size cap."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=24 * _GB,
+            baseline_mb=3600.0,
+            noise_buffer_mb=None,
+            figures=_STREAMING,
+            max_pixels=max_power_to_pixels(32),
+        )
+        assert verdict.capacity_mb is not None and _STREAMING.streams_on(verdict.capacity_mb)
+        assert verdict.tier is ModelServiceabilityTier.SERVICEABLE
+        assert "streams" in verdict.reason()
+
+    def test_a_card_below_the_recommended_minimum_cannot_serve_a_streaming_model(self) -> None:
+        """16 GB minus a baseline sits under the recommended card: not offered at any size."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=16 * _GB,
+            baseline_mb=1500.0,
+            noise_buffer_mb=None,
+            figures=_STREAMING,
+        )
+        assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
+
+    def test_an_unknown_recommended_minimum_keeps_the_conservative_answer(self) -> None:
+        """Without a recommended card there is nothing to judge a streaming fit by, so it does not fit."""
+        figures = ModelFootprintFigures(weights_mb=19500.0, activation_per_megapixel_mb=1500.0)
+        verdict = assess_model_serviceability(
+            total_vram_mb=24 * _GB,
+            baseline_mb=3600.0,
+            noise_buffer_mb=None,
+            figures=figures,
+        )
+        assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
+        assert "unknown" in verdict.reason()
+
+    def test_a_resident_baseline_is_not_judged_by_its_recommendation(self) -> None:
+        """SDXL on 8 GB: the weights fit, so the resident inequality governs even with a recommendation set.
+
+        The recommendation may sit above what a small card achieves; a model the card provably seats must not
+        be delisted by it.
+        """
+        sdxl = ModelFootprintFigures(
+            weights_mb=4900.0,
+            activation_per_megapixel_mb=1200.0,
+            min_recommended_card_mb=8000.0,
+        )
+        verdict = assess_model_serviceability(
+            total_vram_mb=8 * _GB,
+            baseline_mb=512.0,
+            noise_buffer_mb=None,
+            figures=sdxl,
+        )
+        assert verdict.tier is not ModelServiceabilityTier.UNSERVICEABLE
+
+
+class TestConstrainedOfferLane:
+    """A constrained model rides its own capped pop instead of capping every other model's pop."""
+
+    _OFFER = frozenset({"heavy", "light", "other"})
+
+    def test_no_constrained_model_leaves_the_offer_alone(self) -> None:
+        """With no constrained model the offer and max_power pass through and the cadence resets."""
+        decision = decide_constrained_offer(
+            ConstrainedLaneState(full_cycles_taken=2),
+            offered_models=self._OFFER,
+            model_caps={},
+            pop_max_power=32,
+        )
+        assert decision.advertised_models == self._OFFER
+        assert decision.pop_max_power == 32
+        assert decision.constrained_pop is False
+        assert decision.next_state == ConstrainedLaneState()
+
+    def test_full_size_pops_alternate_with_one_constrained_pop(self) -> None:
+        """Three full-size pops of the unconstrained models, then one pop of the constrained model at its cap."""
+        state = ConstrainedLaneState()
+        seen: list[tuple[frozenset[str], int, bool]] = []
+        for _ in range(8):
+            decision = decide_constrained_offer(
+                state,
+                offered_models=self._OFFER,
+                model_caps={"heavy": 19},
+                pop_max_power=32,
+                full_cycles=3,
+            )
+            seen.append((decision.advertised_models, decision.pop_max_power, decision.constrained_pop))
+            state = decision.next_state
+        full = (frozenset({"light", "other"}), 32, False)
+        constrained = (frozenset({"heavy"}), 19, True)
+        assert seen == [full, full, full, constrained, full, full, full, constrained]
+
+    def test_a_wholly_constrained_offer_is_capped_as_one_pop(self) -> None:
+        """With nothing to protect, every model goes out capped at the smallest cap."""
+        decision = decide_constrained_offer(
+            ConstrainedLaneState(),
+            offered_models=frozenset({"heavy", "heavier"}),
+            model_caps={"heavy": 19, "heavier": 12},
+            pop_max_power=32,
+        )
+        assert decision.advertised_models == frozenset({"heavy", "heavier"})
+        assert decision.pop_max_power == 12
+        assert decision.constrained_pop is False
+
+    def test_an_idle_fill_pop_never_takes_the_constrained_lane(self) -> None:
+        """An idle-fill pop wants the quickest work of any model: capped, not laned, and the cadence holds."""
+        state = ConstrainedLaneState(full_cycles_taken=3)
+        decision = decide_constrained_offer(
+            state,
+            offered_models=self._OFFER,
+            model_caps={"heavy": 19},
+            pop_max_power=32,
+            idle_fill=True,
+        )
+        assert decision.advertised_models == self._OFFER
+        assert decision.pop_max_power == 19
+        assert decision.constrained_pop is False
+        assert decision.next_state == state
+
+    def test_a_cap_never_exceeds_the_configured_max_power(self) -> None:
+        """A cap above the configured max_power is clamped to it on the constrained pop."""
+        decision = decide_constrained_offer(
+            ConstrainedLaneState(full_cycles_taken=3),
+            offered_models=self._OFFER,
+            model_caps={"heavy": 40},
+            pop_max_power=32,
+        )
+        assert decision.pop_max_power == 32

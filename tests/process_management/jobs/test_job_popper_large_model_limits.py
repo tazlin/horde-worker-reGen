@@ -191,3 +191,37 @@ class TestServiceabilityMaxPowerCap:
 
         assert popper._serviceability_max_power_cap({"sdxl_model", "sd15_model"}, 64, popper._card_runtimes) == 64
         assert popper._serviceability_cap_logged == {}
+
+
+class TestConstrainedModelLane(TestServiceabilityMaxPowerCap):
+    """The popper lanes a constrained model onto its own capped pop; the other models keep their max_power."""
+
+    def test_full_size_pops_keep_the_configured_max_power_and_the_constrained_pop_comes_round(self) -> None:
+        """SDXL constrained on 8 GB beside a fitting SD15: SD15 pops at 64, SDXL gets its own capped pop."""
+        popper = self._popper_with_card(total_vram_mb=8192.0, baseline_mb=2048.0, max_power=64)
+        sdxl_cap = popper._serviceability_max_power_cap({"sdxl_model"}, 64, popper._card_runtimes)
+        assert sdxl_cap < 64
+
+        pops = [
+            popper._shape_offer_for_serviceability(
+                {"sdxl_model", "sd15_model"},
+                64,
+                popper._card_runtimes,
+                idle_fill_wanted=False,
+            )
+            for _ in range(4)
+        ]
+
+        assert pops[:3] == [({"sd15_model"}, 64)] * 3, "the unconstrained model pops at the configured size"
+        assert pops[3] == ({"sdxl_model"}, sdxl_cap), "the constrained model rides its own capped pop"
+
+    def test_a_fitting_offer_is_untouched(self) -> None:
+        """A card that fits every model at max_power advertises the whole offer at the configured size."""
+        popper = self._popper_with_card(total_vram_mb=24576.0, baseline_mb=1024.0, max_power=64)
+        shaped = popper._shape_offer_for_serviceability(
+            {"sdxl_model", "sd15_model"},
+            64,
+            popper._card_runtimes,
+            idle_fill_wanted=False,
+        )
+        assert shaped == ({"sdxl_model", "sd15_model"}, 64)

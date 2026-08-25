@@ -66,9 +66,12 @@ from horde_worker_regen.process_management.models.model_sizing import (
     model_size_tier,
 )
 from horde_worker_regen.process_management.resources.model_serviceability import (
+    _CONSTRAINED_LANE_FULL_CYCLES,
+    ConstrainedLaneState,
     ModelServiceabilityTier,
     ModelServiceabilityVerdict,
     assess_model_serviceability,
+    decide_constrained_offer,
     max_power_to_pixels,
     model_footprint_figures_for_baseline,
 )
@@ -619,6 +622,7 @@ class JobPopper:
         self._admission_baseline_provider = admission_baseline_provider
         self._serviceability_exclusion_logged: set[str] = set()
         self._serviceability_cap_logged: dict[str, int] = {}
+        self._constrained_lane_state = ConstrainedLaneState()
         self._whole_card_residency_active = (
             whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
         )
@@ -807,16 +811,61 @@ class JobPopper:
         pop_max_power: int,
         card_runtimes: dict[int, CardRuntime] | None,
     ) -> int:
-        """Return ``pop_max_power`` lowered to what every offered model can host on some serving card.
+        """Return ``pop_max_power`` lowered to what every model in ``models`` can host on some serving card.
 
-        For each model whose smallest job fits but whose ``pop_max_power`` job does not fit any serving card,
-        the cap is the best (largest) fitting ``max_power`` across those cards. The pop takes the smallest cap
-        over its models. Each model's cap is logged once per value so an operator sees, at model-pick time,
-        which models the card can only run reduced and to what size.
+        The smallest cap over the constrained models (:meth:`_serviceability_model_caps`); unchanged when none
+        is constrained. This is the figure a pop that carries a constrained model must ask with.
         """
+        caps = self._serviceability_model_caps(models, pop_max_power, card_runtimes)
+        return min(pop_max_power, *caps.values()) if caps else pop_max_power
+
+    def _shape_offer_for_serviceability(
+        self,
+        models: set[str],
+        pop_max_power: int,
+        card_runtimes: dict[int, CardRuntime] | None,
+        *,
+        idle_fill_wanted: bool,
+    ) -> tuple[set[str], int]:
+        """Return the offer and ``max_power`` for this pop once constrained models have been laned.
+
+        The horde's pop carries one ``max_pixels`` for every model in it, so a model the card fits only at
+        reduced size cannot share a pop with the others without capping them too. The lane decision
+        (:func:`decide_constrained_offer`) alternates full-size pops of the unconstrained models with a pop of
+        the constrained models at their cap; this advances the stored cadence state once per built pop.
+        """
+        caps = self._serviceability_model_caps(models, pop_max_power, card_runtimes)
+        decision = decide_constrained_offer(
+            self._constrained_lane_state,
+            offered_models=frozenset(models),
+            model_caps=caps,
+            pop_max_power=pop_max_power,
+            idle_fill=idle_fill_wanted,
+        )
+        self._constrained_lane_state = decision.next_state
+        if decision.constrained_pop:
+            logger.debug(
+                f"Constrained-model pop: advertising {sorted(decision.advertised_models)} at max_power "
+                f"{decision.pop_max_power} (configured {pop_max_power}); the full-size offer resumes next pop.",
+            )
+        return set(decision.advertised_models), decision.pop_max_power
+
+    def _serviceability_model_caps(
+        self,
+        models: set[str],
+        pop_max_power: int,
+        card_runtimes: dict[int, CardRuntime] | None,
+    ) -> dict[str, int]:
+        """Return, per constrained model in ``models``, the largest ``max_power`` some serving card fits it at.
+
+        A model whose smallest job fits but whose ``pop_max_power`` job does not fit any serving card is
+        constrained; its cap is the best (largest) fitting ``max_power`` across those cards. Models the card
+        fits at full size are absent. Each model's cap is logged once per value so an operator sees, at
+        model-pick time, which models the card can only run reduced and to what size.
+        """
+        caps: dict[str, int] = {}
         if self._model_metadata is None or card_runtimes is None or len(card_runtimes) == 0:
-            return pop_max_power
-        capped = pop_max_power
+            return caps
         for model in sorted(models):
             verdicts = _model_serviceability_verdicts(
                 model,
@@ -839,12 +888,13 @@ class JobPopper:
                 self._serviceability_cap_logged[model] = model_cap
                 logger.warning(
                     f"Offering {model} at reduced max_power {model_cap} (configured {pop_max_power}): the card "
-                    f"cannot host it at full size, so pops that include it ask for smaller jobs. Lower max_power, "
-                    f"free VRAM on the card, or remove the model to silence this. "
+                    f"cannot host it at full size, so it is advertised on its own reduced-size pop, one in every "
+                    f"{_CONSTRAINED_LANE_FULL_CYCLES + 1}, and the other models keep the configured max_power. "
+                    f"Lower max_power, free VRAM on the card, or remove the model to silence this. "
                     f"{_serviceability_arithmetic(verdicts)}",
                 )
-            capped = min(capped, model_cap)
-        return capped
+            caps[model] = model_cap
+        return caps
 
     def _apply_idle_fill_ladder(
         self,
@@ -2081,10 +2131,16 @@ class JobPopper:
         pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw
         pop_threads = advertised.threads if advertised is not None else self._max_concurrent_inference_processes
         pop_max_power = advertised.max_power if advertised is not None else bridge_data.max_power
-        # A model whose smallest job fits the card but whose max_power job does not is still offered; the
-        # pop's max_power is lowered to the largest size that fits so the horde never returns a job the card
-        # cannot host. The cap applies to the whole pop (max_pixels is one figure for every model in it).
-        pop_max_power = self._serviceability_max_power_cap(models, pop_max_power, advertised_card_runtimes)
+        # A model whose smallest job fits the card but whose max_power job does not is still offered, on a pop
+        # of its own with max_power lowered to the largest size that fits, so the horde never returns a job the
+        # card cannot host while the other models keep the configured size (max_pixels is one figure for every
+        # model in a pop, so a shared pop would cap them all).
+        models, pop_max_power = self._shape_offer_for_serviceability(
+            models,
+            pop_max_power,
+            advertised_card_runtimes,
+            idle_fill_wanted=idle_fill_wanted,
+        )
         pop_max_batch = advertised.max_batch if advertised is not None else bridge_data.max_batch
         pop_allow_img2img = advertised.allow_img2img if advertised is not None else bridge_data.allow_img2img
         pop_allow_painting = advertised.allow_inpainting if advertised is not None else bridge_data.allow_inpainting

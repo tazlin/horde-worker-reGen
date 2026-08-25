@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
+from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -1128,7 +1130,10 @@ def _job_feature_kinds(job: ImageGenerateJobPopResponse) -> list[FEATURE_KIND]:
         features.append(FEATURE_KIND.lora)
     if payload.tis:
         features.append(FEATURE_KIND.ti)
-    if payload.control_type:
+    # A named controlnet workflow (qr_code) loads a controlnet the same way an explicit control_type does,
+    # without setting control_type; pricing it as one keeps the admission and overlap gates carrying its
+    # extra weights, instead of a worker-wide serialisation standing in for the unpriced cost.
+    if payload.control_type or payload.workflow in KNOWN_CONTROLNET_WORKFLOWS:
         features.append(FEATURE_KIND.controlnet)
     if payload.hires_fix:
         features.append(FEATURE_KIND.hires_fix)
