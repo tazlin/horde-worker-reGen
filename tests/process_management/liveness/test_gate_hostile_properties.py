@@ -21,16 +21,12 @@ named in ``TestGatesWithNoTestSeamYet`` rather than left silently uncovered.
 
 from __future__ import annotations
 
-from unittest.mock import Mock, PropertyMock, patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
-from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.config.worker_state import PopGate, PopPauseOwner, WorkerState
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.liveness.gate_registry import (
     GateKind,
     GateSurface,
@@ -61,9 +57,6 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     offer_under_pop_claim,
 )
 from tests.process_management.conftest import (
-    make_mock_job,
-    make_mock_model_reference_record,
-    make_mock_process_info,
     make_testable_process_manager,
 )
 from tests.process_management.jobs.test_job_popping import _FakeBacklogTracker, _make_popper
@@ -659,53 +652,6 @@ class TestIntakePausedLatch:
 
         state.downloads_only_hold = False
         assert state.workload_intake_paused is False, "no residue survives both holds clearing"
-
-
-class TestKeepSingleInference:
-    """``dispatch_stall.keep_single_inference``: the worker-wide hold for a workflow that cannot share."""
-
-    def test_the_declaration_exists(self) -> None:
-        """The gate under attack is the one the registry describes."""
-        _assert_registered_hold(GateSurface.DISPATCH_STALL, "keep_single_inference")
-
-    @staticmethod
-    def _controlnet_xl_slot() -> tuple[ProcessMap, dict[str, Mock], HordeProcessInfo]:
-        """A single idle slot still associated with a resident ControlNet-XL job, with its reference."""
-        model = "qr-controlnet-sdxl"
-        process_info = make_mock_process_info(1, model_name=model, state=HordeProcessState.WAITING_FOR_JOB)
-        process_info.last_job_referenced = make_mock_job(model=model, workflow="qr_code")
-        reference = {
-            model: make_mock_model_reference_record(
-                model,
-                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
-            ),
-        }
-        return ProcessMap({1: process_info}), reference, process_info
-
-    def test_the_hold_lifts_when_the_workflow_leaves_the_slot(self) -> None:
-        """Engage-has-reachable-release: the hold is re-derived from live state every cycle and latches nothing."""
-        process_map, reference, process_info = self._controlnet_xl_slot()
-        keep, reason = process_map.keep_single_inference(stable_diffusion_model_reference=reference)
-        assert (keep, reason) == (True, "ControlNet XL"), "precondition: the guard is engaged"
-
-        process_info.last_job_referenced = None
-        keep_after, _reason_after = process_map.keep_single_inference(stable_diffusion_model_reference=reference)
-        assert keep_after is False, "the model leaving the slot must lift the worker-wide hold"
-
-    def test_the_hold_is_derived_only_from_the_live_slot_association(self) -> None:
-        """No self-inflicted permanent defer: nothing about past engagements feeds the next verdict.
-
-        Re-asking many times must not accumulate anything, or a workflow that once ran would keep the worker
-        single-lane for the rest of the session.
-        """
-        process_map, reference, process_info = self._controlnet_xl_slot()
-        for _ask in range(50):
-            keep, _reason = process_map.keep_single_inference(stable_diffusion_model_reference=reference)
-            assert keep is True
-
-        process_info.last_job_referenced = make_mock_job(model="stable_diffusion")
-        keep_after, _reason_after = process_map.keep_single_inference(stable_diffusion_model_reference=reference)
-        assert keep_after is False, "fifty engaged reads must leave no residue behind the fifty-first"
 
 
 class TestWholeCardPopClaim:

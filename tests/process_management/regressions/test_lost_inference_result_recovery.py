@@ -12,10 +12,8 @@ or the process ends, but deliberately retained across a job's completion, and se
 heuristics read it while the slot is idle. The characterization tests here lock those assumptions down
 so a future "just clear it when the slot goes idle" change cannot silently break them:
 
-* ``keep_single_inference`` keeps the worker single-process for a resident ControlNet-XL job *while the
-  slot is idle*, reading the retained reference.
-* the VRAM-heavy variant of that same check, by contrast, only fires while the slot is actively
-  inferring.
+* the retained-resident footprint estimate and the status display read the reference while the slot is
+  idle, to size and name the weights the slot still holds.
 * model unload and process end are the points that clear the reference.
 
 That asymmetry is exactly why the lost-result fix releases the stuck *job* rather than blanket-clearing
@@ -26,8 +24,6 @@ from __future__ import annotations
 
 import time
 from unittest.mock import Mock
-
-from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
@@ -40,7 +36,6 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_job,
-    make_mock_model_reference_record,
     make_mock_process_info,
     mark_job_in_progress_async,
 )
@@ -388,84 +383,6 @@ class TestDispatchRaceIsNotReapedAsLostResult:
         await dispatcher.receive_and_handle_process_messages()
 
         assert job in job_tracker.jobs_in_progress
-
-
-class TestKeepSingleInferenceReadsRetainedReference:
-    """``keep_single_inference`` is the main reader that depends on the reference surviving into idle.
-
-    These lock that dependency: it is why the lost-result fix releases the stuck job instead of clearing
-    the reference when a slot goes idle.
-    """
-
-    async def test_controlnet_xl_keeps_single_inference_while_slot_is_idle(self) -> None:
-        """An idle slot still associated with a resident ControlNet-XL job keeps the worker single-process.
-
-        ``can_accept_job()`` is true here (WAITING_FOR_JOB), so this only works because the reference is
-        retained after the job stops actively running. Clearing it on idle would silently drop the guard.
-        """
-        controlnet_xl_model = "qr-controlnet-sdxl"
-        process_info = make_mock_process_info(
-            1,
-            model_name=controlnet_xl_model,
-            state=HordeProcessState.WAITING_FOR_JOB,
-        )
-        process_info.last_job_referenced = make_mock_job(model=controlnet_xl_model, workflow="qr_code")
-        process_map = ProcessMap({1: process_info})
-
-        reference = {
-            controlnet_xl_model: make_mock_model_reference_record(
-                controlnet_xl_model,
-                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
-            ),
-        }
-
-        keep, reason = process_map.keep_single_inference(
-            stable_diffusion_model_reference=reference,
-        )
-
-        assert keep is True
-        assert reason == "ControlNet XL"
-
-    async def test_card_demanding_model_does_not_hold_worker_single(self) -> None:
-        """A card-demanding model actively inferring places no worker-wide single-process hold here.
-
-        Its serialization belongs to the scheduler's size-tier overlap gate, which is derived from the
-        model reference, scopes to the in-flight job's card, and relaxes against measured headroom. A
-        second name-list hold in the process map would stack on that gate while being blind to devices
-        and to demanding models the list never learned about.
-        """
-        card_demanding_model = "Flux.1-Schnell fp8 (Compact)"
-
-        actively_inferring = make_mock_process_info(
-            1,
-            model_name=card_demanding_model,
-            state=HordeProcessState.INFERENCE_STARTING,
-        )
-        actively_inferring.last_job_referenced = make_mock_job(model=card_demanding_model)
-        keep_busy, _reason_busy = ProcessMap({1: actively_inferring}).keep_single_inference(
-            stable_diffusion_model_reference={},
-        )
-        assert keep_busy is False
-
-    async def test_batched_job_does_not_hold_worker_single(self) -> None:
-        """A batched job actively sampling places no worker-wide single-process hold here.
-
-        A batch multiplies the activation peak, but that cost is priced per-card against measured
-        headroom by the scheduler's size-tier overlap gate. A worker-wide hold here would force full
-        serialization whenever any batch samples, even on a card with ample room for a second lane.
-        """
-        batched = make_mock_process_info(
-            1,
-            model_name="stable_diffusion",
-            state=HordeProcessState.INFERENCE_STARTING,
-        )
-        batched.batch_amount = 2
-        batched.last_job_referenced = make_mock_job(model="stable_diffusion", n_iter=2)
-
-        keep, _reason = ProcessMap({1: batched}).keep_single_inference(
-            stable_diffusion_model_reference={},
-        )
-        assert keep is False
 
 
 class TestReferenceClearedOnModelTeardown:

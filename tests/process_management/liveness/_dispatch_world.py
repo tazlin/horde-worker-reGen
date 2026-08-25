@@ -1618,17 +1618,8 @@ class _DispatchWorld:
             await self._job_tracker.queue_for_safety_post_processed(job_info)
 
     async def _dispatch_until_full(self) -> None:
-        """Dispatch onto free lanes, recording the tick each job first reached sampling.
-
-        The fill is bounded by the scheduler's own keep-single decision rather than by a restatement of it, so
-        a pool the worker-wide hold serialises is serialised here on the same verdict the control loop's cycle
-        acts on: nothing while the hold stands, one dispatch under a keep-single that is not holding.
-        """
-        keep_single = self._scheduler.keep_single_dispatch_hold(self._reference)
-        attempts = max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))
-        if keep_single.dispatch_limit is not None:
-            attempts = min(attempts, keep_single.dispatch_limit)
-        for _attempt in range(attempts):
+        """Dispatch onto free lanes, recording the tick each job first reached sampling."""
+        for _attempt in range(max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))):
             before = {str(job.id_) for job in self._job_tracker.jobs_in_progress}
             started = await self._scheduler.start_inference()
             newly = [job for job in self._job_tracker.jobs_in_progress if str(job.id_) not in before]

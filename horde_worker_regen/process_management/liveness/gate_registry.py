@@ -778,25 +778,6 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at=_DISPATCH_STALL_OBSERVABLE,
     ),
     GateEntry(
-        key="keep_single_inference",
-        surface=GateSurface.DISPATCH_STALL,
-        kind=GateKind.HOLD,
-        subsystem="process_management.lifecycle.process_map",
-        engaged_by=(
-            "a workflow that cannot coexist with any concurrent inference is live on a slot that can accept "
-            "work while another inference is running, holding the worker to that single lane"
-        ),
-        released_by=(
-            "the running inference finishing, or that workflow's job leaving the slot it was last referenced "
-            "on; the hold bounds concurrency to one, never to zero (an idle pool still dispatches its head), "
-            "and is derived from live process state every cycle, latching nothing"
-        ),
-        bound_seconds=None,
-        bound_source="the holding job's own duration",
-        backstop="the inference step-progress watchdog, then " + _GIVE_UP_BACKSTOP,
-        observable_at=_DISPATCH_STALL_OBSERVABLE,
-    ),
-    GateEntry(
         key="exclusive_isolation",
         surface=GateSurface.DISPATCH_STALL,
         kind=GateKind.HOLD,

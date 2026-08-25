@@ -10,13 +10,11 @@ from dataclasses import dataclass
 from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
-from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import ConfigDict
 
-from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
 from horde_worker_regen.process_management._internal.util import throttled_log_level
 from horde_worker_regen.process_management.fd_limits import (
     FD_HEADROOM_WARN_FRACTION,
@@ -1095,47 +1093,6 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             if p.last_process_state == HordeProcessState.PROCESS_STARTING:
                 count += 1
         return count
-
-    def keep_single_inference(
-        self,
-        *,
-        stable_diffusion_model_reference: dict[str, ImageGenerationModelRecord],
-    ) -> tuple[bool, str]:
-        """Return true if we should keep only a single inference process running.
-
-        This is a worker-wide, device-blind hold, reserved for a workflow that cannot coexist with any
-        concurrent inference at all. It is checked before the scheduler's dispatch path, so anything held
-        here never reaches the size-tier overlap gate.
-
-        Batched and otherwise card-demanding jobs are deliberately not a rule here: their serialization
-        belongs to the scheduler's size-tier overlap gate, which prices a batch's multiplied activation
-        peak against the card's measured headroom, scopes to the card the in-flight job runs on, and admits
-        an overlap once the running job has made size-appropriate headway. A worker-wide hold on batches
-        would sit on top of that gate and force full serialization whenever any batch samples, blind to
-        whether the card has room for a second lane.
-        """
-        for p in self.values():
-            if (
-                p.last_job_referenced is not None
-                and p.last_job_referenced.payload.workflow in KNOWN_CONTROLNET_WORKFLOWS
-            ):
-                model = p.last_job_referenced.model
-                if model is None:
-                    logger.error(
-                        f"Model is None for process {p.process_id} but workflow is "
-                        f"{p.last_job_referenced.payload.workflow}",
-                    )
-                    continue
-
-                model_info = stable_diffusion_model_reference.get(model)
-                if model_info is None:
-                    logger.debug(f"Model {model} not found in stable diffusion model reference. Is it a custom model?")
-                    continue
-
-                if model_info.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl and p.can_accept_job():
-                    return True, "ControlNet XL"
-
-        return False, "None"
 
     def get_inference_processes(self) -> list[HordeProcessInfo]:
         """Return a list of all inference processes."""

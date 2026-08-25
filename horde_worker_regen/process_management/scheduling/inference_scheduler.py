@@ -832,26 +832,6 @@ class _SafetyPlacementInputs:
 
 
 @dataclass(frozen=True)
-class KeepSingleDispatchVerdict:
-    """How many inferences one scheduling cycle may start under the worker-wide keep-single hold.
-
-    The hold bounds concurrency to one, never to zero: it stands only while an inference is running and more
-    work waits behind it. With nothing running the head is dispatched alone, because withholding on queue
-    depth alone parks an idle pool behind a hold it re-derives unchanged every cycle. Returned by
-    :meth:`InferenceScheduler.keep_single_dispatch_hold` so every driver of the dispatch fill (the scheduling
-    cycle and the closed-loop simulator alike) reads one decision rather than a restatement of it.
-    """
-
-    dispatch_limit: int | None
-    """The most inferences this cycle may start: zero while the hold stands, one under a keep-single that is
-    not holding, and None (unbounded, the slot count is the only cap) when nothing engages it."""
-    holding: bool
-    """Whether the hold is standing, so the caller reports a blocked cycle rather than an empty one."""
-    reason: str
-    """What engaged the keep-single rule, for the operator-facing hold line; ``"None"`` when nothing did."""
-
-
-@dataclass(frozen=True)
 class _MaterializationOutcome:
     """The result of pricing a job's VRAM materialisation through the MONOLITHIC_DISPATCH arbiter identity.
 
@@ -925,7 +905,6 @@ class InferenceScheduler:
     _preload_delay_notified: bool
     _model_recently_missing: bool
     _model_recently_missing_time: float
-    _batch_wait_log_time: float
     _pending_line_skip: NextJobAndProcess | None
     _model_last_in_demand: dict[str, float]
     _vram_budget: VramBudget
@@ -1264,7 +1243,6 @@ class InferenceScheduler:
         self._preload_delay_notified = False
         self._model_recently_missing = False
         self._model_recently_missing_time = 0.0
-        self._batch_wait_log_time = 0.0
         self._pending_line_skip = None
         self._model_last_in_demand = {}
 
@@ -4326,15 +4304,6 @@ class InferenceScheduler:
             )
 
         # Resident on an idle process: the interesting case. Name the gate that is holding dispatch.
-        keep_single, single_reason = self._process_map.keep_single_inference(
-            stable_diffusion_model_reference=stable_diffusion_reference,
-        )
-        pending_and_active = len(self._job_tracker.jobs_pending_inference) + len(self._job_tracker.jobs_in_progress)
-        if keep_single and pending_and_active > 1:
-            return SlotDutyBucket.KEEP_SINGLE_INFERENCE, (
-                f"its model is resident and idle on process {process.process_id}, but dispatch is held by "
-                f"keep-single-inference ({single_reason})"
-            )
         in_progress = len(self._job_tracker.jobs_in_progress)
         cap = self._max_jobs_in_progress_allowed()
         if in_progress >= cap:
@@ -13643,37 +13612,6 @@ class InferenceScheduler:
         """
         self._pending_line_skip = None
 
-    def keep_single_dispatch_hold(
-        self,
-        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
-    ) -> KeepSingleDispatchVerdict:
-        """Decide how many inferences this cycle may start under the worker-wide keep-single rule.
-
-        The rule itself is :meth:`ProcessMap.keep_single_inference`: a workflow that cannot coexist with any
-        concurrent inference at all. What this adds is the bound it implies. The hold stands only while an
-        inference is running *and* more work waits behind it; then nothing starts. Engaged with nothing
-        running, the allowance is exactly one dispatch, so the head is served alone rather than parked behind
-        a hold every later cycle re-derives unchanged, whose only exit is the recovery supervisor faulting
-        the backlog. With the rule disengaged the fill is unbounded and the slot count is the only cap.
-
-        Args:
-            stable_diffusion_reference: The image model reference the rule reads baselines from.
-
-        Returns:
-            The verdict every driver of the dispatch fill bounds itself by.
-        """
-        keep_single_inference, reason = self._process_map.keep_single_inference(
-            stable_diffusion_model_reference=stable_diffusion_reference,
-        )
-        if not keep_single_inference:
-            return KeepSingleDispatchVerdict(dispatch_limit=None, holding=False, reason=reason)
-
-        inference_running = len(self._job_tracker.jobs_in_progress) > 0
-        work_waiting = len(self._job_tracker.jobs_pending_inference) > 0
-        if inference_running and work_waiting:
-            return KeepSingleDispatchVerdict(dispatch_limit=0, holding=True, reason=reason)
-        return KeepSingleDispatchVerdict(dispatch_limit=1, holding=False, reason=reason)
-
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Run a single scheduling cycle: preload, start inference, unload.
 
@@ -13689,35 +13627,23 @@ class InferenceScheduler:
         # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh
         # for this cycle regardless of whether any preload or dispatch happens.
         if not self.preload_models():
-            keep_single = self.keep_single_dispatch_hold(stable_diffusion_reference)
+            # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
+            # tick: when several jobs complete close together, dispatching them one tick apart
+            # leaves the GPU underfed. start_inference() returns False once no more can start
+            # (its own concurrency gate: jobs_in_progress >= max_concurrent, no free process,
+            # or no eligible job, stops the loop), so this cannot over-subscribe. There is no
+            # worker-wide serialisation ahead of it: a workflow's extra weights are priced per
+            # card by the admission and overlap gates, like a batch or a card-demanding model.
+            started = 0
+            while await self.start_inference():
+                started += 1
 
-            if keep_single.holding:
-                if (self._clock() - self._batch_wait_log_time > 10) and bridge_data.max_threads > 1:
-                    logger.opt(ansi=True).info(
-                        f"<fg #7b7d7d><i>Blocking further inference due to {keep_single.reason}.</i></>",
-                    )
-                    self._batch_wait_log_time = self._clock()
-
-            else:
-                # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
-                # tick: when several jobs complete close together, dispatching them one tick apart
-                # leaves the GPU underfed. start_inference() returns False once no more can start
-                # (its own concurrency gate: jobs_in_progress >= max_concurrent, no free process,
-                # or no eligible job, stops the loop), so this cannot over-subscribe. Under a
-                # keep-single that is not holding the fill stops at the first dispatch: that one
-                # inference is the whole allowance.
-                started = 0
-                while await self.start_inference():
-                    started += 1
-                    if keep_single.dispatch_limit is not None and started >= keep_single.dispatch_limit:
-                        break
-
-                if not started:
-                    # Nothing dispatched this cycle though the queue has work: if the head has been parked
-                    # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
-                    # dispatching. Throttled, read-only; it never changes scheduling.
-                    self._log_dispatch_stall_if_needed(stable_diffusion_reference)
-                    # Arm the idle-fill breaker off the same idle-head signal: if the head has been starved
-                    # long enough with a free sibling, let the popper over-pop a quick no-LoRA fill job.
-                    self._update_idle_fill_arm(bridge_data)
-                    self.unload_models()
+            if not started:
+                # Nothing dispatched this cycle though the queue has work: if the head has been parked
+                # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
+                # dispatching. Throttled, read-only; it never changes scheduling.
+                self._log_dispatch_stall_if_needed(stable_diffusion_reference)
+                # Arm the idle-fill breaker off the same idle-head signal: if the head has been starved
+                # long enough with a free sibling, let the popper over-pop a quick no-LoRA fill job.
+                self._update_idle_fill_arm(bridge_data)
+                self.unload_models()

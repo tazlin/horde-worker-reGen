@@ -201,8 +201,6 @@ These fail as interactions, not as units, so component tests stay green through 
   a real `ClearanceController` is stepped over the scheduler's own `build_clearance_inputs` with
   `clearance_admit_process` as its `admit_fn`, and the weights land at clearance), and a lane held for
   `CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS` samples unpriced and is recorded in `world.clearance_timeouts`.
-  The dispatch fill is bounded by the scheduler's own `keep_single_dispatch_hold`, the same verdict
-  `run_scheduling_cycle` acts on, so a worker-wide serialisation hold is not restated in the world.
 - **Every production incident becomes a permanent scenario** in `test_incident_scenarios.py`, written
   so that undoing its fix makes it fail. If the simulator cannot express an incident, extend the
   simulator.
