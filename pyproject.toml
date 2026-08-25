@@ -27,7 +27,7 @@ dependencies = [
     "qrcode==7.4.2",
     "certifi",
     "horde_sdk~=0.30.0",
-    "horde_safety~=0.3.0",
+    "horde_safety~=0.3.1",
     # We don't include all of the horde-engine extras here because some of them pull native deps that have no wheels for some
     # accelerators (Intel XPU / Apple MPS / Ascend), so they are NOT in the base install: a base worker runs on every backend ComfyUI supports
     "horde_engine[layerdiffuse,upscale-extra]>=7.4.1,<8.0.0",
