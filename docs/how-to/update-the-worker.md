@@ -19,6 +19,14 @@ managed release.
    reports `Updated to <version>` or `Already up to date (<version>)` and finishes dependency sync.
 3. Start the worker normally. Confirm the new version in the dashboard or the startup log.
 
+If startup reports **Launcher safety update available**, re-run the latest installer over the same worker
+folder once. This refreshes the small launcher scripts that an in-place update cannot replace while they
+are running. Start the worker again and confirm that the notice is gone.
+
+This applies to v18.0.2 managed workers too. Their existing launcher can install the new updater and
+environment. Expect the launcher safety notice after that first update, then re-run the latest installer
+over the same folder once.
+
 You can also re-run the installer over the same folder. It preserves `bridgeData.yaml` and the sibling
 `<worker>-data` folder that holds models, managed Python, and caches.
 
@@ -93,12 +101,21 @@ backend, cache, non-interactive, and release-channel controls.
 ## Recover from an interrupted update
 
 Run the same update command again. Every launch and update verifies the private package manager and checks
-whether the environment matches the current lockfile before importing worker code. A source update that
-stopped before dependency synchronization therefore resumes safely on the next attempt.
+whether the environment matches the current lockfile before importing worker code. Current managed
+installations also snapshot source before an overlay. If the update process is terminated, the next launch
+restores the complete previous source before loading bootstrap code; running update again then retries the
+release.
+
+An installation updating from a release that predates transactional overlays cannot acquire that protection
+before its first update finishes. If that first update is interrupted and retrying does not work, re-run the
+latest installer over the same folder. It replaces source and preserves configuration, environments, and
+models.
 
 If retrying fails:
 
 - For a download or connection error, restore access to GitHub Releases and retry.
+- If the release check is temporarily unavailable, `update` still repairs local dependencies and reports
+  that the worker can start. Re-run it later to check for newer source.
 - For a disk-space error, free space on the worker-data drive and retry.
 - For `CRYPT_E_NO_REVOCATION_CHECK`, temporarily disable the antivirus download inspection that produced
   it, retry, then re-enable protection.

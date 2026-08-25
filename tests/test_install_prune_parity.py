@@ -41,6 +41,26 @@ def test_one_line_installers_apply_through_the_pruning_overlay() -> None:
         assert "apply-bundle" in text, f"{script} must overlay the bundle via `apply-bundle` (mirror-prune)"
 
 
+def test_one_line_reinstall_refreshes_launchers_only_after_overlay_returns() -> None:
+    """A standalone reinstall must not replace its installed launcher before invoking that launcher."""
+    shell = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+    powershell = (REPO_ROOT / "install.ps1").read_text(encoding="utf-8")
+
+    shell_apply = shell.index('./runtime.sh apply-bundle "$bundle_dir"')
+    assert shell.count('./runtime.sh apply-bundle "$bundle_dir"') == 2
+    assert "Retrying from the complete downloaded bundle" in shell
+    assert shell.index('for shim in "$bundle_dir"/*.cmd', shell_apply) > shell_apply
+    assert shell.index("launcher_generation=2", shell_apply) > shell_apply
+    assert shell.index("existing_overlay_bootstrap") < shell.index('cp -R "$bundle_dir/."') < shell_apply
+
+    powershell_apply = powershell.index('"runtime.cmd") apply-bundle')
+    assert powershell.count('"runtime.cmd") apply-bundle') == 2
+    assert "Retrying from the complete downloaded bundle" in powershell
+    assert powershell.index("Get-ChildItem -Path $bundleDir -File", powershell_apply) > powershell_apply
+    assert powershell.index("launcher_generation=2", powershell_apply) > powershell_apply
+    assert powershell.index("$existingOverlayBootstrap") < powershell.index("Copy-Item -Path") < powershell_apply
+
+
 def _inno_install_delete_targets(iss_text: str) -> list[str]:
     """Return the ``Name:`` targets declared in the Inno script's ``[InstallDelete]`` section."""
     match = re.search(r"^\[InstallDelete\](.*?)(?=^\[)", iss_text, re.MULTILINE | re.DOTALL)

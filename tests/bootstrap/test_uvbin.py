@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import os
 import zipfile
@@ -149,3 +150,36 @@ def test_checksum_mismatch_never_publishes_sidecar(monkeypatch: pytest.MonkeyPat
     with pytest.raises(uvbin.UvCompatibilityError, match="failed SHA-256 verification"):
         uvbin._download_verified_uv("0.12.1", target, probe_directory=tmp_path)
     assert target.read_bytes() == b"last-runnable-sidecar"
+
+
+def test_interrupted_http_body_becomes_actionable_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A truncated HTTP response cannot escape bootstrap as a raw traceback."""
+    monkeypatch.setattr(
+        uvbin,
+        "_download",
+        lambda url: (_ for _ in ()).throw(http.client.IncompleteRead(b"partial", 100)),
+    )
+
+    with pytest.raises(uvbin.UvCompatibilityError, match="Could not download uv 0.12.1"):
+        uvbin._download_verified_uv("0.12.1", tmp_path / "uv.exe", probe_directory=tmp_path)
+
+
+def test_publish_filesystem_failure_becomes_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A locked or unwritable sidecar path is reported without a raw filesystem traceback."""
+    archive_payload = _uv_zip()
+    archive_name = "uv-x86_64-pc-windows-msvc.zip"
+    checksum_payload = f"{hashlib.sha256(archive_payload).hexdigest()}  {archive_name}\n".encode()
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("file", encoding="utf-8")
+    monkeypatch.setattr(uvbin, "_release_archive_name", lambda: archive_name)
+    monkeypatch.setattr(
+        uvbin,
+        "_download",
+        lambda url: checksum_payload if url.endswith(".sha256") else archive_payload,
+    )
+
+    with pytest.raises(uvbin.UvCompatibilityError, match="Could not publish the worker's private uv"):
+        uvbin._download_verified_uv("0.12.1", blocked_parent / "uv.exe", probe_directory=tmp_path)

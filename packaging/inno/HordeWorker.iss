@@ -411,7 +411,8 @@ begin
     SaveStringToFile(AppDir + '\bin\install-consent', 'consent recorded (graphical installer)' + #13#10, False);
     // Record how this worker was installed and from where, so the self-updater can keep the Add/Remove
     // Programs version honest and pull future releases from the right origin.
-    SaveStringToFile(AppDir + '\bin\install-info', 'method=exe' + #13#10 + 'repo={#Repo}' + #13#10, False);
+    SaveStringToFile(AppDir + '\bin\install-info', 'method=exe' + #13#10 + 'repo={#Repo}' + #13#10
+      + 'launcher_generation=2' + #13#10, False);
 
     // If the user selected a specific version (not the default "Latest stable"), download that
     // release's bundle and overlay it onto the install. The bundled (latest) files are already in

@@ -426,6 +426,52 @@ def test_update_retries_sync_when_source_is_already_current(
     assert "Already up to date (18.0.2)" in capsys.readouterr().out
 
 
+def test_update_syncs_local_dependencies_when_release_check_fails(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A GitHub API outage cannot block repair of the already-installed source and lockfile."""
+    _, calls = env
+    unavailable = cli.updater.UpdateInfo(
+        current="18.0.2",
+        latest=None,
+        available=False,
+        bundle_url=None,
+        checksums_url=None,
+    )
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root, **kw: unavailable)
+
+    assert cli.main(["update", "--yes", "--cpu", "--no-sync-preview"]) == 1
+    assert calls == [("sync", "cpu")]
+    output = capsys.readouterr()
+    assert "Dependencies are up to date" in output.err
+    assert "could not be checked" in output.err
+
+
+def test_update_applies_cache_mode_before_sync(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The update command honors the shared sync flags it exposes, including cache ownership."""
+    _, calls = env
+    current = cli.updater.UpdateInfo(
+        current="18.0.2",
+        latest="v18.0.2",
+        available=False,
+        bundle_url=None,
+        checksums_url=None,
+    )
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root, **kw: current)
+    monkeypatch.setenv("UV_CACHE_DIR", "shim-isolated-cache")
+
+    assert cli.main(["update", "--yes", "--cache-mode", "shared", "--no-sync-preview"]) == 0
+    assert calls == [("sync", "cu126")]
+    assert cli.paths.uv_cache_mode() == "shared"
+    assert "UV_CACHE_DIR" not in cli.os.environ
+    cli.os.environ.pop("HORDE_WORKER_UV_CACHE_MODE", None)
+
+
 def test_update_after_legacy_git_pull_syncs_without_overlay(
     env: tuple[Path, list],
     monkeypatch: pytest.MonkeyPatch,
@@ -583,6 +629,22 @@ def test_launch_bows_out_of_self_update_on_dev_checkout(
     monkeypatch.setattr(cli.updater, "check_for_update", lambda r: checked.append(True) or _available_info())
     assert cli.main(["launch", "terminal"]) == 0
     assert checked == []
+
+
+def test_launch_warns_old_managed_install_to_refresh_preserved_launchers(
+    env: tuple[Path, list],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A v18.0.1-style managed marker gets a non-blocking launcher migration instruction."""
+    root, calls = env
+    _make_venv(root)
+    marker = root / "bin" / "install-info"
+    marker.parent.mkdir()
+    marker.write_text("method=one-line\nrepo=Haidra-Org/horde-worker-reGen\n", encoding="utf-8")
+
+    assert cli.main(["launch", "web"]) == 0
+    assert calls == [("run", ["horde-worker-web"])]
+    assert "Launcher safety update available" in capsys.readouterr().err
 
 
 def test_launch_skip_persists_and_suppresses_reoffer(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:

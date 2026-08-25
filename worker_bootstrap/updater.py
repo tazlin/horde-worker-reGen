@@ -82,6 +82,12 @@ state), so pruning files the new bundle no longer ships is safe, and it clears s
 bytecode too. Every other bundle directory is merged (never pruned), so an unknown future layout is left
 intact."""
 
+_UPDATE_TRANSACTION_NAME = "update-transaction.json"
+_UPDATE_BACKUP_NAME = "update-backup"
+_UPDATE_TRANSACTION_SCHEMA = 1
+LAUNCHER_GENERATION = "2"
+"""Generation written by installers whose launchers stage and verify uv before replacing it."""
+
 
 def auto_update_policy() -> str:
     """Resolve the update policy from ``HORDE_WORKER_AUTO_UPDATE``: ``prompt`` (default), ``auto``, ``off``."""
@@ -208,6 +214,15 @@ def self_update_allowed(root: Path | None = None) -> tuple[bool, str]:
     if method == "dev":
         return False, "This looks like a development checkout; update it with `git pull` then `update-runtime`."
     return True, ""
+
+
+def launchers_need_refresh(root: Path | None = None) -> bool:
+    """Whether an older managed install still has preserved pre-hardening launcher scripts."""
+    root = root or default_root()
+    info = _read_install_info(root)
+    return resolve_install_method(root) in ("one-line", "exe") and info.get("launcher_generation") != (
+        LAUNCHER_GENERATION
+    )
 
 
 def installed_version(root: Path) -> str | None:
@@ -548,6 +563,138 @@ def _atomic_copy(src: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
+def _remove_path(path: Path) -> None:
+    """Remove one file, symlink, or directory without following directory symlinks."""
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _copy_path(src: Path, dst: Path) -> None:
+    """Copy one file, symlink, or directory, replacing any existing destination."""
+    _remove_path(dst)
+    if src.is_dir() and not src.is_symlink():
+        shutil.copytree(src, dst, symlinks=True)
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def _transaction_paths(root: Path) -> tuple[Path, Path]:
+    """Return the durable transaction marker and backup directory paths."""
+    bin_dir = paths.bin_dir(root)
+    return bin_dir / _UPDATE_TRANSACTION_NAME, bin_dir / _UPDATE_BACKUP_NAME
+
+
+def _overlay_target_names(bundle_root: Path) -> list[str]:
+    """Return the source-owned top-level names an overlay can change."""
+    return [
+        item.name
+        for item in bundle_root.iterdir()
+        if item.name not in _PRESERVE_NAMES and not (item.is_file() and item.suffix.lower() in _SHIM_SUFFIXES)
+    ]
+
+
+def _validate_transaction_name(name: object) -> str:
+    """Validate one transaction target as a safe, source-owned top-level name."""
+    if not isinstance(name, str) or not name or Path(name).name != name or name in (".", ".."):
+        raise OSError(f"Invalid update recovery target {name!r}.")
+    if name in _PRESERVE_NAMES or name == "bin" or Path(name).suffix.lower() in _SHIM_SUFFIXES:
+        raise OSError(f"Update recovery refused preserved target {name!r}.")
+    return name
+
+
+def _begin_overlay_transaction(bundle_root: Path, install_root: Path) -> None:
+    """Snapshot every overlay target, then publish a durable in-progress marker.
+
+    The marker is written only after every backup is complete. Once it exists, source may be changed; it
+    remains until the complete overlay succeeds. ``bootstrap.py`` understands the same format and restores
+    this snapshot before importing possibly-partial bootstrap modules after process termination or power
+    loss.
+    """
+    marker, backup = _transaction_paths(install_root)
+    if marker.exists():
+        restore_interrupted_update(install_root)
+    _remove_path(backup)
+    backup.mkdir(parents=True, exist_ok=True)
+
+    targets: list[dict[str, object]] = []
+    try:
+        for name in _overlay_target_names(bundle_root):
+            target = install_root / name
+            existed = target.exists() or target.is_symlink()
+            targets.append({"name": name, "existed": existed})
+            if existed:
+                _copy_path(target, backup / name)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"schema": _UPDATE_TRANSACTION_SCHEMA, "targets": targets}),
+            encoding="utf-8",
+        )
+        os.replace(temporary, marker)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            marker.with_suffix(".tmp").unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            _remove_path(backup)
+        raise
+
+
+def restore_interrupted_update(root: Path) -> bool:
+    """Restore a durable pre-overlay snapshot, returning whether recovery was needed.
+
+    The marker is cleared only after every target has been restored. A failed or interrupted restore keeps
+    both marker and backup, so the next bootstrap retries from the same known-good snapshot.
+    """
+    marker, backup = _transaction_paths(root)
+    if not marker.exists():
+        return False
+    transaction = json.loads(marker.read_text(encoding="utf-8"))
+    if not isinstance(transaction, dict) or transaction.get("schema") != _UPDATE_TRANSACTION_SCHEMA:
+        raise OSError("The update recovery marker has an unsupported format.")
+    targets = transaction.get("targets")
+    if not isinstance(targets, list):
+        raise OSError("The update recovery marker has no target list.")
+    validated: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for entry in targets:
+        if not isinstance(entry, dict) or not isinstance(entry.get("existed"), bool):
+            raise OSError("The update recovery marker contains an invalid target entry.")
+        name = _validate_transaction_name(entry.get("name"))
+        if name in seen:
+            raise OSError(f"The update recovery marker repeats target {name!r}.")
+        seen.add(name)
+        existed = entry["existed"]
+        if existed:
+            saved = backup / name
+            if not (saved.exists() or saved.is_symlink()):
+                raise OSError(f"The update recovery backup is missing {name!r}.")
+        validated.append((name, existed))
+
+    # Validate the complete recovery set before touching the partially updated source. A corrupt or
+    # incomplete backup must leave the current tree intact so re-running the installer remains possible.
+    for name, existed in validated:
+        target = root / name
+        _remove_path(target)
+        if existed:
+            saved = backup / name
+            _copy_path(saved, target)
+    marker.unlink()
+    with contextlib.suppress(OSError):
+        _remove_path(backup)
+    return True
+
+
+def _commit_overlay_transaction(root: Path) -> None:
+    """Commit a complete overlay, making it authoritative before discarding its backup."""
+    marker, backup = _transaction_paths(root)
+    marker.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        _remove_path(backup)
+
+
 def _remove_empty_dirs(root: Path) -> None:
     """Remove directories under *root* left empty after a mirror prune (deepest first; non-empty are kept)."""
     for directory in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
@@ -621,11 +768,18 @@ def apply_bundle(extracted: Path, install_root: Path) -> None:
     overwriting the launcher mid-run). The sync stamp is invalidated first so a (re)install that moved
     ``uv.lock`` re-syncs even if the overlay is interrupted. Stdlib-only: safe before the venv exists.
 
-    The caller is responsible for laying the shims down (the installer copies the whole bundle into place
-    before calling this; the self-updater keeps the existing shims on purpose).
+    The caller is responsible for laying the shims down. A standalone installer does that after an existing
+    launcher returns; the managed self-updater keeps the existing shims on purpose.
     """
-    _invalidate_sync_stamp(install_root)
-    _overlay(_bundle_root(extracted), install_root)
+    bundle_root = _bundle_root(extracted)
+    _begin_overlay_transaction(bundle_root, install_root)
+    try:
+        _invalidate_sync_stamp(install_root)
+        _overlay(bundle_root, install_root)
+    except BaseException:
+        restore_interrupted_update(install_root)
+        raise
+    _commit_overlay_transaction(install_root)
 
 
 def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
@@ -666,7 +820,11 @@ def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
             # The same overlay the one-line installers use: mirror-prune the import roots, preserve user
             # state and the running shims, and invalidate the sync stamp so a crash mid-overlay reconciles.
             apply_bundle(extracted, root)
-        except (OSError, zipfile.BadZipFile) as error:
+        except KeyboardInterrupt:
+            return UpdateResult(
+                False, "Update interrupted; the previous version was restored.", info.current, info.latest
+            )
+        except Exception as error:  # noqa: BLE001 - every apply failure must become an actionable result
             return UpdateResult(False, f"Could not apply the update: {error}", info.current, info.latest)
 
     return UpdateResult(True, f"Updated to {info.latest}.", info.current, installed_version(root))

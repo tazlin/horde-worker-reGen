@@ -732,6 +732,13 @@ def _maybe_offer_update(root: Path) -> None:
 
 def _cmd_launch(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Start the worker in the requested mode, syncing first if the venv is missing or stale."""
+    if updater.launchers_need_refresh(root):
+        print(
+            "Launcher safety update available: this worker can start normally, but its currently preserved "
+            "runtime script predates verified uv staging. Re-run the latest installer over this folder once "
+            "to refresh the launchers without deleting configuration, environments, or models.",
+            file=sys.stderr,
+        )
     _maybe_offer_update(root)
     # A launch-time overlay can raise [tool.uv] required-version after ``main`` selected the old private
     # binary. Re-resolve here so this same launch repairs and uses a compatible version before syncing.
@@ -773,6 +780,7 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     ``update.cmd`` workflow remains safe even though git—not the self-updater—owns the source files.
     """
     repo_override: str | None = getattr(args, "repo", None) or None
+    _apply_cache_mode_flag(args)
 
     if args.check:
         info = updater.check_for_update(root, repo=repo_override)
@@ -808,7 +816,19 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     info = updater.check_for_update(root, repo=repo_override)
     channel_note = " (beta channel)" if info.channel == "beta" else ""
     if info.latest is None:
-        print("Could not check for updates; leaving the current install unchanged.", file=sys.stderr)
+        rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
+        if rc != 0:
+            print(
+                "Could not check for source updates, and the dependency sync did not complete. "
+                "Resolve the reported error and re-run update.",
+                file=sys.stderr,
+            )
+            return rc
+        print(
+            "Dependencies are up to date, but source update availability could not be checked. "
+            "The worker can start; re-run update later to check for a newer release.",
+            file=sys.stderr,
+        )
         return 1
 
     # Persist a --repo override as soon as the repo proves reachable (info.latest is not None), whether or

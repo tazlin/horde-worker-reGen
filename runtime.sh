@@ -31,7 +31,7 @@ fi
 # ladder stays env var > cache_home > peered default.
 
 ensure_uv() {
-    local version existing_output existing_version triple os arch
+    local version existing_output existing_version triple os arch archive url tmp_dir candidate expected actual
     # This version MUST match [tool.uv] required-version in pyproject.toml. test_uv_version_consistency.py
     # enforces this: uv checks its version at runtime against required-version, so the version we download
     # here must satisfy it. Override with HORDE_WORKER_UV_VERSION to bump without editing this file.
@@ -63,19 +63,64 @@ ensure_uv() {
                     arm64|aarch64) triple="aarch64-apple-darwin" ;;
                 esac ;;
     esac
-    # Preferred: a direct, pinned download of the uv standalone tarball with curl + tar (no shell piping of
-    # remote code). The tarball nests the binaries under uv-<triple>/, so --strip-components=1 flattens them
-    # into bin/.
-    if [ -n "$triple" ] && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
-        local url="https://github.com/astral-sh/uv/releases/download/${version}/uv-${triple}.tar.gz"
-        if curl -fL --retry 3 "$url" | tar -xz --strip-components=1 -C "$SCRIPT_DIR/bin" 2>/dev/null; then
-            [ -x "$SCRIPT_DIR/bin/uv" ] && { echo "Done."; return 0; }
-        fi
+    if [ -z "$triple" ]; then
+        echo "Automatic uv bootstrap does not support ${os:-unknown}/${arch:-unknown}." >&2
+        return 1
     fi
-    # Fallback: the official installer script (covers platforms without our pinned tarball mapping).
-    echo "Falling back to the astral install script..."
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$SCRIPT_DIR/bin" sh
-    [ -x "$SCRIPT_DIR/bin/uv" ]
+    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        echo "Automatic uv bootstrap requires curl and tar." >&2
+        return 1
+    fi
+    archive="uv-${triple}.tar.gz"
+    url="https://github.com/astral-sh/uv/releases/download/${version}/${archive}"
+    tmp_dir="$(mktemp -d "$SCRIPT_DIR/bin/.uv-download.XXXXXX")" || return 1
+    if ! curl -fL --retry 3 -o "$tmp_dir/$archive.sha256" "$url.sha256" || \
+       ! curl -fL --retry 3 -o "$tmp_dir/$archive" "$url"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    expected="$(awk 'NR == 1 { print $1 }' "$tmp_dir/$archive.sha256")"
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$tmp_dir/$archive" | awk '{ print $1 }')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$tmp_dir/$archive" | awk '{ print $1 }')"
+    else
+        echo "Automatic uv bootstrap requires sha256sum or shasum." >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+        echo "Downloaded uv ${version} failed SHA-256 verification." >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    candidate="$tmp_dir/uv-${triple}/uv"
+    if [ ! -x "$candidate" ]; then
+        echo "The verified uv archive did not contain the expected executable." >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    existing_output="$(cd "$HORDE_WORKER_DATA_DIR" && "$candidate" --version 2>/dev/null)" || true
+    existing_version=""
+    case "$existing_output" in
+        "uv "*) existing_version="${existing_output#uv }"; existing_version="${existing_version%% *}" ;;
+    esac
+    if [ "$existing_version" != "$version" ]; then
+        echo "The verified uv artifact reported ${existing_version:-unknown}; expected ${version}." >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! chmod 755 "$candidate" || ! mv -f "$candidate" "$SCRIPT_DIR/bin/uv"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    rm -rf "$tmp_dir"
+    echo "Done."
+    return 0
 }
 
 if ! ensure_uv; then

@@ -70,37 +70,77 @@ echo Downloading uv package manager...
 
 :download_uv_payload
 if not exist "%~dp0bin" md "%~dp0bin"
-set "UV_ZIP=uv-x86_64-pc-windows-msvc.zip"
-if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "UV_ZIP=uv-aarch64-pc-windows-msvc.zip"
-set "UV_URL=https://github.com/astral-sh/uv/releases/download/%UV_VERSION%/%UV_ZIP%"
+set "UV_ARCHIVE=uv-x86_64-pc-windows-msvc.zip"
+if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "UV_ARCHIVE=uv-aarch64-pc-windows-msvc.zip"
+set "UV_URL=https://github.com/astral-sh/uv/releases/download/%UV_VERSION%/%UV_ARCHIVE%"
+set "UV_DOWNLOAD=%~dp0bin\.uv-download-%RANDOM%.zip"
+set "UV_CHECKSUM=%UV_DOWNLOAD%.sha256"
+set "UV_STAGE=%~dp0bin\.uv-stage-%RANDOM%"
+set "UV_EXPECTED="
+set "UV_CANDIDATE="
 
 REM Prefer in-box curl.exe + tar.exe (Windows 10 1803+). This deliberately avoids the old
-REM "powershell -c irm https://astral.sh/uv/install.ps1 | iex": a nested Windows PowerShell launched from
+REM remote-script PowerShell installer: a nested Windows PowerShell launched from
 REM cmd inherits a pwsh-7-polluted PSModulePath and then fails to load Microsoft.PowerShell.Security, so
 REM even Get-ExecutionPolicy throws. A plain HTTPS download has none of that fragility.
 set "CURL=%SystemRoot%\System32\curl.exe"
 set "TAR=%SystemRoot%\System32\tar.exe"
 if not exist "%CURL%" goto :ensure_uv_ps
 if not exist "%TAR%" goto :ensure_uv_ps
-"%CURL%" -fL --retry 3 -o "%~dp0bin\uv.zip" "%UV_URL%"
+if not exist "%SystemRoot%\System32\certutil.exe" goto :ensure_uv_ps
+"%CURL%" -fL --retry 3 -o "%UV_CHECKSUM%" "%UV_URL%.sha256"
 if errorlevel 1 goto :ensure_uv_ps
-REM The uv zip has uv.exe at its root, so extracting into bin\ lands bin\uv.exe directly.
-"%TAR%" -xf "%~dp0bin\uv.zip" -C "%~dp0bin"
+"%CURL%" -fL --retry 3 -o "%UV_DOWNLOAD%" "%UV_URL%"
 if errorlevel 1 goto :ensure_uv_ps
-del "%~dp0bin\uv.zip" >nul 2>&1
-if exist "%~dp0bin\uv.exe" exit /b 0
+for /f "usebackq tokens=1" %%H in ("%UV_CHECKSUM%") do if not defined UV_EXPECTED set "UV_EXPECTED=%%H"
+if not defined UV_EXPECTED goto :ensure_uv_ps
+if "%UV_EXPECTED:~63,1%"=="" goto :ensure_uv_ps
+if not "%UV_EXPECTED:~64,1%"=="" goto :ensure_uv_ps
+echo(%UV_EXPECTED%| "%SystemRoot%\System32\findstr.exe" /R /X "[0-9A-Fa-f][0-9A-Fa-f]*" >nul
+if errorlevel 1 goto :ensure_uv_ps
+"%SystemRoot%\System32\certutil.exe" -hashfile "%UV_DOWNLOAD%" SHA256 | findstr /L /I /X /C:"%UV_EXPECTED%" >nul
+if errorlevel 1 goto :ensure_uv_ps
+md "%UV_STAGE%" >nul 2>&1
+"%TAR%" -xf "%UV_DOWNLOAD%" -C "%UV_STAGE%"
+if errorlevel 1 goto :ensure_uv_ps
+for /r "%UV_STAGE%" %%F in (uv.exe) do if not defined UV_CANDIDATE set "UV_CANDIDATE=%%F"
+if not defined UV_CANDIDATE goto :ensure_uv_ps
+set "UV_ACTUAL="
+pushd "%HORDE_WORKER_DATA_DIR%"
+"%UV_CANDIDATE%" --version > "%UV_STAGE%\version.txt" 2>nul
+popd
+for /f "usebackq tokens=1,2" %%A in ("%UV_STAGE%\version.txt") do if /I "%%A"=="uv" set "UV_ACTUAL=%%B"
+if not "%UV_ACTUAL%"=="%UV_VERSION%" goto :ensure_uv_ps
+move /Y "%UV_CANDIDATE%" "%~dp0bin\uv.exe" >nul
+if errorlevel 1 goto :ensure_uv_ps
+call :cleanup_uv_download
+exit /b 0
 
 :ensure_uv_ps
-REM Fallback for pre-1803 Windows (no in-box curl/tar). Reset PSModulePath to the system path first so a
-REM pwsh-polluted environment cannot make Windows PowerShell load the wrong (CoreCLR) modules, and opt
-REM into TLS 1.2 (WinPS 5.1 still defaults to 1.0).
-del "%~dp0bin\uv.zip" >nul 2>&1
-echo curl/tar unavailable; falling back to the PowerShell uv installer...
+REM Fallback for pre-1803 Windows or a failed native tool. PowerShell downloads the same exact archive and
+REM checksum into staging, verifies and probes it, then publishes it. The old uv remains untouched until
+REM every check passes. Reset PSModulePath so a pwsh-polluted environment cannot break Windows PowerShell.
+call :cleanup_uv_download
+set "UV_DOWNLOAD=%~dp0bin\.uv-download-%RANDOM%.zip"
+set "UV_CHECKSUM=%UV_DOWNLOAD%.sha256"
+set "UV_STAGE=%~dp0bin\.uv-stage-%RANDOM%"
+echo Native uv download unavailable; retrying with verified PowerShell download...
 set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; $env:UV_INSTALL_DIR='%~dp0bin'; irm https://astral.sh/uv/install.ps1 | iex"
-if exist "%~dp0bin\uv.exe" exit /b 0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri ($env:UV_URL + '.sha256') -OutFile $env:UV_CHECKSUM; Invoke-WebRequest -UseBasicParsing -Uri $env:UV_URL -OutFile $env:UV_DOWNLOAD; $expected=((Get-Content -Raw $env:UV_CHECKSUM).Trim() -split '\s+')[0]; if ($expected -notmatch '^[0-9a-fA-F]{64}$') { throw 'Malformed uv checksum.' }; $actual=(Get-FileHash -Algorithm SHA256 $env:UV_DOWNLOAD).Hash; if ($actual -ne $expected) { throw 'uv checksum mismatch.' }; New-Item -ItemType Directory -Force $env:UV_STAGE | Out-Null; Expand-Archive -Force $env:UV_DOWNLOAD $env:UV_STAGE; $candidate=Get-ChildItem $env:UV_STAGE -Filter uv.exe -Recurse | Select-Object -First 1; if ($null -eq $candidate) { throw 'uv.exe missing from archive.' }; Unblock-File $candidate.FullName; $reported=(& $candidate.FullName --version); if (($reported -split '\s+')[1] -ne $env:UV_VERSION) { throw ('uv version mismatch: ' + $reported) }; $target=Join-Path (Split-Path $env:UV_DOWNLOAD -Parent) 'uv.exe'; Move-Item -Force $candidate.FullName $target"
+if errorlevel 1 goto :uv_download_failed
+call :cleanup_uv_download
+exit /b 0
+
+:uv_download_failed
+call :cleanup_uv_download
 echo.
 echo ERROR: Could not install uv (the package manager).
-echo   - Confirm GitHub and astral.sh are reachable (proxy/firewall?).
+echo   - Confirm GitHub Releases is reachable (proxy/firewall?).
 echo   - Or place a uv.exe in "%~dp0bin" and re-run.
 exit /b 1
+
+:cleanup_uv_download
+if defined UV_DOWNLOAD del "%UV_DOWNLOAD%" >nul 2>&1
+if defined UV_CHECKSUM del "%UV_CHECKSUM%" >nul 2>&1
+if defined UV_STAGE if exist "%UV_STAGE%" rmdir /s /q "%UV_STAGE%" >nul 2>&1
+exit /b 0

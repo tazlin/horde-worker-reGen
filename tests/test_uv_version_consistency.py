@@ -100,3 +100,29 @@ def test_runtime_cmd_replaces_an_existing_mismatched_uv() -> None:
     assert '"%~dp0bin\\uv.exe" --version' in content
     assert 'if "%UV_ACTUAL%"=="%UV_VERSION%" exit /b 0' in content
     assert 'if exist "%~dp0bin\\uv.exe" exit /b 0' not in pre_download_check
+
+
+def test_runtime_sh_verifies_and_stages_uv_before_replacement() -> None:
+    """The POSIX launcher never executes or publishes an unverified uv download."""
+    content = _RUNTIME_SH_PATH.read_text(encoding="utf-8")
+
+    assert '"$url.sha256"' in content
+    assert 'actual="$(sha256sum' in content
+    assert 'candidate="$tmp_dir/uv-${triple}/uv"' in content
+    assert '"$candidate" --version' in content
+    assert 'mv -f "$candidate" "$SCRIPT_DIR/bin/uv"' in content
+    assert "astral.sh/uv/install.sh" not in content
+
+
+def test_runtime_cmd_verifies_and_stages_uv_before_replacement() -> None:
+    """Both Windows download paths verify checksum and version before replacing private uv."""
+    content = _RUNTIME_CMD_PATH.read_text(encoding="utf-8")
+
+    assert '"%UV_URL%.sha256"' in content
+    assert "certutil.exe" in content
+    assert '"%UV_EXPECTED:~63,1%"' in content
+    assert 'findstr /L /I /X /C:"%UV_EXPECTED%"' in content
+    assert '"%UV_CANDIDATE%" --version' in content
+    assert "Get-FileHash -Algorithm SHA256" in content
+    assert "uv version mismatch" in content
+    assert "astral.sh/uv/install.ps1" not in content

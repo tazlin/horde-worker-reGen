@@ -13,7 +13,9 @@ process that launched ``bootstrap.py`` (locked on Windows) and makes repair inte
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import http.client
 import io
 import os
 import platform
@@ -172,7 +174,7 @@ def _download_verified_uv(version: str, target: Path, *, probe_directory: Path) 
     try:
         checksum = _published_sha256(_download(f"{artifact_url}.sha256"), archive_name)
         archive_payload = _download(artifact_url)
-    except (OSError, urllib.error.URLError) as error:
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as error:
         raise UvCompatibilityError(f"Could not download uv {version}: {error}") from error
     actual_checksum = hashlib.sha256(archive_payload).hexdigest()
     if actual_checksum != checksum:
@@ -180,14 +182,15 @@ def _download_verified_uv(version: str, target: Path, *, probe_directory: Path) 
             f"Downloaded uv {version} failed SHA-256 verification (expected {checksum}, got {actual_checksum})."
         )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    suffix = ".exe" if os.name == "nt" else ""
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".uv-{version}-download-", suffix=suffix, dir=target.parent
-    )
-    os.close(file_descriptor)
-    temporary = Path(temporary_name)
+    temporary: Path | None = None
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        suffix = ".exe" if os.name == "nt" else ""
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".uv-{version}-download-", suffix=suffix, dir=target.parent
+        )
+        os.close(file_descriptor)
+        temporary = Path(temporary_name)
         temporary.write_bytes(_uv_payload(archive_payload, archive_name))
         if os.name != "nt":
             temporary.chmod(0o755)
@@ -197,8 +200,14 @@ def _download_verified_uv(version: str, target: Path, *, probe_directory: Path) 
                 f"The downloaded uv reported {actual_version or 'an unreadable version'}; expected {version}."
             )
         os.replace(temporary, target)
+    except UvCompatibilityError:
+        raise
+    except OSError as error:
+        raise UvCompatibilityError(f"Could not publish the worker's private uv {version}: {error}") from error
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
 
 def ensure_compatible_uv(root: Path | None = None, executable: str | None = None) -> str:
@@ -223,14 +232,19 @@ def ensure_compatible_uv(root: Path | None = None, executable: str | None = None
     # uv checks [tool.uv] required-version even for some non-project commands. Run every compatibility
     # probe outside the install, otherwise the stale executable can reject the new pin before we learn its
     # actual version.
-    with tempfile.TemporaryDirectory(prefix="horde-worker-uv-command-") as command_directory_name:
-        command_directory = Path(command_directory_name)
-        if versioned.exists() and _reported_version(str(versioned), cwd=command_directory) == required:
-            return str(versioned)
-        if _reported_version(selected, cwd=command_directory) == required:
-            return selected
+    try:
+        with tempfile.TemporaryDirectory(prefix="horde-worker-uv-command-") as command_directory_name:
+            command_directory = Path(command_directory_name)
+            if versioned.exists() and _reported_version(str(versioned), cwd=command_directory) == required:
+                return str(versioned)
+            if _reported_version(selected, cwd=command_directory) == required:
+                return selected
 
-        _download_verified_uv(required, versioned, probe_directory=command_directory)
+            _download_verified_uv(required, versioned, probe_directory=command_directory)
+    except UvCompatibilityError:
+        raise
+    except OSError as error:
+        raise UvCompatibilityError(f"Could not prepare uv {required} for bootstrap: {error}") from error
     print(f"The worker's private uv is now {required}.")
     return str(versioned)
 

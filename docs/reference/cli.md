@@ -29,6 +29,10 @@ In a git checkout, an applying `update` skips release discovery and synchronizes
 `git pull`. `update --check` remains a release query and does not synchronize dependencies.
 `update-runtime` performs only the dependency synchronization.
 
+If release discovery fails, an applying managed `update` still synchronizes the installed source and
+lockfile. It returns exit code 1 because it could not establish whether newer source exists, and reports
+that the worker can start when local synchronization succeeded.
+
 ### Update-only flags
 
 | Flag | Effect |

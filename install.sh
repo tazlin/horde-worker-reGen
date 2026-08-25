@@ -99,31 +99,21 @@ else
     exit 1
 fi
 
-# Lay the bundle down (shims, bootstrap, source). This overwrites in place but, like the old plain unzip,
-# does not by itself prune modules the new release dropped; the apply-bundle overlay below removes those.
-# The shims must be written here, not by the overlay, so the overlay can run *through* runtime.sh without
-# overwriting the running launcher mid-run.
+# A modern existing install can apply the bundle through its currently intact bootstrap before the installer
+# changes source. Fresh and legacy installs need the downloaded runtime/bootstrap laid down first. The latter
+# path is deliberately idempotent: rerunning this installer recopies the complete release after interruption.
 mkdir -p "$INSTALL_DIR"
-cp -R "$bundle_dir/." "$INSTALL_DIR/"
-
-# Record how this worker was installed and from where, so the in-place self-updater pulls future releases
-# from the same origin (this fork/account) rather than a hardcoded default. Lives under bin/ (preserved
-# across updates, removed on uninstall).
-mkdir -p "$INSTALL_DIR/bin"
-printf 'method=one-line\nrepo=%s/%s\n' "$OWNER" "$REPO" > "$INSTALL_DIR/bin/install-info"
-
-cd "$INSTALL_DIR"
-if ! chmod +x ./*.sh 2>/dev/null; then
-    echo "Note: could not mark the .sh scripts executable. If you later hit 'permission denied'," >&2
-    echo "      run:  chmod +x \"$INSTALL_DIR\"/*.sh" >&2
+existing_overlay_bootstrap=0
+if [ -f "$INSTALL_DIR/runtime.sh" ] && [ -f "$INSTALL_DIR/bootstrap.py" ] && \
+   [ -f "$INSTALL_DIR/worker_bootstrap/updater.py" ]; then
+    existing_overlay_bootstrap=1
 fi
-
 # Show what is about to be installed (and from where) and get consent before any heavy download. Under
 # `curl | sh` our stdin is the piped script, so we read the answer from the controlling terminal
 # (/dev/tty); when there is none (true headless), require HORDE_WORKER_ASSUME_YES instead of guessing.
-if [ -f "$INSTALL_DIR/INSTALL_NOTICE.txt" ]; then
+if [ -f "$bundle_dir/INSTALL_NOTICE.txt" ]; then
     echo ""
-    cat "$INSTALL_DIR/INSTALL_NOTICE.txt"
+    cat "$bundle_dir/INSTALL_NOTICE.txt"
     echo ""
 fi
 if [ -z "${HORDE_WORKER_ASSUME_YES:-}" ]; then
@@ -144,14 +134,48 @@ if [ -z "${HORDE_WORKER_ASSUME_YES:-}" ]; then
     fi
 fi
 
+# Fresh and legacy installs need the current launcher and bootstrap before apply-bundle can run. Keep this
+# after consent so cancelling the installer leaves the destination unchanged.
+if [ "$existing_overlay_bootstrap" -eq 0 ]; then
+    cp -R "$bundle_dir/." "$INSTALL_DIR/"
+fi
+
+cd "$INSTALL_DIR"
+if ! chmod +x ./*.sh 2>/dev/null; then
+    echo "Note: could not mark the .sh scripts executable. If you later hit 'permission denied'," >&2
+    echo "      run:  chmod +x \"$INSTALL_DIR\"/*.sh" >&2
+fi
+
 # Overlay the freshly downloaded bundle onto the install through the shared, mirror-pruning overlay so the
 # one-line (re)install and the in-place self-updater behave identically: a module renamed or removed since
 # the installed version is pruned from the import roots, while .venv, bin, models, and bridgeData.yaml are
 # preserved. This also fetches uv (into bin/), which the dependency sync below reuses.
 if ! ./runtime.sh apply-bundle "$bundle_dir"; then
-    echo "ERROR: could not lay down the worker files (see the output above)." >&2
-    exit 1
+    if [ "$existing_overlay_bootstrap" -eq 1 ]; then
+        echo "The installed bootstrap could not apply the release. Retrying from the complete downloaded bundle..." >&2
+        cp -R "$bundle_dir/." "$INSTALL_DIR/"
+        chmod +x ./*.sh 2>/dev/null || true
+        if ! ./runtime.sh apply-bundle "$bundle_dir"; then
+            echo "ERROR: could not lay down the worker files. Re-run this installer; it preserves worker data." >&2
+            exit 1
+        fi
+    else
+        echo "ERROR: could not lay down the worker files. Re-run this installer; it preserves worker data." >&2
+        exit 1
+    fi
 fi
+
+# The standalone installer, unlike the managed updater, is not running through these downloaded shims. It
+# can therefore refresh them safely after the old launcher has returned from apply-bundle.
+for shim in "$bundle_dir"/*.cmd "$bundle_dir"/*.sh "$bundle_dir"/*.ps1 "$bundle_dir"/*.bat; do
+    [ -f "$shim" ] || continue
+    cp "$shim" "$INSTALL_DIR/"
+done
+
+# Record how this worker was installed and from where, so the in-place self-updater pulls future releases
+# from the same origin. Lives under bin/ (preserved across updates, removed on uninstall).
+mkdir -p "$INSTALL_DIR/bin"
+printf 'method=one-line\nrepo=%s/%s\nlauncher_generation=2\n' "$OWNER" "$REPO" > "$INSTALL_DIR/bin/install-info"
 rm -rf "$tmp_dir"
 
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's

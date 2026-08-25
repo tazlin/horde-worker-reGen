@@ -143,24 +143,19 @@ if (Test-Path $curl) {
 Write-Host "Extracting..."
 Expand-ReleaseZip -ZipPath $tmpZip -Destination $bundleDir
 
-# Lay the bundle down (shims, bootstrap, source). This overwrites in place but, like a plain expand, does
-# not by itself prune modules the new release dropped; the apply-bundle overlay below removes those. The
-# shims must be written here, not by the overlay, so the overlay can run *through* runtime.cmd without
-# overwriting the running launcher mid-run.
+# A modern existing install can apply the bundle through its currently intact bootstrap before the installer
+# changes source. Fresh and legacy installs need the downloaded runtime/bootstrap laid down first. The latter
+# path is deliberately idempotent: rerunning this installer recopies the complete release after interruption.
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item -Path (Join-Path $bundleDir "*") -Destination $InstallDir -Recurse -Force
-
-# Record how this worker was installed and from where, so the in-place self-updater pulls future releases
-# from the same origin (this fork/account) rather than a hardcoded default. Lives under bin/ (preserved
-# across updates, removed on uninstall). Written without a BOM so the bootstrap parses the first key cleanly.
-$binDir = Join-Path $InstallDir "bin"
-New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-[System.IO.File]::WriteAllText((Join-Path $binDir "install-info"), "method=one-line`nrepo=$Owner/$Repo`n")
+$existingOverlayBootstrap =
+    (Test-Path (Join-Path $InstallDir "runtime.cmd")) -and
+    (Test-Path (Join-Path $InstallDir "bootstrap.py")) -and
+    (Test-Path (Join-Path $InstallDir "worker_bootstrap\updater.py"))
 
 # Show what is about to be installed (and from where) and get consent before any heavy download. We do it
 # here, where the user is at a console, then pass HORDE_WORKER_ASSUME_YES so the bootstrap does not prompt
 # again. Honour a pre-set HORDE_WORKER_ASSUME_YES for unattended installs.
-$noticePath = Join-Path $InstallDir "INSTALL_NOTICE.txt"
+$noticePath = Join-Path $bundleDir "INSTALL_NOTICE.txt"
 if (Test-Path $noticePath) {
     Write-Host ""
     Get-Content $noticePath | ForEach-Object { Write-Host $_ }
@@ -179,11 +174,37 @@ if (-not (Get-Option "HORDE_WORKER_ASSUME_YES" "")) {
     }
 }
 
+# Fresh and legacy installs need the current launcher and bootstrap before apply-bundle can run. Keep this
+# after consent so cancelling the installer leaves the destination unchanged.
+if (-not $existingOverlayBootstrap) {
+    Copy-Item -Path (Join-Path $bundleDir "*") -Destination $InstallDir -Recurse -Force
+}
+
 # Overlay the freshly downloaded bundle through the shared, mirror-pruning overlay (same as the self-updater)
 # so a reinstall prunes modules renamed/removed since the installed version, while .venv, bin, models, and
 # bridgeData.yaml are preserved. This also fetches uv (into bin\), which the dependency sync below reuses.
 & (Join-Path $InstallDir "runtime.cmd") apply-bundle "$bundleDir"
-if ($LASTEXITCODE -ne 0) { Write-Error "Could not lay down the worker files (see the output above)."; exit 1 }
+if ($LASTEXITCODE -ne 0 -and $existingOverlayBootstrap) {
+    Write-Host "The installed bootstrap could not apply the release. Retrying from the complete downloaded bundle..." -ForegroundColor Yellow
+    Copy-Item -Path (Join-Path $bundleDir "*") -Destination $InstallDir -Recurse -Force
+    & (Join-Path $InstallDir "runtime.cmd") apply-bundle "$bundleDir"
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Could not lay down the worker files. Re-run this installer; it preserves worker data."
+    exit 1
+}
+
+# The standalone installer, unlike the managed updater, is not running through these downloaded shims. It
+# can therefore refresh them safely after the old launcher has returned from apply-bundle.
+Get-ChildItem -Path $bundleDir -File | Where-Object { $_.Extension -in ".cmd", ".sh", ".ps1", ".bat" } | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $InstallDir $_.Name) -Force
+}
+
+# Record how this worker was installed and from where, so the in-place self-updater pulls future releases
+# from the same origin. Written without a BOM so the bootstrap parses the first key cleanly.
+$binDir = Join-Path $InstallDir "bin"
+New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $binDir "install-info"), "method=one-line`nrepo=$Owner/$Repo`nlauncher_generation=2`n")
 Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
 
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's

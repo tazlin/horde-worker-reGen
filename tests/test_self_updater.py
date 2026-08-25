@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from worker_bootstrap import cli as cli_mod
 from worker_bootstrap import updater as updater_mod
 from worker_bootstrap.cli import _cmd_update
 from worker_bootstrap.updater import (
@@ -218,6 +219,7 @@ def test_update_repo_flag_persists_when_already_up_to_date(
     """
     monkeypatch.setattr(updater_mod, "self_update_allowed", lambda root: (True, ""))
     monkeypatch.setattr(updater_mod, "check_for_update", lambda root, repo=None, channel=None: _info(latest="12.30.1"))
+    monkeypatch.setattr(cli_mod, "_sync", lambda uv, root, *, cli_flag, options: 0)
 
     rc = _cmd_update(_make_args(repo=_FORK_REPO), tmp_path, "uv")
 
@@ -239,6 +241,7 @@ def test_update_repo_flag_does_not_persist_when_check_fails(
     """
     monkeypatch.setattr(updater_mod, "self_update_allowed", lambda root: (True, ""))
     monkeypatch.setattr(updater_mod, "check_for_update", lambda root, repo=None, channel=None: _info(latest=None))
+    monkeypatch.setattr(cli_mod, "_sync", lambda uv, root, *, cli_flag, options: 0)
 
     rc = _cmd_update(_make_args(repo=_FORK_REPO), tmp_path, "uv")
 
@@ -253,6 +256,7 @@ def test_update_without_repo_flag_never_touches_install_info(
     """A plain 'update' (no --repo) must not create or modify bin/install-info."""
     monkeypatch.setattr(updater_mod, "self_update_allowed", lambda root: (True, ""))
     monkeypatch.setattr(updater_mod, "check_for_update", lambda root, repo=None, channel=None: _info(latest="12.30.1"))
+    monkeypatch.setattr(cli_mod, "_sync", lambda uv, root, *, cli_flag, options: 0)
 
     _cmd_update(_make_args(), tmp_path, "uv")
 
@@ -325,8 +329,6 @@ def test_update_repo_flag_persists_on_available_update(
     monkeypatch.setattr(updater_mod, "clear_skip", lambda root: None)
     monkeypatch.setattr(updater_mod, "sync_arp_version", lambda root, version: None)
     # _sync would try to run uv; short-circuit it here
-    from worker_bootstrap import cli as cli_mod
-
     monkeypatch.setattr(cli_mod, "_sync", lambda uv, root, *, cli_flag, options: 0)
 
     rc = _cmd_update(_make_args(repo=_FORK_REPO), tmp_path, "uv")
@@ -381,6 +383,7 @@ def test_inno_installer_writes_repo_to_install_info() -> None:
         "HordeWorker.iss CurStepChanged must write 'repo={#Repo}' into bin/install-info; "
         "without it the self-updater cannot know which fork to pull future releases from"
     )
+    assert "launcher_generation=2" in text
 
 
 def test_install_sh_records_method_and_repo_in_install_info() -> None:
@@ -394,6 +397,7 @@ def test_install_sh_records_method_and_repo_in_install_info() -> None:
     assert "install-info" in text, "install.sh must write to bin/install-info"
     assert "method=one-line" in text, "install.sh must stamp method=one-line in install-info"
     assert "repo=" in text, "install.sh must stamp the repo origin in install-info"
+    assert "launcher_generation=2" in text
 
 
 def test_install_ps1_records_method_and_repo_in_install_info() -> None:
@@ -403,3 +407,4 @@ def test_install_ps1_records_method_and_repo_in_install_info() -> None:
     assert "install-info" in text, "install.ps1 must write to bin/install-info"
     assert "method=one-line" in text
     assert "repo=" in text
+    assert "launcher_generation=2" in text

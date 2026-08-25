@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import zipfile
 from pathlib import Path
 
@@ -171,6 +172,23 @@ def test_resolve_install_method_and_self_update_gating(tmp_path: Path) -> None:
     plain_root.mkdir()
     assert updater.resolve_install_method(plain_root) == "unknown"
     assert updater.self_update_allowed(plain_root)[0] is True
+
+
+def test_managed_install_records_when_preserved_launchers_need_one_time_refresh(tmp_path: Path) -> None:
+    """Old managed installs are identified without treating git or current installers as stale."""
+    marker = tmp_path / "bin" / "install-info"
+    marker.parent.mkdir()
+    marker.write_text("method=one-line\nrepo=Haidra-Org/horde-worker-reGen\n", encoding="utf-8")
+    assert updater.launchers_need_refresh(tmp_path) is True
+
+    marker.write_text(
+        f"method=one-line\nlauncher_generation={updater.LAUNCHER_GENERATION}\n",
+        encoding="utf-8",
+    )
+    assert updater.launchers_need_refresh(tmp_path) is False
+
+    (tmp_path / ".git").mkdir()
+    assert updater.launchers_need_refresh(tmp_path) is False
 
 
 def test_skip_version_persists_until_a_newer_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,6 +431,106 @@ def test_apply_bundle_descends_a_wrapper_dir(tmp_path: Path) -> None:
 
     updater.apply_bundle(extracted, install)
     assert updater.installed_version(install) == "3.0.0"
+
+
+def test_apply_bundle_rolls_back_every_source_target_after_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late overlay failure cannot leave a new version beside old project metadata."""
+    extracted = tmp_path / "extracted"
+    (extracted / "horde_worker_regen").mkdir(parents=True)
+    (extracted / "horde_worker_regen" / "__init__.py").write_text('__version__ = "2.0.0"\n', encoding="utf-8")
+    (extracted / "pyproject.toml").write_text("new project\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    (install / "horde_worker_regen").mkdir(parents=True)
+    (install / "horde_worker_regen" / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    (install / "horde_worker_regen" / "old_only.py").write_text("old\n", encoding="utf-8")
+    (install / "pyproject.toml").write_text("old project\n", encoding="utf-8")
+
+    original_atomic_copy = updater._atomic_copy
+
+    def fail_on_project(src: Path, dst: Path) -> None:
+        if src.name == "pyproject.toml":
+            raise OSError("simulated write failure")
+        original_atomic_copy(src, dst)
+
+    monkeypatch.setattr(updater, "_atomic_copy", fail_on_project)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        updater.apply_bundle(extracted, install)
+
+    assert updater.installed_version(install) == "1.0.0"
+    assert (install / "horde_worker_regen" / "old_only.py").read_text(encoding="utf-8") == "old\n"
+    assert (install / "pyproject.toml").read_text(encoding="utf-8") == "old project\n"
+    marker, backup = updater._transaction_paths(install)
+    assert not marker.exists()
+    assert not backup.exists()
+
+
+def test_pre_import_recovery_restores_a_terminated_overlay(tmp_path: Path) -> None:
+    """The standalone bootstrap restores a durable snapshot before importing partial package code."""
+    import bootstrap as bootstrap_entry
+
+    extracted = tmp_path / "extracted"
+    (extracted / "horde_worker_regen").mkdir(parents=True)
+    (extracted / "horde_worker_regen" / "__init__.py").write_text('__version__ = "2.0.0"\n', encoding="utf-8")
+    (extracted / "pyproject.toml").write_text("new project\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    (install / "horde_worker_regen").mkdir(parents=True)
+    (install / "horde_worker_regen" / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    (install / "pyproject.toml").write_text("old project\n", encoding="utf-8")
+
+    updater._begin_overlay_transaction(extracted, install)
+    updater._mirror_dir(extracted / "horde_worker_regen", install / "horde_worker_regen")
+    assert updater.installed_version(install) == "2.0.0"
+
+    assert bootstrap_entry._recover_interrupted_update(install) is True
+    assert updater.installed_version(install) == "1.0.0"
+    assert (install / "pyproject.toml").read_text(encoding="utf-8") == "old project\n"
+    marker, backup = updater._transaction_paths(install)
+    assert not marker.exists()
+    assert not backup.exists()
+
+
+@pytest.mark.parametrize("pre_import", [False, True])
+def test_recovery_preflights_complete_backup_before_touching_source(tmp_path: Path, pre_import: bool) -> None:
+    """A damaged recovery backup leaves every partial source target untouched for installer recovery."""
+    import bootstrap as bootstrap_entry
+
+    install = tmp_path / "install"
+    package = install / "horde_worker_regen"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('__version__ = "partial-new"\n', encoding="utf-8")
+    (install / "pyproject.toml").write_text("partial new project\n", encoding="utf-8")
+
+    marker, backup = updater._transaction_paths(install)
+    backup_package = backup / "horde_worker_regen"
+    backup_package.mkdir(parents=True)
+    (backup_package / "__init__.py").write_text('__version__ = "old"\n', encoding="utf-8")
+    marker.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "targets": [
+                    {"name": "horde_worker_regen", "existed": True},
+                    {"name": "pyproject.toml", "existed": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    recover = bootstrap_entry._recover_interrupted_update if pre_import else updater.restore_interrupted_update
+    with pytest.raises(OSError, match="backup is missing 'pyproject.toml'"):
+        recover(install)
+
+    assert updater.installed_version(install) == "partial-new"
+    assert (install / "pyproject.toml").read_text(encoding="utf-8") == "partial new project\n"
+    assert marker.exists()
+    assert backup.exists()
 
 
 def test_perform_update_invalidates_sync_stamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
