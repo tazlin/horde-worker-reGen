@@ -136,8 +136,34 @@ class TestCardCanServe:
         req = describe_job_requirements(_make_job(control_type="canny"), "stable_diffusion_1", None)
         assert card_can_serve(no_cn, req) is False
 
-    def test_control_type_absent_from_backend_contract_is_rejected(self) -> None:
-        """An SDK wire value the execution backend does not expose cannot pass a broad ControlNet opt-in."""
+    def test_control_type_absent_from_backend_contract_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An SDK wire value the execution backend does not expose cannot pass a broad ControlNet opt-in.
+
+        The backend map is read once and cached, so the gap is injected into hordelib's constants and the
+        cache is cleared around the check; the restored map is re-read afterwards.
+        """
+        import hordelib.pipeline.constants as backend_constants
+
+        from horde_worker_regen.process_management.gpu import gpu_eligibility
+
+        without_color = {k: v for k, v in backend_constants.CONTROLNET_IMAGE_PREPROCESSOR_MAP.items() if k != "color"}
+        monkeypatch.setattr(backend_constants, "CONTROLNET_IMAGE_PREPROCESSOR_MAP", without_color)
+        gpu_eligibility._implementation_image_features.cache_clear()
+        try:
+            card = CardProfile(
+                0,
+                24576,
+                _config(allow_img2img=True, allow_controlnet=True),
+                frozenset({"modelA"}),
+            )
+            req = describe_job_requirements(_make_job(control_type="color"), "stable_diffusion_1", None)
+
+            assert card_can_serve(card, req) is False
+        finally:
+            gpu_eligibility._implementation_image_features.cache_clear()
+
+    def test_control_type_in_backend_contract_is_served(self) -> None:
+        """A control type the execution backend exposes passes the broad ControlNet opt-in."""
         card = CardProfile(
             0,
             24576,
@@ -146,7 +172,7 @@ class TestCardCanServe:
         )
         req = describe_job_requirements(_make_job(control_type="color"), "stable_diffusion_1", None)
 
-        assert card_can_serve(card, req) is False
+        assert card_can_serve(card, req) is True
 
     def test_unknown_workflow_is_rejected_by_exact_sdk_compatibility(self) -> None:
         """A workflow name is not treated as runnable merely because img2img is enabled."""

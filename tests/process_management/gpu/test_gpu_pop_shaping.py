@@ -113,8 +113,34 @@ class TestUnionAdvertising:
         assert advertised_capabilities({0: sfw}).nsfw is False
         assert advertised_capabilities({1: nsfw}).nsfw is True
 
-    def test_extended_offer_requires_every_server_extended_type(self) -> None:
-        """A backend missing any extended type must not emit the protocol's all-extended bit."""
+    def test_extended_offer_requires_every_server_extended_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A backend missing any extended type must not emit the protocol's all-extended bit.
+
+        The backend map is read once and cached, so the gap is injected into hordelib's constants and the
+        cache is cleared around the check; the restored map is re-read afterwards.
+        """
+        import hordelib.pipeline.constants as backend_constants
+
+        from horde_worker_regen.process_management.gpu import gpu_eligibility
+
+        without_color = {k: v for k, v in backend_constants.CONTROLNET_IMAGE_PREPROCESSOR_MAP.items() if k != "color"}
+        monkeypatch.setattr(backend_constants, "CONTROLNET_IMAGE_PREPROCESSOR_MAP", without_color)
+        gpu_eligibility._implementation_image_features.cache_clear()
+        try:
+            card = _card(
+                device_index=0,
+                max_concurrent=1,
+                allow_img2img=True,
+                allow_controlnet=True,
+                allow_sdxl_controlnet=True,
+            )
+
+            assert advertised_capabilities({0: card}).allow_extended_controlnet is False
+        finally:
+            gpu_eligibility._implementation_image_features.cache_clear()
+
+    def test_extended_offer_is_emitted_when_the_backend_serves_every_extended_type(self) -> None:
+        """With every extended type served, the protocol's all-extended bit follows the ControlNet opt-in."""
         card = _card(
             device_index=0,
             max_concurrent=1,
@@ -123,7 +149,7 @@ class TestUnionAdvertising:
             allow_sdxl_controlnet=True,
         )
 
-        assert advertised_capabilities({0: card}).allow_extended_controlnet is False
+        assert advertised_capabilities({0: card}).allow_extended_controlnet is True
 
     def test_empty_card_plan_cannot_create_a_feature_offer(self) -> None:
         """An absent runtime plan is handled by the caller rather than represented as a fictitious profile."""
