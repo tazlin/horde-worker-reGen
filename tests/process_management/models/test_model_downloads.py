@@ -404,6 +404,16 @@ class TestConfigReloadTriggersDownloads:
         assert args[0] == ["b"]
         assert kwargs["download_aux"] is False
 
+    def test_reload_before_the_scan_report_requests_nothing(self) -> None:
+        """An unreported on-disk set is unknown, not empty: no fetch is planned against it."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(image_models_to_load=["a", "b"], dry_run_skip_inference=True),
+        )
+
+        manager._process_lifecycle.request_downloads.assert_not_called()
+
     def test_reload_with_all_models_present_requests_nothing(self) -> None:
         """A reload that adds no missing model triggers no download."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])

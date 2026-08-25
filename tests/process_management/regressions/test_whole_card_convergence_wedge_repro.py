@@ -541,7 +541,9 @@ class TestConvergenceStopsComponentLane:
 
     _COMPONENT_LANE_ID = 7
 
-    def _staged_with_component_lane(self) -> tuple[InferenceScheduler, ProcessMap, StreamForecast]:
+    def _staged_with_component_lane(
+        self,
+    ) -> tuple[InferenceScheduler, ProcessMap, StreamForecast, JobTracker]:
         """Post-pre-stage state: Flux held on one process, the component lane live on the same card."""
         flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
         component_lane = make_mock_process_info(
@@ -558,26 +560,27 @@ class TestConvergenceStopsComponentLane:
         horde_model_map.update_entry(
             horde_model_name=_FLUX_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=4
         )
+        job_tracker = JobTracker()
         scheduler = _wire_scheduler_with_real_plm(
             process_map=process_map,
-            job_tracker=JobTracker(),
+            job_tracker=job_tracker,
             horde_model_map=horde_model_map,
             bridge_data=_wedge_bridge_data(enable_pipeline_disaggregation=True),
         )
         forecast = _flux_whole_card_forecast(free_now_mb=15007.0)
         scheduler._whole_card_forecast = forecast
         scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        return scheduler, process_map, forecast
+        return scheduler, process_map, forecast, job_tracker
 
     def test_gate_waits_on_the_component_lane(self) -> None:
         """Control: with the lane live on the card the head's teardown is not exhausted."""
-        scheduler, _process_map, forecast = self._staged_with_component_lane()
+        scheduler, _process_map, forecast, _job_tracker = self._staged_with_component_lane()
         assert scheduler._residency_should_pause_component_lane(None) is True
         assert scheduler._whole_card_teardown_exhausted(forecast) is False
 
     def test_convergence_requests_the_component_lane_pause(self) -> None:
         """Convergence ticks must order the lane off the card, the way the establish path does."""
-        scheduler, _process_map, _forecast = self._staged_with_component_lane()
+        scheduler, _process_map, _forecast, _job_tracker = self._staged_with_component_lane()
 
         for _ in range(30):
             scheduler._converge_whole_card_residency()
@@ -588,7 +591,7 @@ class TestConvergenceStopsComponentLane:
 
     def test_head_dispatches_once_the_lane_has_left(self) -> None:
         """End to end: the requested pause takes effect, the lane exits, and the gate reads exhausted."""
-        scheduler, process_map, forecast = self._staged_with_component_lane()
+        scheduler, process_map, forecast, _job_tracker = self._staged_with_component_lane()
 
         for _ in range(30):
             scheduler._converge_whole_card_residency()
@@ -597,6 +600,19 @@ class TestConvergenceStopsComponentLane:
         del process_map[self._COMPONENT_LANE_ID]
 
         assert scheduler._whole_card_teardown_exhausted(forecast) is True
+
+    async def test_stall_names_the_lane_the_gate_waits_on(self) -> None:
+        """While the lane is still on the card, the stall reason names it on the detector's wedge seam."""
+        scheduler, _process_map, _forecast, job_tracker = self._staged_with_component_lane()
+        flux_head = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
+        )
+
+        reason = scheduler._diagnose_dispatch_stall(flux_head, {})
+
+        assert "whole-card residency stuck: cannot reach sole residency" in reason
+        assert "the component lane" in reason
 
 
 class TestWedgeDispatchDiagnostic:

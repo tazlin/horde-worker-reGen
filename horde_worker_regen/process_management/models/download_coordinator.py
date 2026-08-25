@@ -124,7 +124,12 @@ class ModelDownloadCoordinator:
         """Drive the download process toward the desired on-disk model set."""
         if not self._enable_background_downloads:
             return
-        present = self._model_availability.present or set()
+        present = self._model_availability.present
+        if present is None:
+            # Until the download process reports its scan, the on-disk set is unknown, not empty: reconciling
+            # against an empty set reads every configured model as missing and plans a fetch of the whole
+            # list. The scan-complete report drives the first reconcile once the set is known.
+            return
         in_flight = set(self._model_availability.pending)
         if self._model_availability.currently_downloading is not None:
             in_flight.add(self._model_availability.currently_downloading)

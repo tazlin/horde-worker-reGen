@@ -1514,21 +1514,22 @@ def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding
         Finding(
             id="whole_card_convergence_wedge",
             severity=Severity.CRITICAL,
-            title="Whole-card residency cannot reach sole residency (queued-model sibling pins the teardown)",
+            title="Whole-card residency cannot reach sole residency (a sibling or service lane pins the teardown)",
             verdict=(
-                f"A pre-staged whole-card head was parked {len(wedges)} time(s) because an idle sibling process "
-                "still holds a model queued behind it and was not torn down, so the residency never collapsed "
-                "to sole residency and the head was deferred until the recovery supervisor soft-reset the pools "
-                "(faulting the head and forcing process recoveries). The whole-card convergence is meant to "
-                "stop that sibling (sparing only the head's holder), so this indicates the convergence shrink "
-                "did not engage for this process/queue shape."
+                f"A pre-staged whole-card head was parked {len(wedges)} time(s) because something the residency's "
+                "teardown gate waits on never left the card: an idle sibling process still holding a model queued "
+                "behind the head, or a service lane (component or post-processing) whose context the gate requires "
+                "gone. The residency never collapsed to sole residency and the head was deferred until the recovery "
+                "supervisor acted. The convergence is meant to stop that sibling (sparing only the head's holder) "
+                "and to order every lane the gate waits on off-GPU, so this indicates the convergence teardown did "
+                "not engage for this process/queue shape."
             ),
             remediation=(
-                "Capture the surrounding scheduling logs and the process map: confirm the pre-staged head's "
-                "holder is identified (its loaded model name) and that the idle sibling is genuinely idle (not "
-                "busy). A recurrence points at the whole-card teardown failing to stop an eligible sibling. As "
-                "an operational stopgap, reducing queue_size or avoiding a heavy whole-card model alongside a "
-                "deep same-cycle queue lowers the odds of hitting this shape."
+                "Capture the surrounding scheduling logs and the process map: the stall line names what pinned "
+                "the teardown (a sibling process and its queued model, or a lane). A recurrence points at the "
+                "whole-card teardown failing to stop an eligible sibling or failing to order a lane pause. As an "
+                "operational stopgap, reducing queue_size or avoiding a heavy whole-card model alongside a deep "
+                "same-cycle queue lowers the odds of hitting this shape."
             ),
             evidence=[_evidence(r) for r in wedges[:3]],
             see_also="head_dispatch_stall",

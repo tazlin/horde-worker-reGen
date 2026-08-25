@@ -1805,10 +1805,6 @@ class ProcessLifecycleManager:
             else:
                 self._num_process_recoveries += 1
 
-    def _initiate_component_replacement(self) -> None:
-        """Flag the component lane for replacement so the control loop's state machine restarts it."""
-        self._component_processes_should_be_replaced = True
-
     def component_lane_enabled(self) -> bool:
         """Whether the dedicated component (text-encode) lane should run (public view of the config gate)."""
         return self._component_lane_enabled()

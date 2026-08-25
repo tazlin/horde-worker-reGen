@@ -262,7 +262,9 @@ The popper uses this to keep advertised models aligned with reality:
 (`filter_present`), so the worker never accepts a job for a model still
 downloading. Once the first authoritative scan completes, `ModelDownloadCoordinator` kicks off
 the initial download of any configured-but-missing models and lazily starts
-inference/safety processes when their model gates clear.
+inference/safety processes when their model gates clear. A reconcile asked for before that scan
+(a config reload, a picker request) waits for it: the on-disk set is unknown, not empty, and planning
+against an empty set would fetch the whole configured list.
 
 [`ModelDownloadCoordinator`][horde_worker_regen.process_management.models.download_coordinator.ModelDownloadCoordinator]
 owns this parent-side reconciliation and startup gating. The configured

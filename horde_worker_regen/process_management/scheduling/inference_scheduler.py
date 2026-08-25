@@ -4352,13 +4352,17 @@ class InferenceScheduler:
         found_residency, residency_device = self._residency_holder_for_model(head.model)
         if found_residency and self._prestaged_whole_card_not_ready(head):
             blockers = self._whole_card_convergence_blockers(process, residency_device)
-            if blockers:
-                pinned = ", ".join(f"process {pid} holds queued model {model!r}" for pid, model in blockers)
+            lanes = self._whole_card_lane_blockers(residency_device)
+            if blockers or lanes:
+                pinned = ", ".join(
+                    [f"process {pid} holds queued model {model!r}" for pid, model in blockers]
+                    + [f"{lane} still holds its context on the card" for lane in lanes],
+                )
                 return SlotDutyBucket.WHOLE_CARD_CONVERGENCE, (
                     f"its model is resident and idle on process {process.process_id}, but the whole-card "
                     f"residency stuck: cannot reach sole residency because {pinned}; the convergence teardown "
-                    f"should have stopped that idle sibling (only the head's holder is spared), so the shrink "
-                    f"has not collapsed the pool and the head never dispatches"
+                    f"should have stopped that idle sibling or ordered that lane off-GPU (only the head's "
+                    f"holder is spared), so the gate's structural legs never pass and the head never dispatches"
                 )
             return SlotDutyBucket.WHOLE_CARD_CONVERGENCE, (
                 f"its model is resident and idle on process {process.process_id}, but its whole-card residency "
@@ -4448,6 +4452,30 @@ class InferenceScheduler:
             if model is not None and model in queued_models:
                 blockers.append((proc.process_id, model))
         return blockers
+
+    def _whole_card_lane_blockers(self, device_index: int | None) -> list[str]:
+        """Return the service lanes the teardown gate is still waiting on while a whole-card head is parked.
+
+        Mirrors the lane legs of the ledger's ``teardown_complete``: a lane whose pause this residency requires
+        and whose process is still on the card. The component lane always qualifies when the residency's card
+        hosts it; the post-processing lane only when its bare context cannot share the card with the weights.
+        Read-only; used only to explain a stalled dispatch.
+        """
+        lanes: list[str] = []
+        if (
+            self._residency_should_pause_component_lane(device_index)
+            and self._process_map.num_component_processes(device_index=device_index) > 0
+        ):
+            lanes.append("the component lane")
+        forecast = self._residency_state(device_index).forecast
+        if (
+            forecast is not None
+            and self._residency_should_pause_post_process(device_index)
+            and not self._post_process_context_fits_with_residency(forecast, device_index=device_index)
+            and self._process_map.num_post_process_processes(device_index=device_index) > 0
+        ):
+            lanes.append("the post-processing lane")
+        return lanes
 
     _EXCLUSIVE_SUPPRESSION_LOG_INTERVAL_SECONDS = 30.0
     """How often the exclusive-admit dispatch hold may name itself for one card scope.
