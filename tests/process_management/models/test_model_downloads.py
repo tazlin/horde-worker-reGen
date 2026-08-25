@@ -415,6 +415,19 @@ class TestConfigReloadTriggersDownloads:
 
         manager._process_lifecycle.request_downloads.assert_not_called()
 
+    def test_reload_after_a_pre_scan_report_requests_nothing(self) -> None:
+        """The download process's first reports carry an empty set before the scan; that is not "nothing on disk"."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        manager._model_availability.update(
+            present=set(), currently_downloading=None, pending=(), failed=(), scan_complete=False
+        )
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(image_models_to_load=["a", "b"], dry_run_skip_inference=True),
+        )
+
+        manager._process_lifecycle.request_downloads.assert_not_called()
+
     def test_reload_with_all_models_present_requests_nothing(self) -> None:
         """A reload that adds no missing model triggers no download."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
@@ -1212,8 +1225,9 @@ class TestFirstClassAnnotators:
         monkeypatch.setattr(process, "_directml", 1)
         commands: list[list[str]] = []
 
-        def _fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        def _fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             commands.append(command)
+            assert kwargs.get("stderr") is sys.stderr, "the helper's output must reach this process's stderr log"
             return subprocess.CompletedProcess(command, returncode=0)
 
         monkeypatch.setattr(subprocess, "run", _fake_run)

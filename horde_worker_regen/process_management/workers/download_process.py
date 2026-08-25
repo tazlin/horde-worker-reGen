@@ -1993,8 +1993,8 @@ class HordeDownloadProcess(HordeProcess):
         only moves files. Running :mod:`~horde_worker_regen.process_management.workers.annotator_verify` in a
         short-lived child (the same interpreter and environment, so it sees the same cache root and hordelib)
         returns that memory the moment the verify ends; on a host that is already tight the difference is
-        whether the inference pool can still preload its models. The child inherits this process's stdio, so
-        its per-preprocessor progress lands in this process's stderr log rather than being buffered until exit.
+        whether the inference pool can still preload its models. The child writes to this process's stdout
+        and stderr files, so its per-preprocessor progress and any failure land in this process's stderr log.
         """
         # The boot is the dominant cost of the verify, so honor the marker before paying it: a warm marker
         # means a prior process already ran every preprocessor for this pin and ``preload_annotators`` would
@@ -2012,7 +2012,10 @@ class HordeDownloadProcess(HordeProcess):
         )
         started = time.monotonic()
         try:
-            completed = subprocess.run(command, check=False)
+            # The interpreter's own stdout/stderr are the files hordelib's logger redirected them to, not the
+            # descriptors this process inherited; handing those objects over is what lands the helper's
+            # output in this process's stderr log rather than on a console nobody is reading.
+            completed = subprocess.run(command, check=False, stdout=sys.stdout, stderr=sys.stderr)
         except OSError as e:
             logger.error(f"Download process: annotator verify helper could not start: {type(e).__name__}: {e}")
             return False
