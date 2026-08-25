@@ -26,7 +26,7 @@ from .bundle import LogBundle
 from .cache_inventory import collect_cache_inventory
 from .correlate import build_session_context
 from .detectors import run_detectors
-from .log_ingest import _read_physical_lines, read_records
+from .log_ingest import _read_physical_lines
 from .redaction import Redactor, build_redactor
 from .sessions import WorkerSession, segment_sessions
 from .system_info import (
@@ -160,8 +160,8 @@ def _read_log_text(file_path: Path, *, cap: bool) -> str:
     return text
 
 
-def _find_stats_files(root: Path) -> list[Path]:
-    """Find retained stats JSONL files related to ``root``."""
+def _find_stats_files(root: Path, *, modified_since: datetime | None = None) -> list[Path]:
+    """Find retained stats JSONL files related to ``root``, keeping those last written at or after ``modified_since``."""
     candidate_dirs = [
         root / _APP_STATE_DIRNAME / _STATS_DIRNAME,
         root.parent / _APP_STATE_DIRNAME / _STATS_DIRNAME,
@@ -176,8 +176,11 @@ def _find_stats_files(root: Path) -> list[Path]:
                 if resolved in seen:
                     continue
                 seen.add(resolved)
-                if path.is_file():
-                    found.append(path)
+                if not path.is_file():
+                    continue
+                if modified_since is not None and path.stat().st_mtime < modified_since.timestamp():
+                    continue
+                found.append(path)
     return sorted(found, key=lambda p: p.name)
 
 
@@ -238,16 +241,13 @@ def build_support_bundle(
         redact_identifiers: Also scrub home path / username / worker name (not just secrets).
         config_path: The worker config to redact and to source secrets/cache_home from.
     """
-    log_bundle = LogBundle.from_path(path)
-    # Parse only the active orchestrator log by default: it already holds the recent sessions, while the
-    # rotation archives are older history whose ~1M records cost ~15s to parse for little incident value.
-    # --full-logs opts into the complete history.
-    if full_logs:
-        orchestrator_records = log_bundle.orchestrator_records()
-    else:
-        active_paths = [p for p in log_bundle.orchestrator_paths if not _is_rotation(p)]
-        orchestrator_records = read_records(*active_paths)
-    sessions = segment_sessions(orchestrator_records)
+    # Classify only the active logs by default: they hold the recent sessions, while the rotation archives
+    # are older history that costs minutes to decompress and parse for little incident value. The detectors
+    # read child logs through this same bundle, so an archive-inclusive bundle would have every child's
+    # whole rotation history parsed the first time a detector joined child records to the session, even
+    # though those archives are not shipped. --full-logs opts into the complete history on both counts.
+    log_bundle = LogBundle.from_path(path, active_only=not full_logs)
+    sessions = segment_sessions(log_bundle.orchestrator_records())
     selected = _select_sessions(sessions, last=last, index=session_index)
     redactor = _make_redactor(config_path, redact_identifiers=redact_identifiers)
     cache_home = resolve_cache_home(config_path)
@@ -296,8 +296,14 @@ def build_support_bundle(
         if ledger_paths:
             ledger_text = "\n".join(p.read_text(encoding="utf-8", errors="replace").rstrip("\n") for p in ledger_paths)
             _write(zf, "action_ledger.jsonl", _tail_capped_records(ledger_text, cap=not full_logs))
+        # Retained stats can span months of sessions at several MB each; only the files still being written
+        # once the bundled sessions began say anything about them. A modification time is the cheap, stamp-
+        # agnostic test for that, and --full-logs ships the whole retention as it does the log rotations.
+        stats_since = (
+            None if full_logs else min((s.start_ts for s in sessions if s.start_ts is not None), default=None)
+        )
         used_stats_names: set[str] = set()
-        for stats_path in _find_stats_files(log_bundle.root):
+        for stats_path in _find_stats_files(log_bundle.root, modified_since=stats_since):
             name = _stats_member_name(stats_path)
             if name in used_stats_names:
                 stem, _, ext = name.rpartition(".")

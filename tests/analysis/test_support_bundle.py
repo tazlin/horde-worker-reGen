@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -156,6 +158,46 @@ class TestContents:
         assert "stats/stats-v1.0.0-20260620-010203-001.jsonl" in names
         assert _WORKER not in stats_text
         assert _CIVITAI not in compressed_stats_text
+
+
+class TestStatsWindow:
+    """Only stats files still being written once the bundled sessions began are shipped by default."""
+
+    def _stats_file(self, tmp_path: Path, name: str, *, mtime: float | None = None) -> Path:
+        stats_dir = tmp_path / ".horde_worker_regen" / "stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        path = stats_dir / name
+        path.write_text(json.dumps({"event": "stats_sample"}) + "\n", encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_stats_older_than_every_session_are_skipped(self, tmp_path: Path) -> None:
+        """A retention file last written before the earliest bundled session says nothing about it."""
+        logs = _worker_dir(tmp_path)
+        stale = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        self._stats_file(tmp_path, "stats-v1.0.0-20260601-120000-000.jsonl", mtime=stale)
+        self._stats_file(tmp_path, "stats-v1.0.0-20260624-180000-000.jsonl")
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            names = set(zf.namelist())
+        assert "stats/stats-v1.0.0-20260624-180000-000.jsonl" in names
+        assert "stats/stats-v1.0.0-20260601-120000-000.jsonl" not in names
+
+    def test_full_logs_ships_the_whole_retention(self, tmp_path: Path) -> None:
+        """``--full-logs`` includes every retained stats file, as it does the log rotations."""
+        logs = _worker_dir(tmp_path)
+        stale = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        self._stats_file(tmp_path, "stats-v1.0.0-20260601-120000-000.jsonl", mtime=stale)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml", full_logs=True)
+
+        with zipfile.ZipFile(out) as zf:
+            assert "stats/stats-v1.0.0-20260601-120000-000.jsonl" in zf.namelist()
 
 
 class TestTruncationPolarity:
