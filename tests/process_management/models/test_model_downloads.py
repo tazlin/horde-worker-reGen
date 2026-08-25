@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -1122,6 +1123,40 @@ class TestFirstClassAnnotators:
         monkeypatch.setitem(sys.modules, "hordelib", None)  # ``import hordelib`` -> ImportError if reached
 
         assert process._run_annotator_preload() is True
+
+    def test_run_annotator_preload_runs_in_a_helper_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A due verify runs the preload in a child interpreter and reads its exit status as the verdict."""
+        process = self._process()
+        monkeypatch.setattr(process, "_annotators_verified_for_pin", lambda: False)
+        monkeypatch.setattr(process, "_directml", 1)
+        commands: list[list[str]] = []
+
+        def _fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, returncode=0)
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        assert process._run_annotator_preload() is True
+        assert len(commands) == 1
+        assert commands[0][:3] == [
+            sys.executable,
+            "-m",
+            "horde_worker_regen.process_management.workers.annotator_verify",
+        ]
+        assert commands[0][3:] == ["--directml", "1"]
+
+    def test_run_annotator_preload_reports_a_failed_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-zero helper exit is a failed verify, which the caller turns into the bounded recovery."""
+        process = self._process()
+        monkeypatch.setattr(process, "_annotators_verified_for_pin", lambda: False)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda command, **_kwargs: subprocess.CompletedProcess(command, returncode=1),
+        )
+
+        assert process._run_annotator_preload() is False
 
     def test_verify_success_marks_done_without_killing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A passing verify records completion and never touches the kill switch (no re-download)."""

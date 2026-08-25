@@ -81,8 +81,13 @@ instead of a single opaque "annotators" line that froze through a full ComfyUI i
 
 Once the files are present, a single **exclusive** `ANNOTATOR_VERIFY` task runs each
 preprocessor once (a ComfyUI init) to confirm they actually load. That verify is the
-one place the otherwise-offline download process boots a full ComfyUI/torch/CUDA
-stack, so it is **gated on a persistent marker**: hordelib records a marker (keyed to
+one place the otherwise-offline download process needs a full ComfyUI/torch/CUDA
+stack, so it runs in a **short-lived helper process**
+(`python -m horde_worker_regen.process_management.workers.annotator_verify`, the same
+interpreter and environment; its exit status is the verdict and its progress lands in
+the download process's stderr log): the boot plus every detector's weights would
+otherwise stay resident in the download process for the rest of the session. It is also **gated on a
+persistent marker**: hordelib records a marker (keyed to
 the pinned `comfyui_controlnet_aux` commit) once every preprocessor has run, and the
 worker reads it *before* booting (the read needs neither `hordelib.initialise` nor a
 GPU). A warm marker means a prior session already verified this pin, so the verify is

@@ -19,12 +19,29 @@ it. Writes are synchronous (no ``enqueue``) so a crash never loses the last buff
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from loguru import logger
 
 _PLAIN_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
 """Mirror of hordelib's plain file format so the Logs tab parses the level token the same way."""
+
+
+def log_uncaught_thread_exceptions() -> None:
+    """Route exceptions that escape a thread's target into loguru, so they reach the file sink.
+
+    The interpreter's default prints them to stderr only, which for a supervisor process is a console the
+    operator may have closed and the support bundle never collects; the file sink is the durable record.
+    """
+
+    def _hook(args: threading.ExceptHookArgs) -> None:
+        thread_name = args.thread.name if args.thread is not None else "<unknown>"
+        logger.opt(exception=(args.exc_type, args.exc_value, args.exc_traceback)).error(
+            f"Uncaught exception in thread {thread_name}",
+        )
+
+    threading.excepthook = _hook
 
 
 def setup_supervisor_file_logging(role: str, *, quiet_console: bool = False) -> int | None:

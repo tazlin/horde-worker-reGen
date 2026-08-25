@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -126,6 +127,9 @@ FEATURE_IMAGE_MODEL = "image model"
 FEATURE_LORA = "LoRa (default set)"
 FEATURE_CONTROLNET = "ControlNet"
 FEATURE_CONTROLNET_ANNOTATORS = "ControlNet annotators"
+_ANNOTATOR_VERIFY_MODULE = "horde_worker_regen.process_management.workers.annotator_verify"
+"""The module :meth:`HordeDownloadProcess._run_annotator_preload` runs in a child interpreter."""
+
 FEATURE_MISCELLANEOUS = "miscellaneous (SDXL)"
 
 
@@ -1910,11 +1914,19 @@ class HordeDownloadProcess(HordeProcess):
             return None
 
     def _run_annotator_preload(self) -> bool:
-        """Initialise ComfyUI and run each ControlNet preprocessor once; return whether they all loaded.
+        """Run each ControlNet preprocessor once in a helper process; return whether they all loaded.
 
         With the detector checkpoints already on disk (the per-file aux pass placed them) this is a verify:
         ``preload_annotators`` runs every preprocessor and reports success. A failure here means an annotator
         downloaded but does not load/run, which the caller turns into a bounded recovery.
+
+        The verify needs a full ComfyUI/torch boot plus every detector's weights, several gigabytes that
+        would otherwise stay resident in this process for the rest of the session, a process that afterwards
+        only moves files. Running :mod:`~horde_worker_regen.process_management.workers.annotator_verify` in a
+        short-lived child (the same interpreter and environment, so it sees the same cache root and hordelib)
+        returns that memory the moment the verify ends; on a host that is already tight the difference is
+        whether the inference pool can still preload its models. The child inherits this process's stdio, so
+        its per-preprocessor progress lands in this process's stderr log rather than being buffered until exit.
         """
         # The boot is the dominant cost of the verify, so honor the marker before paying it: a warm marker
         # means a prior process already ran every preprocessor for this pin and ``preload_annotators`` would
@@ -1923,16 +1935,27 @@ class HordeDownloadProcess(HordeProcess):
         if self._annotators_verified_for_pin() is True:
             return True
 
-        import hordelib
-        from hordelib.api import SharedModelManager
-
-        extra_comfyui_args = [f"--directml={self._directml}"] if self._directml is not None else []
-        hordelib.initialise(extra_comfyui_args=extra_comfyui_args)
+        command = [sys.executable, "-m", _ANNOTATOR_VERIFY_MODULE]
+        if self._directml is not None:
+            command += ["--directml", str(self._directml)]
+        logger.info(
+            "Download process: verifying the ControlNet annotators in a helper process (a full ComfyUI boot "
+            "that runs every preprocessor once; progress is in this process's stderr log).",
+        )
+        started = time.monotonic()
         try:
-            return bool(SharedModelManager.preload_annotators())
-        except Exception as e:  # noqa: BLE001 - a verify crash is a verify failure, not a process crash
-            logger.error(f"Download process: annotator preload raised: {type(e).__name__}: {e}")
+            completed = subprocess.run(command, check=False)
+        except OSError as e:
+            logger.error(f"Download process: annotator verify helper could not start: {type(e).__name__}: {e}")
             return False
+        elapsed = time.monotonic() - started
+        if completed.returncode != 0:
+            logger.error(
+                f"Download process: annotator verify helper exited {completed.returncode} after {elapsed:.0f}s.",
+            )
+            return False
+        logger.info(f"Download process: ControlNet annotators verified in {elapsed:.0f}s.")
+        return True
 
     def _verify_annotators(self, manager: ModelManager) -> None:
         """Verify the annotators run; on failure re-download once, and disable ControlNet if it still fails.

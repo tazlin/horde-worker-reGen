@@ -59,3 +59,30 @@ def test_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
 
     monkeypatch.setattr("horde_worker_regen.tui.logging_setup.logger.add", _boom)
     assert setup_supervisor_file_logging("tui") is None
+
+
+def test_uncaught_thread_exception_reaches_loguru() -> None:
+    """A thread whose target raises is recorded through loguru rather than only printed to stderr."""
+    import threading
+
+    from loguru import logger
+
+    from horde_worker_regen.tui.logging_setup import log_uncaught_thread_exceptions
+
+    records: list[str] = []
+    sink_id = logger.add(lambda message: records.append(str(message)), level="ERROR")
+    previous_hook = threading.excepthook
+    try:
+        log_uncaught_thread_exceptions()
+
+        def _boom() -> None:
+            raise MemoryError("simulated")
+
+        thread = threading.Thread(target=_boom, name="probe-thread")
+        thread.start()
+        thread.join(timeout=5.0)
+    finally:
+        threading.excepthook = previous_hook
+        logger.remove(sink_id)
+
+    assert any("probe-thread" in record and "MemoryError" in record for record in records)
