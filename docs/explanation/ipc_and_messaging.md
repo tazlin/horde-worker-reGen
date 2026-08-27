@@ -257,6 +257,18 @@ relaunches on a fresh channel. Because this condition has no in-process remedy, 
 restart is required even when no relaunch contract is configured: a headless worker
 exits loudly rather than claiming to run while unable to receive child results.
 
+The same health check judges the write side. On Linux every child's `put` takes the
+queue's one shared writer lock, and a child that dies holding it leaves every other
+child's next `put` blocked forever: the children keep working and logging, the
+parent's reads find the queue empty, and nothing anyone sends arrives, including the
+startup report of any child spawned afterwards. The stuck-read rule cannot see this,
+and the per-process silence timeouts read it as many individual hangs and replace
+healthy children into the same dead channel. So once the channel has delivered
+before, a full `_CHANNEL_SILENCE_THRESHOLD_SECONDS` with nothing from any child, while a
+child that once reported is still meant to be running, is judged the same corrupt
+channel and takes the same terminal restart. Children report memory every second and
+heartbeat throughout a job, so a minute of channel-wide silence is never healthy.
+
 Terminal teardown does not wait indefinitely for unrelated background I/O. Once the
 control loop has drained accepted work and proved every child reaped, it cancels the
 remaining gathered loops; the process-level timed backstop remains armed until that

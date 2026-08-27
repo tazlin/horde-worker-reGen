@@ -294,6 +294,18 @@ class MessageDispatcher:
     Set well above any legitimate single-frame read latency so a merely slow host never trips it, yet bounded
     so the terminal restart is reached in tens of seconds rather than never."""
 
+    _CHANNEL_SILENCE_THRESHOLD_SECONDS = 60.0
+    """How long the channel may deliver nothing from any child, after it has delivered before and while a
+    child that once reported is still meant to be running, before it is judged wedged on the write side.
+
+    The stuck-read watchdog above sees a torn frame the parent is reading. It cannot see a writer that died
+    holding the queue's shared writer lock: every other child's next ``put`` then blocks forever, the parent's
+    reads find the queue empty, and the children keep working and logging while nothing they send arrives.
+    Children report memory at one-second intervals and heartbeat throughout a job, so a minute with nothing
+    from anyone is never healthy. Judging it channel-wide matters because the per-process silence timeouts
+    read the same picture as many individual hangs and replace healthy children into the same dead channel,
+    where the replacements cannot report either."""
+
     def __init__(
         self,
         *,
@@ -375,6 +387,9 @@ class MessageDispatcher:
         stays set is a read that cannot return, which the corruption watchdog reads."""
         self._on_channel_corrupt: Callable[[str], None] | None = None
         self._channel_corruption_reported = False
+        self._last_message_received_at: float | None = None
+        """Monotonic stamp of the last message the channel delivered from any child, or None before the first.
+        Read by the channel-silence rule in :meth:`check_message_channel_health`."""
         self._stale_messages_ignored = 0
         """Messages rejected because their process slot or launch identity is no longer current."""
         self._last_model_load_change_at: dict[int, float] = {}
@@ -516,6 +531,8 @@ class MessageDispatcher:
         Returns early once a message is fully handled, the off-thread-read equivalent of the inline drain's
         per-message ``continue``.
         """
+        # Any delivered frame, whatever its sender or fate below, proves the channel's write side is live.
+        self._last_message_received_at = time.monotonic()
         # The download process lives outside the process map, so its messages must be handled
         # (or ignored) before any of the process-map lookups below, which would otherwise raise.
         if message.process_id == DOWNLOAD_PROCESS_ID:
@@ -781,26 +798,53 @@ class MessageDispatcher:
         A read stuck this long cannot clear in place, so on the first detection this logs CRITICAL and fires
         the registered escalation handler exactly once (a loud abort and restart). Returns whether the channel
         is judged corrupt. Called from the same control-loop maintenance point as deadlock detection.
+
+        Two shapes are judged. A read stuck past :data:`_CHANNEL_STUCK_READ_THRESHOLD_SECONDS` with a backlog
+        is a torn frame on the read side. Nothing delivered from any child for
+        :data:`_CHANNEL_SILENCE_THRESHOLD_SECONDS`, after the channel has delivered before and while a child
+        that once reported is still meant to be running, is a wedged write side (a writer that died holding
+        the shared writer lock). Both are unrepairable in place and take the same escalation.
         """
+        now = time.monotonic()
         started_at = self._reader_read_started_at
-        if started_at is None:
+        if started_at is not None:
+            stuck_seconds = now - started_at
+            if stuck_seconds >= self._CHANNEL_STUCK_READ_THRESHOLD_SECONDS and self._queue_reports_backlog():
+                self._report_channel_corruption(
+                    f"a queue read has not returned in {stuck_seconds:.0f}s while a backlog remains",
+                    f"shared message channel read stuck {stuck_seconds:.0f}s with backlog",
+                )
+                return True
+        last_received_at = self._last_message_received_at
+        if last_received_at is None:
             return False
-        stuck_seconds = time.monotonic() - started_at
-        if stuck_seconds < self._CHANNEL_STUCK_READ_THRESHOLD_SECONDS:
+        silent_seconds = now - last_received_at
+        if silent_seconds < self._CHANNEL_SILENCE_THRESHOLD_SECONDS:
             return False
-        if not self._queue_reports_backlog():
+        if not self._a_reporting_child_is_expected_alive():
             return False
+        self._report_channel_corruption(
+            f"no child has delivered a message in {silent_seconds:.0f}s although children that reported before "
+            "are still running (their sends are blocked on the shared writer lock)",
+            f"shared message channel silent {silent_seconds:.0f}s with live children",
+        )
+        return True
+
+    def _a_reporting_child_is_expected_alive(self) -> bool:
+        """Whether some child that once reported over the channel is still meant to be running."""
+        return any(info.has_ever_reported and not info.end_intended for info in self._process_map.values())
+
+    def _report_channel_corruption(self, description: str, reason: str) -> None:
+        """Log the verdict and fire the escalation handler, once per dispatcher lifetime."""
         if self._channel_corruption_reported:
-            return True
+            return
         self._channel_corruption_reported = True
         logger.critical(
-            f"Shared child-to-parent message channel is corrupt: a queue read has not returned in "
-            f"{stuck_seconds:.0f}s while a backlog remains. The channel cannot be repaired in place "
-            "(children inherit it); escalating to a terminal restart.",
+            f"Shared child-to-parent message channel is corrupt: {description}. The channel cannot be repaired "
+            "in place (children inherit it); escalating to a terminal restart.",
         )
         if self._on_channel_corrupt is not None:
-            self._on_channel_corrupt(f"shared message channel read stuck {stuck_seconds:.0f}s with backlog")
-        return True
+            self._on_channel_corrupt(reason)
 
     def _queue_reports_backlog(self) -> bool:
         """Whether the queue can confirm pending items. A queue that cannot report depth cannot deny a backlog."""

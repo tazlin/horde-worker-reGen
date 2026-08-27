@@ -13,6 +13,9 @@ from __future__ import annotations
 import queue
 import time
 
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from tests.process_management.conftest import make_mock_process_info
 from tests.process_management.ipc.test_dispatcher_drain_liveness import _make_dispatcher
 
 
@@ -107,3 +110,84 @@ class TestChannelCorruptionWatchdog:
 
         assert dispatcher.check_message_channel_health() is True
         assert len(fired) == 1
+
+
+def _silent_dispatcher(
+    *,
+    reported: bool,
+    end_intended: bool = False,
+    silent_for: float | None = None,
+) -> MessageDispatcher:
+    """A dispatcher whose channel delivered once and has been silent since, over a map with one child."""
+    child = make_mock_process_info(1)
+    child.has_ever_reported = reported
+    child.end_intended = end_intended
+    dispatcher = _make_dispatcher(process_message_queue=_DepthQueue(depth=0), process_map=ProcessMap({1: child}))
+    if silent_for is not None:
+        dispatcher._last_message_received_at = time.monotonic() - silent_for
+    return dispatcher
+
+
+class TestChannelSilence:
+    """Nothing from any child for the threshold, with a child that once reported still running, is corruption.
+
+    The shape this pins: a writer died holding the queue's shared writer lock, so every other child's next put
+    blocks forever. The parent's reads find the queue empty and its read stamp never sets, the children keep
+    working, and even a freshly spawned child cannot deliver its startup report. The per-process silence
+    timeouts read that as many individual hangs; the channel rule reads it as one dead channel.
+    """
+
+    def test_channel_wide_silence_with_a_live_reporting_child_escalates_once(self) -> None:
+        """The rule fires once and names the silence; later ticks still report corrupt without re-firing."""
+        dispatcher = _silent_dispatcher(
+            reported=True,
+            silent_for=dispatcher_threshold() + 5.0,
+        )
+        fired: list[str] = []
+        dispatcher.set_channel_corruption_handler(fired.append)
+
+        assert dispatcher.check_message_channel_health() is True
+        assert fired == ["shared message channel silent 65s with live children"]
+        assert dispatcher.check_message_channel_health() is True
+        assert len(fired) == 1
+
+    def test_silence_before_the_first_delivery_is_startup_not_corruption(self) -> None:
+        """A channel that has never delivered cannot have gone silent."""
+        dispatcher = _silent_dispatcher(reported=False, silent_for=None)
+        fired: list[str] = []
+        dispatcher.set_channel_corruption_handler(fired.append)
+
+        assert dispatcher.check_message_channel_health() is False
+        assert fired == []
+
+    def test_silence_shorter_than_the_threshold_is_not_corruption(self) -> None:
+        """An ordinary quiet stretch under the threshold is left alone."""
+        dispatcher = _silent_dispatcher(reported=True, silent_for=dispatcher_threshold() - 5.0)
+        fired: list[str] = []
+        dispatcher.set_channel_corruption_handler(fired.append)
+
+        assert dispatcher.check_message_channel_health() is False
+        assert fired == []
+
+    def test_silence_with_no_child_that_ever_reported_is_not_corruption(self) -> None:
+        """A pool still starting up has nothing to be silent; a child that never opened its side proves nothing."""
+        dispatcher = _silent_dispatcher(reported=False, silent_for=dispatcher_threshold() + 5.0)
+        fired: list[str] = []
+        dispatcher.set_channel_corruption_handler(fired.append)
+
+        assert dispatcher.check_message_channel_health() is False
+        assert fired == []
+
+    def test_silence_while_every_reporting_child_is_being_ended_is_not_corruption(self) -> None:
+        """Children the supervisor is ending are expected to fall silent."""
+        dispatcher = _silent_dispatcher(reported=True, end_intended=True, silent_for=dispatcher_threshold() + 5.0)
+        fired: list[str] = []
+        dispatcher.set_channel_corruption_handler(fired.append)
+
+        assert dispatcher.check_message_channel_health() is False
+        assert fired == []
+
+
+def dispatcher_threshold() -> float:
+    """The channel-silence threshold the rule under test applies."""
+    return MessageDispatcher._CHANNEL_SILENCE_THRESHOLD_SECONDS
