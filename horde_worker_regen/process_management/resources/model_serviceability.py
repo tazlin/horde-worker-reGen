@@ -240,19 +240,24 @@ def assess_model_serviceability(
     )
 
 
-def model_footprint_figures_for_baseline(baseline: str | None) -> ModelFootprintFigures | None:
+def model_footprint_figures_for_baseline(
+    baseline: str | None,
+    model_name: str | None = None,
+) -> ModelFootprintFigures | None:
     """Return footprint figures for a baseline using torch-free hordelib seeds, or None when unavailable.
 
     The figures are the disaggregated sampler charge: hordelib's resident core-weight seed plus its
     per-megapixel sampling activation. The whole-job seed (``vram_base_mb``) is not used because it bundles
     support weights and decode headroom that a small card serves around the sampler rather than beside it.
+    Passing ``model_name`` charges a family member with its own weight set its own figures instead of its
+    baseline's family seed.
     """
     if baseline is None:
         return None
     try:
-        from hordelib.feature_impact import get_baseline_burden
+        from horde_worker_regen.process_management.resources.resource_budget import baseline_burden_entry
 
-        burden = get_baseline_burden(str(baseline))
+        burden = baseline_burden_entry(str(baseline), model_name)
         if burden is None:
             return None
         return ModelFootprintFigures(

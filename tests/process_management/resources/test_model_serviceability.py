@@ -12,6 +12,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     assess_model_serviceability,
     decide_constrained_offer,
     max_power_to_pixels,
+    model_footprint_figures_for_baseline,
 )
 
 _GB = 1024.0
@@ -254,3 +255,29 @@ class TestConstrainedOfferLane:
             pop_max_power=32,
         )
         assert decision.pop_max_power == 32
+
+
+def test_footprint_figures_forward_the_model_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The serviceability footprint is looked up by model name so a per-model override applies."""
+    import hordelib.feature_impact as feature_impact
+
+    calls: list[tuple[str, str | None]] = []
+
+    class _StubBurden:
+        vram_per_megapixel_mb = 1500.0
+        min_recommended_vram_mb = 14000.0
+
+        def resident_weight_estimate_mb(self) -> float:
+            return 12600.0
+
+    def recorder(baseline: str, model_name: str | None = None) -> object:
+        calls.append((baseline, model_name))
+        return _StubBurden()
+
+    monkeypatch.setattr(feature_impact, "get_baseline_burden", recorder)
+
+    figures = model_footprint_figures_for_baseline("qwen_image", "Krea2-Turbo_fp8")
+
+    assert figures is not None
+    assert figures.weights_mb == 12600.0
+    assert calls == [("qwen_image", "Krea2-Turbo_fp8")]

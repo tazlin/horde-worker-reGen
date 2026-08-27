@@ -401,7 +401,7 @@ def _model_serviceability_verdicts(
     serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
     if not serving_cards:
         return []
-    figures = model_footprint_figures_for_baseline(_baseline_value_for_model(model_metadata, model))
+    figures = model_footprint_figures_for_baseline(_baseline_value_for_model(model_metadata, model), model)
     verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
     for card in serving_cards:
         baseline_mb = (

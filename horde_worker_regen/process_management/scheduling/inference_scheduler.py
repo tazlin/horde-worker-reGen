@@ -10116,7 +10116,7 @@ class InferenceScheduler:
         if job.model is None or not self._card_runtimes:
             return []
         baseline = self._baseline_value_for_job(job)
-        figures = model_footprint_figures_for_baseline(baseline)
+        figures = model_footprint_figures_for_baseline(baseline, job.model)
         if figures is None:
             return []
         verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []

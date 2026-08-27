@@ -33,7 +33,7 @@ from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from hordelib.feature_impact import FEATURE_KIND, BurdenEstimate
+    from hordelib.feature_impact import FEATURE_KIND, BaselineBurden, BurdenEstimate
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -804,6 +804,23 @@ class WholeCardResidencyState:
     """
 
 
+def baseline_burden_entry(baseline: str, model_name: str | None) -> BaselineBurden | None:
+    """Return hordelib's burden entry for a model, falling back to its baseline's family seed.
+
+    A family member with its own weight set (a quantized DiT, a different text encoder) carries a
+    per-model burden override in hordelib, so the name has to reach the lookup or the model is charged
+    its family's figures. A pinned hordelib predating that parameter rejects the keyword; the lookup
+    then degrades to the baseline seed rather than losing the estimate entirely.
+    """
+    from hordelib.feature_impact import get_baseline_burden
+
+    try:
+        # pyrefly: ignore[unexpected-keyword] - the pinned hordelib predates the parameter; the except degrades
+        return get_baseline_burden(baseline, model_name=model_name)
+    except TypeError:
+        return get_baseline_burden(baseline)
+
+
 def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
     """Return a job's core (diffusion) resident weight footprint (MB), or None when unestimable.
 
@@ -819,9 +836,7 @@ def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None
     if baseline is None:
         return None
     try:
-        from hordelib.feature_impact import get_baseline_burden
-
-        entry = get_baseline_burden(str(baseline))
+        entry = baseline_burden_entry(str(baseline), job.model)
         if entry is None:
             return None
         return float(entry.resident_weight_estimate_mb())
@@ -844,9 +859,7 @@ def predict_job_footprint_mb(job: ImageGenerateJobPopResponse, baseline: str | N
     if baseline is None:
         return None
     try:
-        from hordelib.feature_impact import get_baseline_burden
-
-        entry = get_baseline_burden(str(baseline))
+        entry = baseline_burden_entry(str(baseline), job.model)
         if entry is None:
             return None
         return float(entry.resident_footprint_estimate_mb())
@@ -1396,12 +1409,22 @@ def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None)
             "batch": max(1, job.payload.n_iter),
             "features": _job_feature_kinds(job),
         }
-        try:
-            return estimate_job_burden(**common_kwargs, post_processing_upscale_factor=_job_upscale_factor(job))
-        except TypeError:
-            # An older pinned hordelib predates the upscale-factor parameter. Fall back to the coarse
-            # (generation-resolution) estimate rather than losing the whole budget on a version mismatch.
-            return estimate_job_burden(**common_kwargs)
+        # Optional keywords, oldest first, so an older pinned hordelib drops the newest term it does not
+        # accept and keeps the rest: a version mismatch costs that term's precision, not the whole budget.
+        # ``post_processing_upscale_factor`` refines the upscaler peak; ``model_name`` selects a per-model
+        # burden override for a family member whose weight set differs from its baseline's seed.
+        optional_kwargs = {
+            "post_processing_upscale_factor": _job_upscale_factor(job),
+            "model_name": job.model,
+        }
+        while True:
+            try:
+                # pyrefly: ignore[unexpected-keyword] - the pinned hordelib may predate a keyword; the loop drops it
+                return estimate_job_burden(**common_kwargs, **optional_kwargs)
+            except TypeError:
+                if not optional_kwargs:
+                    raise
+                optional_kwargs.popitem()
     except Exception as e:
         logger.debug(f"Job burden estimate failed for job {job.id_}: {type(e).__name__} {e}")
         return None

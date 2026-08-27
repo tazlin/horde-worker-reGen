@@ -204,7 +204,10 @@ The arbiter keeps four concerns deliberately separate:
     **Resident** footprints feed the streaming forecast's per-checkpoint weight term. The per-baseline seed
     prices every checkpoint of an architecture alike, so a heavy file is granted sibling room it does not have;
     a measured at-rest figure raises the seed and re-keys the sibling-room and card-dominance judgments on what
-    the file actually costs. Two conversions happen at that seam. The store records a whole *device* charge, so
+    the file actually costs. A family member whose weight set differs from its family's (a quantized DiT, a
+    different text encoder) instead carries its own burden entry keyed by model name, which is why the
+    worker passes the job's model alongside its baseline when it asks for a seed. Two conversions happen at
+    that seam. The store records a whole *device* charge, so
     the context constant is netted back out before the figure reaches a forecast that charges contexts
     separately. And the raise lands on the forecast's full-footprint term only, never on the core-weight term:
     the core weights are deliberately the smaller quantity (support components time-share the card via

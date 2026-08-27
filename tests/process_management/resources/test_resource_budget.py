@@ -1976,3 +1976,61 @@ class TestControlnetWorkflowPricing:
 
         assert plain_mb is not None and qr_mb is not None
         assert qr_mb > plain_mb
+
+
+class TestPerModelBurdenOverrides:
+    """The job's model name reaches hordelib's burden lookup, and an older hordelib still answers."""
+
+    _WEIGHTS_MB = 12600.0
+    _FOOTPRINT_MB = 17900.0
+
+    class _StubBurden:
+        """A burden entry with the two figures the weight and footprint predictions read."""
+
+        vram_per_megapixel_mb = 1500.0
+        min_recommended_vram_mb = 14000.0
+
+        def resident_weight_estimate_mb(self) -> float:
+            return TestPerModelBurdenOverrides._WEIGHTS_MB
+
+        def resident_footprint_estimate_mb(self) -> float:
+            return TestPerModelBurdenOverrides._FOOTPRINT_MB
+
+    def _install_recorder(self, monkeypatch: pytest.MonkeyPatch, *, accepts_model_name: bool) -> list[tuple]:
+        """Replace hordelib's lookup with a recorder, optionally one that predates ``model_name``."""
+        import hordelib.feature_impact as feature_impact
+
+        calls: list[tuple] = []
+
+        def recorder(baseline: str, model_name: str | None = None) -> object:
+            calls.append((baseline, model_name))
+            if not accepts_model_name and model_name is not None:
+                raise TypeError("get_baseline_burden() got an unexpected keyword argument 'model_name'")
+            return TestPerModelBurdenOverrides._StubBurden()
+
+        monkeypatch.setattr(feature_impact, "get_baseline_burden", recorder)
+        return calls
+
+    def test_weight_prediction_passes_the_model_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A family member with its own weight set is charged by name, not by its family's seed."""
+        calls = self._install_recorder(monkeypatch, accepts_model_name=True)
+        job = make_job_pop_response("Krea2-Turbo_fp8")
+
+        assert resource_budget.predict_job_weight_mb(job, "qwen_image") == self._WEIGHTS_MB
+        assert calls == [("qwen_image", "Krea2-Turbo_fp8")]
+
+    def test_footprint_prediction_passes_the_model_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The full-footprint prediction reads the same per-model entry."""
+        calls = self._install_recorder(monkeypatch, accepts_model_name=True)
+        job = make_job_pop_response("Krea2-Turbo_fp8")
+
+        assert resource_budget.predict_job_footprint_mb(job, "qwen_image") == self._FOOTPRINT_MB
+        assert calls == [("qwen_image", "Krea2-Turbo_fp8")]
+
+    def test_an_older_hordelib_degrades_to_the_baseline_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hordelib predating per-model overrides still yields a figure, from the family seed."""
+        calls = self._install_recorder(monkeypatch, accepts_model_name=False)
+        job = make_job_pop_response("Krea2-Turbo_fp8")
+
+        assert resource_budget.predict_job_weight_mb(job, "qwen_image") == self._WEIGHTS_MB
+        assert calls == [("qwen_image", "Krea2-Turbo_fp8"), ("qwen_image", None)]
