@@ -242,7 +242,10 @@ The arbiter keeps four concerns deliberately separate:
     (room for a context, not for a whole sibling model), and deliberately so: the premise of tearing the
     siblings down is that the card is full, and the measurement is what shows it is not. The retirement is
     logged once per model, with the figure and the number of runs behind it, through the stream-forecast
-    diagnostic. Without measurements nothing changes. This is why the resident observer's gates matter: a
+    diagnostic. Without measurements nothing changes, and the scheduler offers the measurement only once
+    the model has produced a result on this worker (`JobTracker.has_model_produced_result`): idle-slot
+    readings say nothing about whether the model runs, so a model that has never finished a job here keeps
+    its seed. This is why the resident observer's gates matter: a
     slot holding its checkpoint in system RAM reports a nearly empty allocator, and hundreds of those readings
     recorded as the checkpoint's resident cost would retire the whole-card claim of a model that needs the
     whole card and admit it beside siblings it cannot fit with. The residency check and the weight-bytes

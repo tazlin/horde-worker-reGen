@@ -558,6 +558,9 @@ class JobTracker:
         # the keying collapses to one entry per model, behaviourally identical to the prior model-only keys.
         self._model_overbudget_fault_counts: dict[tuple[str, int | None], int] = {}
         self._model_last_overbudget_fault_time: dict[tuple[str, int | None], float] = {}
+        # Models that have produced at least one inference result this session. A measured resident footprint
+        # is only allowed to override a model's seed once the model has shown it runs here at all.
+        self._models_with_results: set[str] = set()
         # Models on a conditional ceiling hold: the measured arbiter found their predicted demand above the
         # card's current achievable ceiling (total net of the noise buffer and the sustained foreign floor), so
         # it is not servable *while that ceiling holds*. Keyed by (model, device_index) to the candidate demand
@@ -651,6 +654,7 @@ class JobTracker:
         """
         if model is None:
             return
+        self._models_with_results.add(model)
         if device_index is None:
             keys_to_clear = [key for key in self._model_overbudget_fault_counts if key[0] == model]
             keys_to_clear += [
@@ -665,6 +669,10 @@ class JobTracker:
             self._model_last_overbudget_fault_time.pop(key, None)
         if cleared:
             logger.debug(f"Model {model} produced a result; clearing its over-budget fault streak.")
+
+    def has_model_produced_result(self, model: str | None) -> bool:
+        """Whether ``model`` has completed at least one inference on this worker since it started."""
+        return model is not None and model in self._models_with_results
 
     _CEILING_HOLD_LIFT_MARGIN_MB = 256.0
     """Hysteresis margin (MB): a ceiling hold lifts only once the candidate fits the current ceiling with this

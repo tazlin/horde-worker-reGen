@@ -1329,10 +1329,24 @@ class TestSchedulerMeasuredWholeCardRetirement:
         assert forecast.measured_footprint_mb is None
         assert forecast.needs_exclusive_residency is True
 
+    def test_observed_but_never_completed_checkpoint_still_claims_the_card(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Idle-slot measurements alone do not count until the model has finished a job on this worker."""
+        scheduler, store = self._scheduler(monkeypatch)
+        self._observe(store, 5)
+        job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
+        forecast = scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))
+
+        assert forecast.measured_footprint_mb is None
+        assert forecast.needs_exclusive_residency is True
+
     def test_observed_checkpoint_retires_the_claim(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """At the threshold the measured figure reaches the forecast and the card stops being reserved."""
         scheduler, store = self._scheduler(monkeypatch)
         self._observe(store, 5)
+        scheduler._job_tracker.record_model_inference_success(self._FLUX_MODEL)
         job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
         forecast = scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))
 

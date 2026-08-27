@@ -5493,10 +5493,18 @@ class InferenceScheduler:
         The context constant is netted out for the same reason it is in the raise-only accessor: the store
         keeps whole-device charges while the forecast charges contexts separately.
 
-        Returns ``(None, 0)`` for an under-observed key, an unkeyable model, or a store-less scheduler.
+        The measurement is only offered once the model has produced a result on this worker. At-rest
+        observations come from idle slots and say nothing about whether the model runs; a model that has
+        never finished a job here keeps its seed, so a heavy model cannot be declared small before it has
+        demonstrated anything.
+
+        Returns ``(None, 0)`` for an under-observed key, an unkeyable model, a model with no completed job,
+        or a store-less scheduler.
         """
         store = self._footprint_store
         if store is None or model_name is None or baseline is None:
+            return (None, 0)
+        if not self._job_tracker.has_model_produced_result(model_name):
             return (None, 0)
         key = FootprintKey(
             model_baseline=str(baseline),
