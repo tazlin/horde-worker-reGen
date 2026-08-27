@@ -196,11 +196,17 @@ These fail as interactions, not as units, so component tests stay green through 
   multi-card row states each card's own total, tenants and measured free (one entry on a single card). Changes to
   admission, retention, leases, governor thresholds or recovery rungs ship with a closed-loop test
   asserting an outcome (a duty floor, no safety teardown while serving, no free-VRAM crater). A live
-  run confirms; it is not where you find out. Two fidelities are opt-in per row: `clearance_lease=True`
+  run confirms; it is not where you find out. Three fidelities are opt-in per row: `clearance_lease=True`
   makes dispatch a staging step (the lane sits `INFERENCE_PRIMED` holding its encode working set alone,
   a real `ClearanceController` is stepped over the scheduler's own `build_clearance_inputs` with
   `clearance_admit_process` as its `admit_fn`, and the weights land at clearance), and a lane held for
-  `CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS` samples unpriced and is recorded in `world.clearance_timeouts`.
+  `CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS` samples unpriced and is recorded in `world.clearance_timeouts`;
+  `learned_footprints=True` sends each lane's per-tick memory report through a real `MessageDispatcher` into
+  a `LearnedFootprintStore` the scheduler prices from (`world.footprint_store`), so a row can state what the
+  parent learns from what its children report. It is opt-in because a parent that learns the children's
+  true peaks stops over-committing within a few jobs, which would dissolve the premise of every row about
+  over-commit under a fixed misprice. `child_reports_card_sized_peaks=True` makes a sampling lane report the
+  whole card as its high-water, the reading an overflowed or checkpoint-caching child sends.
 - **Every production incident becomes a permanent scenario** in `test_incident_scenarios.py`, written
   so that undoing its fix makes it fail. If the simulator cannot express an incident, extend the
   simulator.

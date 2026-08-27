@@ -32,6 +32,7 @@ Assertion helpers over a completed run live in ``_world_assertions.py``.
 from __future__ import annotations
 
 import multiprocessing
+import queue
 from dataclasses import dataclass
 from multiprocessing import synchronize
 from unittest.mock import Mock
@@ -43,11 +44,14 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
     HordeControlFlag,
     HordeImageResult,
     HordeInferenceControlMessage,
+    HordeProcessMemoryMessage,
     HordeProcessState,
     ModelLoadState,
 )
@@ -83,6 +87,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     FlatScalarMap,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
+from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ClearanceController,
@@ -240,6 +245,11 @@ a forty-step megapixel job at seven seconds of sampling."""
 
 _DEFAULT_SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL = 0.175
 """Sampling pace for a baseline with no entry above; the mid class, so an unlisted model is not free."""
+
+_STAGED_LANE_ALLOCATED_MB = 1400.0
+"""What a lane's allocator holds while its checkpoint sits in host RAM: a CUDA context and a text encoder.
+A live child reports this against the checkpoint it names as loaded, which is the reading the resident-footprint
+observer must refuse: it is not what the checkpoint costs the card."""
 
 _CHILD_FREE_MARGIN_MB = 1024.0
 """Free VRAM (MB) a child's executor keeps clear of the allocation it is about to make.
@@ -556,6 +566,8 @@ class _DispatchWorld:
         legacy_comfy_vram_unload: bool = False,
         child_free_view_lie_mb: float = 0.0,
         footprint_undershoot: float = 1.0,
+        child_reports_card_sized_peaks: bool = False,
+        learned_footprints: bool = False,
         safety_off_gpu_allowed: bool = False,
         safety_readiness_seconds: float = 0.0,
         safety_load_transient_mb: float = 0.0,
@@ -620,6 +632,15 @@ class _DispatchWorld:
                 to what it actually costs. Above one, admission passes on a figure the load then exceeds, which
                 is the regime where the parent's own defenses have already been satisfied and only the child's
                 freeing stands between the load and the card.
+            child_reports_card_sized_peaks: Whether a sampling child reports its allocator high-water as the
+                whole card. A process that overflowed on WDDM, or that cached other checkpoints beside the
+                job, reports exactly that against the job it is running; the parent must not learn it as the
+                job's cost. Off, a child reports the charge the world actually put on the card.
+            learned_footprints: Whether the children's per-tick memory reports reach the parent's learned
+                footprint store through the production dispatcher, so the scheduler prices later jobs from what
+                the children reported. Opt-in per row like the lease: a row about over-commit under a fixed
+                misprice must keep its misprice, and a parent that learns the children's true peaks stops
+                over-committing within a few jobs.
             safety_off_gpu_allowed: Whether the operator permits safety to be moved off the card to reclaim it.
                 Off, the ladder has no safety rung at all, so a run says nothing about what reaching one costs;
                 on, the safety pause and its restore are modelled as the process cycle they are.
@@ -685,6 +706,8 @@ class _DispatchWorld:
             raise ValueError("the clearance lease is a claim about time, so it needs the closed-loop fidelity")
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.footprint_undershoot = footprint_undershoot
+        self.child_reports_card_sized_peaks = child_reports_card_sized_peaks
+        self.learned_footprints = learned_footprints
         self.unload_release_delay_seconds = unload_release_delay_seconds
         self.child_evicts_granted_resident = child_evicts_granted_resident
         self.child_unload_leaks_mb = child_unload_leaks_mb
@@ -909,14 +932,17 @@ class _DispatchWorld:
         self._card_runtimes: dict[int, CardRuntime] | None = card_runtimes or None
         self._lane_ceiling = lane_count
         self._lifecycle = _make_mock_lifecycle(self)
+        worker_state = WorkerState()
+        runtime_config = make_test_runtime_config(bridge_data=bridge_data)
+        model_metadata = make_test_model_metadata(reference)
         self._scheduler = InferenceScheduler(
-            state=WorkerState(),
+            state=worker_state,
             process_map=self._process_map,
             horde_model_map=self._model_map,
             job_tracker=self._job_tracker,
             process_lifecycle=self._lifecycle,
-            runtime_config=make_test_runtime_config(bridge_data=bridge_data),
-            model_metadata=make_test_model_metadata(reference),
+            runtime_config=runtime_config,
+            model_metadata=model_metadata,
             card_runtimes=self._card_runtimes,
             max_concurrent_inference_processes=max_threads,
             max_inference_processes=lane_count,
@@ -934,6 +960,29 @@ class _DispatchWorld:
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
+        # The learned-footprint feed, through the production observers: the children's per-tick memory reports
+        # go through the real dispatcher into a store the scheduler prices from, so a row can say what the
+        # parent learns from what its children report, and what that learning does to admission.
+        self._footprint_store = LearnedFootprintStore()
+        self._dispatcher = MessageDispatcher(
+            process_map=self._process_map,
+            horde_model_map=self._model_map,
+            job_tracker=self._job_tracker,
+            process_message_queue=Mock(spec=queue.Queue),
+            runtime_config=runtime_config,
+            model_metadata=model_metadata,
+            action_ledger=ActionLedger(),
+            reserve_ledger=self._reserve_ledger,
+            on_unload_vram=Mock(),
+            state=worker_state,
+        )
+        self._dispatcher.set_footprint_store(self._footprint_store)
+        self._scheduler.set_footprint_store(self._footprint_store)
+        self._lane_peak_mb: dict[int, float] = {}
+        """Per lane, the allocator high-water since its last memory report: what a child's peak counter holds."""
+        self._lane_model_state_seen: dict[int, tuple[str | None, ModelLoadState | None]] = {}
+        """Per lane, the (model, load state) its last report carried, so a change anchors the dispatcher's
+        residency settle window the way a child's model-state message does."""
         self._sync_reported_vram()
 
         self._clearance_controllers: dict[int, ClearanceController] = {}
@@ -1313,6 +1362,50 @@ class _DispatchWorld:
             lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
             reported_mb = self._lane_charge_mb(lane.process_id) - self._encode_staging_mb.get(lane.process_id, 0.0)
             lane.process_reserved_mb = int(max(0.0, reported_mb))
+            self._lane_peak_mb[lane.process_id] = max(self._lane_peak_mb.get(lane.process_id, 0.0), reported_mb)
+
+    def _publish_memory_reports(self) -> None:
+        """Send each inference lane's memory report through the dispatcher, once per tick.
+
+        The report carries what a child's reporter thread sends: its allocator reservation and live allocation
+        (equal here, the world has no cache), its high-water since the previous report, and the card's
+        figures. A lane whose model or load state changed since its last report first anchors the dispatcher's
+        residency settle window, as the child's model-state message would have. With
+        ``child_reports_card_sized_peaks`` a sampling lane's high-water is the card's total. A row that did not
+        opt into ``learned_footprints`` publishes nothing, and its scheduler prices from the seeds alone.
+        """
+        if not self.learned_footprints:
+            return
+        for lane in self._process_map.values():
+            if lane.process_type is not HordeProcessType.INFERENCE:
+                continue
+            model_info = self._model_map.root.get(lane.loaded_horde_model_name or "")
+            model_state = (lane.loaded_horde_model_name, model_info.horde_model_load_state if model_info else None)
+            if self._lane_model_state_seen.get(lane.process_id) != model_state:
+                self._lane_model_state_seen[lane.process_id] = model_state
+                self._dispatcher._last_model_load_change_at[lane.process_id] = self.now
+            reserved_mb = lane.process_reserved_mb or 0
+            # A lane holding its checkpoint in host RAM still has a context and a text encoder on the device,
+            # which is what its allocator reports; the world's ledger does not charge that small tenancy.
+            allocated_mb = reserved_mb or (_STAGED_LANE_ALLOCATED_MB if lane.process_id in self._staged_mb else 0)
+            peak_mb = self._lane_peak_mb.pop(lane.process_id, float(reserved_mb))
+            if self.child_reports_card_sized_peaks and lane.is_process_busy():
+                peak_mb = self._card_totals[lane.device_index]
+            self._dispatcher._handle_memory_report(
+                HordeProcessMemoryMessage(
+                    process_id=lane.process_id,
+                    process_launch_identifier=lane.process_launch_identifier,
+                    info="Memory report",
+                    ram_usage_bytes=0,
+                    vram_usage_mb=lane.vram_usage_mb,
+                    vram_total_mb=lane.total_vram_mb,
+                    process_reserved_mb=reserved_mb,
+                    process_allocated_mb=int(allocated_mb),
+                    process_peak_reserved_mb=int(peak_mb),
+                    sampled_at=self.now,
+                    held_components=lane.held_components,
+                ),
+            )
 
     # -- seeding ------------------------------------------------------------------------------------------
 
@@ -2286,6 +2379,7 @@ class _DispatchWorld:
             await self._complete_finished_samplers()
         await self._drain_post_processing()
         await self._drain_safety()
+        self._publish_memory_reports()
         self._begin_arbiter_cycle()
         if self.closed_loop:
             # The parent samples the governor on its resource-monitor cadence; driven here between the frozen
@@ -2641,6 +2735,11 @@ class _DispatchWorld:
     def job_tracker(self) -> JobTracker:
         """The tracker the scheduler shares."""
         return self._job_tracker
+
+    @property
+    def footprint_store(self) -> LearnedFootprintStore:
+        """The learned-footprint store the children's reports feed and the scheduler prices from."""
+        return self._footprint_store
 
     @property
     def governor_states(self) -> list[GovernorState]:

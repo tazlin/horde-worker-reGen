@@ -141,6 +141,10 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FootprintStage,
+    plausible_activation_ceiling_mb,
+)
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
@@ -2921,3 +2925,195 @@ async def test_r_defect_reinjection_a_waiter_charged_its_own_staging_waits_out_i
         f"the wedge costs a full {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s of dead card time per job; "
         f"this run reached sampling on tick {dispatch_tick}, inside the timeout. {world.state_dump()}"
     )
+
+
+# --------------------------------------------------------------------------------------------------------
+# What the parent learns from its children's memory reports
+# --------------------------------------------------------------------------------------------------------
+
+_FOOTPRINT_ROTATION = (_SDXL, _SD15)
+"""Two checkpoints a 24 GB card holds at once, so every job of the run is priced from the same two keys."""
+
+_FOOTPRINT_JOBS = 16
+_FOOTPRINT_TICKS = 200
+
+
+def _footprint_world(*, child_reports_card_sized_peaks: bool) -> _DispatchWorld:
+    """A 24 GB card with two lanes and serial sampling, the shape the learned store prices every job on."""
+    return _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=_QUEUE_DEPTH,
+        whole_card_enabled=False,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+        learned_footprints=True,
+        child_reports_card_sized_peaks=child_reports_card_sized_peaks,
+    )
+
+
+async def _drive_footprint_rotation(world: _DispatchWorld) -> list[ImageGenerateJobPopResponse]:
+    """Keep ``world`` fed with the rotation for the run and return every job it was given."""
+    jobs: list[ImageGenerateJobPopResponse] = []
+    for _ in range(_FOOTPRINT_TICKS):
+        while len(world.job_tracker.jobs_pending_inference) < _QUEUE_DEPTH and len(jobs) < _FOOTPRINT_JOBS:
+            model = _FOOTPRINT_ROTATION[len(jobs) % len(_FOOTPRINT_ROTATION)]
+            job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=30)
+            await world.pop(job)
+            jobs.append(job)
+        await world.step()
+    return jobs
+
+
+def _sampled_count(world: _DispatchWorld, jobs: list[ImageGenerateJobPopResponse]) -> int:
+    return sum(1 for job in jobs if world.dispatch_tick(job) is not None)
+
+
+async def test_s_card_sized_child_peaks_do_not_price_the_next_job_at_the_card() -> None:
+    """A child whose allocator high-water is the whole card must not teach the parent that its job costs that.
+
+    The failure this encodes: the parent learns each job's sampling peak from the child's allocator high-water
+    since its last report, keyed by baseline and resolution band. That counter is the process's, not the
+    job's: a process that overflowed on WDDM, or that kept another checkpoint cached beside the job, reports
+    the size of the card. The learned watermark only rises and is persisted, so one such report priced every
+    later job of that key at the whole card. On a card that was nine-tenths free, every preload was deferred
+    against room it could not find, the dispatch reservation of the running job was booked at the same figure,
+    and the worker ran serial model swaps at less than half its throughput until the operator disabled the
+    budget.
+
+    Read as one statement: what a child reports above what the card can give a process is not evidence about
+    the job. Its consequences are that a run whose children report card-sized peaks samples the same work as a
+    run whose children report the truth, and that no learned sampling peak sits above the card's ceiling.
+    """
+    truthful = _footprint_world(child_reports_card_sized_peaks=False)
+    polluted = _footprint_world(child_reports_card_sized_peaks=True)
+
+    truthful_jobs = await _drive_footprint_rotation(truthful)
+    polluted_jobs = await _drive_footprint_rotation(polluted)
+
+    context = "card-sized child peaks"
+    ceiling_mb = plausible_activation_ceiling_mb(_CARD_24GB.total_mb)
+    assert ceiling_mb is not None
+    truthful_peaks = {
+        key: observation.watermark_mb
+        for key, observation in truthful.footprint_store._observations.items()
+        if key.stage is FootprintStage.SAMPLE
+    }
+    assert truthful_peaks, f"{context}: the truthful run learned no sampling peak at all, so the feed is not wired"
+    polluted_peaks = {
+        key: observation.watermark_mb
+        for key, observation in polluted.footprint_store._observations.items()
+        if key.stage is FootprintStage.SAMPLE
+    }
+    assert all(peak <= ceiling_mb for peak in polluted_peaks.values()), (
+        f"{context}: a learned sampling peak sits above the card's {ceiling_mb:.0f} MB ceiling: {polluted_peaks}"
+    )
+    assert _sampled_count(truthful, truthful_jobs) == _FOOTPRINT_JOBS, (
+        f"{context}: the truthful run itself did not sample its work. {truthful.state_dump()}"
+    )
+    assert _sampled_count(polluted, polluted_jobs) == _sampled_count(truthful, truthful_jobs), (
+        f"{context}: the polluted run sampled {_sampled_count(polluted, polluted_jobs)} jobs against the "
+        f"truthful run's {_sampled_count(truthful, truthful_jobs)}. {polluted.state_dump()}"
+    )
+
+
+_RESIDENT_SETTLE_TICKS = 20
+"""Enough ticks for an idle lane's reports to clear the observer's settle window and its observation floor."""
+
+
+def _staged_heavy_world() -> _DispatchWorld:
+    """A 16 GB card whose first lane holds the extra-large checkpoint in host RAM beside a resident SDXL."""
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=True,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+        clearance_lease=True,
+        learned_footprints=True,
+    )
+    world.seed_resident(0, _FLUX, in_vram=False)
+    world.seed_resident(1, _SDXL, in_vram=True)
+    return world
+
+
+async def test_t_a_checkpoint_staged_in_host_ram_is_not_measured_as_resident() -> None:
+    """An idle lane holding its checkpoint in host RAM teaches the parent nothing about the checkpoint's cost.
+
+    The failure this encodes: under the clearance lease a lane keeps its checkpoint in host RAM between jobs
+    and names it as loaded, while its allocator holds a context and a text encoder. The resident-footprint
+    observer read the slot as idle and model-loaded and recorded that allocation, report after report, as what
+    the checkpoint costs the card at rest. Hundreds of those readings made a whole-card model measure at a
+    tenth of its weights, which retired its whole-card claim and admitted it beside siblings it could not fit
+    with; every attempt then ran out of memory.
+
+    Read as one statement: a model is resident when its weights are on the card, not when a slot names it. Its
+    consequences are that the store holds no resident figure for the staged checkpoint after the lane has sat
+    idle past every settle and observation floor, and that the forecast for a job of that model still claims
+    the card, exactly as it would with nothing measured.
+    """
+    world = _staged_heavy_world()
+    # The model has run here before, so only the observer's residency gate stands between the reading and the
+    # forecast.
+    world.job_tracker.record_model_inference_success(_FLUX.name)
+
+    await world.run(_RESIDENT_SETTLE_TICKS)
+
+    context = "checkpoint staged in host RAM"
+    resident_keys = [
+        key
+        for key in world.footprint_store._observations
+        if key.stage is FootprintStage.RESIDENT and key.checkpoint == _FLUX.name
+    ]
+    assert resident_keys == [], (
+        f"{context}: the store learned a resident cost for a checkpoint whose weights never reached the card: "
+        f"{[(key, world.footprint_store.get_observation(key)) for key in resident_keys]}"
+    )
+    job = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=20)
+    forecast = world.scheduler._forecast_streaming(job, str(_FLUX.baseline))
+    assert forecast.measured_footprint_mb is None, (
+        f"{context}: the forecast was handed a measured figure of {forecast.measured_footprint_mb} MB"
+    )
+    assert forecast.needs_exclusive_residency is True, f"{context}: the whole-card claim was retired. {forecast}"
+
+
+_CREDIT_TICKS = 10
+"""Ticks the staged head is watched for: well inside the lease-acquire timeout, so a grant within them is a
+clearance the price admitted, never the timeout's unpriced sampling."""
+
+
+async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded() -> None:
+    """A job staged under the lease is priced at its full peak at clearance, not at its activation alone.
+
+    The failure this encodes: dispatch under the lease stages a job with its weights in host RAM, and the child
+    marks the model in use as soon as it takes the job. The clearance re-price read that state as the weights
+    being resident, credited them out of the candidate, and priced a whole-card model at its activation only.
+    Against a card holding a sibling checkpoint that was room to spare, so the grant went out and the load ran
+    the card out of memory.
+
+    Read as one statement: weights count as resident when they are on the card, and a primed lane's are not.
+    Its consequence is that the staged head is not granted clearance while the sibling's weights still occupy
+    the room its full peak needs, whatever the map says about the model being in use.
+    """
+    world = _staged_heavy_world()
+    # The sibling's unload returns nothing, so no eviction can make the room; a grant would have to come from
+    # the price.
+    world.child_unload_leaks_mb = _SDXL.weights_mb
+    head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=20)
+    await world.pop(head)
+
+    for _ in range(_CREDIT_TICKS):
+        await world.step()
+
+    context = "staged head credited with unloaded weights"
+    assert head in world.job_tracker.jobs_in_progress, f"{context}: the head was never staged. {world.state_dump()}"
+    granted = [grant for grant in world.clearance_grants if grant[2] == str(head.id_)]
+    assert granted == [], (
+        f"{context}: the head was cleared on tick {granted[0][0]} with the sibling's {_SDXL.weights_mb:.0f} MB "
+        f"still on a {_CARD_16GB.total_mb:.0f} MB card, which only a credit for weights in host RAM prices as "
+        f"fitting. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(head) is None, f"{context}: the head sampled without a grant. {world.state_dump()}"
