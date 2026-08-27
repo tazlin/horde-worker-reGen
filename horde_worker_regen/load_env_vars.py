@@ -132,88 +132,22 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
     apply_beta_model_env_defaults(config.get("api_key"))
 
 
-LEGACY_HUB_CACHES_ENV_VAR = "AIWORKER_HF_LEGACY_HUB_CACHES"
-"""Where the HuggingFace hub cache resolved before isolation took over, ``os.pathsep``-joined.
-
-Set by :func:`apply_huggingface_cache_isolation` for the download process, which moves the annotator
-entries a worker fetched into one of these locations before the cache was isolated."""
-
-
-def _legacy_hub_cache_dirs(*, target_hub_dir: str) -> list[str]:
-    """The hub cache directories a pre-isolation worker may have populated, excluding the target itself.
-
-    An ambient ``HF_HUB_CACHE``/``HUGGINGFACE_HUB_CACHE`` names the hub directory outright; an ambient
-    ``HF_HOME`` holds it under ``hub``; and with none of them set the hub used its own default under the
-    user's cache directory (``XDG_CACHE_HOME`` or ``~/.cache``).
-    """
-    candidates: list[str] = []
-    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
-        value = os.environ.get(name)
-        if value:
-            candidates.append(value)
-    ambient_home = os.environ.get("HF_HOME")
-    if ambient_home:
-        candidates.append(os.path.join(ambient_home, "hub"))
-    user_cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    candidates.append(os.path.join(user_cache, "huggingface", "hub"))
-    target = os.path.normcase(os.path.normpath(target_hub_dir))
-    seen: set[str] = set()
-    legacy: list[str] = []
-    for candidate in candidates:
-        key = os.path.normcase(os.path.normpath(candidate))
-        if key == target or key in seen:
-            continue
-        seen.add(key)
-        legacy.append(candidate)
-    return legacy
-
-
-HUGGING_FACE_CACHE_ENV_VARS: tuple[str, ...] = ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")
-"""The variables the HuggingFace stack reads its cache location from; the later two outrank ``HF_HOME``."""
-
-HUGGINGFACE_HOME_DIRNAME = "hf_transformers"
-"""The worker-wide HuggingFace home under ``AIWORKER_CACHE_HOME``.
-
-The name is ``horde_safety``'s: it has always put the safety models' transformers cache there when it found a
-cache root and no ``HF_HOME``, so every existing worker already holds those weights at this location. Sharing
-it, rather than naming a second isolated directory, is what lets the whole worker use one hub cache without
-any process fetching again what another already has."""
-
-
-def huggingface_home_for(cache_home: str) -> str:
-    """The worker-wide ``HF_HOME`` for a cache root."""
-    return os.path.join(cache_home, HUGGINGFACE_HOME_DIRNAME)
-
-
 def apply_huggingface_cache_isolation() -> None:
-    """Point the HuggingFace stack at the worker-wide cache under ``AIWORKER_CACHE_HOME``, process-wide.
+    """Point the HuggingFace stack at the shared cache under ``AIWORKER_CACHE_HOME``, process-wide.
 
-    ``AIWORKER_CACHE_HOME`` is the operator's promise that every model file the worker fetches lands under one
-    root. The transformers-backed ControlNet annotators (MiDaS, ZoeDepth, depth-anything, OneFormer) fetch
-    through the HuggingFace hub cache, which defaults to the home drive and is outranked by an ambient
-    ``HF_HUB_CACHE``/``HUGGINGFACE_HUB_CACHE``, so those variables are replaced rather than merely warned
-    about. Applied here, before any child spawns, so the download, inference and safety processes share one
-    cache (:data:`HUGGINGFACE_HOME_DIRNAME`); a process that resolved its own would keep a second cache on
-    another volume, and an annotator verified in one process would then be fetched again by the next. The
-    utilities process keeps its own isolated location by its own policy.
+    The rule and its implementation belong to :func:`hordelib.preload.apply_huggingface_cache_isolation`,
+    because hordelib is what actually reads that cache: the transformers-backed ControlNet annotators fetch
+    through it, and hordelib's verify marker records which cache a verify ran against. Two definitions of
+    "where the hub cache lives" would let the worker and a bare hordelib process (its own test suite, a
+    script) disagree, and each one's annotator run would then read the other's marker as stale and refetch.
 
-    A no-op without ``AIWORKER_CACHE_HOME``, in which case the hub stack keeps its own defaults.
+    Called here, before any child spawns, so the download, inference and safety processes inherit one cache;
+    the utilities process keeps its own isolated location by its own policy. Imported lazily so worker
+    startup does not pull hordelib in just to read the environment.
     """
-    cache_home = os.environ.get("AIWORKER_CACHE_HOME")
-    if not cache_home:
-        return
-    huggingface_home = huggingface_home_for(cache_home)
-    overridden = [name for name in HUGGING_FACE_CACHE_ENV_VARS if os.environ.get(name) not in (None, huggingface_home)]
-    legacy_hub_dirs = _legacy_hub_cache_dirs(target_hub_dir=os.path.join(huggingface_home, "hub"))
-    for name in HUGGING_FACE_CACHE_ENV_VARS:
-        os.environ.pop(name, None)
-    os.environ["HF_HOME"] = huggingface_home
-    os.environ[LEGACY_HUB_CACHES_ENV_VAR] = os.pathsep.join(legacy_hub_dirs)
-    if overridden:
-        logger.warning(
-            f"Overriding ambient {', '.join(overridden)}: AIWORKER_CACHE_HOME isolation owns the HuggingFace "
-            f"cache location ({huggingface_home}).",
-        )
+    from hordelib.preload import apply_huggingface_cache_isolation as isolate_huggingface_cache
+
+    isolate_huggingface_cache()
 
 
 def apply_beta_model_env_defaults(api_key: str | None = None) -> None:

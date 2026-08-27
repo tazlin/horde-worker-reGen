@@ -1158,6 +1158,7 @@ class TestFirstClassAnnotators:
         monkeypatch.setenv("HF_HOME", str(hf_home))
         monkeypatch.setenv("AIWORKER_HF_LEGACY_HUB_CACHES", str(tmp_path / "legacy" / "hub"))
         fake_preload = types.ModuleType("hordelib.preload")
+        fake_preload.LEGACY_HUB_CACHES_ENV_VAR = "AIWORKER_HF_LEGACY_HUB_CACHES"  # type: ignore[attr-defined]
         fake_preload.TRANSFORMERS_ANNOTATOR_REPOS = ("Intel/zoedepth-nyu-kitti",)  # type: ignore[attr-defined]
         fake_preload.annotator_verify_marker_predates_location_key = lambda: marker_is_old  # type: ignore[attr-defined]
         fake_preload.annotator_verify_marker_hub_cache_dir = lambda: marker_hub_dir  # type: ignore[attr-defined]

@@ -50,7 +50,6 @@ from multiprocessing.synchronize import Lock, Semaphore
 from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
-from horde_worker_regen.load_env_vars import LEGACY_HUB_CACHES_ENV_VAR
 from horde_worker_regen.model_download_core import (
     UNKNOWN_DOWNLOAD_HOST,
     ChunkPacer,
@@ -1946,6 +1945,7 @@ class HordeDownloadProcess(HordeProcess):
             return
         try:
             from hordelib.preload import (
+                LEGACY_HUB_CACHES_ENV_VAR,  # pyrefly: ignore[missing-module-attribute]
                 TRANSFORMERS_ANNOTATOR_REPOS,  # pyrefly: ignore[missing-module-attribute]
                 annotator_verify_marker_hub_cache_dir,  # pyrefly: ignore[missing-module-attribute]
                 annotator_verify_marker_predates_location_key,  # pyrefly: ignore[missing-module-attribute]
