@@ -176,7 +176,18 @@ The arbiter keeps four concerns deliberately separate:
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
     atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration
-    instead of re-learning it; a missing or corrupt file starts cold.
+    instead of re-learning it; a missing, corrupt, or older-schema file starts cold.
+
+    Every feeder reads a per-process allocator counter, and a process can hold things its key does not
+    describe, so each reading is bounds-checked before the store accepts it (the `plausible_min_mb` and
+    `plausible_max_mb` arguments of `LearnedFootprintStore.observe_peak`). An activation reading above the
+    card total minus the admission noise buffer (`plausible_activation_ceiling_mb`) is dropped: a process only
+    gets there by overflowing on WDDM or by caching other checkpoints, and one such reading in a watermark
+    that only rises prices every later job of that key at the whole card and defers preloads against room
+    that exists. A resident reading below the checkpoint's weight bytes (`predict_model_weight_mb`) is
+    dropped: a file cannot be resident in less than its size, and a run that block-swapped most of it
+    measured only the part that fit. The schema version was bumped with the bounds so files written without
+    them are discarded rather than trusted.
 
     Not every footprint is an activation peak. The same store also carries two at-rest stages under the same
     raise-only contract: `RESIDENT` (a loaded checkpoint's weights, keyed per checkpoint rather than per
@@ -185,9 +196,12 @@ The arbiter keeps four concerns deliberately separate:
     bookkeeping only, as the process's own reservation plus the platform's fixed CUDA-context constant;
     device-view VRAM readings are never folded in, since they report device-wide occupancy on one platform
     and a per-process view on the other. The gates are strict in both cases, because a raise-only watermark
-    keeps whatever it is given: a resident observation is taken only from an idle, model-loaded inference
-    slot with no tracked job of its own in progress whose residency has been stable for a short settle
-    window (a reservation is still in motion for seconds around a model load), and a safety observation only
+    keeps whatever it is given: a resident observation is taken only from an idle inference slot with no
+    tracked job of its own in progress, whose residency has been stable for a short settle window (a
+    reservation is still in motion for seconds around a model load), and whose model is actually in VRAM by
+    the same check admission uses to credit resident weights (`HordeModelMap.weights_resident_on_process`:
+    retention first, then the map's VRAM states, and never a lane primed under the clearance lease, whose
+    weights stay in system RAM until it is cleared); and a safety observation only
     from a safety process that is not mid-evaluation, folding its steady reservation rather than its peak,
     because an evaluation's spike is reclaimable and is not what safety costs the card while it waits.
 
@@ -228,7 +242,11 @@ The arbiter keeps four concerns deliberately separate:
     (room for a context, not for a whole sibling model), and deliberately so: the premise of tearing the
     siblings down is that the card is full, and the measurement is what shows it is not. The retirement is
     logged once per model, with the figure and the number of runs behind it, through the stream-forecast
-    diagnostic. Without measurements nothing changes.
+    diagnostic. Without measurements nothing changes. This is why the resident observer's gates matter: a
+    slot holding its checkpoint in system RAM reports a nearly empty allocator, and hundreds of those readings
+    recorded as the checkpoint's resident cost would retire the whole-card claim of a model that needs the
+    whole card and admit it beside siblings it cannot fit with. The residency check and the weight-bytes
+    floor above keep those readings out of the store.
 - **Arbitration** evaluates the
   [ledger-driven admission identity][horde_worker_regen.process_management.resources.admission_identity]
   plus the concurrent-sampling headroom, then resolves an actuator escalation ladder. It never overcommit-admits

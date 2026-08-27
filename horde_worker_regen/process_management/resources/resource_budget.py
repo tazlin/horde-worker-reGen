@@ -833,15 +833,25 @@ def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None
     :func:`predict_job_footprint_mb` instead. Imported from the torch-free ``feature_impact`` submodule,
     not the ``hordelib.api`` facade, so the orchestrator stays torch-free. Never raises.
     """
+    return predict_model_weight_mb(job.model, baseline)
+
+
+def predict_model_weight_mb(model_name: str | None, baseline: str | None) -> float | None:
+    """Return a checkpoint's core (diffusion) resident weight footprint (MB), or None when unestimable.
+
+    The same estimate as :func:`predict_job_weight_mb` without a job: weights depend on the file, not the
+    request, so a caller that only has a model name (the resident-footprint observer checking whether a
+    reading can describe the checkpoint) gets the same per-baseline seed and per-model override. Never raises.
+    """
     if baseline is None:
         return None
     try:
-        entry = baseline_burden_entry(str(baseline), job.model)
+        entry = baseline_burden_entry(str(baseline), model_name)
         if entry is None:
             return None
         return float(entry.resident_weight_estimate_mb())
     except Exception as e:
-        logger.debug(f"Job weight estimate failed for {baseline!r}: {type(e).__name__} {e}")
+        logger.debug(f"Model weight estimate failed for {baseline!r}: {type(e).__name__} {e}")
         return None
 
 

@@ -50,7 +50,21 @@ from typing import Protocol
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
+from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
+
+
+def plausible_activation_ceiling_mb(total_vram_mb: float | None) -> float | None:
+    """Return the largest activation peak (MB) one process can plausibly reach on a card, or None.
+
+    This is the card total minus the admission noise buffer, the margin admission always keeps free. A
+    process only reads above it when it has overflowed (WDDM pages to host RAM rather than failing the
+    allocation) or when it is caching other checkpoints alongside the job. Returns None when the card total
+    is not known yet, so the caller applies no bound rather than a guessed one.
+    """
+    if total_vram_mb is None or total_vram_mb <= 0:
+        return None
+    return total_vram_mb - admission_noise_buffer_mb(total_vram_mb)
 
 
 class MeasuredJobFootprint(Protocol):
@@ -98,8 +112,12 @@ class MeasuredJobFootprint(Protocol):
         """``whole_job`` for a monolithic run, ``sample_stage`` for a disaggregated sampler stage."""
 
 
-FOOTPRINT_STORE_SCHEMA_VERSION = 1
-"""Bumped when the persisted schema changes incompatibly; an older file is discarded on read."""
+FOOTPRINT_STORE_SCHEMA_VERSION = 2
+"""Bumped when the file format changes, or when observations written by an older build can no longer be trusted.
+A file with another version is discarded on read. Version 2 drops files written before observations were
+bounds-checked (see :meth:`LearnedFootprintStore.observe_peak`): those can hold activation watermarks at the
+size of the card and resident figures smaller than the checkpoint's weights, and since watermarks only ever
+rise, the store would price from them forever."""
 
 FOOTPRINT_STORE_FILENAME = "vram_footprints.json"
 """Name of the persisted store inside the worker's app-state directory (beside ``perf_model.json``)."""
@@ -330,19 +348,51 @@ class LearnedFootprintStore:
         self._file_disabled = False
         self._load()
 
-    def observe_peak(self, key: FootprintKey, peak_reserved_mb: float) -> None:
+    def observe_peak(
+        self,
+        key: FootprintKey,
+        peak_reserved_mb: float,
+        *,
+        plausible_min_mb: float | None = None,
+        plausible_max_mb: float | None = None,
+    ) -> None:
         """Fold one observed device-memory figure into the running statistics for ``key``.
 
         Updates both an EWMA (alpha ``0.3``, smoothed central tendency for observability) and a
         max-watermark (the estimate's undershoot-proof basis). A non-positive figure is ignored: a zero or
         negative reading carries no footprint information and would only pollute the average.
 
+        A reading outside the caller's bounds is dropped. The bounds are facts the feeder knows and the store
+        does not: a checkpoint cannot be resident in less than its own weight bytes, and a job cannot peak
+        above what the card can give one process. Feeders read a per-process allocator counter, and that
+        counter can include things the key does not describe: an idle slot with its weights staged in system
+        RAM reports a nearly empty allocator against a resident key, and a process whose allocator grew to the
+        size of the card reports that against a per-job activation key. Because the watermark only rises and
+        is persisted, one such reading misprices its key for every later admission. Dropping it here keeps
+        every entry describing the key it is filed under.
+
         Args:
             key (FootprintKey): The footprint identity to record under.
             peak_reserved_mb (float): The device memory (MB) observed for this key: the reserved peak for an
                 activation stage, the steady reserved figure for a resident stage.
+            plausible_min_mb (float | None): The smallest reading that can describe this key (a resident
+                stage's weight bytes), or None for no floor.
+            plausible_max_mb (float | None): The largest reading that can describe this key (the card total
+                minus its noise buffer), or None for no ceiling.
         """
         if peak_reserved_mb <= 0:
+            return
+        if plausible_min_mb is not None and peak_reserved_mb < plausible_min_mb:
+            logger.trace(
+                f"Learned footprint {key.stage}/{key.checkpoint or key.model_baseline}: dropping "
+                f"{peak_reserved_mb:.0f} MB below the plausible floor {plausible_min_mb:.0f} MB.",
+            )
+            return
+        if plausible_max_mb is not None and peak_reserved_mb > plausible_max_mb:
+            logger.trace(
+                f"Learned footprint {key.stage}/{key.checkpoint or key.model_baseline}: dropping "
+                f"{peak_reserved_mb:.0f} MB above the plausible ceiling {plausible_max_mb:.0f} MB.",
+            )
             return
 
         existing = self._observations.get(key)
@@ -372,6 +422,7 @@ class LearnedFootprintStore:
         baseline: str | None,
         platform: str,
         context_constant_mb: float = 0.0,
+        resident_floor_mb: float | None = None,
     ) -> list[FootprintKey]:
         """Fold a child's measured per-job footprint into every key it can be attributed to.
 
@@ -380,7 +431,10 @@ class LearnedFootprintStore:
         (``peak_resident_weights_mb``, else ``resident_weights_after_job_mb``) is recorded under
         :attr:`FootprintStage.RESIDENT` for this checkpoint, with ``context_constant_mb`` added so it is in the
         whole-device terms the resident population is already kept in (the caller passes the same platform
-        context charge the reserve uses; the backend measures weights alone).
+        context charge the reserve uses; the backend measures weights alone). ``resident_floor_mb`` is the
+        checkpoint's weight bytes. A resident figure below it is dropped: a run that block-swapped or offloaded
+        most of the file measured only the part that fit, and a model too heavy to sit whole on the card must
+        keep its seed price rather than the price of whatever fraction was loaded at one instant.
 
         The footprint's ``peak_device_used_mb`` is deliberately not folded into the activation keys. It is a
         device-wide high-water, so on a card holding other resident models it carries their weights too; fed
@@ -396,6 +450,7 @@ class LearnedFootprintStore:
             baseline: The model's baseline, resolved by the caller when the footprint does not carry one.
             platform: The host platform token the observation belongs to (``sys.platform``).
             context_constant_mb: The per-process CUDA-context charge to add to the resident figure.
+            resident_floor_mb: The checkpoint's known weight bytes (MB); a resident figure below it is dropped.
 
         Returns:
             list[FootprintKey]: Every key this footprint was recorded under.
@@ -417,8 +472,14 @@ class LearnedFootprintStore:
                 stage=FootprintStage.RESIDENT,
                 checkpoint=footprint.model_name,
             )
-            self.observe_peak(resident_key, float(resident_mb) + max(0.0, context_constant_mb))
-            written.append(resident_key)
+            before = self.observation_count(resident_key)
+            self.observe_peak(
+                resident_key,
+                float(resident_mb) + max(0.0, context_constant_mb),
+                plausible_min_mb=resident_floor_mb,
+            )
+            if self.observation_count(resident_key) > before:
+                written.append(resident_key)
 
         return written
 

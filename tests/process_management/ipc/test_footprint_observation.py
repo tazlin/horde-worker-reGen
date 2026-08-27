@@ -41,6 +41,7 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     platform_context_constant_mb,
+    predict_model_weight_mb,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
     SAFETY_PROCESS_BASELINE,
@@ -520,3 +521,93 @@ def test_metrics_without_a_footprint_are_a_no_op() -> None:
         ),
     )
     assert len(store) == 0
+
+
+def _stage_model_in_ram(dispatcher: MessageDispatcher, process_id: int, *, model: str = _MODEL) -> None:
+    """Drive the child-confirmed load that leaves the checkpoint staged in system RAM (the clearance-lease shape)."""
+    dispatcher._handle_model_state_change(
+        HordeModelStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            info="Model staged",
+            process_state=HordeProcessState.PRELOADED_MODEL,
+            horde_model_name=model,
+            horde_model_state=ModelLoadState.LOADED_IN_RAM,
+        ),
+    )
+
+
+def test_a_slot_holding_its_model_in_system_ram_records_no_resident_footprint() -> None:
+    """Between leased jobs a slot holds its checkpoint staged in RAM; its allocator is not the model's cost."""
+    process_map = ProcessMap({1: make_mock_process_info(1, model_name=_MODEL)})
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
+
+    staged_at = time.time()
+    _stage_model_in_ram(dispatcher, 1)
+    dispatcher._handle_memory_report(
+        _memory_message(1, allocated_mb=1400, sampled_at=staged_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0),
+    )
+
+    assert len(store) == 0
+
+
+def test_a_primed_lane_records_no_resident_footprint() -> None:
+    """A lane primed for a leased job has that job's weights in RAM until clearance, whatever the map reports."""
+    process_map = ProcessMap(
+        {1: make_mock_process_info(1, model_name=_MODEL, state=HordeProcessState.INFERENCE_PRIMED)},
+    )
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
+
+    loaded_at = time.time()
+    _confirm_model_loaded(dispatcher, 1)
+    dispatcher._handle_memory_report(
+        _memory_message(1, allocated_mb=4900, sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0),
+    )
+
+    assert len(store) == 0
+
+
+def test_a_resident_reading_below_the_checkpoint_weights_is_not_attributed() -> None:
+    """A checkpoint cannot sit resident below its own weight bytes; such a reading describes something else."""
+    process_map = ProcessMap({1: make_mock_process_info(1, model_name=_MODEL)})
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=JobTracker(), store=store)
+    weights_mb = predict_model_weight_mb(_MODEL, str(_BASELINE))
+    assert weights_mb is not None
+    assert weights_mb > 0
+
+    loaded_at = time.time()
+    _confirm_model_loaded(dispatcher, 1)
+    dispatcher._handle_memory_report(
+        _memory_message(
+            1,
+            allocated_mb=int(weights_mb / 4),
+            sampled_at=loaded_at + _RESIDENT_OBSERVATION_SETTLE_SECONDS + 1.0,
+        ),
+    )
+
+    assert len(store) == 0
+
+
+async def test_a_sampling_peak_at_the_card_size_is_not_attributed() -> None:
+    """A process whose allocator grew to the card reports that against the running job; the card bounds it."""
+    process_info = make_mock_process_info(1, model_name=_MODEL)
+    job = make_job_pop_response(model=_MODEL, width=1088, height=1088)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    process_map = ProcessMap({1: process_info})
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=job_tracker, store=store)
+
+    sized = _memory_message(1, peak_mb=23604)
+    sized.vram_total_mb = 24576
+    dispatcher._handle_memory_report(sized)
+    assert len(store) == 0
+
+    plausible = _memory_message(1, peak_mb=10654)
+    plausible.vram_total_mb = 24576
+    dispatcher._handle_memory_report(plausible)
+    assert len(store) == 1

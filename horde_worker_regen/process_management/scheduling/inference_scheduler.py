@@ -116,6 +116,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    plausible_activation_ceiling_mb,
 )
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
@@ -5353,39 +5354,18 @@ class InferenceScheduler:
     def _candidate_weights_resident_on_process(self, model_name: str | None, process_id: int | None) -> bool:
         """Whether ``model_name``'s weights already occupy VRAM on ``process_id`` (dispatch materialises nothing).
 
-        The single residency truth two admission concerns share: the resident-weight credit that keeps a
-        candidate delta from re-charging weights the committed floor already counts, and the arbiter's
-        ``candidate_already_resident`` no-op admit. Read primarily from the horde model map's residency state on
-        the matching process. The committed floor charges those weights by the process's own measured
-        reservation, keyed by the process map's ``loaded_horde_model_name``; when the model map's process pointer
-        transiently lags that record the two disagree, so a fallback also credits residency when the target
-        process itself reports this model loaded and the model map agrees the model is VRAM-resident. Aligning
-        the credit with the floor's own truth stops the divergence from double-charging resident weights (once
-        in the committed floor, again as the candidate delta) and wedging a dispatch to an idle resident model.
-
-        The parent's own retention record (``retained_resident_model``) is read first, because it is the only
-        truth that covers a slot holding weights *between* jobs. The model map tracks load transitions a child
-        reports, and a slot that finished a job under a retention grant reports its weights back in system RAM
-        or, on a disaggregated sampler, reports no transition at all: the sample stage emits none, so such a
-        slot never reads as VRAM-resident there however long it holds its UNet. Without this arm every job
-        landing on a retained resident is charged its weights a second time (once through the committed floor
-        that already contains them), which holds a job whose model is on the card at full materialisation
-        price. The credit taken against it is the core weight figure, which is exactly what a component-only
-        (UNet-alone) retention holds.
+        Two admission concerns ask this: the resident-weight credit that stops a candidate delta re-charging
+        weights the committed floor already counts, and the arbiter's ``candidate_already_resident`` no-op
+        admit. Both read
+        :meth:`~horde_worker_regen.process_management.models.horde_model_map.HordeModelMap.weights_resident_on_process`,
+        which the resident-footprint observer also uses, so admission and the learned store agree on what is
+        on the card. Without the credit, a job landing on a retained resident would be charged its weights
+        twice (the committed floor already holds them) and held at full price although its model is loaded.
+        The credit is the core weight figure, which is what a component-only (UNet-alone) retention holds.
         """
-        if model_name is None or process_id is None:
+        if process_id is None:
             return False
-        retainer = self._process_map.get(process_id)
-        if retainer is not None and retainer.retained_resident_model == model_name:
-            return True
-        model_info = self._horde_model_map.root.get(model_name)
-        model_map_says_vram_resident = model_info is not None and model_info.horde_model_load_state in (
-            ModelLoadState.LOADED_IN_VRAM,
-            ModelLoadState.IN_USE,
-        )
-        if model_info is not None and model_info.process_id == process_id and model_map_says_vram_resident:
-            return True
-        return retainer is not None and retainer.loaded_horde_model_name == model_name and model_map_says_vram_resident
+        return self._horde_model_map.weights_resident_on_process(model_name, self._process_map.get(process_id))
 
     def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
         """Inject the single VRAM arbiter: the preload-admission authority and the observational overlay elsewhere."""
@@ -5572,8 +5552,8 @@ class InferenceScheduler:
         figure is the pinned sampler process's latest reported ``process_peak_reserved_mb`` at sample completion:
         it is the allocator high-water since the process's previous memory report, so it can lag the true
         sampling peak by up to one report interval, but it is the best-attributable reading at this seam.
-        Raise-only semantics apply (a non-positive reading is ignored by the store); a store-less, unkeyable, or
-        model-less job is a no-op.
+        Raise-only semantics apply (a non-positive reading, or one above what the card can hand a process, is
+        ignored by the store); a store-less, unkeyable, or model-less job is a no-op.
         """
         store = self._footprint_store
         if store is None:
@@ -5588,7 +5568,11 @@ class InferenceScheduler:
         )
         if key is None:
             return
-        store.observe_peak(key, peak_reserved_mb)
+        store.observe_peak(
+            key,
+            peak_reserved_mb,
+            plausible_max_mb=plausible_activation_ceiling_mb(self._process_map.get_reported_total_vram_mb()),
+        )
 
     def _gpu_process_activity_ids(self, device_index: int | None) -> tuple[frozenset[int], frozenset[int]]:
         """Return the idle and busy GPU-process ids on a card, for the arbiter's release-cache targeting.

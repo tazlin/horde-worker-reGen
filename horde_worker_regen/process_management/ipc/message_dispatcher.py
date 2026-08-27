@@ -60,6 +60,7 @@ from horde_worker_regen.process_management.models.model_metadata import ModelMet
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     platform_context_constant_mb,
+    predict_model_weight_mb,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
     SAFETY_PROCESS_BASELINE,
@@ -67,6 +68,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    plausible_activation_ceiling_mb,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
@@ -1058,7 +1060,16 @@ class MessageDispatcher:
             platform=sys.platform,
             stage=FootprintStage.SAMPLE,
         )
-        store.observe_peak(key, float(peak_mb))
+        # The reading is the process's allocator high-water, not the job's. A process that cached another
+        # checkpoint, or overflowed on WDDM, reports a figure the size of the card against this job's key, and
+        # the watermark only rises, so the reading is capped at what the card can give one process.
+        store.observe_peak(
+            key,
+            float(peak_mb),
+            plausible_max_mb=plausible_activation_ceiling_mb(
+                self._process_map.get_reported_total_vram_mb(device_index=process_info.device_index),
+            ),
+        )
 
     def _observe_job_footprint(self, message: HordeJobMetricsMessage) -> None:
         """Record a child's measured per-job VRAM footprint into the learned-footprint store.
@@ -1093,6 +1104,7 @@ class MessageDispatcher:
             # The backend measures weights alone; the resident population the store keeps (and every consumer
             # that nets it back out) is in whole-device terms, the process's context included.
             context_constant_mb=platform_context_constant_mb(),
+            resident_floor_mb=predict_model_weight_mb(footprint.model_name, str(baseline) if baseline else None),
         )
 
     def _model_residency_settled(self, process_id: int, *, sampled_at: float | None) -> bool:
@@ -1153,6 +1165,14 @@ class MessageDispatcher:
         if not self._model_residency_settled(message.process_id, sampled_at=message.sampled_at):
             return
 
+        # "Loaded" names the slot's model, not where its weights are. Under the clearance lease a slot keeps
+        # its checkpoint in system RAM between jobs, so its allocator holds a context and at most a text
+        # encoder. Recorded as the checkpoint's resident cost, that figure would contradict the seed and
+        # retire the whole-card claim a heavy model really needs. The check is the same one admission uses to
+        # credit resident weights, so the store only learns what admission would also count.
+        if not self._horde_model_map.weights_resident_on_process(model_name, process_info):
+            return
+
         baseline = self._model_metadata.get_baseline(model_name)
         if baseline is None:
             return
@@ -1164,7 +1184,11 @@ class MessageDispatcher:
             stage=FootprintStage.RESIDENT,
             checkpoint=model_name,
         )
-        store.observe_peak(key, platform_context_constant_mb() + float(allocated_mb))
+        store.observe_peak(
+            key,
+            platform_context_constant_mb() + float(allocated_mb),
+            plausible_min_mb=predict_model_weight_mb(model_name, str(baseline)),
+        )
 
     def _observe_safety_footprint(self, message: HordeProcessMemoryMessage) -> None:
         """Record the safety process's at-rest device footprint into the learned-footprint store.

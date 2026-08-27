@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    plausible_activation_ceiling_mb,
 )
 
 
@@ -478,3 +479,53 @@ class TestPersistence:
         store.observe_peak(_key(), 100.0)
         store.save()
         assert list(tmp_path.iterdir()) == []
+
+
+class TestPlausibilityBounds:
+    """A reading that cannot describe its key is refused at the seam, never folded into a raise-only watermark."""
+
+    def test_a_reading_below_the_floor_is_dropped(self) -> None:
+        """A resident figure under the checkpoint's own weight bytes is not a resident observation."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_resident_key(), 1456.0, plausible_min_mb=19500.0)
+        assert len(store) == 0
+
+    def test_a_reading_above_the_ceiling_is_dropped(self) -> None:
+        """An activation figure at the card's size is an allocator artefact, not a job's peak."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 23044.0, plausible_max_mb=23347.0)
+        assert store.get_observation(_key()) is not None
+        store.observe_peak(_key(bucket=ResolutionBucket.GT_1024), 23604.0, plausible_max_mb=23347.0)
+        assert store.get_observation(_key(bucket=ResolutionBucket.GT_1024)) is None
+
+    def test_a_reading_inside_the_bounds_is_kept(self) -> None:
+        """The bounds only refuse; a plausible reading records exactly as before."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 10654.0, plausible_min_mb=4900.0, plausible_max_mb=23347.0)
+        observation = store.get_observation(_key())
+        assert observation is not None
+        assert observation.watermark_mb == 10654.0
+
+    def test_unbounded_observation_is_unchanged(self) -> None:
+        """A feeder with nothing to bound by (an unsized card, an unpriced checkpoint) keeps the old contract."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 30000.0)
+        assert store.get_observation(_key()) is not None
+
+    def test_job_footprint_resident_figure_below_the_floor_writes_no_key(self) -> None:
+        """A run that block-swapped most of a file measures only what fit; that is not the file's resident cost."""
+        store = LearnedFootprintStore()
+        written = store.observe_job_footprint(
+            _Footprint(peak_resident_weights_mb=1456.0),
+            baseline=None,
+            platform="linux",
+            resident_floor_mb=19500.0,
+        )
+        assert written == []
+        assert len(store) == 0
+
+    def test_activation_ceiling_is_the_card_net_of_its_noise_buffer(self) -> None:
+        """The ceiling is the same margin admission keeps free, and unknown when the card is unsized."""
+        assert plausible_activation_ceiling_mb(None) is None
+        assert plausible_activation_ceiling_mb(0.0) is None
+        assert plausible_activation_ceiling_mb(24576.0) == pytest.approx(24576.0 - 1228.8)

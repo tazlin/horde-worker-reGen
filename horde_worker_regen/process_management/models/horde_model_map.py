@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from loguru import logger
 from pydantic import PrivateAttr, RootModel
 
-from horde_worker_regen.process_management.ipc.messages import ModelInfo, ModelLoadState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelInfo, ModelLoadState
+
+if TYPE_CHECKING:
+    from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 
 
 class HordeModelMap(RootModel[dict[str, ModelInfo]]):
@@ -13,6 +18,40 @@ class HordeModelMap(RootModel[dict[str, ModelInfo]]):
 
     _blank_identity_warned: bool = PrivateAttr(default=False)
     """Whether the refusal to key an entry on a blank model name has already been surfaced."""
+
+    def weights_resident_on_process(self, model_name: str | None, process_info: HordeProcessInfo | None) -> bool:
+        """Whether ``model_name``'s weights are in VRAM on ``process_info``'s slot right now.
+
+        Every consumer answers this question here: the admission resident-weight credit, the arbiter's
+        ``candidate_already_resident`` no-op admit, and the resident-footprint observer. The parent's retention
+        record (``retained_resident_model``) is checked first because it is the only record that covers weights
+        held between jobs: a slot that finished under a retention grant reports its weights back in system
+        RAM, and a disaggregated sampler reports no transition at all.
+
+        Otherwise the map's load state decides, for the matching process. The committed floor charges a slot's
+        weights by the process map's ``loaded_horde_model_name``, and the map's process pointer can briefly lag
+        that record, so a process that itself reports the model loaded is also credited when the map says the
+        model is in VRAM. One map state is not evidence: a lane in ``INFERENCE_PRIMED`` still has its job's
+        weights in system RAM until the clearance lease admits it, but the child marks the model ``IN_USE`` as
+        soon as it takes the job. Crediting that would price the clearance as activation only and admit a
+        whole-card model into a slot that cannot hold it. So a primed lane's job model is never resident
+        unless retention holds it.
+        """
+        if model_name is None or process_info is None:
+            return False
+        if process_info.retained_resident_model == model_name:
+            return True
+        if process_info.last_process_state is HordeProcessState.INFERENCE_PRIMED:
+            return False
+        model_info = self.root.get(model_name)
+        if model_info is None or model_info.horde_model_load_state not in (
+            ModelLoadState.LOADED_IN_VRAM,
+            ModelLoadState.IN_USE,
+        ):
+            return False
+        if model_info.process_id == process_info.process_id:
+            return True
+        return process_info.loaded_horde_model_name == model_name
 
     def update_entry(
         self,
