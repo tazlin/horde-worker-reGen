@@ -426,6 +426,7 @@ _FRIENDLY_BASELINES: dict[str, str] = {
     "flux_dev": "Flux Dev",
     "qwen_image": "Qwen",
     "z_image_turbo": "Z-Image Turbo",
+    "krea2_turbo": "Krea 2 Turbo",
 }
 
 

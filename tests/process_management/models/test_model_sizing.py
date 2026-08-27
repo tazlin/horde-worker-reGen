@@ -30,12 +30,13 @@ class TestNamedCheckpointsAreExtraLarge:
 
 
 class TestExtraLargeBaselines:
-    """The extra-large baselines classify as EXTRA_LARGE, including qwen_image and z_image_turbo."""
+    """The extra-large baselines classify as EXTRA_LARGE, including the split-file turbo checkpoints."""
 
-    def test_qwen_and_z_image_baselines_are_extra_large(self) -> None:
-        """A qwen_image or z_image_turbo baseline resolves to EXTRA_LARGE even when the name is not listed."""
+    def test_split_file_large_baselines_are_extra_large(self) -> None:
+        """A qwen/z-image/krea2 baseline resolves to EXTRA_LARGE even when the name is not listed."""
         assert is_extra_large_model("some_qwen_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.qwen_image.value)
         assert is_extra_large_model("some_z_image_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo.value)
+        assert is_extra_large_model("some_krea2_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo.value)
 
     def test_sdxl_is_not_extra_large(self) -> None:
         """An SDXL model is heavy but shares the card, so it is not EXTRA_LARGE."""

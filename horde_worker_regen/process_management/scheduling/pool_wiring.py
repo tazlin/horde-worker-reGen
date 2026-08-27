@@ -50,6 +50,7 @@ _NATIVE_1024_BASELINES = frozenset(
         "flux_1",
         "qwen_image",
         "z_image_turbo",
+        "krea2_turbo",
     },
 )
 """Baselines whose benchmark and normal operating signature uses a 1024-pixel native square."""

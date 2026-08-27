@@ -26,8 +26,8 @@ class ModelSizeTier(IntEnum):
 
     Ordered so heavier tiers compare greater. ``LIGHT`` jobs (SD1.5/SD2) are cheap enough to sample side by
     side; ``HEAVY`` (SDXL) jobs need the job they would overlap to be well underway first; and ``EXTRA_LARGE``
-    (Cascade/Flux/Qwen/Z-Image and the named VRAM-heavy checkpoints) effectively want the whole card and never
-    share it.
+    (Cascade/Flux/Qwen/Z-Image/Krea2 and the named VRAM-heavy checkpoints) effectively want the whole card and
+    never share it.
     """
 
     LIGHT = 0
@@ -59,6 +59,7 @@ EXTRA_LARGE_BASELINE_VALUES = frozenset(
         KNOWN_IMAGE_GENERATION_BASELINE.flux_dev.value,
         KNOWN_IMAGE_GENERATION_BASELINE.qwen_image.value,
         KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo.value,
     },
 )
 """Baselines that effectively want the whole card and never share it with a concurrent job."""
