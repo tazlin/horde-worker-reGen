@@ -21,12 +21,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from horde_worker_regen.process_management.resources.vram_footprints import FOOTPRINT_STORE_FILENAME
+
 from . import ledger_ingest
-from .bundle import LogBundle
+from .bundle import ROTATION_ABUT_SECONDS, LogBundle
 from .cache_inventory import collect_cache_inventory
 from .correlate import build_session_context
 from .detectors import run_detectors
-from .log_ingest import _read_physical_lines
+from .log_ingest import _read_physical_lines, read_time_range
 from .redaction import Redactor, build_redactor
 from .sessions import WorkerSession, segment_sessions
 from .system_info import (
@@ -48,6 +50,12 @@ _MAX_FILE_BYTES = 15 * 1024 * 1024
 # form. These are older sessions; the active bridge.log (appended across restarts) already covers history,
 # so rotations are excluded by default and included only with --full-logs.
 _ROTATION_TS_RE = re.compile(r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.log$")
+# A parent log rotates by size mid-run, so the active bridge.log of a long session begins hours in and the
+# default bundle loses the session's earlier hours (and, through the stats window, its earlier stats). When
+# the earliest bundled session begins mid-run, this many of the active log's abutting predecessors ship
+# uncapped, oldest first, so the run is whole back to its launch or to this bound. Three rotations at the
+# 15 MB roll size cover most of a day of parent DEBUG output for a few MB compressed.
+_MAX_STITCHED_ROTATIONS = 3
 _APP_STATE_DIRNAME = ".horde_worker_regen"
 _STATS_DIRNAME = "stats"
 # The key the JSONL form of the truncation note is emitted under, so a reader that parses every line as
@@ -92,6 +100,47 @@ def _all_log_files(path: Path, *, include_rotations: bool) -> tuple[Path, list[P
         return path.parent, [path]
     files = sorted(p for p in path.glob("*") if p.is_file() and (include_rotations or not _is_rotation(p)))
     return path, files
+
+
+def _stitched_predecessors(active_log: Path, *, limit: int = _MAX_STITCHED_ROTATIONS) -> list[Path]:
+    """The rotated predecessors of an active parent log that belong to its own run, oldest first.
+
+    Walks back from the active file through same-base rotations, keeping each whose last line abuts the next
+    file's first (a size roll-over mid-run) and stopping at the first that does not (an earlier launch) or at
+    ``limit``. Reads only each archive's first and last timestamps, so the walk stays cheap.
+    """
+    base = _base_log_name(active_log)
+    candidates = sorted(
+        (
+            sibling
+            for sibling in active_log.parent.glob("*")
+            if sibling.is_file()
+            and sibling != active_log
+            and _is_rotation(sibling)
+            and _base_log_name(sibling) == base
+        ),
+        key=lambda path: path.name,
+    )
+    stitched: list[Path] = []
+    later_start, _ = read_time_range(active_log)
+    for candidate in reversed(candidates):
+        if len(stitched) >= limit:
+            break
+        first, last = read_time_range(candidate)
+        if later_start is None or last is None or abs((later_start - last).total_seconds()) > ROTATION_ABUT_SECONDS:
+            break
+        stitched.insert(0, candidate)
+        later_start = first if first is not None else later_start
+    return stitched
+
+
+def _base_log_name(file_path: Path) -> str:
+    """``bridge.2026-06-22_00-55-59_013989.log.zip`` -> ``bridge.log``: the log a rotation was cut from."""
+    name = file_path.name
+    for suffix in (".zip", ".gz"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return _ROTATION_TS_RE.sub(".log", name)
 
 
 def _member_name(file_path: Path, logs_root: Path) -> str:
@@ -249,6 +298,18 @@ def build_support_bundle(
     log_bundle = LogBundle.from_path(path, active_only=not full_logs)
     sessions = segment_sessions(log_bundle.orchestrator_records())
     selected = _select_sessions(sessions, last=last, index=session_index)
+    # A session that begins mid-run in the active log continues back through the rotations the size
+    # roll-over cut it from. Ship those (bounded, uncapped) so the run's earlier hours are not lost to
+    # the default bundle, and let the stats window reach back to where the shipped evidence starts.
+    stitched_rotations: list[Path] = []
+    if not full_logs and any(s.start_is_lower_bound for s in selected):
+        for active_log in log_bundle.active_orchestrator_paths():
+            stitched_rotations.extend(_stitched_predecessors(active_log))
+    evidence_start = min((s.start_ts for s in sessions if s.start_ts is not None), default=None)
+    for rotation in stitched_rotations:
+        first, _ = read_time_range(rotation)
+        if first is not None and (evidence_start is None or first < evidence_start):
+            evidence_start = first
     redactor = _make_redactor(config_path, redact_identifiers=redact_identifiers)
     cache_home = resolve_cache_home(config_path)
 
@@ -285,9 +346,13 @@ def build_support_bundle(
         # (driver CUDA ceiling, GPU compute capability, what the arch clamp did). These pin down a
         # wrong-CUDA-build install, which the logs otherwise surface only as a downstream runtime fault.
         install_root = config_path.resolve().parent
+        # The learned VRAM footprint store is what priced every admission and residency verdict in the logs
+        # (a defer line names the room, the store names the charge), so a bundle without it leaves the
+        # arithmetic behind a hold unreadable.
         for source, member in (
             (install_root / "bin" / "backend", "config/backend"),
             (install_root / "bin" / "backend-decision.json", "config/backend-decision.json"),
+            (install_root / _APP_STATE_DIRNAME / FOOTPRINT_STORE_FILENAME, f"config/{FOOTPRINT_STORE_FILENAME}"),
         ):
             if source.is_file():
                 _write(zf, member, source.read_text(encoding="utf-8", errors="replace"))
@@ -299,9 +364,7 @@ def build_support_bundle(
         # Retained stats can span months of sessions at several MB each; only the files still being written
         # once the bundled sessions began say anything about them. A modification time is the cheap, stamp-
         # agnostic test for that, and --full-logs ships the whole retention as it does the log rotations.
-        stats_since = (
-            None if full_logs else min((s.start_ts for s in sessions if s.start_ts is not None), default=None)
-        )
+        stats_since = None if full_logs else evidence_start
         used_stats_names: set[str] = set()
         for stats_path in _find_stats_files(log_bundle.root, modified_since=stats_since):
             name = _stats_member_name(stats_path)
@@ -318,7 +381,8 @@ def build_support_bundle(
         # reduce to the same `.log` name) does not collide in the archive.
         logs_root, log_files = _all_log_files(path, include_rotations=full_logs)
         used_names: set[str] = set()
-        for file_path in log_files:
+        uncapped = set(stitched_rotations)
+        for file_path in [*stitched_rotations, *log_files]:
             name = _member_name(file_path, logs_root)
             if name in used_names:
                 stem, _, ext = name.rpartition(".")
@@ -327,7 +391,7 @@ def build_support_bundle(
                     index += 1
                 name = f"{stem}.{index}.{ext}"
             used_names.add(name)
-            _write(zf, name, _read_log_text(file_path, cap=not full_logs))
+            _write(zf, name, _read_log_text(file_path, cap=not full_logs and file_path not in uncapped))
 
         # Manifest + README last, now that we know the member list and redaction total.
         manifest = {
@@ -338,6 +402,7 @@ def build_support_bundle(
                 "sessions": "all" if session_index is None and not last else ("last" if last else session_index),
                 "session_count": len(selected),
                 "full_logs": full_logs,
+                "stitched_rotations": [_member_name(p, logs_root) for p in stitched_rotations],
                 "cache_inventory": cache_inventory,
                 "gpu_probed": probe_gpu,
                 "identifiers_redacted": redact_identifiers,

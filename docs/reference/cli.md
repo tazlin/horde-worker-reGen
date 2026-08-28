@@ -563,7 +563,7 @@ horde-log bundle
 |------|---------|
 | `--out FILE.zip` | Output path (default `horde_support_<timestamp>.zip`). |
 | `--last` / `--session N` | Diagnose only the most recent / a specific session (the logs are still included). |
-| `--full-logs` | Include rotation archives, every retained stats file, and do not tail-cap large artifacts (a much larger bundle). By default only the active logs are bundled and analysed, stats files last written before the earliest bundled session are skipped; oversized plain logs are read from their tail and bundled already-trimmed, and the active `bridge.log` already spans many sessions. |
+| `--full-logs` | Include rotation archives, every retained stats file, and do not tail-cap large artifacts (a much larger bundle). By default only the active logs are bundled and analysed, stats files last written before the earliest bundled session are skipped; oversized plain logs are read from their tail and bundled already-trimmed, and the active `bridge.log` already spans many sessions. When the earliest bundled session begins mid-run (the active `bridge.log` is a size roll-over continuation), up to three of its abutting predecessor rotations are shipped uncapped and the stats window reaches back to where they start, so a long run's earlier hours are not lost. The learned VRAM footprint store (`.horde_worker_regen/vram_footprints.json`) ships as `config/vram_footprints.json`. |
 | `--no-cache-inventory` | Skip the on-disk model listing. |
 | `--probe-gpu` | Run the GPU probe for the system-info block (slower; the logs already record the GPUs). |
 | `--keep-identifiers` | Do not scrub home path / username / worker name (the keys are still redacted). |

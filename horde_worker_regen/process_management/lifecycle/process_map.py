@@ -1598,11 +1598,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         the console status line. Empty for a process with no reported residency, so a line without a cache is
         unchanged.
         """
+        parts: list[str] = []
         held = process_info.held_components
-        if not held:
+        if held:
+            total_mb = sum(entry.approx_ram_mb for entry in held)
+            parts.append(f"held {len(held)} comp ~{round(total_mb)} MB")
+        # The process's own device reservation is what an admission hold is netted against and what an
+        # unload command is expected to return, so a status line that omits it cannot explain either.
+        if process_info.process_reserved_mb is not None:
+            allocated = process_info.process_allocated_mb
+            live = f" ({allocated} live)" if allocated is not None else ""
+            parts.append(f"vram {process_info.process_reserved_mb} MB reserved{live}")
+        if not parts:
             return ""
-        total_mb = sum(entry.approx_ram_mb for entry in held)
-        return f" <fg #7b7d7d>held {len(held)} comp ~{round(total_mb)} MB</>"
+        return f" <fg #7b7d7d>{' | '.join(parts)}</>"
 
     def get_process_info_strings(self) -> list[str]:
         """Return a list of strings containing information about each process."""

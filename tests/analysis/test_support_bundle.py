@@ -318,3 +318,83 @@ class TestPerformance:
         body = text.split("\n", 1)[1]
         assert body.strip() == "kept line"
         assert "head" not in body
+
+
+class TestMidRunSessionStitching:
+    """A session that begins mid-run in the active log ships its abutting rotations and their stats window."""
+
+    _ROTATION = "bridge.2026-06-24_17-30-00_000000.log"
+
+    def _mid_run_worker_dir(self, tmp_path: Path) -> Path:
+        logs = _worker_dir(tmp_path)
+        # The launch marker lives in the rotation; the active log starts a minute after the rotation ends.
+        (logs / self._ROTATION).write_text(
+            "2026-06-24 17:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process\n"
+            f"2026-06-24 17:00:05.000 | INFO | x:y:1 -   dreamer_name: {_WORKER} | (v12.29.0) | num_models: 113 | "
+            "max_power: 32 (1024x1024) | max_threads: 1 | queue_size: 3 | safety_on_gpu: True\n"
+            "2026-06-24 17:59:30.000 | INFO | x:y:3 - still the same run\n",
+            encoding="utf-8",
+        )
+        (logs / "bridge.log").write_text(
+            "2026-06-24 18:00:10.000 | INFO | x:y:2 - mid-run record\n" + _recovery("18:00:11.000") + "\n",
+            encoding="utf-8",
+        )
+        # An older rotation from a previous launch, hours before, must not be dragged in.
+        (logs / "bridge.2026-06-24_09-00-00_000000.log").write_text(
+            "2026-06-24 08:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process\n"
+            "2026-06-24 08:30:00.000 | INFO | x:y:9 - an earlier launch\n",
+            encoding="utf-8",
+        )
+        return logs
+
+    def test_abutting_rotation_ships_and_stats_window_reaches_back(self, tmp_path: Path) -> None:
+        """The predecessor is a member, the stats file written during it is kept, the unrelated run is not."""
+        logs = self._mid_run_worker_dir(tmp_path)
+        stats_dir = tmp_path / ".horde_worker_regen" / "stats"
+        stats_dir.mkdir(parents=True)
+        during_rotation = stats_dir / "stats-v1.0.0-20260624-170000-000.jsonl"
+        during_rotation.write_text(json.dumps({"event": "stats_sample"}) + "\n", encoding="utf-8")
+        mtime = datetime(2026, 6, 24, 17, 45, 0).timestamp()
+        os.utime(during_rotation, (mtime, mtime))
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            names = set(zf.namelist())
+            manifest = json.loads(zf.read("manifest.json"))
+        assert f"logs/{self._ROTATION}" in names
+        assert "logs/bridge.2026-06-24_09-00-00_000000.log" not in names
+        assert "stats/stats-v1.0.0-20260624-170000-000.jsonl" in names
+        assert manifest["scope"]["stitched_rotations"] == [f"logs/{self._ROTATION}"]
+
+    def test_a_session_with_its_launch_in_the_active_log_ships_no_rotation(self, tmp_path: Path) -> None:
+        """The default bundle stays lean when the active log already holds the launch."""
+        logs = _worker_dir(tmp_path)
+        (logs / self._ROTATION).write_text(
+            "2026-06-24 17:59:59.000 | INFO | x:y:3 - a prior run ending just before\n",
+            encoding="utf-8",
+        )
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            assert f"logs/{self._ROTATION}" not in zf.namelist()
+
+
+class TestFootprintStore:
+    """The learned VRAM footprint store ships beside the config, since it priced the verdicts in the logs."""
+
+    def test_footprint_store_is_included_when_present(self, tmp_path: Path) -> None:
+        """A present store is shipped verbatim under config/, where the redactor also passes over it."""
+        logs = _worker_dir(tmp_path)
+        state_dir = tmp_path / ".horde_worker_regen"
+        state_dir.mkdir(exist_ok=True)
+        (state_dir / "vram_footprints.json").write_text('{"schema_version": 2}', encoding="utf-8")
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            assert zf.read("config/vram_footprints.json").decode() == '{"schema_version": 2}'

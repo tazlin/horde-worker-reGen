@@ -1233,6 +1233,8 @@ class InferenceScheduler:
         # Whether the on-GPU safety process currently holds its CLIP weights in host RAM at the parent's
         # request (the in-place rung below cycling it off the card). Promoted back by the placement reconciler.
         self._safety_weights_demoted = False
+        # The most recent host-RAM verdict, kept so a pop-hold edge can be logged with the reading behind it.
+        self._last_ram_verdict: RamPressureVerdict | None = None
         # When the post-processing backlog last became non-empty, or None while it is empty. Ages the
         # restore-side post-processing bound so an unbroken trickle of shallow post-processing cannot keep a
         # paused safety process off its card for the whole run.
@@ -4784,6 +4786,7 @@ class InferenceScheduler:
         defensively (a partially-mocked config falls back to the field default) so snapshotting never
         crashes the scheduling cycle.
         """
+        self._last_ram_verdict = verdict
         margin_mb = config_number(self._runtime_config.bridge_data.ram_reserve_mb)
         if margin_mb is None:
             margin_mb = 4096.0
@@ -4848,6 +4851,17 @@ class InferenceScheduler:
         for action in actions:
             match action:
                 case SetPopHold(active=hold_active):
+                    if hold_active != self._state.ram_pressure_pop_hold:
+                        # The soft hold has no other trace than a skipped-pop counter; name the reading behind
+                        # each edge so a log reader can see what "ram_pressure" was measuring.
+                        reading = (
+                            self._last_ram_verdict.reason() if self._last_ram_verdict is not None else "no reading"
+                        )
+                        margin = config_number(self._runtime_config.bridge_data.ram_reserve_mb)
+                        logger.info(
+                            f"Host RAM pop hold {'engaged' if hold_active else 'released'}: {reading}, hold margin "
+                            f"{margin:.0f} MB above the floor while work is in flight; in-flight jobs continue.",
+                        )
                     self._state.ram_pressure_pop_hold = hold_active
                 case PausePops(
                     until_time=until_time,
@@ -6540,7 +6554,14 @@ class InferenceScheduler:
             return True
 
         self._note_clearance_hold(job, reclaim_applied=bool(outcome.actuations_applied))
-        self._log_clearance_hold(process_id, job, reason=outcome.verdict.disposition.value, verdict=outcome.verdict)
+        self._log_clearance_hold(
+            process_id,
+            job,
+            reason=outcome.verdict.disposition.value,
+            verdict=outcome.verdict,
+            candidate_mb=outcome.candidate_delta_mb,
+            actuations=outcome.actuations_applied,
+        )
         return False
 
     def _staged_materialization_delta_mb(
@@ -6582,13 +6603,16 @@ class InferenceScheduler:
         *,
         reason: str,
         verdict: VramVerdict | None,
+        candidate_mb: float | None = None,
+        actuations: tuple[ActuatorCommand, ...] = (),
     ) -> None:
         """Edge-log a clearance hold with its concrete denial arithmetic, coalesced per distinct cause.
 
         A persistent clearance hold starving a card is otherwise opaque: the slot-duty line names the bucket
-        but not why admission refused this specific child. This names the disposition and the measured terms
-        (device free, reserve, candidate charge, outstanding reservations) once per distinct ``(process, reason)``
-        rather than every tick, so a held card's cause is always readable without per-tick spam.
+        but not why admission refused this specific child. This names the disposition, the measured terms
+        (device free, reserve, outstanding reservations), the candidate charge net of what the child already
+        holds, and the reclaim the arbiter ran, once per distinct ``(process, reason)`` rather than every
+        tick, so a held card's cause is readable from the line alone.
         """
         suppressed = self._scheduler_diagnostic_suppressed_count("clearance_hold", (str(process_id), reason))
         if suppressed is None:
@@ -6597,10 +6621,16 @@ class InferenceScheduler:
             measured = verdict.measured
             free = "n/a" if measured.device_free_mb is None else f"{measured.device_free_mb:.0f}MB"
             avail = "n/a" if measured.available_mb is None else f"{measured.available_mb:.0f}MB"
+            candidate = "unpriced" if candidate_mb is None else f"{candidate_mb:.0f}MB"
+            process_info = self._process_map.get(process_id)
+            staged = process_info.process_reserved_mb if process_info is not None else None
+            staged_note = "unreported" if staged is None else f"{staged:.0f}MB"
+            reclaim = ", ".join(command.kind.value for command in actuations) or "none"
             detail = (
-                f"device free {free}, available {avail}, reserve {self._vram_budget.reserve_mb:.0f}MB, "
+                f"candidate {candidate} (child already holds {staged_note}) vs device free {free}, "
+                f"available {avail}, reserve {self._vram_budget.reserve_mb:.0f}MB, "
                 f"outstanding reservations {measured.outstanding_reservations_mb:.0f}MB, "
-                f"noise buffer {measured.noise_buffer_mb:.0f}MB"
+                f"noise buffer {measured.noise_buffer_mb:.0f}MB; reclaim run: {reclaim}"
             )
         else:
             detail = "post-processing co-residency mutex held the card for an in-flight or pending chain"
