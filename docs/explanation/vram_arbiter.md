@@ -292,7 +292,11 @@ same netting covers the dispatch flow at clearance: a leased job's encode-only s
 outstanding when the job is re-priced at its full peak, and that peak already covers it, so the job's own
 staging entry is subtracted as well (`own_dispatch_unmaterialized_mb`). Without it a lone staged child on a
 card with room for its peak reads as short by exactly the encode charge and waits out its lease-acquire
-timeout for room the card had all along. Second,
+timeout for room the card had all along. The candidate itself gets the same treatment: what the staged child
+has already put on the card (its text encoder and VAE, any allocator cache left by its previous job, read as
+the process's measured reservation) is missing from the device-free reading and inside the full peak, so the
+clearance re-price charges the peak net of that reservation. Charged gross, a child reads as further from
+fitting the more of its own job it has staged; a multi-GB encoder alone costs it the timeout. Second,
 a candidate whose weights already occupy VRAM on the target process is admitted directly as a no-op: dispatching
 (or preloading) onto an already-resident idle model materialises nothing, its weights are already in the
 committed floor, and its next activation is the monolithic status quo the card has already served. The ledger

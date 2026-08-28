@@ -6520,6 +6520,7 @@ class InferenceScheduler:
             process_info,
             is_head_of_queue=True,
             head_outstanding_mb=None,
+            candidate_delta_override_mb=self._staged_materialization_delta_mb(job, process_info),
             nets_own_dispatch_reservation=True,
         )
         if outcome.verdict.admits:
@@ -6534,6 +6535,38 @@ class InferenceScheduler:
         self._note_clearance_hold(job, reclaim_applied=bool(outcome.actuations_applied))
         self._log_clearance_hold(process_id, job, reason=outcome.verdict.disposition.value, verdict=outcome.verdict)
         return False
+
+    def _staged_materialization_delta_mb(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_info: HordeProcessInfo,
+    ) -> float | None:
+        """The staged child's remaining materialisation (MB): its priced peak net of what it already holds on the card.
+
+        By the clearance moment the child's text encoder, VAE and leftover allocator cache are on the device
+        and already missing from the measured device-free reading, while the priced peak is the process's
+        whole sampling-time reservation including them. Charged gross, a child reads as further from fitting
+        the more of its own job it has staged (a multi-GB encoder alone can cost it the lease-acquire timeout).
+        The ledger already decays the staging reservation by this measured growth; the candidate gets the same
+        netting. ``None`` (unpriceable) and a resident-weight candidate (already credited) pass through.
+        """
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        gross_mb = self._measured_admission_candidate_delta_mb(
+            job,
+            baseline,
+            process_id=process_info.process_id,
+            disaggregated=self._is_disaggregation_class_eligible(job),
+        )
+        if gross_mb is None:
+            return None
+        if self._candidate_weights_resident_on_process(job.model, process_info.process_id):
+            return gross_mb
+        staged_mb = process_info.process_reserved_mb
+        if staged_mb is None:
+            return gross_mb
+        return max(0.0, gross_mb - float(staged_mb))
 
     def _log_clearance_hold(
         self,

@@ -535,3 +535,31 @@ class TestClearanceNetsTheWaiterOwnStagingCharge:
         scheduler = await self._lone_staged_waiter(monkeypatch, room_beyond_peak_mb=-_ENCODE_MB / 4)
 
         assert scheduler.clearance_admit_process(0) is False
+
+    async def test_the_waiter_staged_allocation_is_credited_against_its_peak(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """What the child has already put on the card (its encoder, its cache) is not charged a second time.
+
+        The device-free reading already lacks the staged allocation and the priced peak includes it, so a card
+        short of the gross peak by less than that allocation seats the remainder.
+        """
+        shortfall_mb = 1500.0
+        scheduler = await self._lone_staged_waiter(monkeypatch, room_beyond_peak_mb=-shortfall_mb)
+        scheduler._process_map[0].process_reserved_mb = int(shortfall_mb + 100)
+
+        assert scheduler.clearance_admit_process(0) is True, (
+            "the waiter's staged allocation was priced against its own clearance"
+        )
+
+    async def test_the_staged_credit_is_bounded_by_what_is_actually_held(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A staged allocation smaller than the shortfall does not admit: the remainder must still fit."""
+        shortfall_mb = 1500.0
+        scheduler = await self._lone_staged_waiter(monkeypatch, room_beyond_peak_mb=-shortfall_mb)
+        scheduler._process_map[0].process_reserved_mb = int(shortfall_mb - 100)
+
+        assert scheduler.clearance_admit_process(0) is False
