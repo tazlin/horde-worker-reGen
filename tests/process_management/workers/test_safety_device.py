@@ -13,6 +13,7 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.workers.safety_process import (
     HordeSafetyProcess,
+    _ClipResidency,
     _OnDemandDeepDanbooruModel,
     resolve_safety_device,
 )
@@ -130,3 +131,61 @@ def test_ram_unload_discards_optional_cpu_alchemy_models_but_keeps_clip() -> Non
         process_state=HordeProcessState.UNLOADED_MODEL_FROM_RAM,
         info="Unloaded transient safety/alchemy models from RAM",
     )
+
+
+class _FakeClipModel:
+    def __init__(self) -> None:
+        self.moves: list[str] = []
+
+    def to(self, device: str) -> _FakeClipModel:
+        self.moves.append(device)
+        return self
+
+
+class _FakeInterrogator:
+    def __init__(self) -> None:
+        self.clip_model = _FakeClipModel()
+        self.clip_offloaded = False
+
+
+def test_resident_clip_is_never_moved_between_evaluations() -> None:
+    """The default (resident) placement leaves CLIP on the device across stage and release."""
+    interrogator = _FakeInterrogator()
+    residency = _ClipResidency(interrogator, execution_device="cuda")
+
+    residency.stage()
+    residency.release()
+
+    assert interrogator.clip_model.moves == []
+    assert interrogator.clip_offloaded is False
+
+
+def test_demoted_clip_returns_to_host_ram_and_is_restaged_per_evaluation() -> None:
+    """Once demoted, CLIP leaves the device after an evaluation and comes back only for the next one."""
+    interrogator = _FakeInterrogator()
+    residency = _ClipResidency(interrogator, execution_device="cuda")
+    residency.resident = False
+
+    residency.release()
+    assert interrogator.clip_model.moves == ["cpu"]
+    assert interrogator.clip_offloaded is True
+
+    residency.stage()
+    assert interrogator.clip_model.moves == ["cpu", "cuda"]
+    assert interrogator.clip_offloaded is False
+
+    residency.resident = True
+    residency.release()
+    assert interrogator.clip_model.moves == ["cpu", "cuda"], "a promoted CLIP stays on the device"
+
+
+def test_cpu_safety_never_moves_clip() -> None:
+    """A CPU-only safety process has nothing to demote; the placement is a no-op either way."""
+    interrogator = _FakeInterrogator()
+    residency = _ClipResidency(interrogator, execution_device="cpu")
+    residency.resident = False
+
+    residency.release()
+    residency.stage()
+
+    assert interrogator.clip_model.moves == []

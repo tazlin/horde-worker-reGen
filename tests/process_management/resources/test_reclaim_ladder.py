@@ -14,6 +14,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRungKind,
     VerifiedReclaimLadder,
     build_reclaim_ladder,
+    execute_reclaim_rung,
 )
 
 
@@ -47,6 +48,10 @@ class _FakeActuator:
 
     def safety_off_gpu(self, device_index: int | None) -> bool:
         self.calls.append(("safety", None))
+        return True
+
+    def demote_safety_weights(self, device_index: int | None) -> bool:
+        self.calls.append(("demote_safety", None))
         return True
 
     def restore_post_process_lane(self, device_index: int | None) -> bool:
@@ -122,6 +127,9 @@ class TestBuildReclaimLadder:
                     kind=ReclaimRungKind.PAUSE_COMPONENT_LANE, tenant_label="component", promised_mb=700.0
                 ),
             ),
+            safety_weights=LaneReclaimCandidate(
+                kind=ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS, tenant_label="safety weights", promised_mb=2500.0
+            ),
             safety=LaneReclaimCandidate(
                 kind=ReclaimRungKind.SAFETY_OFF_GPU, tenant_label="safety", promised_mb=3000.0
             ),
@@ -135,8 +143,21 @@ class TestBuildReclaimLadder:
             (ReclaimRungKind.PAUSE_PP_LANE, None),
             (ReclaimRungKind.PAUSE_VAE_LANE, None),
             (ReclaimRungKind.PAUSE_COMPONENT_LANE, None),
+            (ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS, None),  # in-place, before the process-cycling move
             (ReclaimRungKind.SAFETY_OFF_GPU, None),
         ]
+
+    def test_demote_rung_dispatches_to_the_in_place_actuator(self) -> None:
+        """The demotion rung drives the actuator's in-place method, never the process-cycling one."""
+        actuator = _FakeActuator()
+        rung = ReclaimRung(
+            kind=ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS,
+            device_index=0,
+            promised_freed_mb=2500.0,
+            tenant_label="safety weights",
+        )
+        assert execute_reclaim_rung(rung, actuator) is True
+        assert actuator.calls == [("demote_safety", None)]
 
 
 def _ladder(*rungs: ReclaimRung) -> tuple[ReclaimRung, ...]:

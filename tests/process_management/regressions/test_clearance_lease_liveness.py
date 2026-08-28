@@ -13,8 +13,9 @@ from __future__ import annotations
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
-from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState, HordeProcessType
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
@@ -552,6 +553,34 @@ class TestClearanceNetsTheWaiterOwnStagingCharge:
         assert scheduler.clearance_admit_process(0) is True, (
             "the waiter's staged allocation was priced against its own clearance"
         )
+
+    async def test_a_hold_demotes_the_safety_weights_in_place_before_giving_up(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A waiter the card cannot seat gets safety's weights moved to host RAM, not a dead 60 s wait.
+
+        The demotion keeps the safety process and its context; it is asked once, and the hold re-asks the
+        admission next pass against the room it returned.
+        """
+        scheduler = await self._lone_staged_waiter(monkeypatch, room_beyond_peak_mb=-1500.0)
+        scheduler._runtime_config.bridge_data.safety_on_gpu = True
+        scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        lifecycle = scheduler._process_lifecycle  # a Mock in this harness
+        lifecycle.is_safety_gpu_paused = False  # pyrefly: ignore
+        lifecycle.safety_placement_transition_pending = False  # pyrefly: ignore
+        safety = make_mock_process_info(9, model_name=None, process_type=HordeProcessType.SAFETY)
+        send = safety.pipe_connection.send  # a Mock in this harness
+        scheduler._process_map[9] = safety
+
+        assert scheduler.clearance_admit_process(0) is False
+        sent = [call.args[0].control_flag for call in send.call_args_list]  # pyrefly: ignore
+        assert sent == [HordeControlFlag.DEMOTE_SAFETY_WEIGHTS]
+        assert scheduler._safety_weights_demoted is True
+
+        send.reset_mock()  # pyrefly: ignore
+        scheduler.clearance_admit_process(0)
+        assert send.call_args_list == [], "the demotion is asked once, not every tick"  # pyrefly: ignore
 
     async def test_the_staged_credit_is_bounded_by_what_is_actually_held(
         self,

@@ -625,6 +625,14 @@ class HordeControlFlag(enum.Enum):
     its allocator cache and sends a fresh memory report so the parent's ``process_reserved_mb`` reflects
     the release promptly. Distinct from ``UNLOAD_MODELS_FROM_VRAM`` (which evicts models): this is the
     cheap, model-preserving reclaim the future VRAM arbiter uses to recover cached-but-unused VRAM."""
+    DEMOTE_SAFETY_WEIGHTS = auto()
+    """Ask the on-GPU safety process to hold its CLIP weights in host RAM between evaluations.
+
+    The process and its CUDA context stay up; each evaluation stages CLIP onto the device for the batch and
+    returns it afterwards. Reclaims most of the safety footprint within a second, without the rebuild and
+    cooldown a full move off-GPU costs, so an admission short by less than safety's weights can be served."""
+    PROMOTE_SAFETY_WEIGHTS = auto()
+    """Ask a demoted safety process to keep its CLIP weights resident on the device again."""
     DOWNLOAD_MODELS = auto()
     """Signal the dedicated download process to ensure a set of models are present on disk."""
     RELOAD_MODEL_DATABASE = auto()

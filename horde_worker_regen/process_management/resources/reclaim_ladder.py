@@ -124,6 +124,11 @@ class ReclaimRungKind(enum.StrEnum):
     """Pause the dedicated VAE/image lane so its context and models free."""
     PAUSE_COMPONENT_LANE = "pause_component_lane"
     """Pause the component/text-encode lane so its context and models free."""
+    DEMOTE_SAFETY_WEIGHTS = "demote_safety_weights"
+    """Move the safety process's resident weights to host RAM in place, keeping its context and the process.
+
+    Cheaper than :attr:`SAFETY_OFF_GPU` by the whole rebuild: nothing exits, so it carries no cooldown and is
+    verified on the fast budget. Restored by the safety placement policy, like the full move."""
     SAFETY_OFF_GPU = "safety_off_gpu"
     """Move the on-GPU safety context off the card to reclaim it (the last rung before a kill)."""
 
@@ -226,6 +231,8 @@ class LadderCandidates:
     idle_residents: tuple[IdleResidentModel, ...] = ()
     cache_targets: tuple[CacheReleaseTarget, ...] = ()
     lanes: tuple[LaneReclaimCandidate, ...] = ()
+    safety_weights: LaneReclaimCandidate | None = None
+    """The in-place demotion of safety's resident weights, rung before the full move off the card."""
     safety: LaneReclaimCandidate | None = None
 
 
@@ -296,6 +303,16 @@ def build_reclaim_ladder(candidates: LadderCandidates) -> tuple[ReclaimRung, ...
             ),
         )
 
+    if candidates.safety_weights is not None:
+        rungs.append(
+            ReclaimRung(
+                kind=ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS,
+                device_index=device_index,
+                promised_freed_mb=candidates.safety_weights.promised_mb,
+                tenant_label=candidates.safety_weights.tenant_label,
+            ),
+        )
+
     if candidates.safety is not None:
         rungs.append(
             ReclaimRung(
@@ -337,6 +354,10 @@ class ReclaimLadderActuator(Protocol):
 
     def pause_component_lane(self, device_index: int | None) -> bool:
         """Pause the component/text-encode lane off the GPU."""
+        ...
+
+    def demote_safety_weights(self, device_index: int | None) -> bool:
+        """Move the safety process's resident weights to host RAM in place, keeping its context."""
         ...
 
     def safety_off_gpu(self, device_index: int | None) -> bool:
@@ -388,6 +409,8 @@ def execute_reclaim_rung(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> 
         return actuator.pause_vae_lane(rung.device_index)
     if rung.kind is ReclaimRungKind.PAUSE_COMPONENT_LANE:
         return actuator.pause_component_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS:
+        return actuator.demote_safety_weights(rung.device_index)
     if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU:
         return actuator.safety_off_gpu(rung.device_index)
     return False
@@ -906,6 +929,8 @@ class VerifiedReclaimLadder:
                 acted = actuator.pause_vae_lane(device_index)
             elif command.kind is ActuatorCommandKind.PAUSE_COMPONENT_LANE:
                 acted = actuator.pause_component_lane(device_index)
+            elif command.kind is ActuatorCommandKind.DEMOTE_SAFETY_WEIGHTS:
+                acted = actuator.demote_safety_weights(device_index)
             elif command.kind is ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU:
                 acted = actuator.cycle_safety_off_gpu(device_index)
             else:

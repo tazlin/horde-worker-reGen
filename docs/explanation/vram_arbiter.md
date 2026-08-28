@@ -261,7 +261,10 @@ The arbiter keeps four concerns deliberately separate:
   [`VramActuator`][horde_worker_regen.process_management.resources.vram_arbiter.VramActuator] surface runs
   those commands. For preload admission the scheduler is that caller, mapping each command onto the worker
   mechanism that already performs it (allocator-cache release, idle-model eviction, live-context reduction,
-  safety off-GPU cycling).
+  in-place safety weight demotion, safety off-GPU cycling). The demotion is offered to every request kind:
+  the safety child moves its CLIP weights to host RAM and stages them per evaluation, so most of the safety
+  footprint returns within a second while the process and its CUDA context stay up. Cycling safety off the
+  card (a rebuild with a cooldown) remains reserved for the post-processing lane's own deferral.
 
 ## The decision pipeline
 
@@ -735,6 +738,11 @@ forecast would leave a card that hosts one heavy resident without an on-GPU safe
 
 The verified reclaim ladder uses the same operator permission as whole-card safety movement: if
 `whole_card_residency_safety_off_gpu` is false, safety is not added as a reclaim rung even when it is on GPU.
+Under that permission the ladder carries two safety rungs. `DEMOTE_SAFETY_WEIGHTS` comes first: the safety
+child moves its CLIP weights to host RAM in place and stages them per evaluation, keeping its process and
+context, so it needs no cooldown and is verified on the fast budget. `SAFETY_OFF_GPU` (the rebuild) stays the
+last rung. The placement reconciler owns the promotion back, on the same admission and headroom-dwell
+evidence the process-level restore uses; a rebuilt safety process starts resident, which clears any demotion.
 
 **Placement is headroom-aware across cards, not a fixed device 0.** One identity
 ([`_choose_safety_gpu_card`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])

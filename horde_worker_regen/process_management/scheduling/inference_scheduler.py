@@ -1230,6 +1230,9 @@ class InferenceScheduler:
         # is the only code allowed to turn that request into a lifecycle pause or restore, so reclaim,
         # residency, and fit hysteresis cannot issue overlapping safety rebuilds.
         self._safety_reclaim_pause_requested = False
+        # Whether the on-GPU safety process currently holds its CLIP weights in host RAM at the parent's
+        # request (the in-place rung below cycling it off the card). Promoted back by the placement reconciler.
+        self._safety_weights_demoted = False
         # When the post-processing backlog last became non-empty, or None while it is empty. Ages the
         # restore-side post-processing bound so an unbroken trickle of shallow post-processing cannot keep a
         # paused safety process off its card for the whole run.
@@ -2837,6 +2840,8 @@ class InferenceScheduler:
             return
 
         if self._process_lifecycle.is_safety_gpu_paused:
+            # The demotion lived in the process that was just ended; its replacement starts resident.
+            self._safety_weights_demoted = False
             if self._safety_reclaim_pause_requested:
                 # The off-GPU child reached readiness, so the ladder's one-shot request has materialised. Other
                 # live requests still keep it off; absent one, restoration is reconsidered on the next cycle.
@@ -2880,6 +2885,7 @@ class InferenceScheduler:
             return
 
         if requested_owner is None:
+            self._promote_safety_weights_if_room(safety_card, residency_veto=residency_veto)
             return
         pressure_since = self._safety_placement_pressure_since or self._clock()
         if not self._process_lifecycle.pause_safety_on_gpu(owner=requested_owner):
@@ -5719,6 +5725,7 @@ class InferenceScheduler:
             safety_reclaim_allowed=(
                 self._residency_should_pause_safety(device_index) and not self._has_safety_backlog()
             ),
+            safety_weights_demotable=self._safety_weights_demotable(device_index),
             post_process_context_count=post_process_contexts,
             vae_lane_context_count=vae_lane_contexts,
             vae_lane_reclaim_allowed=(
@@ -8610,6 +8617,74 @@ class InferenceScheduler:
         """Cycle the safety model off the GPU to reclaim its context (:class:`VramActuator`)."""
         return self.safety_off_gpu(device_index)
 
+    def _safety_weights_demotable(self, device_index: int | None) -> bool:
+        """Whether safety's resident weights can be demoted to host RAM in place right now.
+
+        Gated on the same operator permission as moving safety off the card, on a live on-GPU safety process
+        that is not mid-rebuild, and on an empty safety backlog (queued checks would only re-stage them).
+        """
+        if (
+            not self._safety_on_gpu_permitted
+            or not self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu
+            or self._safety_weights_demoted
+            or self._process_lifecycle.is_safety_gpu_paused
+            or self._process_lifecycle.safety_placement_transition_pending is True
+            or self._has_safety_backlog()
+        ):
+            return False
+        return self._process_map.num_safety_processes(device_index=device_index) > 0
+
+    def demote_safety_weights(self, device_index: int | None) -> bool:
+        """Ask the safety process to hold its weights in host RAM between evaluations (reclaim actuator).
+
+        The cheap rung below :meth:`safety_off_gpu`: the process and its CUDA context stay up, so there is no
+        rebuild, no cooldown and no placement transition to reconcile. The placement reconciler promotes the
+        weights back once the card demonstrably has room for them.
+        """
+        if not self._safety_weights_demotable(device_index):
+            return False
+        safety_process = self._process_map.get_safety_process()
+        if safety_process is None:
+            return False
+        delivered = safety_process.safe_send_message(
+            HordeControlMessage(control_flag=HordeControlFlag.DEMOTE_SAFETY_WEIGHTS),
+        )
+        if delivered:
+            self._safety_weights_demoted = True
+            logger.info(
+                "Reclaim: demoting the safety process's weights to host RAM in place (its context stays on the "
+                "card); they are promoted back once the card has room.",
+            )
+        return delivered
+
+    def _promote_safety_weights_if_room(self, device_index: int | None, *, residency_veto: bool) -> None:
+        """Promote demoted safety weights back onto the device once the card has durably had room for them.
+
+        Uses the same admission and headroom-dwell evidence the process-level restore does, so the weights are
+        never handed back into the pressure that demoted them. Staying demoted costs each evaluation only a
+        re-stage, so a card that never earns the restore keeps working at that small latency.
+        """
+        if not self._safety_weights_demoted or residency_veto:
+            return
+        if self._process_lifecycle.is_safety_gpu_paused:
+            # A rebuilt safety process starts resident; the demotion died with the old one.
+            self._safety_weights_demoted = False
+            return
+        if self.is_vram_growth_held(device_index) or not self._arbiter_admits_safety_gpu_load(device_index):
+            return
+        if not self._safety_placement_dwell_met(
+            self._safety_placement_headroom_since,
+            self._safety_placement_restore_dwell_seconds(),
+        ):
+            return
+        safety_process = self._process_map.get_safety_process()
+        if safety_process is None:
+            self._safety_weights_demoted = False
+            return
+        if safety_process.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.PROMOTE_SAFETY_WEIGHTS)):
+            self._safety_weights_demoted = False
+            logger.info("Card recovered; promoting the safety process's weights back onto the device.")
+
     def build_reclaim_ladder_candidates(
         self,
         device_index: int | None,
@@ -8689,7 +8764,26 @@ class InferenceScheduler:
             idle_residents=tuple(idle_residents),
             cache_targets=tuple(cache_targets),
             lanes=lanes,
+            safety_weights=self._reclaim_safety_weights_candidate(device_index),
             safety=safety,
+        )
+
+    def _reclaim_safety_weights_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
+        """Build the in-place safety weight demotion rung, promised at safety's measured reservation."""
+        if not self._safety_weights_demotable(device_index):
+            return None
+        reserved_mb = self._reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
+        promised_mb = (
+            reserved_mb
+            if reserved_mb > 0
+            else max(0.0, self._safety_footprint_mb() - self.resolved_context_constant_mb())
+        )
+        if promised_mb <= 0:
+            return None
+        return LaneReclaimCandidate(
+            kind=ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS,
+            tenant_label="safety weights",
+            promised_mb=promised_mb,
         )
 
     def _idle_resident_footprint_mb(self, process_info: HordeProcessInfo, model_name: str) -> float:

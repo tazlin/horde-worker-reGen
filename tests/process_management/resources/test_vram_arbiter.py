@@ -77,6 +77,30 @@ class TestAdmissionPath:
         assert verdict.admits is True
         assert verdict.measured.available_known is True
 
+    def test_defer_offers_safety_weight_demotion_to_any_request_kind(self) -> None:
+        """A dispatch short of room is offered the in-place safety demotion; cycling safety stays PP-only."""
+        arbiter = VramArbiter()
+        state = _roomy_state(
+            device_free_mb=5000.0,
+            safety_context_count=1,
+            safety_reclaim_allowed=True,
+            safety_weights_demotable=True,
+        )
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(_preload(kind=VramRequestKind.MONOLITHIC_DISPATCH, candidate_delta_mb=5000.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        kinds = [command.kind for command in verdict.required_actuations]
+        assert kinds == [ActuatorCommandKind.DEMOTE_SAFETY_WEIGHTS]
+
+    def test_defer_withholds_demotion_once_the_weights_are_already_demoted(self) -> None:
+        """With nothing left to demote the ladder is empty for a dispatch, as before."""
+        arbiter = VramArbiter()
+        state = _roomy_state(device_free_mb=5000.0, safety_context_count=1, safety_weights_demotable=False)
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(_preload(kind=VramRequestKind.MONOLITHIC_DISPATCH, candidate_delta_mb=5000.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.required_actuations == ()
+
     def test_defer_emits_ladder_commands_in_order(self) -> None:
         """A candidate that overflows the device-free room defers with the ladder in escalation order."""
         arbiter = VramArbiter()

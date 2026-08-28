@@ -212,6 +212,8 @@ class ActuatorCommandKind(StrEnum):
     """Temporarily stop an idle VAE service lane so its CUDA context returns to the device."""
     PAUSE_COMPONENT_LANE = "pause_component_lane"
     """Temporarily stop an idle component service lane so its CUDA context returns to the device."""
+    DEMOTE_SAFETY_WEIGHTS = "demote_safety_weights"
+    """Move the safety process's resident weights to host RAM in place, keeping its context and the process."""
     CYCLE_SAFETY_OFF_GPU = "cycle_safety_off_gpu"
     """Cycle the safety model off the GPU to reclaim its context."""
 
@@ -260,6 +262,10 @@ class VramActuator(Protocol):
 
     def restore_component_lane(self, device_index: int | None) -> bool:
         """Restore a component service lane this reclaim path previously paused."""
+        ...
+
+    def demote_safety_weights(self, device_index: int | None) -> bool:
+        """Move the safety process's resident weights to host RAM in place, keeping its context."""
         ...
 
     def cycle_safety_off_gpu(self, device_index: int | None) -> bool:
@@ -428,6 +434,9 @@ class DeviceVramState:
     """Number of on-GPU safety contexts on this card."""
     safety_reclaim_allowed: bool = False
     """Whether policy permits moving this card's safety context off-GPU to relieve admission pressure."""
+    safety_weights_demotable: bool = False
+    """Whether this card's safety process currently holds its weights on the device and policy permits
+    demoting them to host RAM in place (the cheap rung below cycling the context off the card)."""
     post_process_context_count: int = 0
     """Number of on-GPU post-processing contexts on this card."""
     vae_lane_context_count: int = 0
@@ -1162,6 +1171,10 @@ class VramArbiter:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.EVICT_IDLE_MODEL, device_index=None))
         if request.can_reduce_live_contexts:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None))
+        if state.safety_context_count > 0 and state.safety_weights_demotable:
+            # Offered to every request kind: it keeps the safety process and its context, so unlike the
+            # process-cycling rung below it needs no cooldown and costs the next evaluation only a re-stage.
+            commands.append(ActuatorCommand(kind=ActuatorCommandKind.DEMOTE_SAFETY_WEIGHTS, device_index=None))
         service_lane_added = False
         if request.kind is VramRequestKind.PP_JOB and request.allow_idle_service_lane_reclaim and not commands:
             # PP cannot pause its own lane. Offer one idle disaggregation service context in the verified

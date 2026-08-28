@@ -169,6 +169,38 @@ class _OnDemandDeepDanbooruModel:
         self._resident_device = "cpu"
 
 
+class _ClipResidency:
+    """Where the interrogator's CLIP weights live between evaluations, switchable by the parent in place.
+
+    CLIP is the safety lane's hot resident model. While *resident* it stays on the execution device. While
+    *demoted* it lives in host RAM between calls and is staged onto the device for each evaluation, which
+    gives the card most of the safety footprint back within a second without ending the process or its
+    CUDA context (the alternative the parent otherwise has). Drives the interrogator's own
+    ``clip_model``/``clip_offloaded`` pair so its internal caption path stays consistent.
+    """
+
+    def __init__(self, interrogator: object, *, execution_device: str) -> None:
+        self._interrogator = interrogator
+        self._execution_device = execution_device
+        self.resident = True
+
+    def stage(self) -> None:
+        """Put CLIP on the execution device for an evaluation (a no-op when it is already there)."""
+        if self._execution_device == "cpu" or not getattr(self._interrogator, "clip_offloaded", False):
+            return
+        self._interrogator.clip_model = self._interrogator.clip_model.to(self._execution_device)  # type: ignore[attr-defined]
+        self._interrogator.clip_offloaded = False  # type: ignore[attr-defined]
+
+    def release(self) -> None:
+        """After an evaluation, return CLIP to host RAM if it is demoted; keep it on the device if resident."""
+        if self.resident or self._execution_device == "cpu":
+            return
+        if getattr(self._interrogator, "clip_offloaded", False):
+            return
+        self._interrogator.clip_model = self._interrogator.clip_model.to("cpu")  # type: ignore[attr-defined]
+        self._interrogator.clip_offloaded = True  # type: ignore[attr-defined]
+
+
 class CensorReason(enum.Enum):
     """The reason for censoring an image."""
 
@@ -208,6 +240,8 @@ class HordeSafetyProcess(HordeProcess):
     """Lazily-loaded LAION aesthetic head; built on first use and shared by the form and gen-metadata paths."""
     _aesthetic_unavailable: bool = False
     """Latched once the aesthetic weight cannot be obtained, so the cheap per-image path stops retrying."""
+    _clip_residency: "_ClipResidency | None" = None
+    """Where CLIP lives between evaluations; None until the interrogator is built (or in dry-run)."""
 
     def __init__(
         self,
@@ -271,6 +305,7 @@ class HordeSafetyProcess(HordeProcess):
                     execution_device=device,
                 )
                 self._interrogator = get_interrogator_no_blip(device=device)
+                self._clip_residency = _ClipResidency(self._interrogator, execution_device=device)
             except Exception as e:
                 logger.error(f"Failed to initialise horde_safety: {type(e).__name__} {e}")
                 _discard_unreadable_deep_danbooru_weight(e)
@@ -362,6 +397,31 @@ class HordeSafetyProcess(HordeProcess):
             self._interrogator.caption_offloaded = True  # type: ignore[attr-defined]
         if self._aesthetic_scorer is not None:
             self._aesthetic_scorer.to("cpu")
+        if self._clip_residency is not None:
+            self._clip_residency.release()
+
+    def _stage_clip(self) -> None:
+        """Put demoted CLIP weights back on the device for the evaluation about to run."""
+        if self._clip_residency is not None:
+            self._clip_residency.stage()
+
+    def demote_safety_weights(self) -> None:
+        """Hold CLIP in host RAM between evaluations, returning its device memory now; the process stays up."""
+        if self._clip_residency is None or self._safety_device == "cpu":
+            self.send_memory_report_message(include_vram=self._safety_device != "cpu")
+            return
+        self._clip_residency.resident = False
+        logger.info("Safety weights demoted to host RAM; CLIP is staged onto the device per evaluation.")
+        self.release_allocator_cache()
+
+    def promote_safety_weights(self) -> None:
+        """Keep CLIP resident on the device again after a demotion."""
+        if self._clip_residency is None or self._safety_device == "cpu":
+            return
+        self._clip_residency.resident = True
+        self._clip_residency.stage()
+        logger.info("Safety weights promoted; CLIP is resident on the device again.")
+        self.send_memory_report_message(include_vram=True)
 
     def _get_ranking_lists(self) -> dict[str, list[str]]:
         """Load the legacy interrogation ranking lists (vendored from clipfree) once."""
@@ -552,6 +612,7 @@ class HordeSafetyProcess(HordeProcess):
         try:
             with self.periodic_heartbeat(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE):
                 image = PIL.Image.open(BytesIO(form.source_image_bytes))
+                self._stage_clip()
 
                 if is_caption_form(form.form):
                     self._ensure_caption_model()
@@ -656,6 +717,14 @@ class HordeSafetyProcess(HordeProcess):
             self.release_allocator_cache()
             return
 
+        if message.control_flag == HordeControlFlag.DEMOTE_SAFETY_WEIGHTS:
+            self.demote_safety_weights()
+            return
+
+        if message.control_flag == HordeControlFlag.PROMOTE_SAFETY_WEIGHTS:
+            self.promote_safety_weights()
+            return
+
         if message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
             self.unload_transient_models_from_ram()
             return
@@ -711,6 +780,7 @@ class HordeSafetyProcess(HordeProcess):
             return
 
         self.send_memory_report_message(include_vram=False)
+        self._stage_clip()
 
         time_start = time.time()
 

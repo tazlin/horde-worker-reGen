@@ -990,6 +990,14 @@ class FakeSafetyProcess(HordeProcess):
             self._run_fake_alchemy(message.form)
             return
 
+        if message.control_flag in (
+            HordeControlFlag.DEMOTE_SAFETY_WEIGHTS,
+            HordeControlFlag.PROMOTE_SAFETY_WEIGHTS,
+        ):
+            # The fake holds no real weights; like the real child it answers with a fresh memory report.
+            self.send_memory_report_message(include_vram=False)
+            return
+
         if not isinstance(message, HordeSafetyControlMessage):
             logger.critical(f"Fake safety process received unexpected message type: {type(message).__name__}")
             return
