@@ -5546,19 +5546,24 @@ class InferenceScheduler:
         static_seed_mb: float,
         stage: FootprintStage,
     ) -> float:
-        """Raise a static sampling-peak seed by any learned watermark for this job's ``stage`` footprint key.
+        """Price a static sampling-peak seed against the learned footprint population for ``stage``.
 
-        The static predictor stays the seed; the learned overlay can only ever RAISE it (a cold key, a None
+        The static predictor stays the seed and the learned watermark can RAISE it (a cold key, a None
         baseline, or an unkeyable job returns the seed unchanged). This is the single seam admission pricing of
         sampling work routes through so a measured activation peak is never undershot. Callers pricing whole-job
         sampling pass :attr:`FootprintStage.SAMPLE`; callers pricing a disaggregated UNet-only sampler pass
         :attr:`FootprintStage.SAMPLE_ISOLATED` so a monolithic whole-job watermark never over-prices it.
 
-        The activation keys are fed from the child's reserved-peak reports, which include allocator cache, so
-        the margined measured estimate is deliberately not used here: pricing a sampling window at reserved
-        peak times margin plus context charges more than the seed for an ordinary SDXL job and refuses
-        co-residency the card can hold. Measured pricing is confined to the resident footprint, where the
-        backend measures weights alone.
+        The measured population can also LOWER a seed the hardware has disproved. A whole-job static seed
+        prices every component of a combined checkpoint as simultaneously resident, but a backend that swaps
+        support weights out before the diffusion weights land never co-hosts them, so the seed can sit
+        several GB above any peak the card has seen, hold the job at clearance for a deficit that does not
+        exist, and (past the achievable ceiling) price the model off a card that provably serves it. The
+        margined recent-window measurement (:meth:`LearnedFootprintStore.measured_estimate_mb`) governs when
+        it sits below the raise-only figure, but only once this job's model has produced a result here and
+        never below the checkpoint's core weight figure: the population is fed from reserved-peak reports
+        that over-read (allocator cache), so a low reading is trustworthy evidence while the floor guards the
+        one direction it cannot be.
         """
         store = self._footprint_store
         if store is None:
@@ -5566,7 +5571,31 @@ class InferenceScheduler:
         key = self._sampling_footprint_key(job, baseline, stage=stage)
         if key is None:
             return static_seed_mb
-        return store.estimate_mb(key, static_seed_mb=static_seed_mb)
+        raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
+        measured_mb = self._measured_sampling_peak_mb(job, key)
+        if measured_mb is None or measured_mb >= raised_mb:
+            return raised_mb
+        floor_mb = predict_job_weight_mb(job, baseline) or 0.0
+        return min(raised_mb, max(measured_mb, floor_mb))
+
+    def _measured_sampling_peak_mb(self, job: ImageGenerateJobPopResponse, key: FootprintKey) -> float | None:
+        """The margined measured sampling peak (MB) for ``key``, or None while it lacks downward authority.
+
+        Offered only once the job's model has produced a result on this worker, mirroring the resident
+        measurement's trust gate: the sampling keys are baseline-and-resolution wide, so without the
+        per-model gate a light sibling checkpoint's measurements could vouch for a heavy one that has never
+        demonstrated anything here. The platform context constant is netted out because the store keeps
+        whole-device charges while sampling prices are job-level (contexts are charged separately).
+        """
+        store = self._footprint_store
+        if store is None or job.model is None:
+            return None
+        if not self._job_tracker.has_model_produced_result(job.model):
+            return None
+        measured_mb = store.measured_estimate_mb(key)
+        if measured_mb is None:
+            return None
+        return max(0.0, measured_mb - self.resolved_context_constant_mb())
 
     def observe_disaggregated_sampling_peak(self, job_info: HordeJobInfo, peak_reserved_mb: float) -> None:
         """Fold a disaggregated sampler's measured peak into the store under this job's SAMPLE_ISOLATED key.

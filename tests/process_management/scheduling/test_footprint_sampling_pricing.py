@@ -506,3 +506,105 @@ class TestResidentFootprintPricing:
         assert learned.footprint_mb == pytest.approx(cold.footprint_mb + 4000.0)
         # The core-weight term is untouched: the measurement carries no weights-versus-support attribution.
         assert learned.weights_mb == cold.weights_mb
+
+
+class TestMeasuredLoweringPricing:
+    """A trusted measured sampling population lowers a static seed the hardware has disproved.
+
+    The whole-job static seed prices every component of a combined checkpoint as co-resident; a backend that
+    swaps support weights out before the diffusion weights land never co-hosts them, so the seed can sit
+    several GB above any measured peak and hold the job at clearance (or price it past the achievable
+    ceiling) for room it does not need. Once the model has produced a result here and the SAMPLE key holds
+    enough observations, the margined measured figure governs downward, floored at the core weight figure.
+    """
+
+    @staticmethod
+    def _pin_inflated_seed(monkeypatch: pytest.MonkeyPatch, *, seed_mb: float, weight_mb: float) -> None:
+        """Pin the whole-job seed high and the core weight figure below it, the combined-checkpoint shape."""
+        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: seed_mb)
+        monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", lambda _job, _baseline: weight_mb)
+
+    @staticmethod
+    def _observe_sample_peaks(pm: HordeWorkerProcessManager, peak_mb: float, *, count: int = 5) -> None:
+        """Feed ``count`` identical SAMPLE-stage observations (the measured-estimate minimum is five)."""
+        for _ in range(count):
+            pm._learned_footprint_store.observe_peak(_sample_key(ResolutionBucket.LE_1024), peak_mb)
+
+    def test_measured_below_seed_lowers_the_monolithic_price(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A measured population well under the seed reprices the job at the margined measurement."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 13000.0)
+        pm._job_tracker._models_with_results.add(_MODEL)
+
+        expected = (
+            pm._learned_footprint_store.measured_estimate_mb(
+                _sample_key(ResolutionBucket.LE_1024),
+            )
+            - scheduler.resolved_context_constant_mb()
+        )  # type: ignore[operator]
+        priced = scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+        assert priced == pytest.approx(expected)
+        assert priced is not None and priced < 17000.0
+
+    def test_model_without_a_result_keeps_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The sampling keys are baseline-wide, so an unproven model never borrows a sibling's measurement."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 13000.0)
+
+        assert (
+            scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+            == 17000.0
+        )
+
+    def test_an_underobserved_key_keeps_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Below the measured-estimate observation minimum the conservative seed stays in charge."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 13000.0, count=2)
+        pm._job_tracker._models_with_results.add(_MODEL)
+
+        assert (
+            scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+            == 17000.0
+        )
+
+    def test_the_core_weight_figure_floors_the_lowering(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A measured population below the core weights cannot price a job under what its weights occupy."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 8000.0)
+        pm._job_tracker._models_with_results.add(_MODEL)
+
+        assert (
+            scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+            == 12600.0
+        )
+
+    def test_a_measurement_above_the_raised_figure_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The measured figure's only authority is downward; above the seed the raise-only watermark governs."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 18000.0)
+        pm._job_tracker._models_with_results.add(_MODEL)
+
+        assert (
+            scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+            == 18000.0
+        )
