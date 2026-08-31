@@ -723,6 +723,10 @@ class JobPopper:
         # never once per pop at steady state.
         self._last_logged_lora_advertise: tuple[bool, str] | None = None
 
+        # Digest of the last advertised model set actually logged, so the "Advertising models" line is
+        # edge-triggered the same way: it fires only when the offered set changes, never once per pop.
+        self._last_logged_advertised_models_digest: str | None = None
+
     @property
     def _max_concurrent_inference_processes(self) -> int:
         """The live concurrent-inference cap (effective ``max_threads``) advertised to the API."""
@@ -2255,7 +2259,11 @@ class JobPopper:
 
         # The exact offer that goes out, so a later capture can tell an empty model name this worker advertised
         # apart from one the horde answered with. Without it the two are indistinguishable after the fact.
-        logger.debug(f"Advertising models in pop request: {_describe_advertised_models(models)}")
+        # Edge-triggered on the offered set, since it is otherwise identical on nearly every pop.
+        advertised_models_digest = hashlib.sha256("\n".join(sorted(models)).encode("utf-8")).hexdigest()
+        if advertised_models_digest != self._last_logged_advertised_models_digest:
+            logger.debug(f"Advertising models in pop request: {_describe_advertised_models(models)}")
+            self._last_logged_advertised_models_digest = advertised_models_digest
 
         try:
             job_pop_request = ImageGenerateJobPopRequest(

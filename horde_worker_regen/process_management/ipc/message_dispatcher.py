@@ -623,6 +623,12 @@ class MessageDispatcher:
                     f"message_dispatcher.memory_report:{message.process_id}",
                     self._MEMORY_REPORT_DISPATCH_LOG_INTERVAL_SECONDS,
                 )
+            elif isinstance(message, HordeAnnotatorAvailabilityMessage) or (
+                isinstance(message, HordeProcessStateChangeMessage) and message.info == "Waiting for job"
+            ):
+                # Near-identical on every poll (annotator availability rarely changes; a process idling
+                # between jobs reports the same state repeatedly), so the receipt itself is not worth DEBUG.
+                receipt_level = "TRACE"
             logger.log(
                 receipt_level,
                 f"Received {type(message).__name__} from process {message.process_id}: {message.info}",
