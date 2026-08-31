@@ -10,6 +10,8 @@ slot cap holds the next grant until a window retires).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -19,6 +21,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ActiveSampler,
     ClearanceController,
     ClearanceInputs,
@@ -26,12 +29,14 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceWaiter,
     GrantState,
 )
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    make_testable_process_manager,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -592,3 +597,94 @@ class TestClearanceNetsTheWaiterOwnStagingCharge:
         scheduler._process_map[0].process_reserved_mb = int(shortfall_mb - 100)
 
         assert scheduler.clearance_admit_process(0) is False
+
+
+class TestClearanceHoldGraceAccounting:
+    """A clearance-held child's silent wait is the parent's own doing and never reads as a hang.
+
+    The scheduler accounts the time the clearance gate withholds each staged job (closed spans plus any live
+    one), and the liveness watchdog widens the pre-first-step grace by that figure. One static lease window is
+    not enough: a hold can re-arm across lease attempts and outlast the window, and a watchdog that only
+    budgets one window then reaps a healthy child the parent itself was holding.
+    """
+
+    @staticmethod
+    def _held_scheduler_and_job(
+        clock: Callable[[], float],
+    ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, int]:
+        """A scheduler with one primed process owning a staged job, ready for hold accounting."""
+        process_map = ProcessMap()
+        proc = make_mock_process_info(3, state=HordeProcessState.INFERENCE_PRIMED)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        proc.record_inference_ownership(job, attempt_ordinal=1)
+        process_map[3] = proc
+        scheduler = _make_inference_scheduler(process_map=process_map, clock=clock)
+        return scheduler, job, 3
+
+    def test_held_spans_accumulate_across_hold_and_resolve(self) -> None:
+        """Held time grows while a hold is live, freezes at resolve, and resumes on a re-armed hold."""
+        now = [1000.0]
+        scheduler, job, process_id = self._held_scheduler_and_job(lambda: now[0])
+
+        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        now[0] += 70.0
+        assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(70.0)
+
+        scheduler._resolve_clearance_hold(job)
+        now[0] += 30.0
+        assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(70.0)
+
+        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        now[0] += 20.0
+        assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(90.0)
+
+    def test_a_repeated_note_does_not_restart_the_live_span(self) -> None:
+        """The gate re-notes the hold every evaluation pass; the span keeps its original start."""
+        now = [1000.0]
+        scheduler, job, process_id = self._held_scheduler_and_job(lambda: now[0])
+
+        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        now[0] += 40.0
+        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        now[0] += 40.0
+        assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(80.0)
+
+    def test_a_process_with_no_held_job_reads_zero(self) -> None:
+        """No ownership, or a job never held, contributes no widening."""
+        now = [1000.0]
+        scheduler, _job, process_id = self._held_scheduler_and_job(lambda: now[0])
+        assert scheduler.clearance_held_seconds_for_process(process_id) == 0.0
+        assert scheduler.clearance_held_seconds_for_process(99) == 0.0
+
+    def test_first_step_grace_widens_by_the_measured_held_time(self) -> None:
+        """End to end through the wired provider: a hold past one lease window keeps the child alive.
+
+        The reaped-while-held failure shape: a hold that ran ~159s while the widened grace only budgeted
+        one 60s lease window, so the watchdog replaced a child that was waiting on the parent's own gate.
+        """
+        pm = make_testable_process_manager()
+        pm.bridge_data.gpu_sampling_lease_enabled = True
+        proc = make_mock_process_info(3, state=HordeProcessState.INFERENCE_PRIMED)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        proc.record_inference_ownership(job, attempt_ordinal=1)
+        pm._process_map[3] = proc
+
+        now = [1000.0]
+        pm._inference_scheduler._clock = lambda: now[0]
+        pm._inference_scheduler._note_clearance_hold(job, reclaim_applied=False)
+        now[0] += 159.0
+
+        widened = pm._process_lifecycle._effective_first_step_timeout(pm.bridge_data, proc, 90)
+        assert widened == 90 + 159
+
+    def test_short_holds_keep_the_one_lease_window_floor(self) -> None:
+        """A briefly-held (or never-held) child keeps the static lease-window widening."""
+        pm = make_testable_process_manager()
+        pm.bridge_data.gpu_sampling_lease_enabled = True
+        proc = make_mock_process_info(3, state=HordeProcessState.INFERENCE_PRIMED)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        proc.record_inference_ownership(job, attempt_ordinal=1)
+        pm._process_map[3] = proc
+
+        widened = pm._process_lifecycle._effective_first_step_timeout(pm.bridge_data, proc, 90)
+        assert widened == 90 + int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS)

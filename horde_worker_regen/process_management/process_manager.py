@@ -1499,6 +1499,11 @@ class HordeWorkerProcessManager:
             # notifier discards a dead child's grant state.
             clearance_proxy_registrar=self._register_clearance_proxy,
             clearance_child_replaced_notifier=self._note_clearance_child_replaced,
+            clearance_held_seconds_provider=lambda process_id: (
+                self._inference_scheduler.clearance_held_seconds_for_process(
+                    process_id,
+                )
+            ),
         )
 
         self._download_coordinator = ModelDownloadCoordinator(

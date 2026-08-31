@@ -542,6 +542,7 @@ class ProcessLifecycleManager:
         gpu_start_context_mb_provider: Callable[[], float] | None = None,
         clearance_proxy_registrar: Callable[[int, int, ClearanceLeaseProxy], None] | None = None,
         clearance_child_replaced_notifier: Callable[[int, int], None] | None = None,
+        clearance_held_seconds_provider: Callable[[int], float] | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         # All child processes are created from this context (ctx.Process/ctx.Pipe), not the bare
@@ -639,6 +640,13 @@ class ProcessLifecycleManager:
             clearance_child_replaced_notifier
             if clearance_child_replaced_notifier is not None
             else (lambda _device_index, _process_id: None)
+        )
+        # How long the clearance gate has withheld a process's current staged job (seconds). The liveness
+        # watchdog widens the pre-first-step grace by it, since a child the parent itself is holding silent
+        # is waiting, not hung. The zero default keeps the static one-lease-window widening for standalone
+        # use, where no scheduler is wired in to report holds.
+        self._clearance_held_seconds: Callable[[int], float] = (
+            clearance_held_seconds_provider if clearance_held_seconds_provider is not None else (lambda _pid: 0.0)
         )
 
         self.num_processes_launched = 0
@@ -4283,17 +4291,22 @@ class ProcessLifecycleManager:
         Under the GPU denoise clearance lease a dispatched child sits in ``INFERENCE_PRIMED`` emitting no step
         beat until the parent clears it into its load-and-sample window, which the parent may legitimately hold
         while it evicts VRAM to make room. That silent wait is not a hang, so a child that has not yet taken a
-        step gets its first-step grace extended by the lease acquire timeout (the child self-degrades into
-        unpriced sampling by then, resuming heartbeats). The extension is bounded to that one window and applies
-        only to a pre-first-step primed child under the lease; a sampling child or the no-lease path is
-        unchanged.
+        step gets its first-step grace extended by the larger of one lease-acquire window (the child
+        self-degrades into unpriced sampling by then, resuming heartbeats) and the time the clearance gate has
+        actually withheld this child's job. The measured figure matters because a hold can re-arm across lease
+        attempts and outlast a single window, and a watchdog that only budgets one window then reaps a healthy
+        child the parent itself was holding. The widening tracks only parent-attributed held time (a child
+        wedged after its grant still runs out its unwidened grace), and the structural-queue-wedge recovery
+        supervisor remains the backstop for a hold that never resolves. Applies only to a pre-first-step
+        primed child under the lease; a sampling child or the no-lease path is unchanged.
         """
         if (
             bridge_data.gpu_sampling_lease_enabled
             and process_info.last_process_state == HordeProcessState.INFERENCE_PRIMED
             and process_info.last_current_step is None
         ):
-            return int(first_step_timeout + CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS)
+            held_seconds = self._clearance_held_seconds(process_info.process_id)
+            return int(first_step_timeout + max(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS, held_seconds))
         return first_step_timeout
 
     def _effective_inference_step_timeout(self, bridge_data: reGenBridgeData, process_info: HordeProcessInfo) -> int:

@@ -1169,6 +1169,14 @@ class InferenceScheduler:
         # leaves the in-progress set. Only used under the clearance lease; empty otherwise.
         self._clearance_hold_ids: set[str] = set()
 
+        # Per-job clearance-hold time accounting: job id -> (accumulated held seconds from closed spans, the
+        # live span's start or None). The liveness watchdog reads it through
+        # :meth:`clearance_held_seconds_for_process` so a child silently waiting on the parent's own withheld
+        # grant is never reaped as hung: the pre-first-step grace must cover the full held time, not one
+        # static lease window, because a hold can re-arm across lease attempts. Closed spans are kept until
+        # the job leaves the in-progress set so a resolved hold still widens the grace it already consumed.
+        self._clearance_hold_spans: dict[str, tuple[float, float | None]] = {}
+
         # The learned-footprint store, injected by the manager (one shared instance, the same the message
         # dispatcher observes into). Admission pricing of a job's sampling peak reads it so a measured
         # activation high-water raises the static per-model seed the predictor returns; a static seed
@@ -4636,6 +4644,9 @@ class InferenceScheduler:
             # Prune clearance-hold records for jobs that have left the in-progress set (self-healing).
             in_progress_ids = {str(job.id_) for job in in_progress if job.id_ is not None}
             self._clearance_hold_ids &= in_progress_ids
+            self._clearance_hold_spans = {
+                job_id: spans for job_id, spans in self._clearance_hold_spans.items() if job_id in in_progress_ids
+            }
 
             busy = min(sampling_count, capacity)
             hold: SlotDutyBucket | None = None
@@ -6679,6 +6690,9 @@ class InferenceScheduler:
         if job_id is None:
             return
         self._clearance_hold_ids.add(job_id)
+        accumulated, live_since = self._clearance_hold_spans.get(job_id, (0.0, None))
+        if live_since is None:
+            self._clearance_hold_spans[job_id] = (accumulated, self._clock())
 
     def _resolve_clearance_hold(self, job: ImageGenerateJobPopResponse) -> None:
         """Clear any clearance hold on ``job`` now that its materialisation fits (idempotent)."""
@@ -6686,6 +6700,34 @@ class InferenceScheduler:
         if job_id is None:
             return
         self._clearance_hold_ids.discard(job_id)
+        span = self._clearance_hold_spans.get(job_id)
+        if span is not None:
+            accumulated, live_since = span
+            if live_since is not None:
+                self._clearance_hold_spans[job_id] = (accumulated + max(0.0, self._clock() - live_since), None)
+
+    def clearance_held_seconds_for_process(self, process_id: int) -> float:
+        """Total seconds the clearance gate has withheld ``process_id``'s current staged job, 0.0 when none.
+
+        The liveness watchdog's read: a primed child emitting no step beat while the parent itself withholds
+        its clearance grant is waiting, not hung, so the pre-first-step grace is widened by this figure. It
+        spans the job's whole staged phase (closed hold spans plus any live one), because a hold that
+        resolved after consuming most of the grace has still consumed it.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is None:
+            return 0.0
+        job = process_info.current_inference_job()
+        job_id = str(job.id_) if job is not None and job.id_ is not None else None
+        if job_id is None:
+            return 0.0
+        span = self._clearance_hold_spans.get(job_id)
+        if span is None:
+            return 0.0
+        accumulated, live_since = span
+        if live_since is not None:
+            return accumulated + max(0.0, self._clock() - live_since)
+        return accumulated
 
     @staticmethod
     def _required_overlap_headway(running_tier: _ModelSizeTier, candidate_tier: _ModelSizeTier) -> float:
