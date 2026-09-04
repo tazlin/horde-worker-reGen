@@ -1070,7 +1070,14 @@ def _manifest_content_sha256() -> str | None:
         from hordelib.kudos_training import default_manifest  # type: ignore
     except ImportError:
         return None
-    return default_manifest().content_sha256()
+    manifest = default_manifest()
+    # A hordelib that ships the manifest without a content hash predates the pooling gate; its rows are
+    # ungated rather than unbuildable.
+    hasher = getattr(manifest, "content_sha256", None)
+    if not callable(hasher):
+        return None
+    digest = hasher()
+    return digest if isinstance(digest, str) else None
 
 
 _TIERS_WITHOUT_LORA_CELLS: frozenset[str] = frozenset({"heavy"})
