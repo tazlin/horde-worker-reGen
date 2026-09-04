@@ -355,6 +355,9 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].process_peak_reserved_mb = None
         self[process_id].process_aimdo_mb = None
         self[process_id].report_sampled_at = None
+        # Its unload history goes with its last sample: the pair is only meaningful together, and the
+        # replacement starts with neither.
+        self[process_id].last_ram_unload_requested_at = None
 
         self.reset_heartbeat_state(process_id)
 
@@ -696,6 +699,9 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].clear_retained_resident()
         self[process_id].vram_unload_refused = False
         self[process_id].recently_unloaded_from_ram = True
+        # The reclaim path judges whether an unload actually returned RAM by comparing the slot's next
+        # memory report against this stamp; a reading older than it predates the unload entirely.
+        self[process_id].last_ram_unload_requested_at = time.time()
         self[process_id].last_received_timestamp = time.time()
         # The model left VRAM, so it no longer has a materialization time; the next materialization restamps.
         self[process_id].vram_materialized_monotonic = None

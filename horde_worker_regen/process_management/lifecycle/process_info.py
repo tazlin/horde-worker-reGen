@@ -167,6 +167,13 @@ class HordeProcessInfo:
     """The last control flag sent, to avoid duplication."""
     last_preload_requested_at: float
     """Epoch time when the parent last sent ``PRELOAD_MODEL`` to this process."""
+    last_ram_unload_requested_at: float | None
+    """Epoch time this slot's RAM residency was last cleared by an unload, or None if it never was.
+
+    Stamped when the parent commands ``UNLOAD_MODELS_FROM_RAM`` and re-stamped when the child reports the
+    clear, so it only ever moves later. Same clock as ``report_sampled_at``, which is what makes the pair
+    usable: a memory report sampled at or before this stamp describes the slot's footprint *before* the
+    unload and is no evidence of what the unload released."""
 
     preload_job_intent: PreloadJobIntent | None
     """The job that requested the current preload, which is not evidence that inference started."""
@@ -398,6 +405,7 @@ class HordeProcessInfo:
         self.loaded_horde_model_baseline = None
         self.last_control_flag = None
         self.last_preload_requested_at = 0.0
+        self.last_ram_unload_requested_at = None
 
         self.last_heartbeat_timestamp = time.time()
         self.last_heartbeat_delta = 0

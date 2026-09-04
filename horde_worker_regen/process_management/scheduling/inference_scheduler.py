@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, 
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import (
     ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES,
+    MEMORY_REPORT_INTERVAL_SECONDS,
     HordeProcessType,
 )
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -363,8 +364,24 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 """Fallback system-RAM reserve (MB) used until the live config value is read. Matches the
 ``ram_reserve_mb`` config default; keeps resident-in-RAM weights from forcing the OS to page."""
 
-_STALE_RAM_UNLOAD_REPLACE_BYTES = 1024 * 1024 * 1024
-"""RSS threshold above which a model-less idle process is still materially holding RAM after unload."""
+_STALE_RAM_UNLOAD_MARGIN_PERCENT = 2.0
+"""Share of total host RAM added to the cold-child baseline to set the stale-unload reclaim threshold.
+
+The threshold has to sit above anything a *freshly spawned* child can reach, or the reclaim cycles clean
+slots forever: the successor of every cycle would itself qualify. Scaling the margin with the host keeps that
+true across machines, since a larger host's children carry proportionally larger interpreter caches and
+allocator arenas."""
+
+_STALE_RAM_UNLOAD_MARGIN_FLOOR_MB = 512.0
+"""Floor (MB) under the host-scaled stale-unload margin, so a small host still clears the spread between
+individual cold children's baselines rather than resting the threshold on the nominal figure."""
+
+_STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS = 120.0
+"""Minimum seconds between stale-unload cycles of the same slot.
+
+A cycle costs the slot a respawn plus a cold load, so the same slot cycling on consecutive reclaim attempts
+spends more of the pool than the RAM it returns is worth. The interval bounds that: one slot contributes at
+most one stale-unload cycle per window, and sustained pressure spreads its cycles across the pool instead."""
 
 _FRESH_INFERENCE_CHILD_BASELINE_MB = 1100.0
 """Resident RSS (MB) a just-spawned inference child holds before it loads any model weights.
@@ -1351,6 +1368,10 @@ class InferenceScheduler:
         # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
         # deliberate window. 0.0 when no reclaim cycle is in flight. See _RAM_RECLAIM_CYCLE_GRACE_SECONDS.
         self._ram_reclaim_cycle_at: float = 0.0
+        # When each slot was last cycled by the stale-unload reclaim, so one slot cannot absorb the
+        # pool's reclaim attempts by being cycled again every tick. Keyed by process id, which outlives
+        # the replaced process object; creep containment is deliberately not throttled by it.
+        self._stale_ram_unload_cycled_at: dict[int, float] = {}
         # Per-lane throttle for idle service-lane RAM containment (_contain_idle_lane_ram): maps a lane's
         # process id to the monotonic time its last RAM-unload was requested, so a lane is asked to unload
         # at most once per _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS.
@@ -6828,6 +6849,36 @@ class InferenceScheduler:
             process_info.loaded_horde_model_name != model_name
         )
 
+    def _stale_ram_unload_replace_bytes(self) -> float:
+        """RSS above which a model-less idle slot is judged to be still holding a freed model's pages.
+
+        Derived so a freshly spawned child can never reach it: the cold-child baseline
+        (:data:`_FRESH_INFERENCE_CHILD_BASELINE_MB`) plus a host-scaled margin
+        (:data:`_STALE_RAM_UNLOAD_MARGIN_PERCENT`, floored at :data:`_STALE_RAM_UNLOAD_MARGIN_FLOOR_MB`).
+        That invariant is what keeps the reclaim from cycling the very successor its last cycle spawned.
+        """
+        margin_mb = max(
+            self._measured_total_ram_mb() * (_STALE_RAM_UNLOAD_MARGIN_PERCENT / 100.0),
+            _STALE_RAM_UNLOAD_MARGIN_FLOOR_MB,
+        )
+        return (_FRESH_INFERENCE_CHILD_BASELINE_MB + margin_mb) * 1024 * 1024
+
+    @staticmethod
+    def _ram_reading_postdates_unload(process_info: HordeProcessInfo) -> bool:
+        """Whether this slot's latest RSS reading was sampled late enough to describe its post-unload state.
+
+        A child samples its RSS on a fixed interval, so the reading the parent holds in the moment after
+        commanding an unload was taken *before* it and reports the footprint the unload was meant to release.
+        Reclaim decisions taken on that reading cycle slots that did release their pages, at the cost of a
+        respawn and a cold load each time. A candidate must carry a reading at least one report interval
+        newer than the unload; a slot missing either timestamp carries no evidence and is never a candidate.
+        """
+        sampled_at = process_info.report_sampled_at
+        unload_at = process_info.last_ram_unload_requested_at
+        if sampled_at is None or unload_at is None:
+            return False
+        return (sampled_at - unload_at) >= MEMORY_REPORT_INTERVAL_SECONDS
+
     def _replace_stale_ram_unload_process(self, *, protect_process_id: int | None = None) -> bool:
         """Cycle an idle inference process to return retained RAM to the OS; return whether one was cycled.
 
@@ -6838,15 +6889,21 @@ class InferenceScheduler:
           only containment; RSS this high is leak, not clean reusable pages, so this override even cycles the
           protected staging target (reusing a crept slot would only perpetuate the leak).
         - Stale-unload reclaim (the RAM-verdict last resort): a model-less idle slot that did not actually
-          release RAM after an ``UNLOAD_MODELS_FROM_RAM`` request. ``protect_process_id`` spares one slot here,
-          the current head's staging target, so the reclaim does not destroy the retained pages the marginal
-          RAM credit priced the head's preload against (which would force the very cold load the credit avoids).
+          release RAM after an ``UNLOAD_MODELS_FROM_RAM`` request. "Did not release" is judged only against a
+          reading the child sampled after that request (see :meth:`_ram_reading_postdates_unload`) and only
+          above a threshold no cold child reaches (see :meth:`_stale_ram_unload_replace_bytes`), and the same
+          slot is cycled at most once per :data:`_STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS`.
+          ``protect_process_id`` spares one slot here, the current head's staging target, so the reclaim does
+          not destroy the retained pages the marginal RAM credit priced the head's preload against (which
+          would force the very cold load the credit avoids).
 
         Creep victims are preferred over stale victims so an unbounded leak is contained ahead of an ordinary
         retained-page reclaim.
         """
+        now = self._clock()
         creep_victim: HordeProcessInfo | None = None
         stale_victim: HordeProcessInfo | None = None
+        stale_replace_bytes = self._stale_ram_unload_replace_bytes()
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
@@ -6867,7 +6924,12 @@ class InferenceScheduler:
                 continue
             if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 continue
-            if process_info.ram_usage_bytes < _STALE_RAM_UNLOAD_REPLACE_BYTES:
+            if not self._ram_reading_postdates_unload(process_info):
+                continue
+            last_cycled_at = self._stale_ram_unload_cycled_at.get(process_info.process_id)
+            if last_cycled_at is not None and (now - last_cycled_at) < _STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS:
+                continue
+            if process_info.ram_usage_bytes < stale_replace_bytes:
                 continue
             stale_victim = process_info
 
@@ -6886,6 +6948,7 @@ class InferenceScheduler:
                 "after a RAM unload (the allocator retains the freed model's pages); cycling it to return "
                 "the RAM to the OS.",
             )
+            self._stale_ram_unload_cycled_at[victim.process_id] = now
         # A deliberate reclaim of a healthy idle slot, not a crash/hang: keep it out of the crash
         # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
         # quarantine a perfectly healthy slot.
@@ -6897,7 +6960,7 @@ class InferenceScheduler:
         # onto it, a window in which the queue is unservable by the worker's own deliberate action, not
         # a wedge. ram_reclaim_cycle_grace_active() reads this so the recovery supervisor does not
         # soft-reset the pools and fault the servable backlog mid-reclaim.
-        self._ram_reclaim_cycle_at = self._clock()
+        self._ram_reclaim_cycle_at = now
         self._record_churn("process_cycle")
         return True
 

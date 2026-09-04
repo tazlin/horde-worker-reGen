@@ -40,14 +40,15 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
     make_testable_process_manager,
+    mark_ram_unload_settled,
     track_popped_job_async,
 )
 
 # The queue-deadlock flag has been set this long: past the 20s structural-wedge window.
 _STRUCTURAL_WEDGE_AGE = 25.0
 
-# Enough retained RAM to exceed the stale-RAM-unload replace threshold (1GB), so the budget's reclaim
-# path chooses to cycle the slot rather than preload onto it.
+# Far past any retention threshold the reclaim derives from the host, so the budget's reclaim path
+# chooses to cycle the slot rather than preload onto it.
 _RETAINED_RAM_BYTES = 38 * 1024 * 1024 * 1024
 
 
@@ -82,6 +83,7 @@ def _stage_stale_ram_unload_slot(pm: HordeWorkerProcessManager, process_id: int)
     slot = make_mock_process_info(process_id, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
     slot.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
     slot.ram_usage_bytes = _RETAINED_RAM_BYTES
+    mark_ram_unload_settled(slot)
     pm._process_map[process_id] = slot
 
 

@@ -75,7 +75,14 @@ then decides and executes both regimes:
   there being queued work: the pop hold drains the queue, so the footprint left to reclaim is exactly the
   idle resident set on an empty queue, and eviction must still reach it. When no idle model remains to
   unload, an idle slot that kept the freed model's allocator pages is cycled to return that RAM to the OS.
-  Without this the host would stay pinned under its floor with the pop hold latched on indefinitely.
+  Without this the host would stay pinned under its floor with the pop hold latched on indefinitely. What
+  makes a slot "kept its pages" is evidence, not the passage of the unload: a child samples its RSS on a
+  fixed interval, so the reading the parent holds right after commanding an unload was taken before it and
+  describes the very footprint the unload was sent to release. A slot qualifies only on a report sampled at
+  least one report interval after its unload, only above a retention threshold derived from the host (the
+  cold-child baseline plus the larger of 2% of total RAM and 512 MB, so a freshly spawned child can never
+  qualify and a cycle cannot select its own successor), and at most once per slot every two minutes. Creep
+  containment is a separate trigger and none of these bounds apply to it.
 - **Recovered host**: the restore response, and the drain follow-through. Cards the reduction shed grow
   back toward their planned process count, one context per card per tick, gated on measured RAM headroom
   actually fitting another resident working set. A drain the pressure episode initiated but did not

@@ -12,7 +12,9 @@ manufactures the very stall they exist to relieve:
   model-less, most recently told to unload from RAM, above the retention threshold) are each a guard
   against recycling a slot that is doing or about to do useful work; in particular a slot whose most
   recent control message is a preload must never be reaped mid-stage, since the queue head is counting
-  on it.
+  on it. Retention itself is an evidence question: a child samples its RSS on a fixed interval, so
+  "the unload returned nothing" may only be read off a report sampled after the unload, against a
+  threshold no freshly spawned child reaches, and one slot may not answer every reclaim attempt.
 """
 
 from __future__ import annotations
@@ -21,13 +23,18 @@ import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import MEMORY_REPORT_INTERVAL_SECONDS
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _FRESH_INFERENCE_CHILD_BASELINE_MB,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    mark_ram_unload_settled,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -179,6 +186,7 @@ class TestStaleRamUnloadRecycleScope:
         process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
         process_info.ram_usage_bytes = _RETAINED_BYTES
+        mark_ram_unload_settled(process_info)
         return process_info
 
     def test_eligible_slot_is_recycled_as_intentional_reclaim(self) -> None:
@@ -232,3 +240,54 @@ class TestStaleRamUnloadRecycleScope:
 
         assert scheduler._replace_stale_ram_unload_process() is False
         scheduler._process_lifecycle._replace_inference_process.assert_not_called()
+
+    def test_reading_older_than_the_unload_is_not_evidence(self) -> None:
+        """A slot whose only RSS reading predates its unload is not a candidate.
+
+        That reading describes the footprint the unload was sent to release, so treating it as retention
+        cycles slots that did release, paying a respawn and a cold load for nothing. The reclaim waits for a
+        reading that can actually answer the question.
+        """
+        process_info = self._stale_slot()
+        assert process_info.last_ram_unload_requested_at is not None
+        process_info.report_sampled_at = process_info.last_ram_unload_requested_at - 1.0
+        scheduler = self._make_scheduler(process_info)
+
+        assert scheduler._replace_stale_ram_unload_process() is False
+        scheduler._process_lifecycle._replace_inference_process.assert_not_called()
+
+    def test_reading_taken_a_full_interval_after_the_unload_is_evidence(self) -> None:
+        """CONTROL: the same slot, with a reading one report interval past the unload, is cycled."""
+        process_info = self._stale_slot()
+        assert process_info.last_ram_unload_requested_at is not None
+        process_info.report_sampled_at = process_info.last_ram_unload_requested_at + MEMORY_REPORT_INTERVAL_SECONDS
+        scheduler = self._make_scheduler(process_info)
+
+        assert scheduler._replace_stale_ram_unload_process() is True
+        scheduler._process_lifecycle._replace_inference_process.assert_called_once()
+
+    def test_slot_at_the_fresh_child_baseline_is_not_recycled(self) -> None:
+        """A post-unload reading at a cold child's baseline RSS is a released slot, not a stuck one.
+
+        The threshold sits above what any freshly spawned child carries, so a slot at the baseline can never
+        qualify; were it able to, every cycle's own successor would qualify and the pool would cycle forever.
+        """
+        process_info = self._stale_slot()
+        process_info.ram_usage_bytes = int(_FRESH_INFERENCE_CHILD_BASELINE_MB * 1024 * 1024)
+        scheduler = self._make_scheduler(process_info)
+
+        assert scheduler._replace_stale_ram_unload_process() is False
+        scheduler._process_lifecycle._replace_inference_process.assert_not_called()
+
+    def test_same_slot_is_not_cycled_twice_inside_the_minimum_interval(self) -> None:
+        """One slot answers at most one stale-unload cycle per window.
+
+        Its successor respawns and cold-loads, so cycling the same slot again on the next reclaim attempt
+        spends the pool faster than the returned RAM is worth.
+        """
+        process_info = self._stale_slot()
+        scheduler = self._make_scheduler(process_info)
+
+        assert scheduler._replace_stale_ram_unload_process() is True
+        assert scheduler._replace_stale_ram_unload_process() is False
+        scheduler._process_lifecycle._replace_inference_process.assert_called_once()

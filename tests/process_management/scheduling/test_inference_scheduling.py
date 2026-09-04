@@ -62,6 +62,7 @@ from tests.process_management.conftest import (
     make_test_runtime_config,
     mark_job_aux_prepared,
     mark_job_in_progress_async,
+    mark_ram_unload_settled,
     track_popped_job_async,
 )
 
@@ -1341,7 +1342,8 @@ class TestUnloadModels:
         """An idle model-less process that still holds RAM after unload should be replaced."""
         process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
-        process_info.ram_usage_bytes = 2 * 1024 * 1024 * 1024
+        process_info.ram_usage_bytes = 8 * 1024 * 1024 * 1024
+        mark_ram_unload_settled(process_info)
         process_map = ProcessMap({0: process_info})
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map)

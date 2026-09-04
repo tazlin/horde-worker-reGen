@@ -40,6 +40,14 @@ from horde_worker_regen.process_management.ipc.messages import (
     UnsupportedControlMessageError,
 )
 
+MEMORY_REPORT_INTERVAL_SECONDS = 5.0
+"""The cadence (seconds) at which a child's reporter thread samples and sends its memory report.
+
+Module-level because the parent reasons about the age of what a child reported: a reading is only evidence
+about a state change the parent commanded once at least one interval has passed since the command. Kept here,
+in the torch-free process base module, so the orchestrator can import it without pulling torch in.
+"""
+
 
 class HordeProcessType(enum.Enum):
     """The type of process. This distinguishes between inference, safety, and potentially other process types.
@@ -147,7 +155,7 @@ class HordeProcess(abc.ABC):
     _end_process: bool = False
     """Whether the process should end soon."""
 
-    _memory_report_interval: float = 5.0
+    _memory_report_interval: float = MEMORY_REPORT_INTERVAL_SECONDS
     """The cadence (seconds) of the dedicated reporter thread's interval memory report."""
 
     _periodic_report_includes_vram: bool = False

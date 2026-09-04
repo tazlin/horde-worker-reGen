@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from unittest.mock import Mock
@@ -21,7 +22,10 @@ from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle import owned_process_registry
-from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.horde_process import (
+    MEMORY_REPORT_INTERVAL_SECONDS,
+    HordeProcessType,
+)
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoverySupervisor
@@ -570,6 +574,19 @@ def make_mock_process_info(
     )
     proc.loaded_horde_model_name = model_name
     return proc
+
+
+def mark_ram_unload_settled(process_info: HordeProcessInfo) -> None:
+    """Give a slot the evidence pair the stale-RAM reclaim requires of a retention candidate.
+
+    That reclaim judges "the unload returned nothing" only against a memory report the child sampled at
+    least one report interval *after* the unload was commanded, so a slot staged with neither stamp (or with
+    a reading older than its unload) is not a candidate at all. This stamps the settled case: an unload, then
+    a reading a full interval later.
+    """
+    unload_at = time.time() - MEMORY_REPORT_INTERVAL_SECONDS * 2
+    process_info.last_ram_unload_requested_at = unload_at
+    process_info.report_sampled_at = unload_at + MEMORY_REPORT_INTERVAL_SECONDS
 
 
 def make_mock_model_reference_record(

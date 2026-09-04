@@ -42,7 +42,11 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     InferenceScheduler,
     _ReuseCreditRecord,
 )
-from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_process_info,
+    mark_ram_unload_settled,
+)
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _MB = 1024 * 1024
@@ -53,11 +57,25 @@ def _replace_mock(scheduler: InferenceScheduler) -> Mock:
     return scheduler._process_lifecycle._replace_inference_process  # type: ignore[return-value]
 
 
+_PINNED_HOST_RAM_MB = 32000.0
+"""Host total RAM these rows price against.
+
+The stale-unload retention threshold is derived from the host, so leaving it to the runner's own RAM would
+make every ``rss_mb`` in this module mean something different per machine.
+"""
+
+
+def _pin_host_ram(scheduler: InferenceScheduler) -> None:
+    """Pin the host total RAM so the reclaim's retention threshold is the same on every runner."""
+    scheduler._measured_total_ram_mb = lambda: _PINNED_HOST_RAM_MB  # type: ignore[method-assign]
+
+
 def _retaining_target(process_id: int = 0, *, rss_mb: float) -> HordeProcessInfo:
     """An idle, model-less inference slot that kept ``rss_mb`` of pages after unloading its prior model."""
     target = make_mock_process_info(process_id, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
     target.ram_usage_bytes = int(rss_mb * _MB)
     target.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+    mark_ram_unload_settled(target)
     return target
 
 
@@ -116,6 +134,7 @@ class TestCreditedAdmission:
         target = _retaining_target(0, rss_mb=4000.0)
         stale_other = _retaining_target(1, rss_mb=2000.0)
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: target, 1: stale_other}))
+        _pin_host_ram(scheduler)
         scheduler._measured_available_ram_mb = lambda: 5000.0  # type: ignore[method-assign]
         scheduler._ram_danger_floor_mb = lambda: 1024.0  # type: ignore[method-assign]
         scheduler.unload_models = Mock(return_value=False)  # type: ignore[method-assign]
@@ -142,6 +161,7 @@ class TestReclaimRetargeting:
         """The head's staging target is not cycled by the stale-unload reclaim when protected."""
         target = _retaining_target(rss_mb=5000.0)
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: target}))
+        _pin_host_ram(scheduler)
         assert scheduler._replace_stale_ram_unload_process(protect_process_id=0) is False
         assert _replace_mock(scheduler).called is False
 
@@ -149,6 +169,7 @@ class TestReclaimRetargeting:
         """Without protection the same retaining stale slot is cycled (the original last-resort behavior)."""
         target = _retaining_target(rss_mb=5000.0)
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: target}))
+        _pin_host_ram(scheduler)
         assert scheduler._replace_stale_ram_unload_process() is True
         assert _replace_mock(scheduler).call_args.args[0] is target
 
@@ -172,6 +193,7 @@ class TestReclaimRetargeting:
         bloated = make_mock_process_info(1, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
         bloated.ram_usage_bytes = _CREEP_CONTAINMENT_RSS_BYTES + _MB
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: stale, 1: bloated}))
+        _pin_host_ram(scheduler)
 
         assert scheduler._replace_stale_ram_unload_process() is True
         assert _replace_mock(scheduler).call_args.args[0] is bloated

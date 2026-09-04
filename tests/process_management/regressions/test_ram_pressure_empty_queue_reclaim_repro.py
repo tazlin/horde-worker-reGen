@@ -24,7 +24,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.scheduling.governance.actions import EvictIdleModels
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from tests.process_management.conftest import make_mock_process_info
+from tests.process_management.conftest import make_mock_process_info, mark_ram_unload_settled
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _TOTAL_RAM_MB = 64000.0
@@ -78,6 +78,7 @@ class TestUnderPressureReclaimWithEmptyQueue:
         )
         process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
         process_info.ram_usage_bytes = 3 * 1024 * 1024 * 1024
+        mark_ram_unload_settled(process_info)
         process_map = ProcessMap({0: process_info})
         scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=JobTracker())
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
