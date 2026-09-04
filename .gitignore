@@ -4,7 +4,7 @@ bridgeData.yaml*
 .installed_gpu_backend
 .models_downloaded
 .pt_*/*
-docs/plans/**/*.md
+docs/plans/
 kudos_training_data*
 .claude/**
 
