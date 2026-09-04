@@ -9,6 +9,7 @@ cells exist to measure. None of this needs a worker or a GPU.
 from __future__ import annotations
 
 import itertools
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from horde_worker_regen.benchmark.pricing_corpus import (
     CENSUS_AXES,
     CENSUS_JOB_BUDGET,
     CENSUS_SECONDS_PER_JOB,
+    HEAVY_MODELS,
     PRICING_CORPUS_LORA_VERSION_IDS,
     PRICING_CORPUS_TI_NAME,
     REPLICATES,
@@ -36,6 +38,7 @@ from horde_worker_regen.benchmark.pricing_corpus import (
     SDXL_A,
     SDXL_B,
     CorpusCell,
+    CorpusMachineFacts,
     PricingCorpusDefinition,
     PricingCorpusError,
     PricingCorpusJob,
@@ -44,6 +47,7 @@ from horde_worker_regen.benchmark.pricing_corpus import (
     _categorical_cells,
     build_pricing_corpus_scenario,
     definition_json,
+    tier_has_lora_cells,
     write_definition_artifact,
 )
 from horde_worker_regen.benchmark.scenarios import Scenario
@@ -126,6 +130,44 @@ class TestDeterminism:
         scenario, definition = standard
         assert (scenario.name, scenario.revision) == (SCENARIO_NAME, SCENARIO_REVISION)
         assert scenario.total_image_jobs == len(definition.jobs)
+
+
+class TestManifestIdentity:
+    """A corpus is only poolable with corpora built against the same feature encoding."""
+
+    @_REQUIRES_MANIFEST
+    @pytest.mark.parametrize("tier", ["smoke", "standard", "heavy"])
+    def test_every_tier_stamps_the_manifest_content_hash(self, tier: str) -> None:
+        """A tier built where the manifest is importable carries its content hash, census or not."""
+        definition = build_pricing_corpus_scenario(tier)[1]  # type: ignore[arg-type]
+        assert definition.manifest_sha256 is not None
+        assert re.fullmatch(r"[0-9a-f]{64}", definition.manifest_sha256)
+        assert f'"manifest_sha256": "{definition.manifest_sha256}"' in definition_json(definition)
+
+    def test_an_unstamped_hash_carries_no_key_in_the_artifact(
+        self,
+        standard: tuple[Scenario, PricingCorpusDefinition],
+    ) -> None:
+        """A machine with no manifest renders bytes with no key for the hash at all."""
+        definition = standard[1].model_copy(update={"manifest_sha256": None})
+        assert '"manifest_sha256"' not in definition_json(definition)
+
+
+class TestLoraCellTiers:
+    """The preflight and the run both decide LoRA work from whether a tier has LoRA cells."""
+
+    @pytest.mark.parametrize("tier", ["smoke", "standard"])
+    def test_the_small_tiers_carry_lora_cells(self, tier: str) -> None:
+        """A tier the helper calls LoRA-bearing really does reference LoRAs."""
+        definition = build_pricing_corpus_scenario(tier)[1]  # type: ignore[arg-type]
+        assert tier_has_lora_cells(tier)
+        assert any(cell.lora_version_ids for cell in definition.cells)
+
+    def test_the_heavy_tier_has_none(self) -> None:
+        """The heavy tier references no LoRA, so nothing may be evicted or fetched for it."""
+        definition = build_pricing_corpus_scenario("heavy")[1]
+        assert not tier_has_lora_cells("heavy")
+        assert not any(cell.lora_version_ids for cell in definition.cells)
 
 
 class TestCategoricalArray:
@@ -721,3 +763,76 @@ class TestCensusCoverage:
         assert outpainting
         assert all(job.source_image for job in outpainting)
         assert all(job.source_mask for job in outpainting)
+
+
+class TestHeavyTier:
+    """The heavy tier measures models the reference machine cannot hold, one model block at a time."""
+
+    @pytest.fixture(scope="class")
+    def heavy(self) -> tuple[Scenario, PricingCorpusDefinition]:
+        """The heavy-tier corpus, built once per class."""
+        return build_pricing_corpus_scenario("heavy")
+
+    def test_every_job_is_blocked_by_model_and_every_cold_job_follows_a_switch(
+        self,
+        heavy: tuple[Scenario, PricingCorpusDefinition],
+    ) -> None:
+        """A block's first job is its cold cell; the rest of the block never pays a disk read."""
+        _scenario, definition = heavy
+        cells = _cells_by_id(definition)
+        measured = _measured_jobs(definition)
+        for previous, job in zip(measured, measured[1:], strict=False):
+            if job.model != previous.model:
+                assert cells[job.cell_id].requires_model_switch, job.cell_id
+            else:
+                assert not cells[job.cell_id].requires_model_switch, job.cell_id
+        for job in measured:
+            if cells[job.cell_id].requires_model_switch:
+                assert definition.jobs[job.position - 1].model != job.model
+        assert definition.warmup_job_count == 4
+        assert {cells[job.cell_id].model for job in definition.jobs[: definition.warmup_job_count]} == {SDXL_A, SD15_A}
+
+    def test_every_model_has_its_cells_and_three_replicates(
+        self,
+        heavy: tuple[Scenario, PricingCorpusDefinition],
+    ) -> None:
+        """Each heavy model carries its anchor, two resolutions, a batch and a cold cell, at three replicates."""
+        _scenario, definition = heavy
+        cells = _cells_by_id(definition)
+        models = {cell.model for cell in definition.cells if cell.group != "warmup"}
+        assert models == {*HEAVY_MODELS, SDXL_A, SD15_A}
+        for model in HEAVY_MODELS:
+            groups = Counter(cell.group for cell in definition.cells if cell.model == model)
+            assert groups["h1"] == 1 and groups["h3"] == 2 and groups["h4"] == 1 and groups["h5"] == 1, model
+        for cell in definition.cells:
+            if cell.group == "warmup":
+                continue
+            replicates = sorted(job.replicate for job in definition.jobs if job.cell_id == cell.cell_id)
+            assert replicates == [0, 1, 2], cell.cell_id
+        assert all(cells[job.cell_id].group != "warmup" for job in _measured_jobs(definition))
+
+    def test_a_subset_of_models_builds_and_an_unknown_one_is_refused(self) -> None:
+        """A machine holding only some heavy models runs those; a name outside the tier is an error."""
+        _scenario, definition = build_pricing_corpus_scenario("heavy", heavy_models=(HEAVY_MODELS[0],))
+        heavy_cells = [cell for cell in definition.cells if cell.group.startswith("h") and cell.group != "h0"]
+        assert {cell.model for cell in heavy_cells if cell.group != "h5"} == {HEAVY_MODELS[0]}
+        with pytest.raises(PricingCorpusError, match="heavy tier models"):
+            build_pricing_corpus_scenario("heavy", heavy_models=("Not A Model",))
+        with pytest.raises(PricingCorpusError, match="heavy tier models"):
+            build_pricing_corpus_scenario("heavy", heavy_models=())
+
+    def test_definition_omits_machine_and_created_at_until_the_run_stamps_them(
+        self,
+        heavy: tuple[Scenario, PricingCorpusDefinition],
+    ) -> None:
+        """A built definition has no machine identity; the run adds it, so the bytes stay build-only."""
+        _scenario, definition = heavy
+        text = definition_json(definition)
+        assert '"machine"' not in text
+        assert '"created_at"' not in text
+        stamped = definition.model_copy(
+            update={"created_at": 1.0, "machine": CorpusMachineFacts(machine_id="test-rig", vram_mb=1)},
+        )
+        stamped_text = definition_json(stamped)
+        assert '"machine_id": "test-rig"' in stamped_text
+        assert '"created_at": 1.0' in stamped_text

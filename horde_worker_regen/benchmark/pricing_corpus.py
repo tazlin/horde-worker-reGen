@@ -43,12 +43,14 @@ from pydantic import BaseModel, Field
 
 from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, Scenario
 
-PricingCorpusTier = Literal["smoke", "standard", "census"]
+PricingCorpusTier = Literal["smoke", "standard", "census", "heavy"]
 """How much of the corpus to run.
 
-``standard`` is the marginal-cost fit set, ``smoke`` a fast shape check, and ``census`` the coverage
+``standard`` is the marginal-cost fit set, ``smoke`` a fast shape check, ``census`` the coverage
 tier: every value of every categorical axis the kudos feature manifest encodes, exercised against a
-fixed anchor and again under jointly varying conditions."""
+fixed anchor and again under jointly varying conditions. ``heavy`` measures the model families the
+reference machine cannot hold, on a machine that can, beside the SD1.5 and SDXL anchors that machine
+shares with the reference."""
 
 SCENARIO_NAME = "pricing-corpus"
 SCENARIO_REVISION = "2"
@@ -65,7 +67,26 @@ measured separately from a switch that also changes architecture."""
 SD15_A = "Deliberate"
 """The SD1.5 anchor model."""
 
-_MODEL_TAGS: dict[str, str] = {SDXL_A: "sdxl", SDXL_B: "sdxlb", SD15_A: "sd15"}
+FLUX_A = "Flux.1-Schnell fp8 (Compact)"
+QWEN_A = "Qwen-Image_fp8"
+ZIMAGE_A = "Z-Image-Turbo"
+KREA2_A = "Krea2-Turbo_fp8"
+ANIMA_A = "Anima-Turbo-v1.1"
+
+HEAVY_MODELS: tuple[str, ...] = (FLUX_A, QWEN_A, ZIMAGE_A, KREA2_A, ANIMA_A)
+"""The heavy tier's models, one per family the reference machine cannot serve; the beta-overlay names
+(Krea2, Anima) are what the worker's pending-queue opt-in resolves."""
+
+_MODEL_TAGS: dict[str, str] = {
+    SDXL_A: "sdxl",
+    SDXL_B: "sdxlb",
+    SD15_A: "sd15",
+    FLUX_A: "flux",
+    QWEN_A: "qwen",
+    ZIMAGE_A: "zimage",
+    KREA2_A: "krea2",
+    ANIMA_A: "anima",
+}
 """Short, stable per-model tags used in cell ids (the ids are read by humans and by the assembler)."""
 
 REPLICATES = 3
@@ -371,6 +392,25 @@ class CensusSummary(BaseModel):
     """Axis to vocabulary value to how many measured (non-warmup) jobs carry it."""
 
 
+class CorpusMachineFacts(BaseModel):
+    """The measuring machine as the run observed it, so its rows stay attributable and admissible.
+
+    The kudos-training assembler keys every row on ``machine_id`` and its machines table is written
+    from these facts rather than typed by hand.
+    """
+
+    machine_id: str
+    """Operator-chosen id, stable across runs on the same box (``<owner>-<gpu>`` by convention)."""
+    hostname: str | None = None
+    gpu_model: str | None = None
+    vram_mb: int | None = None
+    driver_version: str | None = None
+    os: str | None = None
+    worker_version: str | None = None
+    hordelib_version: str | None = None
+    torch_version: str | None = None
+
+
 class PricingCorpusDefinition(BaseModel):
     """The machine-readable description of one built corpus: what ran, in what order, measuring what.
 
@@ -397,6 +437,16 @@ class PricingCorpusDefinition(BaseModel):
 
     Absent (and omitted from the rendered artifact) for the other tiers, whose bytes predate this field
     and must keep comparing equal across the revision."""
+    created_at: float | None = None
+    """Epoch seconds when the artifact was written; the session's stats stream starts shortly after it."""
+    machine: CorpusMachineFacts | None = None
+    """The measuring machine, when the run was told which machine it is."""
+    manifest_sha256: str | None = None
+    """Content hash of the kudos feature manifest this corpus was built against.
+
+    Rows only pool with rows encoded under the same feature contract, and a manifest revision string can
+    be reused while the contents behind it move, so the hash is what an assembler can safely key on.
+    Absent (and omitted from the rendered artifact) when the installed hordelib ships no manifest."""
 
 
 @dataclass(frozen=True)
@@ -747,7 +797,7 @@ def _post_processing_stack_cell() -> CorpusCell:
     )
 
 
-def _warmup_cells(*, per_model: int) -> list[CorpusCell]:
+def _warmup_cells(*, per_model: int, anchors: tuple[CorpusCell, ...] = _ANCHORS) -> list[CorpusCell]:
     """Build the warmup cells: each model at its anchor shape, loaded once in a fixed order.
 
     The warmup block absorbs the costs a session pays once (process spawn, first model load, engine
@@ -755,7 +805,7 @@ def _warmup_cells(*, per_model: int) -> list[CorpusCell]:
     """
     return [
         _variant(anchor, cell_id=f"warmup.{_tag(anchor.model)}", group="warmup", replicates=per_model)
-        for anchor in _ANCHORS
+        for anchor in anchors
     ]
 
 
@@ -774,6 +824,159 @@ def _standard_cells(lora_version_ids: tuple[str, ...], ti_name: str) -> list[Cor
         *_cold_load_cells(),
         _post_processing_stack_cell(),
     ]
+
+
+_HEAVY_ANCHORS: dict[str, CorpusCell] = {
+    FLUX_A: CorpusCell(
+        cell_id="anchor.flux",
+        group="anchor",
+        model=FLUX_A,
+        width=1024,
+        height=1024,
+        steps=4,
+        cfg_scale=1.0,
+        n_iter=1,
+        sampler_name="k_euler",
+        scheduler="karras",
+        source_processing="txt2img",
+    ),
+    QWEN_A: CorpusCell(
+        cell_id="anchor.qwen",
+        group="anchor",
+        model=QWEN_A,
+        width=1024,
+        height=1024,
+        steps=20,
+        cfg_scale=1.0,
+        n_iter=1,
+        sampler_name="k_euler",
+        scheduler="simple",
+        source_processing="txt2img",
+    ),
+    ZIMAGE_A: CorpusCell(
+        cell_id="anchor.zimage",
+        group="anchor",
+        model=ZIMAGE_A,
+        width=1024,
+        height=1024,
+        steps=9,
+        cfg_scale=1.0,
+        n_iter=1,
+        sampler_name="k_euler",
+        scheduler="simple",
+        source_processing="txt2img",
+    ),
+    KREA2_A: CorpusCell(
+        cell_id="anchor.krea2",
+        group="anchor",
+        model=KREA2_A,
+        width=1024,
+        height=1024,
+        steps=8,
+        cfg_scale=1.0,
+        n_iter=1,
+        sampler_name="er_sde",
+        scheduler="simple",
+        source_processing="txt2img",
+    ),
+    ANIMA_A: CorpusCell(
+        cell_id="anchor.anima",
+        group="anchor",
+        model=ANIMA_A,
+        width=1024,
+        height=1024,
+        steps=8,
+        cfg_scale=1.0,
+        n_iter=1,
+        sampler_name="er_sde",
+        scheduler="simple",
+        source_processing="txt2img",
+    ),
+}
+"""Each heavy model at its native shape, inside the sampler, schedule, step and guidance ranges its model
+reference record requires; a job outside them is refused by the worker rather than measured."""
+
+_HEAVY_ALTERNATE_STEPS: dict[str, int | None] = {FLUX_A: 8, QWEN_A: 40, ZIMAGE_A: None, KREA2_A: None, ANIMA_A: 12}
+"""A second trajectory length inside each model's allowed range, or None where the range is one value.
+
+Distilled turbo models are locked to one step count, so their per-step cost is not separable from the
+per-job constant; the cells say so by carrying one length."""
+
+_HEAVY_OVERLAP_ANCHORS: tuple[CorpusCell, ...] = (ANCHOR_SDXL, ANCHOR_SD15)
+"""The reference-machine anchors a heavy-tier machine runs too, so its speed can be calibrated to the
+reference on cells both have measured."""
+
+
+def _heavy_cells(models: tuple[str, ...]) -> list[CorpusCell]:
+    """H0..H5: the heavy tier's cells.
+
+    Per heavy model: the native anchor, a second trajectory length where the model allows one, a smaller
+    and a wide resolution, a two-image batch, and a cold cell whose every job follows a different model.
+    The overlap anchors get a warm and a cold cell each. The cold cells are the point of the tier: a
+    heavy model's disk read and the eviction it forces are costs no other tier measures, and on this
+    class of model they rival the sampling itself.
+    """
+    cells: list[CorpusCell] = []
+    for anchor in _HEAVY_OVERLAP_ANCHORS:
+        tag = _tag(anchor.model)
+        cells.append(_variant(anchor, cell_id=f"h0.overlap.{tag}", group="h0"))
+        cells.append(_variant(anchor, cell_id=f"h5.cold.{tag}", group="h5", requires_model_switch=True))
+    for model in models:
+        anchor = _HEAVY_ANCHORS[model]
+        tag = _tag(model)
+        cells.append(_variant(anchor, cell_id=f"h1.anchor.{tag}", group="h1"))
+        alternate = _HEAVY_ALTERNATE_STEPS[model]
+        if alternate is not None:
+            cells.append(_variant(anchor, cell_id=f"h2.steps{alternate}.{tag}", group="h2", steps=alternate))
+        cells.append(_variant(anchor, cell_id=f"h3.res768x768.{tag}", group="h3", width=768, height=768))
+        cells.append(_variant(anchor, cell_id=f"h3.res1280x768.{tag}", group="h3", width=1280, height=768))
+        cells.append(_variant(anchor, cell_id=f"h4.batch2.{tag}", group="h4", n_iter=2))
+        cells.append(_variant(anchor, cell_id=f"h5.cold.{tag}", group="h5", requires_model_switch=True))
+    return cells
+
+
+def _order_heavy_blocks(
+    cells: list[CorpusCell],
+    *,
+    seed: str,
+    replicates: tuple[int, ...],
+    state: _OrderState,
+) -> list[_PlacementUnit]:
+    """Order a heavy-tier permutation block model by model.
+
+    The general ordering interleaves models freely because an SD-class switch is a cheap RAM-to-VRAM
+    move. Heavy checkpoints do not fit in host RAM together, so every switch is a disk read of tens of
+    seconds that would land in whichever cell happened to follow it. Grouping a model's jobs into one
+    block per replicate confines that cost to the block's first job, which is the cold cell, and the
+    block sequence is reshuffled per replicate so no model always follows the same predecessor.
+
+    Args:
+        cells: The tier's cells.
+        seed: The permutation's shuffle seed.
+        replicates: The replicate indices this permutation carries.
+        state: Session-wide ordering state, advanced in place.
+
+    Returns:
+        The block's units in placement order, one unit per job.
+    """
+    rng = random.Random(seed)
+    models = sorted({cell.model for cell in cells})
+    ordered: list[_PlacementUnit] = []
+    for replicate in replicates:
+        block_order = list(models)
+        rng.shuffle(block_order)
+        if block_order[0] == state.last_model and len(block_order) > 1:
+            block_order.append(block_order.pop(0))
+        for model in block_order:
+            block = [cell for cell in cells if cell.model == model and replicate < cell.replicates]
+            cold = [cell for cell in block if cell.requires_model_switch]
+            warm = [cell for cell in block if not cell.requires_model_switch]
+            rng.shuffle(warm)
+            for cell in [*cold, *warm]:
+                ordered.append(_PlacementUnit(cell=cell, replicates=(replicate,), permutation=seed))
+                state.position += 1
+            state.last_model = model
+    return ordered
 
 
 def _smoke_cells(lora_version_ids: tuple[str, ...]) -> list[CorpusCell]:
@@ -855,6 +1058,35 @@ def _manifest_vocabularies() -> tuple[str, dict[str, tuple[str, ...]]]:
             f"{', '.join(missing)}, so the census cannot claim to cover it",
         )
     return manifest.manifest_version, vocabularies
+
+
+def _manifest_content_sha256() -> str | None:
+    """Return the content hash of the installed kudos feature manifest, or None when none is installed.
+
+    Read for every tier, not only the ones whose cells come from the manifest: a fit pools rows across
+    machines and the pooling is only sound when both encoded their features the same way.
+    """
+    try:
+        from hordelib.kudos_training import default_manifest  # type: ignore
+    except ImportError:
+        return None
+    return default_manifest().content_sha256()
+
+
+_TIERS_WITHOUT_LORA_CELLS: frozenset[str] = frozenset({"heavy"})
+"""Tiers whose cells reference no LoRA.
+
+The heavy tier measures model families the LoRA references pinned here do not apply to, so it needs
+neither a CivitAI token nor a cold LoRA cache."""
+
+
+def tier_has_lora_cells(tier: str) -> bool:
+    """Whether a tier's cells reference LoRAs, answerable without building the tier.
+
+    A caller holding a built definition should read it instead (``any(cell.lora_version_ids ...)``); this
+    is for callers that judge a machine before any definition exists.
+    """
+    return tier not in _TIERS_WITHOUT_LORA_CELLS
 
 
 def _census_validity() -> tuple[str, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]], list[CorpusExclusion]]:
@@ -1181,6 +1413,7 @@ def _census_cells(
     ti_name: str,
     *,
     warmup_job_count: int,
+    job_budget: int = CENSUS_JOB_BUDGET,
 ) -> tuple[list[CorpusCell], _CensusPlan]:
     """Build the census tier's cells and the plan describing what they cover.
 
@@ -1188,12 +1421,14 @@ def _census_cells(
         lora_version_ids: The pinned LoRA references the count levels use.
         ti_name: The pinned textual-inversion reference.
         warmup_job_count: Jobs the warmup block spends, which come out of the same budget.
+        job_budget: Jobs the tier may spend, warmup included. The sweeps are fixed by the manifest's
+            vocabularies; only the conflation block grows or shrinks with the budget.
 
     Returns:
         The measurement cells and the coverage plan.
 
     Raises:
-        PricingCorpusError: If the sweeps alone exceed :data:`CENSUS_JOB_BUDGET`.
+        PricingCorpusError: If the sweeps alone exceed *job_budget*.
     """
     version, vocabularies, runnable, exclusions = _census_validity()
     sweeps = [
@@ -1208,13 +1443,12 @@ def _census_cells(
         *_census_cold_load_cells(),
     ]
     spent = warmup_job_count + len(sweeps) * REPLICATES
-    if spent > CENSUS_JOB_BUDGET:
+    if spent > job_budget:
         raise PricingCorpusError(
-            f"the census sweeps need {spent} jobs, above the {CENSUS_JOB_BUDGET}-job budget; the "
-            f"manifest ({version}) has outgrown the tier and its budget or its replicate count has to "
-            "be revisited",
+            f"the census sweeps need {spent} jobs, above the {job_budget}-job budget; raise the budget, "
+            f"or the manifest ({version}) has outgrown the tier and its replicate count has to be revisited",
         )
-    conflation_count = (CENSUS_JOB_BUDGET - spent) // REPLICATES
+    conflation_count = (job_budget - spent) // REPLICATES
     conflation = _census_conflation_cells(conflation_count, runnable)
     plan = _CensusPlan(
         manifest_version=version,
@@ -1520,6 +1754,8 @@ def build_pricing_corpus_scenario(
     *,
     lora_version_ids: tuple[str, ...] = PRICING_CORPUS_LORA_VERSION_IDS,
     ti_name: str = PRICING_CORPUS_TI_NAME,
+    job_budget: int = CENSUS_JOB_BUDGET,
+    heavy_models: tuple[str, ...] = HEAVY_MODELS,
 ) -> tuple[Scenario, PricingCorpusDefinition]:
     """Build the pricing corpus for a tier: the scenario to run and the definition describing it.
 
@@ -1530,24 +1766,36 @@ def build_pricing_corpus_scenario(
             references in :data:`PRICING_CORPUS_LORA_VERSION_IDS`.
         ti_name: The textual-inversion reference for the G9 cell. Defaults to
             :data:`PRICING_CORPUS_TI_NAME`.
+        job_budget: Jobs the census tier may spend, warmup included; ignored by the other tiers.
+            Defaults to :data:`CENSUS_JOB_BUDGET`.
+        heavy_models: The heavy tier's models, a subset of :data:`HEAVY_MODELS` for a machine that
+            holds only some of them; ignored by the other tiers.
 
     Returns:
         The scenario (its job list already in final order) and its definition artifact.
 
     Raises:
-        PricingCorpusError: If the tier is unknown, too few LoRA ids are supplied, or the census tier
-            cannot read the kudos feature manifest its vocabularies come from.
+        PricingCorpusError: If the tier is unknown, too few LoRA ids are supplied, the census tier
+            cannot read the kudos feature manifest its vocabularies come from, or a heavy model is not
+            one the tier knows.
         PricingCorpusOrderingError: If the ordering constraints cannot be satisfied.
     """
-    if tier not in ("smoke", "standard", "census"):
+    if tier not in ("smoke", "standard", "census", "heavy"):
         raise PricingCorpusError(f"unknown pricing-corpus tier: {tier!r}")
+    unknown_heavy = sorted(set(heavy_models) - set(HEAVY_MODELS))
+    if tier == "heavy" and (unknown_heavy or not heavy_models):
+        raise PricingCorpusError(
+            f"heavy tier models must be drawn from {list(HEAVY_MODELS)}; unknown: {unknown_heavy}, given: "
+            f"{list(heavy_models)}",
+        )
     if len(lora_version_ids) < len(PRICING_CORPUS_LORA_VERSION_IDS):
         raise PricingCorpusError(
             f"the LoRA cells need {len(PRICING_CORPUS_LORA_VERSION_IDS)} version ids, got {len(lora_version_ids)}",
         )
 
     warmup_per_model = 1 if tier == "smoke" else 2
-    warmup_cells = _warmup_cells(per_model=warmup_per_model)
+    warmup_anchors = _HEAVY_OVERLAP_ANCHORS if tier == "heavy" else _ANCHORS
+    warmup_cells = _warmup_cells(per_model=warmup_per_model, anchors=warmup_anchors)
     warmup_units = [
         _PlacementUnit(cell=cell, replicates=tuple(range(cell.replicates)), permutation="warmup")
         for cell in warmup_cells
@@ -1558,7 +1806,14 @@ def build_pricing_corpus_scenario(
     if tier == "standard":
         cells = _standard_cells(lora_version_ids, ti_name)
     elif tier == "census":
-        cells, plan = _census_cells(lora_version_ids, ti_name, warmup_job_count=len(warmup_jobs))
+        cells, plan = _census_cells(
+            lora_version_ids,
+            ti_name,
+            warmup_job_count=len(warmup_jobs),
+            job_budget=job_budget,
+        )
+    elif tier == "heavy":
+        cells = _heavy_cells(heavy_models)
     else:
         cells = _smoke_cells(lora_version_ids)
 
@@ -1570,8 +1825,11 @@ def build_pricing_corpus_scenario(
 
     jobs = list(warmup_jobs)
     for seed in seeds:
-        units = _units_for_permutation(cells, seed, replicates_by_seed[seed])
-        ordered = _order_units(units, seed=seed, state=state)
+        if tier == "heavy":
+            ordered = _order_heavy_blocks(cells, seed=seed, replicates=replicates_by_seed[seed], state=state)
+        else:
+            units = _units_for_permutation(cells, seed, replicates_by_seed[seed])
+            ordered = _order_units(units, seed=seed, state=state)
         jobs.extend(_units_to_jobs(ordered, start_position=len(jobs)))
 
     all_cells = [*warmup_cells, *cells]
@@ -1587,6 +1845,7 @@ def build_pricing_corpus_scenario(
         scenario_name=SCENARIO_NAME,
         scenario_revision=SCENARIO_REVISION,
         tier=tier,
+        manifest_sha256=_manifest_content_sha256(),
         warmup_job_count=len(warmup_jobs),
         shuffle_seeds=seeds,
         prompts=list(PINNED_PROMPTS),
@@ -1599,7 +1858,7 @@ def build_pricing_corpus_scenario(
             if plan is None
             else CensusSummary(
                 manifest_version=plan.manifest_version,
-                job_budget=CENSUS_JOB_BUDGET,
+                job_budget=job_budget,
                 projected_job_count=len(jobs),
                 projected_runtime_seconds=len(jobs) * CENSUS_SECONDS_PER_JOB,
                 seconds_per_job=CENSUS_SECONDS_PER_JOB,
@@ -1613,8 +1872,8 @@ def build_pricing_corpus_scenario(
     return scenario, definition
 
 
-_TIER_SPECIFIC_FIELDS: tuple[str, ...] = ("census",)
-"""Definition fields only some tiers populate; omitted from the artifact when unset."""
+_TIER_SPECIFIC_FIELDS: tuple[str, ...] = ("census", "created_at", "machine", "manifest_sha256")
+"""Definition fields only some tiers or runs populate; omitted from the artifact when unset."""
 
 
 def _canonical(value: object) -> object:
