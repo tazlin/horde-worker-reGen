@@ -7,7 +7,9 @@ injected through :class:`Probes`, so none of this needs a GPU, weights, or a hor
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -15,19 +17,31 @@ import pytest
 from horde_worker_regen.benchmark.corpus_preflight import (
     COMFY_PIN_PACKAGES,
     CORPUS_FREE_DISK_BYTES,
-    CORPUS_TIER_MIN_VRAM_MB,
+    FootprintObservation,
     HordelibFacts,
     PreflightCheck,
     PreflightReport,
     Probes,
     corpus_bench_tiers,
+    footprint_observation_probe,
     format_report,
     requires_kudos_manifest,
     run_preflight,
     stamp_definition,
 )
 from horde_worker_regen.benchmark.enums import BenchTier
-from horde_worker_regen.benchmark.pricing_corpus import CorpusMachineFacts, build_pricing_corpus_scenario
+from horde_worker_regen.benchmark.pricing_corpus import (
+    CORPUS_MODEL_BASELINES,
+    CorpusMachineFacts,
+    build_pricing_corpus_scenario,
+)
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FOOTPRINT_STORE_FILENAME,
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+    ResolutionBucket,
+)
 
 GOOD_PINS: dict[str, str] = {
     "comfy-kitchen": "0.2.31",
@@ -61,6 +75,8 @@ def healthy_probes(
     missing_models: Callable[[list[str]], list[str] | None] | None = None,
     civitai_token: Callable[[], str | None] | None = None,
     live_worker: Callable[[], str | None] | None = None,
+    footprint_observation: Callable[[FootprintKey], FootprintObservation | None] | None = None,
+    model_size_bytes: Callable[[str], int | None] | None = None,
 ) -> Probes:
     """Probes for a machine on which every check passes, with individual readings overridable."""
     return Probes(
@@ -76,7 +92,35 @@ def healthy_probes(
         missing_models=missing_models or (lambda models: []),
         civitai_token=civitai_token or (lambda: "token"),
         live_worker=live_worker or (lambda: None),
+        footprint_observation=footprint_observation or measured_at(6000.0),
+        model_size_bytes=model_size_bytes or (lambda model: 7 * 1024**3),
     )
+
+
+@dataclass(frozen=True)
+class FakeObservation:
+    """A measured footprint reading, as the preflight reads one."""
+
+    watermark_mb: float
+    observation_count: int = 5
+
+
+def measured_at(watermark_mb: float) -> Callable[[FootprintKey], FootprintObservation | None]:
+    """A probe answering with the same measured watermark for every key the preflight asks about."""
+    return lambda key: FakeObservation(watermark_mb=watermark_mb)
+
+
+def measured_for(watermarks: dict[str, float]) -> Callable[[FootprintKey], FootprintObservation | None]:
+    """A probe answering only for the named checkpoints, keyed the way the preflight keys its lookups."""
+
+    def probe(key: FootprintKey) -> FootprintObservation | None:
+        if key.stage is FootprintStage.RESIDENT:
+            watermark = watermarks.get(key.checkpoint or "")
+            return FakeObservation(watermark_mb=watermark) if watermark is not None else None
+        measured = {CORPUS_MODEL_BASELINES[model] for model in watermarks}
+        return FakeObservation(watermark_mb=0.0) if key.model_baseline in measured else None
+
+    return probe
 
 
 def check_named(report: PreflightReport, name: str) -> PreflightCheck:
@@ -257,52 +301,106 @@ def test_a_full_cache_volume_fails_and_says_how_much_to_free() -> None:
     assert "free up 10.0 GB" in check_named(report, "free disk").fix
 
 
-def test_a_card_at_the_tier_threshold_passes() -> None:
-    """A card holding exactly what the tier asks for is admitted."""
-    probes = healthy_probes(vram_mb=lambda: CORPUS_TIER_MIN_VRAM_MB["heavy"])
+def test_every_model_measured_under_the_card_passes() -> None:
+    """A card that has already held every model of the tier is admitted on that evidence."""
+    probes = healthy_probes(vram_mb=lambda: 24074, footprint_observation=measured_at(6000.0))
 
     report = run_preflight("heavy", "alice-l40s", models=MODELS, require_manifest=True, probes=probes)
     check = check_named(report, "vram")
 
-    assert check.passed, check.detail
-    assert str(CORPUS_TIER_MIN_VRAM_MB["heavy"]) in check.detail
+    assert check.severity == "ok", check.detail
+    assert "6000 MB" in check.detail
+    assert "24074 MB" in check.detail
 
 
-def test_a_card_below_the_tier_threshold_fails_and_names_a_tier_that_fits() -> None:
-    """A card too small for the tier is turned away toward a tier it can actually run."""
-    probes = healthy_probes(vram_mb=lambda: 12288)
+def test_a_measured_peak_above_the_card_warns_and_names_the_model() -> None:
+    """A peak above the card is evidence of paging or of a failed job, not a refusal: the run still starts."""
+    probes = healthy_probes(vram_mb=lambda: 24074, footprint_observation=measured_for({"Deliberate": 30000.0}))
 
     report = run_preflight("heavy", "alice-l40s", models=MODELS, require_manifest=True, probes=probes)
     check = check_named(report, "vram")
 
-    assert not check.passed
-    assert "12288 MB" in check.detail
-    named = check.fix.rsplit(" ", 1)[-1]
-    assert CORPUS_TIER_MIN_VRAM_MB[named] < CORPUS_TIER_MIN_VRAM_MB["heavy"]
-    assert CORPUS_TIER_MIN_VRAM_MB[named] <= 12288
+    assert check.severity == "warn"
+    assert report.passed
+    assert "Deliberate" in check.detail
+    assert "30000 MB" in check.detail
+    assert "24074 MB" in check.detail
+    assert "Deliberate" in check.fix
 
 
-def test_a_card_below_every_tier_says_so_rather_than_naming_one() -> None:
-    """When no tier fits, the fix asks for a bigger card instead of naming an impossible tier."""
-    probes = healthy_probes(vram_mb=lambda: 4096)
+def test_a_card_with_no_measurements_warns_and_names_what_is_unverified() -> None:
+    """Nothing measured is not evidence of an overrun, so the run proceeds with the models named."""
+    probes = healthy_probes(
+        vram_mb=lambda: 8192,
+        footprint_observation=lambda key: None,
+        model_size_bytes=lambda model: 20 * 1024**3,
+    )
 
-    report = run_preflight("standard", "alice-l40s", models=MODELS, require_manifest=False, probes=probes)
+    report = run_preflight("heavy", "alice-l40s", models=MODELS, require_manifest=True, probes=probes)
     check = check_named(report, "vram")
 
-    assert not check.passed
-    assert str(min(CORPUS_TIER_MIN_VRAM_MB.values())) in check.fix
-    assert "--tier" not in check.fix
+    assert check.severity == "warn"
+    assert report.passed
+    assert "8192 MB" in check.detail
+    assert "20.0 GB" in check.detail
+    for model in MODELS:
+        assert model in check.detail
+    assert "one-model smoke" in check.fix
 
 
-def test_unreadable_vram_fails_and_says_the_probe_could_not_read_the_card() -> None:
-    """An unanswerable card is a failure: a run admitted on an unknown card can overflow it."""
+def test_unreadable_vram_warns_and_says_the_probe_could_not_read_the_card() -> None:
+    """An unanswerable card cannot prove an overrun either, so it warns rather than refusing."""
     probes = healthy_probes(vram_mb=lambda: None)
 
     report = run_preflight("standard", "alice-l40s", models=MODELS, require_manifest=False, probes=probes)
     check = check_named(report, "vram")
 
-    assert not check.passed
+    assert check.severity == "warn"
+    assert report.passed
     assert "could not read" in check.detail
+
+
+def test_a_persisted_store_is_read_back_by_the_default_probe(tmp_path: Path) -> None:
+    """The default probe reads the footprints a previous run persisted, keyed as the preflight keys them."""
+    store_path = tmp_path / FOOTPRINT_STORE_FILENAME
+    store = LearnedFootprintStore(path=store_path)
+    resident_key = FootprintKey(
+        model_baseline=CORPUS_MODEL_BASELINES["Deliberate"],
+        resolution_bucket=None,
+        platform=sys.platform,
+        stage=FootprintStage.RESIDENT,
+        checkpoint="Deliberate",
+    )
+    store.observe_peak(resident_key, 5000.0)
+    store.save()
+
+    probe = footprint_observation_probe(store_path)
+    observation = probe(resident_key)
+
+    assert observation is not None
+    assert observation.watermark_mb == 5000.0
+    assert (
+        probe(
+            FootprintKey(
+                model_baseline=CORPUS_MODEL_BASELINES["Deliberate"],
+                resolution_bucket=ResolutionBucket.GT_1024,
+                platform=sys.platform,
+                stage=FootprintStage.SAMPLE,
+                checkpoint=None,
+            ),
+        )
+        is None
+    )
+
+    report = run_preflight(
+        "standard",
+        "alice-l40s",
+        models=["Deliberate"],
+        require_manifest=False,
+        probes=healthy_probes(vram_mb=lambda: 24074, footprint_observation=probe),
+    )
+
+    assert check_named(report, "vram").severity == "ok"
 
 
 def test_the_heavy_tier_does_not_need_a_civitai_token() -> None:

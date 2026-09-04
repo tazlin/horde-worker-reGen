@@ -29,8 +29,12 @@ horde-benchmark corpus-preflight --tier census --machine alice-l40s
 ```
 
 One row per check with a `FIX` column. Run whatever the `FIX` column says, then run the preflight again
-until every row is `OK`. Missing models are the usual finding; the fix line is a
-`horde-benchmark download` command that fetches exactly what the tier needs.
+until no row is `FAIL`. Missing models are the usual finding; the fix line is a `horde-benchmark
+download` command that fetches exactly what the tier needs.
+
+A `WARN` row does not block the run: it is something this machine has not measured yet, most often the
+`vram` row on a card that has never held the tier's models. Clear it by running the one-model smoke in
+step 3 first, which measures the card and turns the row into a verdict.
 
 ## 3. Run the corpus
 

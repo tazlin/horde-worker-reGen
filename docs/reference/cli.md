@@ -403,12 +403,18 @@ horde-benchmark corpus-preflight --tier census --machine alice-l40s
 
 Prints one row per check (machine id, CUDA, VRAM, hordelib and its kudos manifest, the ComfyUI pins,
 cache home, the tier's models on disk, free disk, CivitAI token, no live worker), each with the exact
-command or edit that clears it, and exits non-zero while anything is outstanding. `--model` narrows the
-heavy tier's model check the same way it narrows the run.
+command or edit that clears it, and exits non-zero while anything is outstanding. A row is `OK`, `WARN`
+(reported with its remedy, does not stop the run) or `FAIL`. `--model` narrows the heavy tier's model
+check the same way it narrows the run.
 
-The `vram` check holds the card to what the tier's working set needs: 8192 MB for `smoke`, `standard`
-and `census`, and 24576 MB for `heavy`, whose fp8 checkpoints have to sit in VRAM beside their text
-encoders. A card below the tier's need fails with a fix naming a tier it does fit. The `civitai token`
+The `vram` check judges the card only against what this machine has already measured. hordelib streams a
+model's components on and off the card, so a checkpoint larger than the card still runs and its size
+predicts nothing; the check reads the learned footprint store
+(`.horde_worker_regen/vram_footprints.json`) for each of the tier's models and reports the highest peak
+measured for it against the card. The row never fails: a peak above the card is paging on a demand-paging
+driver or a failed job, and only a run tells which, so it is a `WARN` naming the model. Where a model has
+never been measured here the row is also `WARN`: it names the unverified models and the largest checkpoint
+on disk, and asks for the tier's one-model smoke first rather than refusing a run that may well work. The `civitai token`
 check is skipped for the `heavy` tier, which carries no LoRA cells; the run skips the pre-run LoRA
 eviction there for the same reason.
 

@@ -2,11 +2,15 @@
 
 A corpus run is long and its output is only useful if every row can be attributed to a machine and
 compared against rows from other machines. The failures that make a run worthless are all knowable up
-front: no CUDA, a card too small for the tier, a hordelib without the kudos feature manifest the census
-vocabularies come from, a ComfyUI pin the inference children die on, a model that is not on disk, no
-CivitAI token for the tiers that carry LoRA cells, or another worker already holding the card. Each
+front: no CUDA, a hordelib without the kudos feature manifest the census vocabularies come from, a
+ComfyUI pin the inference children die on, a model that is not on disk, no CivitAI token for the tiers
+that carry LoRA cells, or another worker already holding the card. Each
 check therefore carries the exact command that clears it, so the operator fixes the machine rather than
 reading a stack trace four hours in.
+
+A check that cannot be decided warns instead of refusing. Whether a card holds a model is the clearest
+case: components are streamed on and off the card as a job runs, so the size of a checkpoint predicts
+nothing, and the only honest verdict comes from what this machine has already measured under load.
 
 Every probe is injectable (:class:`Probes`), so the checks can be exercised on a box with no GPU and no
 weights. The default probes stay torch-free in this process: the accelerator enumeration runs
@@ -24,9 +28,11 @@ import os
 import platform
 import re
 import shutil
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, Protocol
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -34,9 +40,17 @@ from loguru import logger
 
 from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.pricing_corpus import (
+    CORPUS_MODEL_BASELINES,
     CorpusMachineFacts,
     PricingCorpusDefinition,
     tier_has_lora_cells,
+)
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FOOTPRINT_STORE_FILENAME,
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+    ResolutionBucket,
 )
 
 HORDELIB_DISTRIBUTION = "horde_engine"
@@ -70,17 +84,6 @@ MACHINE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 CORPUS_FREE_DISK_BYTES = 20 * 1024**3
 """Free space the cache volume needs: the corpus fetches LoRAs and re-fetches evicted ones as it runs."""
 
-CORPUS_TIER_MIN_VRAM_MB: dict[str, int] = {
-    # The small tiers are SDXL-sized, which is the smallest card the corpus is worth running on at all.
-    "smoke": 8192,
-    "standard": 8192,
-    "census": 8192,
-    # The heavy families ship fp8 checkpoints of roughly 17-20 GB on disk that have to sit in VRAM beside
-    # their text encoders, so a smaller card pages instead of sampling and prices the paging.
-    "heavy": 24576,
-}
-"""VRAM each corpus tier needs on its largest card, in MB."""
-
 _MANIFEST_TIERS: frozenset[str] = frozenset({"census", "heavy"})
 """Tiers whose vocabularies are read from the kudos feature manifest."""
 
@@ -109,15 +112,27 @@ def requires_kudos_manifest(tier: str) -> bool:
     return tier in _MANIFEST_TIERS
 
 
+CheckSeverity = Literal["ok", "warn", "fail"]
+"""How much weight a check's verdict carries.
+
+A warning is a reading the preflight cannot turn into a verdict: it is reported with its remedy but does
+not refuse the run, because a condition nothing has measured is not evidence the run will fail."""
+
+
 @dataclass(frozen=True)
 class PreflightCheck:
-    """One preflight condition, its verdict, and the exact remedy when it failed."""
+    """One preflight condition, its verdict, and the exact remedy when it is not clean."""
 
     name: str
-    passed: bool
+    severity: CheckSeverity
     detail: str
     fix: str = ""
-    """Command or edit that clears the check; empty when the check passed."""
+    """Command or edit that clears the check; empty when the check is clean."""
+
+    @property
+    def passed(self) -> bool:
+        """Whether the check permits the run: everything but an outright failure does."""
+        return self.severity != "fail"
 
 
 @dataclass(frozen=True)
@@ -137,6 +152,11 @@ class PreflightReport:
     def failures(self) -> list[PreflightCheck]:
         """The failed checks, for a caller that wants to log only what needs fixing."""
         return [check for check in self.checks if not check.passed]
+
+    @property
+    def warnings(self) -> list[PreflightCheck]:
+        """The checks that could not be judged either way, which a reader should still see."""
+        return [check for check in self.checks if check.severity == "warn"]
 
 
 @dataclass(frozen=True)
@@ -248,6 +268,77 @@ def _probe_largest_vram_mb() -> int | None:
     return max((vram_mb for _name, vram_mb, _kind in _probed_accelerators()), default=None)
 
 
+class FootprintObservation(Protocol):
+    """What the preflight reads off a learned footprint: the measured high-water and how often it was seen.
+
+    Structural rather than a direct dependency on the store's record type, so a caller can inject a
+    reading from anywhere without the store's persistence coming with it.
+    """
+
+    @property
+    def watermark_mb(self) -> float:
+        """The largest device-memory figure ever measured for the key."""
+        ...
+
+    @property
+    def observation_count(self) -> int:
+        """How many measurements the figure rests on."""
+        ...
+
+
+@functools.cache
+def _opened_footprint_store(path: Path) -> LearnedFootprintStore | None:
+    """The persisted footprint store at ``path``, or None when it cannot be opened.
+
+    Memoized because every model the tier names reads the same file, and the observations a preflight
+    judges are whatever a previous run left behind; nothing writes them while the report is built.
+    """
+    try:
+        return LearnedFootprintStore(path=path)
+    except Exception as error:  # noqa: BLE001 - an unreadable store is an unmeasured machine, not a crash
+        logger.debug(f"Could not open the learned footprint store at {path}: {type(error).__name__} {error}")
+        return None
+
+
+def footprint_observation_probe(
+    store_path: Path | None = None,
+) -> Callable[[FootprintKey], FootprintObservation | None]:
+    """A reader for measured VRAM footprints, over ``store_path`` or the worker's own persisted store.
+
+    The store is opened read-only in the sense that the preflight never observes into it: it reports what
+    this machine has already measured under real load, which is the only evidence the worker's own
+    admission policy accepts about what a model costs on a card.
+
+    Args:
+        store_path: The store file to read; the worker's app-state store when omitted.
+
+    Returns:
+        A callable answering with the observation for a key, or None when the key has never been measured.
+    """
+
+    def probe(key: FootprintKey) -> FootprintObservation | None:
+        path = store_path
+        if path is None:
+            from horde_worker_regen.app_state import default_app_state_dir
+
+            path = default_app_state_dir() / FOOTPRINT_STORE_FILENAME
+        store = _opened_footprint_store(path)
+        return store.get_observation(key) if store is not None else None
+
+    return probe
+
+
+@functools.cache
+def _model_size_bytes(model: str) -> int | None:
+    """The declared on-disk size of a checkpoint, or None when the reference cannot answer for it."""
+    from horde_worker_regen.benchmark.requirements import models_disk_plan
+
+    plan = models_disk_plan([model])
+    if plan is None:
+        return None
+    return next((info.size_bytes for info in plan.models if info.name == model), None)
+
+
 def _resolve_cache_home() -> str | None:
     """The model cache directory, resolved the way the worker resolves it."""
     from horde_worker_regen.analysis.system_info import resolve_cache_home
@@ -357,6 +448,10 @@ class Probes:
     missing_models: Callable[[list[str]], list[str] | None] = field(default_factory=lambda: _missing_models)
     civitai_token: Callable[[], str | None] = field(default_factory=lambda: _civitai_token)
     live_worker: Callable[[], str | None] = field(default_factory=lambda: _live_worker_reason)
+    footprint_observation: Callable[[FootprintKey], FootprintObservation | None] = field(
+        default_factory=footprint_observation_probe,
+    )
+    model_size_bytes: Callable[[str], int | None] = field(default_factory=lambda: _model_size_bytes)
 
 
 def _check_machine_id(machine_id: str | None) -> PreflightCheck:
@@ -364,17 +459,17 @@ def _check_machine_id(machine_id: str | None) -> PreflightCheck:
     if machine_id is None:
         return PreflightCheck(
             name="machine id",
-            passed=True,
+            severity="ok",
             detail="none given; this run's rows carry no machine facts and cannot be pooled with others",
         )
     if not MACHINE_ID_PATTERN.match(machine_id):
         return PreflightCheck(
             name="machine id",
-            passed=False,
+            severity="fail",
             detail=f"{machine_id!r} is not a valid machine id (lowercase letters, digits and dashes, 3-41 chars)",
             fix="re-run with --machine <owner>-<gpu>, for example --machine alice-l40s",
         )
-    return PreflightCheck(name="machine id", passed=True, detail=machine_id)
+    return PreflightCheck(name="machine id", severity="ok", detail=machine_id)
 
 
 def _check_cuda(probes: Probes) -> PreflightCheck:
@@ -383,47 +478,115 @@ def _check_cuda(probes: Probes) -> PreflightCheck:
     if not devices:
         return PreflightCheck(
             name="cuda",
-            passed=False,
+            severity="fail",
             detail="torch reported no accelerator",
             fix="install a GPU torch build in the worker venv (see docs/how-to/choose-a-pytorch-build.md)",
         )
-    return PreflightCheck(name="cuda", passed=True, detail="; ".join(devices))
+    return PreflightCheck(name="cuda", severity="ok", detail="; ".join(devices))
 
 
-def _largest_fitting_tier(vram_mb: int) -> str | None:
-    """The most demanding corpus tier this card holds, or None when it holds none of them."""
-    fitting = [tier for tier, needed in CORPUS_TIER_MIN_VRAM_MB.items() if vram_mb >= needed]
-    if not fitting:
+def _measured_need_mb(probes: Probes, model: str) -> float | None:
+    """What this machine has measured a model to cost the card, or None when it has never measured it.
+
+    The store keeps two quantities apart: the checkpoint's resident weights, keyed to the file, and the
+    whole-job sampling peak of its baseline, keyed to the resolution band. The sampling peak already holds
+    the weights that were resident while it was taken, so the two are alternatives rather than parts, and
+    the figure that matters is the larger. A model sampled at several sizes is judged by the highest peak at
+    any band, since a wide band with few observations can carry a lower watermark than a well-sampled one.
+    """
+    baseline = CORPUS_MODEL_BASELINES.get(model)
+    if baseline is None:
         return None
-    return sorted(fitting, key=lambda tier: (-CORPUS_TIER_MIN_VRAM_MB[tier], tier))[0]
+
+    resident = probes.footprint_observation(
+        FootprintKey(
+            model_baseline=baseline,
+            resolution_bucket=None,
+            platform=sys.platform,
+            stage=FootprintStage.RESIDENT,
+            checkpoint=model,
+        ),
+    )
+    sample_peaks = [
+        observed.watermark_mb
+        for bucket in ResolutionBucket
+        if (
+            observed := probes.footprint_observation(
+                FootprintKey(
+                    model_baseline=baseline,
+                    resolution_bucket=bucket,
+                    platform=sys.platform,
+                    stage=FootprintStage.SAMPLE,
+                    checkpoint=None,
+                ),
+            )
+        )
+        is not None
+    ]
+
+    peaks = [*sample_peaks, *([resident.watermark_mb] if resident is not None else [])]
+    return max(peaks) if peaks else None
 
 
-def _check_vram(probes: Probes, tier: str) -> PreflightCheck:
-    """Judge the card against the tier's working set; a tier that overflows prices paging, not inference."""
-    # A tier the table does not name is held to the smallest requirement rather than crashing the report.
-    needed = CORPUS_TIER_MIN_VRAM_MB.get(tier, min(CORPUS_TIER_MIN_VRAM_MB.values()))
+def _check_vram(probes: Probes, tier: str, models: list[str]) -> PreflightCheck:
+    """Judge the card only where this machine has measured it; elsewhere say so rather than guess.
+
+    A checkpoint larger than the card is not by itself a refusal: components are streamed on and off the
+    card, so what a model costs is a measurement, not the size of its weights. Nor is a measured peak above
+    the card a refusal: a demand-paging driver reports peaks past physical VRAM for jobs that completed. So
+    the row follows the worker's own admission policy of admitting once and trusting what the hardware then
+    reports, and never fails; it says what has been measured, what has not, and what to run to find out.
+    """
     vram_mb = probes.vram_mb()
     if vram_mb is None:
         return PreflightCheck(
             name="vram",
-            passed=False,
+            severity="warn",
             detail="the accelerator probe could not read the card's VRAM",
             fix="install a GPU torch build in the worker venv (see docs/how-to/choose-a-pytorch-build.md)",
         )
-    if vram_mb < needed:
-        fitting = _largest_fitting_tier(vram_mb)
-        smallest = min(CORPUS_TIER_MIN_VRAM_MB.values())
+
+    needs = {model: _measured_need_mb(probes, model) for model in models}
+    overruns = sorted(
+        ((need, model) for model, need in needs.items() if need is not None and need > vram_mb),
+        reverse=True,
+    )
+    if overruns:
+        need, model = overruns[0]
         return PreflightCheck(
             name="vram",
-            passed=False,
-            detail=f"{vram_mb} MB on the largest card; the {tier} tier needs {needed} MB",
+            severity="warn",
+            detail=f"{model} has measured a {need:.0f} MB peak on this machine, above the {vram_mb} MB card",
             fix=(
-                f"re-run with --tier {fitting}"
-                if fitting is not None
-                else f"run the corpus on a card with at least {smallest} MB"
+                f"a peak above the card means paging on a demand-paging driver or a failed job; if {model} has "
+                "run here since, trust that, otherwise run the tier's one-model smoke first"
             ),
         )
-    return PreflightCheck(name="vram", passed=True, detail=f"{vram_mb} MB on the largest card, {needed} MB needed")
+
+    unmeasured = [model for model, need in needs.items() if need is None]
+    if models and not unmeasured:
+        largest = max(need for need in needs.values() if need is not None)
+        return PreflightCheck(
+            name="vram",
+            severity="ok",
+            detail=f"largest measured need {largest:.0f} MB against a {vram_mb} MB card",
+        )
+    if not models:
+        return PreflightCheck(name="vram", severity="ok", detail=f"{vram_mb} MB card, no models to measure against")
+
+    biggest_bytes = [size for size in (probes.model_size_bytes(model) for model in unmeasured) if size is not None]
+    on_disk = f"; largest checkpoint on disk {max(biggest_bytes) / 1024**3:.1f} GB" if biggest_bytes else ""
+    return PreflightCheck(
+        name="vram",
+        severity="warn",
+        detail=(
+            f"{vram_mb} MB card{on_disk}; the {tier} tier's "
+            f"unmeasured models on this machine: {', '.join(sorted(unmeasured))}"
+        ),
+        fix=(
+            "unverified on this card: run the tier's one-model smoke first (see the how-to) and trust its measurements"
+        ),
+    )
 
 
 def _check_hordelib(facts: HordelibFacts) -> PreflightCheck:
@@ -431,7 +594,7 @@ def _check_hordelib(facts: HordelibFacts) -> PreflightCheck:
     if not facts.importable:
         return PreflightCheck(
             name="hordelib",
-            passed=False,
+            severity="fail",
             detail="hordelib is not importable",
             fix="uv pip install -e <path-to-hordelib-checkout>",
         )
@@ -441,11 +604,11 @@ def _check_hordelib(facts: HordelibFacts) -> PreflightCheck:
         state = "not installed editable" if facts.editable is False else "install record unreadable"
         return PreflightCheck(
             name="hordelib",
-            passed=False,
+            severity="fail",
             detail=f"{version} at {where} ({state})",
             fix="uv pip install -e <path-to-hordelib-checkout>",
         )
-    return PreflightCheck(name="hordelib", passed=True, detail=f"{version} editable from {where}")
+    return PreflightCheck(name="hordelib", severity="ok", detail=f"{version} editable from {where}")
 
 
 def _check_manifest(facts: HordelibFacts) -> PreflightCheck:
@@ -453,11 +616,11 @@ def _check_manifest(facts: HordelibFacts) -> PreflightCheck:
     if not facts.manifest_importable:
         return PreflightCheck(
             name="kudos manifest",
-            passed=False,
+            severity="fail",
             detail=f"{KUDOS_MANIFEST_MODULE} is not importable, so this tier's vocabularies cannot be built",
             fix="uv pip install -e <hordelib-checkout-that-ships-hordelib/kudos_training/manifest.py>",
         )
-    return PreflightCheck(name="kudos manifest", passed=True, detail=f"{KUDOS_MANIFEST_MODULE} importable")
+    return PreflightCheck(name="kudos manifest", severity="ok", detail=f"{KUDOS_MANIFEST_MODULE} importable")
 
 
 def _check_comfy_pins(probes: Probes) -> PreflightCheck:
@@ -474,10 +637,10 @@ def _check_comfy_pins(probes: Probes) -> PreflightCheck:
             f"{package}: {found or 'absent'} (need {want})" for package, (found, want) in sorted(wrong.items())
         )
         pins = " ".join(f"{package}=={want}" for package, (_found, want) in sorted(wrong.items()))
-        return PreflightCheck(name="comfy pins", passed=False, detail=detail, fix=f"uv pip install {pins}")
+        return PreflightCheck(name="comfy pins", severity="fail", detail=detail, fix=f"uv pip install {pins}")
     return PreflightCheck(
         name="comfy pins",
-        passed=True,
+        severity="ok",
         detail="; ".join(f"{package}=={version}" for package, version in sorted(required.items())),
     )
 
@@ -489,7 +652,7 @@ def _check_cache_home(probes: Probes) -> tuple[PreflightCheck, Path | None]:
         return (
             PreflightCheck(
                 name="cache home",
-                passed=False,
+                severity="fail",
                 detail="neither AIWORKER_CACHE_HOME nor bridgeData.yaml `cache_home` resolves",
                 fix="set `cache_home` in bridgeData.yaml, or export AIWORKER_CACHE_HOME=<models dir>",
             ),
@@ -500,36 +663,36 @@ def _check_cache_home(probes: Probes) -> tuple[PreflightCheck, Path | None]:
         return (
             PreflightCheck(
                 name="cache home",
-                passed=False,
+                severity="fail",
                 detail=f"{path} is not writable",
                 fix=f"grant write access to {path}, or point `cache_home` at a writable directory",
             ),
             path,
         )
-    return PreflightCheck(name="cache home", passed=True, detail=str(path)), path
+    return PreflightCheck(name="cache home", severity="ok", detail=str(path)), path
 
 
 def _check_models(probes: Probes, tier: str, models: list[str]) -> PreflightCheck:
     """Judge model presence; a model fetched mid-run prices the download, not the inference."""
     if not models:
-        return PreflightCheck(name="models", passed=True, detail="no models to check")
+        return PreflightCheck(name="models", severity="ok", detail="no models to check")
     missing = probes.missing_models(models)
     tiers = ",".join(bench_tier.value for bench_tier in corpus_bench_tiers(tier))
     if missing is None:
         return PreflightCheck(
             name="models",
-            passed=False,
+            severity="fail",
             detail=f"could not determine on-disk state for {len(models)} model(s)",
             fix=f"horde-benchmark download --tiers {tiers}",
         )
     if missing:
         return PreflightCheck(
             name="models",
-            passed=False,
+            severity="fail",
             detail=f"not on disk: {', '.join(sorted(missing))}",
             fix=f"horde-benchmark download --tiers {tiers}",
         )
-    return PreflightCheck(name="models", passed=True, detail=f"{len(models)} model(s) on disk")
+    return PreflightCheck(name="models", severity="ok", detail=f"{len(models)} model(s) on disk")
 
 
 def _check_free_disk(probes: Probes, cache_path: Path | None) -> PreflightCheck:
@@ -537,7 +700,7 @@ def _check_free_disk(probes: Probes, cache_path: Path | None) -> PreflightCheck:
     if cache_path is None:
         return PreflightCheck(
             name="free disk",
-            passed=False,
+            severity="fail",
             detail="no cache home to measure",
             fix="resolve the cache home first (see the cache home check)",
         )
@@ -545,7 +708,7 @@ def _check_free_disk(probes: Probes, cache_path: Path | None) -> PreflightCheck:
     if free is None:
         return PreflightCheck(
             name="free disk",
-            passed=False,
+            severity="fail",
             detail=f"could not read free space on the volume holding {cache_path}",
             fix=f"check that {cache_path} exists and is readable",
         )
@@ -553,11 +716,11 @@ def _check_free_disk(probes: Probes, cache_path: Path | None) -> PreflightCheck:
     if free < CORPUS_FREE_DISK_BYTES:
         return PreflightCheck(
             name="free disk",
-            passed=False,
+            severity="fail",
             detail=f"{free / 1024**3:.1f} GB free on {cache_path}, {needed_gb:.0f} GB wanted",
             fix=f"free up {(CORPUS_FREE_DISK_BYTES - free) / 1024**3:.1f} GB on the volume holding {cache_path}",
         )
-    return PreflightCheck(name="free disk", passed=True, detail=f"{free / 1024**3:.1f} GB free on {cache_path}")
+    return PreflightCheck(name="free disk", severity="ok", detail=f"{free / 1024**3:.1f} GB free on {cache_path}")
 
 
 def _check_civitai_token(probes: Probes, tier: str) -> PreflightCheck:
@@ -565,17 +728,17 @@ def _check_civitai_token(probes: Probes, tier: str) -> PreflightCheck:
     if not tier_has_lora_cells(tier):
         return PreflightCheck(
             name="civitai token",
-            passed=True,
+            severity="ok",
             detail=f"not needed: the {tier} tier has no LoRA cells",
         )
     if not probes.civitai_token():
         return PreflightCheck(
             name="civitai token",
-            passed=False,
+            severity="fail",
             detail="no CivitAI token in the environment, so the LoRA cells cannot fetch their weights",
             fix="set `civitai_api_token` in bridgeData.yaml, or export CIVIT_API_TOKEN=<token>",
         )
-    return PreflightCheck(name="civitai token", passed=True, detail="present")
+    return PreflightCheck(name="civitai token", severity="ok", detail="present")
 
 
 def _check_live_worker(probes: Probes) -> PreflightCheck:
@@ -584,11 +747,11 @@ def _check_live_worker(probes: Probes) -> PreflightCheck:
     if reason:
         return PreflightCheck(
             name="no live worker",
-            passed=False,
+            severity="fail",
             detail=reason,
             fix="stop the running worker and remove any stale .abort file, then re-run",
         )
-    return PreflightCheck(name="no live worker", passed=True, detail="nothing is holding this working directory")
+    return PreflightCheck(name="no live worker", severity="ok", detail="nothing is holding this working directory")
 
 
 def run_preflight(
@@ -618,7 +781,7 @@ def run_preflight(
     checks = [
         _check_machine_id(machine_id),
         _check_cuda(probes),
-        _check_vram(probes, tier),
+        _check_vram(probes, tier, models),
         _check_hordelib(hordelib_facts),
     ]
     if require_manifest:
@@ -635,12 +798,13 @@ def run_preflight(
     return PreflightReport(tier=tier, machine_id=machine_id, checks=checks)
 
 
+_STATUS_LABELS: dict[CheckSeverity, str] = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}
+"""The status column's text per severity."""
+
+
 def format_report(report: PreflightReport) -> str:
-    """Render a report as a fixed-width table: status, check, detail, and the fix for each failure."""
-    rows = [
-        ("OK" if check.passed else "FAIL", check.name, check.detail, check.fix if not check.passed else "")
-        for check in report.checks
-    ]
+    """Render a report as a fixed-width table: status, check, detail, and the fix for anything unclean."""
+    rows = [(_STATUS_LABELS[check.severity], check.name, check.detail, check.fix) for check in report.checks]
     headers = ("STATUS", "CHECK", "DETAIL", "FIX")
     widths = [max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)]
 
@@ -652,10 +816,16 @@ def format_report(report: PreflightReport) -> str:
     out.append("  ".join("-" * width for width in widths))
     out.extend(line(row) for row in rows)
     out.append("")
-    if report.passed:
-        out.append(f"All {len(report.checks)} checks passed.")
+    warnings = len(report.warnings)
+    warning_note = f"{warnings} warning" + ("" if warnings == 1 else "s")
+    if not report.passed:
+        out.append(
+            f"{len(report.failures)} of {len(report.checks)} checks failed, {warning_note}; apply the fixes above.",
+        )
+    elif warnings:
+        out.append(f"All {len(report.checks)} checks passed, {warning_note}.")
     else:
-        out.append(f"{len(report.failures)} of {len(report.checks)} checks failed; apply the fixes above.")
+        out.append(f"All {len(report.checks)} checks passed.")
     return "\n".join(out)
 
 
@@ -770,15 +940,17 @@ def stamp_definition(
 __all__ = [
     "COMFY_PIN_PACKAGES",
     "CORPUS_FREE_DISK_BYTES",
-    "CORPUS_TIER_MIN_VRAM_MB",
     "KUDOS_MANIFEST_MODULE",
     "MACHINE_ID_PATTERN",
+    "CheckSeverity",
+    "FootprintObservation",
     "HordelibFacts",
     "PreflightCheck",
     "PreflightReport",
     "Probes",
     "collect_machine_facts",
     "corpus_bench_tiers",
+    "footprint_observation_probe",
     "format_report",
     "installed_versions",
     "probe_hordelib",

@@ -271,7 +271,22 @@ _CENSUS_MODEL_BASELINES: dict[str, str] = {
     SDXL_B: "stable_diffusion_xl",
     SD15_A: "stable_diffusion_1",
 }
-"""The manifest ``baseline`` value each corpus model encodes as."""
+"""The manifest ``baseline`` value each corpus model encodes as.
+
+Only the models the census sweeps, because a baseline outside this set is one no census cell can carry."""
+
+CORPUS_MODEL_BASELINES: dict[str, str] = {
+    **_CENSUS_MODEL_BASELINES,
+    FLUX_A: "flux_1",
+    QWEN_A: "qwen_image",
+    ZIMAGE_A: "z_image_turbo",
+    KREA2_A: "krea2_turbo",
+    ANIMA_A: "anima",
+}
+"""The baseline every corpus model belongs to, across all tiers.
+
+The preflight keys measured VRAM footprints by baseline, so a model whose baseline is absent here is one
+the preflight has no measurement to judge and must treat as unverified."""
 
 _CENSUS_NON_UPSCALING_POST_PROCESSORS: frozenset[str] = frozenset({"CodeFormers", "GFPGAN", "strip_background"})
 """Post-processors that leave the image size alone; every other vocabulary entry enlarges it.
