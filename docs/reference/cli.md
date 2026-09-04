@@ -380,6 +380,13 @@ conflation block whose axes vary jointly, so the marginals can be checked agains
 several of them move at once. The combination space is sampled, not covered: full pairwise over these
 vocabularies is orders of magnitude past any sitting.
 
+The sampler sweep is the one axis whose values get more than a cell each: every sampler runs at two
+trajectory lengths (15 and 30 steps). A sampler's cost is part per-trajectory-step and part per-job, and a
+sampler observed at a single step count leaves the two confounded, so a fit can only price it by borrowing
+another sampler's slope. Both levels sit on the steps sweep's own grid and span the range requests
+mostly fall in. The extra cells come out of the fixed job budget rather than adding to it: the
+conflation block is sized to whatever the sweeps leave, so the tier still runs about four hours.
+
 A value the census cannot run is named in the definition artifact's `census.exclusions`, with the reason,
 alongside a per-axis `census.coverage` count and the projected job count and runtime. Absence is always a
 declared decision: `k_dpm_adaptive` is out because it picks its own step count, the baselines with no

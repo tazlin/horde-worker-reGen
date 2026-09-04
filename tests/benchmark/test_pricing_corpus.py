@@ -18,6 +18,7 @@ from horde_worker_regen.benchmark.pricing_corpus import (
     _CENSUS_EXCLUDED_SAMPLER_SCHEDULE_PAIRS,
     _CENSUS_EXCLUDED_SAMPLERS,
     _CENSUS_NON_UPSCALING_POST_PROCESSORS,
+    _CENSUS_SAMPLER_TRAJECTORY_STEPS,
     _POST_PROCESSING_CHAINS,
     _POST_PROCESSING_MIN_DISTANCE,
     _SAMPLERS,
@@ -621,7 +622,10 @@ class TestCensusCoverage:
         self,
         census: tuple[Scenario, PricingCorpusDefinition],
     ) -> None:
-        """Each sweep group holds the anchor and offers one cell per vocabulary value."""
+        """Each sweep group holds the anchor and offers a cell per vocabulary value.
+
+        The sampler group offers one per value per trajectory length; the rest offer exactly one.
+        """
         _scenario, definition = census
         summary = definition.census
         assert summary is not None
@@ -644,6 +648,32 @@ class TestCensusCoverage:
         }
         assert {cell.hires_fix for cell in by_group["c6"]} == {False, True}
         assert {len(cell.ti_names) for cell in by_group["c8"]} == {0, 1}
+
+    def test_every_sampler_is_measured_at_two_trajectory_lengths(
+        self,
+        census: tuple[Scenario, PricingCorpusDefinition],
+    ) -> None:
+        """No sampler the census measures is confined to a single trajectory length."""
+        # A sampler's cost is part per-trajectory-step and part per-job. Observed at one trajectory
+        # length the two are a single number, and a fit can only price the sampler by borrowing another
+        # sampler's slope, so the sweep carries the levels rather than leaving them to the conflation draw.
+        _scenario, definition = census
+        sweep_levels: dict[str, set[int]] = {}
+        measured_levels: dict[str, set[int]] = {}
+        for cell in definition.cells:
+            if cell.group == "warmup":
+                continue
+            measured_levels.setdefault(cell.sampler_name, set()).add(cell.steps)
+            if cell.group == "c1":
+                sweep_levels.setdefault(cell.sampler_name, set()).add(cell.steps)
+
+        assert len(_CENSUS_SAMPLER_TRAJECTORY_STEPS) >= 2
+        assert sweep_levels
+        assert set(sweep_levels) == set(measured_levels)
+        for sampler, levels in sorted(sweep_levels.items()):
+            assert levels == set(_CENSUS_SAMPLER_TRAJECTORY_STEPS), sampler
+        thin = {sampler: sorted(levels) for sampler, levels in measured_levels.items() if len(levels) < 2}
+        assert not thin, f"samplers measured at one trajectory length: {thin}"
 
     def test_lora_levels_pay_the_fetch_once(
         self,

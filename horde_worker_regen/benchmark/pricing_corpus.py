@@ -23,7 +23,9 @@ few steps to read a marginal cost off it, the census covers the *vocabulary*: ev
 categorical axis the kudos feature manifest encodes, swept against a fixed anchor and then sampled
 again under jointly varying conditions. Its vocabularies come from the manifest itself rather than
 from lists restated here, so its coverage is the encoding contract by construction; any value it
-cannot run is named, with its reason, in the definition artifact's :class:`CensusSummary`.
+cannot run is named, with its reason, in the definition artifact's :class:`CensusSummary`. The sampler
+axis is the exception to one cell per value: a sampler is priced partly per trajectory step, so each one
+is measured at two trajectory lengths rather than one.
 
 The cell groups are carried here as code constants; the design record naming them (G1..G11 for the
 standard tier, C1..C10 for the census) lives with the corpus specification.
@@ -49,7 +51,7 @@ tier: every value of every categorical axis the kudos feature manifest encodes, 
 fixed anchor and again under jointly varying conditions."""
 
 SCENARIO_NAME = "pricing-corpus"
-SCENARIO_REVISION = "1"
+SCENARIO_REVISION = "2"
 """Bumped whenever a cell shape, the replicate count, or the ordering changes.
 
 Records only pool with records produced under the same revision, so this travels into every session's
@@ -214,6 +216,13 @@ _CENSUS_ANCHOR_SAMPLER = "k_euler"
 
 _CENSUS_ANCHOR_SCHEDULER = "karras"
 """Schedule the sampler sweep holds fixed."""
+
+_CENSUS_SAMPLER_TRAJECTORY_STEPS: tuple[int, ...] = (15, 30)
+"""Trajectory lengths every census sampler is measured at.
+
+A sampler's cost is part per-trajectory-step and part per-job, and one step count cannot separate them.
+Every sampler carries the same pair so the cells stay comparable across the vocabulary; both levels sit
+on the steps sweep's own grid and span the range requests mostly fall in."""
 
 _CENSUS_EXCLUDED_SAMPLERS: dict[str, str] = {
     "k_dpm_adaptive": (
@@ -905,7 +914,10 @@ def _census_anchor(model: str) -> CorpusCell:
 
 
 def _census_sampler_cells(samplers: tuple[str, ...]) -> list[CorpusCell]:
-    """C1: every runnable sampler against the anchor schedule.
+    """C1: every runnable sampler against the anchor schedule, at each census trajectory length.
+
+    A sampler measured at one trajectory length can only be priced by borrowing another sampler's slope,
+    so each one carries every level of :data:`_CENSUS_SAMPLER_TRAJECTORY_STEPS`.
 
     ``plms`` and ``dpmsolver`` stay in: hordelib maps them onto another solver's implementation, but the
     manifest prices them as their own vocabulary entries, so the census has to measure what they cost.
@@ -913,12 +925,14 @@ def _census_sampler_cells(samplers: tuple[str, ...]) -> list[CorpusCell]:
     return [
         _variant(
             ANCHOR_SDXL,
-            cell_id=f"c1.sampler.{sampler}.{_tag(SDXL_A)}",
+            cell_id=f"c1.sampler.{sampler}.steps{steps}.{_tag(SDXL_A)}",
             group="c1",
             sampler_name=sampler,
             scheduler=_CENSUS_ANCHOR_SCHEDULER,
+            steps=steps,
         )
         for sampler in samplers
+        for steps in _CENSUS_SAMPLER_TRAJECTORY_STEPS
     ]
 
 
