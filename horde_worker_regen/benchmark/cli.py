@@ -5,6 +5,7 @@ Subcommands:
 - ``plan``: preview each probe's resource needs and run/skip verdict (no worker is started).
 - ``download``: fetch the checkpoints the selected tiers need, ahead of a timed run.
 - ``pricing-corpus``: run the cost-attribution corpus whose stats records fit a pricing model.
+- ``corpus-preflight``: check that a machine can produce admissible pricing-corpus rows.
 - ``soak``: run one sustained-traffic mix for a fixed period, as a before/after performance vehicle.
 - ``report``: re-render the markdown report from an existing output directory.
 - ``monitor``: tail a run's progress.jsonl live (attach or replay).
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions
     from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
     from horde_worker_regen.benchmark.capabilities.result import CapabilityReport, MachineInfo
+    from horde_worker_regen.benchmark.corpus_preflight import PreflightReport
     from horde_worker_regen.benchmark.download_progress import DownloadEvent, DownloadModelRow
     from horde_worker_regen.model_download_core import DownloadControls
     from horde_worker_regen.model_download_plan import DownloadPlan
@@ -231,6 +233,47 @@ def _add_download_parser(subparsers: argparse._SubParsersAction) -> None:
     download.add_argument("--directml", type=int, default=None, help="DirectML device index (for Windows AMD GPUs).")
 
 
+PRICING_CORPUS_TIERS: tuple[str, ...] = ("smoke", "standard", "census", "heavy")
+"""Corpus tiers, shared by ``pricing-corpus`` and ``corpus-preflight`` so the two cannot drift."""
+
+
+def _add_corpus_tier_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the shared ``--tier`` selection for the corpus subcommands."""
+    parser.add_argument(
+        "--tier",
+        default="smoke",
+        choices=PRICING_CORPUS_TIERS,
+        help="standard = the marginal-cost fit set (hours); census = every value of every categorical "
+        "axis the kudos manifest encodes, plus a conflated sample (about four hours); heavy = the census "
+        "over the large baselines as well; smoke = a short subset that proves the corpus runs.",
+    )
+
+
+def _add_corpus_preflight_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``corpus-preflight`` subcommand: judge a machine before hours are spent measuring on it."""
+    preflight = subparsers.add_parser(
+        "corpus-preflight",
+        help="Check that this machine can produce admissible pricing-corpus rows, naming the fix for "
+        "anything that would spoil the run. Nothing is downloaded and no worker is started.",
+    )
+    _add_corpus_tier_argument(preflight)
+    preflight.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        dest="heavy_models",
+        metavar="MODEL",
+        help="Heavy tier only: the models the run will be restricted to (repeatable), so the model check "
+        "covers exactly those.",
+    )
+    preflight.add_argument(
+        "--machine",
+        required=True,
+        metavar="ID",
+        help="Stable id for this machine (lowercase, dashes; `<owner>-<gpu>` by convention).",
+    )
+
+
 def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
     """Add the ``pricing-corpus`` subcommand: the cost-attribution corpus used to fit a pricing model."""
     corpus = subparsers.add_parser(
@@ -238,13 +281,34 @@ def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Run the pricing corpus: a deterministic, axis-sweeping workload whose stats records are "
         "training data for a cost model. Emits a definition artifact that labels every job's cell.",
     )
+    _add_corpus_tier_argument(corpus)
     corpus.add_argument(
-        "--tier",
-        default="smoke",
-        choices=("smoke", "standard", "census"),
-        help="standard = the marginal-cost fit set (hours); census = every value of every categorical "
-        "axis the kudos manifest encodes, plus a conflated sample (about four hours); smoke = a short "
-        "subset that proves the corpus runs.",
+        "--machine",
+        default=None,
+        metavar="ID",
+        help="Stable id for this machine (lowercase, dashes; `<owner>-<gpu>` by convention). Every row the "
+        "run produces is keyed on it, so it is required except for --dry-list and the smoke tier.",
+    )
+    corpus.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Run without checking that this machine can produce admissible rows (not recommended).",
+    )
+    corpus.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        dest="heavy_models",
+        metavar="MODEL",
+        help="Heavy tier only: restrict the tier to these models (repeatable) for a machine that holds only "
+        "some of them; default is every heavy model.",
+    )
+    corpus.add_argument(
+        "--job-budget",
+        type=int,
+        default=None,
+        help="Census tier only: jobs the run may spend, warmup included (default 950, about four hours). "
+        "The vocabulary sweeps are fixed; a smaller budget shrinks only the jointly-varied conflation block.",
     )
     corpus.add_argument(
         "--emit-definition",
@@ -934,8 +998,63 @@ def _pricing_corpus_bridge_overrides(tier: str) -> dict[str, object]:
     }
 
 
+def _corpus_preflight_report(tier: str, machine_id: str | None, *, models: list[str]) -> PreflightReport:
+    """Run the corpus preflight for a tier, with the worker's own environment applied first.
+
+    The cache-home, on-disk-model and CivitAI-token checks all read the environment a worker run derives
+    from ``bridgeData.yaml``, so applying it here is what makes those checks judge the same machine the
+    run would measure.
+    """
+    from horde_worker_regen.benchmark.corpus_preflight import (
+        corpus_bench_tiers,
+        requires_kudos_manifest,
+        run_preflight,
+    )
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+
+    ensure_worker_env("real", corpus_bench_tiers(tier))
+    return run_preflight(tier, machine_id, models=models, require_manifest=requires_kudos_manifest(tier))
+
+
+def _corpus_build_options(args: argparse.Namespace) -> tuple[int, tuple[str, ...]]:
+    """Return the census job budget and the heavy model set an invocation asked for, defaulted where unset."""
+    from horde_worker_regen.benchmark.pricing_corpus import CENSUS_JOB_BUDGET, HEAVY_MODELS
+
+    job_budget: int | None = getattr(args, "job_budget", None)
+    heavy_models: list[str] = getattr(args, "heavy_models", None) or []
+    return (
+        job_budget if job_budget is not None else CENSUS_JOB_BUDGET,
+        tuple(heavy_models) if heavy_models else HEAVY_MODELS,
+    )
+
+
+def _run_corpus_preflight(args: argparse.Namespace) -> int:
+    """Print the corpus preflight for this machine and tier; exit non-zero when anything needs fixing."""
+    from horde_worker_regen.benchmark.corpus_preflight import format_report
+    from horde_worker_regen.benchmark.pricing_corpus import PricingCorpusError, build_pricing_corpus_scenario
+
+    models: list[str] = []
+    try:
+        job_budget, heavy_models = _corpus_build_options(args)
+        scenario, _definition = build_pricing_corpus_scenario(
+            args.tier, job_budget=job_budget, heavy_models=heavy_models
+        )
+    except PricingCorpusError as error:
+        # A tier that cannot be built is itself a preflight finding (the manifest check names the remedy),
+        # so report the rest of the machine rather than exiting on the build failure.
+        logger.warning(f"Could not build the {args.tier} corpus to resolve its models: {error}")
+    else:
+        models = scenario.models_referenced()
+
+    report = _corpus_preflight_report(args.tier, args.machine, models=models)
+    print(format_report(report))  # noqa: T201
+    return 0 if report.passed else 1
+
+
 def _run_pricing_corpus(args: argparse.Namespace) -> int:
     """Build (and, unless listing, run) the pricing corpus, persisting its definition artifact."""
+    from horde_worker_regen.benchmark.corpus_bundle import BundleError, utc_stamp, write_bundle
+    from horde_worker_regen.benchmark.corpus_preflight import corpus_bench_tiers, format_report, stamp_definition
     from horde_worker_regen.benchmark.pricing_corpus import (
         PRICING_CORPUS_LORA_VERSION_IDS,
         PRICING_CORPUS_TI_NAME,
@@ -948,22 +1067,34 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
     from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
     from horde_worker_regen.stats_operations import default_stats_dir
 
+    # Rows are keyed on the machine id, so a run that would produce unattributable rows is refused before
+    # it starts. The smoke tier is exempt: it exists to prove the corpus runs, not to contribute rows.
+    if args.machine is None and not args.dry_list and args.tier != "smoke":
+        logger.error(
+            f"The {args.tier} tier writes rows that are pooled across machines, so it needs --machine <id> "
+            "(lowercase, dashes; `<owner>-<gpu>` by convention).",
+        )
+        return 2
+
     lora_version_ids = tuple(args.lora_version_id) if args.lora_version_id else PRICING_CORPUS_LORA_VERSION_IDS
+    job_budget, heavy_models = _corpus_build_options(args)
     try:
         scenario, definition = build_pricing_corpus_scenario(
             args.tier,
             lora_version_ids=lora_version_ids,
             ti_name=args.ti_name if args.ti_name else PRICING_CORPUS_TI_NAME,
+            job_budget=job_budget,
+            heavy_models=heavy_models,
         )
     except PricingCorpusError as error:
         logger.error(str(error))
         return 2
 
-    if args.emit_definition is not None:
-        write_definition_artifact(definition, args.emit_definition)
-        logger.info(f"Wrote the corpus definition to {args.emit_definition.resolve()}.")
-
     if args.dry_list:
+        # Nothing is measured, so the artifact stays unstamped: it describes the corpus, not a run of it.
+        if args.emit_definition is not None:
+            write_definition_artifact(definition, args.emit_definition)
+            logger.info(f"Wrote the corpus definition to {args.emit_definition.resolve()}.")
         for job in definition.jobs:
             print(f"{job.position:4d}  {job.permutation:8s}  {job.cell_id}")  # noqa: T201
         print(  # noqa: T201
@@ -972,25 +1103,54 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # Before anything is spent: the eviction below makes the LoRA cache colder, and the run itself is
+    # hours long, so a machine that cannot produce admissible rows must be turned away here.
+    if args.skip_preflight:
+        logger.warning(
+            "Preflight skipped: nothing has checked that this machine can produce admissible rows.",
+        )
+    else:
+        report = _corpus_preflight_report(args.tier, args.machine, models=scenario.models_referenced())
+        print(format_report(report))  # noqa: T201
+        if not report.passed:
+            logger.error("Preflight failed; fix what it names above, or re-run with --skip-preflight.")
+            return 2
+
+    definition = stamp_definition(definition, machine_id=args.machine, created_at=time.time())
+
+    # The definition is named by machine and UTC time so runs from many contributors sort and pair on one
+    # disk; the local stamp survives only for the unattributed smoke run.
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    definition_tag = (
+        f"{definition.machine.machine_id}-{utc_stamp(definition.created_at)}"
+        if definition.machine is not None and definition.created_at is not None
+        else stamp
+    )
     out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / f"pricing-corpus-{stamp}"
     _setup_benchmark_file_logging(out_dir)
-    if args.emit_definition is None:
+    if args.emit_definition is not None:
+        definition_path = args.emit_definition
+    else:
         # The artifact is the only key from a stats record back to the cell (and so to the axis values)
         # that produced it, so it lands with the stats stream rather than in a run directory that a later
         # reader of the stats has no reason to look in.
-        definition_path = default_stats_dir() / f"pricing-corpus-{definition.tier}-{stamp}.json"
-        write_definition_artifact(definition, definition_path)
-        logger.info(f"Wrote the corpus definition to {definition_path.resolve()}.")
+        definition_path = default_stats_dir() / f"pricing-corpus-{definition.tier}-{definition_tag}.json"
+    write_definition_artifact(definition, definition_path)
+    logger.info(f"Wrote the corpus definition to {definition_path.resolve()}.")
 
-    if args.no_lora_eviction:
+    if not any(cell.lora_version_ids for cell in definition.cells):
+        logger.info(
+            f"LoRA eviction skipped: the {definition.tier} tier has no LoRA cells, so no LoRA cache state "
+            "can bias its measurements.",
+        )
+    elif args.no_lora_eviction:
         logger.warning(
             "LoRA eviction skipped: any pinned LoRA already cached makes its miss cell measure a hit.",
         )
     elif not _evict_pinned_loras(lora_version_ids):
         return 2
 
-    ensure_worker_env(args.process_mode, [BenchTier.SD15, BenchTier.SDXL])
+    ensure_worker_env(args.process_mode, corpus_bench_tiers(definition.tier))
     # The corpus exists to price jobs, and price varies by model class, so every job's stats record must
     # carry the model's real baseline. Initializing the reference here (a plain sync context, before the
     # harness event loop starts) is what lets the harness resolve real records instead of stubbing them.
@@ -1017,6 +1177,18 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
         f"Corpus finished: {result.num_jobs_completed}/{result.num_jobs_expected} jobs completed, "
         f"{result.num_jobs_faulted} faulted, in {result.elapsed_seconds:.0f}s ({result.exit_reason}).",
     )
+    if definition.machine is not None and args.emit_definition is None:
+        try:
+            bundle_dir = write_bundle(
+                definition,
+                definition_path=definition_path,
+                stats_dir=default_stats_dir(),
+                out_root=Path("benchmark_results"),
+            )
+        except BundleError as bundle_error:
+            logger.error(f"The run finished but could not be bundled: {bundle_error}")
+        else:
+            logger.info(f"Bundled the run for hand-off: {bundle_dir.resolve()} (send this whole directory).")
     return 0 if result.succeeded else 1
 
 
@@ -1269,6 +1441,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_plan_parser(subparsers)
     _add_download_parser(subparsers)
     _add_pricing_corpus_parser(subparsers)
+    _add_corpus_preflight_parser(subparsers)
     _add_soak_parser(subparsers)
 
     report = subparsers.add_parser("report", help="Re-render the markdown report from an output directory.")
@@ -1295,6 +1468,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_download(args)
     if args.command == "pricing-corpus":
         return _run_pricing_corpus(args)
+    if args.command == "corpus-preflight":
+        return _run_corpus_preflight(args)
     if args.command == "soak":
         return _run_soak(args)
     if args.command == "report":

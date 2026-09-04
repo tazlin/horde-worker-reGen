@@ -96,3 +96,5 @@ under **[Code reference](horde_worker_regen/)**.
   development setup and guidelines.
 - **[Enable winget publishing](how-to/enable-winget-publishing.md)**: maintainer runbook for the
   currently-paused winget distribution channel.
+- **[Run a pricing corpus on your machine](how-to/run-a-pricing-corpus-on-another-machine.md)**:
+  producing kudos cost-model training data on a card that is not your own.

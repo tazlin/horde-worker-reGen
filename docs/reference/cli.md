@@ -220,6 +220,7 @@ Progressive worker benchmarking. Subcommands:
 |------------|---------|
 | `run` | Run the capability-probe benchmark: prove what this machine can do, on one warm worker. |
 | `plan` | Show each probe's resource requirements and predicted run/skip verdict (no worker is started). |
+| `corpus-preflight` | Check that this machine can produce admissible pricing-corpus rows, and name the fix for anything it cannot. |
 | `pricing-corpus` | Run the cost-attribution corpus that a pricing model is fitted against. |
 | `soak` | Sustain one named traffic mix for a fixed period and score it: the before/after vehicle. |
 | `report OUT_DIR` | Re-render the markdown report from an existing output directory. |
@@ -345,7 +346,11 @@ it.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--tier {smoke,standard,census}` | `smoke` | `standard` is the marginal-cost fit set (multi-hour); `census` covers every value of every categorical axis the kudos manifest encodes (about four hours); `smoke` is a short subset that proves the corpus runs. |
+| `--tier {smoke,standard,census,heavy}` | `smoke` | `standard` is the marginal-cost fit set (multi-hour); `census` covers every value of every categorical axis the kudos manifest encodes (about four hours at the default budget); `heavy` measures the model families a small card cannot hold, on a machine that can, beside the SD1.5 and SDXL anchors it shares with every other machine; `smoke` is a short subset that proves the corpus runs. |
+| `--machine ID` | — | The measuring machine's id (`<owner>-<gpu>` by convention, lowercase and dash-separated). Required for every tier but `smoke`; stamped into the definition artifact with the machine's GPU, driver and version facts so the rows stay attributable. |
+| `--skip-preflight` | off | Start without the preflight below. The run still needs everything the preflight checks; skipping only removes the early refusal. |
+| `--job-budget N` | `950` | Census tier only: jobs the run may spend, warmup included. The vocabulary sweeps are fixed; a smaller budget shrinks only the jointly-varied conflation block. |
+| `--model NAME` | every heavy model | Heavy tier only: restrict the tier to these models (repeatable), for a machine that holds only some of them. |
 | `--emit-definition PATH` | — | Write the definition artifact here instead of next to the session stats. |
 | `--dry-list` | off | Print the ordered cell ids and exit; no worker is started. |
 | `--lora-version-id ID` | pinned set | Override a pinned CivitAI LoRA *version* id for the LoRA cells (repeatable; the standard and census tiers need five). |
@@ -365,8 +370,47 @@ horde-benchmark pricing-corpus --tier smoke
 horde-benchmark pricing-corpus --tier standard
 
 # Full vocabulary coverage, for a model that must price values the standard tier never runs:
-horde-benchmark pricing-corpus --tier census
+horde-benchmark pricing-corpus --tier census --machine alice-l40s
+
+# The same coverage in about two and a half hours, with a smaller conflation block:
+horde-benchmark pricing-corpus --tier census --machine alice-l40s --job-budget 600
+
+# The heavy families, on a card that holds them:
+horde-benchmark pricing-corpus --tier heavy --machine alice-l40s
 ```
+
+Every tier but `smoke` runs `corpus-preflight` first and exits with code 2 if it fails. A run given a
+machine id names its definition `pricing-corpus-<tier>-<machine>-<UTC stamp>.json` and, when it finishes,
+copies that definition and the run's stats parts into `benchmark_results/corpus-<machine>-<tier>-<UTC
+stamp>/` with a `bundle.json` manifest: the directory a contributor sends back. The how-to
+[Run a pricing corpus on your machine](../how-to/run-a-pricing-corpus-on-another-machine.md) walks a
+developer through the whole sequence.
+
+#### The `heavy` tier
+
+Per heavy model: the native anchor, a second trajectory length where the model's reference record allows
+one, a smaller and a wide resolution, a two-image batch, and a cold cell. Jobs are ordered model by
+model, one block per replicate with the cold cell first, because heavy checkpoints do not share host RAM
+and every switch between them is a disk read that would otherwise land in whichever cell followed it.
+The SDXL and SD1.5 anchors run in the same session, warm and cold, so the machine's speed can be
+calibrated to the reference machine on cells both have measured.
+
+### `corpus-preflight`: prove a machine is ready before spending hours
+
+```bash
+horde-benchmark corpus-preflight --tier census --machine alice-l40s
+```
+
+Prints one row per check (machine id, CUDA, VRAM, hordelib and its kudos manifest, the ComfyUI pins,
+cache home, the tier's models on disk, free disk, CivitAI token, no live worker), each with the exact
+command or edit that clears it, and exits non-zero while anything is outstanding. `--model` narrows the
+heavy tier's model check the same way it narrows the run.
+
+The `vram` check holds the card to what the tier's working set needs: 8192 MB for `smoke`, `standard`
+and `census`, and 24576 MB for `heavy`, whose fp8 checkpoints have to sit in VRAM beside their text
+encoders. A card below the tier's need fails with a fix naming a tier it does fit. The `civitai token`
+check is skipped for the `heavy` tier, which carries no LoRA cells; the run skips the pre-run LoRA
+eviction there for the same reason.
 
 #### The `census` tier
 
