@@ -273,6 +273,42 @@ class RetentionLedger:
         self._slot_dispatch_history: dict[int, deque[str]] = {}
         self._pending_evictions: dict[int, PendingRetentionEviction] = {}
         self._pressure_since: dict[int, float] = {}
+        self.wddm_paging_active: bool = False
+        """The parent's measured WDDM demand-paging verdict on the worker's own children. While set, retention
+        is denied outright: holding weights in a regime the driver is already paging can only deepen it."""
+        self.wddm_paging_victims_shared_mb_by_pid: dict[int, float] = {}
+        """The child PIDs whose VRAM the driver most recently demoted, mapped to their shared (system-backed) GPU
+        MB. Refreshed on every active verdict so a watchdog reads a current set; cleared the moment paging clears."""
+        self.wddm_paging_victims_at: float = 0.0
+        """When the victim set was last recorded."""
+
+    def note_wddm_paging(self, victims_shared_mb_by_pid: Mapping[int, float], *, active: bool) -> bool:
+        """Record the parent's paging verdict; return whether this is the rising edge.
+
+        The rising edge is the one moment to reclaim idle resident VRAM: a repeat of an active verdict only
+        refreshes the victim set, and a cleared verdict empties it so a stale set cannot outlive the pressure
+        that produced it.
+        """
+        was_active = self.wddm_paging_active
+        self.wddm_paging_active = active
+        if active:
+            self.wddm_paging_victims_shared_mb_by_pid = dict(victims_shared_mb_by_pid)
+            self.wddm_paging_victims_at = self._clock()
+        else:
+            self.wddm_paging_victims_shared_mb_by_pid = {}
+        return active and not was_active
+
+    def wddm_paging_victims(self, max_age_seconds: float) -> dict[int, float]:
+        """The victim set while it is younger than ``max_age_seconds``, else empty.
+
+        A stale or absent verdict yields nothing, so a caller can never act on a paging episode that has
+        already cleared or whose telemetry has stopped arriving.
+        """
+        if not self.wddm_paging_victims_shared_mb_by_pid:
+            return {}
+        if (self._clock() - self.wddm_paging_victims_at) > max_age_seconds:
+            return {}
+        return dict(self.wddm_paging_victims_shared_mb_by_pid)
 
     @property
     def grants_issued(self) -> int:

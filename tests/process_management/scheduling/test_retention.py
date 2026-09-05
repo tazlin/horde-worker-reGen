@@ -331,3 +331,30 @@ class TestRetentionFit:
         assert "retained residents 4000MB" in self._fit(1.0).describe()
         bare = RetentionFit(1.0, 0.0, 16000.0, 0.0, 0.0, 0.0)
         assert "retained residents" not in bare.describe()
+
+
+class TestWddmPagingRecord:
+    """The paging verdict is recorded with a rising edge, a refreshed victim set, and a freshness bound."""
+
+    def test_rising_edge_fires_once_per_episode(self) -> None:
+        """Only the first active verdict of an episode is the edge; clearing and re-raising starts a new one."""
+        ledger = RetentionLedger(_Clock())
+        assert ledger.note_wddm_paging({1: 512.0}, active=True) is True
+        assert ledger.note_wddm_paging({1: 600.0}, active=True) is False
+        assert ledger.wddm_paging_victims_shared_mb_by_pid == {1: 600.0}, "a repeat refreshes the victims"
+        assert ledger.note_wddm_paging({}, active=False) is False
+        assert ledger.wddm_paging_active is False
+        assert ledger.wddm_paging_victims_shared_mb_by_pid == {}
+        assert ledger.note_wddm_paging({2: 100.0}, active=True) is True
+
+    def test_victims_age_out_on_the_ledger_clock(self) -> None:
+        """A verdict older than the freshness window yields no victims."""
+        clock = _Clock()
+        ledger = RetentionLedger(clock)
+        ledger.note_wddm_paging({1: 512.0}, active=True)
+        assert ledger.wddm_paging_victims(5.0) == {1: 512.0}
+        clock.now += 5.0
+        assert ledger.wddm_paging_victims(5.0) == {1: 512.0}
+        clock.now += 0.1
+        assert ledger.wddm_paging_victims(5.0) == {}
+        assert ledger.wddm_paging_victims(100.0) == {1: 512.0}

@@ -203,7 +203,7 @@ class TestWddmPagingVictimAccessor:
         scheduler.note_wddm_paging({100001: 512.0}, active=True)
 
         # Backdate the recording stamp past any sane freshness window.
-        scheduler._wddm_paging_victims_updated_monotonic -= 100.0
+        scheduler.retention.wddm_paging_victims_at -= 100.0
 
         assert scheduler.wddm_paging_victim_shared_mb_by_pid(5.0) == {}
 

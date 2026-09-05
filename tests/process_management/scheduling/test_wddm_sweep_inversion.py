@@ -60,7 +60,7 @@ def test_paging_active_flag_still_denies_retention() -> None:
     scheduler.unload_idle_model = lambda process_id, device_index=None: True  # type: ignore[assignment,method-assign]
 
     scheduler.note_wddm_paging({idle.os_pid: 512.0}, active=True)
-    assert scheduler._wddm_paging_active is True
+    assert scheduler.retention.wddm_paging_active is True
 
     scheduler.note_wddm_paging({}, active=False)
-    assert scheduler._wddm_paging_active is False
+    assert scheduler.retention.wddm_paging_active is False

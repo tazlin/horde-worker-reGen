@@ -807,18 +807,6 @@ class InferenceScheduler:
         # missing-model latch, the dispatch-stall diagnostic and the heavy-head load grace.
         self._head_admission = HeadAdmissionLedger(ledger_clock)
 
-        # The parent's measured WDDM demand-paging verdict (per-process GPU shared-segment usage on the
-        # worker's own children). While set, retention is denied; the rising edge triggers an idle-VRAM
-        # reclaim. Always False on hosts without the telemetry.
-        self._wddm_paging_active: bool = False
-        # The parent's most recent WDDM paging attribution: the child PIDs whose VRAM the driver demoted to
-        # system memory, mapped to their shared (system-backed) GPU MB, plus a monotonic stamp of when it was
-        # recorded. Refreshed on every active verdict (not just the rising edge) so the paged-slowdown
-        # watchdog reads a current victim set, and cleared the moment paging clears. See
-        # :meth:`wddm_paging_victim_shared_mb_by_pid`.
-        self._wddm_paging_victims_shared_mb_by_pid: dict[int, float] = {}
-        self._wddm_paging_victims_updated_monotonic: float = 0.0
-
         # Edge-log throttle for the post-processing/sampling time-slice hold on dispatch.
         self._pp_mutex_hold_logged: bool = False
         # Edge-log throttle for a dispatch admitted via the measured-truth co-residency path that the
@@ -2567,7 +2555,7 @@ class InferenceScheduler:
         if not self._budget_active() or not self._whole_card_residency_enabled():
             return True
 
-        target_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        target_device_index = self._routing_device_index(process_with_model)
         baseline = self._model_metadata.get_baseline(job.model)
         forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
         live_inference_processes = self._process_map.num_loaded_inference_processes(
@@ -5638,7 +5626,7 @@ class InferenceScheduler:
             active_grants=tuple(samplers),
             device_free_mb=self._measured_device_free_mb(device_index),
             vram_reserve_mb=self._vram_budget.reserve_mb,
-            paging_active=self._wddm_paging_active,
+            paging_active=self._retention.wddm_paging_active,
             incoming_load_seconds=self._process_map.recent_vram_load_seconds(device_index),
         )
 
@@ -6440,7 +6428,7 @@ class InferenceScheduler:
         self._last_budget_defer_reason = None
 
         baseline = self._model_metadata.get_baseline(job.model)
-        target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
+        target_device_index = self._routing_device_index(available_process)
         # A head waiting behind live work is queued, not starved. With no live job holding this card, the
         # starved-seconds value feeds the arbiter diagnostic and the RAM branch can still decide that exhausted
         # system-RAM reclaim should proceed.
@@ -8473,9 +8461,7 @@ class InferenceScheduler:
                 process.process_id
                 for process in self._process_map.values()
                 if process.process_type is HordeProcessType.INFERENCE
-                and self._job_tracker.has_exclusive_job_in_progress(
-                    process.device_index if self._multi_gpu_routing_active else None
-                )
+                and self._job_tracker.has_exclusive_job_in_progress(self._routing_device_index(process))
             )
 
         # On a multi-GPU host this also chooses *which* card to load onto: an eligible card already
@@ -8501,7 +8487,7 @@ class InferenceScheduler:
                 AdmissionDecision.NO_TARGET, job=job, reason="no idle inference slot available"
             )
 
-        exclusive_scope = available_process.device_index if self._multi_gpu_routing_active else None
+        exclusive_scope = self._routing_device_index(available_process)
         if self._job_tracker.has_exclusive_job_in_progress(exclusive_scope) and not (
             self._job_tracker.is_admitted_exclusive(job)
         ):
@@ -8557,7 +8543,7 @@ class InferenceScheduler:
         # to the card this preload would land on. Worker-wide (device_index=None) on a single-GPU host
         # keeps the original behavior byte-identical. Without this, a card that is almost always mid-load
         # (the busy card) perpetually blocks the idle card from ever getting its first model -> starvation.
-        preload_scope_device = available_process.device_index if self._multi_gpu_routing_active else None
+        preload_scope_device = self._routing_device_index(available_process)
         num_preloading_processes = self._process_map.num_preloading_processes(
             device_index=preload_scope_device,
         )
@@ -8700,6 +8686,10 @@ class InferenceScheduler:
         so all multi-GPU routing below is a strict no-op on a single-GPU host.
         """
         return len(self._card_runtimes) > 1
+
+    def _routing_device_index(self, process_info: HordeProcessInfo) -> int | None:
+        """The card a slot's memory is scoped to: its device on a multi-GPU host, the whole worker otherwise."""
+        return process_info.device_index if self._multi_gpu_routing_active else None
 
     def _eligible_card_indices(self, job: ImageGenerateJobPopResponse) -> set[int]:
         """Device indices of the cards whose effective config can serve ``job`` (see ``gpu_eligibility``).
@@ -8925,7 +8915,7 @@ class InferenceScheduler:
             )
             if target is None:
                 return None
-            device_index = process_info.device_index if self._multi_gpu_routing_active else None
+            device_index = self._routing_device_index(process_info)
             if self._fits_beside_retained_residents(job, target=target, device_index=device_index) is False:
                 return process_info
         return None
@@ -9453,7 +9443,7 @@ class InferenceScheduler:
             next_job = diversity_job
             process_with_model = diversity_process
 
-        dispatch_scope = process_with_model.device_index if self._multi_gpu_routing_active else None
+        dispatch_scope = self._routing_device_index(process_with_model)
         if not self._job_tracker.is_admitted_exclusive(next_job) and self._exclusive_dispatch_suppression_active(
             dispatch_scope,
         ):
@@ -9505,10 +9495,6 @@ class InferenceScheduler:
     def retention(self) -> RetentionLedger:
         """Session tallies and in-flight state for VRAM retention."""
         return self._retention
-
-    def _routing_device_index(self, process_info: HordeProcessInfo) -> int | None:
-        """The card a slot's memory is scoped to: its device on a multi-GPU host, the whole worker otherwise."""
-        return process_info.device_index if self._multi_gpu_routing_active else None
 
     def _commit_retention_verdict(
         self,
@@ -9564,7 +9550,7 @@ class InferenceScheduler:
         if not self._budget_active():
             self._retention.note_denial(RetentionDenialReason.BUDGET_INACTIVE)
             return False
-        if self._wddm_paging_active:
+        if self._retention.wddm_paging_active:
             self._retention.note_denial(RetentionDenialReason.WDDM_PAGING)
             return False
         governor_state = self.governor_state(device_index)
@@ -10308,7 +10294,7 @@ class InferenceScheduler:
         active chain (whose allocations the measured free already reflects) and the predicted reserve for a
         pending chain (which has not allocated yet, so its cost must still be charged).
         """
-        if self._wddm_paging_active:
+        if self._retention.wddm_paging_active:
             return False
         if sampling_peak_mb is None:
             return False
@@ -10462,16 +10448,7 @@ class InferenceScheduler:
         so a busy slot is never swept whatever PDH flagged, and the newest idle resident (the likeliest
         squatter) is the first eviction target.
         """
-        was_active = self._wddm_paging_active
-        self._wddm_paging_active = active
-        # Persist the victim set on every active verdict so recency tracks the latest sample, and clear it
-        # the instant paging clears so a stale set cannot outlive the pressure that produced it.
-        if active:
-            self._wddm_paging_victims_shared_mb_by_pid = dict(elevated_shared_mb_by_pid)
-            self._wddm_paging_victims_updated_monotonic = time.monotonic()
-        else:
-            self._wddm_paging_victims_shared_mb_by_pid = {}
-        if not active or was_active:
+        if not self._retention.note_wddm_paging(elevated_shared_mb_by_pid, active=active):
             return
 
         detail = ", ".join(
@@ -10502,11 +10479,7 @@ class InferenceScheduler:
         is usually the idle newcomer rather than the slow sampler, so no reclaim or kill decision gates on
         membership in this map.
         """
-        if not self._wddm_paging_victims_shared_mb_by_pid:
-            return {}
-        if (time.monotonic() - self._wddm_paging_victims_updated_monotonic) > max_age_seconds:
-            return {}
-        return dict(self._wddm_paging_victims_shared_mb_by_pid)
+        return self._retention.wddm_paging_victims(max_age_seconds)
 
     def _log_job_dispatch_details(self, next_job: ImageGenerateJobPopResponse) -> None:
         """Log the model, conditioning extras, and the resolution/steps/sampler line for a dispatching job.
@@ -10603,7 +10576,7 @@ class InferenceScheduler:
             return
         if not await self._register_disaggregated_job(next_job, None):
             return
-        device_index = pinned_resident.device_index if self._multi_gpu_routing_active else None
+        device_index = self._routing_device_index(pinned_resident)
         await self._job_tracker.mark_inference_started(
             next_job,
             device_index=device_index,
@@ -11342,7 +11315,7 @@ class InferenceScheduler:
         """
         if next_job.model is None:
             raise ValueError("materialisation admission requires a job with a model")
-        device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        device_index = self._routing_device_index(process_with_model)
         own_dispatch_mb = 0.0
         if nets_own_dispatch_reservation and next_job.id_ is not None:
             own_dispatch_mb = self._reserve_ledger.planned_charge_for_unit(
@@ -11604,7 +11577,7 @@ class InferenceScheduler:
                 if line_skip is None
                 else self._displaced_head_outstanding_mb(
                     line_skip.displaced_job,
-                    device_index=process_with_model.device_index if self._multi_gpu_routing_active else None,
+                    device_index=self._routing_device_index(process_with_model),
                 )
             ),
         ):
