@@ -378,6 +378,7 @@ def test_pending_inference_start_is_recoverable_capacity_during_backoff() -> Non
     scheduler.whole_card_governor_defer_active.return_value = False
     scheduler.heavy_head_load_grace_active.return_value = False
     scheduler.ram_reclaim_cycle_grace_active.return_value = False
+    scheduler.dispatch_hold_liveness_active.return_value = False
 
     coordinator = WorkerRecoveryCoordinator(
         state=WorkerState(),
@@ -2058,6 +2059,7 @@ class TestGiveUpDefersToAuxPrefetch:
         scheduler.whole_card_governor_defer_active.return_value = False
         scheduler.heavy_head_load_grace_active.return_value = False
         scheduler.ram_reclaim_cycle_grace_active.return_value = False
+        scheduler.dispatch_hold_liveness_active.return_value = False
         scheduler.governance_healthy_but_held.return_value = False
         scheduler.unload_post_process_models_from_vram.return_value = False
         # No reclaim candidates: this harness is about the aux-prefetch deferral, so the escalation must not be

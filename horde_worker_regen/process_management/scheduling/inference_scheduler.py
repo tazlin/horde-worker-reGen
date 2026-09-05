@@ -7,7 +7,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -52,6 +52,7 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources.admission_identity import (
+    TenantLane,
     admission_noise_buffer_mb,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -99,8 +100,12 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     DecisionKind,
     DecisionSink,
     DecisionVerdict,
+    FlatScalarMap,
+    ResourceStateKind,
+    ResourceStateSink,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _STARVATION_DIAGNOSTIC_SECONDS,
     ActuatorCommand,
     DeviceVramState,
     MeasuredVramSnapshot,
@@ -608,6 +613,13 @@ by ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS``, yet its multi-gigabyte load equally 
 not be mistaken for a structural wedge that faults the never-run backlog. Bounded so a head that genuinely
 never loads still trips the supervisor."""
 
+_DISPATCH_HOLD_LIVENESS_SECONDS = 190.0
+"""How long a head's residency-reconciliation hold keeps the recovery supervisor from reading an idle card
+with pending work as a structural wedge. The hold has its own escalation, and this is that escalation end to
+end: the head-starvation clock the measured-load probe is gated on, the idle-context teardown grace, and the
+heavy head's load window once admitted. A hold older than this has exhausted every remedy the gate owns, so
+the supervisor takes over exactly as it would for any other wedge."""
+
 _RAM_RECLAIM_CYCLE_GRACE_SECONDS = 60.0
 """How long after the worker deliberately cycles an idle inference process to reclaim allocator-retained
 RAM (``_replace_stale_ram_unload_process``) the recovery supervisor keeps ignoring a queue wedge. The
@@ -959,6 +971,7 @@ class InferenceScheduler:
         pool_protected_models_provider: Callable[[], frozenset[str]] | None = None,
         on_pool_pressure_eviction: Callable[[str], None] | None = None,
         decision_sink: DecisionSink | None = None,
+        resource_state_sink: ResourceStateSink | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
@@ -1007,6 +1020,9 @@ class InferenceScheduler:
             decision_sink (DecisionSink | None): Optional callback the manager injects to record
                 dispatch-residency admission decisions (holds and their release) to the stats export.
                 ``None`` in unit tests and until wired; emission is a no-op then.
+            resource_state_sink (ResourceStateSink | None): Optional callback the manager injects to record a
+                dispatch hold standing and releasing, with the measured room it was judged against, as
+                edge-triggered resource-state records. ``None`` in unit tests and until wired.
             clock (Callable[[], float] | None): The wall-clock source for every scheduling and governance
                 window the scheduler owns: residency grace and cooldown, the churn governors' rolling windows
                 and their deferral dwell, head starvation and the dispatch barriers, and the reclaim rate
@@ -1036,6 +1052,12 @@ class InferenceScheduler:
         # Injected by the manager: records dispatch-residency admission decisions (holds and their release)
         # to the stats export, coalesced on the receiving side. None in unit tests and until wired.
         self._decision_sink = decision_sink
+        # Injected by the manager: records a dispatch hold standing and releasing, with the room breakdown it
+        # was judged against. None in unit tests and until wired.
+        self._resource_state_sink = resource_state_sink
+        # The room breakdown of the most recent hold verdict per held job, so the release record can report
+        # what the card held when the hold started against what released it.
+        self._dispatch_hold_room_inputs: dict[str, FlatScalarMap] = {}
         # Per-card runtime plan for multi-GPU routing. A single entry (or None) means single-GPU, where the
         # dispatch path stays card-agnostic and byte-identical to before multi-GPU existed.
         self._card_runtimes: dict[int, CardRuntime] = card_runtimes if card_runtimes is not None else {}
@@ -1121,6 +1143,7 @@ class InferenceScheduler:
         self._dispatch_reconciliation_hold_seconds = 0.0
         self._dispatch_reconciliation_released_by_reclaim = 0
         self._dispatch_reconciliation_released_by_natural_free = 0
+        self._dispatch_reconciliation_released_by_measured_attempt = 0
 
         # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
         # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
@@ -2306,7 +2329,33 @@ class InferenceScheduler:
                 if disaggregated
                 else 0.0
             ),
+            admission_noise_mb=admission_noise_buffer_mb(
+                self._process_map.get_reported_total_vram_mb(device_index=device_index),
+            ),
+            unpausable_tenancy_mb=self._unpausable_tenancy_mb(device_index),
         )
+
+    def _unpausable_tenancy_mb(self, device_index: int | None) -> float:
+        """Device tenancy (MB) on the card that no sole-residency teardown returns.
+
+        The sustained foreign floor (VRAM the OS, desktop or other processes hold) and the utilities lane,
+        which has no off-GPU actuator, priced at its measured reservation plus a context. Safety and the
+        post-processing lane are not here: the residency conversion pauses both. The forecast's alone frame
+        subtracts this so a whole-card claim is retired only against room the dispatch will actually find.
+        """
+        device_key = device_index if device_index is not None else 0
+        foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
+        tenancy_mb = max(0.0, foreign_floor_mb or 0.0)
+        marginal_mb = self._marginal_process_overhead_mb(device_index)
+        if marginal_mb is None or marginal_mb <= 0.0:
+            marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.UTILITIES:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            tenancy_mb += max(0.0, float(process_info.process_reserved_mb or 0)) + marginal_mb
+        return tenancy_mb
 
     def _residency_should_pause_safety(self, device_index: int | None) -> bool:
         """Whether a whole-card residency on this card should also move the single safety process off-GPU.
@@ -3808,6 +3857,40 @@ class InferenceScheduler:
         if self._heavy_head_admitted_at == 0.0:
             return False
         return (self._clock() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
+
+    def dispatch_hold_liveness_active(self) -> bool:
+        """Whether the head's dispatch is held by the residency gate inside the hold's own liveness bound.
+
+        A residency-reconciliation hold is a deliberate scheduler state with its own escalation: the arbiter's
+        reclaim rungs, the idle-context teardown after its grace, and the measured-load probe after the head
+        starvation clock. An idle card with pending work is exactly the shape a structural wedge is read from,
+        so without this the recovery supervisor answers a working hold with pool resets and, past its own
+        budget, faults the head the gate was about to admit. While true the wedge assessment must not act;
+        bounded by :data:`_DISPATCH_HOLD_LIVENESS_SECONDS` (the probe clock, the teardown grace and the heavy
+        head's load window end to end) so a hold that never resolves still trips the supervisor. Public: read by
+        the recovery coordinator's wedge assessment.
+        """
+        head = self._undispatched_head()
+        if head is None or head.id_ is None:
+            return False
+        held_since = self._dispatch_hold_since.get(str(head.id_))
+        if held_since is None:
+            return False
+        return (self._clock() - held_since) < _DISPATCH_HOLD_LIVENESS_SECONDS
+
+    def dispatch_hold_liveness_seconds(self) -> tuple[float, float] | None:
+        """The head's hold age and its liveness bound (seconds), or None when the head is not held.
+
+        Read by the recovery coordinator to say, once per edge, how long it is deferring to the hold and when
+        that deferral lapses.
+        """
+        head = self._undispatched_head()
+        if head is None or head.id_ is None:
+            return None
+        held_since = self._dispatch_hold_since.get(str(head.id_))
+        if held_since is None:
+            return None
+        return max(0.0, self._clock() - held_since), _DISPATCH_HOLD_LIVENESS_SECONDS
 
     def ram_reclaim_cycle_grace_active(self) -> bool:
         """Whether a deliberate RAM-reclaim process cycle is still inside its bounded respawn/preload window.
@@ -5663,6 +5746,37 @@ class InferenceScheduler:
             plausible_max_mb=plausible_activation_ceiling_mb(self._process_map.get_reported_total_vram_mb()),
         )
 
+    def _tenant_lane_by_process_id(self, device_index: int | None) -> dict[int, TenantLane]:
+        """Class every live GPU process on the card for the room breakdown a refusal is explained with.
+
+        Inference processes are idle or busy by whether they are serving a job; the requester's own target
+        slot is reclassed at pricing time, since the same snapshot serves every request in a cycle. The
+        download process never holds a CUDA context and is left out.
+        """
+        lane_by_type = {
+            HordeProcessType.SAFETY: TenantLane.SAFETY,
+            HordeProcessType.POST_PROCESS: TenantLane.POST_PROCESS,
+            HordeProcessType.UTILITIES: TenantLane.UTILITIES,
+            HordeProcessType.VAE_LANE: TenantLane.VAE_LANE,
+            HordeProcessType.COMPONENT: TenantLane.COMPONENT,
+        }
+        safety_on_card = self._safety_on_gpu_permitted and not self._process_lifecycle.is_safety_gpu_paused
+        lanes: dict[int, TenantLane] = {}
+        for process_info in self._process_map.values():
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_type == HordeProcessType.SAFETY and not safety_on_card:
+                continue
+            if process_info.process_type == HordeProcessType.INFERENCE:
+                lanes[process_info.process_id] = (
+                    TenantLane.INFERENCE_BUSY if process_info.is_process_busy() else TenantLane.INFERENCE_IDLE
+                )
+                continue
+            lane = lane_by_type.get(process_info.process_type)
+            if lane is not None:
+                lanes[process_info.process_id] = lane
+        return lanes
+
     def _gpu_process_activity_ids(self, device_index: int | None) -> tuple[frozenset[int], frozenset[int]]:
         """Return the idle and busy GPU-process ids on a card, for the arbiter's release-cache targeting.
 
@@ -5782,6 +5896,7 @@ class InferenceScheduler:
             else self._process_map.num_component_processes(device_index=device_index)
         )
         idle_process_ids, busy_process_ids = self._gpu_process_activity_ids(device_index)
+        utilities_contexts = self._process_map.num_utilities_processes(device_index=device_index)
         return DeviceVramState(
             total_vram_mb=raw_total_mb,
             baseline_mb=baseline_mb,
@@ -5801,6 +5916,16 @@ class InferenceScheduler:
                 self._residency_should_pause_safety(device_index) and not self._has_safety_backlog()
             ),
             safety_weights_demotable=self._safety_weights_demotable(device_index),
+            safety_footprint_mb=self._safety_footprint_mb() if safety_contexts > 0 else 0.0,
+            lane_by_process_id=self._tenant_lane_by_process_id(device_index),
+            utilities_context_count=utilities_contexts,
+            post_process_reclaim_allowed=(
+                post_process_contexts > 0
+                and self._has_idle_service_lane_for_reclaim(HordeProcessType.POST_PROCESS, device_index)
+            ),
+            # No actuator returns the utilities lane's context yet, so the room breakdown reports its tenancy
+            # as a rung policy does not permit rather than promising room nothing can deliver.
+            utilities_reclaim_allowed=False,
             post_process_context_count=post_process_contexts,
             vae_lane_context_count=vae_lane_contexts,
             vae_lane_reclaim_allowed=(
@@ -8028,6 +8153,13 @@ class InferenceScheduler:
             can_reduce_live_contexts=can_reduce_live_contexts,
             idle_contexts_teardownable=idle_contexts_teardownable,
         )
+        request, max_resident = self._apply_measured_context_teardown(
+            request,
+            arbiter,
+            available_process,
+            structural_max_resident=max_resident,
+            device_index=target_device_index,
+        )
         verdict = arbiter.evaluate(request)
 
         if verdict.disposition is VramDisposition.FITS:
@@ -8601,6 +8733,106 @@ class InferenceScheduler:
                 continue
             return True
         return False
+
+    def _apply_measured_context_teardown(
+        self,
+        request: VramRequest,
+        arbiter: VramArbiter,
+        head_process: HordeProcessInfo,
+        *,
+        structural_max_resident: int | None,
+        device_index: int | None,
+    ) -> tuple[VramRequest, int | None]:
+        """Return ``request`` with the idle-context teardown flag and depth judged in the measured frame.
+
+        The structural context count (``max_coresident_for_peak``) sizes a teardown from total VRAM, the peak
+        and a per-context constant, and knows nothing of the noise buffer, the service lanes, or foreign
+        VRAM. The measured frame the arbiter refuses on knows all of them, so on a card at its edge the two
+        disagree: the structural count keeps every sibling while the measured deficit is a few hundred MB that
+        one idle sibling context would return. This reads the deficit the verdict will use
+        (:meth:`VramArbiter.measured_deficit_mb`) and, when idle sibling contexts on the card would close it,
+        marks the request teardownable and sizes the depth to exactly the contexts needed, never below one.
+
+        The structural judgement is kept wherever it already fires (the flag is widened, never narrowed), and
+        the depth is the deeper of the two so :meth:`reduce_live_contexts` acts on whichever frame demanded
+        more. A deficit that idle contexts cannot close leaves the request as it was: a teardown that cannot
+        produce a fit is churn, which is the fence :meth:`StreamForecast.max_resident_processes` keeps.
+        Non-head requests are never widened; the escalation is the head's alone.
+
+        Returns:
+            The request to evaluate and the ``max_resident`` depth to record on the actuation.
+        """
+        if not request.is_head_of_queue or request.idle_contexts_teardownable:
+            return request, structural_max_resident
+        if request.has_reclaimable_idle_model:
+            # An idle resident model is the cheaper rung: its eviction keeps the process. The teardown is only
+            # widened once weight reclaim has nothing left to return.
+            return request, structural_max_resident
+        deficit_mb = arbiter.measured_deficit_mb(request)
+        if deficit_mb is None or deficit_mb <= 0.0:
+            return request, structural_max_resident
+        marginal_mb = self._marginal_process_overhead_mb(device_index)
+        if marginal_mb is None or marginal_mb <= 0.0:
+            marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
+        idle_contexts = self._teardownable_idle_context_returns_mb(head_process, device_index=device_index)
+        if not idle_contexts:
+            return request, structural_max_resident
+        covered = 0.0
+        needed = 0
+        for returned_mb in sorted(idle_contexts, reverse=True):
+            needed += 1
+            covered += max(returned_mb, marginal_mb)
+            if covered >= deficit_mb:
+                break
+        if covered < deficit_mb:
+            return request, structural_max_resident
+        live = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        measured_target = max(1, live - needed)
+        if measured_target >= live:
+            return request, structural_max_resident
+        max_resident = (
+            measured_target if structural_max_resident is None else min(structural_max_resident, measured_target)
+        )
+        return replace(request, idle_contexts_teardownable=True), max_resident
+
+    def _teardownable_idle_context_returns_mb(
+        self,
+        head_process: HordeProcessInfo,
+        *,
+        device_index: int | None,
+    ) -> list[float]:
+        """What each bare idle sibling context on the card would return (MB): its reservation plus a context.
+
+        The candidates :meth:`_has_teardownable_idle_context` admits, narrowed to contexts holding neither a
+        model nor warm components (those have a cheaper rung first), and priced the way the room breakdown
+        prices them, so the measured teardown depth and the room a hold reports agree about the return.
+        """
+        marginal_mb = self._marginal_process_overhead_mb(device_index)
+        if marginal_mb is None or marginal_mb <= 0.0:
+            marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        returns: list[float] = []
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.process_id == head_process.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy():
+                continue
+            if (
+                process_info.loaded_horde_model_name is not None
+                and process_info.loaded_horde_model_name in in_progress_models
+            ):
+                continue
+            # A sibling still holding a model or warm components has a cheaper rung ahead of its teardown (an
+            # eviction or a component unload keeps the process); only a bare idle context is priced here.
+            if process_info.loaded_horde_model_name is not None or process_info.held_components:
+                continue
+            reserved_mb = float(process_info.process_reserved_mb or 0)
+            returns.append(max(0.0, reserved_mb) + marginal_mb)
+        return returns
 
     def _has_teardownable_idle_context(
         self,
@@ -12545,34 +12777,60 @@ class InferenceScheduler:
         """
         pending_ids = {str(job.id_) for job in self._job_tracker.jobs_pending_inference if job.id_ is not None}
         for held_id in [held_id for held_id in self._dispatch_hold_since if held_id not in pending_ids]:
-            self._dispatch_hold_since.pop(held_id, None)
+            held_since = self._dispatch_hold_since.pop(held_id, None)
             self._dispatch_hold_reclaim_requested.discard(held_id)
+            self._record_dispatch_hold_state(
+                held_id,
+                state="abandoned",
+                reason="left_pending_queue",
+                model=None,
+                extra={"hold_seconds": round(max(0.0, self._clock() - held_since), 1) if held_since else 0.0},
+            )
+            self._dispatch_hold_room_inputs.pop(held_id, None)
             self._resolve_dispatch_decision(held_id, reason="left_pending_queue")
         self._post_processing_defer_holds.intersection_update(pending_ids)
 
-    def _note_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_applied: bool) -> None:
+    def _note_dispatch_hold(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        reclaim_applied: bool,
+        room_inputs: FlatScalarMap | None = None,
+    ) -> None:
         """Record that the dispatch of ``job`` was held this pass, stamping the first hold and its cause.
 
-        Every hold pass counts a conflict; the first hold for a job also stamps the hold-start instant and
-        counts a distinct held dispatch. A pass whose actuator accepted an eviction command marks the job so
-        its eventual release is attributed to reclaim rather than to the card recovering on its own.
+        Every hold pass counts a conflict; the first hold for a job also stamps the hold-start instant, counts
+        a distinct held dispatch, and records a standing-hold resource-state transition carrying the measured
+        room the hold was judged against. A pass whose actuator accepted an eviction command marks the job so
+        its eventual release is attributed to reclaim rather than to the card recovering on its own. The
+        latest room breakdown is kept so the release record can report what the card held at the start.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
         self._dispatch_reconciliation_conflicts += 1
+        if room_inputs is not None:
+            self._dispatch_hold_room_inputs[job_id] = room_inputs
         if job_id not in self._dispatch_hold_since:
             self._dispatch_hold_since[job_id] = self._clock()
             self._dispatch_reconciliation_holds += 1
+            self._record_dispatch_hold_state(
+                job_id,
+                state="standing",
+                reason="dispatch_residency_hold",
+                model=job.model,
+                extra={"hold_seconds": 0.0},
+            )
         if reclaim_applied:
             self._dispatch_hold_reclaim_requested.add(job_id)
 
-    def _resolve_dispatch_hold(self, job: ImageGenerateJobPopResponse) -> None:
+    def _resolve_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, measured_attempt: bool = False) -> None:
         """Close out any dispatch hold on ``job`` now that it fits, folding its duration and release cause.
 
         A no-op for a job that was never held (the common admit-first-pass case). A held job's accumulated
-        wait folds into the cumulative hold seconds, and the release is attributed to reclaim when this gate
-        emitted eviction commands during the hold, otherwise to the card freeing on its own.
+        wait folds into the cumulative hold seconds, and the release is attributed to the measured-load probe
+        when that is what admitted it, to reclaim when this gate emitted eviction commands during the hold,
+        otherwise to the card freeing on its own.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
@@ -12580,14 +12838,56 @@ class InferenceScheduler:
         held_since = self._dispatch_hold_since.pop(job_id, None)
         if held_since is None:
             self._dispatch_hold_reclaim_requested.discard(job_id)
+            self._dispatch_hold_room_inputs.pop(job_id, None)
             return
-        self._dispatch_reconciliation_hold_seconds += max(0.0, self._clock() - held_since)
-        if job_id in self._dispatch_hold_reclaim_requested:
+        hold_seconds = max(0.0, self._clock() - held_since)
+        self._dispatch_reconciliation_hold_seconds += hold_seconds
+        if measured_attempt:
+            self._dispatch_reconciliation_released_by_measured_attempt += 1
+            self._dispatch_hold_reclaim_requested.discard(job_id)
+            release = "measured_attempt"
+        elif job_id in self._dispatch_hold_reclaim_requested:
             self._dispatch_reconciliation_released_by_reclaim += 1
             self._dispatch_hold_reclaim_requested.discard(job_id)
+            release = "reclaim"
         else:
             self._dispatch_reconciliation_released_by_natural_free += 1
+            release = "natural_free"
+        self._record_dispatch_hold_state(
+            job_id,
+            state="released",
+            reason=release,
+            model=job.model,
+            extra={"hold_seconds": round(hold_seconds, 1)},
+        )
+        self._dispatch_hold_room_inputs.pop(job_id, None)
         self._resolve_dispatch_decision(job_id, reason="dispatch_admitted")
+
+    def _record_dispatch_hold_state(
+        self,
+        job_id: str,
+        *,
+        state: str,
+        reason: str,
+        model: str | None,
+        extra: FlatScalarMap,
+    ) -> None:
+        """Emit one dispatch-hold resource-state transition with the hold's latest room breakdown attached."""
+        if self._resource_state_sink is None:
+            return
+        inputs: FlatScalarMap = {"job_id": job_id, "model": str(model)}
+        inputs.update(self._dispatch_hold_room_inputs.get(job_id, {}))
+        inputs.update(extra)
+        self._resource_state_sink(
+            state_kind=ResourceStateKind.DISPATCH_HOLD,
+            state=state,
+            reason=reason,
+            inputs=inputs,
+        )
+
+    def latest_dispatch_reconciliation_released_by_measured_attempt(self) -> int:
+        """Return the count of held dispatches the measured-load probe admitted (calibration visibility)."""
+        return self._dispatch_reconciliation_released_by_measured_attempt
 
     def _note_post_processing_defer(self, job: ImageGenerateJobPopResponse, *, deferred: bool) -> None:
         """Record whether the post-processing co-residency gate held ``job``'s dispatch on this pass.
@@ -12745,7 +13045,7 @@ class InferenceScheduler:
         device_index = outcome.device_index
 
         if verdict.admits:
-            self._resolve_dispatch_hold(next_job)
+            self._resolve_dispatch_hold(next_job, measured_attempt=verdict.measured_attempt)
             return False
 
         # The arbiter describes evictions in terms of resident checkpoints, so a card held by idle tenancy it
@@ -12760,34 +13060,40 @@ class InferenceScheduler:
                 device_index=device_index,
             )
 
+        room = verdict.room
+        hold_context = self._dispatch_hold_context_inputs(next_job, device_index=device_index)
+        room_inputs: FlatScalarMap = dict(hold_context)
+        if room is not None:
+            room_inputs.update(room.as_inputs())
         self._note_dispatch_hold(
             next_job,
             reclaim_applied=bool(outcome.actuations_applied) or tenancy_reclaimed,
+            room_inputs=room_inputs,
         )
 
         if self._decision_sink is not None and next_job.id_ is not None:
             measured = verdict.measured
+            inputs: FlatScalarMap = {
+                "model": str(next_job.model),
+                "device_index": device_index,
+                "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
+                "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
+                "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
+                "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
+                "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
+                "is_head_of_queue": is_head_of_queue,
+                "reclaim_requested": bool(outcome.actuations_requested),
+                "reclaim_applied": bool(outcome.actuations_applied),
+                "reclaim_requested_kinds": ",".join(command.kind.value for command in outcome.actuations_requested),
+                "reclaim_applied_kinds": ",".join(command.kind.value for command in outcome.actuations_applied),
+            }
+            inputs.update(room_inputs)
             self._decision_sink(
                 decision_kind=DecisionKind.INFERENCE_DISPATCH,
                 subject=str(next_job.id_),
                 verdict=DecisionVerdict.DEFER,
                 reason=verdict.reason or verdict.disposition.value,
-                inputs={
-                    "model": str(next_job.model),
-                    "device_index": device_index,
-                    "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
-                    "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
-                    "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
-                    "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
-                    "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
-                    "is_head_of_queue": is_head_of_queue,
-                    "reclaim_requested": bool(outcome.actuations_requested),
-                    "reclaim_applied": bool(outcome.actuations_applied),
-                    "reclaim_requested_kinds": ",".join(
-                        command.kind.value for command in outcome.actuations_requested
-                    ),
-                    "reclaim_applied_kinds": ",".join(command.kind.value for command in outcome.actuations_applied),
-                },
+                inputs=inputs,
             )
 
         suppressed = self._scheduler_diagnostic_suppressed_count(
@@ -12807,11 +13113,69 @@ class InferenceScheduler:
                     else " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
                 )
             )
+            room_note = f" Room: {room.describe()}." if room is not None else ""
             logger.opt(colors=True).warning(
-                f"<fg #f0beff>Holding dispatch of {{}} to reconcile residency: {verdict.stated}.{reclaim_note}</>",
+                f"<fg #f0beff>Holding dispatch of {{}} to reconcile residency: {verdict.stated}.{reclaim_note}"
+                f"{room_note} {self._dispatch_hold_context_phrase(hold_context)}</>",
                 next_job.model,
             )
         return True
+
+    def _dispatch_hold_context_inputs(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None,
+    ) -> FlatScalarMap:
+        """The head's standing with the escape hatches, so a hold record says what it is waiting on.
+
+        ``hold_seconds`` is this gate's own ledger; ``starved_seconds`` is the head-starvation clock the
+        measured-load probe is gated on, reported beside its threshold so a reader can see how far the probe
+        is; ``probe_state`` names whether that one-shot is still waiting, in progress, or already spent on this
+        card; and the whole-card intent fields say whether the forecast is claiming the card for this model or
+        has retired that claim on measurement.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        held_since = self._dispatch_hold_since.get(job_id) if job_id is not None else None
+        hold_seconds = max(0.0, self._clock() - held_since) if held_since is not None else 0.0
+        starved_seconds = self._head_starved_seconds(job)
+        if self._job_tracker.is_measured_attempt_on_device(job, device_index):
+            probe_state = "in_progress"
+        elif self._job_tracker.has_spent_measured_attempt_on_device(job, device_index):
+            probe_state = "spent"
+        elif starved_seconds >= _STARVATION_DIAGNOSTIC_SECONDS:
+            probe_state = "eligible"
+        else:
+            probe_state = f"waiting_{max(0.0, _STARVATION_DIAGNOSTIC_SECONDS - starved_seconds):.0f}s"
+        inputs: FlatScalarMap = {
+            "hold_seconds": round(hold_seconds, 1),
+            "starved_seconds": round(starved_seconds, 1),
+            "probe_state": probe_state,
+        }
+        if job.model is not None:
+            baseline = self._model_metadata.get_baseline(job.model)
+            forecast = self._forecast_streaming(job, baseline, device_index=device_index)
+            inputs["whole_card_wants"] = forecast.wants_whole_card
+            inputs["whole_card_retired_by_measurement"] = forecast.measured_retires_whole_card_intent
+            inputs["whole_card_measured_mb"] = (
+                None if forecast.measured_footprint_mb is None else round(forecast.measured_footprint_mb, 1)
+            )
+            inputs["whole_card_observations"] = forecast.measured_observation_count
+        return inputs
+
+    @staticmethod
+    def _dispatch_hold_context_phrase(context: FlatScalarMap) -> str:
+        """Render the hold context as the tail of the hold line."""
+        whole_card = context.get("whole_card_wants")
+        if whole_card is True:
+            retired = context.get("whole_card_retired_by_measurement") is True
+            intent = "whole-card intent retired by measurement" if retired else "whole-card intent standing"
+        else:
+            intent = "no whole-card intent"
+        return (
+            f"Held {context.get('hold_seconds', 0)}s, head starved {context.get('starved_seconds', 0)}s, "
+            f"probe {context.get('probe_state')}, {intent}."
+        )
 
     def _evaluate_materialization_admission(
         self,
@@ -12947,6 +13311,13 @@ class InferenceScheduler:
             # head-only signal is reported for that path.
             can_reduce_live_contexts=False,
             idle_contexts_teardownable=idle_contexts_teardownable,
+        )
+        request, max_resident = self._apply_measured_context_teardown(
+            request,
+            self._ensure_preload_arbiter(),
+            process_with_model,
+            structural_max_resident=max_resident,
+            device_index=device_index,
         )
         verdict = self._ensure_preload_arbiter().evaluate(request)
 

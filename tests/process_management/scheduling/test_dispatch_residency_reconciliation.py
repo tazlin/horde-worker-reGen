@@ -193,6 +193,10 @@ class _CapturingArbiter:
         self.last_request = request
         return self._verdict
 
+    def measured_deficit_mb(self, request: VramRequest) -> float | None:
+        """A fixed verdict prices nothing, so the measured-frame teardown widening has no deficit to read."""
+        return None
+
 
 class TestLineSkipDispatchHeadTruth:
     """A line-skip dispatch is not the true head of queue, so the gate must present is_head_of_queue=False.

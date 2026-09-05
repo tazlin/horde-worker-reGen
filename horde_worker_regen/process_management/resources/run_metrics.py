@@ -188,6 +188,9 @@ class ResourceStateKind(enum.StrEnum):
     GOVERNOR = "governor"
     WDDM_PAGING = "wddm_paging"
     SATURATION_UNRESOLVED = "saturation_unresolved"
+    DISPATCH_HOLD = "dispatch_hold"
+    """A head's dispatch entered or left a residency-reconciliation hold; ``state`` is ``standing`` or the
+    release reason, and the inputs carry the measured room breakdown the hold was judged against."""
 
 
 class JobMetricsRecord(BaseModel):
@@ -409,6 +412,27 @@ class DecisionSink(Protocol):
         timestamp: float | None = ...,
     ) -> DecisionEvent | None:
         """Record one decision verdict for ``subject`` (see :meth:`WorkerRunMetrics.record_decision`)."""
+        ...
+
+
+class ResourceStateSink(Protocol):
+    """The callable a collaborator is handed to record an edge-triggered device or hold state transition.
+
+    Structurally satisfied by :meth:`WorkerRunMetrics.record_resource_state`, on the same injection terms as
+    :class:`DecisionSink`.
+    """
+
+    def __call__(
+        self,
+        *,
+        state_kind: ResourceStateKind,
+        state: str,
+        device_index: int | None = ...,
+        reason: str = ...,
+        inputs: FlatScalarMap | None = ...,
+        timestamp: float | None = ...,
+    ) -> ResourceStateEvent | None:
+        """Record one state transition (see :meth:`WorkerRunMetrics.record_resource_state`)."""
         ...
 
 

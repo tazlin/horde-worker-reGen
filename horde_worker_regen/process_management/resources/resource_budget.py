@@ -338,6 +338,15 @@ class StreamForecast:
     measured_observation_count: int = 0
     """How many observations back ``measured_footprint_mb``, so a residency verdict can be logged with the
     weight of the evidence behind it. Zero when there is no measured figure."""
+    admission_noise_mb: float = 0.0
+    """The admission identity's noise buffer (MB) for this card. The alone frame is judged net of it so a
+    whole-card claim is retired only when the measured admission that will later price the dispatch would
+    admit the model beside a sibling context; zero keeps the pre-noise arithmetic for a directly-constructed
+    forecast."""
+    unpausable_tenancy_mb: float = 0.0
+    """Device tenancy (MB) no sole-residency teardown returns: the sustained foreign floor and any lane with
+    no off-GPU actuator. ``free_if_alone`` assumes every other tenant gone; this is what stays, so the alone
+    frame subtracts it before deciding a whole-card claim can be retired."""
 
     unreclaimable_charge_mb: float = 0.0
     """The share of the ``free_after_model_evict_mb`` deduction that stopping idle inference siblings cannot
@@ -463,6 +472,17 @@ class StreamForecast:
         ) >= _CORESIDENT_SIBLING_MODEL_FLOOR_MB
 
     @property
+    def _free_if_alone_measured_mb(self) -> float:
+        """The alone frame as the measured admission would see it.
+
+        ``free_if_alone`` net of the noise buffer and the tenancy no teardown returns. Zero when the alone
+        figure is unknown (callers test that first).
+        """
+        if self.free_if_alone_mb is None:
+            return 0.0
+        return max(0.0, self.free_if_alone_mb - self.admission_noise_mb - self.unpausable_tenancy_mb)
+
+    @property
     def _residency_is_intent_driven(self) -> bool:
         """Whether the sole-residency claim comes from the baseline's declared intent rather than its weights.
 
@@ -489,13 +509,18 @@ class StreamForecast:
         promise room for a whole sibling model (the seed-based floor's much stronger claim); it only says
         the card is not full, which is the entire premise of tearing the siblings down.
 
+        The alone frame is taken net of the admission noise buffer and the tenancy no teardown returns
+        (:attr:`admission_noise_mb`, :attr:`unpausable_tenancy_mb`), because the dispatch that follows is priced
+        by the measured admission, which charges both; retiring the claim on a frame the admission does not
+        share leaves the siblings standing while the dispatch is refused for the room they hold.
+
         False without a measured figure or without a sized card, so an unmeasured or unsizable case keeps
         the declared intent exactly as before.
         """
         measured_mb = self.measured_footprint_mb
         if measured_mb is None or self.free_if_alone_mb is None:
             return False
-        return (self.free_if_alone_mb - measured_mb) >= self._effective_marginal_overhead_mb
+        return (self._free_if_alone_measured_mb - measured_mb) >= self._effective_marginal_overhead_mb
 
     @property
     def fits_coresident(self) -> bool:
@@ -923,6 +948,8 @@ def forecast_weight_streaming(
     wants_whole_card: bool = False,
     disaggregated: bool = False,
     disaggregation_sibling_charge_mb: float = 0.0,
+    admission_noise_mb: float = 0.0,
+    unpausable_tenancy_mb: float = 0.0,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
@@ -1132,6 +1159,8 @@ def forecast_weight_streaming(
         # quietly lower a load-feasibility judgment, only retire a residency claim the seed alone made.
         measured_footprint_mb=(None if disaggregated else measured_resident_footprint_mb),
         measured_observation_count=(0 if disaggregated else max(0, measured_observation_count)),
+        admission_noise_mb=max(0.0, admission_noise_mb),
+        unpausable_tenancy_mb=max(0.0, unpausable_tenancy_mb),
         unreclaimable_charge_mb=unreclaimable_charge_mb,
     )
 

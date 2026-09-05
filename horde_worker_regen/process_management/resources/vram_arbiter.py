@@ -87,7 +87,10 @@ from strenum import StrEnum
 
 from horde_worker_regen.process_management.resources.admission_identity import (
     _ADMISSION_NOISE_BUFFER_MB,
+    AdmissionRoom,
     AdmissionVerdict,
+    TenantLane,
+    admission_room,
     evaluate_admission,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -474,6 +477,20 @@ class DeviceVramState:
     reclaim_unresolved: bool = False
     """True when the governor's verified reclaim ladder exhausted its rungs while still SATURATED; carried for
     diagnostics and telemetry, not admission."""
+    lane_by_process_id: Mapping[int, TenantLane] = field(default_factory=dict)
+    """Each live GPU process's tenant class by process id, for the room breakdown a refusal is explained with.
+    Inference processes are classed idle or busy by the snapshot builder; the requester's target slot is
+    reclassed per request."""
+    utilities_context_count: int = 0
+    """Number of on-GPU image-utilities contexts on this card."""
+    post_process_reclaim_allowed: bool = False
+    """Whether policy permits pausing this card's post-processing lane off-GPU for a starved head now (the lane
+    is live, idle, and not already paused)."""
+    utilities_reclaim_allowed: bool = False
+    """Whether policy permits pausing this card's utilities lane off-GPU for a starved head now."""
+    safety_footprint_mb: float = 0.0
+    """Safety's whole-device footprint (MB), the figure every safety consumer prices from; used by the room
+    breakdown when the safety process has not reported a reservation."""
 
     def sampling_headroom_mb(self) -> float | None:
         """Reproduce the concurrent-sampling headroom (MB), or None when the total is unknown.
@@ -559,6 +576,10 @@ class VramVerdict:
     :data:`_MEASURED_ATTEMPT_BAND_MB`). The scheduler tags the job on this flag so a subsequent child OOM is
     routed to a terminal scheduling-recovery fault that arms the ceiling hold with real-attempt evidence, rather
     than to the ordinary degraded retry. False for every arithmetic fit and every non-FITS disposition."""
+    room: AdmissionRoom | None = None
+    """The measured room decomposed by tenant and reclaim rung for a non-admit on a card with a device-free
+    reading, so the refusal names who holds the card and what could return it; None for an admit, an
+    indeterminate reading, and request kinds the identity does not price."""
 
     @property
     def admits(self) -> bool:
@@ -701,6 +722,26 @@ class VramArbiter:
             noise_buffer_mb=state.noise_buffer_mb,
         )
 
+    def measured_deficit_mb(self, request: VramRequest) -> float | None:
+        """Return how far ``request`` misses this cycle's measured room (MB), or None when it cannot be priced.
+
+        The same identity :meth:`evaluate` refuses on, exposed so a seam that must decide *before* evaluating
+        what reclaim the request may carry (the idle-context teardown flag and its depth) reasons from the
+        figure the verdict will use rather than from a structural estimate of it. Positive when the candidate
+        does not fit; zero or negative when it does. None without a cycle, without a state for the card, or
+        without a device-free reading.
+        """
+        if self._cycle is None:
+            return None
+        state = self._cycle.device(request.device_index)
+        if state is None:
+            return None
+        measured = self._measured(request, state)
+        headroom = measured.headroom_mb
+        if headroom is None:
+            return None
+        return -headroom
+
     def _evaluate_admission(self, request: VramRequest, state: DeviceVramState) -> VramVerdict:
         measured = self._measured(request, state)
         if request.candidate_already_resident:
@@ -762,6 +803,7 @@ class VramArbiter:
         if measured_attempt is not None:
             return measured_attempt
 
+        room = self._room(request, state, measured)
         if structurally_impossible and not self._ceiling_attempt_pending_convergence(request, measured, state):
             return VramVerdict(
                 disposition=VramDisposition.DENY,
@@ -770,6 +812,7 @@ class VramArbiter:
                 reason=("candidate exceeds this card's achievable ceiling; no reclaim on this card can seat it"),
                 measured=measured,
                 detail=self._impossibility_detail(request, state, measured),
+                room=room,
             )
 
         teardown_actuations = self._starvation_context_teardown(request)
@@ -789,6 +832,7 @@ class VramArbiter:
                     f"{_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s grace; {measured.reason()}"
                 ),
                 required_actuations=teardown_actuations,
+                room=room,
             )
 
         if self._has_first_party_context_reclaim(request):
@@ -807,6 +851,34 @@ class VramArbiter:
             measured=measured,
             detail=measured.reason(),
             required_actuations=actuations,
+            room=room,
+        )
+
+    @staticmethod
+    def _room(request: VramRequest, state: DeviceVramState, measured: AdmissionVerdict) -> AdmissionRoom | None:
+        """Decompose a non-fitting measured verdict into tenancy by class and the rungs that could return room.
+
+        Reads the same frozen figures the verdict was priced from, so the deficit it reports is the verdict's
+        own. None when the identity could not be formed (no device-free reading), since there is no room to
+        decompose. Sibling contexts are charged the marginal per-context figure, the same charge the structural
+        forecast prices them at, so the two frames name the same number for the same context.
+        """
+        if measured.device_free_mb is None:
+            return None
+        return admission_room(
+            candidate_mb=measured.candidate_outstanding_mb,
+            device_free_mb=measured.device_free_mb,
+            total_vram_mb=state.total_vram_mb,
+            outstanding_reservations_mb=measured.outstanding_reservations_mb,
+            noise_buffer_mb=measured.noise_buffer_mb,
+            per_process_reserved_mb=state.per_process_reserved_mb,
+            lane_by_process_id=state.lane_by_process_id,
+            target_process_id=request.target_process_id,
+            context_mb=state.marginal_mb,
+            safety_footprint_mb=state.safety_footprint_mb,
+            post_process_reclaim_permitted=state.post_process_reclaim_allowed,
+            safety_reclaim_permitted=state.safety_reclaim_allowed,
+            utilities_reclaim_permitted=state.utilities_reclaim_allowed,
         )
 
     def _head_protection_defer(

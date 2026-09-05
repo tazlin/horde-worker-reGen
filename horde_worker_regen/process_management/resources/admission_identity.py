@@ -39,7 +39,10 @@ denying or fabricating a fictional free figure. The device total is retained onl
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+from strenum import StrEnum
 
 _ADMISSION_NOISE_BUFFER_MB = 512.0
 """Floor (MB) of the admission noise buffer, the value it takes on small cards and when no total is known.
@@ -208,4 +211,223 @@ def evaluate_admission(
         outstanding_reservations_mb=outstanding_reservations_mb,
         total_vram_mb=total_vram_mb,
         noise_buffer_mb=resolved_noise_buffer_mb,
+    )
+
+
+class TenantLane(StrEnum):
+    """The class of tenant a live GPU process is, for the room breakdown a refusal is explained with.
+
+    The admission identity prices against one device-free number, which is the right authority but says
+    nothing about who holds the card. A refusal a person or a reclaim policy can act on needs the reading
+    decomposed by the class of holder, because each class is returned by a different actuator: an idle
+    inference sibling by a context teardown, the post-processing and utilities lanes and safety by their
+    off-GPU pauses, and the foreign share by nothing the worker can do.
+    """
+
+    INFERENCE_TARGET = "inference_target"
+    INFERENCE_IDLE = "inference_idle"
+    INFERENCE_BUSY = "inference_busy"
+    SAFETY = "safety"
+    POST_PROCESS = "post_process"
+    UTILITIES = "utilities"
+    VAE_LANE = "vae_lane"
+    COMPONENT = "component"
+    FOREIGN = "foreign"
+
+
+class ReclaimRungKind(StrEnum):
+    """A reclaim rung the room breakdown can price, cheapest first in declaration order."""
+
+    IDLE_SIBLING_CONTEXT = "idle_sibling_context"
+    POST_PROCESS_LANE = "post_process_lane"
+    SAFETY_OFF_GPU = "safety_off_gpu"
+    UTILITIES_LANE = "utilities_lane"
+
+
+@dataclass(frozen=True)
+class ReclaimRung:
+    """One rung's promised return (MB) and whether policy currently permits pulling it."""
+
+    kind: ReclaimRungKind
+    promised_mb: float
+    permitted: bool
+
+
+@dataclass(frozen=True)
+class AdmissionRoom:
+    """The measured admission identity decomposed by tenant, with the rungs that could change the answer.
+
+    Built from the same frozen per-cycle figures :func:`evaluate_admission` prices from, so the deficit here is
+    exactly the verdict's deficit; nothing is re-measured. ``tenancy_mb`` attributes the device-used reading
+    (``total - device_free``) to tenant classes from each live process's measured reservation plus its context
+    charge; whatever those do not account for is the foreign share (or zero when the sum overshoots the
+    reading: the per-process reports and the device reading are not sampled at the same instant).
+
+    ``rungs`` lists what each reclaim rung would return, cheapest first. ``closable`` is whether the permitted
+    rungs together cover the deficit, which is what separates a hold worth escalating from one that can only
+    wait for the probe or for foreign VRAM to leave.
+    """
+
+    candidate_mb: float
+    device_free_mb: float
+    total_vram_mb: float | None
+    outstanding_reservations_mb: float
+    noise_buffer_mb: float
+    tenancy_mb: Mapping[TenantLane, float]
+    rungs: tuple[ReclaimRung, ...]
+
+    @property
+    def available_mb(self) -> float:
+        """The admission room (MB): ``device_free - outstanding_reservations - noise``."""
+        return self.device_free_mb - self.outstanding_reservations_mb - self.noise_buffer_mb
+
+    @property
+    def deficit_mb(self) -> float:
+        """How far the candidate misses the room (MB); zero or negative when it fits."""
+        return self.candidate_mb - self.available_mb
+
+    @property
+    def reclaimable_mb(self) -> float:
+        """What the permitted rungs would return together (MB)."""
+        return sum(rung.promised_mb for rung in self.rungs if rung.permitted)
+
+    @property
+    def unpausable_mb(self) -> float:
+        """Tenancy no permitted rung returns (MB): the foreign share, busy siblings, and rungs policy forbids."""
+        forbidden = sum(rung.promised_mb for rung in self.rungs if not rung.permitted)
+        return (
+            self.tenancy_mb.get(TenantLane.FOREIGN, 0.0)
+            + self.tenancy_mb.get(TenantLane.INFERENCE_BUSY, 0.0)
+            + forbidden
+        )
+
+    @property
+    def closable(self) -> bool:
+        """Whether the permitted rungs together cover the deficit."""
+        return self.deficit_mb > 0 and self.reclaimable_mb >= self.deficit_mb
+
+    def rungs_to_close(self) -> tuple[ReclaimRung, ...]:
+        """The cheapest-first permitted rungs whose cumulative return first covers the deficit, or all of them."""
+        chosen: list[ReclaimRung] = []
+        covered = 0.0
+        for rung in self.rungs:
+            if not rung.permitted:
+                continue
+            chosen.append(rung)
+            covered += rung.promised_mb
+            if covered >= self.deficit_mb:
+                break
+        return tuple(chosen)
+
+    def describe(self) -> str:
+        """One log line: the deficit, who holds the card, and what the rungs could return."""
+        tenancy = ", ".join(f"{lane.value} {mb:.0f}" for lane, mb in self.tenancy_mb.items() if mb > 0.0)
+        rungs = ", ".join(
+            f"{rung.kind.value} {rung.promised_mb:.0f}{'' if rung.permitted else ' (not permitted)'}"
+            for rung in self.rungs
+        )
+        if self.deficit_mb > 0:
+            verdict = f"short {self.deficit_mb:.0f} MB ({'closable by rungs' if self.closable else 'not closable'})"
+        else:
+            verdict = f"fits by {-self.deficit_mb:.0f} MB"
+        return (
+            f"{verdict}; tenancy MB: {tenancy or 'none attributed'}; noise {self.noise_buffer_mb:.0f}; "
+            f"rungs MB: {rungs or 'none'}; unpausable {self.unpausable_mb:.0f}"
+        )
+
+    def as_inputs(self) -> dict[str, str | int | float | bool | None]:
+        """Flat scalars for a decision or resource-state record."""
+        inputs: dict[str, str | int | float | bool | None] = {
+            "room_candidate_mb": round(self.candidate_mb, 1),
+            "room_available_mb": round(self.available_mb, 1),
+            "room_deficit_mb": round(self.deficit_mb, 1),
+            "room_reclaimable_mb": round(self.reclaimable_mb, 1),
+            "room_unpausable_mb": round(self.unpausable_mb, 1),
+            "room_closable": self.closable,
+        }
+        for lane, mb in self.tenancy_mb.items():
+            inputs[f"tenancy_{lane.value}_mb"] = round(mb, 1)
+        for rung in self.rungs:
+            inputs[f"rung_{rung.kind.value}_mb"] = round(rung.promised_mb, 1)
+            inputs[f"rung_{rung.kind.value}_permitted"] = rung.permitted
+        return inputs
+
+
+def admission_room(
+    *,
+    candidate_mb: float,
+    device_free_mb: float,
+    total_vram_mb: float | None,
+    outstanding_reservations_mb: float,
+    noise_buffer_mb: float,
+    per_process_reserved_mb: Mapping[int, float],
+    lane_by_process_id: Mapping[int, TenantLane],
+    target_process_id: int | None,
+    context_mb: float,
+    safety_footprint_mb: float,
+    post_process_reclaim_permitted: bool,
+    safety_reclaim_permitted: bool,
+    utilities_reclaim_permitted: bool,
+) -> AdmissionRoom:
+    """Decompose the admission identity for one candidate into tenancy by class and reclaim rungs.
+
+    A live process's tenancy is its measured allocator reservation plus one context charge (``context_mb``,
+    the per-context figure the overhead probe measured); safety is priced at its whole-device footprint, the
+    figure every other safety consumer uses, when its reservation is not reported. The target slot is a tenant
+    too (its context stays whatever happens), but it is never a rung. The foreign share is the device-used
+    reading less everything attributed, floored at zero.
+
+    Rungs, cheapest first: each idle inference sibling context (its full tenancy returns when the process
+    exits), the post-processing lane, safety off-GPU, the utilities lane. A rung is listed even when policy
+    forbids it, so the line a person reads shows what an operator setting would unlock.
+
+    Args:
+        candidate_mb: The candidate's outstanding device cost (MB), net of resident credit.
+        device_free_mb: The frozen NVML device-level free reading (MB).
+        total_vram_mb: The device total (MB), or None when unknown (then no foreign share can be formed).
+        outstanding_reservations_mb: Admitted-but-unmaterialised reservations (MB), net of the requester's own.
+        noise_buffer_mb: The admission margin (MB).
+        per_process_reserved_mb: Each live GPU process's measured reservation (MB) by process id.
+        lane_by_process_id: Each live GPU process's tenant class by process id.
+        target_process_id: The slot the candidate would materialise on; classed as the target tenant.
+        context_mb: The per-context charge (MB) added to each process's reservation.
+        safety_footprint_mb: Safety's whole-device footprint (MB), used when its reservation is unreported.
+        post_process_reclaim_permitted: Whether policy permits pausing the post-processing lane off-GPU now.
+        safety_reclaim_permitted: Whether policy permits moving safety off-GPU now.
+        utilities_reclaim_permitted: Whether policy permits pausing the utilities lane off-GPU now.
+    """
+    tenancy: dict[TenantLane, float] = {}
+    rungs: list[ReclaimRung] = []
+    attributed = 0.0
+    for process_id, lane in lane_by_process_id.items():
+        reserved = per_process_reserved_mb.get(process_id)
+        if lane is TenantLane.SAFETY and reserved is None:
+            charge = max(0.0, safety_footprint_mb)
+        else:
+            charge = max(0.0, reserved or 0.0) + max(0.0, context_mb)
+        classed = TenantLane.INFERENCE_TARGET if process_id == target_process_id else lane
+        tenancy[classed] = tenancy.get(classed, 0.0) + charge
+        attributed += charge
+        if classed is TenantLane.INFERENCE_IDLE:
+            rungs.append(ReclaimRung(ReclaimRungKind.IDLE_SIBLING_CONTEXT, charge, True))
+    lane_rungs = (
+        (TenantLane.POST_PROCESS, ReclaimRungKind.POST_PROCESS_LANE, post_process_reclaim_permitted),
+        (TenantLane.SAFETY, ReclaimRungKind.SAFETY_OFF_GPU, safety_reclaim_permitted),
+        (TenantLane.UTILITIES, ReclaimRungKind.UTILITIES_LANE, utilities_reclaim_permitted),
+    )
+    for lane, kind, permitted in lane_rungs:
+        held = tenancy.get(lane, 0.0)
+        if held > 0.0:
+            rungs.append(ReclaimRung(kind, held, permitted))
+    if total_vram_mb is not None and total_vram_mb > 0:
+        used_mb = max(0.0, total_vram_mb - device_free_mb)
+        tenancy[TenantLane.FOREIGN] = max(0.0, used_mb - attributed)
+    return AdmissionRoom(
+        candidate_mb=candidate_mb,
+        device_free_mb=device_free_mb,
+        total_vram_mb=total_vram_mb,
+        outstanding_reservations_mb=outstanding_reservations_mb,
+        noise_buffer_mb=noise_buffer_mb,
+        tenancy_mb=tenancy,
+        rungs=tuple(rungs),
     )

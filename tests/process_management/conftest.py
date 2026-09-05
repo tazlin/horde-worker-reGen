@@ -714,6 +714,7 @@ def make_test_recovery_coordinator(
         "whole_card_residency_grace_active": False,
         "whole_card_governor_defer_active": False,
         "heavy_head_load_grace_active": False,
+        "dispatch_hold_liveness_active": False,
         "ram_reclaim_cycle_grace_active": False,
         "governance_healthy_but_held": False,
         "unload_post_process_models_from_vram": False,

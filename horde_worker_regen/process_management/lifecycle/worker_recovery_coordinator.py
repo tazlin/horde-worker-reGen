@@ -276,6 +276,7 @@ class WorkerRecoveryCoordinator:
         self.recovery_supervisor = recovery_supervisor or RecoverySupervisor()
         self.limp_by_active = False
         self.episode_saw_unrecoverable_pool = False
+        self._deferring_to_dispatch_hold = False
         self.episode_progress_baseline: int | None = None
         self.episode_inference_start_baseline: int | None = None
         self.episode_post_processing_progress_baseline: int | None = None
@@ -716,17 +717,46 @@ class WorkerRecoveryCoordinator:
         is holding for capacity that is about to arrive.
         """
         if not self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge():
+            self._note_dispatch_hold_deferral(False)
             return False
+        hold_alive = bool(self._inference_scheduler.dispatch_hold_liveness_active())
+        self._note_dispatch_hold_deferral(hold_alive)
         queue_held_for_capacity = (
             self._inference_scheduler.whole_card_residency_grace_active()
             or self._inference_scheduler.whole_card_governor_defer_active()
             or self._inference_scheduler.heavy_head_load_grace_active()
             or self._inference_scheduler.ram_reclaim_cycle_grace_active()
+            or hold_alive
             or self._inference_starts_backing_off()
         )
         if queue_held_for_capacity:
             return False
         return not self._process_map.has_inference_in_progress()
+
+    def _note_dispatch_hold_deferral(self, hold_alive: bool) -> None:
+        """Log once when the wedge assessment starts deferring to a standing dispatch hold, and once when that lapses.
+
+        The deferral itself is silent by design (it is the absence of a remedy), so without an edge line a
+        reader of the log sees an idle card, pending work and no recovery, with nothing saying why. The
+        lapse line is the one that matters after the fact: it says the hold outlived its liveness bound and
+        recovery took over from there.
+        """
+        if hold_alive == self._deferring_to_dispatch_hold:
+            return
+        self._deferring_to_dispatch_hold = hold_alive
+        ages = self._inference_scheduler.dispatch_hold_liveness_seconds()
+        if hold_alive:
+            age, bound = ages if isinstance(ages, tuple) else (0.0, 0.0)
+            logger.info(
+                f"Recovery is deferring to the head's dispatch hold (held {age:.0f}s of a {bound:.0f}s liveness "
+                "bound): the residency gate is reclaiming or waiting on its probe, so the idle card with pending "
+                "work is not a wedge yet.",
+            )
+        else:
+            logger.warning(
+                "Recovery stopped deferring to the head's dispatch hold: it lapsed its liveness bound or released, "
+                "so the wedge assessment reads the queue on its own terms again.",
+            )
 
     def pop_gate_wedge_active(self) -> bool:
         """Return whether job pops have been gated far too long with no work completing behind the gate.

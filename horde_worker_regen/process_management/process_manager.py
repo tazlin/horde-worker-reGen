@@ -1761,6 +1761,7 @@ class HordeWorkerProcessManager:
                 0,
             ),
             decision_sink=self._run_metrics.record_decision,
+            resource_state_sink=self._run_metrics.record_resource_state,
         )
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
         # can estimate the free VRAM achievable under sole residency (total - one process's context) and,
