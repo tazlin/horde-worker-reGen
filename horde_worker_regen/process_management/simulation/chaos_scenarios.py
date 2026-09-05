@@ -49,7 +49,7 @@ from horde_worker_regen.process_management.process_manager import (
     resolve_card_concurrency,
 )
 from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
-from horde_worker_regen.process_management.scheduling.inference_scheduler import _SAFETY_GPU_LOAD_CHARGE_MB
+from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 
@@ -664,7 +664,7 @@ def sampling_headroom_mb(
     """
     charge = card.per_process_overhead_mb + card.marginal_process_overhead_mb * max(0, lanes - 1)
     if service_contexts:
-        charge += _SAFETY_GPU_LOAD_CHARGE_MB + card.marginal_process_overhead_mb
+        charge += SAFETY_GPU_LOAD_CHARGE_MB + card.marginal_process_overhead_mb
     return card.total_vram_mb - charge - foreign_resident_mb - _RESERVE_ALLOWANCE_MB
 
 

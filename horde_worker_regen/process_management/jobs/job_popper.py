@@ -1605,7 +1605,7 @@ class JobPopper:
             self._submit_backpressure_engaged = False
             logger.info("Resuming job pops: the pending-submit backlog has drained.")
 
-        backlog = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
+        backlog = self._job_tracker.safety_backlog_depth
         cap = self._max_safe_safety_backlog()
         if self._safety_backpressure_engaged:
             if backlog <= cap * _SAFETY_BACKLOG_RELEASE_FRACTION:
@@ -2000,9 +2000,7 @@ class JobPopper:
                 and (now - self._safety_backlog_log_time) >= self._SAFETY_BACKLOG_LOG_INTERVAL_SECONDS
             ):
                 self._safety_backlog_log_time = now
-                backlog = len(self._job_tracker.jobs_pending_safety_check) + len(
-                    self._job_tracker.jobs_being_safety_checked,
-                )
+                backlog = self._job_tracker.safety_backlog_depth
                 safety_ages = self._job_tracker.stage_age_summary()
                 oldest = max(
                     safety_ages.get(JobStage.PENDING_SAFETY_CHECK, (0, 0.0))[1],

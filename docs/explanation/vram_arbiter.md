@@ -675,7 +675,9 @@ needs. The scheduler-owned **runtime safety-placement policy**
 generalises the whole-card safety-off lever to that ordinary case: it moves safety to a CPU-only process when
 safety's own card is really short of the memory its work needs, and re-promotes it once that card proves durable
 room. The per-card permission remains the operator's maximum grant; the policy only degrades GPU to CPU and
-back, never beyond it.
+back, never beyond it. The per-card evidence snapshot with its two predicates (`SafetyPlacementInputs`) and the
+dwell clocks, one-shot requests and tallies (`SafetyPlacementLedger`) live in `scheduling/safety_placement.py`;
+the scheduler gathers the evidence from its collaborators and owns the actuation.
 
 **Every term the policy reads is about safety's own card** (the card it occupies, or the card it would land on
 while it is off). Cards are independent VRAM domains, so the peak a sibling card is committed to says nothing

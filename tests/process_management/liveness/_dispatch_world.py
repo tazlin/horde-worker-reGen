@@ -95,10 +95,10 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _SAFETY_GPU_LOAD_CHARGE_MB,
     _STAGING_ENCODE_VRAM_MB,
     InferenceScheduler,
 )
+from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_mock_bridge_data,
@@ -1089,7 +1089,7 @@ class _DispatchWorld:
             if self._card_of(_POST_PROCESS_LANE_ID) == device_index:
                 charge += _MARGINAL_CONTEXT_MB
             if self._safety_card_index == device_index and not self.safety_is_off_gpu():
-                charge += _SAFETY_GPU_LOAD_CHARGE_MB
+                charge += SAFETY_GPU_LOAD_CHARGE_MB
                 if self._safety_transition_until is not None:
                     # A restore is still materialising: the classifier weights are being read and copied, so the
                     # card carries the load peak rather than the at-rest footprint until the process settles.

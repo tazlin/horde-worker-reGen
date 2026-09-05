@@ -1198,6 +1198,11 @@ class _FakeBacklogTracker:
         self.jobs_being_safety_checked: list[object] = []
         self.jobs_pending_submit: list[object] = []
 
+    @property
+    def safety_backlog_depth(self) -> int:
+        """The pending plus in-flight safety count, as the real tracker reports it."""
+        return len(self.jobs_pending_safety_check) + len(self.jobs_being_safety_checked)
+
     def set_backlog(self, depth: int) -> None:
         """Set the pending-safety backlog to exactly ``depth`` placeholder entries."""
         self.jobs_pending_safety_check = [object() for _ in range(depth)]

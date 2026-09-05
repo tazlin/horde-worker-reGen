@@ -209,6 +209,14 @@ from horde_worker_regen.process_management.scheduling.retention import (
     sibling_context_count,
     sibling_retained_resident_present,
 )
+from horde_worker_regen.process_management.scheduling.safety_placement import (
+    MEMORY_PRESSURE_PAUSE_OWNERS,
+    SAFETY_BACKLOG_PRIORITY_DEPTH,
+    SAFETY_GPU_LOAD_CHARGE_MB,
+    SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
+    SafetyPlacementInputs,
+    SafetyPlacementLedger,
+)
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     DISPATCH_ADMISSION_FLOW,
@@ -460,54 +468,6 @@ resident-weight lane out of the release-target set so the escalation ladder does
 never yield, which would otherwise keep the ladder non-empty forever and defer a head that reclaim can
 never actually relieve."""
 
-_SAFETY_GPU_LOAD_CHARGE_MB = 3044.0
-"""The device VRAM (MB) charged when the safety process is loaded onto the GPU, for the arbiter's SAFETY_LOAD
-gate. A documented conservative seed for the idle CLIP model plus its CUDA context. DeepDanbooru, BLIP, the
-aesthetic head, and evaluation activations are explicitly reclaimable and are not fixed safety residency.
-Erring high keeps safety off-GPU one more cycle rather than restoring it onto a card it would over-commit.
-This is the *seed* for the learned safety figure: :meth:`InferenceScheduler._safety_footprint_mb` is the one
-price every consumer reads, and it raises this constant by any measured :attr:`FootprintStage.SAFETY`
-watermark."""
-
-_MEMORY_PRESSURE_PAUSE_OWNERS = frozenset({PauseOwner.RUNTIME_SAFETY_PLACEMENT, PauseOwner.RECLAIM_LADDER})
-"""The safety-off-GPU requests taken because the card was short of memory, rather than to clear it for a model.
-
-Their restores are the ones that have to earn forecast headroom: the memory such a pause returned is part of
-what any instantaneous gate then reads, so a restore priced on that alone hands the card back into the pressure
-that evicted safety. A whole-card residency's pause instead ends when its own model drains, and its restore is
-the liveness path that gives a heavy-resident card its on-GPU safety process back."""
-
-_SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR = 2.0
-"""How much longer restore evidence must persist than demotion evidence, as a multiple of the demotion dwell.
-
-Both dwells are seconds derived from the measured cost of one placement flip
-(:meth:`ProcessLifecycleManager.safety_readiness_latency_seconds`), never a cycle count: the control loop runs
-several times a second, so a run of cycles is a fraction of a second of wall clock against tens of seconds of
-safety unavailability, and counting cycles lets a sub-second reading spend that cost. Greater than one because
-the asymmetry is deliberate: leave a card that is genuinely short of memory promptly, and come back only once
-its room has proven durable, so a readmit does not immediately re-trip on the next heavy job."""
-
-_SAFETY_BACKLOG_PRIORITY_DEPTH = 2
-"""Safety backlog depth above which GPU safety restoration is prioritized over placement inertia."""
-
-_SAFETY_RESTORE_PP_BACKLOG_DEPTH = 2
-"""Post-processing backlog depth above which a paused safety process is kept off its card.
-
-Deferring restoration while post-processing runs protects the lane's transient device demand from a
-concurrent safety (re)load. The bound is a depth rather than mere presence because a worker serving
-post-processed requests is rarely without some post-processing work in flight, and an absolute veto would
-hand that steady trickle the power to keep safety off the card for the whole run. Matched to
-:data:`_SAFETY_BACKLOG_PRIORITY_DEPTH`: a queue of this size is one ordinary job's worth of tail work, while
-anything deeper is a lane genuinely under load."""
-
-_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS = 90.0
-"""How long a shallow post-processing backlog may defer safety restoration before it stops counting.
-
-Measured from when the post-processing backlog last became non-empty, so an emptying lane resets it and only
-continuously-occupied work ages. Long enough to cover the tail of a batch of jobs (the burst this gate exists
-for). The headroom evidence remains the term that decides restoration timing; this bound only stops an unbroken
-trickle from pinning safety to the CPU indefinitely."""
-
 _DISPATCH_STALL_MIN_SECONDS = 10.0
 """How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
 
@@ -649,51 +609,6 @@ class _PreloadActuation:
     available_process: HordeProcessInfo
     forecast: StreamForecast
     max_resident: int | None
-
-
-@dataclass(frozen=True)
-class _SafetyPlacementInputs:
-    """Represents the per-card evidence the runtime safety-placement policy decides one cycle from.
-
-    Every term is about the card safety occupies (or the card it would land on while it is off-GPU), because
-    cards are independent VRAM domains and a sibling card's sampling says nothing about this one. Gathered once
-    per cycle by :meth:`InferenceScheduler._safety_placement_inputs` so the demotion predicate, the restore
-    forecast, and the diagnostics cannot read different pictures of the same card.
-    """
-
-    device_index: int | None
-    measured_free_mb: float | None
-    marginal_need_mb: float
-    noise_buffer_mb: float
-    governor_state: GovernorState
-    safety_footprint_mb: float
-    reclaimable_idle_mb: float = 0.0
-    """Device memory (MB) idle inference processes on the card hold as retained residents.
-
-    Those weights are kept warm between jobs on a grant the reclaim ladder and the clearance gate revoke the
-    moment a peak needs the room, so for a placement decision they are room the card can produce within a
-    tick, not room it lacks. Counting them as used is what armed a demotion for as long as retention held a
-    resident, and what kept the restore forecast from ever passing on a card that retains between jobs."""
-
-    def available_mb(self) -> float | None:
-        """The measured free plus what idle retained residents would return; None without a measurement."""
-        if self.measured_free_mb is None:
-            return None
-        return self.measured_free_mb + self.reclaimable_idle_mb
-
-    def restore_requirement_mb(self) -> float:
-        """The available room the card must show for safety to survive the peak it is committed to."""
-        return self.safety_footprint_mb + self.marginal_need_mb + self.noise_buffer_mb
-
-    def describe(self) -> str:
-        """Return the evidence as one diagnostic clause, for the placement log lines."""
-        free_display = "unreported" if self.measured_free_mb is None else f"{self.measured_free_mb:.0f}MB"
-        return (
-            f"card {self.device_index}: measured free {free_display}, reclaimable idle residents "
-            f"{self.reclaimable_idle_mb:.0f}MB, marginal need "
-            f"{self.marginal_need_mb:.0f}MB, noise buffer {self.noise_buffer_mb:.0f}MB, safety footprint "
-            f"{self.safety_footprint_mb:.0f}MB, governor {self.governor_state.name}"
-        )
 
 
 @dataclass(frozen=True)
@@ -1053,35 +968,12 @@ class InferenceScheduler:
         self._stage_ahead_of_pin_enabled: bool = True
         self._vae_pause_deferred_for_decode = False
 
-        # Runtime safety-placement evidence (see _reconcile_runtime_safety_placement). Each is the clock time
-        # the corresponding condition has held continuously for, or None while it does not hold: pressure on
-        # safety's own card while safety is resident, and forecast headroom on the chosen card while safety is
-        # off it. The policy's verdict is derived from these against a dwell measured in seconds, so no intent
-        # can outlive the evidence that produced it and a sub-second run of cycles cannot spend a flip that
-        # costs tens of seconds of safety unavailability.
-        self._safety_placement_pressure_since: float | None = None
-        self._safety_placement_headroom_since: float | None = None
-        # The placement inputs last logged, so the diagnostic speaks on a state change and repeats at TRACE.
-        self._safety_placement_last_logged_inputs: tuple[object, ...] | None = None
-        # The reclaim ladder files a one-shot safety placement request here. The recurring placement reconciler
-        # is the only code allowed to turn that request into a lifecycle pause or restore, so reclaim,
-        # residency, and fit hysteresis cannot issue overlapping safety rebuilds.
-        self._safety_reclaim_pause_requested = False
-        # Whether the on-GPU safety process currently holds its CLIP weights in host RAM at the parent's
-        # request (the in-place rung below cycling it off the card). Promoted back by the placement reconciler.
-        self._safety_weights_demoted = False
+        # Evidence clocks, one-shot requests and tallies for runtime safety placement. The placement
+        # reconciler is the only code that turns a request into a lifecycle pause or restore, so reclaim,
+        # residency and the policy cannot issue overlapping safety rebuilds.
+        self._safety_placement = SafetyPlacementLedger(self._clock)
         # The most recent host-RAM verdict, kept so a pop-hold edge can be logged with the reading behind it.
         self._last_ram_verdict: RamPressureVerdict | None = None
-        # When the post-processing backlog last became non-empty, or None while it is empty. Ages the
-        # restore-side post-processing bound so an unbroken trickle of shallow post-processing cannot keep a
-        # paused safety process off its card for the whole run.
-        self._safety_restore_pp_backlog_since: float | None = None
-        # Lifetime counts of runtime safety-placement policy actuations, for the run-metrics readback: a
-        # demotion moves safety off-GPU (its charge did not fit beside the sampler), a promotion restores it
-        # once the chosen card's measured free proved durable room. These count only policy-initiated moves,
-        # not the whole-card residency's own safety pauses (which the lifecycle manager counts separately).
-        self._safety_placement_demotions = 0
-        self._safety_placement_promotions = 0
 
         self._preload_delay_notified = False
         self._model_recently_missing = False
@@ -1918,57 +1810,20 @@ class InferenceScheduler:
             tenancy_mb += max(0.0, float(process_info.process_reserved_mb or 0)) + marginal_mb
         return tenancy_mb
 
-    def _has_safety_backlog(self) -> bool:
-        """Return whether safety has work that should not be interrupted by residency churn."""
-        return self._safety_backlog_depth() > 0
+    # ---- runtime safety placement ----------------------------------------------------------------------
+    # Pricing, card choice, evidence gathering and the one reconciler that moves safety on and off the GPU.
+    # The per-card evidence snapshot with its predicates and the evidence ledger live in
+    # :mod:`horde_worker_regen.process_management.scheduling.safety_placement`.
 
-    def _safety_backlog_depth(self) -> int:
-        """Return the total safety backlog: pending checks plus checks awaiting a verdict."""
-        return len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
-
-    def _has_priority_safety_backlog(self) -> bool:
-        """Return whether the safety backlog is deep enough to prioritize GPU restoration."""
-        return self._safety_backlog_depth() > _SAFETY_BACKLOG_PRIORITY_DEPTH
-
-    def _track_post_processing_backlog_age(self) -> int:
-        """Return the post-processing backlog depth, advancing the clock the restore bound reads.
-
-        The clock marks when the backlog last became non-empty and is cleared the moment it drains, so only
-        continuously-occupied post-processing work accrues age and an intermittent lane never does.
-        """
-        pp_backlog_depth = len(self._job_tracker.jobs_pending_post_processing) + len(
-            self._job_tracker.jobs_being_post_processed,
-        )
-        if pp_backlog_depth == 0:
-            self._safety_restore_pp_backlog_since = None
-        elif self._safety_restore_pp_backlog_since is None:
-            self._safety_restore_pp_backlog_since = self._clock()
-        return pp_backlog_depth
-
-    def _post_processing_defers_safety_restore(self, pp_backlog_depth: int) -> bool:
-        """Whether post-processing work should keep a paused safety process off its card this cycle.
-
-        A safety (re)load competes for the card with the post-processing lane's transient demand, so live
-        post-processing defers restoration. The deferral is bounded on both depth and age rather than being
-        absolute: a backlog deeper than :data:`_SAFETY_RESTORE_PP_BACKLOG_DEPTH` is a lane under real load and
-        always defers, while a shallow backlog defers only until it has been continuously occupied for
-        :data:`_SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS`. Without the age bound a worker with a steady
-        trickle of post-processed requests never presents an empty lane, and safety stays on the CPU for the
-        whole run no matter how much room the card has.
-        """
-        if pp_backlog_depth == 0:
-            return False
-        if pp_backlog_depth > _SAFETY_RESTORE_PP_BACKLOG_DEPTH:
-            return True
-        since = self._safety_restore_pp_backlog_since
-        if since is None:
-            return True
-        return (self._clock() - since) < _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS
+    @property
+    def safety_placement(self) -> SafetyPlacementLedger:
+        """Evidence clocks, one-shot requests and tallies for runtime safety placement."""
+        return self._safety_placement
 
     def _safety_footprint_mb(self) -> float:
         """The device VRAM (MB) the safety process costs while it sits on the GPU: the single safety price.
 
-        :data:`_SAFETY_GPU_LOAD_CHARGE_MB` is the static seed and any measured
+        :data:`SAFETY_GPU_LOAD_CHARGE_MB` is the static seed and any measured
         :attr:`FootprintStage.SAFETY` watermark raises it, the same raise-only overlay every other stage's
         pricing uses. The learned figure is already safety's *whole device* footprint (its at-rest allocation
         plus the platform context constant, as the observation seam records it), directly
@@ -1981,7 +1836,7 @@ class InferenceScheduler:
         """
         store = self._footprint_store
         if store is None:
-            return _SAFETY_GPU_LOAD_CHARGE_MB
+            return SAFETY_GPU_LOAD_CHARGE_MB
         return store.estimate_mb(
             FootprintKey(
                 model_baseline=SAFETY_PROCESS_BASELINE,
@@ -1989,7 +1844,7 @@ class InferenceScheduler:
                 platform=sys.platform,
                 stage=FootprintStage.SAFETY,
             ),
-            static_seed_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+            static_seed_mb=SAFETY_GPU_LOAD_CHARGE_MB,
         )
 
     def _arbiter_admits_safety_gpu_load(self, device_index: int | None) -> bool:
@@ -2080,23 +1935,6 @@ class InferenceScheduler:
         if current_card is not None and current_card in self._card_runtimes:
             return current_card
         return self._choose_safety_gpu_card()
-
-    def _safety_restore_headroom_fits(self, device_index: int | None) -> bool:
-        """Whether the chosen card's measured free covers safety *and* the peak that card is committed to.
-
-        The restore side is a forecast, not a snapshot: safety only has to fit beside the sampling the card is
-        already committed to, so readmitting it on room that the next peak will take back is how one restore
-        buys the next eviction. The requirement is therefore safety's whole footprint plus the marginal step the
-        heaviest committed peak still has to make, plus the proportional noise buffer, measured against the
-        card's truthful device-free between allocation peaks. The device-free governor must also be HEALTHY
-        there, so a card hovering at the paging cliff never readmits safety. Missing telemetry (no measured
-        free) does not restore: the policy promotes only on positive, measured evidence.
-        """
-        inputs = self._safety_placement_inputs(device_index)
-        available_mb = inputs.available_mb()
-        if available_mb is None or inputs.governor_state is not GovernorState.HEALTHY:
-            return False
-        return available_mb >= inputs.restore_requirement_mb()
 
     def _runtime_safety_placement_enabled(self) -> bool:
         """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
@@ -2192,10 +2030,10 @@ class InferenceScheduler:
         peak_mb, model = heaviest
         return max(0.0, peak_mb - self._resident_committed_mb_for_model(device_index, model))
 
-    def _safety_placement_inputs(self, device_index: int | None) -> _SafetyPlacementInputs:
+    def _safety_placement_inputs(self, device_index: int | None) -> SafetyPlacementInputs:
         """Gather the per-card evidence both placement predicates read, as one snapshot for one cycle."""
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
-        return _SafetyPlacementInputs(
+        return SafetyPlacementInputs(
             device_index=device_index,
             measured_free_mb=self._measured_free_vram_mb(device_index=device_index),
             marginal_need_mb=self._safety_placement_marginal_need_mb(device_index),
@@ -2204,56 +2042,6 @@ class InferenceScheduler:
             safety_footprint_mb=self._safety_footprint_mb(),
             reclaimable_idle_mb=idle_retained_resident_mb(self._process_map.values(), device_index),
         )
-
-    def _safety_placement_card_is_pressured(self, device_index: int | None) -> bool:
-        """Whether safety's own card is short of memory right now, as measured evidence rather than a model.
-
-        Two facts demote, both about the card safety occupies: the device-free governor has left HEALTHY there,
-        or its measured free no longer covers the marginal step the heaviest committed peak still has to take
-        plus the proportional noise buffer. A modeled non-fit is deliberately not one of them: on a small card
-        that arithmetic (device total less the whole peak, the noise buffer and safety's footprint) can be
-        unsatisfiable by a margin narrower than the buffer itself, which arms a permanent eviction against a
-        card that is in fact serving its work. Missing telemetry does not demote, matching the
-        every-gate-admits-on-missing-measurement contract, and neither does a card with nothing left to find:
-        a low free reading beside work the card already holds the memory for is a card full of weights, which is
-        admission's and reclaim's subject rather than safety's placement.
-        """
-        inputs = self._safety_placement_inputs(device_index)
-        if inputs.governor_state is not GovernorState.HEALTHY:
-            return True
-        available_mb = inputs.available_mb()
-        if available_mb is None or inputs.marginal_need_mb <= 0.0:
-            return False
-        return available_mb < (inputs.marginal_need_mb + inputs.noise_buffer_mb)
-
-    def _safety_fits_beside_largest_sampling_peak(
-        self,
-        device_index: int | None,
-        *,
-        require_margin: bool,
-    ) -> bool:
-        """Whether the safety charge fits on the card beside the largest active sampling peak, as arithmetic.
-
-        Structural fit over (device total, largest learned sampling peak, proportional noise buffer, the safety
-        charge): ``total - peak - noise - safety_charge >= 0``. No constant is tuned to a card size; the
-        noise buffer scales with the device total. With ``require_margin`` an extra proportional buffer must
-        also clear, so a caller wanting durable headroom asks for more than a bare fit. When the device total
-        is unknown or nothing is sampling on the card, the charge trivially fits (the policy never forces safety
-        off on missing telemetry, matching the every-gate-admits-on-missing-measurement contract).
-
-        This is a forecast input and never a trigger on its own: on a small card the arithmetic can fail by less
-        than the noise buffer while the card is comfortably serving its work, so a policy that demoted on it
-        alone would hold safety off the card permanently.
-        """
-        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
-        if total_vram_mb is None or total_vram_mb <= 0:
-            return True
-        peak_mb = self._largest_active_sampling_peak_mb(device_index)
-        if peak_mb is None:
-            return True
-        noise_mb = self._admission_margin_mb(device_index, total_vram_mb)
-        margin_mb = noise_mb if require_margin else 0.0
-        return (total_vram_mb - peak_mb - noise_mb - self._safety_footprint_mb() - margin_mb) >= 0.0
 
     def _safety_placement_dwell_seconds(self) -> float:
         """Seconds of continuous evidence a safety demotion must have before it is worth actuating.
@@ -2269,75 +2057,7 @@ class InferenceScheduler:
 
     def _safety_placement_restore_dwell_seconds(self) -> float:
         """Seconds of continuous forecast headroom a safety restore must have (never below the demotion dwell)."""
-        return self._safety_placement_dwell_seconds() * _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
-
-    def _safety_placement_dwell_met(self, since: float | None, dwell_seconds: float) -> bool:
-        """Whether evidence first seen at ``since`` has now held continuously for ``dwell_seconds``."""
-        if since is None:
-            return False
-        return (self._clock() - since) >= dwell_seconds
-
-    def _log_safety_placement_inputs(self, inputs: _SafetyPlacementInputs) -> None:
-        """Log the placement evidence on a change, so a later capture can attribute a flip to what it saw.
-
-        Edge-triggered on the rounded evidence: the control loop runs several times a second, so an unchanged
-        picture repeats at TRACE and only a genuine change speaks at DEBUG.
-        """
-        free_mb = inputs.measured_free_mb
-        signature: tuple[object, ...] = (
-            inputs.device_index,
-            None if free_mb is None else round(free_mb / 64.0),
-            round(inputs.marginal_need_mb / 64.0),
-            round(inputs.reclaimable_idle_mb / 64.0),
-            inputs.governor_state,
-            self._process_lifecycle.is_safety_gpu_paused,
-        )
-        message = f"Runtime safety placement inputs: {inputs.describe()}."
-        if signature == self._safety_placement_last_logged_inputs:
-            logger.trace(message)
-            return
-        self._safety_placement_last_logged_inputs = signature
-        logger.debug(message)
-
-    def _advance_safety_placement_evidence(
-        self,
-        inputs: _SafetyPlacementInputs,
-        *,
-        safety_backlog_depth: int,
-        residency_veto: bool,
-    ) -> None:
-        """Advance the one evidence clock that applies to safety's current placement, clearing the other.
-
-        Only one side can be gathering evidence at a time: a resident safety process accrues the pressure that
-        would justify evicting it, and an evicted one accrues the forecast headroom that would justify bringing
-        it back. Either clock resets the moment its condition stops holding, so an intent can never outlive the
-        evidence that produced it.
-
-        Two conditions reset the pressure clock outright rather than feeding it. A backlog waiting on safety,
-        because evicting safety while the worker is behind on safety checks stalls exactly the stage it is behind
-        on. And a whole-card residency on safety's card, because filling that card is what the residency is: the
-        pressure is the residency's own, it already owns safety's placement while it holds the card, and a
-        pressure-owned pause taken alongside it would outlive the residency that caused it.
-        """
-        now = self._clock()
-        if self._process_lifecycle.is_safety_gpu_paused:
-            self._safety_placement_pressure_since = None
-            if not self._safety_restore_headroom_fits(inputs.device_index):
-                self._safety_placement_headroom_since = None
-            elif self._safety_placement_headroom_since is None:
-                self._safety_placement_headroom_since = now
-            return
-
-        self._safety_placement_headroom_since = None
-        pressure_counts = (
-            not residency_veto
-            and safety_backlog_depth == 0
-            and self._safety_placement_card_is_pressured(inputs.device_index)
-        )
-        if not pressure_counts:
-            self._safety_placement_pressure_since = None
-        elif self._safety_placement_pressure_since is None:
-            self._safety_placement_pressure_since = now
+        return self._safety_placement_dwell_seconds() * SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
 
     def _reconcile_runtime_safety_placement(self, *, update_policy: bool = True) -> None:
         """Apply the single reconciled safety placement chosen from every resource-governance request.
@@ -2346,8 +2066,9 @@ class InferenceScheduler:
         cycling the process independently. This method is the sole caller of the lifecycle safety pause and
         restore actuators. A live residency is a restore veto even when another request initiated the pause,
         and the device-free governor similarly vetoes growth back onto the card. Accepted post-processing work
-        defers restoration under a depth-and-age bound (see :meth:`_post_processing_defers_safety_restore`)
-        rather than absolutely, so a steady trickle cannot hold safety off the card for the whole run.
+        defers restoration under a depth-and-age bound rather than absolutely (see
+        :meth:`SafetyPlacementLedger.post_processing_defers_restore`), so a steady trickle cannot hold safety off
+        the card for the whole run.
 
         The policy demotes only on measured pressure on safety's own card, sustained for a dwell measured in
         seconds against what the flip costs, and restores only once that card's measured free covers safety
@@ -2369,17 +2090,16 @@ class InferenceScheduler:
         # permission is exactly what turns that gate off.
         self._process_lifecycle.demote_safety_from_unpermitted_card()
 
-        placement_enabled = self._runtime_safety_placement_enabled()
-        if not placement_enabled:
-            self._safety_placement_pressure_since = None
-            self._safety_placement_headroom_since = None
-            self._safety_reclaim_pause_requested = False
-            self._safety_restore_pp_backlog_since = None
+        ledger = self._safety_placement
+        if not self._runtime_safety_placement_enabled():
+            ledger.reset()
             return
 
-        safety_backlog_depth = self._safety_backlog_depth()
+        safety_paused = self._process_lifecycle.is_safety_gpu_paused
+        safety_backlog_depth = self._job_tracker.safety_backlog_depth
         safety_card = self._safety_gpu_card()
-        pp_backlog_depth = self._track_post_processing_backlog_age()
+        pp_backlog_depth = self._job_tracker.post_processing_backlog_depth
+        ledger.track_post_processing_backlog(pp_backlog_depth)
 
         # The headroom-aware placement choice only takes effect at a bring-up, and pushing it while safety is
         # resident would migrate the process on its next respawn for reasons unrelated to that respawn. Pushed
@@ -2389,38 +2109,35 @@ class InferenceScheduler:
             self._process_lifecycle.set_desired_safety_card(self._choose_safety_gpu_card())
 
         inputs = self._safety_placement_inputs(safety_card)
-        self._log_safety_placement_inputs(inputs)
+        ledger.log_inputs(inputs, safety_paused=safety_paused)
 
         residency_veto = self._held_residency_requests_safety_off_gpu()
-        residency_may_initiate = residency_veto and (
-            self._process_lifecycle.is_safety_gpu_paused or safety_backlog_depth == 0
-        )
+        residency_may_initiate = residency_veto and (safety_paused or safety_backlog_depth == 0)
 
         transition_pending = self._process_lifecycle.safety_placement_transition_pending is True
         if transition_pending:
             # An intentional rebuild is the actuation of a decision already taken. The card it is reshaping says
             # nothing about whether the next flip is warranted, so evidence is frozen and restarts from scratch
             # once the rebuild proves readiness; otherwise the respawn window itself decides the next flip.
-            self._safety_placement_pressure_since = None
-            self._safety_placement_headroom_since = None
+            ledger.freeze_evidence()
         elif update_policy:
-            self._advance_safety_placement_evidence(
+            # A backlog waiting on safety resets the pressure clock outright: evicting safety while the worker
+            # is behind on safety checks stalls exactly the stage it is behind on. So does a whole-card
+            # residency on safety's card: filling that card is what the residency is, it already owns safety's
+            # placement while it holds the card, and a pressure-owned pause taken alongside it would outlive it.
+            ledger.advance_evidence(
                 inputs,
-                safety_backlog_depth=safety_backlog_depth,
-                residency_veto=residency_veto,
+                safety_paused=safety_paused,
+                pressure_counts=not residency_veto and safety_backlog_depth == 0,
             )
-        placement_wants_off = (
-            not self._process_lifecycle.is_safety_gpu_paused
-            and self._safety_placement_pressure_since is not None
-            and self._safety_placement_dwell_met(
-                self._safety_placement_pressure_since,
-                self._safety_placement_dwell_seconds(),
-            )
+        placement_wants_off = not safety_paused and ledger.dwell_met(
+            ledger.pressure_since,
+            self._safety_placement_dwell_seconds(),
         )
         requested_owner: PauseOwner | None = None
         if residency_may_initiate:
             requested_owner = PauseOwner.WHOLE_CARD
-        elif self._safety_reclaim_pause_requested:
+        elif ledger.reclaim_pause_requested:
             requested_owner = PauseOwner.RECLAIM_LADDER
         elif placement_wants_off:
             requested_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
@@ -2428,27 +2145,27 @@ class InferenceScheduler:
         if transition_pending:
             return
 
-        if self._process_lifecycle.is_safety_gpu_paused:
+        if safety_paused:
             # The demotion lived in the process that was just ended; its replacement starts resident.
-            self._safety_weights_demoted = False
-            if self._safety_reclaim_pause_requested:
+            ledger.weights_demoted = False
+            if ledger.reclaim_pause_requested:
                 # The off-GPU child reached readiness, so the ladder's one-shot request has materialised. Other
                 # live requests still keep it off; absent one, restoration is reconsidered on the next cycle.
-                self._safety_reclaim_pause_requested = False
+                ledger.reclaim_pause_requested = False
                 return
             if requested_owner is not None or residency_veto:
                 return
-            if 0 < safety_backlog_depth <= _SAFETY_BACKLOG_PRIORITY_DEPTH:
+            if 0 < safety_backlog_depth <= SAFETY_BACKLOG_PRIORITY_DEPTH:
                 return
-            if self._post_processing_defers_safety_restore(pp_backlog_depth):
+            if ledger.post_processing_defers_restore(pp_backlog_depth):
                 return
             if self.is_vram_growth_held(safety_card) or not self._arbiter_admits_safety_gpu_load(safety_card):
                 return
             pause_owner = self._process_lifecycle.safety_pause_owner
             if pause_owner is None:
                 return
-            if pause_owner in _MEMORY_PRESSURE_PAUSE_OWNERS and not self._safety_placement_dwell_met(
-                self._safety_placement_headroom_since,
+            if pause_owner in MEMORY_PRESSURE_PAUSE_OWNERS and not ledger.dwell_met(
+                ledger.headroom_since,
                 self._safety_placement_restore_dwell_seconds(),
             ):
                 # A pause taken because the card was short of memory is part of why the instantaneous gates
@@ -2459,12 +2176,12 @@ class InferenceScheduler:
                 # set: it ends when its own model drains, and holding its restore to a memory forecast would
                 # leave a card that hosts one heavy resident without an on-GPU safety process for the session.
                 return
-            headroom_since = self._safety_placement_headroom_since or self._clock()
+            headroom_since = ledger.headroom_since or self._clock()
             if not self._process_lifecycle.restore_safety_on_gpu(owner=pause_owner):
                 return
-            self._safety_placement_headroom_since = None
+            ledger.headroom_since = None
             if pause_owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT:
-                self._safety_placement_promotions += 1
+                ledger.promotions += 1
                 logger.info(
                     f"Runtime safety placement: restoring safety to card {safety_card} after "
                     f"{self._clock() - headroom_since:.0f}s of measured free at or above the "
@@ -2476,12 +2193,12 @@ class InferenceScheduler:
         if requested_owner is None:
             self._promote_safety_weights_if_room(safety_card, residency_veto=residency_veto)
             return
-        pressure_since = self._safety_placement_pressure_since or self._clock()
+        pressure_since = ledger.pressure_since or self._clock()
         if not self._process_lifecycle.pause_safety_on_gpu(owner=requested_owner):
             return
-        self._safety_placement_pressure_since = None
+        ledger.pressure_since = None
         if requested_owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT:
-            self._safety_placement_demotions += 1
+            ledger.demotions += 1
             logger.info(
                 f"Runtime safety placement: moving safety off card {safety_card} after "
                 f"{self._clock() - pressure_since:.0f}s of sustained memory pressure there "
@@ -2490,16 +2207,35 @@ class InferenceScheduler:
                 f"this pressure had to outlast.",
             )
 
-    def _has_post_process_backlog(self) -> bool:
-        """Return whether a post-processing job is pending or actively on the lane.
+    def _promote_safety_weights_if_room(self, device_index: int | None, *, residency_veto: bool) -> None:
+        """Promote demoted safety weights back onto the device once the card has durably had room for them.
 
-        Whole-card residency must leave a bounded window for post-processing jobs that peel off the resident
-        model. Pending work therefore counts as backlog: the normal residency lever is to unload the idle lane's
-        modules from VRAM, not to remove the lane and strand its queue. The one exception is a structurally
-        incompatible card/model/lane combination, which first disables post-processing for the session and then
-        stops the idle lane so the heavy model can fit.
+        Uses the same admission and headroom-dwell evidence the process-level restore does, so the weights are
+        never handed back into the pressure that demoted them. Staying demoted costs each evaluation only a
+        re-stage, so a card that never earns the restore keeps working at that small latency.
         """
-        return bool(self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed)
+        if not self._safety_placement.weights_demoted or residency_veto:
+            return
+        if self._process_lifecycle.is_safety_gpu_paused:
+            # A rebuilt safety process starts resident; the demotion died with the old one.
+            self._safety_placement.weights_demoted = False
+            return
+        if self.is_vram_growth_held(device_index) or not self._arbiter_admits_safety_gpu_load(device_index):
+            return
+        if not self._safety_placement.dwell_met(
+            self._safety_placement.headroom_since,
+            self._safety_placement_restore_dwell_seconds(),
+        ):
+            return
+        safety_process = self._process_map.get_safety_process()
+        if safety_process is None:
+            self._safety_placement.weights_demoted = False
+            return
+        if safety_process.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.PROMOTE_SAFETY_WEIGHTS)):
+            self._safety_placement.weights_demoted = False
+            logger.info("Card recovered; promoting the safety process's weights back onto the device.")
+
+    # ---- end runtime safety placement ------------------------------------------------------------------
 
     # ---- whole-card exclusive residency -----------------------------------------------------------------
     # Reserving the device for a model whose weights plus activations would stream if it shared the card. The
@@ -2693,7 +2429,7 @@ class InferenceScheduler:
         if self._post_process_context_fits_with_residency(forecast, device_index=device_index):
             return self.unload_post_process_models_from_vram(device_index=device_index)
         self._disable_post_processing_for_whole_card(model_name, forecast)
-        if self._process_lifecycle.is_post_process_gpu_paused or self._has_post_process_backlog():
+        if self._process_lifecycle.is_post_process_gpu_paused or self._job_tracker.post_processing_backlog_depth > 0:
             return False
         return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
@@ -2969,7 +2705,9 @@ class InferenceScheduler:
                 spared_process_id=target_process.process_id if target_process is not None else None,
             )
 
-        safety_pause_requested = self._residency_should_pause_safety(device_index) and not self._has_safety_backlog()
+        safety_pause_requested = (
+            self._residency_should_pause_safety(device_index) and self._job_tracker.safety_backlog_depth == 0
+        )
         post_process_paused = self._pause_post_process_for_residency_if_idle(
             device_index,
             model_name=job.model,
@@ -5507,7 +5245,7 @@ class InferenceScheduler:
             ),
             safety_context_count=safety_contexts,
             safety_reclaim_allowed=(
-                self._residency_should_pause_safety(device_index) and not self._has_safety_backlog()
+                self._residency_should_pause_safety(device_index) and self._job_tracker.safety_backlog_depth == 0
             ),
             safety_weights_demotable=self._safety_weights_demotable(device_index),
             safety_footprint_mb=self._safety_footprint_mb() if safety_contexts > 0 else 0.0,
@@ -8240,10 +7978,10 @@ class InferenceScheduler:
         if (
             not self._safety_on_gpu_permitted
             or not self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu
-            or self._safety_weights_demoted
+            or self._safety_placement.weights_demoted
             or self._process_lifecycle.is_safety_gpu_paused
             or self._process_lifecycle.safety_placement_transition_pending is True
-            or self._has_safety_backlog()
+            or self._job_tracker.safety_backlog_depth > 0
         ):
             return False
         return self._process_map.num_safety_processes(device_index=device_index) > 0
@@ -8264,40 +8002,12 @@ class InferenceScheduler:
             HordeControlMessage(control_flag=HordeControlFlag.DEMOTE_SAFETY_WEIGHTS),
         )
         if delivered:
-            self._safety_weights_demoted = True
+            self._safety_placement.weights_demoted = True
             logger.info(
                 "Reclaim: demoting the safety process's weights to host RAM in place (its context stays on the "
                 "card); they are promoted back once the card has room.",
             )
         return delivered
-
-    def _promote_safety_weights_if_room(self, device_index: int | None, *, residency_veto: bool) -> None:
-        """Promote demoted safety weights back onto the device once the card has durably had room for them.
-
-        Uses the same admission and headroom-dwell evidence the process-level restore does, so the weights are
-        never handed back into the pressure that demoted them. Staying demoted costs each evaluation only a
-        re-stage, so a card that never earns the restore keeps working at that small latency.
-        """
-        if not self._safety_weights_demoted or residency_veto:
-            return
-        if self._process_lifecycle.is_safety_gpu_paused:
-            # A rebuilt safety process starts resident; the demotion died with the old one.
-            self._safety_weights_demoted = False
-            return
-        if self.is_vram_growth_held(device_index) or not self._arbiter_admits_safety_gpu_load(device_index):
-            return
-        if not self._safety_placement_dwell_met(
-            self._safety_placement_headroom_since,
-            self._safety_placement_restore_dwell_seconds(),
-        ):
-            return
-        safety_process = self._process_map.get_safety_process()
-        if safety_process is None:
-            self._safety_weights_demoted = False
-            return
-        if safety_process.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.PROMOTE_SAFETY_WEIGHTS)):
-            self._safety_weights_demoted = False
-            logger.info("Card recovered; promoting the safety process's weights back onto the device.")
 
     def build_reclaim_ladder_candidates(
         self,
@@ -8428,7 +8138,7 @@ class InferenceScheduler:
         Image post-processing lives in JobTracker. Graph-backed alchemy shares the same child process but
         owns its queue in AlchemyCoordinator, so the manager wires that count in through a provider.
         """
-        if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+        if self._job_tracker.post_processing_backlog_depth > 0:
             return True
         try:
             return self._post_processing_lane_commitments_provider() > 0
@@ -8742,12 +8452,12 @@ class InferenceScheduler:
         residency or runtime-policy transition.
         """
         if (
-            self._safety_reclaim_pause_requested
+            self._safety_placement.reclaim_pause_requested
             or self._process_lifecycle.is_safety_gpu_paused
             or self._process_lifecycle.safety_placement_transition_pending is True
         ):
             return False
-        self._safety_reclaim_pause_requested = True
+        self._safety_placement.reclaim_pause_requested = True
         self._reconcile_runtime_safety_placement(update_policy=False)
         return True
 
@@ -12368,14 +12078,6 @@ class InferenceScheduler:
         if self._affinity_skip_state.skip_count == 0:
             return 0.0
         return self._clock() - self._affinity_skip_state.first_skip_time
-
-    def latest_safety_placement_demotions(self) -> int:
-        """Return how many times the runtime safety-placement policy moved safety off-GPU this run."""
-        return self._safety_placement_demotions
-
-    def latest_safety_placement_promotions(self) -> int:
-        """Return how many times the runtime safety-placement policy restored safety to the GPU this run."""
-        return self._safety_placement_promotions
 
     def latest_safety_placement_card(self) -> int | None:
         """Return the card the safety process currently occupies, or None when safety is off-GPU (on CPU)."""

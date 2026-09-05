@@ -41,6 +41,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Concurrent-overlap headway rule        | `process_management/scheduling/concurrent_overlap.py` (`concurrent_overlap_permitted`) |
 | Control-loop log coalescing            | `process_management/scheduling/diagnostic_throttle.py` (`DiagnosticThrottle`) |
 | VRAM retention state and arithmetic    | `process_management/scheduling/retention.py` (`RetentionLedger`, `RetentionFit`) |
+| Runtime safety placement evidence      | `process_management/scheduling/safety_placement.py` (`SafetyPlacementInputs`, `SafetyPlacementLedger`) |
 | Multi-GPU routing                      | `process_management/gpu/`                                          |
 | File descriptor limit preflight        | `process_management/fd_limits.py`                                  |
 | Dry-run / test doubles                 | `process_management/simulation/`                                   |

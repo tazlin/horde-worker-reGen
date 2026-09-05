@@ -130,12 +130,7 @@ class ShutdownManager:
         ``jobs_pending_inference`` already includes in-progress inference, so it is not double-counted.
         """
         tracker = self._job_tracker
-        return (
-            len(tracker.jobs_pending_inference)
-            + len(tracker.jobs_pending_safety_check)
-            + len(tracker.jobs_being_safety_checked)
-            + len(tracker.jobs_pending_submit)
-        )
+        return len(tracker.jobs_pending_inference) + tracker.safety_backlog_depth + len(tracker.jobs_pending_submit)
 
     def _has_outstanding_work(self) -> bool:
         """Return whether shutdown still has accepted work to drain before children may be killed quickly."""
@@ -259,10 +254,7 @@ class ShutdownManager:
 
         if len(self._job_tracker.jobs_pending_submit) > 0:
             return False
-        if (
-            len(self._job_tracker.jobs_being_safety_checked) > 0
-            or len(self._job_tracker.jobs_pending_safety_check) > 0
-        ):
+        if self._job_tracker.safety_backlog_depth > 0:
             return False
         if len(self._job_tracker.jobs_in_progress) > 0:
             return False

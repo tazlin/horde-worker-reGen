@@ -540,9 +540,7 @@ class WorkerRecoveryCoordinator:
         average_check_seconds = self._state.avg_safety_seconds
         if average_check_seconds <= 0:
             return baseline_seconds
-        backlog_depth = len(self._job_tracker.jobs_pending_safety_check) + len(
-            self._job_tracker.jobs_being_safety_checked,
-        )
+        backlog_depth = self._job_tracker.safety_backlog_depth
         scaled_seconds = average_check_seconds * (self.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + backlog_depth)
         return min(max(baseline_seconds, scaled_seconds), self.SAFETY_GRACE_MAX_SECONDS)
 
@@ -907,7 +905,7 @@ class WorkerRecoveryCoordinator:
             return False
         if self._job_tracker.total_num_post_processing_progress > self.episode_post_processing_progress_baseline:
             return True
-        if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+        if self._job_tracker.post_processing_backlog_depth > 0:
             # A downstream post-processing drain stall is not disproved by starting more upstream inference.
             return False
         if self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline:

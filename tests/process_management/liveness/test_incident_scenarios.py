@@ -155,9 +155,11 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _HEAD_PROTECTION_MAX_STARVE_SECONDS,
-    _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
     InferenceScheduler,
     NextJobAndProcess,
+)
+from horde_worker_regen.process_management.scheduling.safety_placement import (
+    SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
 )
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
@@ -1453,7 +1455,7 @@ async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeyp
         f"inside its {cooldown_seconds:.0f}s dwell. Pauses at "
         f"{[f'{when:.0f}' for _t, when, _o in world.safety_pause_events]}. {world.state_dump()}"
     )
-    restore_dwell_seconds = SAFETY_READINESS_LATENCY_FLOOR_SECONDS * _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
+    restore_dwell_seconds = SAFETY_READINESS_LATENCY_FLOOR_SECONDS * SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
     for (_pause_tick, paused_at, _owner), (_restore_tick, restored_at) in zip(
         world.safety_pause_events,
         world.safety_restore_events,
@@ -2663,7 +2665,7 @@ async def _drive_two_card_traffic(world: _DispatchWorld) -> list[int]:
                 ),
             )
         await world.step()
-        if world.scheduler._safety_placement_card_is_pressured(_TWO_CARD_SAFETY_CARD):
+        if world.scheduler._safety_placement_inputs(_TWO_CARD_SAFETY_CARD).is_pressured():
             pressured_ticks.append(world.tick)
     return pressured_ticks
 

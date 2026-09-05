@@ -4423,10 +4423,8 @@ class HordeWorkerProcessManager:
             ):
                 self._process_lifecycle.end_inference_processes()
                 if (
-                    len(self._job_tracker.jobs_pending_safety_check) == 0
-                    and len(self._job_tracker.jobs_being_safety_checked) == 0
-                    and len(self._job_tracker.jobs_pending_post_processing) == 0
-                    and len(self._job_tracker.jobs_being_post_processed) == 0
+                    self._job_tracker.safety_backlog_depth == 0
+                    and self._job_tracker.post_processing_backlog_depth == 0
                     # A pending background strip runs on the utilities lane, so keep it up until strips drain.
                     and len(self._job_tracker.jobs_pending_strip) == 0
                     and self._alchemy_coordinator.num_forms_pending == 0
@@ -5896,8 +5894,8 @@ class HordeWorkerProcessManager:
             dispatch_reconciliation_released_by_natural_free=(
                 self._inference_scheduler.latest_dispatch_reconciliation_released_by_natural_free()
             ),
-            safety_placement_demotions=self._inference_scheduler.latest_safety_placement_demotions(),
-            safety_placement_promotions=self._inference_scheduler.latest_safety_placement_promotions(),
+            safety_placement_demotions=self._inference_scheduler.safety_placement.demotions,
+            safety_placement_promotions=self._inference_scheduler.safety_placement.promotions,
             safety_placement_card=self._inference_scheduler.latest_safety_placement_card(),
         )
 
@@ -6940,9 +6938,7 @@ class HordeWorkerProcessManager:
             )
 
         # Safety backlog backpressure (pops withheld to let the safety stage catch up)
-        safety_backlog = len(self._job_tracker.jobs_pending_safety_check) + len(
-            self._job_tracker.jobs_being_safety_checked
-        )
+        safety_backlog = self._job_tracker.safety_backlog_depth
         if safety_backlog > 0 and getattr(self._job_popper, "_is_post_inference_backlogged", lambda: False)():
             return OrchestrationIntentSnapshot(
                 summary=f"Safety backlogged: withholding pops ({safety_backlog} waiting).",
@@ -6967,7 +6963,7 @@ class HordeWorkerProcessManager:
             )
 
         # Safety stage activity (normal, not backlogged)
-        safety = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
+        safety = self._job_tracker.safety_backlog_depth
         if safety:
             return OrchestrationIntentSnapshot(
                 summary=f"Safety checking {safety} job{'s' if safety != 1 else ''}.",

@@ -32,10 +32,8 @@ from horde_worker_regen.process_management.resources.resource_budget import Stre
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     WHOLE_CARD_DRAIN_SETTLE_SECONDS,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _SAFETY_GPU_LOAD_CHARGE_MB,
-    InferenceScheduler,
-)
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -50,7 +48,7 @@ _WEIGHTS_MB = 11500.0
 _BASE_RESERVE_MB = 3100.0
 # The live reading on a card the residency has cleared of everything except safety: the weights plus their
 # bounded reserve overrun it by roughly the safety context.
-_FREE_WITH_SAFETY_RESIDENT_MB = _FREE_IF_ALONE_MB - _SAFETY_GPU_LOAD_CHARGE_MB
+_FREE_WITH_SAFETY_RESIDENT_MB = _FREE_IF_ALONE_MB - SAFETY_GPU_LOAD_CHARGE_MB
 
 
 def _whole_card_forecast() -> StreamForecast:

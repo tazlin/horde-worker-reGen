@@ -581,7 +581,7 @@ class TestClearanceNetsTheWaiterOwnStagingCharge:
         assert scheduler.clearance_admit_process(0) is False
         sent = [call.args[0].control_flag for call in send.call_args_list]  # pyrefly: ignore
         assert sent == [HordeControlFlag.DEMOTE_SAFETY_WEIGHTS]
-        assert scheduler._safety_weights_demoted is True
+        assert scheduler.safety_placement.weights_demoted is True
 
         send.reset_mock()  # pyrefly: ignore
         scheduler.clearance_admit_process(0)

@@ -1143,6 +1143,16 @@ class JobTracker:
         return tuple(t.job_info for t in self._jobs_in_stage(JobStage.POST_PROCESSING) if t.job_info is not None)
 
     @property
+    def safety_backlog_depth(self) -> int:
+        """How many jobs are waiting for or undergoing a safety check."""
+        return len(self.jobs_pending_safety_check) + len(self.jobs_being_safety_checked)
+
+    @property
+    def post_processing_backlog_depth(self) -> int:
+        """How many jobs are waiting for or on the dedicated post-processing lane."""
+        return len(self.jobs_pending_post_processing) + len(self.jobs_being_post_processed)
+
+    @property
     def jobs_pending_submit(self) -> tuple[HordeJobInfo, ...]:
         """Return the `HordeJobInfo` objects for jobs pending submit."""
         return tuple(t.job_info for t in self._jobs_in_stage(JobStage.PENDING_SUBMIT) if t.job_info is not None)

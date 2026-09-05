@@ -40,10 +40,8 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
     WholeCardPopClaimRelease,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _SAFETY_GPU_LOAD_CHARGE_MB,
-    InferenceScheduler,
-)
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -262,7 +260,7 @@ class TestStreamForecastClassification:
         with_safety = forecast_weight_streaming(
             job,
             "flux_1",
-            safety_context_charge_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+            safety_context_charge_mb=SAFETY_GPU_LOAD_CHARGE_MB,
             **kwargs,
         )
         # The ceiling (sole residency, safety off) is unchanged...
@@ -272,7 +270,7 @@ class TestStreamForecastClassification:
         assert without_safety.free_after_model_evict_mb is not None
         assert (
             with_safety.free_after_model_evict_mb
-            == without_safety.free_after_model_evict_mb - _SAFETY_GPU_LOAD_CHARGE_MB
+            == without_safety.free_after_model_evict_mb - SAFETY_GPU_LOAD_CHARGE_MB
         )
 
 
@@ -609,7 +607,7 @@ class TestWholeCardSiblingTeardown:
 
         # Pausing safety frees its whole device footprint, so the structural floor rises by that charge.
         assert on_gpu.free_after_model_evict_mb is not None
-        assert paused.free_after_model_evict_mb == on_gpu.free_after_model_evict_mb + _SAFETY_GPU_LOAD_CHARGE_MB
+        assert paused.free_after_model_evict_mb == on_gpu.free_after_model_evict_mb + SAFETY_GPU_LOAD_CHARGE_MB
 
     def test_grace_suppresses_structural_wedge_during_establishment(self) -> None:
         """While a whole-card residency establishes, the intentionally-held queue is not a structural wedge.
@@ -854,7 +852,7 @@ def _live_forecast(
         configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
         # Production-faithful: the live scheduler prices the GPU-resident safety process by its whole
         # device footprint, the same figure admission and placement charge, not by a bare context marginal.
-        safety_context_charge_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+        safety_context_charge_mb=SAFETY_GPU_LOAD_CHARGE_MB,
         # Production-faithful: the real scheduler sets this from the model's size tier, so an EXTRA_LARGE
         # baseline (Flux) takes the whole-card-intent branch as it does live. Without it Flux would be judged
         # purely on weight-dominance, which a roomy-context card no longer treats as needing the whole card.
