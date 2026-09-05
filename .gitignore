@@ -8,6 +8,8 @@ docs/plans/
 kudos_training_data*
 .claude/**
 
+.VSCodeCounter/*
+
 _testing/
 
 benchmark_results/runs
