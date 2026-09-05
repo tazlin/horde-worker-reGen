@@ -31,12 +31,11 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.resources.resource_budget import _COMPONENT_STAGING_CHARGE_FLOOR_MB
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _REUSE_CREDIT_KIND_COMPONENT,
-    _REUSE_CREDIT_KIND_PAGE_REUSE,
-    _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
-    InferenceScheduler,
-    _ReuseCreditRecord,
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+    REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
+    ReuseCreditKind,
+    ReuseCreditRecord,
 )
 from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -180,7 +179,7 @@ class TestMissingSidecarParity:
         """
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: _WHOLE_MB)
 
-        def _run(*, disaggregation_class: bool) -> tuple[bool, _ReuseCreditRecord | None]:
+        def _run(*, disaggregation_class: bool) -> tuple[bool, ReuseCreditRecord | None]:
             target = _retaining_target(rss_mb=8000.0)
             scheduler = _make_inference_scheduler(process_map=ProcessMap({0: target}))
             scheduler._measured_available_ram_mb = lambda: 17946.0  # type: ignore[method-assign]
@@ -196,7 +195,7 @@ class TestMissingSidecarParity:
                 is_head_blocker=False,
                 no_live_resource_consumer=True,
             )
-            return admitted, scheduler._pending_reuse_credits.get(0)
+            return admitted, scheduler.ram_reclaim.pending_reuse_credits.get(0)
 
         disagg_admitted, disagg_record = _run(disaggregation_class=True)
         mono_admitted, mono_record = _run(disaggregation_class=False)
@@ -208,7 +207,7 @@ class TestMissingSidecarParity:
         assert mono_record is not None
         assert disagg_record.effective_charge_mb == pytest.approx(mono_record.effective_charge_mb)
         assert disagg_record.effective_charge_mb == pytest.approx(11170.0)
-        assert disagg_record.kind == mono_record.kind == _REUSE_CREDIT_KIND_PAGE_REUSE
+        assert disagg_record.kind == mono_record.kind == ReuseCreditKind.PAGE_REUSE
 
 
 class TestComponentAdmissionLiveness:
@@ -237,10 +236,10 @@ class TestComponentAdmissionLiveness:
             no_live_resource_consumer=True,
         )
         assert admitted is True
-        assert 0 in scheduler._pending_reuse_credits
-        record = scheduler._pending_reuse_credits[0]
+        assert 0 in scheduler.ram_reclaim.pending_reuse_credits
+        record = scheduler.ram_reclaim.pending_reuse_credits[0]
         assert record.model == "disagg_model"
-        assert record.kind == _REUSE_CREDIT_KIND_COMPONENT
+        assert record.kind == ReuseCreditKind.COMPONENT
         assert record.effective_charge_mb == pytest.approx(_RESIDUAL_MB)
 
 
@@ -259,12 +258,12 @@ class TestComponentChargeReconciliation:
         proc = make_mock_process_info(0, model_name="disagg_model", state=HordeProcessState.WAITING_FOR_JOB)
         proc.ram_usage_bytes = int(now_rss_mb * _MB)
         scheduler._process_map = ProcessMap({0: proc})
-        scheduler._pending_reuse_credits[0] = _ReuseCreditRecord(
+        scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="disagg_model",
             rss_at_admit_mb=admit_rss_mb,
             effective_charge_mb=charge_mb,
-            admitted_at=time.time() - _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
-            kind=_REUSE_CREDIT_KIND_COMPONENT,
+            admitted_at=time.time() - REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
+            kind=ReuseCreditKind.COMPONENT,
         )
 
     def test_under_priced_component_charge_flagged_once(self) -> None:
@@ -280,7 +279,7 @@ class TestComponentChargeReconciliation:
             logger.remove(sink_id)
         assert any("under-priced the stage" in str(record) for record in messages)
         assert not any("too generous" in str(record) for record in messages)
-        assert 0 not in scheduler._pending_reuse_credits
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
 
     def test_component_charge_within_slack_is_silent(self) -> None:
         """Growth within the component charge plus slack (expected mmap sharing) clears the record silently."""
@@ -294,20 +293,20 @@ class TestComponentChargeReconciliation:
         finally:
             logger.remove(sink_id)
         assert not any("under-priced the stage" in str(record) for record in messages)
-        assert 0 not in scheduler._pending_reuse_credits
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
 
     def test_vanished_component_slot_is_dropped(self) -> None:
         """A component record whose slot has vanished is dropped without a warning."""
         scheduler = _make_inference_scheduler(process_map=ProcessMap({}))
-        scheduler._pending_reuse_credits[0] = _ReuseCreditRecord(
+        scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="disagg_model",
             rss_at_admit_mb=2000.0,
             effective_charge_mb=6000.0,
             admitted_at=time.time(),
-            kind=_REUSE_CREDIT_KIND_COMPONENT,
+            kind=ReuseCreditKind.COMPONENT,
         )
         scheduler._reconcile_reuse_credit()
-        assert 0 not in scheduler._pending_reuse_credits
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
 
     def test_page_reuse_record_keeps_its_wording(self) -> None:
         """A page-reuse record (the default kind) still logs the too-generous wording, not the component one."""
@@ -315,12 +314,12 @@ class TestComponentChargeReconciliation:
         proc = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
         proc.ram_usage_bytes = int(9000.0 * _MB)
         scheduler._process_map = ProcessMap({0: proc})
-        scheduler._pending_reuse_credits[0] = _ReuseCreditRecord(
+        scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="m",
             rss_at_admit_mb=2000.0,
             effective_charge_mb=1000.0,
-            admitted_at=time.time() - _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
-            kind=_REUSE_CREDIT_KIND_PAGE_REUSE,
+            admitted_at=time.time() - REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
+            kind=ReuseCreditKind.PAGE_REUSE,
         )
         messages: list[object] = []
         sink_id = logger.add(lambda record: messages.append(record), level="WARNING")

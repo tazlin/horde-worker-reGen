@@ -30,7 +30,7 @@ class TestResetGovernanceToBaseline:
         # Seed a full pressure-episode state plus flags that belong to other subsystems.
         scheduler._state.ram_pressure_pop_hold = True
         scheduler._state.last_pop_skipped_reasons = {"ram_pressure": 5, "models": 2}
-        scheduler._ram_reclaim_cycle_at = 123.0
+        scheduler.ram_reclaim.cycle_at = 123.0
         scheduler._ram_pressure_notified = True
         scheduler._ram_governor_state.shed_cards = {0, 1}
         scheduler._ram_governor_state.worker_shed = WorkerProcessShedState(
@@ -52,7 +52,7 @@ class TestResetGovernanceToBaseline:
         # RAM-governance state is back at baseline.
         assert scheduler._state.ram_pressure_pop_hold is False
         assert scheduler._state.last_pop_skipped_reasons == {"models": 2}, "only the RAM-pressure reason is dropped"
-        assert scheduler._ram_reclaim_cycle_at == 0.0
+        assert scheduler.ram_reclaim.cycle_at == 0.0
         assert scheduler._ram_pressure_notified is False
         assert scheduler._ram_governor_state.shed_cards == set()
         assert scheduler._ram_governor_state.worker_shed is None

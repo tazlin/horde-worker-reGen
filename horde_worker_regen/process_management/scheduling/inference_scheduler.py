@@ -197,6 +197,15 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 )
 from horde_worker_regen.process_management.scheduling.model_affinity import affinity_active
 from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
+from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+    RamCycleReason,
+    RamReclaimLedger,
+    ReuseCreditKind,
+    idle_lanes_over_ram_ceiling,
+    select_ram_cycle_victim,
+    staging_reuse_credit_mb,
+    stale_ram_unload_replace_bytes,
+)
 from horde_worker_regen.process_management.scheduling.retention import (
     PendingRetentionEviction,
     RetentionDenialReason,
@@ -342,113 +351,6 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 """Fallback system-RAM reserve (MB) used until the live config value is read. Matches the
 ``ram_reserve_mb`` config default; keeps resident-in-RAM weights from forcing the OS to page."""
 
-_STALE_RAM_UNLOAD_MARGIN_PERCENT = 2.0
-"""Share of total host RAM added to the cold-child baseline to set the stale-unload reclaim threshold.
-
-The threshold has to sit above anything a *freshly spawned* child can reach, or the reclaim cycles clean
-slots forever: the successor of every cycle would itself qualify. Scaling the margin with the host keeps that
-true across machines, since a larger host's children carry proportionally larger interpreter caches and
-allocator arenas."""
-
-_STALE_RAM_UNLOAD_MARGIN_FLOOR_MB = 512.0
-"""Floor (MB) under the host-scaled stale-unload margin, so a small host still clears the spread between
-individual cold children's baselines rather than resting the threshold on the nominal figure."""
-
-_STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS = 120.0
-"""Minimum seconds between stale-unload cycles of the same slot.
-
-A cycle costs the slot a respawn plus a cold load, so the same slot cycling on consecutive reclaim attempts
-spends more of the pool than the RAM it returns is worth. The interval bounds that: one slot contributes at
-most one stale-unload cycle per window, and sustained pressure spreads its cycles across the pool instead."""
-
-_FRESH_INFERENCE_CHILD_BASELINE_MB = 1100.0
-"""Resident RSS (MB) a just-spawned inference child holds before it loads any model weights.
-
-The interpreter, torch/CUDA import allocations, and IPC scaffolding a cold child carries (measured ~1.03-1.1GB
-fresh). An idle process's RSS above this baseline is retained model pages the allocator kept after an unload,
-which a subsequent preload onto that slot reuses rather than allocating anew; the excess is what the marginal
-RAM credit is computed from. Erring toward the high end of the measured range keeps the credit conservative
-(less RSS is treated as reusable) so the budget under-credits rather than over-admits."""
-
-_CREEP_CONTAINMENT_RSS_BYTES = 18432 * 1024 * 1024
-"""Idle-slot RSS above which a process is cycled for creep containment regardless of its unload state.
-
-An inference child creeps ~400MB/job with the model unchanged; left unchecked it grows unbounded (observed
-8->19.8GB) and cycling is the only containment. The ceiling mirrors the ``ram_per_process_max_mb`` default
-(18432 MB), the figure the danger-floor reclaim already treats as a single process's balloon limit, so the two
-reclaim paths agree on what "too big" means; unlike that path (which fires only under the danger floor) this
-containment runs whenever a reclaim is attempted, so a genuine leak is bounded before the host reaches the
-floor. It sits well above any single resident XL checkpoint plus its runtime, so a legitimate single-model
-reuse target never trips it, but a genuinely crept slot does. Above this figure the retained RSS is leak, not
-clean reusable pages, so creep containment overrides the reuse protection that otherwise spares the head's
-staging target: such a slot is cycled and cold-loaded rather than reused, which is the correct trade when
-reusing it would only perpetuate the leak. A slot that was just routed a preload is still spared (reaping it
-mid-stage would fault the head's load), matching the stale-unload path's own mid-preload guard."""
-
-_LANE_RAM_CONTAINMENT_RSS_BYTES = 10240 * 1024 * 1024
-"""Idle service-lane RSS above which the lane is asked to unload its models from RAM.
-
-A disaggregation service lane (the COMPONENT text-encode lane, and the VAE decode lane) keeps its
-components resident across jobs and, alternating between the hot pool models, ratchets its resident set
-well past what its live encoders occupy (observed to 19-26GB on the COMPONENT lane). Unlike an inference
-slot, a lane self-reloads its encoders on the next stage, so the containment remedy is an in-process RAM
-unload rather than a process cycle: the only cost is one reload. This ceiling sits far below the host RAM
-danger floor so containment actuates as a bounded sawtooth well before the floor is threatened, yet high
-enough that a lane holding only its working encoders never trips it."""
-
-_LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS = 180.0
-"""Minimum wall-time between two RAM-unload requests to the same idle service lane.
-
-A lane re-pages its encoders on the next stage after an unload, so a too-eager re-unload would pay a reload
-every few jobs. This spacing bounds the containment to at most one unload per lane per interval, keeping the
-sawtooth's reload cost negligible against the RAM it returns."""
-
-_REUSE_CREDIT_RECONCILE_SETTLE_SECONDS = 30.0
-"""How long after a credited admission the target's RSS must settle before the credit is reconciled.
-
-A credited preload's real RAM growth is only truthful once the load completes and transient churn subsides.
-This grace lets the target reach steady state before the measured-truth check compares its actual growth to
-the charged amount, so the reconciliation reads settled RSS rather than a mid-load spike."""
-
-_REUSE_CREDIT_RECONCILE_SLACK_MB = 2048.0
-"""How far a credited admission's measured RSS growth may exceed its charge before it is flagged too generous.
-
-The measured-truth check on the marginal credit: if a target's settled RSS grew by more than the effective
-charge plus this slack, the credit under-priced the swap and the discrepancy is logged once so the credit
-constants can be retuned against field truth. Slack absorbs ordinary per-job creep and measurement noise so
-only a materially over-generous credit is reported."""
-
-
-_REUSE_CREDIT_KIND_PAGE_REUSE = "page_reuse"
-"""A credited admission whose charge was reduced by a reusable staging target's retained resident pages."""
-
-_REUSE_CREDIT_KIND_COMPONENT = "component"
-"""A credited admission priced at a disaggregation-class job's UNet-only component charge, not the checkpoint."""
-
-
-@dataclass(frozen=True)
-class _ReuseCreditRecord:
-    """A credited RAM admission awaiting the measured-truth check against its target's settled RSS.
-
-    Records what the marginal credit assumed at admit time so the reconciliation can compare the target's
-    real RSS growth to the effective charge once the load settles. Held per target process; superseded if
-    that slot is credited again before it settles.
-    """
-
-    model: str
-    """The model the credited preload was staging onto the target."""
-    rss_at_admit_mb: float
-    """The target's resident RSS (MB) at admit time, the baseline the settled growth is measured against."""
-    effective_charge_mb: float
-    """The credited charge (MB) the admission priced the swap at; the growth is reconciled against this."""
-    admitted_at: float
-    """Wall-clock time of the credited admission, gating the settle grace before reconciliation."""
-    kind: str = _REUSE_CREDIT_KIND_PAGE_REUSE
-    """Which marginal accounting priced the admission (:data:`_REUSE_CREDIT_KIND_PAGE_REUSE` for a retained-page
-    reuse credit, :data:`_REUSE_CREDIT_KIND_COMPONENT` for a UNet-only component charge). The reconciliation
-    reads settled growth against the charge identically for both; only the discrepancy wording differs."""
-
-
 _PRELOAD_FIRST_REPORT_GRACE_SECONDS = 5.0
 """How long a just-sent preload may still look idle before its first child state report arrives.
 
@@ -503,17 +405,6 @@ end: the head-starvation clock the measured-load probe is gated on, the idle-con
 heavy head's load window once admitted. A hold older than this has exhausted every remedy the gate owns, so
 the supervisor takes over exactly as it would for any other wedge."""
 
-_RAM_RECLAIM_CYCLE_GRACE_SECONDS = 60.0
-"""How long after the worker deliberately cycles an idle inference process to reclaim allocator-retained
-RAM (``_replace_stale_ram_unload_process``) the recovery supervisor keeps ignoring a queue wedge. The
-cycle restarts the slot (a ~20s spawn) and the next head must then preload onto it (another ~20s+), a
-window in which the queue is legitimately unservable through no fault of the pool. Without this grace
-that deliberate, bounded hold ages past ``_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`` (20s) and is mistaken for
-a structural wedge, soft-resetting the pools and faulting the perfectly-servable backlog (in a
-sole-process configuration this drops every queued job over a window the worker itself created).
-Covers the respawn + preload window; bounded so a cycle that genuinely never recovers still trips the
-supervisor."""
-
 _HEAD_RAM_DEFER_BARRIER_SECONDS = 60.0
 """How long the head-of-queue preload may be continuously system-RAM-deferred behind live work before the
 scheduler latches the head-priority dispatch barrier. Below this the head is treated as ordinarily queued: a
@@ -521,7 +412,7 @@ running sibling legitimately holds the memory the head needs, and the RAM branch
 re-asking each cycle. Past it, with reclaim freeing nothing and a sibling still holding memory, the head can
 never reach the no-live-consumer best-effort admit on its own, so the barrier withholds new dispatch to other
 slots and lets the running jobs drain to that escape. Chosen above a normal reclaim-and-retry settle and above
-``_RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a deliberate reclaim cycle is never mistaken for starvation, and short
+``RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a deliberate reclaim cycle is never mistaken for starvation, and short
 enough that a genuinely wedged head is unblocked in seconds rather than only when the horde faults its job."""
 
 _HEAD_RAM_DEFER_BARRIER_CAP_SECONDS = 180.0
@@ -990,10 +881,8 @@ class InferenceScheduler:
         self._ram_pressure_notified = False
         self._last_budget_defer_reason = None
         self._context_reduction_at = {}
-        # Credited RAM admissions awaiting the measured-truth reconciliation, keyed by target process id.
-        self._pending_reuse_credits: dict[int, _ReuseCreditRecord] = {}
-        # Last credited-admission log key, so an unchanged credited admit is not re-logged (edge-triggered).
-        self._last_credited_admission_key: tuple[int, str | None, int] | None = None
+        # Reuse credits awaiting reconciliation and the clocks bounding RAM reclaim actuations.
+        self._ram_reclaim = RamReclaimLedger(self._clock)
         # Torch-free component-charge plumbing for disaggregation-class RAM staging. The checkpoint path per
         # model is stable once the reference is loaded, so it is resolved once and cached; the component-
         # identity sidecar is cached per model keyed on the checkpoint's on-disk size, so a replaced checkpoint
@@ -1057,19 +946,6 @@ class InferenceScheduler:
         # floor was last reported as holding a ready different-model head off that card. Cleared when the
         # residency restores, so each episode's floor is stated once.
         self._min_hold_disclosed: dict[int | None, str | None] = {}
-        # When an idle inference slot was last deliberately cycled to reclaim allocator-retained RAM
-        # (_replace_stale_ram_unload_process). The respawn + the next head's preload leave the queue
-        # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
-        # deliberate window. 0.0 when no reclaim cycle is in flight. See _RAM_RECLAIM_CYCLE_GRACE_SECONDS.
-        self._ram_reclaim_cycle_at: float = 0.0
-        # When each slot was last cycled by the stale-unload reclaim, so one slot cannot absorb the
-        # pool's reclaim attempts by being cycled again every tick. Keyed by process id, which outlives
-        # the replaced process object; creep containment is deliberately not throttled by it.
-        self._stale_ram_unload_cycled_at: dict[int, float] = {}
-        # Per-lane throttle for idle service-lane RAM containment (_contain_idle_lane_ram): maps a lane's
-        # process id to the monotonic time its last RAM-unload was requested, so a lane is asked to unload
-        # at most once per _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS.
-        self._lane_ram_containment_at: dict[int, float] = {}
         # Head-of-queue starvation clock. Tracks the id of the job currently at the head of the queue and
         # when it first became budget-deferred onto an idle device. It only feeds
         # the arbiter's starvation diagnostic (a warning naming the arithmetic once a head is deferred past
@@ -3729,13 +3605,11 @@ class InferenceScheduler:
         RAM to the OS (:meth:`_replace_stale_ram_unload_process`), the slot respawns and the head must then
         preload onto it. The queue is unservable across that window, but by the worker's own deliberate,
         bounded action, not a wedge. While true the recovery supervisor must not treat the held queue as a
-        structural wedge and fault the servable backlog. Bounded by ``_RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a
+        structural wedge and fault the servable backlog. Bounded by ``RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a
         cycle that genuinely never recovers still trips the supervisor. Public: read by the process manager's
         wedge assessment.
         """
-        if self._ram_reclaim_cycle_at == 0.0:
-            return False
-        return (self._clock() - self._ram_reclaim_cycle_at) < _RAM_RECLAIM_CYCLE_GRACE_SECONDS
+        return self._ram_reclaim.cycle_grace_active()
 
     def _ready_different_model_head_on_device(
         self,
@@ -4507,7 +4381,7 @@ class InferenceScheduler:
                     )
                     governor_state.draining_process_ids.discard(process_id)
                     self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
-                    self._ram_reclaim_cycle_at = self._clock()
+                    self._ram_reclaim.note_cycle()
                     self._record_churn("process_cycle")
                 case RestoreCardProcess(device_index=device_index, target_count=target_count, planned_count=planned):
                     current = self._process_map.num_loaded_inference_processes(device_index=device_index)
@@ -4614,7 +4488,7 @@ class InferenceScheduler:
         logger.warning(f"Resetting RAM governance to baseline: {reason}")
         self._state.ram_pressure_pop_hold = False
         self._state.last_pop_skipped_reasons.pop("ram_pressure", None)
-        self._ram_reclaim_cycle_at = 0.0
+        self._ram_reclaim.cycle_at = 0.0
         self._ram_pressure_notified = False
         self._governor.reset_bookkeeping()
 
@@ -6074,80 +5948,35 @@ class InferenceScheduler:
 
         return expired
 
-    def _stale_ram_unload_replace_bytes(self) -> float:
-        """RSS above which a model-less idle slot is judged to be still holding a freed model's pages.
-
-        Derived so a freshly spawned child can never reach it: the cold-child baseline
-        (:data:`_FRESH_INFERENCE_CHILD_BASELINE_MB`) plus a host-scaled margin
-        (:data:`_STALE_RAM_UNLOAD_MARGIN_PERCENT`, floored at :data:`_STALE_RAM_UNLOAD_MARGIN_FLOOR_MB`).
-        That invariant is what keeps the reclaim from cycling the very successor its last cycle spawned.
-        """
-        margin_mb = max(
-            self._measured_total_ram_mb() * (_STALE_RAM_UNLOAD_MARGIN_PERCENT / 100.0),
-            _STALE_RAM_UNLOAD_MARGIN_FLOOR_MB,
-        )
-        return (_FRESH_INFERENCE_CHILD_BASELINE_MB + margin_mb) * 1024 * 1024
+    @property
+    def ram_reclaim(self) -> RamReclaimLedger:
+        """Reuse credits awaiting reconciliation and the clocks bounding RAM reclaim actuations."""
+        return self._ram_reclaim
 
     def _replace_stale_ram_unload_process(self, *, protect_process_id: int | None = None) -> bool:
         """Cycle an idle inference process to return retained RAM to the OS; return whether one was cycled.
 
-        Two triggers, in priority order:
-
-        - Creep containment: any idle inference slot whose RSS exceeds :data:`_CREEP_CONTAINMENT_RSS_BYTES` is
-          cycled regardless of its unload state or resident model. A child creeps ~400MB/job and cycling is the
-          only containment; RSS this high is leak, not clean reusable pages, so this override even cycles the
-          protected staging target (reusing a crept slot would only perpetuate the leak).
-        - Stale-unload reclaim (the RAM-verdict last resort): a model-less idle slot that did not actually
-          release RAM after an ``UNLOAD_MODELS_FROM_RAM`` request. "Did not release" is judged only against a
-          reading the child sampled after that request (see
-          :meth:`HordeProcessInfo.ram_reading_postdates_unload`) and only above a threshold no cold child
-          reaches (see :meth:`_stale_ram_unload_replace_bytes`), and the same slot is cycled at most once per
-          :data:`_STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS`.
-          ``protect_process_id`` spares one slot here, the current head's staging target, so the reclaim does
-          not destroy the retained pages the marginal RAM credit priced the head's preload against (which
-          would force the very cold load the credit avoids).
-
-        Creep victims are preferred over stale victims so an unbounded leak is contained ahead of an ordinary
-        retained-page reclaim.
+        The victim comes from :func:`select_ram_cycle_victim`: creep containment first (RSS above
+        :data:`CREEP_CONTAINMENT_RSS_BYTES` is leak, and cycles even the protected staging target), then the
+        stale-unload reclaim, the RAM-verdict last resort for a model-less idle slot that did not release RAM
+        after an ``UNLOAD_MODELS_FROM_RAM`` request. ``protect_process_id`` spares the head's staging target from
+        the stale trigger so the reclaim does not destroy the retained pages the reuse credit priced its preload
+        against. The cycle is a deliberate reclaim of a healthy slot, kept out of the crash bookkeeping so
+        sustained RAM pressure cannot quarantine it.
         """
+        ledger = self._ram_reclaim
         now = self._clock()
-        creep_victim: HordeProcessInfo | None = None
-        stale_victim: HordeProcessInfo | None = None
-        stale_replace_bytes = self._stale_ram_unload_replace_bytes()
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if process_info.is_process_busy():
-                continue
-            # A slot the admission pipeline just routed a preload onto is mid-stage: reaping it would fault the
-            # head's load. Spared from both triggers, exactly as the stale-unload path spares a non-UNLOAD flag.
-            if process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL:
-                continue
-            if creep_victim is None and process_info.ram_usage_bytes >= _CREEP_CONTAINMENT_RSS_BYTES:
-                creep_victim = process_info
-                continue
-            if stale_victim is not None:
-                continue
-            if process_info.process_id == protect_process_id:
-                continue
-            if process_info.loaded_horde_model_name is not None:
-                continue
-            if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
-                continue
-            if not process_info.ram_reading_postdates_unload():
-                continue
-            last_cycled_at = self._stale_ram_unload_cycled_at.get(process_info.process_id)
-            if last_cycled_at is not None and (now - last_cycled_at) < _STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS:
-                continue
-            if process_info.ram_usage_bytes < stale_replace_bytes:
-                continue
-            stale_victim = process_info
-
-        victim = creep_victim if creep_victim is not None else stale_victim
-        if victim is None:
+        selected = select_ram_cycle_victim(
+            self._process_map.values(),
+            now=now,
+            protect_process_id=protect_process_id,
+            cycled_at=ledger.stale_cycled_at,
+            stale_replace_bytes=stale_ram_unload_replace_bytes(self._measured_total_ram_mb()),
+        )
+        if selected is None:
             return False
-
-        if creep_victim is not None:
+        victim, reason = selected
+        if reason is RamCycleReason.CREEP:
             logger.warning(
                 f"Idle process {victim.process_id} holds {victim.ram_usage_bytes} bytes "
                 "(above the creep-containment ceiling); cycling it to return the crept RAM to the OS.",
@@ -6158,21 +5987,38 @@ class InferenceScheduler:
                 "after a RAM unload (the allocator retains the freed model's pages); cycling it to return "
                 "the RAM to the OS.",
             )
-            self._stale_ram_unload_cycled_at[victim.process_id] = now
-        # A deliberate reclaim of a healthy idle slot, not a crash/hang: keep it out of the crash
-        # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
-        # quarantine a perfectly healthy slot.
+            ledger.stale_cycled_at[victim.process_id] = now
         self._process_lifecycle._replace_inference_process(victim, intentional_reclaim=True)
-        # A cycled slot's pending reuse credit is void: its successor cold-loads, so the recorded swap will
-        # never settle and must not be reconciled against the fresh process.
-        self._pending_reuse_credits.pop(victim.process_id, None)
-        # Open the bounded reclaim-cycle grace: the slot now respawns and the next head must preload
-        # onto it, a window in which the queue is unservable by the worker's own deliberate action, not
-        # a wedge. ram_reclaim_cycle_grace_active() reads this so the recovery supervisor does not
-        # soft-reset the pools and fault the servable backlog mid-reclaim.
-        self._ram_reclaim_cycle_at = now
+        ledger.void_credit(victim.process_id)
+        # The slot now respawns and the next head must preload onto it; the grace keeps the recovery supervisor
+        # from reading that deliberate window as a wedge and faulting the servable backlog.
+        ledger.note_cycle()
         self._record_churn("process_cycle")
         return True
+
+    def _contain_idle_lane_ram(self) -> None:
+        """Ask each idle service lane holding excess resident RAM to unload its models, throttled per lane.
+
+        Runs every governance tick as a bounded sawtooth over :func:`idle_lanes_over_ram_ceiling`. The unload
+        never interrupts a stage: a lane handles its pipe messages serially and finishes any in-flight encode or
+        decode before it reads the control message, then re-pages its encoders on its next stage. The ceiling
+        sits well below the host RAM danger floor, so service lanes take part in the RAM-pressure response rather
+        than being exempt from it.
+        """
+        now = self._clock()
+        ledger = self._ram_reclaim
+        for lane in idle_lanes_over_ram_ceiling(
+            self._process_map.values(),
+            now=now,
+            contained_at=ledger.lane_contained_at,
+        ):
+            logger.opt(ansi=True).info(
+                f"<fg #ff8c69>Idle {lane.process_type.name} lane {lane.process_id} holds "
+                f"{lane.ram_usage_bytes / (1024 * 1024):.0f}MB resident (above the lane RAM "
+                f"containment ceiling); unloading its models from RAM. It re-pages on its next stage.</>",
+            )
+            ledger.lane_contained_at[lane.process_id] = now
+            self.unload_from_ram(lane.process_id)
 
     def _preload_blocked_by_ram_pressure(self, job: ImageGenerateJobPopResponse) -> bool:
         """Return whether the host's absolute RAM danger floor forces this preload to defer.
@@ -6320,21 +6166,6 @@ class InferenceScheduler:
             return
         self.unload_models(under_pressure=True, for_head_of_queue=True)
 
-    def _staging_reuse_credit_mb(self, target: HordeProcessInfo) -> float:
-        """The retained, reusable resident RSS (MB) a preload onto ``target`` can reuse instead of allocating.
-
-        An idle inference slot keeps the freed model's pages resident after an unload (its RSS stays above a
-        fresh child's baseline); a preload onto it reuses those pages, so its real system-RAM growth is a
-        fraction of a cold load. This returns the retained excess over :data:`_FRESH_INFERENCE_CHILD_BASELINE_MB`
-        that the marginal RAM credit is computed from. A busy target's pages are in live use and are not
-        reusable, so it earns no credit; a fresh slot (RSS at baseline) yields zero, collapsing the verdict to
-        the ordinary full charge.
-        """
-        if target.is_process_busy():
-            return 0.0
-        target_rss_mb = max(0, target.ram_usage_bytes) / (1024 * 1024)
-        return max(0.0, target_rss_mb - _FRESH_INFERENCE_CHILD_BASELINE_MB)
-
     def _ram_danger_floor_mb(self) -> float:
         """The absolute available-RAM danger floor (MB) below which the host must degrade rather than load.
 
@@ -6360,10 +6191,9 @@ class InferenceScheduler:
         cannot spam an unchanged decision. The record lets :meth:`_reconcile_reuse_credit` later compare the
         target's settled RSS growth to the charge the credit priced the swap at.
         """
-        retained_mb = self._staging_reuse_credit_mb(target)
+        retained_mb = staging_reuse_credit_mb(target)
         charge_key = int(verdict.predicted_mb) if verdict.predicted_mb is not None else 0
-        key = (target.process_id, job.model, charge_key)
-        if key != self._last_credited_admission_key:
+        if self._ram_reclaim.announce_admission((target.process_id, job.model, charge_key)):
             uncredited = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
             logger.opt(colors=True).info(
                 "<fg #8fd6a0>RAM credit admitting preload of {} "
@@ -6372,13 +6202,12 @@ class InferenceScheduler:
                 f"(retained reusable {retained_mb:.0f} MB), effective charge ~{charge_key:.0f} MB.</>",
                 job.model,
             )
-            self._last_credited_admission_key = key
         if job.model is not None:
-            self._pending_reuse_credits[target.process_id] = _ReuseCreditRecord(
+            self._ram_reclaim.record_credit(
+                target,
                 model=job.model,
-                rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
                 effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
-                admitted_at=self._clock(),
+                kind=ReuseCreditKind.PAGE_REUSE,
             )
 
     def _note_component_admission(
@@ -6392,12 +6221,11 @@ class InferenceScheduler:
         The disaggregation-class analogue of :meth:`_note_credited_admission`: emitted once per distinct
         (target, model, rounded charge) so the sub-second loop cannot spam it, and recorded so
         :meth:`_reconcile_reuse_credit` can compare the target's settled RSS growth to the component charge the
-        stage was priced at. The record carries :data:`_REUSE_CREDIT_KIND_COMPONENT` so the reconciliation
+        stage was priced at. The record carries :attr:`ReuseCreditKind.COMPONENT` so the reconciliation
         wording reflects a UNet-only charge rather than a retained-page reuse credit.
         """
         charge_key = int(verdict.predicted_mb) if verdict.predicted_mb is not None else 0
-        key = (target.process_id, job.model, charge_key)
-        if key != self._last_credited_admission_key:
+        if self._ram_reclaim.announce_admission((target.process_id, job.model, charge_key)):
             whole = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
             logger.opt(colors=True).info(
                 "<fg #8fd6a0>RAM UNet-only charge admitting preload of {} onto process "
@@ -6405,15 +6233,40 @@ class InferenceScheduler:
                 "(disaggregation-class sampler stages the UNet only).</>",
                 job.model,
             )
-            self._last_credited_admission_key = key
         if job.model is not None:
-            self._pending_reuse_credits[target.process_id] = _ReuseCreditRecord(
+            self._ram_reclaim.record_credit(
+                target,
                 model=job.model,
-                rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
                 effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
-                admitted_at=self._clock(),
-                kind=_REUSE_CREDIT_KIND_COMPONENT,
+                kind=ReuseCreditKind.COMPONENT,
             )
+
+    def _reconcile_reuse_credit(self) -> None:
+        """Log each settled credited admission whose real RSS growth exceeded its charge (the measured-truth check).
+
+        Growth below the charge is the intended outcome of both credit kinds and stays silent; the wording tells
+        a UNet-only component charge from a retained-page reuse credit so the constants can be retuned. See
+        :meth:`RamReclaimLedger.settle_credits`.
+        """
+        for discrepancy in self._ram_reclaim.settle_credits(self._process_map):
+            record = discrepancy.record
+            if record.kind is ReuseCreditKind.COMPONENT:
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>UNet-only component charge for {} "
+                    f"on process {discrepancy.process_id} "
+                    f"under-priced the stage: measured RSS grew ~{discrepancy.growth_mb:.0f} MB against a component "
+                    f"charge of ~{record.effective_charge_mb:.0f} MB; the reload shared fewer pages than the "
+                    "residual implied.</>",
+                    record.model,
+                )
+            else:
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>RAM reuse credit for {} "
+                    f"on process {discrepancy.process_id} was too generous: "
+                    f"measured RSS grew ~{discrepancy.growth_mb:.0f} MB against an effective charge of "
+                    f"~{record.effective_charge_mb:.0f} MB; the retained pages were less reusable than priced.</>",
+                    record.model,
+                )
 
     def _disaggregated_component_charge_mb(
         self,
@@ -6530,53 +6383,6 @@ class InferenceScheduler:
             f"UNet-only RAM charge unavailable for {model_name!r} ({reason}); charging the whole checkpoint.",
         )
 
-    def _reconcile_reuse_credit(self) -> None:
-        """Compare each settled credited admission's real RSS growth to its charge (the measured-truth check).
-
-        Once a credited target has settled past :data:`_REUSE_CREDIT_RECONCILE_SETTLE_SECONDS` with the staged
-        model resident, its measured RSS growth is known. Growth exceeding the charge by more than
-        :data:`_REUSE_CREDIT_RECONCILE_SLACK_MB` means the charge under-priced the load; log it once so the
-        constants can be retuned. Growth below the charge is expected and silent: a page-reuse credit assumes a
-        retaining slot, and a UNet-only component charge assumes mmap page sharing keeps a reload cheap, so
-        settling below the charge is the intended outcome, not a discrepancy. The wording distinguishes the two
-        record kinds; the threshold is identical. Records for vanished or re-tasked slots are dropped so the map
-        does not accumulate.
-        """
-        now = self._clock()
-        for process_id, record in list(self._pending_reuse_credits.items()):
-            process_info = self._process_map.get(process_id)
-            if process_info is None:
-                del self._pending_reuse_credits[process_id]
-                continue
-            settled = (
-                now - record.admitted_at >= _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
-                and process_info.loaded_horde_model_name == record.model
-                and not process_info.is_process_busy()
-            )
-            if not settled:
-                continue
-            del self._pending_reuse_credits[process_id]
-            growth_mb = max(0, process_info.ram_usage_bytes) / (1024 * 1024) - record.rss_at_admit_mb
-            if growth_mb <= record.effective_charge_mb + _REUSE_CREDIT_RECONCILE_SLACK_MB:
-                continue
-            if record.kind == _REUSE_CREDIT_KIND_COMPONENT:
-                logger.opt(colors=True).warning(
-                    "<fg #f0beff>UNet-only component charge for {} "
-                    f"on process {process_id} "
-                    f"under-priced the stage: measured RSS grew ~{growth_mb:.0f} MB against a component charge of "
-                    f"~{record.effective_charge_mb:.0f} MB; the reload shared fewer pages than the residual "
-                    "implied.</>",
-                    record.model,
-                )
-            else:
-                logger.opt(colors=True).warning(
-                    "<fg #f0beff>RAM reuse credit for {} "
-                    f"on process {process_id} was too generous: "
-                    f"measured RSS grew ~{growth_mb:.0f} MB against an effective charge of "
-                    f"~{record.effective_charge_mb:.0f} MB; the retained pages were less reusable than priced.</>",
-                    record.model,
-                )
-
     def _apply_ram_verdict(
         self,
         job: ImageGenerateJobPopResponse,
@@ -6591,7 +6397,7 @@ class InferenceScheduler:
         When the predicted RAM cost fits, returns True immediately. The charge is credited for a reusable
         staging target: an idle ``available_process`` that retains its unloaded model's pages (or swaps a model
         in place) reuses those pages, so the verdict prices the swap at its marginal growth rather than a full
-        cold load (see :meth:`_staging_reuse_credit_mb` and :meth:`RamBudget.check_job`). The credit is gated on
+        cold load (see :func:`staging_reuse_credit_mb` and :meth:`RamBudget.check_job`). The credit is gated on
         the host RAM danger floor so it never admits into a floor breach.
 
         A disaggregation-class job (the same class predicate the VRAM side charges sampler-only against) is
@@ -6617,7 +6423,7 @@ class InferenceScheduler:
             baseline,
             self._measured_available_ram_mb(),
             committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
-            reusable_credit_mb=0.0 if is_component_charge else self._staging_reuse_credit_mb(available_process),
+            reusable_credit_mb=0.0 if is_component_charge else staging_reuse_credit_mb(available_process),
             danger_floor_mb=self._ram_danger_floor_mb(),
             disaggregated=is_component_charge,
             component_charge_mb=component_charge_mb,
@@ -12720,43 +12526,6 @@ class InferenceScheduler:
             )
         logger.debug(f"Clearing process {process_id} of model {process_info.loaded_horde_model_name}")
         self._process_map.on_model_ram_clear(process_id=process_id)
-
-    def _contain_idle_lane_ram(self) -> None:
-        """Ask each idle service lane holding excess resident RAM to unload its models, throttled per lane.
-
-        Runs every governance tick as a bounded sawtooth. A disaggregation service lane (the COMPONENT
-        text-encode lane and the VAE decode lane) keeps its components resident across jobs and, alternating
-        between the hot pool models, ratchets its resident set well above the RAM its working encoders occupy.
-        When a lane is idle (:meth:`HordeProcessInfo.can_accept_job`) and its reported RSS exceeds
-        :data:`_LANE_RAM_CONTAINMENT_RSS_BYTES`, it is sent ``UNLOAD_MODELS_FROM_RAM`` via
-        :meth:`unload_from_ram`; the lane re-pages its encoders on its next stage, so the only cost is one
-        reload. The unload never interrupts a stage: a lane handles its pipe messages serially and finishes any
-        in-flight encode or decode before it reads the control message. A per-lane throttle
-        (:data:`_LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS`) keeps the reload cost negligible against the RAM
-        returned.
-
-        The threshold sits well below the host RAM danger floor, so containment actuates both before and under
-        host RAM pressure: service lanes participate in the RAM-pressure response rather than being exempt from
-        it.
-        """
-        now = time.monotonic()
-        for process_info in self._process_map.values():
-            if process_info.process_type not in (HordeProcessType.COMPONENT, HordeProcessType.VAE_LANE):
-                continue
-            if not process_info.is_process_alive() or not process_info.can_accept_job():
-                continue
-            if process_info.ram_usage_bytes < _LANE_RAM_CONTAINMENT_RSS_BYTES:
-                continue
-            last_contained = self._lane_ram_containment_at.get(process_info.process_id)
-            if last_contained is not None and (now - last_contained) < _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS:
-                continue
-            logger.opt(ansi=True).info(
-                f"<fg #ff8c69>Idle {process_info.process_type.name} lane {process_info.process_id} holds "
-                f"{process_info.ram_usage_bytes / (1024 * 1024):.0f}MB resident (above the lane RAM "
-                f"containment ceiling); unloading its models from RAM. It re-pages on its next stage.</>",
-            )
-            self._lane_ram_containment_at[process_info.process_id] = now
-            self.unload_from_ram(process_info.process_id)
 
     def get_next_n_models(self, n: int) -> list[str]:
         """Get the next n models that will be used in the job deque."""

@@ -35,12 +35,13 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import resource_budget
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _CREEP_CONTAINMENT_RSS_BYTES,
-    _FRESH_INFERENCE_CHILD_BASELINE_MB,
-    _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
-    InferenceScheduler,
-    _ReuseCreditRecord,
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+    CREEP_CONTAINMENT_RSS_BYTES,
+    FRESH_INFERENCE_CHILD_BASELINE_MB,
+    REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
+    ReuseCreditRecord,
+    staging_reuse_credit_mb,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -84,23 +85,20 @@ class TestStagingReuseCredit:
 
     def test_retaining_idle_target_yields_excess_over_baseline(self) -> None:
         """The credit is the target's resident RSS above a fresh child's baseline."""
-        scheduler = _make_inference_scheduler()
         target = _retaining_target(rss_mb=8000.0)
-        assert scheduler._staging_reuse_credit_mb(target) == pytest.approx(8000.0 - _FRESH_INFERENCE_CHILD_BASELINE_MB)
+        assert staging_reuse_credit_mb(target) == pytest.approx(8000.0 - FRESH_INFERENCE_CHILD_BASELINE_MB)
 
     def test_busy_target_earns_no_credit(self) -> None:
         """A busy target's pages are in live use, so it contributes no reusable credit."""
-        scheduler = _make_inference_scheduler()
         busy = make_mock_process_info(0, model_name="m", state=HordeProcessState.INFERENCE_PRIMED)
         busy.ram_usage_bytes = int(9000.0 * _MB)
-        assert scheduler._staging_reuse_credit_mb(busy) == 0.0
+        assert staging_reuse_credit_mb(busy) == 0.0
 
     def test_fresh_target_earns_no_credit(self) -> None:
         """A just-spawned child at baseline RSS yields zero credit (collapses to the full charge)."""
-        scheduler = _make_inference_scheduler()
         fresh = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        fresh.ram_usage_bytes = int((_FRESH_INFERENCE_CHILD_BASELINE_MB - 200.0) * _MB)
-        assert scheduler._staging_reuse_credit_mb(fresh) == 0.0
+        fresh.ram_usage_bytes = int((FRESH_INFERENCE_CHILD_BASELINE_MB - 200.0) * _MB)
+        assert staging_reuse_credit_mb(fresh) == 0.0
 
 
 class TestCreditedAdmission:
@@ -123,8 +121,8 @@ class TestCreditedAdmission:
             no_live_resource_consumer=True,
         )
         assert admitted is True
-        assert 0 in scheduler._pending_reuse_credits
-        assert scheduler._pending_reuse_credits[0].model == "head_model"
+        assert 0 in scheduler.ram_reclaim.pending_reuse_credits
+        assert scheduler.ram_reclaim.pending_reuse_credits[0].model == "head_model"
 
     def test_credited_defer_escalates_to_cycle_of_a_different_stale_slot(
         self, monkeypatch: pytest.MonkeyPatch
@@ -176,22 +174,22 @@ class TestReclaimRetargeting:
     def test_creep_override_cycles_bloated_slot_even_with_model_and_protection(self) -> None:
         """A slot above the creep ceiling is cycled regardless of a resident model or protection."""
         bloated = make_mock_process_info(0, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
-        bloated.ram_usage_bytes = _CREEP_CONTAINMENT_RSS_BYTES + _MB
+        bloated.ram_usage_bytes = CREEP_CONTAINMENT_RSS_BYTES + _MB
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: bloated}))
-        scheduler._pending_reuse_credits[0] = _ReuseCreditRecord("resident", 100.0, 100.0, time.time())
+        scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord("resident", 100.0, 100.0, time.time())
 
         assert scheduler._replace_stale_ram_unload_process(protect_process_id=0) is True
         replace = _replace_mock(scheduler)
         assert replace.call_args.args[0] is bloated
         assert replace.call_args.kwargs["intentional_reclaim"] is True
         # A cycled slot's pending credit is void (its successor cold-loads).
-        assert 0 not in scheduler._pending_reuse_credits
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
 
     def test_creep_victim_preferred_over_stale_victim(self) -> None:
         """When both a stale slot and a crept slot exist, creep containment cycles the crept one first."""
         stale = _retaining_target(0, rss_mb=2000.0)
         bloated = make_mock_process_info(1, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
-        bloated.ram_usage_bytes = _CREEP_CONTAINMENT_RSS_BYTES + _MB
+        bloated.ram_usage_bytes = CREEP_CONTAINMENT_RSS_BYTES + _MB
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: stale, 1: bloated}))
         _pin_host_ram(scheduler)
 
@@ -214,11 +212,11 @@ class TestCreditReconciliation:
         proc = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
         proc.ram_usage_bytes = int(now_rss_mb * _MB)
         scheduler._process_map = ProcessMap({0: proc})
-        scheduler._pending_reuse_credits[0] = _ReuseCreditRecord(
+        scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="m",
             rss_at_admit_mb=admit_rss_mb,
             effective_charge_mb=charge_mb,
-            admitted_at=time.time() - _REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
+            admitted_at=time.time() - REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
         )
 
     def test_over_generous_credit_is_flagged_once_and_cleared(self) -> None:
@@ -233,7 +231,7 @@ class TestCreditReconciliation:
         finally:
             logger.remove(sink_id)
         assert any("too generous" in str(record) for record in messages)
-        assert 0 not in scheduler._pending_reuse_credits
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
 
     def test_credit_within_slack_is_silent(self) -> None:
         """Growth within the charge plus slack clears the record without a discrepancy warning."""
@@ -247,4 +245,4 @@ class TestCreditReconciliation:
         finally:
             logger.remove(sink_id)
         assert not any("too generous" in str(record) for record in messages)
-        assert 0 not in scheduler._pending_reuse_credits
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits

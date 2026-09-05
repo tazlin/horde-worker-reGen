@@ -18,9 +18,9 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS,
-    _LANE_RAM_CONTAINMENT_RSS_BYTES,
+from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+    LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS,
+    LANE_RAM_CONTAINMENT_RSS_BYTES,
 )
 from tests.process_management.conftest import make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -59,7 +59,7 @@ class TestContainIdleLaneRam:
             0,
             process_type=HordeProcessType.COMPONENT,
             state=HordeProcessState.WAITING_FOR_JOB,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
 
@@ -73,7 +73,7 @@ class TestContainIdleLaneRam:
             0,
             process_type=HordeProcessType.VAE_LANE,
             state=HordeProcessState.WAITING_FOR_JOB,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
 
@@ -87,7 +87,7 @@ class TestContainIdleLaneRam:
             0,
             process_type=HordeProcessType.COMPONENT,
             state=HordeProcessState.INFERENCE_STARTING,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
 
@@ -101,7 +101,7 @@ class TestContainIdleLaneRam:
             0,
             process_type=HordeProcessType.COMPONENT,
             state=HordeProcessState.WAITING_FOR_JOB,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES - 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES - 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
 
@@ -115,7 +115,7 @@ class TestContainIdleLaneRam:
             0,
             process_type=HordeProcessType.INFERENCE,
             state=HordeProcessState.WAITING_FOR_JOB,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: slot}))
 
@@ -129,7 +129,7 @@ class TestContainIdleLaneRam:
             0,
             process_type=HordeProcessType.COMPONENT,
             state=HordeProcessState.WAITING_FOR_JOB,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
 
@@ -141,7 +141,7 @@ class TestContainIdleLaneRam:
         assert _unload_ram_message_count(lane) == 1
 
         # Age the recorded stamp past the interval so the lane, still above the ceiling, is contained again.
-        scheduler._lane_ram_containment_at[0] -= _LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS + 1.0
+        scheduler.ram_reclaim.lane_contained_at[0] -= LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS + 1.0
         scheduler._contain_idle_lane_ram()
         assert _unload_ram_message_count(lane) == 2
 
@@ -155,7 +155,7 @@ class TestUnloadFromRamLaneTargeting:
             0,
             process_type=HordeProcessType.COMPONENT,
             state=HordeProcessState.WAITING_FOR_JOB,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         lane.loaded_horde_model_name = "A"
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
@@ -172,7 +172,7 @@ class TestUnloadFromRamLaneTargeting:
             0,
             process_type=HordeProcessType.VAE_LANE,
             state=HordeProcessState.INFERENCE_STARTING,
-            ram_usage_bytes=_LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
 
@@ -218,3 +218,40 @@ class TestAlchemyLaneRamPressureReclaim:
         scheduler._reclaim_idle_alchemy_lanes_under_pressure()
 
         assert _unload_ram_message_count(post_process) == 0
+
+
+class _HandClock:
+    def __init__(self) -> None:
+        self.now = 5_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestContainmentThrottleClock:
+    """The per-lane throttle reads the scheduler's injected clock, like every other scheduler clock."""
+
+    def test_the_throttle_follows_the_injected_clock(self) -> None:
+        """Advancing the injected clock past the interval permits the next unload; not advancing it does not."""
+        lane = _lane(
+            0,
+            process_type=HordeProcessType.COMPONENT,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            ram_usage_bytes=LANE_RAM_CONTAINMENT_RSS_BYTES + 1,
+        )
+        clock = _HandClock()
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}), clock=clock)
+
+        scheduler._contain_idle_lane_ram()
+        assert scheduler.ram_reclaim.lane_contained_at[0] == clock.now
+        scheduler._contain_idle_lane_ram()
+        assert _unload_ram_message_count(lane) == 1
+
+        clock.now += LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS - 1.0
+        scheduler._contain_idle_lane_ram()
+        assert _unload_ram_message_count(lane) == 1
+
+        clock.now += 1.0
+        scheduler._contain_idle_lane_ram()
+        assert _unload_ram_message_count(lane) == 2
+        assert scheduler.ram_reclaim.lane_contained_at[0] == clock.now

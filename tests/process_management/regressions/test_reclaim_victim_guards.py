@@ -27,9 +27,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import MEMORY
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _FRESH_INFERENCE_CHILD_BASELINE_MB,
-)
+from horde_worker_regen.process_management.scheduling.ram_reclaim import FRESH_INFERENCE_CHILD_BASELINE_MB
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -273,7 +271,7 @@ class TestStaleRamUnloadRecycleScope:
         qualify; were it able to, every cycle's own successor would qualify and the pool would cycle forever.
         """
         process_info = self._stale_slot()
-        process_info.ram_usage_bytes = int(_FRESH_INFERENCE_CHILD_BASELINE_MB * 1024 * 1024)
+        process_info.ram_usage_bytes = int(FRESH_INFERENCE_CHILD_BASELINE_MB * 1024 * 1024)
         scheduler = self._make_scheduler(process_info)
 
         assert scheduler._replace_stale_ram_unload_process() is False

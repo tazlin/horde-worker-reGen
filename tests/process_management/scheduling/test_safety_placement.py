@@ -53,6 +53,7 @@ from horde_worker_regen.process_management.scheduling.safety_placement import (
     SAFETY_RESTORE_PP_BACKLOG_DEPTH,
     SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS,
     SafetyPlacementInputs,
+    SafetyPlacementLedger,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -1188,3 +1189,72 @@ class TestReclaimableIdleResidents:
 
         scheduler._process_map[1].retained_resident_model = None
         assert scheduler._safety_placement_inputs(0).restore_headroom_fits() is False
+
+
+class TestSafetyPlacementLedger:
+    """The evidence clocks, stated directly: one side accrues at a time, and either resets the moment it fails."""
+
+    def test_pressure_accrues_only_while_resident_and_counted(self) -> None:
+        """Resident safety accrues pressure from its first pressured reading; a veto or a clear reading resets it."""
+        clock = _TestClock()
+        ledger = SafetyPlacementLedger(clock)
+        ledger.advance_evidence(_evidence(pressured=True), safety_paused=False, pressure_counts=True)
+        started = clock.now
+        assert ledger.pressure_since == started
+        clock.advance(5.0)
+        ledger.advance_evidence(_evidence(pressured=True), safety_paused=False, pressure_counts=True)
+        assert ledger.pressure_since == started, "a continuing reading keeps the original start"
+        ledger.advance_evidence(_evidence(pressured=True), safety_paused=False, pressure_counts=False)
+        assert ledger.pressure_since is None, "a veto resets the clock outright"
+        ledger.advance_evidence(_evidence(pressured=True), safety_paused=False, pressure_counts=True)
+        ledger.advance_evidence(_evidence(pressured=False), safety_paused=False, pressure_counts=True)
+        assert ledger.pressure_since is None
+        assert ledger.headroom_since is None, "the restore clock never runs while safety is resident"
+
+    def test_headroom_accrues_only_while_paused(self) -> None:
+        """Paused safety accrues forecast headroom from its first fitting reading and drops the pressure clock."""
+        clock = _TestClock()
+        ledger = SafetyPlacementLedger(clock)
+        ledger.pressure_since = clock.now - 100.0
+        ledger.advance_evidence(_evidence(headroom_fits=True), safety_paused=True, pressure_counts=True)
+        started = clock.now
+        assert ledger.headroom_since == started
+        assert ledger.pressure_since is None
+        clock.advance(5.0)
+        ledger.advance_evidence(_evidence(headroom_fits=True), safety_paused=True, pressure_counts=True)
+        assert ledger.headroom_since == started
+        ledger.advance_evidence(_evidence(headroom_fits=False), safety_paused=True, pressure_counts=True)
+        assert ledger.headroom_since is None
+
+    def test_dwell_freeze_and_reset(self) -> None:
+        """A dwell needs a start and the full span; freezing drops both clocks; reset drops the requests too."""
+        clock = _TestClock()
+        ledger = SafetyPlacementLedger(clock)
+        assert ledger.dwell_met(None, 10.0) is False
+        assert ledger.dwell_met(clock.now - 9.0, 10.0) is False
+        assert ledger.dwell_met(clock.now - 10.0, 10.0) is True
+        ledger.pressure_since = clock.now
+        ledger.headroom_since = clock.now
+        ledger.freeze_evidence()
+        assert ledger.pressure_since is None and ledger.headroom_since is None
+        ledger.reclaim_pause_requested = True
+        ledger.pp_backlog_since = clock.now
+        ledger.reset()
+        assert ledger.reclaim_pause_requested is False
+        assert ledger.pp_backlog_since is None
+
+    def test_post_processing_backlog_defers_on_depth_and_age(self) -> None:
+        """An empty lane never defers; a deep lane always does; a shallow lane only until it has aged out."""
+        clock = _TestClock()
+        ledger = SafetyPlacementLedger(clock)
+        ledger.track_post_processing_backlog(0)
+        assert ledger.post_processing_defers_restore(0) is False
+        ledger.track_post_processing_backlog(1)
+        assert ledger.pp_backlog_since == clock.now
+        assert ledger.post_processing_defers_restore(1) is True
+        clock.advance(SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS)
+        ledger.track_post_processing_backlog(1)
+        assert ledger.post_processing_defers_restore(1) is False, "a shallow backlog stops counting once aged"
+        assert ledger.post_processing_defers_restore(SAFETY_RESTORE_PP_BACKLOG_DEPTH + 1) is True
+        ledger.track_post_processing_backlog(0)
+        assert ledger.pp_backlog_since is None, "a drained lane restarts the age"

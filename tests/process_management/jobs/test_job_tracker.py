@@ -456,3 +456,37 @@ class TestFaultCounting:
 
         assert job_tracker.total_num_completed_jobs - completed_before == 3
         assert job_tracker.num_jobs_faulted - faulted_before == 3
+
+
+async def test_safety_backlog_depth_counts_pending_and_in_flight(job_tracker: JobTracker) -> None:
+    """The safety backlog is every job waiting for or undergoing a check, and nothing else."""
+    assert job_tracker.safety_backlog_depth == 0
+    await queue_job_for_safety_async(job_tracker, Mock())
+    await queue_job_for_safety_async(job_tracker, Mock())
+    await move_job_to_being_safety_checked_async(job_tracker, Mock())
+    await queue_job_for_submit_async(job_tracker, Mock())
+    assert job_tracker.safety_backlog_depth == 3
+    assert job_tracker.safety_backlog_depth == len(job_tracker.jobs_pending_safety_check) + len(
+        job_tracker.jobs_being_safety_checked,
+    )
+
+
+async def test_post_processing_backlog_depth_counts_pending_and_in_flight(job_tracker: JobTracker) -> None:
+    """The post-processing backlog is every job waiting for or on the lane; abandoning one drains it."""
+    assert job_tracker.post_processing_backlog_depth == 0
+    queued: list[HordeJobInfo] = []
+    for _ in range(2):
+        job_info = HordeJobInfo(
+            sdk_api_job_info=make_job_pop_response(post_processing=["RealESRGAN_x4plus"]),
+            job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=0.0,
+        )
+        await job_tracker.queue_for_post_processing(job_info)
+        queued.append(job_info)
+    assert job_tracker.post_processing_backlog_depth == 2
+    await job_tracker.begin_post_processing(queued[0])
+    assert job_tracker.post_processing_backlog_depth == 2
+    await job_tracker.abandon_pending_post_processing(queued[1])
+    assert job_tracker.post_processing_backlog_depth == 1
