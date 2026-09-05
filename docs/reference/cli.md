@@ -348,6 +348,7 @@ it.
 |------|---------|---------|
 | `--tier {smoke,standard,census,heavy}` | `smoke` | `standard` is the marginal-cost fit set (multi-hour); `census` covers every value of every categorical axis the kudos manifest encodes (about four hours at the default budget); `heavy` measures the model families a small card cannot hold, on a machine that can, beside the SD1.5 and SDXL anchors it shares with every other machine; `smoke` is a short subset that proves the corpus runs. |
 | `--machine ID` | — | The measuring machine's id (`<owner>-<gpu>` by convention, lowercase and dash-separated). Required for every tier but `smoke`; stamped into the definition artifact with the machine's GPU, driver and version facts so the rows stay attributable. |
+| `--keep-learned-footprints` | off | Keep the worker's learned VRAM footprint store for this run. By default a corpus sets the store aside (kept beside it under a stamped name) and starts empty, so one tier's measured peaks never price the next; keeping it trades that predictability for a warm start. |
 | `--skip-preflight` | off | Start without the preflight below. The run still needs everything the preflight checks; skipping only removes the early refusal. |
 | `--job-budget N` | `950` | Census tier only: jobs the run may spend, warmup included. The vocabulary sweeps are fixed; a smaller budget shrinks only the jointly-varied conflation block. |
 | `--model NAME` | every heavy model | Heavy tier only: restrict the tier to these models (repeatable), for a machine that holds only some of them. |

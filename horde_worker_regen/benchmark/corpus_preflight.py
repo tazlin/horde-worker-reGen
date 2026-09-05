@@ -44,6 +44,7 @@ from horde_worker_regen.benchmark.pricing_corpus import (
     CorpusMachineFacts,
     PricingCorpusDefinition,
     tier_has_lora_cells,
+    tier_has_strip_cells,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FOOTPRINT_STORE_FILENAME,
@@ -376,6 +377,16 @@ def _missing_models(models: list[str]) -> list[str] | None:
     return [info.name for info in plan.models if not info.on_disk]
 
 
+def _utilities_interpreter_available() -> bool:
+    """Whether the image-utilities service's own interpreter is provisioned, so the strip cells can run."""
+    try:
+        from worker_bootstrap import paths
+
+        return paths.utilities_python().is_file()
+    except Exception:  # noqa: BLE001 - an unprovisioned bootstrap reads as no interpreter, never as a crash
+        return False
+
+
 def _civitai_token() -> str | None:
     """The CivitAI token the LoRA cells will download with, from the env the worker config populates."""
     from horde_worker_regen.benchmark.requirements import _CIVITAI_TOKEN_ENV_VARS
@@ -447,6 +458,7 @@ class Probes:
     free_bytes: Callable[[Path], int | None] = field(default_factory=lambda: _free_bytes)
     missing_models: Callable[[list[str]], list[str] | None] = field(default_factory=lambda: _missing_models)
     civitai_token: Callable[[], str | None] = field(default_factory=lambda: _civitai_token)
+    utilities_interpreter: Callable[[], bool] = field(default_factory=lambda: _utilities_interpreter_available)
     live_worker: Callable[[], str | None] = field(default_factory=lambda: _live_worker_reason)
     footprint_observation: Callable[[FootprintKey], FootprintObservation | None] = field(
         default_factory=footprint_observation_probe,
@@ -741,6 +753,24 @@ def _check_civitai_token(probes: Probes, tier: str) -> PreflightCheck:
     return PreflightCheck(name="civitai token", severity="ok", detail="present")
 
 
+def _check_utilities_lane(probes: Probes, tier: str) -> PreflightCheck:
+    """Judge the image-utilities service; without it every background-strip cell faults at the lane."""
+    if not tier_has_strip_cells(tier):
+        return PreflightCheck(
+            name="utilities lane",
+            severity="ok",
+            detail=f"not needed: the {tier} tier has no background-strip cells",
+        )
+    if not probes.utilities_interpreter():
+        return PreflightCheck(
+            name="utilities lane",
+            severity="fail",
+            detail="the image-utilities venv is not provisioned, so the background-strip cells cannot run",
+            fix="run the worker's utilities provisioning (the update script installs it), then re-run",
+        )
+    return PreflightCheck(name="utilities lane", severity="ok", detail="interpreter provisioned")
+
+
 def _check_live_worker(probes: Probes) -> PreflightCheck:
     """Judge whether the card is already taken; two workers on one card make both measurements junk."""
     reason = probes.live_worker()
@@ -793,6 +823,7 @@ def run_preflight(
     checks.append(_check_models(probes, tier, models))
     checks.append(_check_free_disk(probes, cache_path))
     checks.append(_check_civitai_token(probes, tier))
+    checks.append(_check_utilities_lane(probes, tier))
     checks.append(_check_live_worker(probes))
 
     return PreflightReport(tier=tier, machine_id=machine_id, checks=checks)

@@ -1865,6 +1865,13 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_forms_expected = num_forms_completed
 
     num_jobs_faulted = manager._job_tracker.num_jobs_faulted
+    # The tracker counts a fault only on the submit path, which a dry run never takes, so a job that sampled
+    # and faulted at the post-processing lane reads as completed there while its stats record says faulted.
+    # The exported records are what a reader of the run will see; the finish line reports the same partition.
+    exported_faulted = manager._run_metrics.exported_image_jobs_faulted
+    if exported_faulted > num_jobs_faulted:
+        num_jobs_completed = max(0, num_jobs_completed - (exported_faulted - num_jobs_faulted))
+        num_jobs_faulted = exported_faulted
     boot_failed_no_progress = _is_boot_failure_no_progress(
         is_soak=config.soak_seconds is not None,
         num_jobs_expected=num_jobs_expected,

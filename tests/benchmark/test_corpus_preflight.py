@@ -74,6 +74,7 @@ def healthy_probes(
     free_bytes: Callable[[Path], int | None] | None = None,
     missing_models: Callable[[list[str]], list[str] | None] | None = None,
     civitai_token: Callable[[], str | None] | None = None,
+    utilities_interpreter: Callable[[], bool] | None = None,
     live_worker: Callable[[], str | None] | None = None,
     footprint_observation: Callable[[FootprintKey], FootprintObservation | None] | None = None,
     model_size_bytes: Callable[[str], int | None] | None = None,
@@ -91,6 +92,7 @@ def healthy_probes(
         free_bytes=free_bytes or (lambda path: CORPUS_FREE_DISK_BYTES * 2),
         missing_models=missing_models or (lambda models: []),
         civitai_token=civitai_token or (lambda: "token"),
+        utilities_interpreter=utilities_interpreter or (lambda: True),
         live_worker=live_worker or (lambda: None),
         footprint_observation=footprint_observation or measured_at(6000.0),
         model_size_bytes=model_size_bytes or (lambda model: 7 * 1024**3),
@@ -147,6 +149,7 @@ def test_healthy_machine_passes_every_check() -> None:
         "models",
         "free disk",
         "civitai token",
+        "utilities lane",
         "no live worker",
     ]
 
@@ -423,6 +426,28 @@ def test_a_missing_civitai_token_fails() -> None:
     assert "CIVIT_API_TOKEN" in check_named(report, "civitai token").fix
 
 
+def test_the_heavy_tier_does_not_need_the_utilities_lane() -> None:
+    """The heavy tier carries no background-strip cell, so a missing utilities venv is not a refusal."""
+    probes = healthy_probes(utilities_interpreter=lambda: False)
+
+    report = run_preflight("heavy", "alice-l40s", models=MODELS, require_manifest=True, probes=probes)
+    check = check_named(report, "utilities lane")
+
+    assert check.passed
+    assert "no background-strip cells" in check.detail
+
+
+def test_a_missing_utilities_venv_fails_a_tier_with_strip_cells() -> None:
+    """Without the image-utilities service every background-strip cell faults at the lane."""
+    probes = healthy_probes(utilities_interpreter=lambda: False)
+
+    report = run_preflight("standard", "alice-l40s", models=MODELS, require_manifest=False, probes=probes)
+    check = check_named(report, "utilities lane")
+
+    assert not check.passed
+    assert "provisioning" in check.fix
+
+
 def test_a_live_worker_fails_with_its_reason() -> None:
     """A worker already holding the working directory blocks the run."""
     probes = healthy_probes(live_worker=lambda: "a .abort sentinel is present in the working directory")
@@ -448,14 +473,14 @@ def test_the_report_renders_every_check_with_its_fix() -> None:
     for check in report.checks:
         assert check.name in rendered
     assert "CIVIT_API_TOKEN" in rendered
-    assert "2 of 10 checks failed" in rendered
+    assert "2 of 11 checks failed" in rendered
 
 
 def test_a_passing_report_says_so() -> None:
     """A clean report states that every check passed."""
     report = run_preflight("smoke", "alice-l40s", models=MODELS, require_manifest=False, probes=healthy_probes())
 
-    assert "All 10 checks passed." in format_report(report)
+    assert "All 11 checks passed." in format_report(report)
 
 
 def test_tier_mapping_matches_what_the_worker_env_needs() -> None:

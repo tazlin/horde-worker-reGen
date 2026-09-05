@@ -290,6 +290,15 @@ def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
         "run produces is keyed on it, so it is required except for --dry-list and the smoke tier.",
     )
     corpus.add_argument(
+        "--keep-learned-footprints",
+        action="store_true",
+        help=(
+            "Keep the worker's learned VRAM footprints for this run instead of resetting them. A corpus starts "
+            "from an empty store so one tier's measured peaks do not price the next; keeping them trades that "
+            "predictability for a warm start."
+        ),
+    )
+    corpus.add_argument(
         "--skip-preflight",
         action="store_true",
         help="Run without checking that this machine can produce admissible rows (not recommended).",
@@ -979,6 +988,42 @@ def _evict_pinned_loras(version_ids: tuple[str, ...]) -> bool:
     return True
 
 
+def _reset_learned_footprints(*, keep: bool) -> bool:
+    """Set the worker's learned VRAM footprint store aside before a corpus run, unless asked to keep it.
+
+    The store carries every measured peak forward: a heavy tier's whole-card peaks would price the next
+    tier's small models, and a standard run after it would hold its dispatches on room the earlier models
+    needed. A corpus therefore starts from an empty store, for consistent and predictable rows, and the
+    previous store is kept beside it under a stamped name so nothing the operator learned is lost. Ordinary
+    benchmarks and the live worker keep updating the store as they always did.
+
+    Returns:
+        False when the store could not be moved, which the caller treats as a refusal to run.
+    """
+    from horde_worker_regen.app_state import default_app_state_dir
+    from horde_worker_regen.process_management.resources.vram_footprints import FOOTPRINT_STORE_FILENAME
+
+    store_path = default_app_state_dir() / FOOTPRINT_STORE_FILENAME
+    if keep:
+        logger.warning(
+            f"Keeping the learned VRAM footprints at {store_path}: earlier measured peaks may price this run's cells.",
+        )
+        return True
+    if not store_path.exists():
+        logger.info("No learned VRAM footprint store to reset; the corpus starts from an empty store.")
+        return True
+    backup_path = store_path.with_name(f"{store_path.name}.pre-corpus-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        store_path.replace(backup_path)
+    except OSError as move_error:
+        logger.error(f"Could not set the learned VRAM footprint store aside ({move_error}); refusing to run.")
+        return False
+    logger.info(
+        f"Reset the learned VRAM footprints for the corpus: the previous store is kept at {backup_path.name}.",
+    )
+    return True
+
+
 def _pricing_corpus_bridge_overrides(tier: str) -> dict[str, object]:
     """Return the bridge capabilities a corpus tier's workload needs advertised.
 
@@ -1150,6 +1195,8 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
     elif not _evict_pinned_loras(lora_version_ids):
         return 2
 
+    if not _reset_learned_footprints(keep=args.keep_learned_footprints):
+        return 2
     ensure_worker_env(args.process_mode, corpus_bench_tiers(definition.tier))
     # The corpus exists to price jobs, and price varies by model class, so every job's stats record must
     # carry the model's real baseline. Initializing the reference here (a plain sync context, before the

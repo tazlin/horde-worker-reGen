@@ -1102,6 +1102,18 @@ The heavy tier measures model families the LoRA references pinned here do not ap
 neither a CivitAI token nor a cold LoRA cache."""
 
 
+_TIERS_WITH_STRIP_CELLS: frozenset[str] = frozenset({"standard", "census"})
+"""Tiers whose post-processing cells include a background strip, which runs on the image-utilities lane.
+
+The strip is the one post-processor served by the out-of-venv utilities service rather than in the
+post-processing lane's own graph, so a machine without that service faults every strip cell at the lane."""
+
+
+def tier_has_strip_cells(tier: str) -> bool:
+    """Whether a tier's cells include a background strip, answerable without building the tier."""
+    return tier in _TIERS_WITH_STRIP_CELLS
+
+
 def tier_has_lora_cells(tier: str) -> bool:
     """Whether a tier's cells reference LoRAs, answerable without building the tier.
 

@@ -63,6 +63,12 @@ The heavy families are the only ones that exercise the beta model opt-in and the
 tiers never touch, so a single-model run proves the whole path in a fraction of the time a failed full
 tier would cost.
 
+A corpus run sets the worker's learned VRAM footprint store aside before it starts (the previous store is
+kept beside it under a stamped name), so one tier's measured peaks never price the next tier's cells. Pass
+`--keep-learned-footprints` to keep it instead. The preflight also checks that the image-utilities service is
+provisioned for tiers whose cells include a background strip, and that a CivitAI token is present for tiers
+with LoRA cells; skipping the preflight skips those refusals, not the faults they predict.
+
 The run refuses to start if the preflight fails, and its last log line is
 `Corpus finished: N/N jobs completed, 0 faulted`. A few faulted jobs are fine; the assembler drops them.
 
