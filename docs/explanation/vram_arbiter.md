@@ -676,7 +676,7 @@ generalises the whole-card safety-off lever to that ordinary case: it moves safe
 safety's own card is really short of the memory its work needs, and re-promotes it once that card proves durable
 room. The per-card permission remains the operator's maximum grant; the policy only degrades GPU to CPU and
 back, never beyond it. The per-card evidence snapshot with its two predicates (`SafetyPlacementInputs`) and the
-dwell clocks, one-shot requests and tallies (`SafetyPlacementLedger`) live in `scheduling/safety_placement.py`;
+dwell clocks, one-shot requests and tallies (`SafetyPlacementLedger`) live in `scheduling/ledgers/safety_placement.py`;
 the scheduler gathers the evidence from its collaborators and owns the actuation.
 
 **Every term the policy reads is about safety's own card** (the card it occupies, or the card it would land on
@@ -910,7 +910,7 @@ to the card. It is instead a governed live gate that grants only when:
   is handed no new resident to evict. This reads the one figure a WDDM driver cannot misreport under
   demand-paging (NVML device-free), so it holds precisely in the regime where measured free VRAM lies.
 - **The slot's own recent traffic repeats this model.** The dispatched model must appear among the slot's
-  previous `RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3, in `scheduling/retention.py`) dispatches. See
+  previous `RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3, in `scheduling/ledgers/retention.py`) dispatches. See
   [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
 - **The card statically fits the job.** The card's reported total (a constant the driver cannot misreport)
   must absorb the job's sampling peak plus the reserve, after charging everything else that shares the card

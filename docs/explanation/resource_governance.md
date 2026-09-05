@@ -130,7 +130,7 @@ resident across jobs and, alternating between the hot pool models, ratchets its 
 what its working encoders occupy. The governor tick therefore also runs
 [`_contain_idle_lane_ram`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler._contain_idle_lane_ram]
 every iteration: an idle lane (one accepting a job, so never mid-stage) whose reported resident RAM
-crosses `LANE_RAM_CONTAINMENT_RSS_BYTES` (in `scheduling/ram_reclaim.py`) is sent `UNLOAD_MODELS_FROM_RAM`. Unlike an inference slot, a
+crosses `LANE_RAM_CONTAINMENT_RSS_BYTES` (in `scheduling/ledgers/ram_reclaim.py`) is sent `UNLOAD_MODELS_FROM_RAM`. Unlike an inference slot, a
 lane self-reloads its encoders on its next stage, so containment is an in-process RAM unload rather than a
 process cycle; the only cost is one reload. A control message cannot interrupt a stage (a lane reads its
 pipe serially and finishes any in-flight encode or decode first), and a per-lane throttle

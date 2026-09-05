@@ -122,7 +122,6 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
-from horde_worker_regen.process_management.scheduling import retention
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
     ActiveSampler,
@@ -195,9 +194,8 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     post_process_context_fits,
     residency_has_holder,
 )
-from horde_worker_regen.process_management.scheduling.model_affinity import affinity_active
-from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
-from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+from horde_worker_regen.process_management.scheduling.ledgers import retention
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     RamCycleReason,
     RamReclaimLedger,
     ReuseCreditKind,
@@ -206,7 +204,7 @@ from horde_worker_regen.process_management.scheduling.ram_reclaim import (
     staging_reuse_credit_mb,
     stale_ram_unload_replace_bytes,
 )
-from horde_worker_regen.process_management.scheduling.retention import (
+from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     PendingRetentionEviction,
     RetentionDenialReason,
     RetentionFit,
@@ -218,7 +216,7 @@ from horde_worker_regen.process_management.scheduling.retention import (
     sibling_context_count,
     sibling_retained_resident_present,
 )
-from horde_worker_regen.process_management.scheduling.safety_placement import (
+from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     MEMORY_PRESSURE_PAUSE_OWNERS,
     SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_GPU_LOAD_CHARGE_MB,
@@ -226,6 +224,8 @@ from horde_worker_regen.process_management.scheduling.safety_placement import (
     SafetyPlacementInputs,
     SafetyPlacementLedger,
 )
+from horde_worker_regen.process_management.scheduling.model_affinity import affinity_active
+from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     DISPATCH_ADMISSION_FLOW,
@@ -1689,7 +1689,7 @@ class InferenceScheduler:
     # ---- runtime safety placement ----------------------------------------------------------------------
     # Pricing, card choice, evidence gathering and the one reconciler that moves safety on and off the GPU.
     # The per-card evidence snapshot with its predicates and the evidence ledger live in
-    # :mod:`horde_worker_regen.process_management.scheduling.safety_placement`.
+    # :mod:`horde_worker_regen.process_management.scheduling.ledgers.safety_placement`.
 
     @property
     def safety_placement(self) -> SafetyPlacementLedger:
@@ -9808,9 +9808,10 @@ class InferenceScheduler:
         return next_job_and_process
 
     # ---- VRAM retention ---------------------------------------------------------------------------------
-    # Grant policy, pricing, dispatch holds and evictions for weights left on the card across jobs. The state and
-    # the pure arithmetic live in :mod:`horde_worker_regen.process_management.scheduling.retention`; what remains
-    # here needs the scheduler's other collaborators (budget, overhead model, metadata) or issues unloads.
+    # Grant policy, pricing, dispatch holds and evictions for weights left on the card across jobs. The state
+    # and the pure arithmetic live in :mod:`horde_worker_regen.process_management.scheduling.ledgers.retention`;
+    # what remains here needs the scheduler's other collaborators (budget, overhead model, metadata) or issues
+    # unloads.
 
     @property
     def retention(self) -> RetentionLedger:

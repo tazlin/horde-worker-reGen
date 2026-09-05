@@ -38,7 +38,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.scheduling import retention as retention_module
-from horde_worker_regen.process_management.scheduling.retention import (
+from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     RETENTION_REPEAT_EVIDENCE_DISPATCHES,
     RetentionDenialReason,
     RetentionLedger,

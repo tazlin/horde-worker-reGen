@@ -98,7 +98,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     _STAGING_ENCODE_VRAM_MB,
     InferenceScheduler,
 )
-from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
+from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_mock_bridge_data,

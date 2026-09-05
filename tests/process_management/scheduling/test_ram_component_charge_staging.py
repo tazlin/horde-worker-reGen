@@ -32,7 +32,7 @@ from horde_worker_regen.process_management.models.component_residency_map import
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.resources.resource_budget import _COMPONENT_STAGING_CHARGE_FLOOR_MB
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
     ReuseCreditKind,
     ReuseCreditRecord,

@@ -33,7 +33,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_DRAIN_SETTLE_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
+from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 

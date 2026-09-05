@@ -49,7 +49,7 @@ from horde_worker_regen.process_management.process_manager import (
     resolve_card_concurrency,
 )
 from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
-from horde_worker_regen.process_management.scheduling.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
+from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 

@@ -18,7 +18,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS,
     LANE_RAM_CONTAINMENT_RSS_BYTES,
 )

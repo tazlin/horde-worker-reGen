@@ -27,7 +27,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import MEMORY
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
-from horde_worker_regen.process_management.scheduling.ram_reclaim import FRESH_INFERENCE_CHILD_BASELINE_MB
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import FRESH_INFERENCE_CHILD_BASELINE_MB
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,

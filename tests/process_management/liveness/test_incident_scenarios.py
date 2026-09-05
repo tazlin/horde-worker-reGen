@@ -158,7 +158,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     InferenceScheduler,
     NextJobAndProcess,
 )
-from horde_worker_regen.process_management.scheduling.safety_placement import (
+from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
 )
 from tests.process_management.conftest import make_job_pop_response

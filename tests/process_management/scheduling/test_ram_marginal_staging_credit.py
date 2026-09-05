@@ -36,7 +36,7 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.scheduling.ram_reclaim import (
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     CREEP_CONTAINMENT_RSS_BYTES,
     FRESH_INFERENCE_CHILD_BASELINE_MB,
     REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,

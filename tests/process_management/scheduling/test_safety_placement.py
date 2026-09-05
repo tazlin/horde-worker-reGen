@@ -46,8 +46,8 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 )
 from horde_worker_regen.process_management.scheduling import inference_scheduler as sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.scheduling.retention import idle_retained_resident_mb
-from horde_worker_regen.process_management.scheduling.safety_placement import (
+from horde_worker_regen.process_management.scheduling.ledgers.retention import idle_retained_resident_mb
+from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_GPU_LOAD_CHARGE_MB,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
     SAFETY_RESTORE_PP_BACKLOG_DEPTH,
