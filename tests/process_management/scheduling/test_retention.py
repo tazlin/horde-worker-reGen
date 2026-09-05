@@ -10,7 +10,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.scheduling import retention as retention_module
+from horde_worker_regen.process_management.scheduling.ledgers import retention as retention_module
 from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     RETENTION_EVICTION_CONFIRMATION_PASSES,
     RETENTION_PRESSURE_REVOKE_SECONDS,
