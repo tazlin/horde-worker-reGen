@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import (
     DEFAULT_CAPABILITIES,
+    MEMORY_REPORT_INTERVAL_SECONDS,
     HordeProcessType,
     WorkerCapability,
 )
@@ -671,3 +672,50 @@ class HordeProcessInfo:
             or self.last_process_state == HordeProcessState.INFERENCE_COMPLETE
             or self.last_process_state == HordeProcessState.ALCHEMY_COMPLETE
         )
+
+    def is_unoccupied(self) -> bool:
+        """Whether the slot holds no model and is idle, so loading onto it displaces nothing.
+
+        Stronger than :meth:`can_accept_job`, which is also true of a slot holding a resident model.
+        """
+        return self.loaded_horde_model_name is None and self.last_process_state == HordeProcessState.WAITING_FOR_JOB
+
+    def holds_different_model(self, model_name: str) -> bool:
+        """Whether the slot has been loaded over with a model other than ``model_name``.
+
+        A slot naming nothing is not read as displaced: that is the transient between a load being commanded
+        and the slot being attributed, and treating it as displacement would discard a live load's record.
+        """
+        return self.loaded_horde_model_name is not None and self.loaded_horde_model_name != model_name
+
+    def progress_fraction(self) -> float:
+        """Denoise progress in ``[0.0, 1.0]`` from the last reported step, else the last heartbeat percentage.
+
+        A process that has not yet reported reads as ``0.0``, which is when a heavy overlap is most dangerous.
+        """
+        if self.last_total_steps is not None and self.last_total_steps > 0 and self.last_current_step is not None:
+            return max(0.0, min(1.0, self.last_current_step / self.last_total_steps))
+        if self.last_heartbeat_percent_complete is not None:
+            return max(0.0, min(1.0, self.last_heartbeat_percent_complete / 100.0))
+        return 0.0
+
+    def ram_reading_postdates_unload(self) -> bool:
+        """Whether the latest RSS reading was sampled late enough to describe the slot's post-unload state.
+
+        A child samples RSS on a fixed interval, so the reading held in the moment after an unload was commanded
+        predates it and still reports the footprint the unload was meant to release. The reading must be at
+        least one report interval newer than the unload; a slot missing either timestamp carries no evidence.
+        """
+        if self.report_sampled_at is None or self.last_ram_unload_requested_at is None:
+            return False
+        return (self.report_sampled_at - self.last_ram_unload_requested_at) >= MEMORY_REPORT_INTERVAL_SECONDS
+
+    def reclaim_recency_key(self, now_monotonic: float, now_wall: float) -> float:
+        """A monotonic-scale key ranking this process by how recently it materialized VRAM.
+
+        Falls back to the report-time proxy mapped onto the monotonic timeline when the materialization stamp is
+        unset, so stamped and unstamped processes stay comparable in one ranking.
+        """
+        if self.vram_materialized_monotonic is not None:
+            return self.vram_materialized_monotonic
+        return now_monotonic - (now_wall - self.last_received_timestamp)

@@ -497,8 +497,9 @@ what those jobs are or how far along they are. That count-only cap will happily 
 (plus a speculatively-staged third) stack their weight loads and activation peaks on the same card at the
 same moment, thrashing a sampler badly enough to trip its step-timeout watchdog into a teardown.
 
-`InferenceScheduler._concurrent_overlap_allowed` adds the missing dimension: a new job may join work that
-is already sampling only when the in-flight work can tolerate it. Models are classed into size tiers
+`InferenceScheduler._concurrent_overlap_allowed` adds the missing dimension (the rule itself is the pure
+`concurrent_overlap_permitted` in `scheduling/concurrent_overlap.py`; the scheduler only gathers its inputs):
+a new job may join work that is already sampling only when the in-flight work can tolerate it. Models are classed into size tiers
 (`_model_size_tier`): a model in the VRAM-heavy list or carrying an extra-large baseline is
 **extra-large**; SDXL is **heavy**; SD1.5/SD2 are **light**; an unknown baseline falls back to light so a
 missing reference does not starve dispatch. The rules, scaled by tier:
@@ -516,14 +517,14 @@ missing reference does not starve dispatch. The rules, scaled by tier:
 The heavy fractions are sized for a tight card and would otherwise price a high-VRAM card identically: on
 a heavy-only queue (an all-SDXL worker) a 75% both-heavy headway converges two configured threads to
 roughly one effective thread. So the gate conditions its strictness on measurement
-(`_overlap_headroom_ample`): when the device's live free VRAM absorbs the candidate's full predicted
+(`_overlap_memory_verdict`, the arbiter's answer): when the device's live free VRAM absorbs the candidate's full predicted
 sampling peak plus the configured reserve (the same verdict the VRAM admission budget uses, and doubly
 conservative here because a dispatchable candidate's weights are already resident), the heavy headway
 drops to a small constant that still gives the running job its memory-hungry startup beat. No measurement
 (cold start) or a disabled VRAM budget keeps the strict fractions.
 
 The required headway is finally scaled by the worker's performance mode
-(`_performance_mode_headway_scale`): high-performance mode multiplies it by `0.5` and moderate-performance
+(`performance_mode_headway_scale`): high-performance mode multiplies it by `0.5` and moderate-performance
 mode by `0.75`, so an operator who has provisioned the card for aggressive co-sampling brings the next
 job's sampling into the tail of the current one sooner. The scale only moves *when* an admissible overlap
 begins; the arbiter's memory verdict still independently decides *whether* the card can hold it, so a

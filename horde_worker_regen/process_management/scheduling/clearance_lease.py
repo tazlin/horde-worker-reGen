@@ -33,6 +33,8 @@ from typing import Protocol
 
 from loguru import logger
 
+from horde_worker_regen.process_management.scheduling.diagnostic_throttle import DiagnosticThrottle, suppressed_suffix
+
 TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE = 0.15
 """How far through its denoise loop an in-flight sampler must be before its remaining sampling time is
 estimated at all. A rate taken from the first step or two of a job is dominated by the one-off cost of entering
@@ -49,11 +51,6 @@ _DEFAULT_INCOMING_LOAD_SECONDS = 6.0
 Deliberately on the long side of a typical SDXL upload: over-estimating opens the handoff window earlier, which
 the headroom clause still gates, whereas under-estimating leaves the load outside the outgoing tail entirely,
 which is the failure this handoff exists to remove."""
-
-_TAIL_OVERLAP_DENIAL_REPEAT_SECONDS = 30.0
-"""How long an unchanged tail-overlap denial reason is suppressed before it is restated. The gate is evaluated
-every control-loop tick, so only the reason *edge* is interesting; the periodic restatement keeps a persistent
-starvation visible in a log that is otherwise silent about it."""
 
 _TAIL_OVERLAP_MARGIN_MB = 3072.0
 """Measured free-VRAM headroom (device free minus the configured reserve) required before an early clear. The
@@ -222,6 +219,9 @@ class ClearanceInputs:
     The recent median of observed weight uploads on this card; the tail-overlap window is sized from it so the
     incoming load lands inside the outgoing sampler's tail. ``None`` falls back to
     :data:`_DEFAULT_INCOMING_LOAD_SECONDS`."""
+
+
+_TAIL_DENIAL_DIAGNOSTIC = "tail_overlap_denial"
 
 
 class TailOverlapDenialReason(enum.Enum):
@@ -487,8 +487,7 @@ class ClearanceController:
         self._grants_issued = 0
         self._unpriced_sampling_windows = 0
         self._tail_overlap_denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
-        # The denial reason last logged, when it was logged, and how many identical ticks were suppressed.
-        self._tail_denial_log_state: tuple[TailOverlapDenialReason, float, int] | None = None
+        self._tail_denial_diagnostics = DiagnosticThrottle(self._clock)
 
     def register(self, process_id: int, proxy: ClearanceLeaseProxy) -> None:
         """Register a freshly spawned child's proxy so its clearance can be granted and its done drained."""
@@ -576,7 +575,7 @@ class ClearanceController:
                         self._tail_cleared_job_ids.add(plan.tail_cleared_for_job_id)
                         self._tail_overlap_grants += 1
                         # A fired handoff ends the denial run, so the next denial reason logs on its own edge.
-                        self._tail_denial_log_state = None
+                        self._tail_denial_diagnostics.forget(_TAIL_DENIAL_DIAGNOSTIC)
                         self._log_tail_overlap_clear(inputs, outgoing_job_id=plan.tail_cleared_for_job_id)
             else:
                 held.append(process_id)
@@ -667,30 +666,18 @@ class ClearanceController:
         return self._tail_overlap_denials
 
     def _note_tail_overlap_denial(self, denial: TailOverlapDenial) -> None:
-        """Tally a denied handoff tick and log it when the refusing clause changes (or after a long run).
+        """Tally a denied handoff tick and log it on a reason edge or a periodic restatement.
 
-        The gate is evaluated every control-loop tick, so a per-tick line would be noise: the reason edge is
-        what carries information, and a persistent run is restated only every
-        ``_TAIL_OVERLAP_DENIAL_REPEAT_SECONDS`` with the count of ticks it stood for. Emitted at debug beside
-        the per-child clearance line, since a denied handoff is ordinary operation rather than a fault.
+        The gate is evaluated every control-loop tick, so only the reason edge carries information. Emitted at
+        debug, since a denied handoff is ordinary operation rather than a fault.
         """
         self._tail_overlap_denials[denial.reason] += 1
-
-        now = self._clock()
-        suppressed = 0
-        previous = self._tail_denial_log_state
-        if previous is not None:
-            previous_reason, previous_emit, previous_suppressed = previous
-            if previous_reason == denial.reason and (now - previous_emit) < _TAIL_OVERLAP_DENIAL_REPEAT_SECONDS:
-                self._tail_denial_log_state = (previous_reason, previous_emit, previous_suppressed + 1)
-                return
-            suppressed = previous_suppressed
-        self._tail_denial_log_state = (denial.reason, now, 0)
-
-        suffix = f" (suppressed {suppressed} unchanged repeats)" if suppressed > 0 else ""
+        suppressed = self._tail_denial_diagnostics.suppressed_count(_TAIL_DENIAL_DIAGNOSTIC, denial.reason)
+        if suppressed is None:
+            return
         logger.debug(
             f"Clearance lease on device {self._device_index}: tail-overlap handoff denied "
-            f"({denial.describe()}).{suffix}",
+            f"({denial.describe()}).{suppressed_suffix(suppressed)}",
         )
 
     def _drain_done_discard(self) -> None:

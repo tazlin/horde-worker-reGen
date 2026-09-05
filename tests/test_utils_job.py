@@ -12,7 +12,7 @@ from horde_worker_regen.consts import (
     KNOWN_SLOW_MODELS_DIFFICULTIES,
     KNOWN_SLOW_WORKFLOWS,
 )
-from horde_worker_regen.utils.job_utils import get_single_job_magnitude
+from horde_worker_regen.utils.job_utils import get_single_job_magnitude, job_batch_amount
 
 
 def create_mock_job(
@@ -200,3 +200,11 @@ def test_get_single_job_effective_megapixelsteps_complex_job() -> None:
 
     # This should be a higher value due to all the factors
     assert result > 20  # At least 20 megapixelsteps with all these factors
+
+
+@pytest.mark.parametrize(("n_iter", "expected"), [(1, 1), (4, 4), (0, 1), (-2, 1), (None, 1)])
+def test_job_batch_amount_floors_malformed_values(n_iter: object, expected: int) -> None:
+    """A missing or non-positive batch size reads as a single image."""
+    job = create_mock_job()
+    job.payload.n_iter = n_iter
+    assert job_batch_amount(job) == expected

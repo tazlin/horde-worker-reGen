@@ -1581,11 +1581,7 @@ async def test_i_defect_reinjection_a_displaced_record_hides_the_head_from_the_p
     from ordinary memory pressure: jobs pending against idle lanes, a card with most of its memory free, and
     no reclaim ordered at all, because nothing in the worker believes it is short of anything.
     """
-    monkeypatch.setattr(
-        InferenceScheduler,
-        "_model_map_entry_is_displaced",
-        staticmethod(lambda model_name, process_info: False),
-    )
+    monkeypatch.setattr(HordeProcessInfo, "holds_different_model", lambda self, model_name: False)
     world = _streak_world(max_threads=max_threads)
 
     jobs = await _drive_rotation(world, _ROTATION_3, job_count=_ROTATION_3_JOBS)

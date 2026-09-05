@@ -1068,7 +1068,7 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         assert "replenish" in emitted, "the refusal names when the allowance returns"
 
         # A later ask, past the diagnostic cadence, speaks again: the hold is still in force and still worth saying.
-        scheduler._scheduler_diagnostic_log_state.clear()
+        scheduler._diagnostics.reset()
         with patch.object(inference_scheduler_module.logger, "warning") as warning:
             scheduler._decide_whole_card_demand(
                 flux_job,

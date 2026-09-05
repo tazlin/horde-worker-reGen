@@ -43,10 +43,12 @@ import contextlib
 import enum
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Protocol
 
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -250,6 +252,32 @@ class FootprintKey(BaseModel):
     """The specific checkpoint the footprint belongs to, or None when the stage is baseline-keyed.
 
     Defaulted so a key that predates the distinction (every activation stage) is written unchanged."""
+
+
+def sampling_footprint_key(
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+    *,
+    stage: FootprintStage,
+) -> FootprintKey | None:
+    """The activation-stage key for ``job``, or None when the job cannot be attributed to a population.
+
+    A monolithic peak (:attr:`FootprintStage.SAMPLE`) and a disaggregated sampler-only peak
+    (:attr:`FootprintStage.SAMPLE_ISOLATED`) are different quantities and, since watermarks are raise-only, must
+    never share a key. A None baseline or a missing dimension returns None so the caller keeps its static seed.
+    """
+    if baseline is None:
+        return None
+    width = job.payload.width
+    height = job.payload.height
+    if width is None or height is None:
+        return None
+    return FootprintKey(
+        model_baseline=str(baseline),
+        resolution_bucket=ResolutionBucket.from_dimensions(width, height, job.payload.n_iter or 1),
+        platform=sys.platform,
+        stage=stage,
+    )
 
 
 class _FootprintObservation(BaseModel):

@@ -29,9 +29,10 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier
+from horde_worker_regen.process_management.scheduling.concurrent_overlap import required_overlap_headway
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
-    _ModelSizeTier,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -387,13 +388,13 @@ class TestModelSizeTier:
                 "b": make_mock_model_reference_record("b", baseline=_SD2),
             },
         )
-        assert scheduler._model_size_tier("a") is _ModelSizeTier.LIGHT
-        assert scheduler._model_size_tier("b") is _ModelSizeTier.LIGHT
+        assert scheduler._model_size_tier("a") is ModelSizeTier.LIGHT
+        assert scheduler._model_size_tier("b") is ModelSizeTier.LIGHT
 
     def test_sdxl_is_heavy(self) -> None:
         """The SDXL baseline classifies as heavy."""
         scheduler = _make_scheduler(reference={"a": make_mock_model_reference_record("a", baseline=_SDXL)})
-        assert scheduler._model_size_tier("a") is _ModelSizeTier.HEAVY
+        assert scheduler._model_size_tier("a") is ModelSizeTier.HEAVY
 
     def test_flux_cascade_qwen_are_extra_large(self) -> None:
         """Flux, Cascade, and Qwen baselines classify as extra-large."""
@@ -404,20 +405,20 @@ class TestModelSizeTier:
                 "q": make_mock_model_reference_record("q", baseline=_QWEN),
             },
         )
-        assert scheduler._model_size_tier("f") is _ModelSizeTier.EXTRA_LARGE
-        assert scheduler._model_size_tier("c") is _ModelSizeTier.EXTRA_LARGE
-        assert scheduler._model_size_tier("q") is _ModelSizeTier.EXTRA_LARGE
+        assert scheduler._model_size_tier("f") is ModelSizeTier.EXTRA_LARGE
+        assert scheduler._model_size_tier("c") is ModelSizeTier.EXTRA_LARGE
+        assert scheduler._model_size_tier("q") is ModelSizeTier.EXTRA_LARGE
 
     def test_named_vram_heavy_model_is_extra_large_without_a_baseline(self) -> None:
         """A model named in the VRAM-heavy list is extra-large even when its baseline is unknown."""
         scheduler = _make_scheduler(reference={})
-        assert scheduler._model_size_tier(VRAM_HEAVY_MODELS[0]) is _ModelSizeTier.EXTRA_LARGE
+        assert scheduler._model_size_tier(VRAM_HEAVY_MODELS[0]) is ModelSizeTier.EXTRA_LARGE
 
     def test_unknown_or_missing_model_defaults_to_light(self) -> None:
         """Missing metadata stays permissive (light) rather than starving dispatch."""
         scheduler = _make_scheduler(reference={})
-        assert scheduler._model_size_tier("never-heard-of-it") is _ModelSizeTier.LIGHT
-        assert scheduler._model_size_tier(None) is _ModelSizeTier.LIGHT
+        assert scheduler._model_size_tier("never-heard-of-it") is ModelSizeTier.LIGHT
+        assert scheduler._model_size_tier(None) is ModelSizeTier.LIGHT
 
 
 class TestRequiredOverlapHeadway:
@@ -425,19 +426,19 @@ class TestRequiredOverlapHeadway:
 
     def test_two_light_jobs_need_no_headway(self) -> None:
         """Two light jobs may overlap immediately."""
-        assert InferenceScheduler._required_overlap_headway(_ModelSizeTier.LIGHT, _ModelSizeTier.LIGHT) == 0.0
+        assert required_overlap_headway(ModelSizeTier.LIGHT, ModelSizeTier.LIGHT) == 0.0
 
     def test_one_heavy_side_is_modest(self) -> None:
         """A pairing with exactly one heavy side needs modest, symmetric headway."""
-        modest = InferenceScheduler._required_overlap_headway(_ModelSizeTier.HEAVY, _ModelSizeTier.LIGHT)
+        modest = required_overlap_headway(ModelSizeTier.HEAVY, ModelSizeTier.LIGHT)
         assert modest == 0.5
-        assert InferenceScheduler._required_overlap_headway(_ModelSizeTier.LIGHT, _ModelSizeTier.HEAVY) == modest
+        assert required_overlap_headway(ModelSizeTier.LIGHT, ModelSizeTier.HEAVY) == modest
 
     def test_two_heavy_jobs_need_considerable_headway(self) -> None:
         """Two heavy jobs need more headway than a pairing with a single heavy side."""
-        considerable = InferenceScheduler._required_overlap_headway(_ModelSizeTier.HEAVY, _ModelSizeTier.HEAVY)
+        considerable = required_overlap_headway(ModelSizeTier.HEAVY, ModelSizeTier.HEAVY)
         assert considerable == 0.75
-        assert considerable > InferenceScheduler._required_overlap_headway(_ModelSizeTier.HEAVY, _ModelSizeTier.LIGHT)
+        assert considerable > required_overlap_headway(ModelSizeTier.HEAVY, ModelSizeTier.LIGHT)
 
 
 class TestInFlightProgressFraction:

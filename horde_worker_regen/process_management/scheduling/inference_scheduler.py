@@ -40,7 +40,6 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, 
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import (
     ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES,
-    MEMORY_REPORT_INTERVAL_SECONDS,
     HordeProcessType,
 )
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -121,8 +120,8 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
-    ResolutionBucket,
     plausible_activation_ceiling_mb,
+    sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
@@ -130,7 +129,17 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceInputs,
     ClearanceWaiter,
 )
+from horde_worker_regen.process_management.scheduling.concurrent_overlap import (
+    RunningSampler,
+    concurrent_overlap_permitted,
+    performance_mode_headway_scale,
+)
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
+from horde_worker_regen.process_management.scheduling.diagnostic_throttle import (
+    DiagnosticThrottle,
+    diagnostic_mb_bucket,
+    suppressed_suffix,
+)
 from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     _AFFINITY_MAX_SKIPS,
     AffinitySkipState,
@@ -187,9 +196,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import (
 )
 from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.utils.config_coercion import config_number
-from horde_worker_regen.utils.job_utils import (
-    get_single_job_magnitude as _get_single_job_effective_megapixelsteps,
-)
+from horde_worker_regen.utils.job_utils import job_batch_amount
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
 if TYPE_CHECKING:
@@ -677,69 +684,6 @@ stuck condition (the give-up machinery already watches safety-pool health, so th
 Chosen above a normal drain-and-respawn window and bounded so a permanently stuck safety pool cannot wedge
 inference intake."""
 
-_SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS = 30.0
-"""Minimum cadence for unchanged high-frequency scheduler diagnostics.
-
-These diagnostics are useful when reconstructing residency and performance behavior, but they sit inside
-the scheduler's fast polling loop. Log immediately when the decision state changes, otherwise emit only
-periodic reminders with a suppressed-repeat count.
-"""
-
-_SCHEDULER_DIAGNOSTIC_MB_BUCKET = 256.0
-"""Bucket size for deciding whether memory telemetry changed enough to re-log a scheduler diagnostic."""
-
-
-# The model-size tier classification (and its baseline value sets) lives in the shared, torch-free
-# ``model_sizing`` module so the scheduler and the job popper's large-model pop limiters classify "very large"
-# identically. Aliased to the historical private name so the existing references read unchanged.
-_ModelSizeTier = ModelSizeTier
-
-_OVERLAP_HEADWAY_MIXED_HEAVY = 0.5
-"""Fraction of the in-flight job's sampling that must be done before a concurrent job joins it when
-exactly one side of the overlap is heavy (e.g. an SDXL is running and a cheaper SD1.5 wants to join,
-or vice versa). Gives the heavier job room to get past its memory-hungry startup before another
-sampler adds pressure."""
-
-_OVERLAP_HEADWAY_BOTH_HEAVY = 0.75
-"""Fraction of the in-flight job's sampling that must be done before a *second heavy* job joins it.
-Two SDXL jobs stacking their weight loads and activation peaks is the over-subscription that thrashes
-a sampler into a watchdog teardown, so the running job must be most of the way done first."""
-
-_OVERLAP_HEADWAY_AMPLE_VRAM = 0.15
-"""Headway applied instead of the mixed/both-heavy fractions when the device's measured free VRAM
-absorbs the candidate's full predicted sampling peak plus the configured reserve.
-
-The strict fractions price every card as tight; on a high-VRAM card serving a heavy-only queue that
-prices a second configured thread out of existence (a both-heavy candidate waits for 75% progress, so
-two threads converge to ~one effective thread). When the measurement says the newcomer's whole peak
-fits *now*, the over-subscription the strict headway guards against cannot occur; a small headway is
-kept so the running job clears its memory-hungry startup before a sibling adds pressure."""
-
-_OVERLAP_HEADWAY_SCALE_HIGH_PERFORMANCE = 0.5
-"""Multiplier applied to the required overlap headway when the worker runs in high-performance mode.
-
-High-performance operators have provisioned the card for aggressive co-sampling and want the next job's
-sampling to overlap the tail of the current one sooner. Halving the headway brings the newcomer in
-earlier while the VRAM arbiter still independently decides whether the card can hold the overlap."""
-
-_OVERLAP_HEADWAY_SCALE_MODERATE_PERFORMANCE = 0.75
-"""Multiplier applied to the required overlap headway in moderate-performance mode: a milder pull-in than
-high-performance mode, still gated by the arbiter's memory verdict."""
-
-
-def _performance_mode_headway_scale(bridge_data: reGenBridgeData) -> float:
-    """Return the overlap-headway multiplier for the worker's performance mode (1.0 outside the fast modes).
-
-    Higher performance modes shrink the sampling headway a newcomer must wait for, so concurrent inference
-    starts sooner. The memory arbiter still gates whether the overlap fits, so this only moves *when* an
-    admissible overlap begins, never *whether* an over-committing one is allowed.
-    """
-    if bridge_data.high_performance_mode:
-        return _OVERLAP_HEADWAY_SCALE_HIGH_PERFORMANCE
-    if bridge_data.moderate_performance_mode:
-        return _OVERLAP_HEADWAY_SCALE_MODERATE_PERFORMANCE
-    return 1.0
-
 
 class VaeLanePauseRequester(enum.StrEnum):
     """Which subsystem is asking to pause the VAE lane, and therefore which decode-drain rule applies.
@@ -942,7 +886,7 @@ class InferenceScheduler:
     _reserve_ledger: CommittedReserveLedger
     _ram_budget_defer_notified: bool
     _ram_pressure_notified: bool
-    _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
+    _diagnostics: DiagnosticThrottle
     _last_budget_defer_reason: str | None
     _context_reduction_at: dict[int | None, float]
     _last_preload_admission: LatestPreloadAdmission | None
@@ -1323,7 +1267,7 @@ class InferenceScheduler:
         self._component_sidecar_cache: dict[str, tuple[int, ComponentIdentitySidecar]] = {}
         self._component_charge_fallback_logged: set[str] = set()
         self._weights_root: Path | None = None
-        self._scheduler_diagnostic_log_state = {}
+        self._diagnostics = DiagnosticThrottle(self._clock)
         self._last_preload_admission = None
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
@@ -1581,10 +1525,6 @@ class InferenceScheduler:
         """The live concurrent-inference cap (effective ``max_threads``), bounded by the ceiling."""
         return self._runtime_config.effective_max_threads
 
-    def get_single_job_effective_megapixelsteps(self, job: ImageGenerateJobPopResponse) -> int:
-        """Return the number of effective megapixelsteps for a single job."""
-        return _get_single_job_effective_megapixelsteps(job)
-
     def _expected_sampling_seconds(
         self,
         job: ImageGenerateJobPopResponse,
@@ -1602,46 +1542,6 @@ class InferenceScheduler:
             return None
         return self._performance_model.expected_sampling_seconds(signature)
 
-    def _diagnostic_mb_bucket(self, value: float | None) -> int | None:
-        """Bucket memory telemetry so harmless measurement jitter does not spam diagnostics."""
-        if value is None:
-            return None
-        return round(value / _SCHEDULER_DIAGNOSTIC_MB_BUCKET)
-
-    def _scheduler_diagnostic_suppressed_count(
-        self,
-        name: str,
-        state_key: tuple[object, ...],
-    ) -> int | None:
-        """Return suppressed-repeat count when a high-frequency diagnostic should be emitted.
-
-        The first observation logs, a semantic state change logs immediately, and an unchanged observation
-        logs periodically. ``None`` means "do not emit this time".
-        """
-        now = self._clock()
-        previous = self._scheduler_diagnostic_log_state.get(name)
-        if previous is None:
-            self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
-            return 0
-
-        previous_key, previous_emit, suppressed_count = previous
-        if previous_key != state_key:
-            self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
-            return suppressed_count
-
-        if (now - previous_emit) >= _SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS:
-            self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
-            return suppressed_count
-
-        self._scheduler_diagnostic_log_state[name] = (previous_key, previous_emit, suppressed_count + 1)
-        return None
-
-    def _suppressed_suffix(self, suppressed_count: int) -> str:
-        """Return a compact suffix for diagnostics that skipped unchanged loop repeats."""
-        if suppressed_count <= 0:
-            return ""
-        return f" (suppressed {suppressed_count} unchanged repeats)"
-
     def _log_stream_forecast(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
         """Log the stream forecast when its decision or materially-relevant measurements change."""
         if not forecast.known:
@@ -1651,21 +1551,21 @@ class InferenceScheduler:
         state_key = (
             job.model,
             job_id,
-            self._diagnostic_mb_bucket(forecast.weights_mb),
-            self._diagnostic_mb_bucket(forecast.reserve_mb),
-            self._diagnostic_mb_bucket(forecast.free_now_mb),
-            self._diagnostic_mb_bucket(forecast.free_after_model_evict_mb),
-            self._diagnostic_mb_bucket(forecast.free_if_alone_mb),
+            diagnostic_mb_bucket(forecast.weights_mb),
+            diagnostic_mb_bucket(forecast.reserve_mb),
+            diagnostic_mb_bucket(forecast.free_now_mb),
+            diagnostic_mb_bucket(forecast.free_after_model_evict_mb),
+            diagnostic_mb_bucket(forecast.free_if_alone_mb),
             self._process_map.num_loaded_inference_processes(),
-            self._diagnostic_mb_bucket(self._per_process_overhead_mb()),
-            self._diagnostic_mb_bucket(forecast.marginal_process_overhead_mb),
+            diagnostic_mb_bucket(self._per_process_overhead_mb()),
+            diagnostic_mb_bucket(forecast.marginal_process_overhead_mb),
             forecast.fits_coresident,
             forecast.needs_exclusive_residency,
             forecast.needs_process_count_reduction,
             forecast.streams_unavoidably,
             forecast.measured_retires_whole_card_intent,
         )
-        suppressed_count = self._scheduler_diagnostic_suppressed_count(f"stream_forecast:{job_id}", state_key)
+        suppressed_count = self._diagnostics.suppressed_count(f"stream_forecast:{job_id}", state_key)
         if suppressed_count is None:
             return
 
@@ -1699,7 +1599,7 @@ class InferenceScheduler:
             f"needs_process_count_reduction={forecast.needs_process_count_reduction}"
             f"(max_resident={forecast.max_resident_processes()}), "
             f"streams_unavoidably={forecast.streams_unavoidably}"
-            f"{self._suppressed_suffix(suppressed_count)}",
+            f"{suppressed_suffix(suppressed_count)}",
         )
 
     def _log_next_models_for_vram_unload(
@@ -1718,10 +1618,10 @@ class InferenceScheduler:
             for_head_of_queue,
             self._max_inference_processes,
         )
-        suppressed_count = self._scheduler_diagnostic_suppressed_count("vram_unload_next_models", state_key)
+        suppressed_count = self._diagnostics.suppressed_count("vram_unload_next_models", state_key)
         if suppressed_count is None:
             return
-        logger.debug(f"Next n models: {next_n_models}{self._suppressed_suffix(suppressed_count)}")
+        logger.debug(f"Next n models: {next_n_models}{suppressed_suffix(suppressed_count)}")
 
     def _budget_active(self) -> bool:
         """Whether the measured VRAM/RAM budget gates preload/dispatch this cycle.
@@ -2300,7 +2200,7 @@ class InferenceScheduler:
         # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,
         # rather than co-residing and thrashing as Z-Image did.
         whole_card_pinned = self._whole_card_pinned(job.model, baseline, device_index=device_index)
-        wants_whole_card = whole_card_pinned or self._model_size_tier(job.model) >= _ModelSizeTier.EXTRA_LARGE
+        wants_whole_card = whole_card_pinned or self._model_size_tier(job.model) >= ModelSizeTier.EXTRA_LARGE
         # A disaggregated job's sampler holds only the UNet, so its forecast charges the sampler-only figure
         # (keeping two samplers co-resident where the whole-job charge collapses them), and the image lane's
         # concurrent decode spike is charged as a sibling context. Class-eligibility (not the liveness-coupled
@@ -5552,34 +5452,6 @@ class InferenceScheduler:
         """
         self._footprint_store = store
 
-    def _sampling_footprint_key(
-        self,
-        job: ImageGenerateJobPopResponse,
-        baseline: str | None,
-        *,
-        stage: FootprintStage,
-    ) -> FootprintKey | None:
-        """Build the footprint key for ``job`` at ``stage``, or None when it cannot be keyed.
-
-        The key is (baseline, resolution bucket by the job's maximum dimension, host platform, stage). The stage
-        distinguishes a whole-job monolithic peak (:attr:`FootprintStage.SAMPLE`) from a disaggregated UNet-only
-        sampler peak (:attr:`FootprintStage.SAMPLE_ISOLATED`): the two are physically different quantities and,
-        since watermarks are raise-only, must not share a key. A None baseline or an absent width/height cannot
-        be attributed to a footprint population, so it returns None and the caller keeps the static seed.
-        """
-        if baseline is None:
-            return None
-        width = job.payload.width
-        height = job.payload.height
-        if width is None or height is None:
-            return None
-        return FootprintKey(
-            model_baseline=str(baseline),
-            resolution_bucket=ResolutionBucket.from_dimensions(width, height, job.payload.n_iter or 1),
-            platform=sys.platform,
-            stage=stage,
-        )
-
     def _learned_resident_footprint_mb(
         self,
         model_name: str | None,
@@ -5691,7 +5563,7 @@ class InferenceScheduler:
         store = self._footprint_store
         if store is None:
             return static_seed_mb
-        key = self._sampling_footprint_key(job, baseline, stage=stage)
+        key = sampling_footprint_key(job, baseline, stage=stage)
         if key is None:
             return static_seed_mb
         raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
@@ -5741,7 +5613,7 @@ class InferenceScheduler:
         job = job_info.sdk_api_job_info
         if job.model is None:
             return
-        key = self._sampling_footprint_key(
+        key = sampling_footprint_key(
             job,
             self._model_metadata.get_baseline(job.model),
             stage=FootprintStage.SAMPLE_ISOLATED,
@@ -6097,40 +5969,12 @@ class InferenceScheduler:
         *,
         target_device_index: int | None = None,
     ) -> bool:
-        """Whether ``candidate_job`` may start while other jobs are already sampling, the arbiter deciding memory.
+        """Whether ``candidate_job`` may start while other jobs are already sampling.
 
-        The concurrency cap (``max_threads``) only counts in-flight jobs; it does not look at what those jobs
-        are, how far along they are, or how much the card can hold. This gate adds both missing dimensions: a
-        temporal/structural guard that keeps a newcomer off a running job's memory-hungry startup beat, and the
-        VRAM arbiter's authoritative answer to whether the card can hold the overlap at all.
-
-        The non-memory guards run first and can decline overlap on their own:
-            * The first job (nothing in flight) always starts: with no overlap there is no memory question.
-            * An extra-large (whole-card tier) model neither joins a busy card nor shares one, whatever the
-              card's headroom; that contract is the tier's, not the card's.
-            * A newcomer must let the running job make size-appropriate sampling headway (none for light+light,
-              a startup beat when a memory-hungry pairing has room, the strictest headway behind a batch) before
-              it joins, so two loads and activation peaks do not stack into a step-timeout teardown.
-
-        The memory question is then the arbiter's: a :attr:`VramRequestKind.MONOLITHIC_DISPATCH` verdict that
-        FITS admits the overlap, a DEFER or DENY withholds it this cycle and the dispatch re-asks
-        naturally on the next scheduling pass. This seam runs no actuations on a DEFER (reclaim is single-owner,
-        driven only by the preload path); a cold start or an unwired arbiter relaxes the memory answer to admit.
-
-        The headway relaxation is driven by positive confirmation only: a heavy pairing's headway drops to the
-        startup-beat constant (and a batch is bounded by the strictest headway rather than a hard block) only
-        when the arbiter has actually confirmed room this cycle. A cold start (no cycle) keeps the strict
-        headway fractions, since the admit-on-missing-telemetry relaxation is not evidence the card has room.
-
-        A blocked job is not dropped: it keeps its queue position and dispatches once the in-flight job(s)
-        progress or finish and the card has room.
-
-        Args:
-            candidate_job: The job being considered for dispatch.
-            target_device_index: On a multi-GPU host, the card this candidate would run on; the headway check
-                then considers only jobs already sampling on that same card (jobs on other cards do not contend
-                for its VRAM or sampler), and the arbiter prices the demand against that card. ``None`` (and
-                every single-GPU call) keeps the worker-wide comparison.
+        Gathers the running samplers (those on ``target_device_index`` when multi-GPU routing is active, else
+        worker-wide) and defers to :func:`concurrent_overlap_permitted`, with the VRAM arbiter's dispatch
+        verdict as the memory answer. No actuations run on a DEFER; reclaim is driven only by the preload path.
+        A blocked job keeps its queue position and is re-asked on the next scheduling pass.
         """
         if self._multi_gpu_routing_active and target_device_index is not None:
             in_progress_jobs: tuple[ImageGenerateJobPopResponse, ...] | list[ImageGenerateJobPopResponse] = (
@@ -6138,69 +5982,24 @@ class InferenceScheduler:
             )
         else:
             in_progress_jobs = self._job_tracker.jobs_in_progress
-        if not in_progress_jobs:
-            return True
 
-        candidate_tier = self._model_size_tier(candidate_job.model)
-        if candidate_tier >= _ModelSizeTier.EXTRA_LARGE:
-            return False
-
-        # The memory question is the arbiter's, resolved once and only when a rule needs it. ``memory_ample``
-        # is the arbiter's positive confirmation of room (a real cycle that admits), which relaxes the headway;
-        # ``memory_admits`` is the veto, which withholds only when a real cycle denies and relaxes to admit when
-        # the demand could not be priced. A cold start therefore keeps the strict headway yet admits on memory.
-        memory_verdict_cache: bool | None = None
-        memory_evaluated = False
-
-        def memory_verdict() -> bool | None:
-            nonlocal memory_verdict_cache, memory_evaluated
-            if not memory_evaluated:
-                memory_verdict_cache = self._overlap_memory_verdict(
-                    candidate_job,
-                    target_device_index=target_device_index,
-                )
-                memory_evaluated = True
-            return memory_verdict_cache
-
-        def memory_admits() -> bool:
-            return memory_verdict() is not False
-
-        def memory_ample() -> bool:
-            return memory_verdict() is True
-
-        candidate_batched = self._job_batch_amount(candidate_job) > 1
-        if candidate_batched and not memory_ample():
-            return False
-
-        # Higher performance modes pull a newcomer's sampling into the current job's tail sooner by shrinking
-        # the headway it must wait for; the arbiter's memory verdict below still independently gates the overlap.
-        headway_scale = _performance_mode_headway_scale(self._runtime_config.bridge_data)
-
-        for job in in_progress_jobs:
-            running_tier = self._model_size_tier(job.model)
-            if running_tier >= _ModelSizeTier.EXTRA_LARGE:
-                return False
-
-            if candidate_batched or self._job_batch_amount(job) > 1:
-                # A batch multiplies the activation peak, so without confirmed room it keeps the hard block;
-                # with room it is bounded instead by the strictest headway (never the startup-beat relaxation,
-                # which is sized for single jobs).
-                if not memory_ample():
-                    return False
-                required_headway = _OVERLAP_HEADWAY_BOTH_HEAVY
-            else:
-                required_headway = self._required_overlap_headway(running_tier, candidate_tier)
-                if required_headway > 0.0 and memory_ample():
-                    required_headway = _OVERLAP_HEADWAY_AMPLE_VRAM
-
-            required_headway *= headway_scale
-
-            if required_headway <= 0.0:
-                continue
-            if self._in_flight_progress_fraction(job) < required_headway:
-                return False
-
-        return memory_admits()
+        running = tuple(
+            RunningSampler(
+                tier=self._model_size_tier(job.model),
+                batched=job_batch_amount(job) > 1,
+                progress_fraction=self._in_flight_progress_fraction(job),
+            )
+            for job in in_progress_jobs
+        )
+        return concurrent_overlap_permitted(
+            candidate_tier=self._model_size_tier(candidate_job.model),
+            candidate_batched=job_batch_amount(candidate_job) > 1,
+            running=running,
+            headway_scale=performance_mode_headway_scale(self._runtime_config.bridge_data),
+            memory_verdict=lambda: self._overlap_memory_verdict(
+                candidate_job, target_device_index=target_device_index
+            ),
+        )
 
     def set_vram_growth_hold(self, device_index: int, active: bool) -> None:
         """Set or clear the device-free governor's growth hold for a card (parent control loop only).
@@ -6558,7 +6357,7 @@ class InferenceScheduler:
         if process_info.retained_resident_model is not None:
             self._retention_evicted_unused += 1
 
-    def _model_size_tier(self, model_name: str | None) -> _ModelSizeTier:
+    def _model_size_tier(self, model_name: str | None) -> ModelSizeTier:
         """Classify a model by how much of the device its inference is expected to want.
 
         Resolves the model's baseline from the loaded reference and delegates to the shared, torch-free
@@ -6568,12 +6367,6 @@ class InferenceScheduler:
         baseline = self._model_metadata.get_baseline(model_name) if model_name is not None else None
         baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
         return model_size_tier(model_name, baseline_value)
-
-    @staticmethod
-    def _job_batch_amount(job: ImageGenerateJobPopResponse) -> int:
-        """The batch size (``n_iter``) of a job, floored at 1 for malformed values."""
-        n_iter = job.payload.n_iter
-        return n_iter if isinstance(n_iter, int) and n_iter > 0 else 1
 
     def _process_running_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The inference process currently dispatched the given in-flight job, if any.
@@ -6589,24 +6382,6 @@ class InferenceScheduler:
             if referenced is not None and referenced.id_ == job_id:
                 return process_info
         return None
-
-    @staticmethod
-    def _progress_fraction_of_process(process_info: HordeProcessInfo) -> float:
-        """Denoise progress in ``[0.0, 1.0]`` for a process, from its last reported step or heartbeat.
-
-        A process that has not yet reported a step reads as ``0.0`` (its progress fields are unset), which is
-        exactly when a heavy overlap is most dangerous.
-        """
-        total_steps = process_info.last_total_steps
-        current_step = process_info.last_current_step
-        if total_steps is not None and total_steps > 0 and current_step is not None:
-            return max(0.0, min(1.0, current_step / total_steps))
-
-        percent_complete = process_info.last_heartbeat_percent_complete
-        if percent_complete is not None:
-            return max(0.0, min(1.0, percent_complete / 100.0))
-
-        return 0.0
 
     def _remaining_sampling_seconds(self, process_info: HordeProcessInfo) -> float | None:
         """Estimated wall seconds left in a process's denoise loop, or None while no rate can be trusted.
@@ -6640,7 +6415,7 @@ class InferenceScheduler:
         process_info = self._process_running_job(job)
         if process_info is None:
             return 0.0
-        return self._progress_fraction_of_process(process_info)
+        return process_info.progress_fraction()
 
     def build_clearance_inputs(self, *, device_index: int) -> ClearanceInputs:
         """Snapshot the per-tick truth the clearance controller reads for ``device_index``.
@@ -6689,7 +6464,7 @@ class InferenceScheduler:
                     ActiveSampler(
                         process_id=process_info.process_id,
                         job_id=str(referenced.id_),
-                        progress_fraction=self._progress_fraction_of_process(process_info),
+                        progress_fraction=process_info.progress_fraction(),
                         remaining_sampling_seconds=self._remaining_sampling_seconds(process_info),
                     ),
                 )
@@ -6813,7 +6588,7 @@ class InferenceScheduler:
         holds, and the reclaim the arbiter ran, once per distinct ``(process, reason)`` rather than every
         tick, so a held card's cause is readable from the line alone.
         """
-        suppressed = self._scheduler_diagnostic_suppressed_count("clearance_hold", (str(process_id), reason))
+        suppressed = self._diagnostics.suppressed_count("clearance_hold", (str(process_id), reason))
         if suppressed is None:
             return
         if verdict is not None:
@@ -6888,20 +6663,6 @@ class InferenceScheduler:
             return accumulated + max(0.0, self._clock() - live_since)
         return accumulated
 
-    @staticmethod
-    def _required_overlap_headway(running_tier: _ModelSizeTier, candidate_tier: _ModelSizeTier) -> float:
-        """Progress the running job must have made before a candidate joins it concurrently.
-
-        Only called once both jobs are known to be non-extra-large and non-batched (those are hard
-        blocks handled earlier). Two light jobs thread together freely; any pairing involving a heavy
-        job requires headway, and two heavy jobs require the most.
-        """
-        if running_tier <= _ModelSizeTier.LIGHT and candidate_tier <= _ModelSizeTier.LIGHT:
-            return 0.0
-        if running_tier >= _ModelSizeTier.HEAVY and candidate_tier >= _ModelSizeTier.HEAVY:
-            return _OVERLAP_HEADWAY_BOTH_HEAVY
-        return _OVERLAP_HEADWAY_MIXED_HEAVY
-
     def _jobs_in_progress_on_card(self, device_index: int) -> list[ImageGenerateJobPopResponse]:
         """The in-progress jobs whose live inference process is pinned to ``device_index``.
 
@@ -6965,7 +6726,7 @@ class InferenceScheduler:
                 )
                 continue
 
-            if self._model_map_entry_is_displaced(model_name, process_info):
+            if process_info.holds_different_model(model_name):
                 self._horde_model_map.expire_entry(model_name)
                 expired.append(model_name)
                 logger.warning(
@@ -6974,19 +6735,6 @@ class InferenceScheduler:
                 )
 
         return expired
-
-    @staticmethod
-    def _model_map_entry_is_displaced(model_name: str, process_info: HordeProcessInfo) -> bool:
-        """Whether ``model_name``'s map entry names a slot that has since been loaded over.
-
-        A slot holds one model at a time, so a slot naming a different model has given these weights up. A
-        slot naming nothing is not read as displaced: that is the transient the process map reports between a
-        load being commanded and the slot being attributed, and expiring on it would discard a live load's
-        record.
-        """
-        return process_info.loaded_horde_model_name is not None and (
-            process_info.loaded_horde_model_name != model_name
-        )
 
     def _stale_ram_unload_replace_bytes(self) -> float:
         """RSS above which a model-less idle slot is judged to be still holding a freed model's pages.
@@ -7002,22 +6750,6 @@ class InferenceScheduler:
         )
         return (_FRESH_INFERENCE_CHILD_BASELINE_MB + margin_mb) * 1024 * 1024
 
-    @staticmethod
-    def _ram_reading_postdates_unload(process_info: HordeProcessInfo) -> bool:
-        """Whether this slot's latest RSS reading was sampled late enough to describe its post-unload state.
-
-        A child samples its RSS on a fixed interval, so the reading the parent holds in the moment after
-        commanding an unload was taken *before* it and reports the footprint the unload was meant to release.
-        Reclaim decisions taken on that reading cycle slots that did release their pages, at the cost of a
-        respawn and a cold load each time. A candidate must carry a reading at least one report interval
-        newer than the unload; a slot missing either timestamp carries no evidence and is never a candidate.
-        """
-        sampled_at = process_info.report_sampled_at
-        unload_at = process_info.last_ram_unload_requested_at
-        if sampled_at is None or unload_at is None:
-            return False
-        return (sampled_at - unload_at) >= MEMORY_REPORT_INTERVAL_SECONDS
-
     def _replace_stale_ram_unload_process(self, *, protect_process_id: int | None = None) -> bool:
         """Cycle an idle inference process to return retained RAM to the OS; return whether one was cycled.
 
@@ -7029,9 +6761,10 @@ class InferenceScheduler:
           protected staging target (reusing a crept slot would only perpetuate the leak).
         - Stale-unload reclaim (the RAM-verdict last resort): a model-less idle slot that did not actually
           release RAM after an ``UNLOAD_MODELS_FROM_RAM`` request. "Did not release" is judged only against a
-          reading the child sampled after that request (see :meth:`_ram_reading_postdates_unload`) and only
-          above a threshold no cold child reaches (see :meth:`_stale_ram_unload_replace_bytes`), and the same
-          slot is cycled at most once per :data:`_STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS`.
+          reading the child sampled after that request (see
+          :meth:`HordeProcessInfo.ram_reading_postdates_unload`) and only above a threshold no cold child
+          reaches (see :meth:`_stale_ram_unload_replace_bytes`), and the same slot is cycled at most once per
+          :data:`_STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS`.
           ``protect_process_id`` spares one slot here, the current head's staging target, so the reclaim does
           not destroy the retained pages the marginal RAM credit priced the head's preload against (which
           would force the very cold load the credit avoids).
@@ -7063,7 +6796,7 @@ class InferenceScheduler:
                 continue
             if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 continue
-            if not self._ram_reading_postdates_unload(process_info):
+            if not process_info.ram_reading_postdates_unload():
                 continue
             last_cycled_at = self._stale_ram_unload_cycled_at.get(process_info.process_id)
             if last_cycled_at is not None and (now - last_cycled_at) < _STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS:
@@ -7269,7 +7002,7 @@ class InferenceScheduler:
         diagnostic cadence are counted and left at TRACE so a tick-rate loop cannot flood the log.
         """
         name = "whole_card_governor_downgrade" if downgraded else "whole_card_governor_hold"
-        suppressed = self._scheduler_diagnostic_suppressed_count(name, (str(job.model), device_index, hold.governor))
+        suppressed = self._diagnostics.suppressed_count(name, (str(job.model), device_index, hold.governor))
         stated = hold.reason if hold.detail is None else f"{hold.reason} ({hold.detail})"
         if downgraded:
             message = (
@@ -7287,7 +7020,7 @@ class InferenceScheduler:
         if suppressed is None:
             logger.trace(message)
             return
-        logger.warning(f"{message}{self._suppressed_suffix(suppressed)}")
+        logger.warning(f"{message}{suppressed_suffix(suppressed)}")
 
     def _decide_whole_card_demand(
         self,
@@ -8216,7 +7949,7 @@ class InferenceScheduler:
         # reason rather than latched, so a changed objection always speaks and an unchanged one is counted;
         # the line itself renders the arithmetic behind that reason, which moves every cycle.
         self._last_budget_defer_reason = verdict.reason
-        suppressed = self._scheduler_diagnostic_suppressed_count(
+        suppressed = self._diagnostics.suppressed_count(
             "preload_budget_defer",
             (str(job.model), verdict.disposition.value, verdict.reason),
         )
@@ -8224,7 +7957,7 @@ class InferenceScheduler:
             forecast_note = "" if not vram_verdict.fits else " (the static forecast calls this a fit)"
             logger.opt(colors=True).warning(
                 f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.stated}{forecast_note}. "
-                f"Reclaiming idle VRAM.{self._suppressed_suffix(suppressed)}</>",
+                f"Reclaiming idle VRAM.{suppressed_suffix(suppressed)}</>",
                 job.model,
             )
         self._preload_actuation = _PreloadActuation(
@@ -8571,7 +8304,7 @@ class InferenceScheduler:
                 reason="head protection released: the head's whole-card establishment is governor-deferred",
                 inputs={"model": str(head.model)},
             )
-        suppressed = self._scheduler_diagnostic_suppressed_count(
+        suppressed = self._diagnostics.suppressed_count(
             "head_protection_governor_deferred",
             (str(head.id_),),
         )
@@ -8580,7 +8313,7 @@ class InferenceScheduler:
         logger.opt(colors=True).warning(
             "<fg #ff8c69>Head {} ({}) is not asking for this card while a governor defers its whole-card "
             "residency, so it no longer reserves card room from the jobs behind it; a fitting sibling may "
-            f"dispatch. The head keeps its queue position.{self._suppressed_suffix(suppressed)}</>",
+            f"dispatch. The head keeps its queue position.{suppressed_suffix(suppressed)}</>",
             str(head.id_)[:8],
             head.model,
         )
@@ -8601,7 +8334,7 @@ class InferenceScheduler:
                     "starved_seconds": round(starved_seconds, 1),
                 },
             )
-        suppressed = self._scheduler_diagnostic_suppressed_count(
+        suppressed = self._diagnostics.suppressed_count(
             "head_protection_released",
             (str(head.id_),),
         )
@@ -8610,7 +8343,7 @@ class InferenceScheduler:
         logger.opt(colors=True).warning(
             "<fg #ff8c69>Head {} ({}) has been parked {:.0f}s without dispatching, so it no longer reserves "
             "card room from the jobs behind it; a fitting sibling may dispatch. The head keeps its queue "
-            f"position.{self._suppressed_suffix(suppressed)}</>",
+            f"position.{suppressed_suffix(suppressed)}</>",
             str(head.id_)[:8],
             head.model,
             starved_seconds,
@@ -9244,7 +8977,7 @@ class InferenceScheduler:
                 IdleResidentModel(
                     process_id=process_info.process_id,
                     tenant_label=process_info.loaded_horde_model_name,
-                    materialized_monotonic=self._reclaim_recency_key(process_info, now_monotonic, now_wall),
+                    materialized_monotonic=process_info.reclaim_recency_key(now_monotonic, now_wall),
                     footprint_mb=footprint_mb,
                 ),
             )
@@ -9260,7 +8993,7 @@ class InferenceScheduler:
                 CacheReleaseTarget(
                     process_id=process_id,
                     tenant_label=f"{process_info.process_type.name.lower()}#{process_id}",
-                    materialized_monotonic=self._reclaim_recency_key(process_info, now_monotonic, now_wall),
+                    materialized_monotonic=process_info.reclaim_recency_key(now_monotonic, now_wall),
                     reclaimable_mb=reclaimable_mb,
                 ),
             )
@@ -9315,20 +9048,6 @@ class InferenceScheduler:
         if job is None:
             return 0.0
         return predict_job_footprint_mb(job, baseline) or 0.0
-
-    @staticmethod
-    def _reclaim_recency_key(process_info: HordeProcessInfo, now_monotonic: float, now_wall: float) -> float:
-        """Return a monotonic-scale recency key for LIFO reclaim ranking of a process.
-
-        Prefers the dedicated ``vram_materialized_monotonic`` stamp (set when the parent observed the process
-        materialize VRAM). When that is unset (an older child, or a process that has not materialized since
-        start) it falls back to the report-time proxy, mapped onto the monotonic timeline
-        (``now_monotonic - (now_wall - last_received_timestamp)``) so stamped and unstamped processes remain
-        comparable in one ranking rather than one scale sorting entirely above the other.
-        """
-        if process_info.vram_materialized_monotonic is not None:
-            return process_info.vram_materialized_monotonic
-        return now_monotonic - (now_wall - process_info.last_received_timestamp)
 
     def _post_processing_lane_has_committed_work(self) -> bool:
         """Return true if the shared post-processing lane has queued or active work.
@@ -9800,7 +9519,7 @@ class InferenceScheduler:
 
     def _note_retention_dispatch_hold(self, next_job: ImageGenerateJobPopResponse, *, reclaiming: bool) -> None:
         """Disclose (throttled) that a dispatch is waiting for retained weights to come back off the card."""
-        suppressed = self._scheduler_diagnostic_suppressed_count(
+        suppressed = self._diagnostics.suppressed_count(
             "retained_resident_dispatch_hold",
             (str(next_job.id_), reclaiming),
         )
@@ -9848,7 +9567,7 @@ class InferenceScheduler:
                 continue
             if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
                 continue
-            recency_key = self._reclaim_recency_key(process_info, now_monotonic, now_wall)
+            recency_key = process_info.reclaim_recency_key(now_monotonic, now_wall)
             if recency_key < coldest_recency_key:
                 coldest_recency_key = recency_key
                 coldest_process_id = process_info.process_id
@@ -10513,7 +10232,7 @@ class InferenceScheduler:
         # An aux-gated preload takes a wholly unoccupied slot or none at all. Displacing a resident model,
         # cycling a process, or evicting to make room are all costs paid on behalf of a job that cannot sample
         # until its auxiliary files land, and the model thrown away may be one a dispatchable job still wants.
-        if aux_gated and not self._slot_is_unoccupied(available_process):
+        if aux_gated and not available_process.is_unoccupied():
             return self._preload_outcome(
                 AdmissionDecision.NEXT_JOB,
                 job=job,
@@ -10620,18 +10339,6 @@ class InferenceScheduler:
             )
         return self._preload_outcome(
             AdmissionDecision.STOP_PASS, job=job, process=available_process, reason="preload send failed"
-        )
-
-    @staticmethod
-    def _slot_is_unoccupied(process_info: HordeProcessInfo) -> bool:
-        """Whether a slot holds no model and is idle, so loading onto it displaces nothing.
-
-        Distinct from ``can_accept_job()``, which is also true of a slot holding a resident model: a caller
-        that must not throw any load away needs the stronger property that there is nothing there to throw.
-        """
-        return (
-            process_info.loaded_horde_model_name is None
-            and process_info.last_process_state == HordeProcessState.WAITING_FOR_JOB
         )
 
     def _select_head_room_process(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
@@ -13244,7 +12951,7 @@ class InferenceScheduler:
                 inputs=inputs,
             )
 
-        suppressed = self._scheduler_diagnostic_suppressed_count(
+        suppressed = self._diagnostics.suppressed_count(
             "dispatch_residency_hold",
             (str(next_job.id_), verdict.disposition.value),
         )

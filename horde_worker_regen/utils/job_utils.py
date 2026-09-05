@@ -12,6 +12,12 @@ from horde_worker_regen.consts import (
 )
 
 
+def job_batch_amount(job: ImageGenerateJobPopResponse) -> int:
+    """The batch size (``n_iter``) of a job, floored at 1 for malformed values."""
+    n_iter = job.payload.n_iter
+    return n_iter if isinstance(n_iter, int) and n_iter > 0 else 1
+
+
 def get_single_job_magnitude(job: ImageGenerateJobPopResponse) -> int:
     """Return an approximate magnitude of a single job based on megapixelsteps and other factors.
 
