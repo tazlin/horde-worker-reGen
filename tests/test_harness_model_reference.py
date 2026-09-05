@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from horde_model_reference import PENDING_SOURCE_ID
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
@@ -23,14 +24,40 @@ def _sdxl_record() -> ImageGenerationModelRecord:
     )
 
 
-class _StubReferenceManager:
-    """A reference manager returning one real image-generation record."""
-
+class _StubQuery:
     def __init__(self, records: dict[str, ImageGenerationModelRecord]) -> None:
         self._records = records
 
-    def get_model_reference(self, _category: object) -> dict[str, ImageGenerationModelRecord]:
-        return self._records
+    def to_list(self) -> list[ImageGenerationModelRecord]:
+        return list(self._records.values())
+
+
+class _StubReferenceManager:
+    """A reference manager serving canonical records, plus pending-queue records once a provider is registered.
+
+    Mirrors the ``get_provider`` / ``register_provider`` / ``query(source=...)`` surface the harness reads
+    through, so the beta (pending) merge is exercised rather than short-circuited by a missing attribute.
+    """
+
+    def __init__(
+        self,
+        records: dict[str, ImageGenerationModelRecord],
+        pending: dict[str, ImageGenerationModelRecord] | None = None,
+    ) -> None:
+        self._records = records
+        self._pending = pending or {}
+        self._providers: dict[str, object] = {}
+
+    def get_provider(self, source_id: str) -> object | None:
+        return self._providers.get(source_id)
+
+    def register_provider(self, provider: object, *, replace: bool = False) -> None:
+        self._providers[PENDING_SOURCE_ID] = provider
+
+    def query(self, _category: object, *, source: object) -> _StubQuery:
+        if isinstance(source, list) and PENDING_SOURCE_ID in source:
+            return _StubQuery({**self._records, **self._pending})
+        return _StubQuery(self._records)
 
 
 def _install_singleton(monkeypatch: pytest.MonkeyPatch, instance: object | None) -> None:
@@ -59,6 +86,28 @@ def test_supplied_manager_resolves_the_real_baseline() -> None:
     )
 
     assert reference[_SDXL_MODEL].baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+
+
+def test_pending_only_model_keeps_its_real_baseline_when_beta_is_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A model that exists only in the PRIMARY pending queue resolves through the beta source, not the stub."""
+    import hordelib.beta_models as beta_models
+
+    pending_model = "Pending-Only-Model"
+    pending_record = ImageGenerationModelRecord(
+        name=pending_model,
+        baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+        nsfw=False,
+        description="a pending-queue record",
+    )
+    monkeypatch.setenv("HORDELIB_BETA_MODEL_CATEGORIES", "image_generation")
+    monkeypatch.setattr(beta_models, "build_pending_provider", lambda **_kwargs: object())
+
+    reference = build_harness_model_reference(
+        [make_canned_job(pending_model)],
+        _StubReferenceManager({_SDXL_MODEL: _sdxl_record()}, pending={pending_model: pending_record}),  # type: ignore[arg-type]
+    )
+
+    assert reference[pending_model].baseline == KNOWN_IMAGE_GENERATION_BASELINE.flux_1
 
 
 def test_reference_singleton_is_used_when_no_manager_is_passed(monkeypatch: pytest.MonkeyPatch) -> None:

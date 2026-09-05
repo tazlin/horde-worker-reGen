@@ -34,7 +34,7 @@ from multiprocessing.managers import SyncManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -48,6 +48,7 @@ from horde_sdk.generation_parameters.image.object_models import ImageGenerationF
 from horde_sdk.worker.dispatch.ai_horde.image.convert import image_job_pop_response_to_feature_flags
 from loguru import logger
 
+from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec, HordeProcessState
@@ -906,8 +907,11 @@ def _real_image_model_reference(
 
     Falls back to the process-wide :class:`ModelReferenceManager` singleton when no manager is passed,
     so a caller that has already initialized the reference (any real-mode driver) gets real records
-    without having to thread the manager through the harness config. An unreadable or unpopulated
-    reference resolves to an empty mapping, leaving the caller's synthetic fallback in charge.
+    without having to thread the manager through the harness config. Beta (pending-queue) records are
+    merged in under the same opt-in the inference subprocesses honour, so a model that exists only in the
+    pending queue keeps its real baseline instead of falling to the synthetic stable_diffusion_1 stub,
+    which would misprice its VRAM burden and mislabel every stats record it produces. An unreadable or
+    unpopulated reference resolves to an empty mapping, leaving the caller's synthetic fallback in charge.
     """
     manager = reference_manager
     if manager is None:
@@ -915,11 +919,10 @@ def _real_image_model_reference(
             return {}
         manager = ModelReferenceManager.get_instance()
     try:
-        resolved = manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
+        return beta_aware_image_records(manager)
     except Exception as reference_error:  # noqa: BLE001 - a reference miss must not fail harness startup
         logger.warning(f"Could not resolve the image model reference: {type(reference_error).__name__}")
         return {}
-    return resolved if isinstance(resolved, dict) else {}
 
 
 def build_harness_model_reference(
