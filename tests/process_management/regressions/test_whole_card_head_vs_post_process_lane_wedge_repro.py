@@ -166,8 +166,8 @@ def _mark_head_starved(scheduler: InferenceScheduler, head_job: object, *, secon
     past its short grace. This models the incident's long-starved head.
     """
     job_id = head_job.id_  # pyrefly: ignore - the pop response always carries an id in these tests.
-    scheduler._head_starvation_job_id = str(job_id)
-    scheduler._head_starvation_since = time.time() - seconds
+    scheduler.head_admission.starvation_job_id = str(job_id)
+    scheduler.head_admission.starvation_since = time.time() - seconds
 
 
 # --------------------------------------------------------------------------------------------------------

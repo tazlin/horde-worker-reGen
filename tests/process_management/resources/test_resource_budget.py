@@ -628,9 +628,9 @@ class TestPreloadBudgetGate:
 
         assert scheduler.preload_models() is False
         assert spare.last_control_flag != HordeControlFlag.PRELOAD_MODEL
-        assert scheduler._head_starvation_job_id == str(job.id_)
+        assert scheduler.head_admission.starvation_job_id == str(job.id_)
 
-        scheduler._head_starvation_since -= 120.0
+        scheduler.head_admission.starvation_since -= 120.0
         assert scheduler.preload_models() is False
         assert spare.last_control_flag != HordeControlFlag.PRELOAD_MODEL
         assert job_tracker._tracked_for(job).admitted_over_budget is False
@@ -674,7 +674,7 @@ class TestPreloadBudgetGate:
 
         scheduler._update_head_starvation_timer(head)
         # A live job holds the device, so the head's clock must not be running.
-        assert scheduler._head_starvation_job_id is None
+        assert scheduler.head_admission.starvation_job_id is None
         assert scheduler._head_starved_seconds(head) == 0.0
 
     async def test_preload_proceeds_when_within_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:

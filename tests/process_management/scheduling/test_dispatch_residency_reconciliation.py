@@ -35,10 +35,10 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramRequestKind,
     VramVerdict,
 )
-from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _GOVERNOR_DEFER_DWELL_SECONDS,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -259,7 +259,7 @@ class TestHeadProtectionIsBounded:
         scheduler, job, _target, _sibling = await _scheduler_with_idle_sibling()
         _install_cycle(scheduler, _fitting_state())
         scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
-            return_value=inference_scheduler_module._HEAD_PROTECTION_MAX_STARVE_SECONDS + 1.0,
+            return_value=HEAD_PROTECTION_MAX_STARVE_SECONDS + 1.0,
         )
 
         assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None

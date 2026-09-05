@@ -46,9 +46,9 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramArbiter,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _SAFETY_RECOVERY_HOLD_TTL_SECONDS,
     _WholeCardDemandOutcome,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import SAFETY_RECOVERY_HOLD_TTL_SECONDS
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -205,14 +205,14 @@ class TestSafetyCrashLoopBackpressure:
 
         scheduler = pm._inference_scheduler
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._safety_recovery_hold_since != 0.0
+        assert scheduler.head_admission.recovery_hold_since != 0.0
 
         # The safety pool started: its deferred GPU start is satisfied, so the pending-start signal clears.
         lifecycle._pending_gpu_starts.clear()
         assert lifecycle.has_pending_safety_starts() is False
 
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._safety_recovery_hold_since == 0.0
+        assert scheduler.head_admission.recovery_hold_since == 0.0
 
     async def test_hold_releases_at_ttl_when_safety_still_cannot_start(self) -> None:
         """The hold releases at its TTL even if safety never starts, so inference is not starved forever.
@@ -232,12 +232,12 @@ class TestSafetyCrashLoopBackpressure:
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
 
         # Age the hold past its TTL while the safety pool is still crash-looping and its start still pending.
-        scheduler._safety_recovery_hold_since -= _SAFETY_RECOVERY_HOLD_TTL_SECONDS + 1.0
+        scheduler.head_admission.recovery_hold_since -= SAFETY_RECOVERY_HOLD_TTL_SECONDS + 1.0
         assert lifecycle.safety_pool_failing is True
         assert lifecycle.has_pending_safety_starts() is True
 
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._safety_recovery_hold_since == 0.0
+        assert scheduler.head_admission.recovery_hold_since == 0.0
 
     async def test_ttl_expiry_latches_so_a_persistent_failure_does_not_re_hold(self) -> None:
         """After a TTL expiry with the condition persisting, admission proceeds and does not re-hold.
@@ -263,16 +263,16 @@ class TestSafetyCrashLoopBackpressure:
         assert engage_events_after_hold == 1
 
         # Age past the TTL: the hold expires once and latches the episode.
-        scheduler._safety_recovery_hold_since -= _SAFETY_RECOVERY_HOLD_TTL_SECONDS + 1.0
+        scheduler.head_admission.recovery_hold_since -= SAFETY_RECOVERY_HOLD_TTL_SECONDS + 1.0
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._safety_recovery_hold_expired is True
+        assert scheduler.head_admission.recovery_hold_expired is True
         released_events = _count(LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED)
 
         # Every subsequent evaluation, with the condition still persisting, proceeds without re-holding and
         # accrues no further engage or release (CRITICAL) events.
         for _ in range(5):
             assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-            assert scheduler._safety_recovery_hold_since == 0.0
+            assert scheduler.head_admission.recovery_hold_since == 0.0
         assert _count(LedgerEventType.SAFETY_RECOVERY_HOLD_ENGAGED) == engage_events_after_hold
         assert _count(LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED) == released_events
 
@@ -292,18 +292,18 @@ class TestSafetyCrashLoopBackpressure:
 
         scheduler = pm._inference_scheduler
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        scheduler._safety_recovery_hold_since -= _SAFETY_RECOVERY_HOLD_TTL_SECONDS + 1.0
+        scheduler.head_admission.recovery_hold_since -= SAFETY_RECOVERY_HOLD_TTL_SECONDS + 1.0
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._safety_recovery_hold_expired is True
+        assert scheduler.head_admission.recovery_hold_expired is True
 
         # The condition clears: the pending safety start is satisfied, so the release path runs and unlatches.
         lifecycle._pending_gpu_starts.clear()
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._safety_recovery_hold_expired is False
+        assert scheduler.head_admission.recovery_hold_expired is False
 
         # A fresh crash-loop episode on the saturated card holds again, exactly like the first.
         _drive_safety_crash_loop(lifecycle)
         assert lifecycle.safety_pool_failing is True
         assert lifecycle.has_pending_safety_starts() is True
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._safety_recovery_hold_since != 0.0
+        assert scheduler.head_admission.recovery_hold_since != 0.0

@@ -9,11 +9,11 @@ whose RAM verdict keeps failing and whose reclaim attempts free nothing would de
 reach the escape on its own.
 
 The head-priority barrier resolves that. When a head-of-queue preload has been continuously RAM-deferred
-behind live work past ``_HEAD_RAM_DEFER_BARRIER_SECONDS`` with reclaim freeing nothing, the scheduler latches a
+behind live work past ``HEAD_RAM_DEFER_BARRIER_SECONDS`` with reclaim freeing nothing, the scheduler latches a
 barrier: new inference dispatch to other slots is withheld so the running siblings drain to the
 no-live-consumer best-effort admit that seats the head. The barrier is edge-triggered, releases the moment the
 head is admitted, dispatched, faulted, or departs, and is hard-capped: a barrier that has held past
-``_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS`` without admitting the head declines it for reissue rather than holding
+``HEAD_RAM_DEFER_BARRIER_CAP_SECONDS`` without admitting the head declines it for reissue rather than holding
 dispatch forever.
 
 Contract asserted here: past the bound with a sibling busy and reclaim freeing nothing, the head stays pending
@@ -46,10 +46,12 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
 )
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _HEAD_RAM_DEFER_BARRIER_CAP_SECONDS,
-    _HEAD_RAM_DEFER_BARRIER_SECONDS,
     InferenceScheduler,
     _WholeCardDemandOutcome,
+)
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
+    HEAD_RAM_DEFER_BARRIER_CAP_SECONDS,
+    HEAD_RAM_DEFER_BARRIER_SECONDS,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -172,20 +174,20 @@ class TestHeadRamDeferBarrier:
 
         # First evaluation: the head defers (RAM does not fit, a sibling holds memory) and the clock starts.
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._head_priority_barrier_job_id is None
+        assert scheduler.head_admission.barrier_job_id is None
 
         # Time passes past the barrier bound with the sibling still busy and the RAM verdict still failing.
-        clock.now += _HEAD_RAM_DEFER_BARRIER_SECONDS + 1.0
+        clock.now += HEAD_RAM_DEFER_BARRIER_SECONDS + 1.0
         _install_fitting_cycle(scheduler)
         assert len(scheduler._job_tracker.jobs_in_progress) == 1
 
         # The head is not force-admitted; instead the barrier latches on this head.
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._head_priority_barrier_job_id == str(head.id_)
+        assert scheduler.head_admission.barrier_job_id == str(head.id_)
 
         # At the dispatch seam the barrier withholds a sibling dispatch while sparing the head's own job.
-        assert scheduler._head_priority_barrier_withholds_dispatch(sibling) is True
-        assert scheduler._head_priority_barrier_withholds_dispatch(head) is False
+        assert scheduler.head_admission.barrier_withholds(str(sibling.id_)) is True
+        assert scheduler.head_admission.barrier_withholds(str(head.id_)) is False
 
         scheduler.get_next_job_and_process = AsyncMock(  # type: ignore[method-assign]
             return_value=NextJobAndProcess(next_job=sibling, process_with_model=target),
@@ -211,11 +213,11 @@ class TestHeadRamDeferBarrier:
         _install_fitting_cycle(scheduler)
 
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        clock.now += _HEAD_RAM_DEFER_BARRIER_SECONDS + 1.0
+        clock.now += HEAD_RAM_DEFER_BARRIER_SECONDS + 1.0
         _install_fitting_cycle(scheduler)
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._head_priority_barrier_job_id == str(head.id_)
-        assert scheduler._head_priority_barrier_withholds_dispatch(sibling) is True
+        assert scheduler.head_admission.barrier_job_id == str(head.id_)
+        assert scheduler.head_admission.barrier_withholds(str(sibling.id_)) is True
 
         # The barred dispatch let the sibling finish; with no live consumer the escape now admits the head.
         await scheduler._job_tracker.handle_job_fault(sibling, retryable=False)
@@ -223,8 +225,8 @@ class TestHeadRamDeferBarrier:
         _install_fitting_cycle(scheduler)
 
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._head_priority_barrier_job_id is None
-        assert scheduler._head_priority_barrier_withholds_dispatch(sibling) is False
+        assert scheduler.head_admission.barrier_job_id is None
+        assert scheduler.head_admission.barrier_withholds(str(sibling.id_)) is False
 
     async def test_head_declined_for_reissue_after_hard_cap_with_sibling_busy(
         self, monkeypatch: pytest.MonkeyPatch
@@ -244,16 +246,16 @@ class TestHeadRamDeferBarrier:
         _install_fitting_cycle(scheduler)
 
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        clock.now += _HEAD_RAM_DEFER_BARRIER_SECONDS + 1.0
+        clock.now += HEAD_RAM_DEFER_BARRIER_SECONDS + 1.0
         _install_fitting_cycle(scheduler)
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._head_priority_barrier_job_id == str(head.id_)
+        assert scheduler.head_admission.barrier_job_id == str(head.id_)
 
         # The sibling never finishes; past the hard cap the head is declined for reissue and the barrier drops.
-        clock.now += _HEAD_RAM_DEFER_BARRIER_CAP_SECONDS + 1.0
+        clock.now += HEAD_RAM_DEFER_BARRIER_CAP_SECONDS + 1.0
         _install_fitting_cycle(scheduler)
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
-        assert scheduler._head_priority_barrier_job_id is None
+        assert scheduler.head_admission.barrier_job_id is None
         assert head.id_ is not None
         assert scheduler._job_tracker.get_stage(head.id_) is JobStage.PENDING_SUBMIT
 
@@ -274,7 +276,7 @@ class TestHeadRamDeferBarrier:
 
         assert len(scheduler._job_tracker.jobs_in_progress) == 0
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._head_priority_barrier_job_id is None
+        assert scheduler.head_admission.barrier_job_id is None
 
     async def test_head_whose_ram_verdict_fits_is_admitted_with_sibling_busy(
         self, monkeypatch: pytest.MonkeyPatch
@@ -296,4 +298,4 @@ class TestHeadRamDeferBarrier:
         _install_fitting_cycle(scheduler)
 
         assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is True
-        assert scheduler._head_priority_barrier_job_id is None
+        assert scheduler.head_admission.barrier_job_id is None

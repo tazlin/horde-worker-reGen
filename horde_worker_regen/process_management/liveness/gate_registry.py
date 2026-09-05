@@ -138,8 +138,8 @@ _DISPATCH_STALL_OBSERVABLE = (
 """Where a dispatch-stall attribution is readable at runtime."""
 
 _PRELOAD_ADMISSION_OBSERVABLE = (
-    "the AdmissionResult recorded as InferenceScheduler._last_preload_admission, quoted by the parked-head "
-    "line when it names the head's model"
+    "the AdmissionResult recorded as InferenceScheduler.head_admission.last_preload_admission, quoted by the "
+    "parked-head line when it names the head's model"
 )
 """Where a preload-admission verdict is readable at runtime."""
 

@@ -159,8 +159,8 @@ class _World:
     def starve_head(self, job: ImageGenerateJobPopResponse, *, seconds: float) -> None:
         """Set the head-starvation clock so this job reads as the starved head of an idle device."""
         assert job.id_ is not None
-        self._scheduler._head_starvation_job_id = str(job.id_)
-        self._scheduler._head_starvation_since = time.time() - seconds
+        self._scheduler.head_admission.starvation_job_id = str(job.id_)
+        self._scheduler.head_admission.starvation_since = time.time() - seconds
 
     def freeze(self) -> None:
         """Refreeze the arbiter on a fresh snapshot carrying the injected measured inputs."""

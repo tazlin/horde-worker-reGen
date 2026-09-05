@@ -49,6 +49,8 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
     InferenceScheduler,
+)
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     StagingDeferReason,
     format_staging_defer_tally,
 )
@@ -171,7 +173,7 @@ class TestModelServiceabilityAdmission:
         outcome = scheduler._attempt_preload_for_job(job, head_job=job, loaded_models=set())
 
         assert outcome.name == "NEXT_JOB"
-        latest = scheduler.latest_preload_admission()
+        latest = scheduler.head_admission.last_preload_admission
         assert latest is not None
         assert latest.decision is AdmissionDecision.UNSERVICEABLE
         # The doomed job is faulted terminally through the existing fault machinery before any child preload:
@@ -1608,7 +1610,7 @@ class TestSpeculativeDispatchCap:
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
         )
         short_of_headroom._max_jobs_in_progress_allowed()
-        assert dict(short_of_headroom.staging_defer_counts) == {StagingDeferReason.ENCODE_HEADROOM_SHORT: 1}
+        assert dict(short_of_headroom.head_admission.staging_defers) == {StagingDeferReason.ENCODE_HEADROOM_SHORT: 1}
 
         unread = _make_inference_scheduler(
             max_concurrent=2,
@@ -1616,7 +1618,7 @@ class TestSpeculativeDispatchCap:
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
         )
         unread._max_jobs_in_progress_allowed()
-        assert dict(unread.staging_defer_counts) == {StagingDeferReason.MEASUREMENT_UNREAD: 1}
+        assert dict(unread.head_admission.staging_defers) == {StagingDeferReason.MEASUREMENT_UNREAD: 1}
 
     def test_an_admitted_cap_is_not_tallied(self) -> None:
         """A cap that admitted pre-staging records nothing, so the tally counts refusals only."""
@@ -1627,7 +1629,7 @@ class TestSpeculativeDispatchCap:
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
         )
         scheduler._max_jobs_in_progress_allowed()
-        assert dict(scheduler.staging_defer_counts) == {}
+        assert dict(scheduler.head_admission.staging_defers) == {}
 
 
 class TestFormatStagingDeferTally:
@@ -2821,7 +2823,7 @@ class TestIneligibleCardResidencyIsNotAMissingModel:
         assert scheduler._resident_only_on_ineligible_cards(job) is True
         assert await scheduler.get_next_job_and_process(information_only=False) is None
         assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is True
-        assert scheduler._model_recently_missing is False
+        assert scheduler.head_admission.model_recently_missing is False
 
     async def test_without_the_check_the_record_is_expired_as_stale(
         self,
@@ -2835,7 +2837,7 @@ class TestIneligibleCardResidencyIsNotAMissingModel:
 
         assert await scheduler.get_next_job_and_process(information_only=False) is None
         assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is False
-        assert scheduler._model_recently_missing is True
+        assert scheduler.head_admission.model_recently_missing is True
 
 
 class TestMissingModelLatchBound:
@@ -2860,7 +2862,7 @@ class TestMissingModelLatchBound:
         )
 
         await scheduler._handle_process_missing(job)
-        assert scheduler._model_recently_missing is True
+        assert scheduler.head_admission.model_recently_missing is True
         assert scheduler._missing_model_recovery_latched() is True
 
         # A second stale record inside the budget is left alone: one recovery per budget.

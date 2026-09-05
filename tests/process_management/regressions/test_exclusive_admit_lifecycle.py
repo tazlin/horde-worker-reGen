@@ -158,8 +158,8 @@ class TestExclusivePreloadGate:
 
         scheduler._attempt_preload_for_job(sibling_job, head_job=sibling_job, loaded_models=set())
 
-        assert scheduler._last_preload_admission is not None
-        assert scheduler._last_preload_admission.decision is AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        assert scheduler.head_admission.last_preload_admission is not None
+        assert scheduler.head_admission.last_preload_admission.decision is AdmissionDecision.EXCLUSIVE_IN_PROGRESS
 
     async def test_exclusive_jobs_own_preload_passes_the_hold(self, job_tracker: JobTracker) -> None:
         """The exclusive job's own preload proceeds past the hold; the device is being held for it."""
@@ -168,8 +168,8 @@ class TestExclusivePreloadGate:
 
         scheduler._attempt_preload_for_job(exclusive_job, head_job=exclusive_job, loaded_models=set())
 
-        assert scheduler._last_preload_admission is not None
-        assert scheduler._last_preload_admission.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        assert scheduler.head_admission.last_preload_admission is not None
+        assert scheduler.head_admission.last_preload_admission.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
 
 
 class TestOverbudgetAdmitLogContract:

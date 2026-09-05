@@ -217,8 +217,8 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
-    format_staging_defer_tally,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import format_staging_defer_tally
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot, ModelDemandPoller
 from horde_worker_regen.process_management.scheduling.model_pool import (
     ModelPool,
@@ -4236,7 +4236,7 @@ class HordeWorkerProcessManager:
 
     def latest_admission_denials(self, device_index: int = 0) -> int:
         """Return the count of measured-floor admission denials for a card this run (calibration visibility)."""
-        return self._inference_scheduler.latest_admission_denials(device_index=device_index)
+        return self._inference_scheduler.head_admission.admission_denials(device_index)
 
     def latest_measured_unloads_issued(self, device_index: int = 0) -> int:
         """Return the count of physical-overcommit pressure unloads issued for a card this run."""
@@ -4244,7 +4244,7 @@ class HordeWorkerProcessManager:
 
     def latest_admission_headroom_mb(self, device_index: int = 0) -> float | None:
         """Return the last observed measured-floor admission headroom (MB) for a card, or None when unapplied."""
-        return self._inference_scheduler.latest_admission_headroom_mb(device_index=device_index)
+        return self._inference_scheduler.head_admission.admission_headroom_mb(device_index)
 
     async def _control_loop_tick(self) -> bool:
         """Run a single iteration of the process control loop.
@@ -6077,7 +6077,7 @@ class HordeWorkerProcessManager:
         tail_overlap = self._format_tail_overlap_tally()
         if tail_overlap:
             explanation_parts.append(tail_overlap)
-        staging_defers = format_staging_defer_tally(self._inference_scheduler.staging_defer_counts)
+        staging_defers = format_staging_defer_tally(self._inference_scheduler.head_admission.staging_defers)
         if staging_defers:
             explanation_parts.append(staging_defers)
         # Reported beside the churn figures because it is the same quantity from the other side: each reorder is
@@ -7367,7 +7367,7 @@ class HordeWorkerProcessManager:
                 per_process_ceiling_mb=self._round_optional_mb(ram_snapshot.per_process_ceiling_mb),
             )
 
-        preload_status = self._inference_scheduler.latest_preload_admission()
+        preload_status = self._inference_scheduler.head_admission.last_preload_admission
         if preload_status is None:
             preload = PreloadAdmissionSnapshot()
         else:

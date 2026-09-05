@@ -410,8 +410,8 @@ class TestStallReasonStability:
             first_skip_time=time.time() - 300.0,
             skip_count=1,
         )
-        scheduler._head_starvation_job_id = str(head.id_)
-        scheduler._head_starvation_since = time.time() - 300.0
+        scheduler.head_admission.starvation_job_id = str(head.id_)
+        scheduler.head_admission.starvation_since = time.time() - 300.0
         return scheduler, head
 
     async def test_advancing_bypass_counters_leave_the_reason_unchanged(self) -> None:

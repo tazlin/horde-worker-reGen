@@ -1011,9 +1011,9 @@ class TestHeavyHeadLoadGrace:
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
 
         assert scheduler.heavy_head_load_grace_active() is False
-        scheduler._heavy_head_admitted_at = time.time()
+        scheduler.head_admission.heavy_head_admitted_at = time.time()
         assert scheduler.heavy_head_load_grace_active() is True
-        scheduler._heavy_head_admitted_at = time.time() - (HEAVY_HEAD_LOAD_GRACE_SECONDS + 1.0)
+        scheduler.head_admission.heavy_head_admitted_at = time.time() - (HEAVY_HEAD_LOAD_GRACE_SECONDS + 1.0)
         assert scheduler.heavy_head_load_grace_active() is False
 
     def test_assess_wedge_suppressed_during_heavy_head_load(self) -> None:
@@ -1029,7 +1029,7 @@ class TestHeavyHeadLoadGrace:
         dispatcher._last_queue_deadlock_detected_time = time.time() - 60.0
         assert pm._recovery_coordinator.assess_wedge() is True
 
-        pm._inference_scheduler._heavy_head_admitted_at = time.time()
+        pm._inference_scheduler.head_admission.heavy_head_admitted_at = time.time()
         assert pm._recovery_coordinator.assess_wedge() is False
 
 

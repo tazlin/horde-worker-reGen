@@ -154,10 +154,10 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _HEAD_PROTECTION_MAX_STARVE_SECONDS,
     InferenceScheduler,
     NextJobAndProcess,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
 )
@@ -2372,7 +2372,7 @@ def _price_the_deferred_head(
     del device_index
     if displaced_head.model is None:
         return None
-    if self._head_starved_seconds(displaced_head) >= _HEAD_PROTECTION_MAX_STARVE_SECONDS:
+    if self._head_starved_seconds(displaced_head) >= HEAD_PROTECTION_MAX_STARVE_SECONDS:
         return None
     return self._measured_admission_candidate_delta_mb(
         displaced_head,
@@ -2470,7 +2470,7 @@ async def _drive_ineligible_card_head(
     latched_ticks: list[int] = []
     for _ in range(_INELIGIBLE_CARD_TICKS):
         await world.step()
-        if world.scheduler._model_recently_missing:
+        if world.scheduler.head_admission.model_recently_missing:
             latched_ticks.append(world.tick)
     return head, latched_ticks
 

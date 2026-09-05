@@ -195,6 +195,18 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     residency_has_holder,
 )
 from horde_worker_regen.process_management.scheduling.ledgers import retention
+from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
+    DISPATCH_STALL_MIN_SECONDS,
+    HEAD_PROTECTION_MAX_STARVE_SECONDS,
+    HEAD_RAM_DEFER_BARRIER_CAP_SECONDS,
+    HEAD_RAM_DEFER_BARRIER_SECONDS,
+    MISSING_MODEL_LATCH_FALLBACK_SECONDS,
+    SAFETY_RECOVERY_HOLD_TTL_SECONDS,
+    HeadAdmissionLedger,
+    HeadRamDeferStep,
+    SafetyRecoveryHoldStep,
+    StagingDeferReason,
+)
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     RamCycleReason,
     RamReclaimLedger,
@@ -243,22 +255,6 @@ if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 
-@dataclass(frozen=True)
-class LatestPreloadAdmission:
-    """Operator-facing record of the most recent preload-admission decision."""
-
-    decision: AdmissionDecision
-    """The admission gate's decision."""
-    model: str | None
-    """Model whose queued job was judged, when available."""
-    process_id: int | None
-    """Target inference process selected by the decision, when one was selected."""
-    reason: str
-    """Short human-readable explanation for the decision."""
-    timestamp: float
-    """Worker wall-clock time when the decision was recorded."""
-
-
 _PRELOAD_ADMISSION_VERDICTS: dict[AdmissionDecision, DecisionVerdict] = {
     AdmissionDecision.ADMIT: DecisionVerdict.ADMIT,
     AdmissionDecision.ALREADY_LOADED: DecisionVerdict.NO_OP,
@@ -281,51 +277,12 @@ only this encode working set until it is cleared. Dispatch admits staging while 
 of the reserve covers this charge; the full materialisation is priced at clearance instead."""
 
 
-class StagingDeferReason(enum.Enum):
-    """Why the in-progress cap was held at the sampling-slot count instead of allowing another staged job.
-
-    Deferring staging is ordinary backpressure, but it is also the clause that leaves spare inference
-    processes idle while jobs queue, so a session has to be able to read which of the two measurements held
-    it: an unread card, or a card whose free reserve does not cover the encode footprint a staged job adds.
-    """
-
-    MEASUREMENT_UNREAD = "unread"
-    """No GPU-bearing child has reported its VRAM yet, so there is no evidence to admit staging on."""
-    ENCODE_HEADROOM_SHORT = "headroom"
-    """Measured free VRAM net of the reserve does not cover a staged job's encode working set."""
-
-
-_STAGING_DEFER_REPEAT_SECONDS = 300.0
-"""How long an unchanged staging-defer reason stays suppressed before it is restated with its tally.
-
-The cap is consulted on every dispatch decision, so a line per deferral would be noise: the reason edge
-carries the information and a persistent hold is worth one restatement every few minutes."""
-
 _AFFINITY_SCAN_TRACE_SECONDS = 30.0
 """Throttle window for the empty-affinity-scan diagnostic line.
 
 The scan runs every scheduling cycle and empty is its common answer; one line per window while retained
 weights exist keeps the gate that empties the scan visible without flooding the log."""
 
-
-def format_staging_defer_tally(defers: Mapping[StagingDeferReason, int]) -> str | None:
-    """A compact staging-deferral tally for the duty-cycle line, or None when staging was never held back.
-
-    Reports the total and the share each measurement took of it, largest first, so a duty figure short of
-    target can be read straight across to what kept spare inference processes out of the queue.
-    """
-    counted = {reason: count for reason, count in defers.items() if count}
-    total = sum(counted.values())
-    if not total:
-        return None
-    ranked = sorted(counted.items(), key=lambda entry: (-entry[1], entry[0].value))
-    shares = ", ".join(f"{reason.value} {count / total:.0%}" for reason, count in ranked)
-    return f"staging deferred: {total} ({shares})"
-
-
-_MISSING_MODEL_LATCH_FALLBACK_SECONDS = 150.0
-"""Bound for the missing-model recovery latch when no numeric ``preload_timeout`` is configured.
-Matches the ``preload_timeout`` default."""
 
 _RESIDENCY_GRACE_SECONDS = 30.0
 """How long a model stays protected from RAM eviction after its last live demand, in the
@@ -370,16 +327,6 @@ resident-weight lane out of the release-target set so the escalation ladder does
 never yield, which would otherwise keep the ladder non-empty forever and defer a head that reclaim can
 never actually relieve."""
 
-_DISPATCH_STALL_MIN_SECONDS = 10.0
-"""How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
-
-Reuses the head-starvation clock so an ordinary one-tick gap between jobs (or a model mid-preload) is
-never reported; only a head that has been parked this long, with nothing dispatching, is explained."""
-
-_DISPATCH_STALL_LOG_INTERVAL_SECONDS = 30.0
-"""Minimum gap between repeats of the dispatch-stall diagnostic for an unchanged reason, so the
-sub-second control loop cannot spam it. A changed reason logs immediately (the stall's cause shifted)."""
-
 _CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS = 60.0
 """Minimum gap between live-context reductions on one card.
 
@@ -388,40 +335,12 @@ it, and the head whose peak was rejected asks again every scheduling cycle. Rate
 head that cannot be admitted from buying one teardown per cycle; it does not change what the reduction does
 when it is taken. Paired with the restore dwell, so a reduction and its regrowth cannot chase each other."""
 
-_HEAD_PROTECTION_MAX_STARVE_SECONDS = 120.0
-"""How long a parked head may reserve card room from the jobs behind it before the reservation is released.
-
-Head protection holds physical room so the head, not a line-skipper, gets the next opportunity. That is only
-worth its cost while the head is actually converging on a dispatch: a head whose own admission keeps
-declining otherwise holds an idle card against fitting siblings for as long as the queue lasts, and the
-worker serves nothing at all. Set well above the ordinary drain of an in-flight job (the wait the protection
-exists to cover) so a normal handoff never trips it, and far below the horizon at which a stalled queue
-starts missing the horde's dispatch deadlines."""
-
 _DISPATCH_HOLD_LIVENESS_SECONDS = 190.0
 """How long a head's residency-reconciliation hold keeps the recovery supervisor from reading an idle card
 with pending work as a structural wedge. The hold has its own escalation, and this is that escalation end to
 end: the head-starvation clock the measured-load probe is gated on, the idle-context teardown grace, and the
 heavy head's load window once admitted. A hold older than this has exhausted every remedy the gate owns, so
 the supervisor takes over exactly as it would for any other wedge."""
-
-_HEAD_RAM_DEFER_BARRIER_SECONDS = 60.0
-"""How long the head-of-queue preload may be continuously system-RAM-deferred behind live work before the
-scheduler latches the head-priority dispatch barrier. Below this the head is treated as ordinarily queued: a
-running sibling legitimately holds the memory the head needs, and the RAM branch keeps reclaiming and
-re-asking each cycle. Past it, with reclaim freeing nothing and a sibling still holding memory, the head can
-never reach the no-live-consumer best-effort admit on its own, so the barrier withholds new dispatch to other
-slots and lets the running jobs drain to that escape. Chosen above a normal reclaim-and-retry settle and above
-``RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a deliberate reclaim cycle is never mistaken for starvation, and short
-enough that a genuinely wedged head is unblocked in seconds rather than only when the horde faults its job."""
-
-_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS = 180.0
-"""How long the head-priority dispatch barrier may hold before the head is declined outright. New dispatch is
-barred while the barrier holds, so the running siblings drain and the head normally admits well inside this
-window; if it still cannot be admitted this long after the barrier engaged (a sibling that never completes, or
-a head that will not fit even as the card empties), the head is faulted for reissue with retryable semantics
-rather than left to rot, and the barrier releases. Three times the engage bound: long enough that draining
-siblings win the race in practice, bounded so a permanently unfittable head fails fast."""
 
 _DISPATCH_ANTI_STARVATION_TTL_FRACTION = 0.3
 """Fraction of a queued head's ttl past which resident-model bypass yields so the head's own preload runs.
@@ -432,15 +351,6 @@ winnable window, and by the time it dispatches the horde has aborted it as too s
 anchored at ``time_popped`` and the job's own ttl, closes that gap independently of the skip budget. Sized
 below the affinity budget fraction so the head reclaims its slot with enough of the ttl left for its own
 staging, sampling, and submission."""
-
-_SAFETY_RECOVERY_HOLD_TTL_SECONDS = 120.0
-"""How long the safety-recovery admission hold may keep new preloads off a saturated card while the safety
-pool crash-loops before it releases. The hold exists to let the card drain so a deferred safety GPU start can
-succeed; if the safety pool still cannot start this long after the hold engaged, holding inference longer only
-starves the card without helping, so the hold releases and logs CRITICAL plus a ledger event to surface the
-stuck condition (the give-up machinery already watches safety-pool health, so this does not re-escalate).
-Chosen above a normal drain-and-respawn window and bounded so a permanently stuck safety pool cannot wedge
-inference intake."""
 
 
 class VaeLanePauseRequester(enum.StrEnum):
@@ -553,8 +463,6 @@ class InferenceScheduler:
     _performance_model: PerformanceModel | None
 
     _preload_delay_notified: bool
-    _model_recently_missing: bool
-    _model_recently_missing_time: float
     _pending_line_skip: NextJobAndProcess | None
     _model_last_in_demand: dict[str, float]
     _vram_budget: VramBudget
@@ -565,7 +473,6 @@ class InferenceScheduler:
     _diagnostics: DiagnosticThrottle
     _last_budget_defer_reason: str | None
     _context_reduction_at: dict[int | None, float]
-    _last_preload_admission: LatestPreloadAdmission | None
     _post_processing_lane_commitments_provider: Callable[[], int]
     _pool_protected_models_provider: Callable[[], frozenset[str]]
     _on_pool_pressure_eviction: Callable[[str], None]
@@ -695,10 +602,8 @@ class InferenceScheduler:
         # The ledger-driven admission overlay. The baseline provider yields the reconciler's measured
         # shared-device baseline (MB) per card, wired by the manager (None until wired, and in standalone unit
         # tests: the overlay then reads baseline 0, so capacity is the raw total and the measured gate matches
-        # the predictive gate). The per-card counters/headroom feed run-metrics calibration visibility.
+        # the predictive gate).
         self._admission_baseline_provider: Callable[[int | None], float | None] | None = None
-        self._admission_denials_by_device: dict[int, int] = {}
-        self._admission_headroom_mb_by_device: dict[int, float | None] = {}
         # The device-free governor's growth hold per card, set each tick by the parent. True while a card is at
         # PRESSURE or SATURATED (device-level free VRAM below the soft floor): the scheduler must not grow the
         # card's VRAM footprint (no new model brought to VRAM on a process that does not already hold it, no
@@ -749,13 +654,6 @@ class InferenceScheduler:
         # through the single reclaim owner. The per-job map stamps when each held job first held, so a release is
         # attributed to reclaim (this gate emitted eviction commands for it) versus natural free (device-free
         # recovered on its own); the counters are calibration visibility only.
-        # Session tallies for the staged-job admission cap: how often each measurement held the cap at the
-        # sampling-slot count, and the reason last logged with when it was logged and how many identical
-        # deferrals were suppressed behind it. Read into the duty-cycle summary, so a duty figure short of
-        # target can be read across to the clause leaving spare processes idle.
-        self._staging_defers: dict[StagingDeferReason, int] = {}
-        self._staging_defer_log_state: tuple[StagingDeferReason, float, int] | None = None
-
         self._dispatch_hold_since: dict[str, float] = {}
         self._dispatch_hold_reclaim_requested: set[str] = set()
         self._dispatch_reconciliation_holds = 0
@@ -867,8 +765,6 @@ class InferenceScheduler:
         self._last_ram_verdict: RamPressureVerdict | None = None
 
         self._preload_delay_notified = False
-        self._model_recently_missing = False
-        self._model_recently_missing_time = 0.0
         self._pending_line_skip = None
         self._model_last_in_demand = {}
 
@@ -894,7 +790,6 @@ class InferenceScheduler:
         self._component_charge_fallback_logged: set[str] = set()
         self._weights_root: Path | None = None
         self._diagnostics = DiagnosticThrottle(self._clock)
-        self._last_preload_admission = None
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
         # Sustained per-card minimum of measured foreign (non-worker) VRAM usage, folded into each device
@@ -933,10 +828,6 @@ class InferenceScheduler:
         # multi-tick bookkeeping (shed cards, draining processes), exposed under the historical attribute
         # names through the _ram_pressure_shed_cards / _processes_draining_for_ram properties.
         self._governor = ResourceGovernor(host=self)
-        # When a heavy head was last admitted through the foreign-pressure physical-fit branch. Its load
-        # equally holds the queue, so this bounds a wedge grace that the whole-card establishment grace does
-        # not cover. 0.0 when none is loading.
-        self._heavy_head_admitted_at: float = 0.0
         # Edge-trigger latch for the disclosure that whole-card residency is off because its config flag
         # never resolved to a value (as distinct from resolving to False, which is an operator choice).
         self._whole_card_flag_unresolved_disclosed: bool = False
@@ -946,47 +837,10 @@ class InferenceScheduler:
         # floor was last reported as holding a ready different-model head off that card. Cleared when the
         # residency restores, so each episode's floor is stated once.
         self._min_hold_disclosed: dict[int | None, str | None] = {}
-        # Head-of-queue starvation clock. Tracks the id of the job currently at the head of the queue and
-        # when it first became budget-deferred onto an idle device. It only feeds
-        # the arbiter's starvation diagnostic (a warning naming the arithmetic once a head is deferred past
-        # the diagnostic horizon with reclaim exhausted). Reset when the head changes, a job dispatches, or a
-        # live job takes the device.
-        self._head_starvation_job_id: str | None = None
-        self._head_starvation_since: float = 0.0
-
-        # Head-of-queue RAM-defer starvation clock and the dispatch barrier it latches. The clock tracks the
-        # head job whose preload the system-RAM verdict is continuously deferring behind live work, and when
-        # that defer began; the head-starvation clock above is forced to zero whenever any job is in progress,
-        # so it cannot see this behind-a-busy-sibling case. Once the continuous defer outlives
-        # _HEAD_RAM_DEFER_BARRIER_SECONDS with reclaim freeing nothing, the barrier latches (its job id and
-        # latch time recorded): new inference dispatch to other slots is withheld so the running siblings drain
-        # to the no-live-consumer best-effort admit that seats the head. Both clear on the head's admission,
-        # dispatch, fault, or departure. See _apply_ram_verdict, start_inference, and _reconcile_head_priority_barrier.
-        self._head_ram_defer_job_id: str | None = None
-        self._head_ram_defer_since: float = 0.0
-        self._head_priority_barrier_job_id: str | None = None
-        self._head_priority_barrier_since: float = 0.0
-        self._head_priority_barrier_withhold_logged: bool = False
-
-        # Safety-recovery admission hold. When the safety pool is crash-looping while a safety GPU start stays
-        # deferred on a saturated card, new preload admissions on that card are held and idle reclaim is nudged
-        # so the card can drain and the safety pool can start. Records when the hold engaged (0.0 when inactive)
-        # and whether its engage notice has been emitted, so the edge is announced once. Bounded by
-        # _SAFETY_RECOVERY_HOLD_TTL_SECONDS. See _safety_recovery_hold_active.
-        self._safety_recovery_hold_since: float = 0.0
-        self._safety_recovery_hold_logged: bool = False
-        # Per-episode latch set when the hold gives up at its TTL. While set (and the crash-loop condition
-        # still persists) the hold does not re-engage or re-log, so a stuck safety pool admits normally rather
-        # than re-holding one preload per TTL window forever. Cleared by _release_safety_recovery_hold once the
-        # condition clears, so a later recurrence is a fresh episode that may hold and expire again.
-        self._safety_recovery_hold_expired: bool = False
-
-        # Dispatch-stall diagnostic throttle. When the queue has work but nothing dispatches, the scheduler
-        # would otherwise return None silently; this records the last reason logged and when, so the
-        # explanation is emitted at most once per interval (and immediately when the reason changes) rather
-        # than every sub-second control-loop tick.
-        self._dispatch_stall_last_reason: str | None = None
-        self._dispatch_stall_log_time: float = 0.0
+        # Clocks, latches and records about the head of the queue: its idle-device starvation, the RAM-defer
+        # barrier, the safety-recovery admission hold, the last admission decision, staging deferrals, the
+        # missing-model latch, the dispatch-stall diagnostic and the heavy-head load grace.
+        self._head_admission = HeadAdmissionLedger(self._clock)
 
         # The parent's measured WDDM demand-paging verdict (per-process GPU shared-segment usage on the
         # worker's own children). While set, retention is denied; the rising edge triggers an idle-VRAM
@@ -1032,14 +886,6 @@ class InferenceScheduler:
         predictive gate admits.
         """
         self._admission_baseline_provider = provider
-
-    def latest_admission_denials(self, *, device_index: int | None = None) -> int:
-        """Return the count of measured-floor admission denials on a card this run (calibration visibility)."""
-        return self._admission_denials_by_device.get(device_index if device_index is not None else 0, 0)
-
-    def latest_admission_headroom_mb(self, *, device_index: int | None = None) -> float | None:
-        """Return the last measured-floor admission headroom (MB) on a card, or None when the floor was unapplied."""
-        return self._admission_headroom_mb_by_device.get(device_index if device_index is not None else 0)
 
     def set_disaggregation_hooks(
         self,
@@ -1102,10 +948,6 @@ class InferenceScheduler:
             return decode_spike_mb
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         return effective_post_process_vram_quota_mb(total_vram_mb)
-
-    def latest_preload_admission(self) -> LatestPreloadAdmission | None:
-        """Return the most recent preload-admission decision, for the supervisor snapshot."""
-        return self._last_preload_admission
 
     def latest_host_memory_governance_snapshot(self) -> HostMemorySnapshot | None:
         """Return the latest host-memory governance input snapshot, or None before the first tick."""
@@ -1300,7 +1142,7 @@ class InferenceScheduler:
         other preload. An unsized or missing forecast keeps the conservative isolation.
         """
         if not self._job_tracker.is_admitted_over_budget(job):
-            self._heavy_head_admitted_at = self._clock()
+            self._head_admission.note_heavy_head_admitted()
         self._job_tracker.mark_admitted_over_budget(job)
         if self._runtime_config.bridge_data.overbudget_exclusive_mode and (
             forecast is None or forecast.admit_requires_isolation
@@ -3368,9 +3210,7 @@ class InferenceScheduler:
 
         Read by the recovery supervisor: such a head bypasses the establish grace yet its load holds the queue.
         """
-        if self._heavy_head_admitted_at == 0.0:
-            return False
-        return (self._clock() - self._heavy_head_admitted_at) < HEAVY_HEAD_LOAD_GRACE_SECONDS
+        return self._head_admission.heavy_head_load_grace_active(HEAVY_HEAD_LOAD_GRACE_SECONDS)
 
     def card_residency(self, device_index: int | None) -> tuple[str | None, str]:
         """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
@@ -3646,6 +3486,17 @@ class InferenceScheduler:
         else:
             worker_shed.shed_process_count = worker_shed.planned_process_count - loaded
 
+    # ---- head-of-queue admission state -------------------------------------------------------------------
+    # The starvation clock, the RAM-defer barrier, the safety-recovery hold, the missing-model latch and the
+    # dispatch-stall diagnostic. The state and its step decisions live in
+    # :mod:`horde_worker_regen.process_management.scheduling.ledgers.head_admission`; the log lines, ledger
+    # events and actuations stay here.
+
+    @property
+    def head_admission(self) -> HeadAdmissionLedger:
+        """Clocks, latches and records about the head of the queue's admission."""
+        return self._head_admission
+
     def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
         """Track how long the current head-of-queue job has been stuck on an otherwise-idle device.
 
@@ -3655,21 +3506,14 @@ class InferenceScheduler:
         the queue's age.
         """
         head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
-        in_progress_blocks_idle_fill = len(self._job_tracker.jobs_in_progress) > 0
-        if head_id is None or in_progress_blocks_idle_fill:
-            self._head_starvation_job_id = None
-            self._head_starvation_since = 0.0
-            return
-        if head_id != self._head_starvation_job_id:
-            self._head_starvation_job_id = head_id
-            self._head_starvation_since = self._clock()
+        self._head_admission.track_head_starvation(
+            head_id,
+            work_in_progress=len(self._job_tracker.jobs_in_progress) > 0,
+        )
 
     def _head_starved_seconds(self, job: ImageGenerateJobPopResponse) -> float:
         """Seconds this job has been the idle-device head, or 0.0 when it is not the tracked head."""
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None or job_id != self._head_starvation_job_id or self._head_starvation_since == 0.0:
-            return 0.0
-        return self._clock() - self._head_starvation_since
+        return self._head_admission.starved_seconds(str(job.id_) if job.id_ is not None else None)
 
     def _undispatched_head(self) -> ImageGenerateJobPopResponse | None:
         """Return the first queued job no process is running yet (the head of queue), or None when there is none."""
@@ -3700,8 +3544,7 @@ class InferenceScheduler:
 
     def _clear_head_starvation_timer(self) -> None:
         """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
-        self._head_starvation_job_id = None
-        self._head_starvation_since = 0.0
+        self._head_admission.clear_head_starvation()
         # A dispatch means the card is fed, so the idle-fill breaker (if armed) is done; disarm it and
         # restart the ladder so the next idle episode begins at the smallest, quickest rung.
         if self._state.wants_idle_fill_candidate:
@@ -3718,10 +3561,9 @@ class InferenceScheduler:
         the head is no longer starved or no sibling is free.
         """
         threshold = bridge_data.idle_fill_threshold_seconds
+        starvation_since = self._head_admission.starvation_since
         starved_long_enough = (
-            threshold is not None
-            and self._head_starvation_since > 0.0
-            and (self._clock() - self._head_starvation_since) >= threshold
+            threshold is not None and starvation_since > 0.0 and (self._clock() - starvation_since) >= threshold
         )
         has_free_sibling = self._process_map.get_first_available_inference_process() is not None
         if starved_long_enough and has_free_sibling:
@@ -3729,6 +3571,175 @@ class InferenceScheduler:
         elif self._state.wants_idle_fill_candidate:
             self._state.wants_idle_fill_candidate = False
             self._state.idle_fill_rung = 0
+
+    def _govern_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, made_reclaim_progress: bool) -> None:
+        """Advance the head RAM-defer clock and latch, release or hard-cap the head-priority barrier.
+
+        Reached only when the head-of-queue preload cannot fit system RAM and the RAM branch resolved to defer
+        while a live job still holds memory (with no live consumer the caller best-effort admits instead, so
+        the head never starves there). The step is decided by :meth:`HeadAdmissionLedger.govern_ram_defer`; a
+        deliberate RAM-reclaim process cycle inside its grace suppresses the barrier so an actively resolving
+        defer is never mistaken for starvation.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        step = self._head_admission.govern_ram_defer(
+            job_id,
+            made_reclaim_progress=made_reclaim_progress,
+            reclaim_grace_active=self.ram_reclaim_cycle_grace_active(),
+        )
+        if step is HeadRamDeferStep.RELEASE_BARRIER:
+            self._release_head_priority_barrier(reason="reclaim progress")
+        elif step is HeadRamDeferStep.DECLINE_HEAD:
+            self._decline_head_priority_barrier(job)
+        elif step is HeadRamDeferStep.ENGAGE_BARRIER:
+            self._engage_head_priority_barrier(job)
+
+    def _resolve_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, reason: str) -> None:
+        """Clear the RAM-defer clock and release the barrier once this head's preload is admitted."""
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is not None and self._head_admission.resolve_ram_defer(job_id):
+            self._release_head_priority_barrier(reason=reason)
+
+    def _engage_head_priority_barrier(self, job: ImageGenerateJobPopResponse) -> None:
+        """Latch the head-priority dispatch barrier for a starved head (edge-triggered).
+
+        While latched, :meth:`start_inference` withholds new dispatch to every slot but the head's own, so the
+        running jobs drain to the no-live-consumer best-effort admit that finally seats the head.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None or not self._head_admission.engage_barrier(job_id):
+            return
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>Head-of-queue model {} has been RAM-deferred behind live work for over "
+            f"{HEAD_RAM_DEFER_BARRIER_SECONDS:.0f}s with reclaim freeing nothing; withholding new dispatch to "
+            "other slots so the running jobs drain and the head can load.</>",
+            job.model,
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.HEAD_PRIORITY_BARRIER_ENGAGED,
+            job_id=job_id,
+            reason="head RAM-deferred behind live work past the starvation bound",
+            detail={"model": job.model},
+        )
+
+    def _release_head_priority_barrier(self, *, reason: str) -> None:
+        """Release the head-priority dispatch barrier (edge-triggered) so normal dispatch resumes."""
+        released_id = self._head_admission.release_barrier()
+        if released_id is None:
+            return
+        logger.opt(ansi=True).info(
+            f"<fg #f0beff>Head-priority dispatch barrier released ({reason}); resuming normal dispatch.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.HEAD_PRIORITY_BARRIER_RELEASED,
+            job_id=released_id,
+            reason=reason,
+        )
+
+    def _decline_head_priority_barrier(self, job: ImageGenerateJobPopResponse) -> None:
+        """Fault a head the barrier could not unblock within the cap, then release the barrier.
+
+        The fault is retryable and resource-classed through the existing job fault machinery so the horde
+        reissues the job promptly, the least-destructive terminal path: no model quarantine and no ceiling
+        hold, because the block is transient host-RAM pressure behind live work, not an unroutable model.
+        """
+        logger.opt(colors=True).warning(
+            "<fg #f0beff>Head-of-queue model {} could not be admitted within "
+            f"{HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding the dispatch barrier; faulting it for "
+            "reissue and releasing the barrier.</>",
+            job.model,
+        )
+        self._job_tracker.handle_job_fault_now(
+            job,
+            is_resource_failure=True,
+            retryable=True,
+            fault_reason=(
+                f"head-of-queue preload could not fit system RAM within "
+                f"{HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding new dispatch; reissuing"
+            ),
+            fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY,
+        )
+        self._head_admission.clear_ram_defer(str(job.id_) if job.id_ is not None else None)
+        self._release_head_priority_barrier(reason="hard-cap decline")
+
+    def _reconcile_head_priority_barrier(self, head_job: ImageGenerateJobPopResponse | None) -> None:
+        """Clear the RAM-defer clock and release the barrier when their head is no longer the queue front.
+
+        A head that dispatched, faulted, or was cancelled by the horde is no longer at the front, so its
+        barrier must not outlive it and hold dispatch for a job that has departed.
+        """
+        head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
+        if self._head_admission.reconcile_to_head(head_id):
+            self._release_head_priority_barrier(reason="head departed")
+
+    def _safety_recovery_hold_active(self, target_device_index: int | None) -> bool:
+        """Whether a crash-looping safety pool on a saturated card is holding new preload admissions here.
+
+        The hold engages when the safety pool is crash-looping and a safety GPU start is deferred for want of
+        device headroom, for a preload that would land on the same card as that deferred start (a single-GPU
+        worker holds worker-wide). While held it nudges idle reclaim toward the card so it can drain and the
+        safety pool can start. It releases when the pool starts or its crash-loop signal clears, and expires at
+        :data:`SAFETY_RECOVERY_HOLD_TTL_SECONDS` (logged CRITICAL so a stuck safety pool is loud), latching the
+        episode so a permanently stuck pool does not re-hold one preload per TTL window. The lifecycle reads are
+        ``is True``-guarded so a mocked lifecycle never trips the hold.
+        """
+        crash_looping = (
+            self._process_lifecycle.safety_pool_failing is True
+            and self._process_lifecycle.has_pending_safety_starts() is True
+        )
+        targets_card = crash_looping and (
+            target_device_index is None
+            or target_device_index in self._process_lifecycle.pending_safety_start_device_indices()
+        )
+        step = self._head_admission.recovery_hold_step(crash_looping=crash_looping, targets_card=targets_card)
+        if step is SafetyRecoveryHoldStep.RELEASED:
+            self._release_safety_recovery_hold(reason="safety pool started or recovered")
+            return False
+        if step is SafetyRecoveryHoldStep.ENGAGED:
+            self._engage_safety_recovery_hold(target_device_index)
+            return True
+        if step is SafetyRecoveryHoldStep.EXPIRED:
+            self._expire_safety_recovery_hold(target_device_index)
+            return False
+        return step is SafetyRecoveryHoldStep.HOLDING
+
+    def _engage_safety_recovery_hold(self, target_device_index: int | None) -> None:
+        """Announce the safety-recovery admission hold once and nudge idle reclaim so the card can drain."""
+        logger.opt(ansi=True).warning(
+            "<fg #f0beff>Safety pool is crash-looping while its GPU start is deferred on a saturated card; "
+            "holding new inference preloads and reclaiming idle VRAM so the card can drain for safety.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.SAFETY_RECOVERY_HOLD_ENGAGED,
+            reason="safety pool crash-looping with a deferred GPU start on a saturated card",
+            detail={"device_index": target_device_index},
+        )
+        self.unload_models(under_pressure=True)
+
+    def _release_safety_recovery_hold(self, *, reason: str) -> None:
+        """Announce the release of an engaged safety-recovery admission hold (edge-triggered)."""
+        logger.opt(ansi=True).info(
+            f"<fg #f0beff>Safety-recovery admission hold released ({reason}); resuming inference preloads.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED,
+            reason=reason,
+        )
+
+    def _expire_safety_recovery_hold(self, target_device_index: int | None) -> None:
+        """Announce, CRITICAL and once, that the hold gave up at its TTL with the safety pool still not started."""
+        logger.opt(ansi=True).critical(
+            "<fg #ff5f5f>Safety pool still cannot start "
+            f"{SAFETY_RECOVERY_HOLD_TTL_SECONDS:.0f}s after the safety-recovery admission hold engaged; "
+            "releasing the hold so inference is not starved. The safety pool needs operator attention.</>",
+        )
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED,
+            reason="ttl expired: safety pool still not started",
+            detail={"device_index": target_device_index},
+        )
 
     def _diagnose_dispatch_stall(
         self,
@@ -3812,7 +3823,7 @@ class InferenceScheduler:
             # the defer notice is coalesced on an unchanged reason, so a head that has been declined for the
             # same arithmetic all along has no live line to read. The record is only quoted when it names this
             # head's model, since it holds the most recent decision for any job.
-            admission = self._last_preload_admission
+            admission = self._head_admission.last_preload_admission
             if admission is not None and admission.model == head.model and admission.reason:
                 return SlotDutyBucket.PRELOAD_DEFERRED, (
                     f"its model is not resident and its preload was declined ({admission.decision.value}): "
@@ -3970,7 +3981,7 @@ class InferenceScheduler:
         The stable stall attribution (no ticking figures), cleared when a job dispatches. Read by the
         recovery coordinator to judge remedy relevance and by the work ledger for operator disclosure.
         """
-        return self._dispatch_stall_last_reason
+        return self._head_admission.stall_reason
 
     def _log_dispatch_stall_if_needed(
         self,
@@ -3978,34 +3989,30 @@ class InferenceScheduler:
     ) -> None:
         """Emit a throttled explanation when a parked head is not dispatching despite pending work.
 
-        Only fires once the head has been undispatched past :data:`_DISPATCH_STALL_MIN_SECONDS` (so a normal
-        between-jobs gap is silent), then at most once per :data:`_DISPATCH_STALL_LOG_INTERVAL_SECONDS` for an
+        Only fires once the head has been undispatched past :data:`DISPATCH_STALL_MIN_SECONDS` (so a normal
+        between-jobs gap is silent), then at most once per :data:`DISPATCH_STALL_LOG_INTERVAL_SECONDS` for an
         unchanged reason. The line carries the quantities that advance every cycle (how long the head has been
         parked, how often it has been passed) so the compared reason can stay stable across a sustained block.
         Read-only: it explains the stall, it does not change scheduling.
         """
         head = self._undispatched_head()
-        if head is None or self._head_starved_seconds(head) < _DISPATCH_STALL_MIN_SECONDS:
+        if head is None or self._head_starved_seconds(head) < DISPATCH_STALL_MIN_SECONDS:
             return
         try:
             reason = self._diagnose_dispatch_stall(head, stable_diffusion_reference)
         except Exception as e:  # noqa: BLE001 - a diagnostic must never crash the scheduling cycle
             reason = f"undiagnosed ({type(e).__name__}: {e})"
 
-        now = time.monotonic()
-        if (
-            reason == self._dispatch_stall_last_reason
-            and (now - self._dispatch_stall_log_time) < _DISPATCH_STALL_LOG_INTERVAL_SECONDS
-        ):
+        if not self._head_admission.note_stall(reason):
             return
-        self._dispatch_stall_last_reason = reason
-        self._dispatch_stall_log_time = now
         logger.opt(colors=True).warning(
             "<fg #ff8c69>Inference dispatch stalled: head {} ({}) has been parked "
             f"{self._head_starved_seconds(head):.0f}s: {reason}{self._affinity_bypass_note(head)}.</>",
             str(head.id_)[:8],
             head.model,
         )
+
+    # ---- end head-of-queue admission state ---------------------------------------------------------------
 
     def record_slot_duty(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Attribute the wall clock since the last scheduling cycle across the configured inference slots.
@@ -5074,8 +5081,9 @@ class InferenceScheduler:
             per_process_reserved,
         )
         noise_buffer_mb = self._admission_margin_mb(device_index, raw_total_mb)
-        self._admission_headroom_mb_by_device[device_index if device_index is not None else 0] = (
-            None if device_free_mb is None else device_free_mb - planned_mb - noise_buffer_mb
+        self._head_admission.note_admission_headroom(
+            device_index,
+            None if device_free_mb is None else device_free_mb - planned_mb - noise_buffer_mb,
         )
 
         override_mb = self._config_overhead_override_mb()
@@ -5540,21 +5548,12 @@ class InferenceScheduler:
         """Tally a staging deferral and log it when the reason changes (or after a long unchanged run).
 
         The cap is consulted several times per scheduling pass, so the reason edge is what carries
-        information; an unchanged run is restated only every :data:`_STAGING_DEFER_REPEAT_SECONDS` with the
+        information; an unchanged run is restated only every :data:`STAGING_DEFER_REPEAT_SECONDS` with the
         count it stood for. Emitted at debug, since holding staging back is ordinary backpressure.
         """
-        self._staging_defers[reason] = self._staging_defers.get(reason, 0) + 1
-
-        now = self._clock()
-        suppressed = 0
-        previous = self._staging_defer_log_state
-        if previous is not None:
-            previous_reason, previous_emit, previous_suppressed = previous
-            if previous_reason is reason and (now - previous_emit) < _STAGING_DEFER_REPEAT_SECONDS:
-                self._staging_defer_log_state = (previous_reason, previous_emit, previous_suppressed + 1)
-                return
-            suppressed = previous_suppressed
-        self._staging_defer_log_state = (reason, now, 0)
+        suppressed = self._head_admission.note_staging_defer(reason)
+        if suppressed is None:
+            return
 
         measured = "no device reading yet" if headroom_mb is None else f"{headroom_mb:.0f}MB free net of reserve"
         suffix = f" (suppressed {suppressed} unchanged repeats)" if suppressed > 0 else ""
@@ -5563,11 +5562,6 @@ class InferenceScheduler:
             f"{process_ceiling}: {reason.value}, {measured} against the {_STAGING_ENCODE_VRAM_MB:.0f}MB a "
             f"staged job's encode working set charges.{suffix}",
         )
-
-    @property
-    def staging_defer_counts(self) -> Mapping[StagingDeferReason, int]:
-        """How many staging deferrals each measurement accounted for this session, keyed by the reason."""
-        return self._staging_defers
 
     def _model_size_tier(self, model_name: str | None) -> ModelSizeTier:
         """Classify a model by how much of the device its inference is expected to want.
@@ -6477,247 +6471,6 @@ class InferenceScheduler:
         self._resolve_head_ram_defer(job, reason="admitted best-effort")
         return True
 
-    def _govern_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, made_reclaim_progress: bool) -> None:
-        """Advance the head RAM-defer starvation clock and latch or hard-cap the head-priority barrier.
-
-        Reached only when the head-of-queue preload cannot fit system RAM and the RAM branch resolved to defer
-        while a live job still holds memory (with no live consumer the caller best-effort admits instead, so
-        the head never starves there). The continuous-defer clock starts at this head's first such defer and
-        restarts on reclaim progress or a change of head, since only a head that keeps deferring with nothing
-        freed is starving. Once the clock outlives ``_HEAD_RAM_DEFER_BARRIER_SECONDS`` the dispatch barrier
-        latches so the running siblings drain to the best-effort escape; a barrier that has held past
-        ``_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS`` without admitting the head declines it for reissue. The barrier
-        is suppressed while a deliberate RAM-reclaim process cycle is still inside its bounded grace, so an
-        actively-resolving defer is never mistaken for starvation.
-        """
-        now = self._clock()
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None:
-            return
-
-        if made_reclaim_progress or job_id != self._head_ram_defer_job_id:
-            self._head_ram_defer_job_id = job_id
-            self._head_ram_defer_since = now
-            if made_reclaim_progress and self._head_priority_barrier_job_id == job_id:
-                self._release_head_priority_barrier(reason="reclaim progress")
-            return
-
-        if (
-            self._head_priority_barrier_job_id == job_id
-            and (now - self._head_priority_barrier_since) >= _HEAD_RAM_DEFER_BARRIER_CAP_SECONDS
-        ):
-            self._decline_head_priority_barrier(job)
-            return
-
-        if (
-            now - self._head_ram_defer_since
-        ) < _HEAD_RAM_DEFER_BARRIER_SECONDS or self.ram_reclaim_cycle_grace_active():
-            return
-
-        self._engage_head_priority_barrier(job)
-
-    def _resolve_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, reason: str) -> None:
-        """Clear the RAM-defer clock and release the barrier once this head's preload is admitted."""
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None:
-            return
-        if job_id == self._head_ram_defer_job_id:
-            self._head_ram_defer_job_id = None
-            self._head_ram_defer_since = 0.0
-        if job_id == self._head_priority_barrier_job_id:
-            self._release_head_priority_barrier(reason=reason)
-
-    def _engage_head_priority_barrier(self, job: ImageGenerateJobPopResponse) -> None:
-        """Latch the head-priority dispatch barrier for a starved head (edge-triggered).
-
-        While latched, :meth:`start_inference` withholds new dispatch to every slot but the head's own, so the
-        running jobs drain to the no-live-consumer best-effort admit that finally seats the head.
-        """
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None or self._head_priority_barrier_job_id == job_id:
-            return
-        self._head_priority_barrier_job_id = job_id
-        self._head_priority_barrier_since = self._clock()
-        self._head_priority_barrier_withhold_logged = False
-        logger.opt(colors=True).warning(
-            "<fg #f0beff>Head-of-queue model {} has been RAM-deferred behind live work for over "
-            f"{_HEAD_RAM_DEFER_BARRIER_SECONDS:.0f}s with reclaim freeing nothing; withholding new dispatch to "
-            "other slots so the running jobs drain and the head can load.</>",
-            job.model,
-        )
-        self._process_lifecycle.action_ledger.record(
-            LedgerEventType.HEAD_PRIORITY_BARRIER_ENGAGED,
-            job_id=job_id,
-            reason="head RAM-deferred behind live work past the starvation bound",
-            detail={"model": job.model},
-        )
-
-    def _release_head_priority_barrier(self, *, reason: str) -> None:
-        """Release the head-priority dispatch barrier (edge-triggered) so normal dispatch resumes."""
-        released_id = self._head_priority_barrier_job_id
-        if released_id is None:
-            return
-        self._head_priority_barrier_job_id = None
-        self._head_priority_barrier_since = 0.0
-        self._head_priority_barrier_withhold_logged = False
-        logger.opt(ansi=True).info(
-            f"<fg #f0beff>Head-priority dispatch barrier released ({reason}); resuming normal dispatch.</>",
-        )
-        self._process_lifecycle.action_ledger.record(
-            LedgerEventType.HEAD_PRIORITY_BARRIER_RELEASED,
-            job_id=released_id,
-            reason=reason,
-        )
-
-    def _decline_head_priority_barrier(self, job: ImageGenerateJobPopResponse) -> None:
-        """Fault a head the barrier could not unblock within the cap, then release the barrier.
-
-        The fault is retryable and resource-classed through the existing job fault machinery so the horde
-        reissues the job promptly, the least-destructive terminal path: no model quarantine and no ceiling
-        hold, because the block is transient host-RAM pressure behind live work, not an unroutable model.
-        """
-        logger.opt(colors=True).warning(
-            "<fg #f0beff>Head-of-queue model {} could not be admitted within "
-            f"{_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding the dispatch barrier; faulting it for "
-            "reissue and releasing the barrier.</>",
-            job.model,
-        )
-        self._job_tracker.handle_job_fault_now(
-            job,
-            is_resource_failure=True,
-            retryable=True,
-            fault_reason=(
-                f"head-of-queue preload could not fit system RAM within "
-                f"{_HEAD_RAM_DEFER_BARRIER_CAP_SECONDS:.0f}s of holding new dispatch; reissuing"
-            ),
-            fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY,
-        )
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is not None and job_id == self._head_ram_defer_job_id:
-            self._head_ram_defer_job_id = None
-            self._head_ram_defer_since = 0.0
-        self._release_head_priority_barrier(reason="hard-cap decline")
-
-    def _reconcile_head_priority_barrier(self, head_job: ImageGenerateJobPopResponse | None) -> None:
-        """Clear the RAM-defer clock and release the barrier when their head is no longer the queue front.
-
-        A head that dispatched, faulted, or was cancelled by the horde is no longer at the front, so its
-        barrier must not outlive it and hold dispatch for a job that has departed.
-        """
-        head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
-        if self._head_ram_defer_job_id is not None and self._head_ram_defer_job_id != head_id:
-            self._head_ram_defer_job_id = None
-            self._head_ram_defer_since = 0.0
-        if self._head_priority_barrier_job_id is not None and self._head_priority_barrier_job_id != head_id:
-            self._release_head_priority_barrier(reason="head departed")
-
-    def _head_priority_barrier_withholds_dispatch(self, next_job: ImageGenerateJobPopResponse) -> bool:
-        """Whether the barrier withholds dispatching ``next_job`` so running siblings drain for the head.
-
-        The barred head keeps its own path to dispatch; every other job is withheld so the card drains to the
-        no-live-consumer best-effort admit that seats the head. Inert (returns False) when no barrier is held.
-        """
-        if self._head_priority_barrier_job_id is None:
-            return False
-        job_id = str(next_job.id_) if next_job.id_ is not None else None
-        return job_id != self._head_priority_barrier_job_id
-
-    def _safety_recovery_hold_active(self, target_device_index: int | None) -> bool:
-        """Whether a crash-looping safety pool on a saturated card is holding new preload admissions here.
-
-        Engages (edge-triggered) when the safety pool is crash-looping and a safety GPU start is deferred for
-        want of device headroom, for a preload that would land on the same card as that deferred start (a
-        single-GPU worker holds worker-wide). While held it nudges idle reclaim toward the card so it can drain
-        and the safety pool can start. Releases when the safety pool starts or its crash-loop signal clears, or
-        when the hold outlives ``_SAFETY_RECOVERY_HOLD_TTL_SECONDS`` (logged CRITICAL so a stuck safety pool is
-        loud). A TTL expiry latches the episode: the hold does not re-engage while the same condition persists,
-        so a permanently stuck safety pool no longer re-holds one preload per TTL window forever; it may hold
-        again only once the condition clears and a fresh episode arises. The lifecycle reads are
-        ``is True``-guarded so a mocked lifecycle never trips the hold.
-        """
-        failing = self._process_lifecycle.safety_pool_failing is True
-        pending = self._process_lifecycle.has_pending_safety_starts() is True
-        if not (failing and pending):
-            self._release_safety_recovery_hold(reason="safety pool started or recovered")
-            return False
-
-        if (
-            target_device_index is not None
-            and target_device_index not in self._process_lifecycle.pending_safety_start_device_indices()
-        ):
-            return False
-
-        if self._safety_recovery_hold_expired:
-            # The TTL already gave up on this episode; do not re-hold or re-log while the same condition
-            # persists. A fresh episode is possible only after the condition clears (the release path runs).
-            return False
-
-        now = self._clock()
-        if self._safety_recovery_hold_since == 0.0:
-            self._safety_recovery_hold_since = now
-            self._engage_safety_recovery_hold(target_device_index)
-
-        if (now - self._safety_recovery_hold_since) >= _SAFETY_RECOVERY_HOLD_TTL_SECONDS:
-            self._expire_safety_recovery_hold(target_device_index)
-            return False
-        return True
-
-    def _engage_safety_recovery_hold(self, target_device_index: int | None) -> None:
-        """Announce the safety-recovery admission hold once and nudge idle reclaim so the card can drain."""
-        self._safety_recovery_hold_logged = True
-        logger.opt(ansi=True).warning(
-            "<fg #f0beff>Safety pool is crash-looping while its GPU start is deferred on a saturated card; "
-            "holding new inference preloads and reclaiming idle VRAM so the card can drain for safety.</>",
-        )
-        self._process_lifecycle.action_ledger.record(
-            LedgerEventType.SAFETY_RECOVERY_HOLD_ENGAGED,
-            reason="safety pool crash-looping with a deferred GPU start on a saturated card",
-            detail={"device_index": target_device_index},
-        )
-        self.unload_models(under_pressure=True)
-
-    def _release_safety_recovery_hold(self, *, reason: str) -> None:
-        """Release the safety-recovery admission hold (edge-triggered) when safety can proceed.
-
-        Also clears the per-episode expiry latch: once the crash-loop condition has cleared, a later
-        recurrence is a fresh episode that may hold and expire again. A hold that had already given up at its
-        TTL emits no second release notice (the expiry already logged one), so the edge stays single.
-        """
-        was_engaged = self._safety_recovery_hold_since != 0.0 or self._safety_recovery_hold_logged
-        self._safety_recovery_hold_since = 0.0
-        self._safety_recovery_hold_logged = False
-        self._safety_recovery_hold_expired = False
-        if not was_engaged:
-            return
-        logger.opt(ansi=True).info(
-            f"<fg #f0beff>Safety-recovery admission hold released ({reason}); resuming inference preloads.</>",
-        )
-        self._process_lifecycle.action_ledger.record(
-            LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED,
-            reason=reason,
-        )
-
-    def _expire_safety_recovery_hold(self, target_device_index: int | None) -> None:
-        """Release the safety-recovery hold at its TTL and latch the episode, logging CRITICAL once.
-
-        The latch keeps the hold from re-engaging while the same crash-loop condition persists, so inference is
-        not re-held one preload per TTL window; :meth:`_release_safety_recovery_hold` clears it when the
-        condition finally clears.
-        """
-        self._safety_recovery_hold_since = 0.0
-        self._safety_recovery_hold_logged = False
-        self._safety_recovery_hold_expired = True
-        logger.opt(ansi=True).critical(
-            "<fg #ff5f5f>Safety pool still cannot start "
-            f"{_SAFETY_RECOVERY_HOLD_TTL_SECONDS:.0f}s after the safety-recovery admission hold engaged; "
-            "releasing the hold so inference is not starved. The safety pool needs operator attention.</>",
-        )
-        self._process_lifecycle.action_ledger.record(
-            LedgerEventType.SAFETY_RECOVERY_HOLD_RELEASED,
-            reason="ttl expired: safety pool still not started",
-            detail={"device_index": target_device_index},
-        )
-
     def _admit_preload_under_budget(
         self,
         job: ImageGenerateJobPopResponse,
@@ -7198,7 +6951,7 @@ class InferenceScheduler:
         the skipper.
 
         Head protection is also released once the head has been parked past
-        :data:`_HEAD_PROTECTION_MAX_STARVE_SECONDS` without dispatching. Reserving room for a head is only
+        :data:`HEAD_PROTECTION_MAX_STARVE_SECONDS` without dispatching. Reserving room for a head is only
         worth anything if the head eventually takes it: a head whose own admission keeps declining holds the
         card empty while runnable siblings that fit are turned away, which serves nobody. The head keeps its
         queue position and first claim on the next opportunity; it simply stops blocking work in the meantime.
@@ -7214,7 +6967,7 @@ class InferenceScheduler:
         if self._whole_card_ledger.governor_deferred_head(device_index, now=self._clock()) == displaced_head.model:
             self._note_head_protection_governor_deferred(displaced_head)
             return None
-        if self._head_starved_seconds(displaced_head) >= _HEAD_PROTECTION_MAX_STARVE_SECONDS:
+        if self._head_starved_seconds(displaced_head) >= HEAD_PROTECTION_MAX_STARVE_SECONDS:
             self._note_head_protection_released(displaced_head)
             return None
         baseline = self._model_metadata.get_baseline(displaced_head.model)
@@ -8644,12 +8397,11 @@ class InferenceScheduler:
         gives the same answer to offline analysis, which previously saw nothing at all from this gate. The
         sink coalesces repeats, so a head declined for the same reason every cycle costs one event.
         """
-        self._last_preload_admission = LatestPreloadAdmission(
-            decision=decision,
+        self._head_admission.record_preload_admission(
+            decision,
             model=job.model if job is not None else None,
             process_id=process.process_id if process is not None else None,
             reason=reason,
-            timestamp=time.time(),
         )
         if self._decision_sink is None or job is None or job.id_ is None:
             return
@@ -9490,11 +9242,9 @@ class InferenceScheduler:
         would keep telling the recovery coordinator a load is still in flight. Read-only; the flag is left as
         written and only ever read through this bound.
         """
-        if not self._model_recently_missing:
-            return False
         budget = self._runtime_config.bridge_data.preload_timeout
-        budget_seconds = float(budget) if isinstance(budget, int | float) else _MISSING_MODEL_LATCH_FALLBACK_SECONDS
-        return (self._clock() - self._model_recently_missing_time) < budget_seconds
+        budget_seconds = float(budget) if isinstance(budget, int | float) else MISSING_MODEL_LATCH_FALLBACK_SECONDS
+        return self._head_admission.missing_model_latched(budget_seconds)
 
     async def _handle_process_missing(self, job: ImageGenerateJobPopResponse) -> None:
         """Recover when the head's model was expected resident but no process holds it.
@@ -9519,10 +9269,8 @@ class InferenceScheduler:
             logger.debug(f"Horde model map: {self._horde_model_map}")
             logger.debug(f"Process map: {self._process_map}")
 
-            self._model_recently_missing = True
-
-            logger.debug(f"Last missing time: {self._model_recently_missing_time}")
-            self._model_recently_missing_time = self._clock()
+            logger.debug(f"Last missing time: {self._head_admission.model_recently_missing_at}")
+            self._head_admission.latch_missing_model()
 
             if not await self._job_tracker.release_in_progress(job):
                 logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
@@ -9772,7 +9520,7 @@ class InferenceScheduler:
             self._note_exclusive_dispatch_suppression(next_job, dispatch_scope)
             return None
 
-        self._model_recently_missing = False
+        self._head_admission.clear_missing_model()
 
         if (
             not information_only
@@ -11380,7 +11128,7 @@ class InferenceScheduler:
         if job_id is None:
             return False
         held_since = self._dispatch_hold_since.get(job_id)
-        return held_since is not None and (self._clock() - held_since) >= _DISPATCH_STALL_MIN_SECONDS
+        return held_since is not None and (self._clock() - held_since) >= DISPATCH_STALL_MIN_SECONDS
 
     def _has_reclaimable_idle_tenancy(
         self,
@@ -11854,7 +11602,7 @@ class InferenceScheduler:
         head = self._undispatched_head()
         if head is None:
             return False
-        return self._head_starved_seconds(head) >= _DISPATCH_STALL_MIN_SECONDS
+        return self._head_starved_seconds(head) >= DISPATCH_STALL_MIN_SECONDS
 
     def latest_dispatch_reconciliation_holds(self) -> int:
         """Return the count of dispatches held for residency reconciliation this run (calibration visibility)."""
@@ -11908,17 +11656,17 @@ class InferenceScheduler:
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
 
-        if self._head_priority_barrier_withholds_dispatch(next_job):
+        if self._head_admission.barrier_withholds(str(next_job.id_) if next_job.id_ is not None else None):
             # A starved head has latched the head-priority barrier: withhold every dispatch but the head's own
             # so the running jobs drain and the head reaches its best-effort admit. The head keeps its queue
             # position and dispatches the moment the barrier releases.
-            if not self._head_priority_barrier_withhold_logged:
+            if not self._head_admission.barrier_withhold_logged:
                 logger.opt(colors=True).info(
                     "<fg #7b7d7d><i>Holding dispatch of job {} behind the head-priority "
                     "barrier so running jobs drain for the starved head.</i></>",
                     str(next_job.id_)[:8],
                 )
-                self._head_priority_barrier_withhold_logged = True
+                self._head_admission.barrier_withhold_logged = True
             return False
 
         if next_job_and_process.line_skip is None and self._job_requires_aux_preparation(next_job):
@@ -12073,7 +11821,7 @@ class InferenceScheduler:
 
         # A job dispatched: any prior stall reason is now stale. Clear it so the
         # orchestrator intent's "Holding dispatch" does not stick after the stall resolves.
-        self._dispatch_stall_last_reason = None
+        self._head_admission.clear_stall()
 
         return True
 

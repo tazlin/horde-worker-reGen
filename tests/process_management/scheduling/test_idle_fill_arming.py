@@ -41,7 +41,7 @@ def _scheduler(*, process_map: ProcessMap, threshold: int | None = 5, state: Wor
 def test_arms_when_head_starved_with_free_sibling() -> None:
     """A head starved past the threshold with a free inference sibling arms the breaker."""
     scheduler, bridge = _scheduler(process_map=_free_sibling_map(), threshold=5)
-    scheduler._head_starvation_since = time.time() - 30.0
+    scheduler.head_admission.starvation_since = time.time() - 30.0
 
     scheduler._update_idle_fill_arm(bridge)
 
@@ -51,7 +51,7 @@ def test_arms_when_head_starved_with_free_sibling() -> None:
 def test_does_not_arm_below_threshold() -> None:
     """A head starved less than the threshold does not arm (a between-jobs gap is not a stall)."""
     scheduler, bridge = _scheduler(process_map=_free_sibling_map(), threshold=5)
-    scheduler._head_starvation_since = time.time() - 1.0
+    scheduler.head_admission.starvation_since = time.time() - 1.0
 
     scheduler._update_idle_fill_arm(bridge)
 
@@ -61,7 +61,7 @@ def test_does_not_arm_below_threshold() -> None:
 def test_does_not_arm_in_steady_state() -> None:
     """With no head starvation clock running (a job is in progress), the breaker never arms."""
     scheduler, bridge = _scheduler(process_map=_free_sibling_map(), threshold=5)
-    scheduler._head_starvation_since = 0.0  # the clock is zeroed whenever a job is in progress
+    scheduler.head_admission.starvation_since = 0.0  # the clock is zeroed whenever a job is in progress
 
     scheduler._update_idle_fill_arm(bridge)
 
@@ -71,7 +71,7 @@ def test_does_not_arm_in_steady_state() -> None:
 def test_does_not_arm_without_a_free_sibling() -> None:
     """A starved head with no idle inference sibling (nothing to run the fill on) does not arm."""
     scheduler, bridge = _scheduler(process_map=_busy_only_map(), threshold=5)
-    scheduler._head_starvation_since = time.time() - 30.0
+    scheduler.head_admission.starvation_since = time.time() - 30.0
 
     scheduler._update_idle_fill_arm(bridge)
 
@@ -81,7 +81,7 @@ def test_does_not_arm_without_a_free_sibling() -> None:
 def test_disabled_when_threshold_none() -> None:
     """A None threshold disables idle-fill entirely: it never arms however long the head is starved."""
     scheduler, bridge = _scheduler(process_map=_free_sibling_map(), threshold=None)
-    scheduler._head_starvation_since = time.time() - 300.0
+    scheduler.head_admission.starvation_since = time.time() - 300.0
 
     scheduler._update_idle_fill_arm(bridge)
 
@@ -94,7 +94,7 @@ def test_disarms_and_resets_ladder_when_no_longer_starved() -> None:
     state.wants_idle_fill_candidate = True
     state.idle_fill_rung = 2
     scheduler, bridge = _scheduler(process_map=_free_sibling_map(), threshold=5, state=state)
-    scheduler._head_starvation_since = 0.0  # head no longer starved
+    scheduler.head_admission.starvation_since = 0.0  # head no longer starved
 
     scheduler._update_idle_fill_arm(bridge)
 
@@ -113,4 +113,4 @@ def test_dispatch_clears_the_breaker_and_ladder() -> None:
 
     assert scheduler._state.wants_idle_fill_candidate is False
     assert scheduler._state.idle_fill_rung == 0
-    assert scheduler._head_starvation_since == 0.0
+    assert scheduler.head_admission.starvation_since == 0.0
