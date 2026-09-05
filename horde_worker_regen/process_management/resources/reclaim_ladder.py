@@ -123,6 +123,9 @@ class ReclaimRungKind(enum.StrEnum):
     PAUSE_VAE_LANE = "pause_vae_lane"
     """Pause the dedicated VAE/image lane so its context and models free."""
     PAUSE_COMPONENT_LANE = "pause_component_lane"
+    PAUSE_UTILITIES_LANE = "pause_utilities_lane"
+    """Stop the image-utilities lane so its CUDA context returns to the card. Issued only for a starved head
+    whose deficit the cheaper rungs cannot close, and only while the lane is idle."""
     """Pause the component/text-encode lane so its context and models free."""
     DEMOTE_SAFETY_WEIGHTS = "demote_safety_weights"
     """Move the safety process's resident weights to host RAM in place, keeping its context and the process.
@@ -138,6 +141,7 @@ LANE_PAUSE_RUNG_KINDS = frozenset(
         ReclaimRungKind.PAUSE_PP_LANE,
         ReclaimRungKind.PAUSE_VAE_LANE,
         ReclaimRungKind.PAUSE_COMPONENT_LANE,
+        ReclaimRungKind.PAUSE_UTILITIES_LANE,
     },
 )
 """The rung kinds that stop a dedicated lane off the GPU, which the issuer must later restore on its own.
@@ -376,6 +380,14 @@ class ReclaimLadderActuator(Protocol):
         """Restart the component/text-encode lane the ladder paused, once the card has recovered."""
         ...
 
+    def pause_utilities_lane(self, device_index: int | None) -> bool:
+        """Stop the idle image-utilities lane so its CUDA context returns to the card."""
+        ...
+
+    def restore_utilities_lane(self, device_index: int | None) -> bool:
+        """Restart the image-utilities lane the ladder paused, once the card has recovered."""
+        ...
+
     def restore_live_contexts(self, device_index: int | None) -> bool:
         """Regrow the card's inference-process pool toward its configured size, once the card has recovered."""
         ...
@@ -435,6 +447,8 @@ def restore_reclaim_rung(rung: ReclaimRung, actuator: ReclaimLadderActuator) -> 
         return actuator.restore_vae_lane(rung.device_index)
     if rung.kind is ReclaimRungKind.PAUSE_COMPONENT_LANE:
         return actuator.restore_component_lane(rung.device_index)
+    if rung.kind is ReclaimRungKind.PAUSE_UTILITIES_LANE:
+        return actuator.restore_utilities_lane(rung.device_index)
     return False
 
 
@@ -636,6 +650,43 @@ class VerifiedReclaimLadder:
         if reduction in episode.restore_obligations:
             return
         episode.restore_obligations.append(reduction)
+
+    def record_lane_pause(
+        self,
+        device_index: int | None,
+        kind: ReclaimRungKind,
+        *,
+        tenant_label: str,
+        promised_mb: float,
+    ) -> None:
+        """Book a lane pause the per-cycle admission path issued for a starved head as a restore obligation.
+
+        The arbiter's ladder can stop a service lane for a head whose deficit nothing cheaper closes; that
+        pause is taken outside any saturation episode, so without a record nothing would bring the lane back.
+        Booking it here puts the restart on the same footing as a ladder-issued pause: unwound LIFO with the
+        rest once the governor calls the card HEALTHY, through the owner-guarded restore path. Idempotent per
+        card and kind: a head that re-asks every cycle books one obligation, not one per ask.
+
+        Args:
+            device_index: The card the lane was stopped on; ``None`` is the worker-wide (single-GPU) scope.
+            kind: The lane-pause rung kind that was actuated.
+            tenant_label: The lane name for the restore log line.
+            promised_mb: What the pause was expected to return (MB), for the same line.
+        """
+        if kind not in LANE_PAUSE_RUNG_KINDS:
+            return
+        episode = self._episodes.get(device_index)
+        if episode is None:
+            episode = _Episode()
+            self._episodes[device_index] = episode
+        for obligation in episode.restore_obligations:
+            if isinstance(obligation, ReclaimRung) and obligation.kind is kind:
+                return
+        episode.restore_obligations.append(
+            ReclaimRung(
+                kind=kind, device_index=device_index, promised_freed_mb=promised_mb, tenant_label=tenant_label
+            ),
+        )
 
     def has_context_reduction(self, device_index: int | None) -> bool:
         """Whether an outstanding live-context reduction on ``device_index`` still owes the card its pool back."""
@@ -933,6 +984,10 @@ class VerifiedReclaimLadder:
                 acted = actuator.demote_safety_weights(device_index)
             elif command.kind is ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU:
                 acted = actuator.cycle_safety_off_gpu(device_index)
+            elif command.kind is ActuatorCommandKind.PAUSE_POST_PROCESS_LANE:
+                acted = actuator.pause_post_process_lane(device_index)
+            elif command.kind is ActuatorCommandKind.PAUSE_UTILITIES_LANE:
+                acted = actuator.pause_utilities_lane(device_index)
             else:
                 acted = False
             if acted:

@@ -8285,9 +8285,15 @@ class HordeWorkerProcessManager:
             return
         self._session_end_recorded = True
         try:
+            scheduler = self._inference_scheduler
             self._run_metrics.record_session_end(
                 reason=reason,
                 process_recoveries=self.get_run_metrics_snapshot().num_process_recoveries,
+                dispatch_holds=scheduler.latest_dispatch_reconciliation_holds(),
+                dispatch_hold_seconds=scheduler.latest_dispatch_reconciliation_hold_seconds(),
+                dispatch_holds_released_by_reclaim=scheduler.latest_dispatch_reconciliation_released_by_reclaim(),
+                dispatch_holds_released_by_natural_free=scheduler.latest_dispatch_reconciliation_released_by_natural_free(),
+                dispatch_holds_released_by_measured_attempt=scheduler.latest_dispatch_reconciliation_released_by_measured_attempt(),
             )
         except Exception as end_error:  # noqa: BLE001 - session_end is best-effort; never block shutdown
             logger.debug(f"session_end record skipped: {type(end_error).__name__}: {end_error}")

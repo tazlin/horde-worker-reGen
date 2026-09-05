@@ -454,6 +454,10 @@ class TrackedJob:
 
     Counts tracked jobs in ``PENDING_POST_PROCESSING`` and ``POST_PROCESSING`` other than this one. A job
     that requests post-processing behind a busy lane pays a tail its own generation did not cause."""
+    dispatch_hold_seconds: float | None = None
+    """Seconds this job's dispatch was held by the residency-reconciliation gate before it was admitted;
+    None when it was never held. Recorded by the scheduler on the release so the job record can carry
+    it and the queue wait can be attributed."""
     served_whole_card: bool | None = None
     """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
 
@@ -2308,6 +2312,26 @@ class JobTracker:
         """Whether ``job`` has ever started a measured attempt on ``device_index``."""
         tracked = self._tracked_for(job)
         return tracked is not None and device_index in tracked.measured_attempted_device_indices
+
+    def note_dispatch_hold_seconds(self, job: ImageGenerateJobPopResponse, seconds: float) -> None:
+        """Record how long ``job``'s dispatch was held by the residency gate before it was admitted."""
+        tracked = self._tracked_for(job)
+        if tracked is not None:
+            tracked.dispatch_hold_seconds = max(0.0, seconds)
+
+    def rearm_measured_attempt(self, job: ImageGenerateJobPopResponse) -> None:
+        """Forget a job's spent measured-load probes after the card's process pool changed under it.
+
+        The one-shot exists so a job does not bang a converged card with the same load twice; a process cycle
+        (a RAM reclaim, a scale-down, a replacement) is a different card state, so the job may earn one more
+        real load against it. An in-progress tag is cleared too: the process that carried it is gone.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is None:
+            return
+        tracked.measured_attempt = False
+        tracked.measured_attempt_device_index = None
+        tracked.measured_attempted_device_indices.clear()
 
     def mark_admitted_exclusive(
         self,

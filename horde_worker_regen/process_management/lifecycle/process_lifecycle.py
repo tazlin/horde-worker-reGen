@@ -710,6 +710,14 @@ class ProcessLifecycleManager:
         # restore path clears it; None while the lane is not paused. See :class:`PauseOwner`.
         self._post_process_pause_owner: PauseOwner | None = None
         self._post_process_gpu_pause_count = 0
+        # The image-utilities lane's off-GPU pause, on the same owner contract as the post-processing lane:
+        # the reclaim ladder stops it for a starved head whose deficit nothing cheaper closes, and only the
+        # owner's restore path brings it back. The lane is an external service, so a pause ends its
+        # subprocess through the ordinary replacement state machine and the restore starts it again.
+        self._utilities_gpu_paused = False
+        self._utilities_pause_owner: PauseOwner | None = None
+        self._utilities_gpu_pause_count = 0
+        self._utilities_gpu_restore_count = 0
         self._post_process_gpu_restore_count = 0
         # Marks the *next* post-processing-lane rebuild as an intentional whole-card pause/restore cycle, so
         # its completion is not counted as a crash recovery (mirrors ``_safety_replacement_intentional``).
@@ -1535,6 +1543,10 @@ class ProcessLifecycleManager:
 
     def start_utilities_processes(self) -> bool:
         """Start the dedicated image-utilities lane, if enabled and not already running."""
+        # While a starved head holds the lane off the card this per-tick start hook must not resurrect it;
+        # the owner's restore clears the pause and starts the lane directly.
+        if self._utilities_gpu_paused:
+            return False
         if not self.utilities_process_enabled():
             return False
 
@@ -3024,6 +3036,11 @@ class ProcessLifecycleManager:
         return self._post_process_gpu_paused
 
     @property
+    def is_utilities_gpu_paused(self) -> bool:
+        """Whether the image-utilities lane is being held off-GPU for a starved head."""
+        return self._utilities_gpu_paused
+
+    @property
     def post_process_pause_owner(self) -> PauseOwner | None:
         """Which initiator holds the post-processing lane's off-GPU pause (None when it is not paused).
 
@@ -3099,6 +3116,53 @@ class ProcessLifecycleManager:
         self._post_process_gpu_restore_count += 1
         logger.info(f"{_pause_owner_phrase(owner)}: restarting the post-processing lane after releasing the card.")
         self.start_post_process_processes()
+        return True
+
+    def pause_utilities_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Stop the image-utilities lane so its CUDA context frees for a starved head.
+
+        A no-op (returns False) when the lane is not enabled, is already paused, or is not live. Otherwise
+        records ``owner`` as the pause holder (so only its restore path clears it), sets the override that
+        suppresses the per-tick restart in :meth:`start_utilities_processes`, and triggers the lane's
+        replacement state machine to end the service subprocess; the intentional flag keeps that teardown out
+        of the crash-recovery count. Callers offer this only while the lane is idle (the arbiter's rung is
+        gated on an idle lane), so no strip is stranded by it.
+
+        Args:
+            owner: The subsystem initiating the pause; only this owner's restore path clears it.
+
+        Returns:
+            True if a pause was initiated, False otherwise.
+        """
+        if not self.utilities_process_enabled() or self._utilities_gpu_paused:
+            return False
+        if self._process_map.num_utilities_processes() == 0:
+            return False
+        self._utilities_gpu_paused = True
+        self._utilities_pause_owner = owner
+        self._utilities_gpu_pause_count += 1
+        self._utilities_replacement_intentional = True
+        self._initiate_utilities_replacement()
+        logger.info(f"{_pause_owner_phrase(owner)}: stopping the image-utilities lane to free its VRAM context.")
+        return True
+
+    def restore_utilities_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Bring the image-utilities lane back after ``owner``'s pause, starting it directly.
+
+        A no-op (returns False) when the lane is not paused or ``owner`` is not the holder. The replacement
+        state machine consumed its flag while the pause suppressed its final start, so without this call the
+        lane would stay down for the rest of the session.
+
+        Args:
+            owner: The subsystem requesting the restore; it must match the owner that initiated the pause.
+        """
+        if not self._utilities_gpu_paused or self._utilities_pause_owner is not owner:
+            return False
+        self._utilities_gpu_paused = False
+        self._utilities_pause_owner = None
+        self._utilities_gpu_restore_count += 1
+        logger.info(f"{_pause_owner_phrase(owner)}: restarting the image-utilities lane after releasing the card.")
+        self.start_utilities_processes()
         return True
 
     def _initiate_safety_replacement(self) -> None:

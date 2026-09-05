@@ -219,6 +219,11 @@ class ActuatorCommandKind(StrEnum):
     """Move the safety process's resident weights to host RAM in place, keeping its context and the process."""
     CYCLE_SAFETY_OFF_GPU = "cycle_safety_off_gpu"
     """Cycle the safety model off the GPU to reclaim its context."""
+    PAUSE_POST_PROCESS_LANE = "pause_post_process_lane"
+    """Stop the idle post-processing lane so its CUDA context and resident models return to the card; a
+    starved-head rung, taken after weight reclaim and idle-context teardown have nothing left."""
+    PAUSE_UTILITIES_LANE = "pause_utilities_lane"
+    """Stop the idle image-utilities lane so its CUDA context returns to the card; the last starved-head rung."""
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,14 @@ class VramActuator(Protocol):
 
     def cycle_safety_off_gpu(self, device_index: int | None) -> bool:
         """Cycle the safety model off the GPU to reclaim its context."""
+        ...
+
+    def pause_post_process_lane(self, device_index: int | None) -> bool:
+        """Stop the idle post-processing lane so its context returns to the card."""
+        ...
+
+    def pause_utilities_lane(self, device_index: int | None) -> bool:
+        """Stop the idle image-utilities lane so its context returns to the card."""
         ...
 
 
@@ -357,6 +370,10 @@ class VramRequest:
     """Seconds this head has been the undispatched head of an idle device, used only to time the
     starvation diagnostic and the first-party context teardown grace; zero when a live job holds the card (the
     head is then queued behind live work, not starved)."""
+    probe_after_seconds: float = _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
+    """How long the head must have starved before the measured-load probe may fire at a converged-empty card.
+    The teardown grace by default (once the ladder is empty, waiting longer buys nothing); the scheduler sets
+    it from the card's ``measured_load_probe_seconds``."""
     sampling_peak_mb: float | None = None
     active_sampling_peaks_total_mb: float | None = None
     """The live sum (MB) of the in-flight disaggregated sampling peaks at the moment of this request, for
@@ -365,6 +382,12 @@ class VramRequest:
     figure so a peak booked earlier in the same tick is counted before the cycle snapshot is next refrozen."""
     has_reclaimable_idle_model: bool = False
     """True when an idle resident model on the card could be evicted to reclaim its weights for this request."""
+    has_reclaimable_idle_tenancy: bool = False
+    """Whether an idle lane on the card holds tenancy the parent can unload but the arbiter cannot name as a
+    resident model: warm components held between jobs, or a slot parked on a preload whose dispatch never
+    came. The scheduler reclaims it through its own actuator once the head's hold stands; while it exists the
+    card is not converged-empty, so the measured-load probe waits for that reclaim rather than loading over
+    it."""
     can_reduce_live_contexts: bool = False
     """True when reducing the live inference-context count is a warranted remedy for this head's over-commit."""
     idle_contexts_teardownable: bool = False
@@ -382,6 +405,10 @@ class VramRequest:
     False on the first admission rejection, while existing cache/model reclaim is still being attempted. The
     PP orchestrator enables it only on a fresh measured re-check that remains non-fitting, so a reversible lane
     pause is an escalation after the softer actions rather than a competing first response."""
+    lane_reclaim_permitted: bool = True
+    """Whether policy lets a starved head stop an idle service lane (post-processing, safety off-GPU, the
+    utilities lane) once weight reclaim and idle-context teardown have nothing left. The operator's out for
+    the lane rungs; the per-lane flags on the device state still decide whether each lane is pausable now."""
 
 
 @dataclass(frozen=True)
@@ -961,7 +988,7 @@ class VramArbiter:
         if impossible:
             if not self._ceiling_attempt_eligible(request, measured, state):
                 return None
-        elif not self._measured_attempt_eligible(request, measured):
+        elif not self._measured_attempt_eligible(request, measured, state):
             return None
         key = (request.head_job_id or request.job_label, request.device_index)
         if key in self._measured_attempts_started:
@@ -1093,6 +1120,7 @@ class VramArbiter:
         self,
         request: VramRequest,
         measured: AdmissionVerdict,
+        state: DeviceVramState,
     ) -> bool:
         """Whether the measured-attempt trigger holds: a starved head at a converged-empty card.
 
@@ -1110,11 +1138,33 @@ class VramArbiter:
         from an impossible one; the band continues to describe the uncertainty the ceiling allowance is sized
         from (see :data:`_CEILING_ATTEMPT_OVERSHOOT_CAP_MB`).
         """
-        if request.starved_seconds < _STARVATION_DIAGNOSTIC_SECONDS:
+        if request.starved_seconds < self._probe_delay_seconds(request, measured):
             return False
         if measured.available_mb is None:
             return False
-        return self._card_converged_empty(request, measured)
+        if not self._card_converged_empty(request, measured):
+            return False
+        room = self._room(request, state, measured)
+        # A permitted service-lane rung that would close the deficit is a real remedy still on the ladder; the
+        # speculative load waits for it (reclaim before speculation), so the probe never pre-empts a pause.
+        return room is None or not room.closable
+
+    @staticmethod
+    def _probe_delay_seconds(request: VramRequest, measured: AdmissionVerdict) -> float:
+        """How long the head must have starved before its one real load, sized by how far it misses.
+
+        A shortfall inside :data:`_MEASURED_ATTEMPT_BAND_MB` is the shape a conservative prediction makes, and
+        once the ladder is empty waiting on it buys nothing: the card's configured probe delay applies (the
+        teardown grace by default). A larger shortfall on a card the worker reads as converged is likelier a
+        tenant the ledger cannot see (a child whose unload returned nothing, a foreign process), and admitting
+        a load into it is the one way this path can produce an out-of-memory; that keeps the long diagnostic
+        horizon, the same wait as before, so the reclaim and attribution machinery has its window first.
+        """
+        headroom = measured.headroom_mb
+        shortfall_mb = -headroom if headroom is not None else float("inf")
+        if shortfall_mb <= _MEASURED_ATTEMPT_BAND_MB:
+            return request.probe_after_seconds
+        return max(request.probe_after_seconds, _STARVATION_DIAGNOSTIC_SECONDS)
 
     @staticmethod
     def _card_converged_empty(request: VramRequest, measured: AdmissionVerdict) -> bool:
@@ -1138,6 +1188,7 @@ class VramArbiter:
         return (
             measured.outstanding_reservations_mb <= _CONVERGED_EMPTY_RESERVATION_EPSILON_MB
             and not request.has_reclaimable_idle_model
+            and not request.has_reclaimable_idle_tenancy
             and not request.idle_contexts_teardownable
         )
 
@@ -1216,8 +1267,7 @@ class VramArbiter:
             required_actuations=self._escalation_ladder(state, request),
         )
 
-    @staticmethod
-    def _escalation_ladder(state: DeviceVramState, request: VramRequest) -> tuple[ActuatorCommand, ...]:
+    def _escalation_ladder(self, state: DeviceVramState, request: VramRequest) -> tuple[ActuatorCommand, ...]:
         """Describe the pressure-relief ladder for a non-fitting demand, in escalation order.
 
         Only commands that could still free device memory are emitted. RELEASE_CACHE targets idle lanes (a
@@ -1265,7 +1315,41 @@ class VramArbiter:
             and state.safety_reclaim_allowed
         ):
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None))
+        if not commands:
+            lane_rung = self._starved_head_lane_rung(state, request)
+            if lane_rung is not None:
+                commands.append(lane_rung)
         return tuple(commands)
+
+    def _starved_head_lane_rung(self, state: DeviceVramState, request: VramRequest) -> ActuatorCommand | None:
+        """One service-lane rung for a starved head whose deficit the cheaper rungs cannot close, or None.
+
+        Reached only with an otherwise empty ladder: no idle cache, no idle resident model, no warranted
+        context reduction. The lanes' contexts are physically inside the device-free reading the head is
+        refused on, and each has an owner-guarded pause with a restore, so a head short by what a lane holds
+        has a real remedy the ladder can name. Cheapest first: the post-processing lane, safety off the card,
+        the utilities lane; one per evaluation, so the card gives lanes up one at a time and the next
+        evaluation prices the result. Offered only past the teardown grace (the same clock the idle-context
+        teardown waits out), only when the permitted rungs together would close the deficit (a lane paused
+        for a head that still cannot fit is churn), and never when policy withholds lane reclaim.
+        """
+        if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
+            return None
+        if not request.is_head_of_queue or not request.lane_reclaim_permitted:
+            return None
+        if request.starved_seconds < _FIRST_PARTY_TEARDOWN_GRACE_SECONDS:
+            return None
+        measured = self._measured(request, state)
+        room = self._room(request, state, measured)
+        if room is None or not room.closable:
+            return None
+        if state.post_process_context_count > 0 and state.post_process_reclaim_allowed:
+            return ActuatorCommand(kind=ActuatorCommandKind.PAUSE_POST_PROCESS_LANE, device_index=None)
+        if state.safety_context_count > 0 and state.safety_reclaim_allowed:
+            return ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None)
+        if state.utilities_context_count > 0 and state.utilities_reclaim_allowed:
+            return ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=None)
+        return None
 
     @staticmethod
     def _has_first_party_context_reclaim(request: VramRequest) -> bool:

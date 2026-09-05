@@ -662,8 +662,9 @@ class TestFirstPartyTeardownGraceTiming:
             starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 1.0,
             idle_contexts_teardownable=False,
         )
-        # This card has nothing left to reclaim, so the head's first ask past the horizon spends its one
-        # measured load. The diagnostic is what backstops every ask after that.
+        # This card has nothing left to reclaim, and the shortfall is well past the measured-attempt band, so
+        # the short probe delay does not apply: the head's first ask past the horizon spends its one measured
+        # load. The diagnostic is what backstops every ask after that.
         arbiter.begin_cycle(_snapshot(self._state()))
         arbiter.evaluate(past_diagnostic)
         arbiter.begin_cycle(_snapshot(self._state()))

@@ -65,6 +65,8 @@ async def test_a_hold_records_standing_with_the_room_and_release_with_its_cause(
     released = [record for record in recorder.states if record["state"] == "released"]
     assert len(released) == 1
     assert released[0]["reason"] == "natural_free"
+    tracked = scheduler._job_tracker.get_tracked_job(job.id_)
+    assert tracked is not None and tracked.dispatch_hold_seconds is not None, "the job record carries the hold"
     released_inputs = released[0]["inputs"]
     assert isinstance(released_inputs, dict)
     assert released_inputs["room_deficit_mb"] == inputs["room_deficit_mb"], "the release names what the hold saw"

@@ -769,6 +769,52 @@ therefore the sole reclaim path: a deferred demand emits a release command targe
 process's cache, the preload adapter executes it, and the freed reservation shows up in the next cycle's
 measurement.
 
+## The measured room, the lane rungs, and the probe
+
+The identity refuses on one number. A refusal a person or a reclaim policy can act on needs that number
+decomposed by who holds the card, because each class of holder is returned by a different actuator. Every
+non-admit on a card with a device-free reading therefore carries an `AdmissionRoom`
+(`admission_identity.py`): the device-used reading attributed by tenant class (the requester's own slot, idle
+and busy inference siblings, safety, the post-processing lane, the image-utilities lane, the disaggregation
+lanes, and the foreign remainder), the reclaim rungs that could return room, cheapest first (each idle sibling
+context, the post-processing lane, safety off-GPU, the utilities lane), what each would return, whether policy
+permits it, and whether the permitted rungs together close the deficit. The hold line in the log renders it,
+the `inference_dispatch` deferral and the `dispatch_hold` resource-state records export it
+([stats reference](../reference/stats.md)).
+
+The room is also what the other frames read, so they cannot disagree with the verdict on a card at its edge:
+
+- **Idle-context teardown** is widened from the measured deficit. The structural context count (total minus
+  peak minus reserve, contexts at a constant) still sizes whole-card residency, but a starved head whose
+  deficit a bare idle sibling context would return is marked teardownable and the depth is exactly the
+  contexts needed. A sibling holding a model or warm components is never a candidate, since its eviction or
+  unload is the cheaper rung, and a deficit no context can close leaves the request as it was (a teardown that
+  cannot produce a fit is churn).
+- **Whole-card retirement** judges the alone frame net of the admission margin and the tenancy no teardown
+  returns (the foreign floor, and the utilities lane when policy withholds it), so a claim is retired only
+  against room the dispatch will find. `whole_card_models` pins a model (by name or baseline id) against any
+  retirement.
+- **The service lanes enter the ladder** for a starved head once weight reclaim, cache release and the
+  idle-context teardown have nothing left: the post-processing lane, then safety off the card, then the
+  utilities lane, one per evaluation and only when the permitted rungs would close the deficit. Each pause is
+  booked with the reclaim ladder as a restore obligation, so the lane comes back LIFO with the rest once the
+  governor calls the card healthy. `starved_head_lane_reclaim` withholds the rungs; `starved_head_utilities_pause`
+  withholds the last one.
+- **The measured-load probe** fires once the ladder is empty and the head has starved `measured_load_probe_seconds`
+  (the teardown grace by default). It never pre-empts a rung that could close the deficit, and a shortfall
+  larger than the measured-attempt band keeps the longer diagnostic horizon: a big miss on a card the worker
+  reads as empty is likelier a tenant the ledger cannot see (a child whose unload returned nothing, a foreign
+  process) than arithmetic, and a load into it is the one way this path can produce an out-of-memory. A spent
+  probe is re-armed when the process that carried it goes away.
+- **Recovery defers to a standing hold** inside its liveness bound (the probe clock, the teardown grace and
+  the heavy head's load window end to end), logging the deferral once on each edge; past the bound the hold
+  is a wedge like any other.
+
+The admission margin itself is platform-aware (`vram_admission_noise_mb`): the physics buffer on WDDM, half
+of it where the NVML reading is device-wide, with the operator's override winning whole. The device-free
+governor's pressure floors stay on the physics buffer regardless, because on a device-wide platform an
+over-commit is a hard OOM and those floors are what stand between growth and it.
+
 ## Doomed model prevention
 
 Some models cannot ever run on a card because their minimum footprint exceeds the card's usable capacity

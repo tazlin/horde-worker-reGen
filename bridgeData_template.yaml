@@ -719,6 +719,38 @@ whole_card_exclusive_residency: true
 # streaming. Restored after. Only used with enable_vram_budget and safety_on_gpu.
 whole_card_residency_safety_off_gpu: true
 
+# The VRAM admission margin (MB) subtracted from the measured free reading before a load or dispatch is
+# judged to fit. Unset derives it from the card: 5% of the total on Windows (WDDM), 2.5% where the NVML
+# reading is device-wide (Linux), never below 512 MB. This is the one margin the admission keeps, so a
+# whole-card model on a card at its edge is refused by exactly this much; an operator who has seen a model
+# run with the card to itself can lower it (or set 0). Does not move the device-free governor's floors.
+# vram_admission_noise_mb: 512
+
+# Seconds the head of queue must have starved at a card with nothing left to reclaim before the worker
+# admits one real load to let measured reality decide. The reclaim rungs and the idle-context teardown run
+# first; 0 probes as soon as the ladder is empty. A shortfall larger than the measured-attempt band keeps
+# the longer diagnostic horizon regardless, since a big miss on a card the worker reads as empty is
+# likelier a tenant the ledger cannot see than arithmetic.
+measured_load_probe_seconds: 10
+
+# Whether a head that has starved past the teardown grace, with every cheaper reclaim exhausted, may stop
+# an idle service lane (the post-processing lane, safety off-GPU, the image-utilities lane) to make its
+# room, cheapest first and one at a time; the lanes come back through the reclaim ladder once the card is
+# healthy. false keeps every lane on the card and leaves such a head to the measured-load probe.
+starved_head_lane_reclaim: true
+
+# Whether the image-utilities lane is among the lanes a starved head may stop. It is the last rung and
+# costs the service a restart; false keeps it on the card while the other lanes stay eligible.
+starved_head_utilities_pause: true
+
+# Models the worker must treat as needing the card to itself regardless of what its footprint store has
+# measured, by reference name or by baseline id. The measured-footprint rule retires a whole-card claim
+# when the model looks to leave room for a sibling context; for a model you know runs several times
+# slower beside anything, this keeps the claim.
+# whole_card_models:
+#   - "Qwen-Image_fp8"
+#   - "z_image_turbo"
+
 # How long to hold a whole-card residency in place after its last heavy job drains, before restoring full
 # concurrency and safety-on-GPU. A whole-card event is disruptive (stops processes, cycles safety), so a
 # burst of heavy jobs should reuse one residency rather than each churning a teardown/restore. During the
@@ -863,7 +895,8 @@ capture_kudos_training_data: false
 # extra_slow_worker, preload_timeout, models_to_load, models_to_skip, dynamic_models, allow_lora,
 # allow_controlnet, allow_sdxl_controlnet, allow_post_processing, allow_painting, allow_img2img, nsfw,
 # max_power, max_batch, safety_on_gpu, enable_vram_budget, vram_reserve_mb, vram_to_leave_free,
-# whole_card_exclusive_residency.
+# whole_card_exclusive_residency, vram_admission_noise_mb, measured_load_probe_seconds,
+# starved_head_lane_reclaim, starved_head_utilities_pause, whole_card_models.
 # max_batch caps the images one request may ask this card for; safety_on_gpu is this card's permission to
 # host the safety process (the worker picks one permitted card, or runs safety off-GPU if none permits it).
 # gpu_overrides:

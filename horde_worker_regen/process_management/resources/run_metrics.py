@@ -260,6 +260,10 @@ class JobMetricsRecord(BaseModel):
     to scheduling, and it is a residual wait, not a download duration (a fetch that overlapped other waiting
     contributes only the part the job actually waited on). None for a job carrying no LoRAs, and for a job
     whose auxiliary readiness was never stamped (no prefetch pipeline ran)."""
+    dispatch_hold_seconds: float | None = None
+    """Seconds this job's dispatch was held by the residency-reconciliation gate before it was admitted, or
+    None when it was never held. Part of ``queue_wait_seconds``; the share of the wait the card's tenancy
+    caused rather than scheduling or auxiliary fetching."""
     queue_depth_at_dispatch: int | None = None
     """Other jobs queued for or running inference at the moment this job was dispatched. None when the job
     never reached dispatch."""
@@ -336,6 +340,16 @@ class SessionEndEvent(BaseModel):
     to the number of such lines in the file."""
     process_recoveries: int = 0
     kudos_per_hour: float | None = None
+    dispatch_holds: int = 0
+    """Dispatches the residency-reconciliation gate held at least once this session."""
+    dispatch_hold_seconds: float = 0.0
+    """Cumulative seconds those dispatches spent held."""
+    dispatch_holds_released_by_reclaim: int = 0
+    """Holds released after the gate's own reclaim (eviction, teardown, a lane pause) freed the room."""
+    dispatch_holds_released_by_natural_free: int = 0
+    """Holds released because the card freed on its own (a finishing job, a foreign tenant leaving)."""
+    dispatch_holds_released_by_measured_attempt: int = 0
+    """Holds released by the one-real-load probe rather than by a fit."""
 
 
 class DecisionEvent(BaseModel):
@@ -728,6 +742,7 @@ class WorkerRunMetrics:
         self._session_start_time: float | None = None
         self._exported_jobs_submitted = 0
         self._exported_jobs_faulted = 0
+        self._exported_image_jobs_faulted = 0
         self._decision_states: dict[tuple[DecisionKind, str], _DecisionCoalesceState] = {}
         self._churn_event_times: dict[ChurnKind, list[float]] = {
             "model_swap": [],
@@ -903,6 +918,7 @@ class WorkerRunMetrics:
             sampling_seconds=sampling_seconds,
             model_load_seconds=model_load_seconds,
             lora_wait_seconds=lora_wait_seconds,
+            dispatch_hold_seconds=tracked.dispatch_hold_seconds,
             queue_depth_at_dispatch=tracked.queue_depth_at_dispatch,
             post_processing_depth_at_dispatch=tracked.post_processing_depth_at_dispatch,
             whole_card=tracked.served_whole_card,
@@ -994,6 +1010,16 @@ class WorkerRunMetrics:
             SessionStartEvent(worker_version=self._worker_version, timestamp=now, config=dict(config)),
         )
 
+    @property
+    def exported_image_jobs_faulted(self) -> int:
+        """Image jobs whose ``job_completed`` record this session wrote in the faulted state.
+
+        The job tracker counts a fault only on the submit path, which a dry run never takes; this tally sees
+        every finalized job, including one that sampled and then faulted at the post-processing lane, so a
+        run's finish line can report what the stats stream will show.
+        """
+        return self._exported_image_jobs_faulted
+
     def record_session_end(
         self,
         *,
@@ -1002,6 +1028,11 @@ class WorkerRunMetrics:
         jobs_faulted: int | None = None,
         process_recoveries: int = 0,
         kudos_per_hour: float | None = None,
+        dispatch_holds: int = 0,
+        dispatch_hold_seconds: float = 0.0,
+        dispatch_holds_released_by_reclaim: int = 0,
+        dispatch_holds_released_by_natural_free: int = 0,
+        dispatch_holds_released_by_measured_attempt: int = 0,
         timestamp: float | None = None,
     ) -> None:
         """Emit a ``session_end`` marker with terminal totals. Writes only when export is enabled.
@@ -1025,6 +1056,11 @@ class WorkerRunMetrics:
                 jobs_faulted=faulted,
                 process_recoveries=process_recoveries,
                 kudos_per_hour=kudos_per_hour,
+                dispatch_holds=dispatch_holds,
+                dispatch_hold_seconds=round(dispatch_hold_seconds, 1),
+                dispatch_holds_released_by_reclaim=dispatch_holds_released_by_reclaim,
+                dispatch_holds_released_by_natural_free=dispatch_holds_released_by_natural_free,
+                dispatch_holds_released_by_measured_attempt=dispatch_holds_released_by_measured_attempt,
             ),
         )
 
@@ -1300,6 +1336,8 @@ class WorkerRunMetrics:
             return
         if record.faulted:
             self._exported_jobs_faulted += 1
+            if not record.is_alchemy:
+                self._exported_image_jobs_faulted += 1
         else:
             self._exported_jobs_submitted += 1
 

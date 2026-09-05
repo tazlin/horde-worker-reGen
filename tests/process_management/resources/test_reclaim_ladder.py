@@ -62,6 +62,14 @@ class _FakeActuator:
         self.calls.append(("restore_vae", None))
         return True
 
+    def pause_utilities_lane(self, device_index: int | None) -> bool:
+        self.calls.append(("utilities", None))
+        return True
+
+    def restore_utilities_lane(self, device_index: int | None) -> bool:
+        self.calls.append(("restore_utilities", None))
+        return True
+
     def restore_component_lane(self, device_index: int | None) -> bool:
         self.calls.append(("restore_component", None))
         return True
@@ -818,3 +826,35 @@ class TestSafetyRungCooldown:
         )
         assert actuator.calls == [("safety", None), ("safety", None)]
         assert engine.safety_rungs_refused == 0
+
+
+class TestStarvedHeadLanePauseObligation:
+    """A lane pause the admission path issued for a starved head is restored by the ladder's unwind."""
+
+    def test_recorded_lane_pause_is_unwound_once_when_healthy(self) -> None:
+        """Booked once per card and kind, held through PRESSURE, restored LIFO on the first HEALTHY sample."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        engine.record_lane_pause(
+            0, ReclaimRungKind.PAUSE_UTILITIES_LANE, tenant_label="utilities_lane", promised_mb=487.0
+        )
+        engine.record_lane_pause(
+            0, ReclaimRungKind.PAUSE_UTILITIES_LANE, tenant_label="utilities_lane", promised_mb=487.0
+        )
+        engine.record_lane_pause(0, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post_process_lane", promised_mb=487.0)
+        assert engine.episode_holds_paused_lane(0) is True
+        engine.on_tick(
+            0, saturated=False, healthy=False, device_free_mb=500.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == []
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("restore_pp", None), ("restore_utilities", None)]
+        assert engine.episode_holds_paused_lane(0) is False
+
+    def test_a_non_lane_kind_is_never_booked(self) -> None:
+        """Only lane-pause rungs have a restore to book; anything else is ignored."""
+        engine = VerifiedReclaimLadder()
+        engine.record_lane_pause(0, ReclaimRungKind.SAFETY_OFF_GPU, tenant_label="safety", promised_mb=3044.0)
+        assert engine.episode_holds_paused_lane(0) is False

@@ -53,7 +53,7 @@ from horde_worker_regen.process_management.models.model_metadata import ModelMet
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources.admission_identity import (
     TenantLane,
-    admission_noise_buffer_mb,
+    admission_margin_mb,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.foreign_vram_floor import ForeignVramFloorTracker
@@ -105,8 +105,8 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     ResourceStateSink,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
-    _STARVATION_DIAGNOSTIC_SECONDS,
     ActuatorCommand,
+    ActuatorCommandKind,
     DeviceVramState,
     MeasuredVramSnapshot,
     VramArbiter,
@@ -2299,7 +2299,8 @@ class InferenceScheduler:
         # source of truth for "wants the whole card and never shares". Feed it to the forecast so a baseline
         # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,
         # rather than co-residing and thrashing as Z-Image did.
-        wants_whole_card = self._model_size_tier(job.model) >= _ModelSizeTier.EXTRA_LARGE
+        whole_card_pinned = self._whole_card_pinned(job.model, baseline, device_index=device_index)
+        wants_whole_card = whole_card_pinned or self._model_size_tier(job.model) >= _ModelSizeTier.EXTRA_LARGE
         # A disaggregated job's sampler holds only the UNet, so its forecast charges the sampler-only figure
         # (keeping two samplers co-resident where the whole-job charge collapses them), and the image lane's
         # concurrent decode spike is charged as a sibling context. Class-eligibility (not the liveness-coupled
@@ -2329,23 +2330,30 @@ class InferenceScheduler:
                 if disaggregated
                 else 0.0
             ),
-            admission_noise_mb=admission_noise_buffer_mb(
+            admission_noise_mb=self._admission_margin_mb(
+                device_index,
                 self._process_map.get_reported_total_vram_mb(device_index=device_index),
             ),
+            whole_card_pinned=whole_card_pinned,
             unpausable_tenancy_mb=self._unpausable_tenancy_mb(device_index),
         )
 
     def _unpausable_tenancy_mb(self, device_index: int | None) -> float:
         """Device tenancy (MB) on the card that no sole-residency teardown returns.
 
-        The sustained foreign floor (VRAM the OS, desktop or other processes hold) and the utilities lane,
-        which has no off-GPU actuator, priced at its measured reservation plus a context. Safety and the
-        post-processing lane are not here: the residency conversion pauses both. The forecast's alone frame
-        subtracts this so a whole-card claim is retired only against room the dispatch will actually find.
+        The sustained foreign floor (VRAM the OS, desktop or other processes hold), plus the utilities lane
+        at its measured reservation and a context when policy withholds lane reclaim (with it permitted the
+        lane is a rung like the others). Safety and the post-processing lane are not here: the residency
+        conversion pauses both. The forecast's alone frame subtracts this so a whole-card claim is retired
+        only against room the dispatch will actually find.
         """
         device_key = device_index if device_index is not None else 0
         foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
         tenancy_mb = max(0.0, foreign_floor_mb or 0.0)
+        if self._starved_head_lane_reclaim_permitted(device_index) and self._starved_head_utilities_pause_permitted(
+            device_index,
+        ):
+            return tenancy_mb
         marginal_mb = self._marginal_process_overhead_mb(device_index)
         if marginal_mb is None or marginal_mb <= 0.0:
             marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
@@ -2670,7 +2678,7 @@ class InferenceScheduler:
             device_index=device_index,
             measured_free_mb=self._measured_free_vram_mb(device_index=device_index),
             marginal_need_mb=self._safety_placement_marginal_need_mb(device_index),
-            noise_buffer_mb=admission_noise_buffer_mb(total_vram_mb),
+            noise_buffer_mb=self._admission_margin_mb(device_index, total_vram_mb),
             governor_state=self.governor_state(device_index),
             safety_footprint_mb=self._safety_footprint_mb(),
             reclaimable_idle_mb=self._idle_retained_resident_mb(device_index),
@@ -2742,8 +2750,8 @@ class InferenceScheduler:
         peak_mb = self._largest_active_sampling_peak_mb(device_index)
         if peak_mb is None:
             return True
-        noise_mb = admission_noise_buffer_mb(total_vram_mb)
-        margin_mb = admission_noise_buffer_mb(total_vram_mb) if require_margin else 0.0
+        noise_mb = self._admission_margin_mb(device_index, total_vram_mb)
+        margin_mb = noise_mb if require_margin else 0.0
         return (total_vram_mb - peak_mb - noise_mb - self._safety_footprint_mb() - margin_mb) >= 0.0
 
     def _safety_placement_dwell_seconds(self) -> float:
@@ -5867,7 +5875,7 @@ class InferenceScheduler:
             PRELOAD_ADMISSION_FLOW,
             per_process_reserved,
         )
-        noise_buffer_mb = admission_noise_buffer_mb(raw_total_mb)
+        noise_buffer_mb = self._admission_margin_mb(device_index, raw_total_mb)
         self._admission_headroom_mb_by_device[device_index if device_index is not None else 0] = (
             None if device_free_mb is None else device_free_mb - planned_mb - noise_buffer_mb
         )
@@ -5921,11 +5929,16 @@ class InferenceScheduler:
             utilities_context_count=utilities_contexts,
             post_process_reclaim_allowed=(
                 post_process_contexts > 0
+                and self._starved_head_lane_reclaim_permitted(device_index)
                 and self._has_idle_service_lane_for_reclaim(HordeProcessType.POST_PROCESS, device_index)
             ),
-            # No actuator returns the utilities lane's context yet, so the room breakdown reports its tenancy
-            # as a rung policy does not permit rather than promising room nothing can deliver.
-            utilities_reclaim_allowed=False,
+            utilities_reclaim_allowed=(
+                utilities_contexts > 0
+                and self._starved_head_lane_reclaim_permitted(device_index)
+                and self._starved_head_utilities_pause_permitted(device_index)
+                and not self._process_lifecycle.is_utilities_gpu_paused
+                and self._has_idle_service_lane_for_reclaim(HordeProcessType.UTILITIES, device_index)
+            ),
             post_process_context_count=post_process_contexts,
             vae_lane_context_count=vae_lane_contexts,
             vae_lane_reclaim_allowed=(
@@ -5990,7 +6003,7 @@ class InferenceScheduler:
             return None
         device_key = device_index if device_index is not None else 0
         foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
-        return total_vram_mb - admission_noise_buffer_mb(total_vram_mb) - (foreign_floor_mb or 0.0)
+        return total_vram_mb - self._admission_margin_mb(device_index, total_vram_mb) - (foreign_floor_mb or 0.0)
 
     def build_vram_arbiter_snapshot(
         self,
@@ -6927,6 +6940,7 @@ class InferenceScheduler:
             if process_info is None:
                 self._horde_model_map.expire_entry(model_name)
                 expired.append(model_name)
+                self._rearm_measured_attempts_for_model(model_name)
                 logger.warning(
                     f"Expiring stale model-map entry for {model_name}: process {model_info.process_id} is gone.",
                 )
@@ -8220,13 +8234,14 @@ class InferenceScheduler:
             max_resident=max_resident,
         )
         try:
-            self._execute_preload_actuations(
+            applied_actuations = self._execute_preload_actuations(
                 verdict.required_actuations,
                 device_index=target_device_index,
                 for_head_of_queue=is_head_blocker,
             )
         finally:
             self._preload_actuation = None
+        self._book_starved_head_lane_pauses(applied_actuations, device_index=target_device_index)
         return False
 
     def _mark_measured_attempt(
@@ -8368,6 +8383,13 @@ class InferenceScheduler:
                 target_device_index,
             ),
             starved_seconds=self._head_starved_seconds(job),
+            probe_after_seconds=self._probe_after_seconds(target_device_index),
+            has_reclaimable_idle_tenancy=self._has_reclaimable_idle_tenancy(
+                job,
+                available_process,
+                device_index=target_device_index,
+            ),
+            lane_reclaim_permitted=self._starved_head_lane_reclaim_permitted(target_device_index),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             can_reduce_live_contexts=can_reduce_live_contexts,
             idle_contexts_teardownable=idle_contexts_teardownable,
@@ -8794,6 +8816,96 @@ class InferenceScheduler:
             measured_target if structural_max_resident is None else min(structural_max_resident, measured_target)
         )
         return replace(request, idle_contexts_teardownable=True), max_resident
+
+    def _card_bridge_data(self, device_index: int | None) -> reGenBridgeData:
+        """The effective config for ``device_index``: its per-card resolution when one exists, else the global."""
+        if device_index is not None:
+            card = self._card_runtimes.get(device_index)
+            if card is not None:
+                return card.config
+        return self._runtime_config.bridge_data
+
+    def _admission_margin_mb(self, device_index: int | None, total_vram_mb: float | None) -> float:
+        """The admission margin (MB) for ``device_index``: the card's operator override, else the platform default."""
+        override = self._card_bridge_data(device_index).vram_admission_noise_mb
+        return admission_margin_mb(total_vram_mb, override_mb=None if override is None else float(override))
+
+    def _probe_after_seconds(self, device_index: int | None) -> float:
+        """How long the head must have starved before the measured-load probe may fire on ``device_index``."""
+        return float(self._card_bridge_data(device_index).measured_load_probe_seconds)
+
+    def _starved_head_lane_reclaim_permitted(self, device_index: int | None) -> bool:
+        """Whether policy lets a starved head stop an idle service lane once cheaper reclaim is exhausted.
+
+        The operator's out for the lane rungs. Read by the device-state builder (which decides per lane whether a
+        pause is offerable now) and by the forecast's unpausable tenancy (a lane policy withholds is tenancy no
+        teardown returns).
+        """
+        return bool(self._card_bridge_data(device_index).starved_head_lane_reclaim)
+
+    def _starved_head_utilities_pause_permitted(self, device_index: int | None) -> bool:
+        """Whether the image-utilities lane is among the lanes a starved head may stop on ``device_index``."""
+        return bool(self._card_bridge_data(device_index).starved_head_utilities_pause)
+
+    def _whole_card_pinned(
+        self,
+        model_name: str | None,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether the operator pinned ``model_name`` (by name or by its baseline id) as whole-card on this card."""
+        if model_name is None:
+            return False
+        pins = self._card_bridge_data(device_index).whole_card_models
+        if not pins:
+            return False
+        baseline_id = str(baseline) if baseline is not None else None
+        return model_name in pins or (baseline_id is not None and baseline_id in pins)
+
+    def _book_starved_head_lane_pauses(
+        self,
+        applied: tuple[ActuatorCommand, ...],
+        *,
+        device_index: int | None,
+    ) -> None:
+        """Book each lane pause the head path just actuated as a reclaim-ladder restore obligation.
+
+        The arbiter's starved-head rungs stop a service lane outside any saturation episode; the reclaim
+        ladder owns every restore, so the pause is recorded with it and comes back LIFO with the rest once the
+        card is healthy. Safety is not booked: its restore is the runtime placement policy, as for every other
+        safety-off rung.
+        """
+        if self._reclaim_ladder is None:
+            return
+        for command in applied:
+            if command.kind is ActuatorCommandKind.PAUSE_POST_PROCESS_LANE:
+                self._reclaim_ladder.record_lane_pause(
+                    device_index,
+                    ReclaimRungKind.PAUSE_PP_LANE,
+                    tenant_label="post_process_lane",
+                    promised_mb=self._marginal_process_overhead_mb(device_index)
+                    or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
+                )
+            elif command.kind is ActuatorCommandKind.PAUSE_UTILITIES_LANE:
+                self._reclaim_ladder.record_lane_pause(
+                    device_index,
+                    ReclaimRungKind.PAUSE_UTILITIES_LANE,
+                    tenant_label="utilities_lane",
+                    promised_mb=self._marginal_process_overhead_mb(device_index)
+                    or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
+                )
+
+    def _rearm_measured_attempts_for_model(self, model_name: str) -> None:
+        """Let pending jobs for ``model_name`` earn a fresh measured-load probe after their process went away.
+
+        The probe is one per job per card so a load does not hit a converged card twice; a process that is
+        gone (cycled for RAM, scaled down, replaced) makes that card a different state, and a head whose only
+        escape was already spent would otherwise hold until recovery faults it.
+        """
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.model == model_name:
+                self._job_tracker.rearm_measured_attempt(job)
 
     def _teardownable_idle_context_returns_mb(
         self,
@@ -9857,6 +9969,14 @@ class InferenceScheduler:
         """Restart a ladder-paused component lane once the card has recovered (reclaim-ladder actuator)."""
         return self._process_lifecycle.restore_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
+    def pause_utilities_lane(self, device_index: int | None) -> bool:
+        """Stop the idle image-utilities lane so its context returns to the card (reclaim actuator)."""
+        return self._note_lane_cycle(self._process_lifecycle.pause_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER))
+
+    def restore_utilities_lane(self, device_index: int | None) -> bool:
+        """Restart a ladder-paused image-utilities lane once the card has recovered (reclaim-ladder actuator)."""
+        return self._process_lifecycle.restore_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
     def record_calibration_event(self, rung: ReclaimRung, *, promised_mb: float, realized_mb: float) -> None:
         """Record a verified reclaim shortfall as a calibration counter (reclaim-ladder actuator).
 
@@ -10645,7 +10765,7 @@ class InferenceScheduler:
                     assess_model_serviceability(
                         total_vram_mb=card.total_vram_mb,
                         baseline_mb=baseline_mb,
-                        noise_buffer_mb=None,
+                        noise_buffer_mb=self._admission_margin_mb(card.device_index, card.total_vram_mb),
                         figures=figures,
                     ),
                 ),
@@ -11559,7 +11679,7 @@ class InferenceScheduler:
         # contexts (charged above at their truthful marginal) and the job's own post-processing are already
         # netted out of static_available_mb.
         predicted_mb = static_verdict.predicted_mb
-        noise_mb = admission_noise_buffer_mb(total_vram_mb)
+        noise_mb = self._admission_margin_mb(device_index, total_vram_mb)
         effective_available_mb = static_available_mb - committed_reserve_mb
         granted = predicted_mb is None or (predicted_mb + noise_mb) <= effective_available_mb
         retained_detail = f", retained residents {retained_resident_mb:.0f}MB" if retained_resident_mb > 0 else ""
@@ -11901,7 +12021,7 @@ class InferenceScheduler:
         predicted_mb = static_verdict.predicted_mb
         if predicted_mb is None:
             return None
-        return (predicted_mb + admission_noise_buffer_mb(total_vram_mb)) <= (
+        return (predicted_mb + self._admission_margin_mb(device_index, total_vram_mb)) <= (
             static_available_mb - committed_reserve_mb
         )
 
@@ -12842,6 +12962,7 @@ class InferenceScheduler:
             return
         hold_seconds = max(0.0, self._clock() - held_since)
         self._dispatch_reconciliation_hold_seconds += hold_seconds
+        self._job_tracker.note_dispatch_hold_seconds(job, hold_seconds)
         if measured_attempt:
             self._dispatch_reconciliation_released_by_measured_attempt += 1
             self._dispatch_hold_reclaim_requested.discard(job_id)
@@ -12933,6 +13054,33 @@ class InferenceScheduler:
             return False
         held_since = self._dispatch_hold_since.get(job_id)
         return held_since is not None and (self._clock() - held_since) >= _DISPATCH_STALL_MIN_SECONDS
+
+    def _has_reclaimable_idle_tenancy(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        target_process: HordeProcessInfo,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether :meth:`_reclaim_idle_tenancy_for_head` would find a lane to ask for the card back.
+
+        The read-only mirror of that actuator's candidate rule, reported to the arbiter so it does not read a
+        card holding warm components or a parked preload as converged-empty and probe a load over tenancy the
+        parent was about to reclaim.
+        """
+        head_model = head_job.model
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_id == target_process.process_id:
+                continue
+            if process_info.loaded_horde_model_name == head_model and head_model is not None:
+                continue
+            if bool(process_info.held_components) or self._slot_is_reclaimable_while_busy(process_info):
+                return True
+        return False
 
     def _reclaim_idle_tenancy_for_head(
         self,
@@ -13143,10 +13291,10 @@ class InferenceScheduler:
             probe_state = "in_progress"
         elif self._job_tracker.has_spent_measured_attempt_on_device(job, device_index):
             probe_state = "spent"
-        elif starved_seconds >= _STARVATION_DIAGNOSTIC_SECONDS:
+        elif starved_seconds >= self._probe_after_seconds(device_index):
             probe_state = "eligible"
         else:
-            probe_state = f"waiting_{max(0.0, _STARVATION_DIAGNOSTIC_SECONDS - starved_seconds):.0f}s"
+            probe_state = f"waiting_{max(0.0, self._probe_after_seconds(device_index) - starved_seconds):.0f}s"
         inputs: FlatScalarMap = {
             "hold_seconds": round(hold_seconds, 1),
             "starved_seconds": round(starved_seconds, 1),
@@ -13302,6 +13450,13 @@ class InferenceScheduler:
             ),
             head_outstanding_mb=head_outstanding_mb,
             starved_seconds=self._head_starved_seconds(next_job),
+            probe_after_seconds=self._probe_after_seconds(device_index),
+            has_reclaimable_idle_tenancy=self._has_reclaimable_idle_tenancy(
+                next_job,
+                process_with_model,
+                device_index=device_index,
+            ),
+            lane_reclaim_permitted=self._starved_head_lane_reclaim_permitted(device_index),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             # An ordinary staged dispatch never reduces the live inference-context count: it evicts idle
             # residents to make room, it does not collapse the co-resident pool (can_reduce_live_contexts stays
@@ -13350,6 +13505,7 @@ class InferenceScheduler:
             )
         finally:
             self._preload_actuation = None
+        self._book_starved_head_lane_pauses(applied_actuations, device_index=device_index)
         return _MaterializationOutcome(
             verdict=verdict,
             candidate_delta_mb=candidate_delta_mb,

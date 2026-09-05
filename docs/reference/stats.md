@@ -40,12 +40,16 @@ deletion; a foreign file, a leftover `.tmp`, or a nested folder is never touched
 | `job_completed`  | Per finished job or alchemy form | The full [`JobMetricsRecord`][horde_worker_regen.process_management.resources.run_metrics.JobMetricsRecord] (stage timings, queue-wait/e2e/sampling seconds, model, resolution, sampler/scheduler/cfg_scale, post-processing, VRAM high-water) and its resolved `baseline`. |
 | `stats_sample`   | At most once per second | A periodic [`StatsSample`][horde_worker_regen.process_management.ipc.supervisor_channel.StatsSample] (throughput, kudos/hr, VRAM/RAM, duty cycle). Written whether or not a dashboard is attached: a headless worker is the one whose stream gets read afterwards, and every duty figure is a difference between adjacent samples. |
 | `decision`       | On an admission/dispatch/reclaim verdict (coalesced) | `decision_kind`, `subject`, `verdict`, `reason`, and a flat `inputs` map of the quantities the arbiter decided from. |
-| `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved), `state`, `device_index`, and flat `inputs`. |
+| `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved / dispatch hold), `state`, `device_index`, and flat `inputs`. A `dispatch_hold` record is written when a head's dispatch is first held by the residency gate (`standing`), when it is admitted (`released`, with `reason` `measured_attempt`, `reclaim` or `natural_free`), or when the job leaves the queue unadmitted (`abandoned`); its inputs carry the measured room breakdown described below plus `hold_seconds`. |
 
 A `job_completed` record pairs the priced request with what it cost to serve: alongside resolution, steps
 and batch count it carries `sampler_name` (as the horde advertised it, uncanonicalized), `scheduler`
 (the schedule sampled on, `karras`/`normal` when the request only carried the legacy karras bool) and
-`cfg_scale`, against measured `sampling_seconds` and the horde's `kudos_reward`. Records written before
+`cfg_scale`, against measured `sampling_seconds` and the horde's `kudos_reward`. `dispatch_hold_seconds` is
+the share of `queue_wait_seconds` the residency gate held the job for (None when it was never held), so a
+wait the card's tenancy caused can be told apart from scheduling and auxiliary fetching. The `session_end`
+record totals the session's holds: `dispatch_holds`, `dispatch_hold_seconds`, and the releases by cause
+(`dispatch_holds_released_by_reclaim`, `_by_natural_free`, `_by_measured_attempt`). Records written before
 these fields existed simply omit them.
 
 ### Worker-condition fields on `job_completed`
@@ -119,6 +123,17 @@ So a sustained hold reads as one opening record, occasional heartbeats, and one 
 `image_utilities_routing`; `verdict` is one of `admit`, `defer`, `deny`, `withhold`, `freed`, or `no_op` (the
 last three of which are *resolving*). Preload admission records under `vram_admission`, carrying the gate's
 decision and its reason, so a head that never loads can be attributed offline without a log.
+
+An `inference_dispatch` deferral (and every `dispatch_hold` record) carries the measured room the hold was
+judged against: `room_candidate_mb`, `room_available_mb`, `room_deficit_mb`, `room_reclaimable_mb`,
+`room_unpausable_mb` and `room_closable` (whether the permitted reclaim rungs together cover the deficit);
+`tenancy_<lane>_mb` for each class of holder on the card (`inference_target`, `inference_idle`,
+`inference_busy`, `safety`, `post_process`, `utilities`, `vae_lane`, `component`, `foreign`);
+`rung_<kind>_mb` and `rung_<kind>_permitted` for each reclaim rung (`idle_sibling_context`,
+`post_process_lane`, `safety_off_gpu`, `utilities_lane`); and the hold's standing with its escape hatches:
+`hold_seconds`, `starved_seconds`, `probe_state` (`waiting_<n>s`, `eligible`, `in_progress`, `spent`),
+`whole_card_wants`, `whole_card_retired_by_measurement`, `whole_card_measured_mb`,
+`whole_card_observations`. The hold WARNING in the log renders the same figures on one line.
 
 ## Stats tab: the Model pool section
 

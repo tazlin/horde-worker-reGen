@@ -483,6 +483,11 @@ class GpuOverride(BaseModel):
     vram_reserve_mb: int | None = Field(default=None, ge=0)
     vram_to_leave_free: str | None = Field(default=None, pattern=r"^\d+%$|^\d+$")
     whole_card_exclusive_residency: bool | None = None
+    vram_admission_noise_mb: int | None = Field(default=None, ge=0)
+    measured_load_probe_seconds: int | None = Field(default=None, ge=0, le=600)
+    starved_head_lane_reclaim: bool | None = None
+    starved_head_utilities_pause: bool | None = None
+    whole_card_models: list[str] | None = None
 
 
 class PinnedModelEntry(BaseModel):
@@ -1249,6 +1254,44 @@ class reGenBridgeData(CombinedHordeBridgeData):
     after. Costs a brief safety-process restart at each end of a whole-card residency burst (batched by
     `whole_card_residency_cooldown_seconds`). Only used when `enable_vram_budget` and `safety_on_gpu` are
     both true."""
+
+    vram_admission_noise_mb: int | None = Field(default=None, ge=0)
+    """The VRAM admission margin (MB) subtracted from the measured device-free reading before a load or
+    dispatch is judged to fit; None derives it from the card (5 % of the total on Windows/WDDM, 2.5 % where the
+    NVML reading is device-wide, never below 512 MB).
+
+    The one margin the admission arithmetic keeps, so a whole-card model on a card at its edge is refused by
+    exactly this much. An operator who has watched a model load and run with the card to itself can lower it
+    (or set 0) to admit that model without waiting on the measured-load probe; raising it buys headroom
+    against transient spikes. Does not move the device-free governor's pressure floors. Overridable per card
+    under `gpu_overrides`."""
+
+    measured_load_probe_seconds: int = Field(default=10, ge=0, le=600)
+    """How long (seconds) the head of queue must have starved at a card with nothing left to reclaim before
+    the worker admits one real load to let measured reality decide, instead of holding on arithmetic.
+
+    The reclaim rungs and the idle-context teardown run first; once they have nothing left this is the only
+    wait that remains. 0 probes as soon as the ladder is empty. Overridable per card under `gpu_overrides`."""
+
+    starved_head_lane_reclaim: bool = Field(default=True)
+    """Whether a head of queue that has starved past the teardown grace, with every cheaper reclaim exhausted,
+    may stop an idle service lane (the post-processing lane, the safety process off-GPU, the image-utilities
+    lane) to make its room, cheapest first and one at a time. The lanes come back through the reclaim
+    ladder's restore once the card is healthy. False keeps every lane on the card and leaves such a head to
+    the measured-load probe. Overridable per card under `gpu_overrides`."""
+
+    starved_head_utilities_pause: bool = Field(default=True)
+    """Whether the image-utilities lane is among the lanes a starved head may stop (see
+    `starved_head_lane_reclaim`). It is the last rung and costs the service a restart; false keeps it on the
+    card while the other lanes stay eligible. Overridable per card under `gpu_overrides`."""
+
+    whole_card_models: list[str] = Field(default_factory=list)
+    """Models the worker must treat as needing the card to itself regardless of what its footprint store has
+    measured, by reference name or by baseline id (e.g. `qwen_image`).
+
+    The measured-footprint rule retires a whole-card claim when the model looks to leave room for a sibling
+    context; for a model the operator knows runs several times slower beside anything, that retirement is
+    wrong and this pin keeps the claim. Overridable per card under `gpu_overrides`."""
 
     whole_card_residency_cooldown_seconds: int = Field(default=45, ge=0, le=600)
     """How long to hold a whole-card residency in place after its last heavy job drains, before restoring

@@ -39,6 +39,7 @@ denying or fabricating a fictional free figure. The device total is retained onl
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -79,6 +80,45 @@ def admission_noise_buffer_mb(total_vram_mb: float | None) -> float:
     if total_vram_mb is None or total_vram_mb <= 0:
         return _ADMISSION_NOISE_BUFFER_MB
     return max(_ADMISSION_NOISE_BUFFER_MB, _ADMISSION_NOISE_BUFFER_FRACTION * total_vram_mb)
+
+
+_ADMISSION_MARGIN_FRACTION_WDDM = _ADMISSION_NOISE_BUFFER_FRACTION
+"""Fraction of the device total the admission margin scales to on Windows/WDDM, where the free reading
+oscillates as the driver demotes over-commits to shared memory; the physics buffer's own fraction."""
+
+_ADMISSION_MARGIN_FRACTION_DEVICE_WIDE = 0.025
+"""Fraction of the device total the admission margin scales to where the NVML free reading is device-wide
+and stable (Linux): half the WDDM fraction, since there is no paging oscillation to absorb, only the
+inter-report activation transients. The device-free governor's floors do not follow this figure; they stay
+on :func:`admission_noise_buffer_mb`, because on such a platform an over-commit is a hard OOM rather than
+paging and the pressure thresholds are what stand between growth and that failure."""
+
+
+def admission_margin_mb(
+    total_vram_mb: float | None,
+    *,
+    override_mb: float | None = None,
+    platform: str = sys.platform,
+) -> float:
+    """Return the admission identity's margin (MB): the operator's override, else the platform-scaled buffer.
+
+    The margin the admission sites (the identity, the achievable ceiling, model serviceability, the streaming
+    forecast, the retention fit) subtract from device-free room. On WDDM it is the physics buffer; on a
+    platform whose free reading is device-wide it scales to :data:`_ADMISSION_MARGIN_FRACTION_DEVICE_WIDE`
+    above the same floor. An explicit override wins whole (an operator who knows the card can set it low or
+    zero), so the out is direct rather than a scaling knob.
+
+    Args:
+        total_vram_mb: The device's total VRAM (MB), or None when no total has been reported yet.
+        override_mb: The operator's ``vram_admission_noise_mb`` for this card, or None to derive.
+        platform: ``sys.platform`` by default; injectable so a test can pin either shape.
+    """
+    if override_mb is not None:
+        return max(0.0, float(override_mb))
+    if total_vram_mb is None or total_vram_mb <= 0:
+        return _ADMISSION_NOISE_BUFFER_MB
+    fraction = _ADMISSION_MARGIN_FRACTION_WDDM if platform == "win32" else _ADMISSION_MARGIN_FRACTION_DEVICE_WIDE
+    return max(_ADMISSION_NOISE_BUFFER_MB, fraction * total_vram_mb)
 
 
 @dataclass(frozen=True)
@@ -235,7 +275,7 @@ class TenantLane(StrEnum):
     FOREIGN = "foreign"
 
 
-class ReclaimRungKind(StrEnum):
+class RoomRungKind(StrEnum):
     """A reclaim rung the room breakdown can price, cheapest first in declaration order."""
 
     IDLE_SIBLING_CONTEXT = "idle_sibling_context"
@@ -245,10 +285,10 @@ class ReclaimRungKind(StrEnum):
 
 
 @dataclass(frozen=True)
-class ReclaimRung:
+class RoomRung:
     """One rung's promised return (MB) and whether policy currently permits pulling it."""
 
-    kind: ReclaimRungKind
+    kind: RoomRungKind
     promised_mb: float
     permitted: bool
 
@@ -274,7 +314,7 @@ class AdmissionRoom:
     outstanding_reservations_mb: float
     noise_buffer_mb: float
     tenancy_mb: Mapping[TenantLane, float]
-    rungs: tuple[ReclaimRung, ...]
+    rungs: tuple[RoomRung, ...]
 
     @property
     def available_mb(self) -> float:
@@ -306,9 +346,9 @@ class AdmissionRoom:
         """Whether the permitted rungs together cover the deficit."""
         return self.deficit_mb > 0 and self.reclaimable_mb >= self.deficit_mb
 
-    def rungs_to_close(self) -> tuple[ReclaimRung, ...]:
+    def rungs_to_close(self) -> tuple[RoomRung, ...]:
         """The cheapest-first permitted rungs whose cumulative return first covers the deficit, or all of them."""
-        chosen: list[ReclaimRung] = []
+        chosen: list[RoomRung] = []
         covered = 0.0
         for rung in self.rungs:
             if not rung.permitted:
@@ -397,7 +437,7 @@ def admission_room(
         utilities_reclaim_permitted: Whether policy permits pausing the utilities lane off-GPU now.
     """
     tenancy: dict[TenantLane, float] = {}
-    rungs: list[ReclaimRung] = []
+    rungs: list[RoomRung] = []
     attributed = 0.0
     for process_id, lane in lane_by_process_id.items():
         reserved = per_process_reserved_mb.get(process_id)
@@ -409,16 +449,16 @@ def admission_room(
         tenancy[classed] = tenancy.get(classed, 0.0) + charge
         attributed += charge
         if classed is TenantLane.INFERENCE_IDLE:
-            rungs.append(ReclaimRung(ReclaimRungKind.IDLE_SIBLING_CONTEXT, charge, True))
+            rungs.append(RoomRung(RoomRungKind.IDLE_SIBLING_CONTEXT, charge, True))
     lane_rungs = (
-        (TenantLane.POST_PROCESS, ReclaimRungKind.POST_PROCESS_LANE, post_process_reclaim_permitted),
-        (TenantLane.SAFETY, ReclaimRungKind.SAFETY_OFF_GPU, safety_reclaim_permitted),
-        (TenantLane.UTILITIES, ReclaimRungKind.UTILITIES_LANE, utilities_reclaim_permitted),
+        (TenantLane.POST_PROCESS, RoomRungKind.POST_PROCESS_LANE, post_process_reclaim_permitted),
+        (TenantLane.SAFETY, RoomRungKind.SAFETY_OFF_GPU, safety_reclaim_permitted),
+        (TenantLane.UTILITIES, RoomRungKind.UTILITIES_LANE, utilities_reclaim_permitted),
     )
     for lane, kind, permitted in lane_rungs:
         held = tenancy.get(lane, 0.0)
         if held > 0.0:
-            rungs.append(ReclaimRung(kind, held, permitted))
+            rungs.append(RoomRung(kind, held, permitted))
     if total_vram_mb is not None and total_vram_mb > 0:
         used_mb = max(0.0, total_vram_mb - device_free_mb)
         tenancy[TenantLane.FOREIGN] = max(0.0, used_mb - attributed)

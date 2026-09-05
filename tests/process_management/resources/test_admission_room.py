@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from horde_worker_regen.process_management.resources.admission_identity import (
     AdmissionRoom,
-    ReclaimRungKind,
+    RoomRungKind,
     TenantLane,
     admission_room,
 )
@@ -93,10 +93,10 @@ def test_rungs_are_cheapest_first_and_the_target_slot_is_never_a_rung() -> None:
 
     kinds = [rung.kind for rung in room.rungs]
     assert kinds == [
-        ReclaimRungKind.IDLE_SIBLING_CONTEXT,
-        ReclaimRungKind.POST_PROCESS_LANE,
-        ReclaimRungKind.SAFETY_OFF_GPU,
-        ReclaimRungKind.UTILITIES_LANE,
+        RoomRungKind.IDLE_SIBLING_CONTEXT,
+        RoomRungKind.POST_PROCESS_LANE,
+        RoomRungKind.SAFETY_OFF_GPU,
+        RoomRungKind.UTILITIES_LANE,
     ]
     assert room.rungs[0].promised_mb == 100 + _CONTEXT_MB
     assert room.rungs[3].permitted is False
@@ -184,7 +184,7 @@ def test_arbiter_attaches_the_room_to_a_non_fitting_verdict() -> None:
     assert held.room is not None
     assert held.room.deficit_mb == 19424.0 - (20157.0 - _NOISE_MB)
     assert held.room.tenancy_mb[TenantLane.INFERENCE_TARGET] == 100 + _CONTEXT_MB
-    assert held.room.rungs[0].kind is ReclaimRungKind.IDLE_SIBLING_CONTEXT
+    assert held.room.rungs[0].kind is RoomRungKind.IDLE_SIBLING_CONTEXT
 
     admitted = arbiter.evaluate(
         VramRequest(

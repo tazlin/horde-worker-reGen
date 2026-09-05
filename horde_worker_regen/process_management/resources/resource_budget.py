@@ -347,6 +347,9 @@ class StreamForecast:
     """Device tenancy (MB) no sole-residency teardown returns: the sustained foreign floor and any lane with
     no off-GPU actuator. ``free_if_alone`` assumes every other tenant gone; this is what stays, so the alone
     frame subtracts it before deciding a whole-card claim can be retired."""
+    whole_card_pinned: bool = False
+    """Whether the operator pinned this model as whole-card (``whole_card_models``), which keeps the claim
+    against any measured retirement."""
 
     unreclaimable_charge_mb: float = 0.0
     """The share of the ``free_after_model_evict_mb`` deduction that stopping idle inference siblings cannot
@@ -491,6 +494,8 @@ class StreamForecast:
         not of the instantaneous free reading: a whole-card baseline claims the card for the same reason
         whether the card currently reads full or empty.
         """
+        if self.wants_whole_card and self.whole_card_pinned:
+            return True
         return (
             self.wants_whole_card
             and not self._has_room_for_coresident_model
@@ -517,6 +522,8 @@ class StreamForecast:
         False without a measured figure or without a sized card, so an unmeasured or unsizable case keeps
         the declared intent exactly as before.
         """
+        if self.whole_card_pinned:
+            return False
         measured_mb = self.measured_footprint_mb
         if measured_mb is None or self.free_if_alone_mb is None:
             return False
@@ -950,6 +957,7 @@ def forecast_weight_streaming(
     disaggregation_sibling_charge_mb: float = 0.0,
     admission_noise_mb: float = 0.0,
     unpausable_tenancy_mb: float = 0.0,
+    whole_card_pinned: bool = False,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
@@ -1161,6 +1169,7 @@ def forecast_weight_streaming(
         measured_observation_count=(0 if disaggregated else max(0, measured_observation_count)),
         admission_noise_mb=max(0.0, admission_noise_mb),
         unpausable_tenancy_mb=max(0.0, unpausable_tenancy_mb),
+        whole_card_pinned=whole_card_pinned,
         unreclaimable_charge_mb=unreclaimable_charge_mb,
     )
 
