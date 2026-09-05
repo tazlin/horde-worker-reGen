@@ -5877,13 +5877,13 @@ class HordeWorkerProcessManager:
             ladder_verified_frees_mb=self._reclaim_ladder.verified_frees_mb,
             ladder_verification_shortfalls=self._reclaim_ladder.verification_shortfalls,
             safety_rungs_refused=self._reclaim_ladder.safety_rungs_refused,
-            retention_grants_issued=self._inference_scheduler.retention_grants_issued,
+            retention_grants_issued=self._inference_scheduler.retention.grants_issued,
             retention_grant_denials={
-                reason.value: count for reason, count in self._inference_scheduler.retention_grant_denials.items()
+                reason.value: count for reason, count in self._inference_scheduler.retention.grant_denials.items()
             },
-            retention_reuses=self._inference_scheduler.retention_reuses,
-            retention_evicted_unused=self._inference_scheduler.retention_evicted_unused,
-            retention_revokes=self._inference_scheduler.retention_revokes,
+            retention_reuses=self._inference_scheduler.retention.reuses,
+            retention_evicted_unused=self._inference_scheduler.retention.evicted_unused,
+            retention_revokes=self._inference_scheduler.retention.revokes,
             per_step_floor_triggers=self._per_step_floor_triggers,
             dispatch_reconciliation_holds=self._inference_scheduler.latest_dispatch_reconciliation_holds(),
             dispatch_reconciliation_conflicts=self._inference_scheduler.latest_dispatch_reconciliation_conflicts(),
@@ -6085,7 +6085,7 @@ class HordeWorkerProcessManager:
         # Reported beside the churn figures because it is the same quantity from the other side: each reorder is
         # a job served on weights that were already on the card, where the queue's own order would have evicted
         # them. One per job seated, so it reads against the window's completions.
-        affinity_reorders = self._inference_scheduler.retention_affinity_reorders
+        affinity_reorders = self._inference_scheduler.retention.affinity_reorders
         if affinity_reorders:
             explanation_parts.append(f"retained-copy reorders: {affinity_reorders}")
         retention_tally = self._format_retention_tally()
@@ -6118,17 +6118,17 @@ class HordeWorkerProcessManager:
         a card that will not carry what it could.
         """
         scheduler = self._inference_scheduler
-        denials = scheduler.retention_grant_denials
-        issued = scheduler.retention_grants_issued
+        denials = scheduler.retention.grant_denials
+        issued = scheduler.retention.grants_issued
         if not issued and not denials:
             return None
         parts = [
             f"{issued} granted",
-            f"{scheduler.retention_reuses} reused",
-            f"{scheduler.retention_evicted_unused} unused",
+            f"{scheduler.retention.reuses} reused",
+            f"{scheduler.retention.evicted_unused} unused",
         ]
-        if scheduler.retention_revokes:
-            parts.append(f"{scheduler.retention_revokes} revoked under pressure")
+        if scheduler.retention.revokes:
+            parts.append(f"{scheduler.retention.revokes} revoked under pressure")
         if denials:
             reason, count = max(denials.items(), key=lambda item: item[1])
             parts.append(f"{sum(denials.values())} denied (mostly {reason.value}: {count})")

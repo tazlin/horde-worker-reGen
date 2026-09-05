@@ -52,6 +52,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS,
     InferenceScheduler,
 )
+from horde_worker_regen.process_management.scheduling.retention import idle_retained_resident_mb
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -1188,14 +1189,14 @@ class TestReclaimableIdleResidents:
         scheduler = self._card_scheduler(monkeypatch)
         self._idle_retained_slot(scheduler, reserved_mb=3200)
         scheduler._process_map[1].last_process_state = HordeProcessState.INFERENCE_STARTING
-        assert scheduler._idle_retained_resident_mb(0) == 0.0
+        assert idle_retained_resident_mb(scheduler._process_map.values(), 0) == 0.0
 
     def test_a_retained_slot_without_a_reservation_reading_adds_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Missing telemetry never inflates the room."""
         scheduler = self._card_scheduler(monkeypatch)
         self._idle_retained_slot(scheduler, reserved_mb=3200)
         scheduler._process_map[1].process_reserved_mb = None
-        assert scheduler._idle_retained_resident_mb(0) == 0.0
+        assert idle_retained_resident_mb(scheduler._process_map.values(), 0) == 0.0
 
     def test_the_restore_forecast_counts_reclaimable_room(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A card retaining a resident between jobs can still earn its safety process back."""

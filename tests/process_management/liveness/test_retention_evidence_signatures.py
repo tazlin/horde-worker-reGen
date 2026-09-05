@@ -37,11 +37,11 @@ import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
-from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _RETENTION_REPEAT_EVIDENCE_DISPATCHES,
-    InferenceScheduler,
+from horde_worker_regen.process_management.scheduling import retention as retention_module
+from horde_worker_regen.process_management.scheduling.retention import (
+    RETENTION_REPEAT_EVIDENCE_DISPATCHES,
     RetentionDenialReason,
+    RetentionLedger,
 )
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
@@ -147,7 +147,7 @@ def _model_class_named(name: str) -> _ModelClass:
 
 def _denials(world: _DispatchWorld, reason: RetentionDenialReason) -> int:
     """How many retention grants the named gate refused over the run."""
-    return world.scheduler.retention_grant_denials.get(reason, 0)
+    return world.scheduler.retention.grant_denials.get(reason, 0)
 
 
 def _assert_signature_drained(
@@ -174,7 +174,7 @@ def _slot_repeats_within_window(world: _DispatchWorld) -> list[str]:
     seen_per_lane: dict[int, list[str]] = collections.defaultdict(list)
     repeats: list[str] = []
     for model, lane in world.dispatch_lanes:
-        window = seen_per_lane[lane][-_RETENTION_REPEAT_EVIDENCE_DISPATCHES:]
+        window = seen_per_lane[lane][-RETENTION_REPEAT_EVIDENCE_DISPATCHES:]
         if model in window:
             repeats.append(f"lane {lane}: {model} recurred within {window}")
         seen_per_lane[lane].append(model)
@@ -215,11 +215,11 @@ async def test_a_pool_locked_traffic_is_granted_retention_after_its_warmup() -> 
         f"{context}: the run paid {world.weight_uploads} weight uploads for {len(jobs)} jobs, so it is not "
         f"being served from a retained copy. {world.state_dump()}"
     )
-    assert scheduler.retention_reuses >= len(jobs) - _LANE_COUNT, (
-        f"{context}: only {scheduler.retention_reuses} of {len(jobs)} dispatches landed on a retained copy, so "
+    assert scheduler.retention.reuses >= len(jobs) - _LANE_COUNT, (
+        f"{context}: only {scheduler.retention.reuses} of {len(jobs)} dispatches landed on a retained copy, so "
         f"the grants issued are not the ones the traffic comes back for. {world.state_dump()}"
     )
-    assert scheduler.retention_grants_issued > 0, (
+    assert scheduler.retention.grants_issued > 0, (
         f"{context}: no retention was granted at all over the run. {world.state_dump()}"
     )
 
@@ -233,7 +233,7 @@ async def test_a_defect_reinjection_an_unsatisfiable_gate_reuploads_every_job(
     requirement takes, and it costs a pool-locked operator the whole of the feature. It is what makes the
     scenario above a measurement of the warmup bound rather than a restatement of whatever the gate does.
     """
-    monkeypatch.setattr(inference_scheduler_module, "_RETENTION_REPEAT_EVIDENCE_DISPATCHES", 0)
+    monkeypatch.setattr(retention_module, "RETENTION_REPEAT_EVIDENCE_DISPATCHES", 0)
     world = _signature_world()
 
     jobs = await _drive_signature(world, [_SDXL])
@@ -243,7 +243,7 @@ async def test_a_defect_reinjection_an_unsatisfiable_gate_reuploads_every_job(
         "with the evidence window emptied a pool-locked streak must pay one weight upload per job, which is "
         f"the cost the gate must not impose on it; it paid {world.weight_uploads} for {len(jobs)} jobs"
     )
-    assert world.scheduler.retention_grants_issued == 0, (
+    assert world.scheduler.retention.grants_issued == 0, (
         "an unsatisfiable evidence window must grant nothing, so the warmup bound the scenario asserts would "
         "pass on a tree whose gate never fires"
     )
@@ -280,16 +280,16 @@ async def test_b_diverse_traffic_earns_almost_no_retention_and_makes_no_pressure
         "diverse signature it asserts about:\n    " + "\n    ".join(repeats[:4])
     )
     scheduler = world.scheduler
-    assert scheduler.retention_grants_issued == 0, (
-        f"{context}: {scheduler.retention_grants_issued} grant(s) were issued on traffic that never repeats a "
+    assert scheduler.retention.grants_issued == 0, (
+        f"{context}: {scheduler.retention.grants_issued} grant(s) were issued on traffic that never repeats a "
         f"model on a slot, so each one is a copy nothing can come back for. {world.state_dump()}"
     )
     assert _denials(world, RetentionDenialReason.NO_REPEAT_EVIDENCE) > 0, (
         f"{context}: nothing was refused for lack of repeat evidence, so the run never reached the gate it is "
         f"about. {world.state_dump()}"
     )
-    assert scheduler.retention_evicted_unused == 0, (
-        f"{context}: {scheduler.retention_evicted_unused} retained copies were given back unused, which on this "
+    assert scheduler.retention.evicted_unused == 0, (
+        f"{context}: {scheduler.retention.evicted_unused} retained copies were given back unused, which on this "
         f"signature is the whole of what the gate exists to prevent. {world.state_dump()}"
     )
     assert world.retained_residents() == {}, (
@@ -309,8 +309,8 @@ async def test_b_defect_reinjection_an_ungated_grant_brings_the_unused_holds_bac
     having reused them.
     """
     monkeypatch.setattr(
-        InferenceScheduler,
-        "_slot_has_repeat_evidence",
+        RetentionLedger,
+        "slot_has_repeat_evidence",
         lambda self, process_id, model, *, exclude_latest=False: True,
     )
     world = _signature_world(card=_CARD_24GB)
@@ -319,11 +319,11 @@ async def test_b_defect_reinjection_an_ungated_grant_brings_the_unused_holds_bac
 
     _assert_signature_drained(world, jobs, context="ungated diverse signature")
     scheduler = world.scheduler
-    assert scheduler.retention_grants_issued > 0, (
+    assert scheduler.retention.grants_issued > 0, (
         "an ungated policy must grant on this rotation, since that is the behaviour being reinjected; it "
         f"granted nothing. {world.state_dump()}"
     )
-    assert scheduler.retention_evicted_unused > 0, (
+    assert scheduler.retention.evicted_unused > 0, (
         "an ungated policy on traffic that never repeats must leave copies to be given back unused, which is "
         "the cost the gated scenario asserts away; none were recorded, so that assertion would pass on a tree "
         f"with no gate at all. {world.state_dump()}"
@@ -365,7 +365,7 @@ async def test_c_a_bimodal_mix_concentrates_retention_on_the_repeating_model() -
         f"({collections.Counter(held).most_common()}), so the holds are following the rotation rather than the "
         f"traffic that comes back for them. {world.state_dump()}"
     )
-    assert world.scheduler.retention_reuses > 0, (
+    assert world.scheduler.retention.reuses > 0, (
         f"{context}: no dispatch landed on a retained copy, so the holds concentrated above were never used. "
         f"{world.state_dump()}"
     )
@@ -422,19 +422,19 @@ async def test_d_sustained_pressure_revokes_the_hold_nothing_came_back_for() -> 
     # Age both holds past the horizon with no work arriving, then let one lane's traffic come back for its
     # weights: the reuse ends that episode and starts a fresh one, which is the whole of what distinguishes
     # the two lanes when the sweep runs.
-    world.now += inference_scheduler_module._RETENTION_STALE_HOLD_SECONDS + world.tick_seconds
+    world.now += retention_module.RETENTION_STALE_HOLD_SECONDS + world.tick_seconds
     reused_model = sorted(retained.items())[0][1]
     await _drive_signature(world, [_model_class_named(reused_model)], job_count=1, width=512, height=512)
     still_retained = world.retained_residents()
     reused_lane = next(lane for lane, model in still_retained.items() if model == reused_model)
     stale_lane = next(lane for lane, model in still_retained.items() if model != reused_model)
 
-    await _hold_pressure(world, inference_scheduler_module._RETENTION_PRESSURE_REVOKE_SECONDS + world.tick_seconds)
+    await _hold_pressure(world, retention_module.RETENTION_PRESSURE_REVOKE_SECONDS + world.tick_seconds)
 
     context = "stale-hold revoke"
     scheduler = world.scheduler
-    assert scheduler.retention_revokes == 1, (
-        f"{context}: {scheduler.retention_revokes} copies were revoked, not the one aged hold. {world.state_dump()}"
+    assert scheduler.retention.revokes == 1, (
+        f"{context}: {scheduler.retention.revokes} copies were revoked, not the one aged hold. {world.state_dump()}"
     )
     assert world.retained_residents().get(stale_lane) is None, (
         f"{context}: lane {stale_lane} still holds weights no job came back for through the whole pressure "
@@ -456,7 +456,7 @@ async def test_d_defect_reinjection_without_the_horizon_the_dead_hold_survives(
     scenario above ends, a retention that no evidence and no elapsed time can dislodge, which is what makes
     that scenario a measurement of the horizon rather than of the sweep merely running.
     """
-    monkeypatch.setattr(inference_scheduler_module, "_RETENTION_STALE_HOLD_SECONDS", 1_000_000.0)
+    monkeypatch.setattr(retention_module, "RETENTION_STALE_HOLD_SECONDS", 1_000_000.0)
     world = _signature_world()
 
     await _drive_signature(world, [_SDXL, _SD15], job_count=8, width=512, height=512)
@@ -464,9 +464,9 @@ async def test_d_defect_reinjection_without_the_horizon_the_dead_hold_survives(
     assert held_before, f"the run retained nothing, so there is no hold to survive. {world.state_dump()}"
 
     world.now += 60.0 * 60.0
-    await _hold_pressure(world, inference_scheduler_module._RETENTION_PRESSURE_REVOKE_SECONDS + world.tick_seconds)
+    await _hold_pressure(world, retention_module.RETENTION_PRESSURE_REVOKE_SECONDS + world.tick_seconds)
 
-    assert world.scheduler.retention_revokes == 0, (
+    assert world.scheduler.retention.revokes == 0, (
         "with the horizon out of reach the sweep must revoke nothing, so the scenario's revoke assertion would "
         f"pass on a tree with no horizon at all. {world.state_dump()}"
     )

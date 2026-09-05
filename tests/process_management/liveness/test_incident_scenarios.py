@@ -822,7 +822,7 @@ async def test_e_a_rotation_serves_retained_copies_before_loading_a_cold_head_ov
         "the one-per-job cost of loading each cold head over whichever slot was free. "
         f"{world.state_dump()}"
     )
-    assert world.scheduler.retention_affinity_reorders > 0, (
+    assert world.scheduler.retention.affinity_reorders > 0, (
         f"{context}: no job was ever seated ahead of the head by the placement order, so the upload count above "
         f"says nothing about it. {world.state_dump()}"
     )
@@ -885,8 +885,8 @@ async def test_e_with_nothing_retained_the_placement_order_is_the_queues_own() -
         f"{context}: a slot was recorded as retaining weights under the regime where the child returns the "
         f"card at the end of every prompt, so this run is not the no-retention case. {world.state_dump()}"
     )
-    assert world.scheduler.retention_affinity_reorders == 0, (
-        f"{context}: the placement order seated {world.scheduler.retention_affinity_reorders} job(s) ahead of a "
+    assert world.scheduler.retention.affinity_reorders == 0, (
+        f"{context}: the placement order seated {world.scheduler.retention.affinity_reorders} job(s) ahead of a "
         f"head with nothing on the card to seat them onto. {world.state_dump()}"
     )
     assert world.weight_uploads == len(jobs), (
@@ -1033,8 +1033,8 @@ async def test_f_a_rotation_drains_without_the_placement_preference(monkeypatch:
 
     context = "unreordered three-model rotation"
     _assert_streak_drained(world, jobs, context=context)
-    assert world.scheduler.retention_affinity_reorders == 0, (
-        f"{context}: the placement order reordered {world.scheduler.retention_affinity_reorders} time(s) though "
+    assert world.scheduler.retention.affinity_reorders == 0, (
+        f"{context}: the placement order reordered {world.scheduler.retention.affinity_reorders} time(s) though "
         f"the preference was neutered, so this run is not the unreordered case. {world.state_dump()}"
     )
     assert world.tick <= _ROTATION_3_TICK_CEILING, (

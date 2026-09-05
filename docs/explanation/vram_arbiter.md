@@ -908,7 +908,7 @@ to the card. It is instead a governed live gate that grants only when:
   is handed no new resident to evict. This reads the one figure a WDDM driver cannot misreport under
   demand-paging (NVML device-free), so it holds precisely in the regime where measured free VRAM lies.
 - **The slot's own recent traffic repeats this model.** The dispatched model must appear among the slot's
-  previous `_RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3) dispatches. See
+  previous `RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3, in `scheduling/retention.py`) dispatches. See
   [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
 - **The card statically fits the job.** The card's reported total (a constant the driver cannot misreport)
   must absorb the job's sampling peak plus the reserve, after charging everything else that shares the card
@@ -964,8 +964,8 @@ asked to run.
 Re-asking the *issuance* question is not what re-opens it. A live grant's own dispatch heads the slot's
 history, so the window a sweep would read is the window that issued the grant and every live retention passes
 by construction. What can refute the prediction is the predicted successor failing to arrive. When a card has
-been off `HEALTHY` continuously for `_RETENTION_PRESSURE_REVOKE_SECONDS` (15s), any retained copy that has
-gone unreused for `_RETENTION_STALE_HOLD_SECONDS` (60s) is given back. Both constants are starting points
+been off `HEALTHY` continuously for `RETENTION_PRESSURE_REVOKE_SECONDS` (15s), any retained copy that has
+gone unreused for `RETENTION_STALE_HOLD_SECONDS` (60s) is given back. Both constants are starting points
 pending a signature sweep, and both are expressed in seconds of demand so they mean the same thing on any card
 and any offer size.
 

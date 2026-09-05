@@ -97,7 +97,7 @@ def _budget_on_scheduler(
 
 def _seed_repeat_evidence(scheduler: InferenceScheduler, process_id: int, model: str) -> None:
     """Record a prior dispatch of ``model`` on ``process_id``, the evidence a retention grant is gated on."""
-    scheduler._record_slot_dispatch(process_id, model)
+    scheduler.retention.record_slot_dispatch(process_id, model)
 
 
 def _map_with_model_on_process(

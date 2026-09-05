@@ -2520,7 +2520,7 @@ class TestRetentionPlacementProtection:
 
         assert len(tracker.jobs_in_progress) == 1, "precondition: the single sampling slot is spent"
         assert scheduler._retention_affinity_candidates(head) == []
-        assert scheduler._retention_reorder_pareto_vetoes == 1
+        assert scheduler.retention.reorder_pareto_vetoes == 1
 
         with_spare, _spare_processes, spare_tracker = await self._worker(spare_lane=True, cap_spent=True)
         spare_head = spare_tracker.jobs_pending_inference[0]
@@ -2528,7 +2528,7 @@ class TestRetentionPlacementProtection:
         candidates = with_spare._retention_affinity_candidates(spare_head)
 
         assert [process.process_id for _job, process in candidates] == [1]
-        assert with_spare._retention_reorder_pareto_vetoes == 0
+        assert with_spare.retention.reorder_pareto_vetoes == 0
 
     async def test_a_disaggregation_pinned_retainer_defers_the_head_until_the_pin_lifts(self) -> None:
         """A pinned lane is live work even while it idles between stages: the head waits for it, boundedly.
