@@ -206,6 +206,6 @@ async def test_non_reducing_actuation_does_not_acquire_residency_or_recovery_gra
 
     assert reduced is False
     assert scheduler._job_tracker.is_admitted_exclusive(head) is False
-    assert scheduler._residency_state(None).model is None
+    assert scheduler._whole_card_ledger.state_for(None).model is None
     assert scheduler.whole_card_residency_grace_active() is False
     scheduler.unload_models_from_vram.assert_not_called()

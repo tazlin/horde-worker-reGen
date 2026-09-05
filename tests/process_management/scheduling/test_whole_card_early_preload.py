@@ -242,10 +242,13 @@ class TestResidencyConvergesAfterDrain:
             load_state=ModelLoadState.LOADED_IN_RAM,
             process_id=flux_holder.process_id,
         )
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_forecast = scheduler._forecast_streaming(
-            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
-            _FLUX_BASELINE,
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(
+            None,
+            scheduler._forecast_streaming(
+                make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
+                _FLUX_BASELINE,
+            ),
         )
 
         safety_job = make_job_pop_response(_RESIDENT_SDXL)
@@ -311,10 +314,13 @@ class TestResidencyConvergesAfterDrain:
             load_state=ModelLoadState.LOADED_IN_RAM,
             process_id=flux_holder.process_id,
         )
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_forecast = scheduler._forecast_streaming(
-            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
-            _FLUX_BASELINE,
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(
+            None,
+            scheduler._forecast_streaming(
+                make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
+                _FLUX_BASELINE,
+            ),
         )
 
         flux_head = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
@@ -474,7 +480,7 @@ def _staged_flux_scheduler(
         load_state=ModelLoadState.LOADED_IN_RAM,
         process_id=flux_holder.process_id,
     )
-    scheduler._sibling_teardown_for_model = _FLUX_MODEL
+    scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
     return scheduler, job_tracker, flux_holder
 
 

@@ -183,4 +183,4 @@ class TestSchedulerActuatesProcessReduction:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(
             3, device_index=None, protected_model="CyberRealistic Pony", spared_process_id=1
         )
-        assert scheduler._sibling_teardown_for_model == "CyberRealistic Pony"
+        assert scheduler._whole_card_ledger.state_for(None).model == "CyberRealistic Pony"

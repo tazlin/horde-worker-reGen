@@ -31,10 +31,13 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     forecast_weight_streaming,
     predict_job_weight_mb,
 )
-from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _POP_CLAIM_EMPTY_POP_RUN,
     _POP_CLAIM_EMPTY_POP_WINDOW_SECONDS,
+    HEAVY_HEAD_LOAD_GRACE_SECONDS,
+    POP_CLAIM_RELEASE_VISIBLE_SECONDS,
+    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    WHOLE_CARD_RESTORE_GRACE_SECONDS,
     WholeCardPopClaimRelease,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
@@ -440,7 +443,7 @@ class TestWholeCardSiblingTeardown:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(
             1, device_index=None, protected_model=_FLUX_MODEL, spared_process_id=1
         )
-        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
+        assert scheduler._whole_card_ledger.state_for(None).model == _FLUX_MODEL
 
     async def test_siblings_restored_after_whole_card_job_drains(
         self,
@@ -453,12 +456,12 @@ class TestWholeCardSiblingTeardown:
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=2, max_inference=4)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
         # Simulate the state left after a teardown whose exclusive job has since completed and drained.
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
 
         scheduler._restore_siblings_after_whole_card()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
-        assert scheduler._sibling_teardown_for_model is None
+        assert scheduler._whole_card_ledger.state_for(None).model is None
 
     async def test_restore_held_while_torn_down_model_still_queued(
         self,
@@ -471,12 +474,12 @@ class TestWholeCardSiblingTeardown:
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
         head_job = make_job_pop_response(_FLUX_MODEL)
         await track_popped_job_async(job_tracker, head_job)
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
 
         scheduler._restore_siblings_after_whole_card()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
-        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
+        assert scheduler._whole_card_ledger.state_for(None).model == _FLUX_MODEL
 
     async def test_restore_releases_a_residency_that_can_no_longer_converge(
         self,
@@ -496,13 +499,13 @@ class TestWholeCardSiblingTeardown:
         head_job = make_job_pop_response("CyberRealistic Pony")
         await track_popped_job_async(job_tracker, head_job)
         await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL))
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = time.time() - 600.0
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time() - 600.0
 
         scheduler._restore_siblings_after_whole_card()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
-        assert scheduler._sibling_teardown_for_model is None
+        assert scheduler._whole_card_ledger.state_for(None).model is None
 
     async def test_restore_releases_an_unconvergeable_residency_despite_a_pending_exclusive_admit(
         self,
@@ -524,13 +527,13 @@ class TestWholeCardSiblingTeardown:
         await track_popped_job_async(job_tracker, flux_job)
         job_tracker.mark_admitted_exclusive(flux_job)
         assert job_tracker.has_exclusive_job_in_progress(None)
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = time.time() - 600.0
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time() - 600.0
 
         scheduler._restore_siblings_after_whole_card()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
-        assert scheduler._sibling_teardown_for_model is None
+        assert scheduler._whole_card_ledger.state_for(None).model is None
 
     async def test_restore_retains_a_residency_whose_model_still_has_a_holder(
         self,
@@ -545,13 +548,13 @@ class TestWholeCardSiblingTeardown:
         head_job = make_job_pop_response("CyberRealistic Pony")
         await track_popped_job_async(job_tracker, head_job)
         await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL))
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = time.time() - 600.0
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time() - 600.0
 
         scheduler._restore_siblings_after_whole_card()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
-        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
+        assert scheduler._whole_card_ledger.state_for(None).model == _FLUX_MODEL
 
     async def test_restore_held_through_cooldown_then_restores(
         self,
@@ -567,19 +570,19 @@ class TestWholeCardSiblingTeardown:
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=2, max_inference=4)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
         scheduler._runtime_config.bridge_data.whole_card_residency_cooldown_seconds = 300
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
 
         # Drained (no job queued/in progress) but still inside the cooldown -> hold the residency.
-        scheduler._whole_card_cooldown_until = time.time() + 300
+        scheduler._whole_card_ledger.state_for(None).cooldown_until = time.time() + 300
         scheduler._restore_siblings_after_whole_card()
         scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
-        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
+        assert scheduler._whole_card_ledger.state_for(None).model == _FLUX_MODEL
 
         # Cooldown elapsed -> restore concurrency.
-        scheduler._whole_card_cooldown_until = time.time() - 1
+        scheduler._whole_card_ledger.state_for(None).cooldown_until = time.time() - 1
         scheduler._restore_siblings_after_whole_card()
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
-        assert scheduler._sibling_teardown_for_model is None
+        assert scheduler._whole_card_ledger.state_for(None).model is None
 
     def test_forecast_stops_charging_safety_once_paused(self) -> None:
         """Once safety is paused off-GPU, the forecast must stop charging it.
@@ -619,22 +622,24 @@ class TestWholeCardSiblingTeardown:
         scheduler, _process_map, _job_tracker = _build_context_overcommit_scheduler(num_processes=4)
         assert scheduler.whole_card_residency_grace_active() is False
 
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = time.time()
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time()
         assert scheduler.whole_card_residency_grace_active() is True
 
         # Past the bounded grace window the suppression lifts (a genuinely-stuck residency trips the SOS).
-        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
-
-        scheduler._whole_card_established_at = time.time() - (_sched_mod._WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time() - (
+            WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0
+        )
         assert scheduler.whole_card_residency_grace_active() is False
 
         # The restore window is also covered: respawning siblings + cycling safety back on-GPU is churn
         # that must not read as a wedge either.
-        scheduler._sibling_teardown_for_model = None
-        scheduler._whole_card_restore_at = time.time()
+        scheduler._whole_card_ledger.state_for(None).model = None
+        scheduler._whole_card_ledger.state_for(None).restore_at = time.time()
         assert scheduler.whole_card_residency_grace_active() is True
-        scheduler._whole_card_restore_at = time.time() - (_sched_mod._WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        scheduler._whole_card_ledger.state_for(None).restore_at = time.time() - (
+            WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0
+        )
         assert scheduler.whole_card_residency_grace_active() is False
 
 
@@ -724,10 +729,10 @@ class TestWholeCardResidencyState:
             per_process_overhead_mb=float(_PER_PROCESS_OVERHEAD_MB),
         )
         # Simulate the state _establish_whole_card_residency leaves: model reserved, forecast cached, grace running.
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_forecast = forecast
-        scheduler._whole_card_established_at = time.time()
-        scheduler._whole_card_cooldown_until = time.time() + 45.0
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(None, forecast)
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time()
+        scheduler._whole_card_ledger.state_for(None).cooldown_until = time.time() + 45.0
 
         state = scheduler.whole_card_residency_state()
 
@@ -747,8 +752,8 @@ class TestWholeCardResidencyState:
     def test_active_state_reports_the_standing_pop_claim(self) -> None:
         """A held residency that claims the offer says which model it is advertising, and for how long."""
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = time.time()
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time()
 
         state = scheduler.whole_card_residency_state()
 
@@ -761,17 +766,17 @@ class TestWholeCardResidencyState:
     def test_a_released_claim_reports_why_the_offer_widened(self) -> None:
         """Once the claim ends the snapshot carries which of its ends fired, so the widening is explained."""
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = time.time()
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time()
         # Disclose the standing claim, then let the empty-pop evidence end it: the run has to both reach its
         # count and cover its span, so the pops are spread over the window the ledger requires.
-        scheduler._disclose_pop_claim_edge()
+        scheduler._pop_claim_tracker.disclose_edge(scheduler.whole_card_pop_claim(), now=scheduler._clock())
         for _ in range(_POP_CLAIM_EMPTY_POP_RUN):
             scheduler.note_whole_card_pop_outcome(served=False)
         state = scheduler._whole_card_ledger.state_for(None)
         state.pop_claim_empty_pop_since -= _POP_CLAIM_EMPTY_POP_WINDOW_SECONDS + 1.0
         scheduler.note_whole_card_pop_outcome(served=False)
-        scheduler._disclose_pop_claim_edge()
+        scheduler._pop_claim_tracker.disclose_edge(scheduler.whole_card_pop_claim(), now=scheduler._clock())
 
         snapshot = scheduler.whole_card_residency_state()
 
@@ -782,22 +787,22 @@ class TestWholeCardResidencyState:
     def test_a_stale_release_stops_explaining_the_current_offer(self) -> None:
         """Past its visibility window the reason is dropped: an unclaimed offer is then the ordinary state."""
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
-        scheduler._pop_claim_release = (
+        scheduler._pop_claim_tracker._release = (
             WholeCardPopClaimRelease.MAXIMUM_HOLD,
-            time.time() - (_sched_mod._POP_CLAIM_RELEASE_VISIBLE_SECONDS + 1.0),
+            time.time() - (POP_CLAIM_RELEASE_VISIBLE_SECONDS + 1.0),
         )
 
         assert scheduler.whole_card_residency_state().pop_claim_release is None
 
     def test_phase_holding_after_establish_grace(self) -> None:
         """Once the establish grace elapses, an active residency reads as holding (serving), not establishing."""
-        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
-
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
         scheduler._process_lifecycle.is_safety_gpu_paused = False
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_forecast = None
-        scheduler._whole_card_established_at = time.time() - (_sched_mod._WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).forecast = None
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time() - (
+            WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0
+        )
 
         state = scheduler.whole_card_residency_state()
 
@@ -973,14 +978,14 @@ class TestSchedulerResidencyRouting:
         scheduler.preload_models()
 
         assert job_tracker.is_admitted_exclusive(head_job) is False
-        assert scheduler._sibling_teardown_for_model is None
+        assert scheduler._whole_card_ledger.state_for(None).model is None
         assert scheduler.whole_card_residency_grace_active() is False
 
     async def test_flux_highres_head_establishes_whole_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A 1216^2 Flux head must take the whole-card branch, not fall through to a co-resident admit.
 
         An inflated reserve that marked this job streams_unavoidably would skip the whole-card branch
-        (``_sibling_teardown_for_model`` stays None, no establishment grace) and admit it into a zero-free
+        (the ledger holds no model, no establishment grace) and admit it into a zero-free
         hang. The weight-based ``fits_alone`` routes it to sole residency instead.
         """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
@@ -995,7 +1000,7 @@ class TestSchedulerResidencyRouting:
 
         scheduler.preload_models()
 
-        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
+        assert scheduler._whole_card_ledger.state_for(None).model == _FLUX_MODEL
         assert job_tracker.is_admitted_exclusive(head_job) is True
         assert scheduler.whole_card_residency_grace_active() is True
 
@@ -1004,15 +1009,13 @@ class TestHeavyHeadLoadGrace:
     """A genuinely-unservable heavy head admitted best-effort must not read as a structural wedge while it loads."""
 
     def test_grace_active_within_window_then_lifts(self) -> None:
-        """The grace is bounded by ``_HEAVY_HEAD_LOAD_GRACE_SECONDS`` so a head that never loads still trips SOS."""
-        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
-
+        """The grace is bounded by ``HEAVY_HEAD_LOAD_GRACE_SECONDS`` so a head that never loads still trips SOS."""
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
 
         assert scheduler.heavy_head_load_grace_active() is False
         scheduler._heavy_head_admitted_at = time.time()
         assert scheduler.heavy_head_load_grace_active() is True
-        scheduler._heavy_head_admitted_at = time.time() - (_sched_mod._HEAVY_HEAD_LOAD_GRACE_SECONDS + 1.0)
+        scheduler._heavy_head_admitted_at = time.time() - (HEAVY_HEAD_LOAD_GRACE_SECONDS + 1.0)
         assert scheduler.heavy_head_load_grace_active() is False
 
     def test_assess_wedge_suppressed_during_heavy_head_load(self) -> None:
@@ -1317,7 +1320,7 @@ class TestSdxlStartupResidencyRace:
     async def test_scheduler_does_not_reserve_whole_card_for_sdxl(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """End to end: with the probe marginal the scheduler never reserves the whole card for SDXL at startup.
 
-        A phantom shortfall would mark the head exclusive and set ``_sibling_teardown_for_model`` to the SDXL
+        A phantom shortfall would mark the head exclusive and record the SDXL model as the residency
         model, so the TUI would show the whole card reserved for it. With ~20GB free and the measured marginal,
         SDXL reclaims through the normal co-resident path and never claims the device.
         """
@@ -1334,6 +1337,6 @@ class TestSdxlStartupResidencyRace:
 
         scheduler.preload_models()
 
-        assert scheduler._sibling_teardown_for_model is None, "SDXL must not reserve the whole card"
+        assert scheduler._whole_card_ledger.state_for(None).model is None, "SDXL must not reserve the whole card"
         assert job_tracker.is_admitted_exclusive(head_job) is False
         assert scheduler.whole_card_residency_grace_active() is False

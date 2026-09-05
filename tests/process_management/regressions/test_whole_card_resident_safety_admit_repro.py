@@ -29,9 +29,11 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    WHOLE_CARD_DRAIN_SETTLE_SECONDS,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _SAFETY_GPU_LOAD_CHARGE_MB,
-    _WHOLE_CARD_DRAIN_SETTLE_SECONDS,
     InferenceScheduler,
 )
 from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
@@ -113,12 +115,12 @@ def _residency_scheduler(
         model=_HEAD_MODEL,
         forecast=_whole_card_forecast(),
         cooldown_until=time.time() + 45.0,
-        now=time.time() - (_WHOLE_CARD_DRAIN_SETTLE_SECONDS + 5.0),
+        now=time.time() - (WHOLE_CARD_DRAIN_SETTLE_SECONDS + 5.0),
     )
     # The backstop runs from structural completion, so age that stamp rather than the establishment: the
     # scenario under test is a teardown that finished long ago and whose drain the live reading never confirmed.
     scheduler._whole_card_ledger.state_for(None).structural_complete_at = time.time() - (
-        _WHOLE_CARD_DRAIN_SETTLE_SECONDS + 5.0
+        WHOLE_CARD_DRAIN_SETTLE_SECONDS + 5.0
     )
     return scheduler
 

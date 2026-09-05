@@ -458,8 +458,8 @@ class TestConvergenceLoopWedge:
         )
         # Record the held whole-card residency the pre-stage leaves (the None-keyed single-GPU residency).
         forecast = _flux_whole_card_forecast(free_now_mb=15007.0)
-        scheduler._whole_card_forecast = forecast
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(None, forecast)
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
         return scheduler, process_map, job_tracker, forecast
 
     async def test_residency_converges_despite_queued_sibling(self) -> None:
@@ -568,8 +568,8 @@ class TestConvergenceStopsComponentLane:
             bridge_data=_wedge_bridge_data(enable_pipeline_disaggregation=True),
         )
         forecast = _flux_whole_card_forecast(free_now_mb=15007.0)
-        scheduler._whole_card_forecast = forecast
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(None, forecast)
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
         return scheduler, process_map, forecast, job_tracker
 
     def test_gate_waits_on_the_component_lane(self) -> None:
@@ -660,8 +660,8 @@ class TestWedgeDispatchDiagnostic:
             horde_model_map=horde_model_map,
             bridge_data=_wedge_bridge_data(),
         )
-        scheduler._whole_card_forecast = _flux_whole_card_forecast(free_now_mb=15007.0)
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(None, _flux_whole_card_forecast(free_now_mb=15007.0))
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
         return scheduler, job_tracker
 
     async def test_dispatch_stall_attributes_the_convergence_wedge(self) -> None:

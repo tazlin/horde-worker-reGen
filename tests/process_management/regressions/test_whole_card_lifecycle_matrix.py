@@ -394,7 +394,7 @@ async def test_governance_reprice_tightens_a_held_residency_without_rewriting_it
 
     harness.scheduler._reprice_held_whole_card_residencies()
 
-    state = harness.scheduler._residency_state(None)
+    state = harness.scheduler._whole_card_ledger.state_for(None)
     assert state.forecast is grant_forecast
     assert harness.scheduler._whole_card_ledger.effective_target(state) == 1
     assert harness.process_map.num_loaded_inference_processes() == 1
@@ -458,7 +458,7 @@ async def test_governance_reprice_never_grows_a_held_residency() -> None:
 
     harness.scheduler._reprice_held_whole_card_residencies()
 
-    state = harness.scheduler._residency_state(None)
+    state = harness.scheduler._whole_card_ledger.state_for(None)
     assert state.forecast is grant_forecast
     assert harness.scheduler._whole_card_ledger.effective_target(state) == 1
     assert harness.process_map.num_loaded_inference_processes() == 1

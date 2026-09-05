@@ -53,10 +53,8 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _GRACE_BUDGET_SECONDS,
-)
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    WHOLE_CARD_RESTORE_GRACE_SECONDS,
 )
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
@@ -701,10 +699,10 @@ def _seed_governor_state(world: _DispatchWorld, row: _Row) -> None:
             f"{row.label}: precondition, the card's establishment allowance is spent"
         )
         return
-    cycle_cost = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
+    cycle_cost = WHOLE_CARD_ESTABLISH_GRACE_SECONDS + WHOLE_CARD_RESTORE_GRACE_SECONDS
     for index in range(int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1):
-        state.grace_charges.append((now - index, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS))
-        state.grace_charges.append((now - index, _WHOLE_CARD_RESTORE_GRACE_SECONDS))
+        state.grace_charges.append((now - index, WHOLE_CARD_ESTABLISH_GRACE_SECONDS))
+        state.grace_charges.append((now - index, WHOLE_CARD_RESTORE_GRACE_SECONDS))
     assert ledger.grace_budget_exhausted(None, now=now) is True, (
         f"{row.label}: precondition, the card's rolling grace allowance is spent"
     )

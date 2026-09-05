@@ -87,7 +87,7 @@ def _arm_drained_residency(scheduler: InferenceScheduler, model: str) -> None:
     in flight is still using it, and the cooldown has elapsed, so the pass releases the residency and grows
     the pool back to the launched ceiling this cycle.
     """
-    state = scheduler._residency_state(None)
+    state = scheduler._whole_card_ledger.state_for(None)
     state.model = model
     state.cooldown_until = 0.0
     state.forecast = None

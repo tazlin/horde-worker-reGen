@@ -208,7 +208,7 @@ class TestGenuineResidencyEstablishStillClaimsTheCard:
 
         assert process_map.num_loaded_inference_processes() == 1
         lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
-        assert scheduler._residency_state(None).model == _WHOLE_CARD_MODEL
+        assert scheduler._whole_card_ledger.state_for(None).model == _WHOLE_CARD_MODEL
 
 
 class TestManagerWiresTheLadderIntoTheScheduler:
@@ -242,6 +242,6 @@ class TestLadderReductionOpensNoResidencyCooldown:
         assert scheduler.is_whole_card_residency_active() is False, (
             "a context-reduction rung must not leave a residency lease that gates unrelated heads"
         )
-        assert scheduler._residency_state(None).cooldown_until <= time.time(), (
+        assert scheduler._whole_card_ledger.state_for(None).cooldown_until <= time.time(), (
             "a context-reduction rung must not open a residency cooldown"
         )

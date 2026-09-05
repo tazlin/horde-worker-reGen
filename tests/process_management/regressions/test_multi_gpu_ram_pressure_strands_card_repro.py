@@ -220,7 +220,7 @@ class TestRamPressureReExpansion:
         scheduler = _two_card_scheduler(process_map)
         _stub_spawn_onto_map(scheduler._process_lifecycle)
         scheduler._ram_pressure_shed_cards = {0}
-        scheduler._residency_state(0).model = "Flux.1-Schnell fp8 (Compact)"
+        scheduler._whole_card_ledger.state_for(0).model = "Flux.1-Schnell fp8 (Compact)"
         _set_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
 
         scheduler._restore_processes_after_ram_pressure()

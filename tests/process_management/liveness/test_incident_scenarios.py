@@ -148,12 +148,14 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
-from horde_worker_regen.process_management.scheduling.governance.whole_card import _GRACE_BUDGET_SECONDS
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    _GRACE_BUDGET_SECONDS,
+    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    WHOLE_CARD_RESTORE_GRACE_SECONDS,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _HEAD_PROTECTION_MAX_STARVE_SECONDS,
     _SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
-    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
     NextJobAndProcess,
 )
@@ -2276,10 +2278,10 @@ def _governed_head_world() -> _DispatchWorld:
         cooldown_seconds=120,
     )
     state = world.scheduler._whole_card_ledger.state_for(None)
-    cycle_seconds = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
+    cycle_seconds = WHOLE_CARD_ESTABLISH_GRACE_SECONDS + WHOLE_CARD_RESTORE_GRACE_SECONDS
     for index in range(int(_GRACE_BUDGET_SECONDS // cycle_seconds) + 1):
-        state.grace_charges.append((world.now - index, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS))
-        state.grace_charges.append((world.now - index, _WHOLE_CARD_RESTORE_GRACE_SECONDS))
+        state.grace_charges.append((world.now - index, WHOLE_CARD_ESTABLISH_GRACE_SECONDS))
+        state.grace_charges.append((world.now - index, WHOLE_CARD_RESTORE_GRACE_SECONDS))
     assert world.scheduler._whole_card_ledger.grace_budget_exhausted(None, now=world.now), (
         "precondition: the card's rolling grace allowance must be spent, or no governor defers anything"
     )

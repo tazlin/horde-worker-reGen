@@ -197,12 +197,12 @@ class TestPerCardResidency:
             device_index=1,
         )
 
-        held = dict(scheduler._held_residencies())
+        held = dict(scheduler._whole_card_ledger.held())
         assert set(held) == {0, 1}
         assert held[0].model == "big_model"
         assert held[1].model == "other_model"
-        assert scheduler._residency_holder_for_model("big_model") == (True, 0)
-        assert scheduler._residency_holder_for_model("other_model") == (True, 1)
+        assert scheduler._whole_card_ledger.holder_for_model("big_model") == (True, 0)
+        assert scheduler._whole_card_ledger.holder_for_model("other_model") == (True, 1)
 
     async def test_restoring_one_card_leaves_the_other_held(self) -> None:
         """A drained residency on card 0 is restored while card 1's still-active residency is kept."""
@@ -225,16 +225,18 @@ class TestPerCardResidency:
             process_lifecycle=lifecycle,
         )
         # Card 0's residency has drained (its model is queued nowhere); card 1's is still serving a queued job.
-        scheduler._residency_state(0).model = "drained_model"
-        scheduler._residency_state(1).model = "active_model"
+        scheduler._whole_card_ledger.state_for(0).model = "drained_model"
+        scheduler._whole_card_ledger.state_for(1).model = "active_model"
         active_job = make_job_pop_response("active_model")
         await track_popped_job_async(job_tracker, active_job)
         await mark_job_in_progress_async(job_tracker, active_job)
 
         scheduler._restore_siblings_after_whole_card()
 
-        assert scheduler._residency_state(0).model is None, "drained card-0 residency should be restored"
-        assert scheduler._residency_state(1).model == "active_model", "active card-1 residency must be kept"
+        assert scheduler._whole_card_ledger.state_for(0).model is None, "drained card-0 residency should be restored"
+        assert scheduler._whole_card_ledger.state_for(1).model == "active_model", (
+            "active card-1 residency must be kept"
+        )
 
     def test_safety_is_paused_only_for_the_safety_card(self) -> None:
         """The single safety process (pinned to the lowest-index card) is paused only by that card's residency."""

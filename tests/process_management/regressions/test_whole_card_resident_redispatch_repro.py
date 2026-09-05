@@ -108,7 +108,7 @@ class TestResidentWholeCardReDispatch:
         scheduler.preload_models()
         dispatch = await scheduler.get_next_job_and_process()
 
-        assert scheduler._sibling_teardown_for_model == _FLUX_MODEL, (
+        assert scheduler._whole_card_ledger.state_for(None).model == _FLUX_MODEL, (
             "a resident whole-card head must establish sole residency, not run co-resident with sibling models"
         )
         assert HordeControlFlag.UNLOAD_MODELS_FROM_VRAM in {

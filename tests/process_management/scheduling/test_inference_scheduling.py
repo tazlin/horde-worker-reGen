@@ -42,12 +42,12 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
 from horde_worker_regen.process_management.scheduling.governance import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _GOVERNOR_DEFER_DWELL_SECONDS,
+    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    WHOLE_CARD_RESTORE_GRACE_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
-    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
     StagingDeferReason,
     format_staging_defer_tally,
@@ -690,7 +690,7 @@ class TestGetNextJobAndProcess:
             first_skip_time=time.time(),
             skip_count=_AFFINITY_MAX_SKIPS,
         )
-        sched._sibling_teardown_for_model = "resident_b"
+        sched._whole_card_ledger.state_for(None).model = "resident_b"
 
         result = await sched.get_next_job_and_process()
 
@@ -718,7 +718,7 @@ class TestGetNextJobAndProcess:
             first_skip_time=time.time(),
             skip_count=_AFFINITY_MAX_SKIPS,
         )
-        sched._sibling_teardown_for_model = "some_other_model"
+        sched._whole_card_ledger.state_for(None).model = "some_other_model"
 
         assert await sched.get_next_job_and_process() is None
 
@@ -2155,12 +2155,12 @@ class TestSchedulerClockIsInjectable:
         scheduler._whole_card_ledger.record_restore(
             None,
             now=now[0],
-            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+            restore_grace_seconds=WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
 
         assert scheduler.whole_card_residency_grace_active() is True
 
-        now[0] += _WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0
+        now[0] += WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0
         assert scheduler.whole_card_residency_grace_active() is False
 
     def test_the_default_clock_is_the_real_one(self) -> None:
@@ -2252,7 +2252,7 @@ class TestRestoreGraceIsGrantedForChurn:
         scheduler._process_lifecycle.restore_component_off_gpu = Mock(return_value=False)
         state = scheduler._whole_card_ledger.state_for(None)
         state.model = "flux_model"
-        state.established_at = scheduler._clock() - (_WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
+        state.established_at = scheduler._clock() - (WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
         state.cooldown_until = 0.0
         return scheduler
 

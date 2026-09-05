@@ -221,7 +221,7 @@ class TestNonHeadContextReductionBlocked:
             f"non-head model {_RESIDENT_SDXL!r} must not establish a whole-card residency via context reduction"
         )
         # Also check the residency map directly.
-        held_model = scheduler._residency_state(None).model
+        held_model = scheduler._whole_card_ledger.state_for(None).model
         assert held_model != _RESIDENT_SDXL, (
             f"non-head model {_RESIDENT_SDXL!r} must not hold a whole-card residency; "
             f"only the head-of-queue may claim the card via context reduction"
@@ -282,7 +282,7 @@ class TestNonHeadContextReductionBlocked:
         )
         scheduler.preload_models()
 
-        held_model = scheduler._residency_state(None).model
+        held_model = scheduler._whole_card_ledger.state_for(None).model
         if held_model is not None:
             assert held_model != _RESIDENT_SDXL, (
                 f"if a residency is held, it must be for the head model, not {_RESIDENT_SDXL!r}"
@@ -391,8 +391,8 @@ class TestWholeCardResidencyProtectsFromVramEviction:
             bridge_data=_deadlock_bridge_data(),
         )
         # Establish a whole-card residency for the holder model.
-        scheduler._sibling_teardown_for_model = holder_model
-        scheduler._whole_card_established_at = 0.0  # reset so next establish reads as fresh
+        scheduler._whole_card_ledger.state_for(None).model = holder_model
+        scheduler._whole_card_ledger.state_for(None).established_at = 0.0  # reset so next establish reads as fresh
         return scheduler, process_map, job_tracker
 
     def test_residency_holder_protected_from_vram_eviction_under_pressure(self) -> None:
@@ -594,8 +594,8 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
         )
 
         # Hold the whole-card residency for Flux, including the stored forecast.
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
-        scheduler._whole_card_established_at = 0.0
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).established_at = 0.0
         forecast = StreamForecast(
             weights_mb=_FLUX_WEIGHTS_MB,
             reserve_mb=2975.0,
@@ -611,7 +611,7 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
             marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
-        scheduler._whole_card_forecast = forecast
+        scheduler._whole_card_ledger.set_forecast(None, forecast)
 
         # When teardown is exhausted (at target count, no safety needed, fits_weights_now),
         # _prestaged_whole_card_not_ready must return False so the head can dispatch.
@@ -676,8 +676,8 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
             marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
-        scheduler._whole_card_forecast = forecast
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(None, forecast)
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
 
         # Drive convergence: it must still recognize process 1 as the holder even though
         # the model is only in RAM, and tear down process 2.
@@ -742,8 +742,8 @@ class TestFullDeadlockScenario:
             marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
-        scheduler._whole_card_forecast = forecast
-        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_ledger.set_forecast(None, forecast)
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
 
         # Drive the scheduling cycle (convergence + preload models).
         scheduler._converge_whole_card_residency()
@@ -759,5 +759,5 @@ class TestFullDeadlockScenario:
         assert not_ready is False, "Flux head must be ready to dispatch after convergence"
 
         # The non-head SDXL must NOT hold the whole-card residency.
-        held_model = scheduler._residency_state(None).model
+        held_model = scheduler._whole_card_ledger.state_for(None).model
         assert held_model != _RESIDENT_SDXL, "non-head model must not hold the whole-card residency"

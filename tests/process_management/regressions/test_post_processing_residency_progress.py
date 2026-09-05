@@ -145,7 +145,7 @@ async def test_residency_release_keeps_safety_off_until_pending_post_processing_
         time_popped=time.time(),
     )
     await tracker.queue_for_post_processing(post_process_job)
-    scheduler._residency_state(None).cooldown_until = time.time() - 1
+    scheduler._whole_card_ledger.state_for(None).cooldown_until = time.time() - 1
     scheduler._process_lifecycle.restore_safety_on_gpu = Mock(return_value=True)
 
     scheduler._restore_siblings_after_whole_card()

@@ -170,9 +170,9 @@ from horde_worker_regen.process_management.scheduling.governance import (
     SetPopHold,
     StopTrackingShedCard,
     StopTrackingWorkerShed,
-    WholeCardGovernor,
+    WholeCardGovernorHold,
     WholeCardPopClaim,
-    WholeCardPopClaimRelease,
+    WholeCardPopClaimTracker,
     WholeCardResidency,
     WholeCardResidencyMachine,
     WorkerProcessShedState,
@@ -185,6 +185,15 @@ from horde_worker_regen.process_management.scheduling.governance import (
     max_coresident_for_peak,
     preload_concurrency_blocked,
     select_head_room_process_id,
+)
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    HEAVY_HEAD_LOAD_GRACE_SECONDS,
+    WHOLE_CARD_DRAIN_SETTLE_SECONDS,
+    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    convergence_blockers,
+    post_process_context_fits,
+    residency_has_holder,
 )
 from horde_worker_regen.process_management.scheduling.model_affinity import affinity_active
 from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
@@ -527,48 +536,6 @@ worker serves nothing at all. Set well above the ordinary drain of an in-flight 
 exists to cover) so a normal handoff never trips it, and far below the horizon at which a stalled queue
 starts missing the horde's dispatch deadlines."""
 
-_WHOLE_CARD_ESTABLISH_GRACE_SECONDS = 120.0
-"""How long after a whole-card residency is established the worker may keep the queue intentionally held
-(heavy head deferred while idle siblings stop, safety cycles off-GPU, and the model loads ~11GB) without
-the recovery supervisor treating it as a structural wedge. The establishment is deliberately slow now
-that it cycles the safety process, so the plain ``_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`` (20s) window would
-otherwise soft-reset the pools mid-setup. Bounded so a residency that genuinely never loads still trips
-the supervisor."""
-
-_WHOLE_CARD_DRAIN_SETTLE_SECONDS = 20.0
-"""How long after a whole-card teardown reaches sole residency the head waits for the live free-VRAM reading to
-confirm the drain before loading best-effort regardless.
-
-A teardown frees the stopped siblings' VRAM asynchronously, so the live measurement can lag or be briefly
-unavailable. The live reading dispatches the head the moment it confirms; this bound guarantees the head is
-never parked indefinitely on a stuck or missing measurement; once the teardown has been structurally complete
-this long it loads on the structural ``fits_alone`` guarantee (the grant precondition for a residency).
-Comfortably under ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` so the head always dispatches before the recovery
-supervisor would treat the held queue as a structural wedge."""
-
-_WHOLE_CARD_RESTORE_GRACE_SECONDS = 60.0
-"""How long after a whole-card residency is *restored* the recovery supervisor keeps ignoring a queue
-wedge. Restoring respawns the torn-down sibling inference processes and cycles the safety process back
-on-GPU, each a ~20s spawn during which the queue is briefly unservable. Without this grace that churn
-looks like a structural wedge and soft-resets the pools, which then cascades into further whole-card
-churn and more resets. Covers the respawn window; bounded so a genuine post-restore wedge still trips
-the supervisor."""
-
-_POP_CLAIM_RELEASE_VISIBLE_SECONDS = 120.0
-"""How long a released pop claim's end is still reported alongside the residency posture.
-
-The reason answers "why is the full pool being advertised again", which is only a live question while the
-widening is what the operator is looking at. Long enough to cover the restore churn that usually follows a
-release, short enough that a stale reason never sits beside an offer nothing has claimed for minutes."""
-
-_HEAVY_HEAD_LOAD_GRACE_SECONDS = 120.0
-"""How long after a heavy head is admitted on the over-budget classification path (for example under
-foreign-pressure fit-into-reality, when a model streams even with the whole card to itself) the recovery
-supervisor keeps ignoring a queue wedge. Such a head bypasses the whole-card branch, so it is not covered
-by ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS``, yet its multi-gigabyte load equally holds the queue and must
-not be mistaken for a structural wedge that faults the never-run backlog. Bounded so a head that genuinely
-never loads still trips the supervisor."""
-
 _DISPATCH_HOLD_LIVENESS_SECONDS = 190.0
 """How long a head's residency-reconciliation hold keeps the recovery supervisor from reading an idle card
 with pending work as a structural wedge. The hold has its own escalation, and this is that escalation end to
@@ -655,22 +622,6 @@ class _WholeCardDemandOutcome(enum.Enum):
     DEFER = enum.auto()
     """The reservation is mid-teardown (idle siblings stopping, safety cycling off-GPU, freed VRAM
     draining); defer this cycle and re-evaluate against the reduced topology next tick."""
-
-
-@dataclass(frozen=True)
-class _WholeCardGovernorHold:
-    """A churn governor's refusal to open a new whole-card residency on one card, with its arithmetic."""
-
-    governor: WholeCardGovernor
-    """Which governor refused, used to key the throttled disclosure so a changed objection always speaks."""
-    reason: str
-    """Operator-facing sentence naming the refusal; also the recorded defer reason.
-
-    Stable while the same refusal persists: the recorded reason is compared across ticks by the stall-line
-    throttle and across recovery settling windows by the remedy-relevance judgement, so figures that tick
-    (spend, countdowns) belong in :attr:`detail`, never here."""
-    detail: str | None = None
-    """The refusal's current arithmetic (spend, remaining allowance, replenish wait), for disclosure only."""
 
 
 class _PreloadJobOutcome(enum.Enum):
@@ -1011,7 +962,6 @@ class InferenceScheduler:
         # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
         # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
         # the operator has already read.
-        self._exclusive_suppression_logged_at: dict[int | None, float] = {}
 
         # The bounded affinity line-skip window for the currently-tracked displaced head. Resident-model jobs
         # may pass a cold FIFO head only while it is inside this window (a wall-clock budget derived from the
@@ -1209,18 +1159,8 @@ class InferenceScheduler:
         # Edge-trigger latch for the disclosure that whole-card residency is off because its config flag
         # never resolved to a value (as distinct from resolving to False, which is an operator choice).
         self._whole_card_flag_unresolved_disclosed: bool = False
-        # The whole-card pop claim as it was last disclosed, so the engage/release lines are edge-triggered:
-        # a claim standing over many ticks says so once. None when the last disclosure was a release.
-        self._pop_claim_disclosed: WholeCardPopClaim | None = None
-        # Whether the empty-pop evidence ended the standing claim, so the release line names that reason
-        # rather than the cap. Consumed by the disclosure that reports the release.
-        self._pop_claim_empty_release_pending: bool = False
-        # How the last standing claim ended and when, so the status snapshot can still say why the offer
-        # widened back out after the disclosure line has scrolled. None before any claim has been released.
-        self._pop_claim_release: tuple[WholeCardPopClaimRelease, float] | None = None
-        # Edge-trigger latch for the disclosure that a residency on this multi-card host does not claim the
-        # worker-wide offer, so its absence reads as deliberate rather than as the feature failing.
-        self._pop_claim_multi_gpu_disclosed: bool = False
+        # What the pop claim last disclosed and why the last claim ended; the claim itself is live from the ledger.
+        self._pop_claim_tracker = WholeCardPopClaimTracker()
         # Per-card edge-trigger latch for the whole-card minimum hold's disclosure: the residency model whose
         # floor was last reported as holding a ready different-model head off that card. Cleared when the
         # residency restores, so each episode's floor is stated once.
@@ -1812,184 +1752,6 @@ class InferenceScheduler:
         """
         return platform_context_constant_mb(self._marginal_process_overhead_mb())
 
-    def _whole_card_residency_enabled(self) -> bool:
-        """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config).
-
-        The identity test against True is deliberate: a config surface that has not resolved the flag hands
-        back None, and a None here would otherwise silently read as "operator turned it off". That case is
-        disclosed once, because a worker that quietly forgoes whole-card residency streams heavy models
-        instead of failing visibly, which is very hard to attribute after the fact.
-        """
-        enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
-        if enabled is None and not self._whole_card_flag_unresolved_disclosed:
-            self._whole_card_flag_unresolved_disclosed = True
-            logger.warning(
-                "Whole-card exclusive residency is disabled because its config flag never resolved to a "
-                "value. Heavy models will load co-resident with sibling contexts and may stream their "
-                "weights. Set `whole_card_exclusive_residency` explicitly to choose the behaviour.",
-            )
-        return enabled is True
-
-    def _whole_card_warranted(self, forecast: StreamForecast) -> bool:
-        """Whether a teardown demand is trustworthy enough to engage the whole-card residency machinery.
-
-        Reserving the whole card has a large blast radius: it stops sibling processes (which may be serving
-        other queued heads), moves safety off-GPU, and holds the device through a cooldown, so it must only
-        fire on a demand that is not a measurement artifact. Two signals qualify it:
-
-        - a genuinely card-demanding model (its persistent footprint dominates the device, or its baseline is
-          declared whole-card on intent): the teardown is warranted regardless of how contexts are counted; or
-        - a per-additional-context cost that was actually *measured* (the probe's second-context delta or a
-          derived idle-floor): the contention the demand rests on is real, not an over-count.
-
-        When neither holds (a card-light model on a host where the marginal context cost could not be
-        measured), the per-context overhead falls back to the full first-context cost, which charges the
-        one-time CUDA runtime against every context and can collapse the structural floor below a model that
-        physically co-resides with room to spare. Engaging a whole-card residency off that phantom reserves the
-        card for a model that never needed it (and, held through the cooldown, can then starve a later head of a
-        different model). So the caller falls through to the ordinary model-eviction path instead, whose
-        admission still gates on real free VRAM, rather than reserving the device on an unmeasured guess.
-        """
-        if forecast.is_card_demanding:
-            return True
-        return self._marginal_process_overhead_mb() is not None
-
-    def _log_whole_card_declined(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
-        """Record (once per model) that a whole-card teardown demand was declined as untrustworthy.
-
-        Names why a model that the budget/forecast wanted to give the whole card was instead served by
-        ordinary eviction: its footprint does not dominate the device and the per-additional-context cost was
-        not measured, so the demand rests on the fallback that charges the one-time runtime cost against every
-        context. Surfaces the numbers behind that call (the model's weight share of the card and whether the
-        marginal was measured) so a teardown that does *not* happen is as visible in the logs as one that does.
-        """
-        if self._whole_card_declined_notified.get(job.model or "", False):
-            return
-        self._whole_card_declined_notified[job.model or ""] = True
-        weights = forecast.weights_mb
-        total = forecast.total_vram_mb
-        share = f"{(weights / total) * 100:.0f}%" if weights is not None and total else "unknown"
-        logger.opt(colors=True).info(
-            "<fg #7b7d7d>Declined a whole-card residency for {}: "
-            f"its weights (~{weights or 0:.0f}MB, "
-            f"{share} of the {total or 0:.0f}MB card) do not dominate the device and the per-context overhead is "
-            f"unmeasured (using the conservative first-context fallback), so a teardown demand cannot be trusted. "
-            f"Serving it co-resident via model eviction instead of reserving the card.</>",
-            job.model,
-        )
-
-    def _log_whole_card_reduction_suppressed(
-        self,
-        job: ImageGenerateJobPopResponse,
-        forecast: StreamForecast,
-        *,
-        live_inference_processes: int,
-    ) -> None:
-        """Record (once per model) that a process-count-reduction claim was refused for want of a remedy.
-
-        The reduction branch asks for idle sibling *processes* to be stopped. Where the budget already sizes
-        at least as many co-resident contexts as are running, and the shortfall is within the charges no
-        inference teardown reclaims, stopping siblings buys the head nothing: the deficit is the safety
-        footprint, the service lanes' contexts, and the disaggregated image lane's decode spike, which a
-        teardown removes only by stopping the lanes the work runs on. Names the figures behind that refusal so
-        a residency that does *not* happen is as visible as one that does. Latched per model, so a head
-        re-asking every scheduling tick discloses once rather than at the tick rate.
-        """
-        if self._whole_card_reduction_suppressed_notified.get(job.model or "", False):
-            return
-        self._whole_card_reduction_suppressed_notified[job.model or ""] = True
-        weights = forecast.weights_mb or 0.0
-        floor = forecast.base_reserve_mb if forecast.base_reserve_mb is not None else forecast.reserve_mb
-        after_evict = forecast.free_after_model_evict_mb or 0.0
-        logger.opt(colors=True).info(
-            "<fg #7b7d7d>Refused a whole-card process-count reduction for {}: "
-            f"its weights (~{weights:.0f}MB) plus the {floor:.0f}MB floor exceed the {after_evict:.0f}MB "
-            f"siblings-present figure by {max(0.0, weights + floor - after_evict):.0f}MB, but "
-            f"{forecast.unreclaimable_charge_mb:.0f}MB of that figure is safety, service-lane and decode "
-            f"charges no inference teardown reclaims, and the budget already holds "
-            f"{forecast.max_resident_processes()} contexts against {live_inference_processes} live. "
-            f"Serving it co-resident instead of reserving the card.</>",
-            job.model,
-        )
-
-    def _residency_state(self, device_index: int | None) -> WholeCardResidency:
-        """Return the (lazily-created) whole-card residency state for ``device_index``.
-
-        ``None`` is the single-GPU / worker-wide key, so a single-GPU host keeps exactly one residency state
-        and behaves as the pre-multi-GPU scalar fields did.
-        """
-        return self._whole_card_ledger.state_for(device_index)
-
-    def _serving_under_whole_card(self, model: str | None, device_index: int | None) -> bool:
-        """Whether a whole-card exclusive residency for ``model`` is held on the card a job is dispatched to.
-
-        Recorded per job at dispatch so a cost analysis can separate work served with the card to itself
-        (which carries the amortized cost of establishing that residency) from co-resident work of the same
-        shape. A residency held for a different model is not this job's, so it reads False.
-        """
-        if model is None:
-            return False
-        return self._residency_state(device_index).model == model
-
-    def _held_residencies(self) -> list[tuple[int | None, WholeCardResidency]]:
-        """Return ``(device_index, state)`` for every card currently holding a whole-card residency.
-
-        A residency is "held" while its model is set. Used by the per-cycle convergence/restore passes and the
-        supervisor-facing grace checks, which must consider every card's residency, not just one.
-        """
-        return self._whole_card_ledger.held()
-
-    # The worker-wide (single-GPU) whole-card residency is the entry under the ``None`` key. These properties
-    # expose its fields under their historical scalar names so single-GPU callers and tests read/write the
-    # worker-wide residency exactly as before the per-card ``_whole_card_residencies`` map existed. The
-    # multi-GPU admission path keys residency by real device index and does not go through these.
-    @property
-    def _sibling_teardown_for_model(self) -> str | None:
-        """The model holding the worker-wide whole-card residency (the ``None``-keyed entry)."""
-        return self._residency_state(None).model
-
-    @_sibling_teardown_for_model.setter
-    def _sibling_teardown_for_model(self, value: str | None) -> None:
-        self._residency_state(None).model = value
-
-    @property
-    def _whole_card_forecast(self) -> StreamForecast | None:
-        """The forecast that established the worker-wide whole-card residency."""
-        return self._residency_state(None).forecast
-
-    @_whole_card_forecast.setter
-    def _whole_card_forecast(self, value: StreamForecast | None) -> None:
-        state = self._residency_state(None)
-        state.forecast = value
-        state.repriced_target = self._whole_card_ledger.target_process_count(value)
-
-    @property
-    def _whole_card_established_at(self) -> float:
-        """When the worker-wide whole-card residency was established (0.0 when none)."""
-        return self._residency_state(None).established_at
-
-    @_whole_card_established_at.setter
-    def _whole_card_established_at(self, value: float) -> None:
-        self._residency_state(None).established_at = value
-
-    @property
-    def _whole_card_cooldown_until(self) -> float:
-        """Cooldown deadline of the worker-wide whole-card residency."""
-        return self._residency_state(None).cooldown_until
-
-    @_whole_card_cooldown_until.setter
-    def _whole_card_cooldown_until(self, value: float) -> None:
-        self._residency_state(None).cooldown_until = value
-
-    @property
-    def _whole_card_restore_at(self) -> float:
-        """When the worker-wide whole-card residency was last restored (0.0 when none)."""
-        return self._residency_state(None).restore_at
-
-    @_whole_card_restore_at.setter
-    def _whole_card_restore_at(self, value: float) -> None:
-        self._residency_state(None).restore_at = value
-
     def _max_coresident_for_peak_mb(
         self,
         peak_mb: float,
@@ -2156,34 +1918,6 @@ class InferenceScheduler:
             tenancy_mb += max(0.0, float(process_info.process_reserved_mb or 0)) + marginal_mb
         return tenancy_mb
 
-    def _residency_should_pause_safety(self, device_index: int | None) -> bool:
-        """Whether a whole-card residency on this card should also move the single safety process off-GPU.
-
-        Requires safety configured-and-on-GPU (:meth:`_whole_card_safety_off_gpu_enabled`) and that this is
-        the card the one safety process is pinned to (:meth:`_safety_gpu_card`, headroom-chosen, not a fixed
-        index). A residency on a non-safety card never disturbs safety. The worker-wide key (``None``,
-        single-GPU) always qualifies.
-        """
-        if not self._whole_card_safety_off_gpu_enabled():
-            return False
-        if device_index is None or not self._card_runtimes:
-            return True
-        return device_index == self._safety_gpu_card()
-
-    def _safety_clear_of_residency_card(self, device_index: int | None) -> bool:
-        """Whether safety satisfies this residency's card-local teardown leg.
-
-        A residency that does not displace safety is clear by definition. When it does, a globally paused
-        safety process is clear, but so is a live safety process now pinned to another card. Reading only the
-        global pause flag would strand a residency after headroom-aware placement moved safety elsewhere.
-        """
-        if not self._residency_should_pause_safety(device_index):
-            return True
-        if self._process_lifecycle.is_safety_gpu_paused:
-            return True
-        safety_card = self._safety_gpu_card()
-        return device_index is not None and safety_card != device_index
-
     def _has_safety_backlog(self) -> bool:
         """Return whether safety has work that should not be interrupted by residency churn."""
         return self._safety_backlog_depth() > 0
@@ -2230,10 +1964,6 @@ class InferenceScheduler:
         if since is None:
             return True
         return (self._clock() - since) < _SAFETY_RESTORE_PP_BACKLOG_MAX_AGE_SECONDS
-
-    def _held_residency_requests_safety_off_gpu(self) -> bool:
-        """Return whether any live residency requires safety to remain off its card."""
-        return any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies())
 
     def _safety_footprint_mb(self) -> float:
         """The device VRAM (MB) the safety process costs while it sits on the GPU: the single safety price.
@@ -2760,6 +2490,121 @@ class InferenceScheduler:
                 f"this pressure had to outlast.",
             )
 
+    def _has_post_process_backlog(self) -> bool:
+        """Return whether a post-processing job is pending or actively on the lane.
+
+        Whole-card residency must leave a bounded window for post-processing jobs that peel off the resident
+        model. Pending work therefore counts as backlog: the normal residency lever is to unload the idle lane's
+        modules from VRAM, not to remove the lane and strand its queue. The one exception is a structurally
+        incompatible card/model/lane combination, which first disables post-processing for the session and then
+        stops the idle lane so the heavy model can fit.
+        """
+        return bool(self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed)
+
+    # ---- whole-card exclusive residency -----------------------------------------------------------------
+    # Reserving the device for a model whose weights plus activations would stream if it shared the card. The
+    # per-card state and its pure queries live in ``scheduling/governance/whole_card.py``; what remains here
+    # needs the scheduler's collaborators (forecast, lifecycle, tracker) or actuates.
+
+    def _whole_card_residency_enabled(self) -> bool:
+        """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config).
+
+        The identity test against True is deliberate: a config surface that has not resolved the flag hands
+        back None, and a None here would otherwise silently read as "operator turned it off". That case is
+        disclosed once, because a worker that quietly forgoes whole-card residency streams heavy models
+        instead of failing visibly, which is very hard to attribute after the fact.
+        """
+        enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
+        if enabled is None and not self._whole_card_flag_unresolved_disclosed:
+            self._whole_card_flag_unresolved_disclosed = True
+            logger.warning(
+                "Whole-card exclusive residency is disabled because its config flag never resolved to a "
+                "value. Heavy models will load co-resident with sibling contexts and may stream their "
+                "weights. Set `whole_card_exclusive_residency` explicitly to choose the behaviour.",
+            )
+        return enabled is True
+
+    def _whole_card_safety_off_gpu_enabled(self) -> bool:
+        """Whether a whole-card job should move the safety process off-GPU (config + safety actually on-GPU)."""
+        return self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu and self._safety_on_gpu_permitted
+
+    def _whole_card_cooldown_seconds(self) -> float:
+        """Operator-configured seconds to hold a whole-card residency after its last job drains."""
+        return float(self._runtime_config.bridge_data.whole_card_residency_cooldown_seconds)
+
+    def _whole_card_max_hold_seconds(self) -> float:
+        """Longest one whole-card residency may own the card and the offer, from operator configuration.
+
+        Coerced defensively because a partially-mocked configuration would otherwise put a non-numeric value
+        into a comparison on the pop path; a value that is not a number reads as the feature being off.
+        """
+        configured = self._runtime_config.bridge_data.whole_card_residency_max_hold_seconds
+        if isinstance(configured, bool) or not isinstance(configured, (int, float)):
+            return 0.0
+        return float(configured)
+
+    def _whole_card_pinned(
+        self,
+        model_name: str | None,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether the operator pinned ``model_name`` (by name or by its baseline id) as whole-card on this card."""
+        if model_name is None:
+            return False
+        pins = self._card_bridge_data(device_index).whole_card_models
+        if not pins:
+            return False
+        baseline_id = str(baseline) if baseline is not None else None
+        return model_name in pins or (baseline_id is not None and baseline_id in pins)
+
+    def _whole_card_warranted(self, forecast: StreamForecast) -> bool:
+        """Whether a teardown demand is trustworthy enough to reserve the card.
+
+        Reserving the card stops siblings, moves safety off-GPU and holds the device through a cooldown, so it
+        must not fire on a measurement artifact. A card-demanding model warrants it outright; otherwise the
+        per-context cost must have been measured, since the unmeasured fallback charges the one-time CUDA runtime
+        against every context and can manufacture a demand for a model that co-resides with room to spare.
+        """
+        if forecast.is_card_demanding:
+            return True
+        return self._marginal_process_overhead_mb() is not None
+
+    def _residency_should_pause_safety(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency on this card should also move the single safety process off-GPU.
+
+        Requires safety configured-and-on-GPU (:meth:`_whole_card_safety_off_gpu_enabled`) and that this is
+        the card the one safety process is pinned to (:meth:`_safety_gpu_card`, headroom-chosen, not a fixed
+        index). A residency on a non-safety card never disturbs safety. The worker-wide key (``None``,
+        single-GPU) always qualifies.
+        """
+        if not self._whole_card_safety_off_gpu_enabled():
+            return False
+        if device_index is None or not self._card_runtimes:
+            return True
+        return device_index == self._safety_gpu_card()
+
+    def _safety_clear_of_residency_card(self, device_index: int | None) -> bool:
+        """Whether safety satisfies this residency's card-local teardown leg.
+
+        A residency that does not displace safety is clear by definition. When it does, a globally paused
+        safety process is clear, but so is a live safety process now pinned to another card. Reading only the
+        global pause flag would strand a residency after headroom-aware placement moved safety elsewhere.
+        """
+        if not self._residency_should_pause_safety(device_index):
+            return True
+        if self._process_lifecycle.is_safety_gpu_paused:
+            return True
+        safety_card = self._safety_gpu_card()
+        return device_index is not None and safety_card != device_index
+
+    def _held_residency_requests_safety_off_gpu(self) -> bool:
+        """Return whether any live residency requires safety to remain off its card."""
+        return any(
+            self._residency_should_pause_safety(device_index) for device_index, _ in self._whole_card_ledger.held()
+        )
+
     def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
         """Whether a whole-card residency on this card should also stop the dedicated post-processing lane.
 
@@ -2805,17 +2650,6 @@ class InferenceScheduler:
             return True
         return device_index == self._process_lifecycle.component_lane_card_index()
 
-    def _has_post_process_backlog(self) -> bool:
-        """Return whether a post-processing job is pending or actively on the lane.
-
-        Whole-card residency must leave a bounded window for post-processing jobs that peel off the resident
-        model. Pending work therefore counts as backlog: the normal residency lever is to unload the idle lane's
-        modules from VRAM, not to remove the lane and strand its queue. The one exception is a structurally
-        incompatible card/model/lane combination, which first disables post-processing for the session and then
-        stops the idle lane so the heavy model can fit.
-        """
-        return bool(self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed)
-
     def _post_process_context_fits_with_residency(
         self,
         forecast: StreamForecast,
@@ -2825,18 +2659,7 @@ class InferenceScheduler:
         """Whether the residency model can load with the post-processing lane's bare context alive."""
         if not self._residency_should_pause_post_process(device_index):
             return True
-        if forecast.weights_mb is None or forecast.total_vram_mb is None:
-            return True
-        target = self._whole_card_ledger.target_process_count(forecast)
-        if target is None:
-            return True
-        marginal = forecast._effective_marginal_overhead_mb  # noqa: SLF001 - same budget object owns the estimate.
-        extra_contexts = max(0, target - 1) + 1  # surviving inference siblings plus the PP lane context.
-        free_with_pp_lane_mb = max(
-            0.0,
-            float(forecast.total_vram_mb) - forecast.per_process_overhead_mb - marginal * extra_contexts,
-        )
-        return (free_with_pp_lane_mb - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001
+        return post_process_context_fits(forecast, self._whole_card_ledger.target_process_count(forecast))
 
     def _disable_post_processing_for_whole_card(self, model_name: str | None, forecast: StreamForecast) -> None:
         """Session-disable post-processing because a whole-card model cannot fit beside the lane context."""
@@ -2897,6 +2720,210 @@ class InferenceScheduler:
             return False
         return self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
+    def _decide_whole_card_demand(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        forecast: StreamForecast,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        is_head_blocker: bool,
+        target_device_index: int | None,
+    ) -> _WholeCardDemandOutcome:
+        """Decide whether the head should claim the whole card, driving the residency side effects.
+
+        The forecast judges whether loading this model beside the resident siblings would drive the device into
+        weight streaming; when it would, and the model fits with the card to itself, it is given sole residency
+        before it loads. Only the head may claim the card. A disaggregation-class job never does, since its
+        sampler co-resides by design and the teardown would stop the lanes it runs on. See
+        :class:`_WholeCardDemandOutcome` for how each result maps to the admission verdict.
+        """
+        # A disaggregation-class job never demands exclusive device residency: it runs as a UNet-only sampler
+        # whose sampler-only footprint co-resides with the encode lane and other samplers by design. Coupled
+        # with sampler-only charging in the forecast, this breaks the loop where a whole-card window (which
+        # pauses the lane) would otherwise flip the job to its monolithic footprint and re-demand the card,
+        # starving the encode lane. Decided on class-eligibility, not liveness, so the contract holds even
+        # while the lane is transiently paused.
+        if self._is_disaggregation_class_eligible(job):
+            return _WholeCardDemandOutcome.FALL_THROUGH
+        # A model needs the teardown path either because it is weight-dominant (needs sole residency) or
+        # because the live sibling process contexts have squeezed its bounded weights off the card though it
+        # co-resides once the process count is reduced. Both are served by the same machinery: establish
+        # residency, stop idle siblings down to max_resident_processes, and admit once the weights fit.
+        live_inference_processes = self._process_map.num_loaded_inference_processes(
+            device_index=target_device_index,
+        )
+        whole_card_demanded = self._whole_card_ledger.residency_demanded(
+            forecast,
+            enabled=self._whole_card_residency_enabled(),
+            is_head_blocker=is_head_blocker,
+            live_inference_process_count=live_inference_processes,
+        )
+        if not whole_card_demanded:
+            # Only the head could have claimed the card, so only the head's refusal is worth naming: a
+            # deeper-queue job reads the same forecast every tick and never had a claim to lose.
+            if is_head_blocker and forecast.needs_process_count_reduction:
+                self._log_whole_card_reduction_suppressed(
+                    job,
+                    forecast,
+                    live_inference_processes=live_inference_processes,
+                )
+            return _WholeCardDemandOutcome.FALL_THROUGH
+        if not self._whole_card_warranted(forecast):
+            # The teardown demand is not trustworthy (a card-light model on a host with no measured
+            # per-context cost): decline the reservation and fall through to ordinary eviction rather than
+            # reserving the device on an over-counted-context phantom.
+            self._log_whole_card_declined(job, forecast)
+            return _WholeCardDemandOutcome.FALL_THROUGH
+
+        held = self._whole_card_ledger.get(target_device_index)
+        establishing_anew = held is None or held.model is None
+        governor_hold = (
+            self._whole_card_ledger.governor_hold(target_device_index, now=self._clock())
+            if establishing_anew
+            else None
+        )
+        if governor_hold is not None:
+            # A governor brakes how fast this card may be rotated; it never says the head cannot be served.
+            # Hold the whole-card ask for a bounded dwell (the head re-asks every cycle), then stop preferring
+            # the card and let the measured arbiter decide: a card that can demonstrably hold the weights
+            # serves the head co-resident rather than standing idle behind a brake with no fallback.
+            elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
+                target_device_index,
+                model=job.model,
+                now=self._clock(),
+            )
+            self._disclose_whole_card_governor_hold(
+                job,
+                governor_hold,
+                device_index=target_device_index,
+                elapsed=elapsed,
+                downgraded=dwell_exhausted,
+            )
+            if dwell_exhausted:
+                return _WholeCardDemandOutcome.FALL_THROUGH
+            self._last_budget_defer_reason = governor_hold.reason
+            return _WholeCardDemandOutcome.DEFER
+        self._whole_card_ledger.clear_governor_defer(target_device_index)
+
+        first_time = not self._job_tracker.is_admitted_exclusive(job)
+        self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
+        if self._should_prestage_whole_card_head(
+            job,
+            baseline,
+            forecast,
+            available_process,
+            device_index=target_device_index,
+        ):
+            # A live job still holds the device, but the heavy head's weights can begin loading into a spare
+            # process's RAM right now: preload_model is a RAM-only load (weights move to VRAM at sampling
+            # time), so it does not contend with the in-flight job's VRAM. Record the residency and send the
+            # preload; _converge_whole_card_residency then collapses the live process count to sole VRAM
+            # residency before the staged model samples. The heavy disk->RAM load overlaps the in-flight job
+            # instead of waiting for the device to drain first.
+            self._begin_whole_card_residency(
+                job,
+                forecast,
+                announce=first_time,
+                device_index=target_device_index,
+                target_process=available_process,
+            )
+            return _WholeCardDemandOutcome.PRESTAGE
+
+        # Claim the device: stop idle siblings to the model's max-resident count and, on the very edge, move
+        # safety off-GPU too. Announces (once) why, for the operator. Held through the cooldown so a burst of
+        # heavy jobs reuses one residency instead of churning per job.
+        self._establish_whole_card_residency(
+            job,
+            forecast,
+            announce=first_time,
+            device_index=target_device_index,
+            target_process=available_process,
+        )
+        # Evict the idle resident models on the *other* processes (sparing the slot that will load this
+        # model, and never a live in-progress model) so their VRAM returns to the driver. A live sibling is
+        # left to drain; the preload simply waits until the device is clear.
+        self.unload_models_from_vram(
+            available_process,
+            under_pressure=True,
+            for_head_of_queue=True,
+            device_index=target_device_index,
+        )
+        if not self._whole_card_teardown_exhausted(forecast, device_index=target_device_index):
+            # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed VRAM to
+            # drain: defer and let a later tick re-evaluate against the reduced topology.
+            return _WholeCardDemandOutcome.DEFER
+        # Teardown is structurally exhausted (already at the target process count, safety settled). The card is
+        # now cleared to sole residency, so the head's weights are priced against a drained card: fall through
+        # to the measured arbiter evaluation, which admits when the weights fit the cleared card (the
+        # activation peak is the sampling gate's concern, not preload admission) and denies when even the
+        # cleared card cannot hold them (an unserviceable model the offering seam should have excluded).
+        return _WholeCardDemandOutcome.FALL_THROUGH
+
+    def _should_prestage_whole_card_head(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        forecast: StreamForecast,
+        available_process: HordeProcessInfo,
+        *,
+        device_index: int | None = None,
+    ) -> bool:
+        """Whether a whole-card head should preload into a spare's RAM while a live job still holds the device.
+
+        A preload is RAM-only, so the multi-GB disk read overlaps the in-flight job instead of starting after the
+        drain. Worthwhile only when a live job holds the card, the head is not already resident or loading, an idle
+        spare exists, and system RAM can hold the weights beside the in-flight job.
+        """
+        if device_index is None:
+            live_jobs_on_device = len(self._job_tracker.jobs_in_progress)
+        else:
+            live_jobs_on_device = len(self._jobs_in_progress_on_card(device_index))
+        if live_jobs_on_device == 0:
+            return False
+        if self._is_model_forecast_to_load(job.model):
+            return False
+        if available_process.is_process_busy():
+            return False
+        return self._prestage_weights_fit_ram(job, baseline, forecast)
+
+    def _begin_whole_card_residency(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+        *,
+        announce: bool,
+        device_index: int | None = None,
+        target_process: HordeProcessInfo | None = None,
+    ) -> None:
+        """Record a residency for a head pre-staging into RAM, without claiming the card yet.
+
+        The same bookkeeping as an establishment (cooldown, restore, wedge grace) minus the teardown, which
+        :meth:`_converge_whole_card_residency` performs once the head is staged and the device frees. The spare
+        the pre-stage loads into is remembered so the convergence shrink can spare a slot that does not yet
+        carry the model name.
+        """
+        self._whole_card_ledger.record_grant(
+            device_index,
+            model=job.model,
+            forecast=forecast,
+            cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
+            now=self._clock(),
+            establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+        )
+        if target_process is not None:
+            self._whole_card_ledger.state_for(device_index).prestage_process_id = target_process.process_id
+        if announce:
+            logger.opt(colors=True).info(
+                "<fg #f0beff>Pre-staging whole-card head {} into a spare process's RAM while the "
+                f"in-flight job finishes; the device will be reserved for it (idle siblings stopped"
+                f"{' and safety moved off-GPU' if self._residency_should_pause_safety(device_index) else ''}) "
+                f"once it frees, so its weights are loaded before it samples instead of after. "
+                "{}</>",
+                job.model,
+                self._process_map.residency_snapshot(),
+            )
+
     def _establish_whole_card_residency(
         self,
         job: ImageGenerateJobPopResponse,
@@ -2907,23 +2934,13 @@ class InferenceScheduler:
         device_index: int | None = None,
         target_process: HordeProcessInfo | None = None,
     ) -> None:
-        """Claim the device for a whole-card model: stop idle siblings and move safety off-GPU.
+        """Claim the device for a whole-card model: stop idle siblings and move safety and the lanes off the card.
 
-        The siblings' fixed per-process CUDA contexts (not their models) over-commit the device, and a context
-        is only reclaimed by the process exiting (``torch.cuda.empty_cache`` returns cached blocks but never a
-        context). Reduce the live inference-process count to the largest that still leaves room for this model's
-        weights plus its activation reserve, and, on the very edge (Flux on a 16GB card), also move the
-        safety process off-GPU so its context is freed too. The model is remembered so the residency is held
-        and then restored once its job drains (after the configured cooldown). Only idle inference processes
-        are stopped; a busy sibling is left to finish its job.
-
-        ``device_index`` scopes the residency to one card on a multi-GPU host (only that card's processes are
-        reduced, and safety is paused only if it sits on that card); None is the single-GPU / worker-wide case.
-
-        ``target_process`` is the slot the caller is about to load or dispatch this head on. It is spared from
-        the scale-down: ``protected_model`` spares only lanes already carrying the model, and a head that is
-        not staged anywhere yet has none, so its own empty idle target would otherwise be a legal victim of
-        the teardown its residency ordered.
+        Sibling CUDA contexts are only reclaimed by the process exiting, so the live inference count is reduced
+        to the largest that still leaves room for the weights plus the activation reserve. Only idle siblings are
+        stopped. ``target_override`` sizes the depth from a rejected admission peak instead of the forecast.
+        ``target_process`` is the slot this head will load on and is spared from the shrink, since a head not
+        yet staged anywhere carries no model name for the protected-model rule to match.
         """
         self._whole_card_ledger.record_grant(
             device_index,
@@ -2931,7 +2948,7 @@ class InferenceScheduler:
             forecast=forecast,
             cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
             now=self._clock(),
-            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
         if target_override is not None:
             self._whole_card_ledger.tighten_target(device_index, target_override)
@@ -2990,171 +3007,15 @@ class InferenceScheduler:
                 self._process_map.residency_snapshot(),
             )
 
-    def _scale_sparing(
-        self,
-        target: int,
-        *,
-        device_index: int | None,
-        protected_model: str | None,
-        spared_process_id: int | None,
-    ) -> int:
-        """Scale the inference pool, naming a spared slot only when this caller holds one.
-
-        The spare is an optional extra on top of the model-name protection: a residency that has no slot of
-        its own committed yet (its head is resident somewhere, or the caller is a convergence with nothing
-        pre-staged) asks for exactly the shrink it always did.
-        """
-        if spared_process_id is None:
-            return self._process_lifecycle.scale_inference_processes(
-                target,
-                device_index=device_index,
-                protected_model=protected_model,
-            )
-        return self._process_lifecycle.scale_inference_processes(
-            target,
-            device_index=device_index,
-            protected_model=protected_model,
-            spared_process_id=spared_process_id,
-        )
-
-    def _should_prestage_whole_card_head(
-        self,
-        job: ImageGenerateJobPopResponse,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        forecast: StreamForecast,
-        available_process: HordeProcessInfo,
-        *,
-        device_index: int | None = None,
-    ) -> bool:
-        """Whether a whole-card head should be pre-loaded into a spare's RAM while a live job holds the device.
-
-        ``preload_model`` is a RAM-only load (the weights reach VRAM only at sampling), so a heavy head can
-        load into an idle process's RAM concurrently with the in-flight job, and be ready to sample the
-        instant the device frees, rather than its multi-GB disk->RAM load only starting after the drain.
-
-        Pre-staging is worthwhile only when:
-
-        - a live job actually holds the device (otherwise the normal whole-card path claims the idle card and
-          loads immediately, with nothing to overlap);
-        - the head is not already resident or loading somewhere (nothing left to pre-stage);
-        - there is an idle spare to hand the preload to (never the live job's own process); and
-        - system RAM can hold the head's *weights* alongside the in-flight job, i.e. the operator's "assuming the
-          RAM can support it" (see :meth:`_prestage_weights_fit_ram`). A RAM shortfall falls back to the prior
-          claim-the-card-and-wait behavior.
-
-        ``device_index`` scopes "a live job holds the device" to one card on a multi-GPU host (the card the
-        spare slot sits on); None is the single-GPU / worker-wide case.
-        """
-        if device_index is None:
-            live_jobs_on_device = len(self._job_tracker.jobs_in_progress)
-        else:
-            live_jobs_on_device = len(self._jobs_in_progress_on_card(device_index))
-        if live_jobs_on_device == 0:
-            return False
-        if self._is_model_forecast_to_load(job.model):
-            return False
-        if available_process.is_process_busy():
-            return False
-        return self._prestage_weights_fit_ram(job, baseline, forecast)
-
-    def _prestage_weights_fit_ram(
-        self,
-        job: ImageGenerateJobPopResponse,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        forecast: StreamForecast,
-    ) -> bool:
-        """Whether system RAM can hold the head's *weights* alongside the in-flight job.
-
-        A RAM preload materialises only the model's weights on the CPU offload device; the activation working
-        set that inflates the full :func:`predict_job_ram_mb` burden lives in VRAM at sampling time, not in
-        RAM. Gating the pre-stage on that full burden over-rejects a head whose weights comfortably fit (a Flux
-        fp8 head's ~11.5GB of weights versus its ~24GB activation-inclusive estimate), which is what forces the
-        worker to tear every idle sibling down instead of staging. Worse, the establish path it then falls back
-        to loads those same weights into RAM with no hard gate at all, so the burden gate held the pre-stage to
-        a stricter standard than the path it defers to. So gate on the weight footprint (the forecast's
-        ``weights_mb``, the persistent RAM cost of a preload) plus the configured RAM reserve.
-
-        When the weight estimate is unavailable (it should not be once ``needs_exclusive_residency`` is True,
-        which requires known weights) fall back to the conservative full-burden RAM budget, so a head whose
-        footprint cannot be sized is never force-staged onto a RAM-pressured host.
-        """
-        available_ram_mb = self._measured_available_ram_mb()
-        weights_mb = forecast.weights_mb
-        committed_ram_mb = self._reserve_ledger.total_ram_mb()
-        if weights_mb is None:
-            return self._ram_budget.check_job(
-                job,
-                baseline,
-                available_ram_mb,
-                committed_reserve_mb=committed_ram_mb,
-            ).fits
-        return (available_ram_mb - committed_ram_mb) >= float(weights_mb) + self._ram_budget.reserve_mb
-
-    def _begin_whole_card_residency(
-        self,
-        job: ImageGenerateJobPopResponse,
-        forecast: StreamForecast,
-        *,
-        announce: bool,
-        device_index: int | None = None,
-        target_process: HordeProcessInfo | None = None,
-    ) -> None:
-        """Record a whole-card residency for a head being pre-staged into RAM, without claiming the card yet.
-
-        The device cannot be claimed while a live job holds it, but the heavy head's weights can load into a
-        spare's RAM now. This sets the same residency bookkeeping :meth:`_establish_whole_card_residency` does
-        (so the cooldown, the restore, and the recovery-supervisor wedge grace all cover the pre-stage load and
-        the convergence that follows), minus the process teardown and safety pause: those are deferred to
-        :meth:`_converge_whole_card_residency`, which runs once the head is staged and the device frees.
-
-        ``device_index`` scopes the pre-staged residency to one card on a multi-GPU host; None is the
-        single-GPU / worker-wide case.
-
-        ``target_process`` is the spare the pre-stage loads into. It is remembered on the residency so the
-        convergence that follows spares it: that shrink spares the holder by model name, which a slot still
-        mid-load does not carry, so the pre-stage's own target would otherwise be a legal victim of the
-        collapse it is loading for.
-        """
-        self._whole_card_ledger.record_grant(
-            device_index,
-            model=job.model,
-            forecast=forecast,
-            cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
-            now=self._clock(),
-            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-        )
-        if target_process is not None:
-            self._whole_card_ledger.state_for(device_index).prestage_process_id = target_process.process_id
-        if announce:
-            logger.opt(colors=True).info(
-                "<fg #f0beff>Pre-staging whole-card head {} into a spare process's RAM while the "
-                f"in-flight job finishes; the device will be reserved for it (idle siblings stopped"
-                f"{' and safety moved off-GPU' if self._residency_should_pause_safety(device_index) else ''}) "
-                f"once it frees, so its weights are loaded before it samples instead of after. "
-                "{}</>",
-                job.model,
-                self._process_map.residency_snapshot(),
-            )
-
     def _converge_whole_card_residency(self) -> None:
-        """Collapse an in-progress whole-card residency to sole VRAM residency once its model is staged.
+        """Collapse each held residency to sole VRAM residency once its model has a holder.
 
-        Driven each scheduling cycle while a residency is held. A pre-staged head is loaded into RAM before
-        the device is claimed (see :meth:`_begin_whole_card_residency`); stopping idle siblings before the head
-        is actually resident on a process could kill the very spare the pre-stage wants to use, so this waits
-        until the head is resident or loading on a process. From then on the scale-down is told this is a
-        whole-card collapse (``protected_model``), so it spares only that head's holder and stops the *other*
-        idle siblings, including ones holding a model still queued behind the head, which the generic
-        scale-down guard would otherwise protect and thereby pin the count above the target forever. Those
-        queued jobs wait and reload once the head drains (see :meth:`_restore_siblings_after_whole_card`).
-        Reclaiming the siblings' CUDA contexts and moving safety off-GPU leaves the staged head the whole card
-        when it samples. The VAE lane is retried here as well: establishment withholds its pause while a
-        disaggregated decode is still in flight on it, so the lane leaves the card on the first cycle after
-        those decodes drain. A no-op until a residency is held and its model is staged; idempotent at the target.
-        Converges every held residency, so on a multi-GPU host each card's pre-staged head collapses its own
-        card independently.
+        Runs every scheduling cycle. Waits for the pre-staged head to have a holder so the shrink cannot kill the
+        spare it is loading into, then stops the other idle siblings (including ones holding a model queued behind
+        the head, which the generic scale-down guard would otherwise protect) and retries the lane pauses that
+        establishment withheld while a decode was in flight. Idempotent at the target.
         """
-        for device_index, state in self._held_residencies():
+        for device_index, state in self._whole_card_ledger.held():
             model = state.model
             if model is None or not self._whole_card_residency_has_holder(model, device_index):
                 continue
@@ -3180,6 +3041,62 @@ class InferenceScheduler:
             if self._residency_should_pause_component_lane(device_index):
                 self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
+    def _reprice_held_whole_card_residencies(self) -> None:
+        """Tighten held residency targets from current pricing without rewriting their grant forecasts.
+
+        New allocator evidence and live reservation changes can show that a residency granted for two contexts
+        now safely holds only one. Each governance tick re-forecasts pending or active jobs for the held model
+        and keeps the strictest target. A target never grows mid-hold. Any resulting context reduction is booked
+        with the verified reclaim ladder as the single restore obligation; the residency's own release still
+        performs the physical regrowth and discharges that debt.
+        """
+        for device_index, state in self._whole_card_ledger.held():
+            model = state.model
+            if model is None:
+                continue
+            matching_jobs = [
+                job
+                for job in (*self._job_tracker.jobs_in_progress, *self._job_tracker.jobs_pending_inference)
+                if job.model == model
+            ]
+            targets = [
+                target
+                for job in matching_jobs
+                if (
+                    target := self._whole_card_ledger.target_process_count(
+                        self._forecast_streaming(
+                            job,
+                            self._model_metadata.get_baseline(model),
+                            device_index=device_index,
+                        )
+                    )
+                )
+                is not None
+            ]
+            if not targets:
+                continue
+            self._whole_card_ledger.tighten_target(device_index, min(targets))
+            effective_target = self._whole_card_ledger.effective_target(state)
+            live_count = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if effective_target is None or live_count <= effective_target:
+                continue
+            # A tightened target can arrive while the head is still pre-staging into a slot that does not yet
+            # carry its model name, so the shrink is told which slot that is, the same as the convergence shrink.
+            after = self._scale_sparing(
+                effective_target,
+                device_index=device_index,
+                protected_model=model,
+                spared_process_id=state.prestage_process_id,
+            )
+            if after >= live_count:
+                continue
+            if self._reclaim_ladder is not None:
+                self._reclaim_ladder.record_context_reduction(device_index)
+            logger.info(
+                f"Re-priced held whole-card residency for {model} on device {device_index}: "
+                f"inference processes {live_count} -> {after}, tightened target {effective_target}."
+            )
+
     def _whole_card_residency_has_holder(self, model: str, device_index: int | None) -> bool:
         """Whether a held whole-card model is staged or resident on a live process.
 
@@ -3187,34 +3104,23 @@ class InferenceScheduler:
         Once the holder reports ready it may sit in ``WAITING_FOR_JOB`` rather than a preload state, so the
         generic "forecast to load" predicate is too narrow here.
         """
-        return any(
-            process.process_type is HordeProcessType.INFERENCE
-            and process.loaded_horde_model_name == model
-            and (device_index is None or process.device_index == device_index)
-            for process in self._process_map.values()
-        )
+        return residency_has_holder(self._process_map.values(), model, device_index)
 
     def _prestaged_whole_card_not_ready(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job`` must wait for its in-progress whole-card residency to claim the card before sampling.
 
-        A pre-staged whole-card head is loaded into RAM (see :meth:`_begin_whole_card_residency`) before the
-        device is reserved, so dispatching it would commit its weights to VRAM while idle siblings (or the
-        just-drained busy process) still hold their CUDA contexts, forcing the first step to stream. This
-        returns True until the residency has converged, i.e. the live inference-process count is at the forecast's
-        target, safety is off-GPU if this residency needs it, and the card has drained enough to load the
-        weights (the same :meth:`_whole_card_teardown_exhausted` gate the non-pre-staged path loads under).
-
-        Returns False for any job that is not the currently-held residency's model, so ordinary dispatch (and
-        the non-pre-staged whole-card path, which only preloads once already at sole residency) is unaffected.
+        Dispatching a pre-staged head before convergence would commit its weights beside sibling contexts and
+        force the first step to stream. The residency's stored forecast is preferred for the readiness check,
+        since it carries the target and fits-alone guarantee captured at establishment.
         """
-        found, device_index = self._residency_holder_for_model(job.model)
+        found, device_index = self._whole_card_ledger.holder_for_model(job.model)
         if not found:
             return False
         # Re-use the residency's stored forecast for the readiness check rather than re-deriving from the
         # current (possibly degraded) state: it carries the stable weight footprint, the budget-relative target,
         # and the fits_alone guarantee captured at establishment, which the live device reading and the bounded
         # drain backstop in _whole_card_teardown_exhausted then resolve against the real, post-teardown VRAM.
-        stored = self._residency_state(device_index).forecast
+        stored = self._whole_card_ledger.state_for(device_index).forecast
         if stored is not None:
             # The stored forecast reflects the residency's actual budget-relative target and the
             # weight footprint at establishment time; only re-derive when it was never captured.
@@ -3230,10 +3136,10 @@ class InferenceScheduler:
     ) -> bool:
         """Ensure an already-resident whole-card head has sole residency before it samples.
 
-        The ordinary whole-card path runs during preload admission, so it used to miss a heavy head whose
-        model was already resident on an idle process while sibling processes still held their own models.
-        That job is entitled to the same residency as a to-be-loaded head: establish the residency, evict
-        sibling VRAM, and defer dispatch until the teardown is complete.
+        The admission-time path misses a heavy head whose model is already resident on an idle slot while siblings
+        hold their own models. That head is owed the same residency: establish it, evict sibling VRAM, and defer
+        dispatch until the teardown is complete. The same churn governors that gate an establishment at admission
+        gate it here, with the dwell shared through the ledger.
         """
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
@@ -3279,7 +3185,7 @@ class InferenceScheduler:
         # through the ledger, so a head that already sat out its dwell dispatches co-resident immediately.
         held = self._whole_card_ledger.get(target_device_index)
         if held is None or held.model is None or held.model != job.model:
-            governor_hold = self._whole_card_governor_hold(target_device_index, now=self._clock())
+            governor_hold = self._whole_card_ledger.governor_hold(target_device_index, now=self._clock())
             if governor_hold is not None:
                 elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
                     target_device_index,
@@ -3319,41 +3225,16 @@ class InferenceScheduler:
         )
         return self._whole_card_teardown_exhausted(forecast, device_index=target_device_index)
 
-    def _residency_holder_for_model(self, model: str | None) -> tuple[bool, int | None]:
-        """Return ``(found, device_index)`` for the card whose held whole-card residency is for ``model``.
-
-        ``found`` distinguishes a genuine hit on the ``None`` (single-GPU / worker-wide) key from a miss, since
-        ``None`` is itself a valid residency key.
-        """
-        return self._whole_card_ledger.holder_for_model(model)
-
     def _whole_card_teardown_exhausted(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
 
-        The whole-card branch defers a heavy head while a teardown can still make room: idle siblings left to
-        stop, the safety process still on-GPU, or their freed VRAM still draining. The first two are the
-        *structural* hold and are decided on topology alone (live process count at or below the forecast's
-        target, safety off-GPU if this residency needs it). Once both hold the teardown is structurally
-        complete: the model fits alone (``fits_alone``, the grant precondition for a whole-card residency), so
-        the only remaining question is whether the asynchronously-freed VRAM has actually materialised.
-
-        That last step is resolved against the live device, not the stale establishment forecast (whose
-        ``free_now_mb`` was captured before the teardown freed the siblings' VRAM, so reading it would park the
-        head forever once it drains): the *live* free-VRAM reading dispatches the head the moment it confirms the
-        drain (safe to read here, at sole residency, where it only rises as the stopped contexts release), and a
-        bounded ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` backstop admits it on the structural sole-residency
-        guarantee if the measurement is unavailable or lags, so the head never parks indefinitely. That
-        guarantee is sized for a card every other context has left, so the safety context this residency is
-        leaving in place (:meth:`_resident_safety_charge_mb`) is priced back out of it: otherwise the backstop
-        admits the head against room only a departure the configuration forbids would free, and the weights
-        load into a card short by roughly the safety footprint. A model that still cannot fit co-resident even
-        at sole residency loads best-effort the same way and samples slowly under the over-budget step grace
-        rather than wedging the queue until the recovery supervisor soft-resets.
-
-        ``device_index`` scopes the live-context count and the safety check to one card on a multi-GPU host;
-        None is the single-GPU / worker-wide case.
+        The structural legs (live process count at or below the target, safety and the lanes off the card when
+        this residency needs them) are decided on topology alone. Once they hold, the only remaining question is
+        whether the asynchronously freed VRAM has materialised, which is resolved against the live device reading
+        rather than the stale establishment forecast; a bounded settle backstop admits the head on the structural
+        fits-alone guarantee if the measurement lags, net of the safety context this residency leaves in place.
         """
-        state = self._residency_state(device_index)
+        state = self._whole_card_ledger.state_for(device_index)
         return self._whole_card_ledger.teardown_complete(
             forecast,
             loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
@@ -3377,23 +3258,6 @@ class InferenceScheduler:
             now=self._clock(),
         )
 
-    def _resident_safety_charge_mb(self, device_index: int | None) -> float:
-        """The device charge of a safety context this card's residency is leaving where it is.
-
-        A whole-card residency only reaches sole residency where it actually moves safety off the card. Where
-        the configuration keeps safety on-GPU (:meth:`_residency_should_pause_safety` is False) and safety is
-        still holding its context, the residency's structural sole-residency figure over-states the room the
-        head will find by :meth:`_safety_footprint_mb`, so that charge is what a caller leaning on the
-        figure must price back out. Zero once safety is off-GPU, or where this residency is going to move it.
-        """
-        if not self._safety_on_gpu_permitted:
-            return 0.0
-        if self._residency_should_pause_safety(device_index):
-            return 0.0
-        if self._process_lifecycle.is_safety_gpu_paused:
-            return 0.0
-        return self._safety_footprint_mb()
-
     def _whole_card_weights_fit_live(
         self,
         forecast: StreamForecast,
@@ -3401,21 +3265,12 @@ class InferenceScheduler:
         device_index: int | None = None,
         model: str | None = None,
     ) -> bool:
-        """Whether the residency model's weights fit the *live* measured free VRAM (read only at sole residency).
+        """Whether the residency model's weights fit the live measured free VRAM, read only at sole residency.
 
-        Keyed on the live device reading rather than the forecast's stored ``free_now_mb`` (captured at
-        establishment, before the teardown freed the siblings' VRAM). Only the caller's structural-completion
-        guard makes this safe to trust: at sole residency the reading is monotonic, only rising as the
-        stopped siblings' contexts release, so it never reads deceptively high the way an instantaneous
-        reading does during startup (idle contexts not yet allocated reading as free). Unknown weight or
-        measurement returns False so the bounded structural backstop, not a guess, drives the fallback.
-
-        Weights already committed to VRAM are the answered case: a free-VRAM reading taken while the residency
-        model itself is resident already excludes those weights, so comparing the model's full weight figure
-        against it asks the card for room it is spending on this very model. That comparison can never pass
-        while the model is resident, which parks every dispatch of a resident head on the drain-settle backstop
-        even though the fit it is waiting to confirm is already a physical fact. Residency of the model is
-        therefore the fit.
+        At sole residency the reading only rises as stopped contexts release, so it is safe to trust here. A
+        model already resident is the answered case: a free reading taken while it is resident already excludes
+        its weights, so comparing the full weight figure against it could never pass. Unknown figures read as
+        not fitting so the bounded backstop, not a guess, drives the fallback.
         """
         if model is not None and self._whole_card_model_weights_resident(model, device_index=device_index):
             return True
@@ -3440,20 +3295,380 @@ class InferenceScheduler:
         )
 
     def _whole_card_drain_backstop_elapsed(self, device_index: int | None) -> bool:
-        """Whether the bounded drain-settle window has elapsed since this residency was established.
+        """Whether the bounded drain-settle window has run since the teardown's structural legs first all held.
 
-        The deterministic backstop for the dispatch gate: once a structurally-complete teardown has held for
-        ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` without the live reading confirming the drain, the head is admitted
-        on the structural ``fits_alone`` guarantee rather than parking forever. Measured from the moment the
-        teardown's structural legs first all passed, so a slow establishment does not spend the backstop before
-        the sole-residency guarantee it admits the head against exists; once that guarantee holds, a stuck or
-        unavailable free-VRAM measurement can never wedge the head.
+        Measured from that moment so a slow establishment does not spend the backstop before the sole-residency
+        guarantee it admits the head against exists.
         """
         return self._whole_card_ledger.drain_backstop_elapsed(
             device_index,
             now=self._clock(),
-            settle_seconds=_WHOLE_CARD_DRAIN_SETTLE_SECONDS,
+            settle_seconds=WHOLE_CARD_DRAIN_SETTLE_SECONDS,
         )
+
+    def _residency_can_never_converge(
+        self,
+        device_index: int | None,
+        state: WholeCardResidency,
+        *,
+        now: float,
+    ) -> bool:
+        """Whether a held residency has lost every route to running its model or draining.
+
+        Retention is justified by the residency's own queued work being about to run on it. Past the establish
+        grace, a model with no holder, nothing staging it, no exclusive job sampling, and a different model at the
+        head can neither converge nor drain, so it is released through the normal restore path.
+        """
+        model = state.model
+        if model is None:
+            return False
+        if state.established_at == 0.0 or (now - state.established_at) < WHOLE_CARD_ESTABLISH_GRACE_SECONDS:
+            return False
+        if self._whole_card_residency_has_holder(model, device_index):
+            return False
+        if self._horde_model_map.is_model_loading(model):
+            return False
+        prestage_process_id = state.prestage_process_id
+        if prestage_process_id is not None:
+            # The pre-stage target is remembered for the life of the residency, so its mere existence says
+            # nothing; only a slot still mid-load is a route to a holder.
+            prestage_process = self._process_map.get(prestage_process_id)
+            if (
+                prestage_process is not None
+                and prestage_process.is_process_alive()
+                and prestage_process.last_process_state
+                in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.DOWNLOADING_MODEL)
+            ):
+                return False
+        # Only a job actually sampling keeps the residency: a pending exclusive admit for this model is exactly
+        # the work that has no route to a holder, and its own claim on the card is what bars every other head.
+        if self._job_tracker.has_exclusive_job_running(device_index):
+            return False
+        head = self._undispatched_head()
+        return not (head is not None and head.model == model)
+
+    def _restore_siblings_after_whole_card(self) -> None:
+        """Restore inference concurrency and the lanes after a whole-card residency has drained.
+
+        Held while the residency model is pending or in progress and through the cooldown, so a burst of heavy
+        jobs reuses one residency. The operator's maximum hold and the empty-pop release end that retention. A
+        ready different-model head may cut the cooldown short once the minimum hold has amortised the teardown.
+        The restore's wedge-grace window is granted before the churn is ordered and withdrawn again when the
+        release turns out to have changed nothing, so the supervisor is never told to ignore a wedge for free.
+        """
+        now = self._clock()
+        max_hold_seconds = 0.0 if self._multi_gpu_routing_active else self._whole_card_max_hold_seconds()
+        active_models = {j.model for j in self._job_tracker.jobs_in_progress}
+        active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
+        for device_index, state in self._whole_card_ledger.held():
+            model = state.model
+            # Past the maximum hold (or once the empty-pop evidence has ended the claim) the residency stops
+            # being retained: it neither refreshes its cooldown nor honours a standing one, so it lets go as
+            # soon as its own accepted work has drained and the full model pool returns. Retention is all it
+            # ends; work in flight finishes and a granted grace window still runs its own duration.
+            retention_ended = self._whole_card_ledger.pop_claim_retention_ended(
+                device_index,
+                now=now,
+                max_hold_seconds=max_hold_seconds,
+            )
+            if (
+                model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
+            ) and not self._residency_can_never_converge(device_index, state, now=now):
+                # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
+                # back-to-back heavy jobs).
+                if not retention_ended:
+                    state.cooldown_until = now + self._whole_card_cooldown_seconds()
+                continue
+            # A ready head for a different model may cut the cooldown short, but not before the residency has
+            # held long enough to amortize the teardown and the regrowth the release itself will pay for;
+            # otherwise a queue alternating heavy and light heads rebuilds the pool on every job.
+            ready_different_model_head = self._ready_different_model_head_on_device(
+                residency_model=model,
+                device_index=device_index,
+            )
+            min_hold_disclosure = (
+                self._whole_card_ledger.min_hold_disclosure(device_index, now=now)
+                if ready_different_model_head
+                else None
+            )
+            if min_hold_disclosure is not None:
+                self._disclose_whole_card_min_hold(device_index, model, min_hold_disclosure)
+            preempt_cooldown = ready_different_model_head and min_hold_disclosure is None
+            if self._clock() < state.cooldown_until and not preempt_cooldown and not retention_ended:
+                # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
+                continue
+            # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
+            # unservable; mark its start so the wedge grace covers it (see WHOLE_CARD_RESTORE_GRACE_SECONDS).
+            # The window is granted here, before the churn is ordered, so no reader can see the release without
+            # its excuse; it is withdrawn below if the release turns out to have had no churn to cover.
+            granted_at = self._clock()
+            self._whole_card_ledger.record_restore(
+                device_index,
+                now=granted_at,
+                restore_grace_seconds=WHOLE_CARD_RESTORE_GRACE_SECONDS,
+            )
+            self._min_hold_disclosed.pop(device_index, None)
+            if self._reclaim_ladder is not None:
+                self._reclaim_ladder.discharge_context_reduction(device_index)
+            post_process_restored = (
+                self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
+                if self._residency_should_pause_post_process(device_index)
+                and not self._state.post_processing_disabled_by_breaker
+                else False
+            )
+            vae_lane_restored = (
+                self._process_lifecycle.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
+                if self._residency_should_pause_vae_lane(device_index)
+                else False
+            )
+            component_lane_restored = (
+                self._process_lifecycle.restore_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
+                if self._residency_should_pause_component_lane(device_index)
+                else False
+            )
+            lanes_restarting = post_process_restored or vae_lane_restored or component_lane_restored
+            ceiling = self._residency_restore_ceiling(device_index)
+            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if current >= ceiling and not lanes_restarting:
+                # The pool is already at its ceiling and no lane was restarted: this release changed nothing.
+                self._whole_card_ledger.close_restore_window(device_index, granted_at=granted_at)
+                continue
+            after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
+            self._reconcile_worker_shed_to_pool()
+            regrown_to_ceiling = isinstance(after, int) and after >= ceiling
+            if not lanes_restarting and regrown_to_ceiling:
+                # Every sibling was back before this call returned, so there is no respawn still in flight for
+                # the window to cover. A pool that has not reached its ceiling keeps it: the spawns it is
+                # waiting on are exactly the churn the wedge grace exists to excuse.
+                self._whole_card_ledger.close_restore_window(device_index, granted_at=granted_at)
+            post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
+            vae_lane_note = " and restarting the VAE lane" if vae_lane_restored else ""
+            component_lane_note = " and restarting the component lane" if component_lane_restored else ""
+            logger.opt(colors=True).info(
+                "<fg #7b7d7d>Whole-card residency for {} complete; restoring inference processes "
+                f"({current} -> {after} of {ceiling})"
+                f"{post_process_note}{vae_lane_note}{component_lane_note}.</>",
+                model,
+            )
+        self._pop_claim_tracker.disclose_edge(self.whole_card_pop_claim(), now=self._clock())
+
+    def _residency_restore_ceiling(self, device_index: int | None) -> int:
+        """The process count to grow back to when a card's whole-card residency is restored.
+
+        That card's own ``target_process_count`` on a multi-GPU host; the worker-wide launched-process
+        ceiling for the single-GPU / worker-wide (``None``) case.
+        """
+        if device_index is not None and device_index in self._card_runtimes:
+            return self._card_runtimes[device_index].target_process_count
+        return self._max_inference_processes
+
+    def _disclose_whole_card_min_hold(
+        self,
+        device_index: int | None,
+        model: str | None,
+        disclosure: str,
+    ) -> None:
+        """State once per residency episode that the minimum hold is what kept a ready head off the card.
+
+        The floor holds a different-model head without returning any admission verdict, so silence leaves the
+        wait attributable only to the cooldown, which a ready head is otherwise allowed to cut short. Keyed to
+        the card and the residency's model so one episode speaks once however many cycles it holds for, and a
+        later residency speaks for itself; cleared when the residency restores.
+        """
+        if self._min_hold_disclosed.get(device_index) == model:
+            return
+        self._min_hold_disclosed[device_index] = model
+        logger.info(f"A ready different-model head may not release this residency yet: {disclosure}.")
+
+    def _disclose_whole_card_governor_hold(
+        self,
+        job: ImageGenerateJobPopResponse,
+        hold: WholeCardGovernorHold,
+        *,
+        device_index: int | None,
+        elapsed: float,
+        downgraded: bool,
+    ) -> None:
+        """Disclose a governor holding this head off the card, and the downgrade when the dwell is spent.
+
+        A hold that persists is re-stated periodically rather than announced once: the operator needs the
+        current spend and the wait, not a single line from whenever the hold began. Repeats inside the
+        diagnostic cadence are counted and left at TRACE so a tick-rate loop cannot flood the log.
+        """
+        name = "whole_card_governor_downgrade" if downgraded else "whole_card_governor_hold"
+        suppressed = self._diagnostics.suppressed_count(name, (str(job.model), device_index, hold.governor))
+        stated = hold.reason if hold.detail is None else f"{hold.reason} ({hold.detail})"
+        if downgraded:
+            message = (
+                f"Whole-card residency downgraded for {job.model}: {stated}. It has asked for the card for "
+                f"{elapsed:.0f}s, so the ask is dropped and ordinary admission decides; if the device holds its "
+                "weights it runs co-resident (slower than sole residency) instead of waiting for the allowance."
+            )
+        else:
+            message = (
+                f"Deferring a new whole-card residency for {job.model}: {stated}. Normal scheduling "
+                f"continues; after {self._whole_card_ledger.governor_defer_dwell_seconds:.0f}s held (currently "
+                f"{elapsed:.0f}s) the head stops asking for the card and is served co-resident if the device "
+                "can hold it."
+            )
+        if suppressed is None:
+            logger.trace(message)
+            return
+        logger.warning(f"{message}{suppressed_suffix(suppressed)}")
+
+    def _log_whole_card_declined(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
+        """Record (once per model) that a whole-card teardown demand was declined as untrustworthy.
+
+        Names why a model that the budget/forecast wanted to give the whole card was instead served by
+        ordinary eviction: its footprint does not dominate the device and the per-additional-context cost was
+        not measured, so the demand rests on the fallback that charges the one-time runtime cost against every
+        context. Surfaces the numbers behind that call (the model's weight share of the card and whether the
+        marginal was measured) so a teardown that does *not* happen is as visible in the logs as one that does.
+        """
+        if self._whole_card_declined_notified.get(job.model or "", False):
+            return
+        self._whole_card_declined_notified[job.model or ""] = True
+        weights = forecast.weights_mb
+        total = forecast.total_vram_mb
+        share = f"{(weights / total) * 100:.0f}%" if weights is not None and total else "unknown"
+        logger.opt(colors=True).info(
+            "<fg #7b7d7d>Declined a whole-card residency for {}: "
+            f"its weights (~{weights or 0:.0f}MB, "
+            f"{share} of the {total or 0:.0f}MB card) do not dominate the device and the per-context overhead is "
+            f"unmeasured (using the conservative first-context fallback), so a teardown demand cannot be trusted. "
+            f"Serving it co-resident via model eviction instead of reserving the card.</>",
+            job.model,
+        )
+
+    def _log_whole_card_reduction_suppressed(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+        *,
+        live_inference_processes: int,
+    ) -> None:
+        """Record (once per model) that a process-count-reduction claim was refused for want of a remedy.
+
+        The reduction branch asks for idle sibling *processes* to be stopped. Where the budget already sizes
+        at least as many co-resident contexts as are running, and the shortfall is within the charges no
+        inference teardown reclaims, stopping siblings buys the head nothing: the deficit is the safety
+        footprint, the service lanes' contexts, and the disaggregated image lane's decode spike, which a
+        teardown removes only by stopping the lanes the work runs on. Names the figures behind that refusal so
+        a residency that does *not* happen is as visible as one that does. Latched per model, so a head
+        re-asking every scheduling tick discloses once rather than at the tick rate.
+        """
+        if self._whole_card_reduction_suppressed_notified.get(job.model or "", False):
+            return
+        self._whole_card_reduction_suppressed_notified[job.model or ""] = True
+        weights = forecast.weights_mb or 0.0
+        floor = forecast.base_reserve_mb if forecast.base_reserve_mb is not None else forecast.reserve_mb
+        after_evict = forecast.free_after_model_evict_mb or 0.0
+        logger.opt(colors=True).info(
+            "<fg #7b7d7d>Refused a whole-card process-count reduction for {}: "
+            f"its weights (~{weights:.0f}MB) plus the {floor:.0f}MB floor exceed the {after_evict:.0f}MB "
+            f"siblings-present figure by {max(0.0, weights + floor - after_evict):.0f}MB, but "
+            f"{forecast.unreclaimable_charge_mb:.0f}MB of that figure is safety, service-lane and decode "
+            f"charges no inference teardown reclaims, and the budget already holds "
+            f"{forecast.max_resident_processes()} contexts against {live_inference_processes} live. "
+            f"Serving it co-resident instead of reserving the card.</>",
+            job.model,
+        )
+
+    def _exclusive_dispatch_suppression_active(self, device_index: int | None) -> bool:
+        """Whether an exclusive over-budget admit currently withholds co-dispatch in ``device_index``'s scope.
+
+        Suppression follows a live claim on the card, not the per-job ``admitted_exclusive`` flag: that flag is
+        sticky for the life of the job because it also carries fault attribution and the over-budget step
+        grace. Two claims qualify. An exclusive job actually sampling has its over-budget footprint on the card
+        right now, so co-dispatch stays suppressed for its whole run (on a single-GPU host that is worker-wide,
+        which is the intended conservatism). A staged exclusive job qualifies only while its whole-card
+        residency is held or being established, since that is when the card has actually been given to it. A
+        marked job with neither claim (its establishment deferred by the residency rate limiter, for instance)
+        holds nothing and must not stop unrelated work from dispatching.
+        """
+        if self._job_tracker.has_exclusive_job_running(device_index):
+            return True
+        if not self._job_tracker.has_exclusive_job_in_progress(device_index):
+            return False
+        return self._exclusive_residency_live(device_index)
+
+    def _exclusive_residency_live(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency is held or being established in ``device_index``'s scope.
+
+        A residency record with a model set covers both phases: the model is recorded at the grant, which is
+        when the teardown begins, and cleared only on restore. A card is asked about its own residency and
+        about the card-agnostic worker-wide record, mirroring how an unattributed exclusive admit is treated as
+        applying to every card.
+        """
+        if device_index is None:
+            return self._whole_card_ledger.any_held()
+        return any(
+            (state := self._whole_card_ledger.get(key)) is not None and state.model is not None
+            for key in (device_index, None)
+        )
+
+    def _note_exclusive_dispatch_suppression(
+        self,
+        job: ImageGenerateJobPopResponse,
+        device_index: int | None,
+    ) -> None:
+        """Disclose (throttled per card scope) that an exclusive admit is holding this job's dispatch back."""
+        if self._diagnostics.suppressed_count(f"exclusive_dispatch_suppression:{device_index}", ()) is None:
+            return
+        scope = "worker-wide" if device_index is None else f"device {device_index}"
+        logger.debug(
+            f"Dispatch of job {str(job.id_)[:8]} ({job.model}) is held {scope}: an exclusively-admitted "
+            "over-budget job holds the card.",
+        )
+
+    def _whole_card_convergence_blockers(
+        self,
+        head_process: HordeProcessInfo,
+        device_index: int | None,
+    ) -> list[tuple[int, str]]:
+        """Return idle sibling processes still holding a queued model while a whole-card head is parked.
+
+        Returns ``(process_id, model)`` for each inference process other than the head's own holder that is
+        idle (not busy), pinned to ``device_index`` when scoped, and holds a model that is still queued. The
+        whole-card convergence is meant to have torn these siblings down (sparing only the head's holder), so
+        finding any while the head is still parked is the fingerprint of a teardown that did not collapse the
+        pool. Read-only; used only to explain a stalled dispatch.
+        """
+        queued_models = {
+            job.model
+            for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress)
+            if job.model is not None
+        }
+        return convergence_blockers(
+            self._process_map.values(),
+            head_process_id=head_process.process_id,
+            device_index=device_index,
+            queued_models=queued_models,
+        )
+
+    def _whole_card_lane_blockers(self, device_index: int | None) -> list[str]:
+        """Return the service lanes the teardown gate is still waiting on while a whole-card head is parked.
+
+        Mirrors the lane legs of the ledger's ``teardown_complete``: a lane whose pause this residency requires
+        and whose process is still on the card. The component lane always qualifies when the residency's card
+        hosts it; the post-processing lane only when its bare context cannot share the card with the weights.
+        Read-only; used only to explain a stalled dispatch.
+        """
+        lanes: list[str] = []
+        if (
+            self._residency_should_pause_component_lane(device_index)
+            and self._process_map.num_component_processes(device_index=device_index) > 0
+        ):
+            lanes.append("the component lane")
+        forecast = self._whole_card_ledger.state_for(device_index).forecast
+        if (
+            forecast is not None
+            and self._residency_should_pause_post_process(device_index)
+            and not self._post_process_context_fits_with_residency(forecast, device_index=device_index)
+            and self._process_map.num_post_process_processes(device_index=device_index) > 0
+        ):
+            lanes.append("the post-processing lane")
+        return lanes
 
     def is_whole_card_residency_active(self) -> bool:
         """Whether any card currently holds a whole-card residency lease (its cooldown still running).
@@ -3479,13 +3694,13 @@ class InferenceScheduler:
         which disables the claim along with the cap that bounds it.
         """
         if self._multi_gpu_routing_active:
-            self._disclose_pop_claim_skipped_on_multi_gpu()
+            self._pop_claim_tracker.disclose_skipped_on_multi_gpu(any_held=self._whole_card_ledger.any_held())
             return None
         max_hold_seconds = self._whole_card_max_hold_seconds()
         if max_hold_seconds <= 0.0:
             return None
         now = self._clock()
-        for device_index, _state in self._held_residencies():
+        for device_index, _state in self._whole_card_ledger.held():
             claim = self._whole_card_ledger.pop_claim(
                 device_index,
                 now=now,
@@ -3512,130 +3727,228 @@ class InferenceScheduler:
             now=self._clock(),
         )
         if released:
-            self._pop_claim_empty_release_pending = True
-
-    def _disclose_pop_claim_skipped_on_multi_gpu(self) -> None:
-        """State once that a residency on this host does not claim the offer, and why.
-
-        The offer is worker-wide while a residency is per-card, so on a multi-card host narrowing intake to
-        one card's resident model would leave the other cards with nothing to serve. Silence would read as
-        the feature being broken rather than deliberately inapplicable, so the first residency to be held
-        here says so.
-        """
-        if self._pop_claim_multi_gpu_disclosed or not self._whole_card_ledger.any_held():
-            return
-        self._pop_claim_multi_gpu_disclosed = True
-        logger.info(
-            "Whole-card residency is held on a multi-card host, so it does not claim the pop offer: the offer "
-            "is worker-wide and narrowing it to one card's model would starve the others.",
-        )
-
-    def _whole_card_max_hold_seconds(self) -> float:
-        """Longest one whole-card residency may own the card and the offer, from operator configuration.
-
-        Coerced defensively because a partially-mocked configuration would otherwise put a non-numeric value
-        into a comparison on the pop path; a value that is not a number reads as the feature being off.
-        """
-        configured = self._runtime_config.bridge_data.whole_card_residency_max_hold_seconds
-        if isinstance(configured, bool) or not isinstance(configured, (int, float)):
-            return 0.0
-        return float(configured)
-
-    def _disclose_pop_claim_edge(self) -> None:
-        """Emit the one-line engage/release disclosure when the pop claim's state actually changes.
-
-        Edge-triggered against the claim last surfaced, so a claim held across many ticks is stated once and
-        a released one is stated once. The release names which of the claim's ends fired, since the remedies
-        differ: a cap expiry says the burst outlasted its window, an empty-pop release says the demand went
-        away, and neither reads the same as the residency simply finishing its work. The same end is retained
-        for the status snapshot, which is asked about the offer widening back out after the line has scrolled.
-        """
-        claim = self.whole_card_pop_claim()
-        previous = self._pop_claim_disclosed
-        if claim is not None:
-            if previous is not None and previous.model == claim.model:
-                return
-            self._pop_claim_disclosed = claim
-            self._pop_claim_empty_release_pending = False
-            self._pop_claim_release = None
-            logger.info(
-                f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
-                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.",
-            )
-            return
-        if previous is None:
-            return
-        self._pop_claim_disclosed = None
-        if self._pop_claim_empty_release_pending:
-            release = WholeCardPopClaimRelease.NO_FURTHER_WORK
-            reason = "the horde had no further work for it"
-        elif self._clock() >= previous.expires_at:
-            release = WholeCardPopClaimRelease.MAXIMUM_HOLD
-            reason = "the maximum hold elapsed"
-        else:
-            release = WholeCardPopClaimRelease.RESIDENCY_RELEASED
-            reason = "the residency released"
-        self._pop_claim_empty_release_pending = False
-        self._pop_claim_release = (release, self._clock())
-        logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
-
-    def _recent_pop_claim_release(self, now: float) -> WholeCardPopClaimRelease | None:
-        """Return why the last claim ended while that still explains the offer, else None.
-
-        The release is only an answer to "why is the full pool being advertised again" for as long as the
-        question is being asked about this release; past
-        :data:`_POP_CLAIM_RELEASE_VISIBLE_SECONDS` an unclaimed offer is just the ordinary state and a stale
-        reason beside it would read as a claim that had only just ended.
-        """
-        if self._pop_claim_release is None:
-            return None
-        release, released_at = self._pop_claim_release
-        if (now - released_at) >= _POP_CLAIM_RELEASE_VISIBLE_SECONDS:
-            return None
-        return release
+            self._pop_claim_tracker.note_empty_pop_release()
 
     def whole_card_residency_grace_active(self) -> bool:
-        """Whether a whole-card residency is establishing, so the held queue is intentional (not a wedge).
+        """Whether a residency is establishing or restoring, so a held queue is intentional rather than a wedge.
 
-        While true, the recovery supervisor must not treat the deliberately-deferred heavy head (waiting
-        for idle siblings to stop, the safety process to cycle off-GPU, and ~11GB of weights to load) as a
-        structural queue wedge and soft-reset the pools mid-setup. A granted window holds for its own
-        duration (``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` or ``_WHOLE_CARD_RESTORE_GRACE_SECONDS``), which is
-        the liveness bound on a residency that never loads; how often a card may open a new window is
-        governed at admission, where an establishment is deferred while the card's rolling grace budget is
-        spent. Public: read by the process manager's wedge assessment.
+        Read by the recovery supervisor. Each granted window holds for its own bounded duration; how often a card
+        may open one is governed at admission by the rolling grace budget.
         """
         return self._whole_card_ledger.grace_active(
             now=self._clock(),
-            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+            establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            restore_grace_seconds=WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
 
     def whole_card_governor_defer_active(self) -> bool:
-        """Whether a churn governor is deferring a head's whole-card establishment, so a held queue is chosen.
+        """Whether a churn governor is deferring a head's establishment, so an idle card with work is chosen.
 
-        The governor brakes how fast a card may be rotated; while it holds, the head does not take the card
-        and the smaller work behind it is admitted by ordinary measured admission. That window can legitimately
-        present as an idle card with pending work, which is the raw shape a structural wedge is read from, so
-        the recovery supervisor must not answer a governance brake with constructive remedies or a pool reset.
-        Bounded by the ledger's defer dwell, after which the head stops asking for the card and is served
-        co-resident, so a governor that never releases still leaves the wedge assessment reachable. Public:
-        read by the process manager's wedge assessment.
+        Read by the recovery supervisor. Bounded by the ledger's defer dwell, after which the head is served
+        co-resident, so a governor that never releases still leaves the wedge assessment reachable.
         """
         return self._whole_card_ledger.any_governor_defer_active(now=self._clock())
 
     def heavy_head_load_grace_active(self) -> bool:
         """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
 
-        A model that streams even with the whole card to itself never enters the whole-card branch, so
-        ``whole_card_residency_grace_active`` does not cover it; but its multi-gigabyte load holds the queue
-        just the same. While true the recovery supervisor must not treat that deliberate hold as a structural
-        wedge and give up the never-run backlog. Bounded by ``_HEAVY_HEAD_LOAD_GRACE_SECONDS`` so a head that
-        genuinely never loads still trips the supervisor. Public: read by the process manager's wedge assessment.
+        Read by the recovery supervisor: such a head bypasses the establish grace yet its load holds the queue.
         """
         if self._heavy_head_admitted_at == 0.0:
             return False
-        return (self._clock() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
+        return (self._clock() - self._heavy_head_admitted_at) < HEAVY_HEAD_LOAD_GRACE_SECONDS
+
+    def card_residency(self, device_index: int | None) -> tuple[str | None, str]:
+        """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
+
+        ``model`` is None when this card holds no residency; otherwise ``phase`` is ``establishing`` while the
+        establish grace is still in effect, else ``holding``; this is the same phase split the worker-wide
+        :meth:`whole_card_residency_state` reports. The single-GPU worker-wide residency lives under the
+        ``None`` key, so a single-GPU caller reads it by passing ``device_index=None``. Reads without creating:
+        a card with no residency is left absent from the map.
+        """
+        model, phase = self._whole_card_ledger.phase(
+            device_index,
+            now=self._clock(),
+            establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+        )
+        if model is None:
+            return None, ""
+        return model, str(phase)
+
+    def whole_card_residency_state(self) -> WholeCardResidencyState:
+        """Return a read-only view of the whole-card residency posture, for the status snapshot/TUI.
+
+        ``possible`` is config + topology only (feature on, the VRAM budget on, and something is actually
+        tear-down-able: more than one inference process, or a safety process that can be moved off-GPU);
+        it powers the operator heads-up so a teardown is not a surprise. The remaining fields describe a
+        residency that is currently held (its model, the establish/hold phase, the reduced process count,
+        the safety-pause state, the establishing forecast's hard numbers for the detailed view, and the claim
+        it holds over the pop offer or the reason its last claim ended).
+        Tolerant of partially-mocked config (used in tests that build snapshots): config flags are read
+        with boolean coercion so a non-bool never leaks a truthy Mock into ``possible``.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        enabled = self._whole_card_residency_enabled()
+        budget_on = bridge_data.enable_vram_budget is True
+        safety_off_enabled = bool(self._whole_card_safety_off_gpu_enabled())
+        multi_process = self._max_inference_processes > 1
+        possible = enabled and budget_on and (multi_process or safety_off_enabled)
+
+        # Represent the posture with the first held residency (single-GPU has at most one).
+        # ``active`` is true while any card holds a residency.
+        held = self._whole_card_ledger.held()
+        representative_index, representative = held[0] if held else (None, None)
+        model = representative.model if representative is not None else None
+        active = model is not None
+        forecast = representative.forecast if representative is not None else None
+        now = self._clock()
+
+        phase = ""
+        cooldown_remaining: float | None = None
+        processes_target = 0
+        weights_mb = reserve_mb = free_now_mb = free_if_alone_mb = None
+        max_resident_processes: int | None = None
+        if active and representative is not None:
+            establishing = (
+                representative.established_at != 0.0
+                and (now - representative.established_at) < WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+            )
+            phase = "establishing" if establishing else "holding"
+            cooldown_remaining = max(0.0, representative.cooldown_until - now)
+            if forecast is not None:
+                weights_mb = forecast.weights_mb
+                reserve_mb = forecast.reserve_mb
+                free_now_mb = forecast.free_now_mb
+                free_if_alone_mb = forecast.free_if_alone_mb
+                max_resident_processes = self._whole_card_ledger.effective_target(representative)
+            processes_target = max_resident_processes or 1
+
+        total_vram_mb = (
+            forecast.total_vram_mb
+            if forecast is not None
+            else self._process_map.get_reported_total_vram_mb(device_index=representative_index)
+        )
+
+        # The claim is a separate fact from the residency: a card can hold a model without narrowing the
+        # offer to it, and the offer is what an operator watching models come and go actually sees change.
+        pop_claim = self.whole_card_pop_claim()
+        pop_claim_release = self._pop_claim_tracker.recent_release(now) if pop_claim is None else None
+
+        return WholeCardResidencyState(
+            possible=possible,
+            enabled=enabled,
+            safety_off_gpu_enabled=safety_off_enabled,
+            cooldown_seconds=self._whole_card_cooldown_seconds(),
+            per_process_overhead_mb=self._per_process_overhead_mb(representative_index),
+            total_vram_mb=total_vram_mb,
+            active=active,
+            model=model,
+            phase=phase,
+            safety_paused=bool(self._process_lifecycle.is_safety_gpu_paused),
+            processes_now=self._process_map.num_loaded_inference_processes(),
+            processes_target=processes_target,
+            processes_max=self._max_inference_processes,
+            cooldown_remaining_seconds=cooldown_remaining,
+            pop_claim_model=pop_claim.model if pop_claim is not None else None,
+            pop_claim_remaining_seconds=max(0.0, pop_claim.expires_at - now) if pop_claim is not None else None,
+            pop_claim_release=pop_claim_release.value if pop_claim_release is not None else None,
+            weights_mb=weights_mb,
+            reserve_mb=reserve_mb,
+            free_now_mb=free_now_mb,
+            free_if_alone_mb=free_if_alone_mb,
+            max_resident_processes=max_resident_processes,
+        )
+
+    def _serving_under_whole_card(self, model: str | None, device_index: int | None) -> bool:
+        """Whether a whole-card exclusive residency for ``model`` is held on the card a job is dispatched to.
+
+        Recorded per job at dispatch so a cost analysis can separate work served with the card to itself
+        (which carries the amortized cost of establishing that residency) from co-resident work of the same
+        shape. A residency held for a different model is not this job's, so it reads False.
+        """
+        if model is None:
+            return False
+        return self._whole_card_ledger.state_for(device_index).model == model
+
+    # ---- end whole-card exclusive residency -------------------------------------------------------------
+
+    def _scale_sparing(
+        self,
+        target: int,
+        *,
+        device_index: int | None,
+        protected_model: str | None,
+        spared_process_id: int | None,
+    ) -> int:
+        """Scale the inference pool, naming a spared slot only when this caller holds one.
+
+        The spare is an optional extra on top of the model-name protection: a residency that has no slot of
+        its own committed yet (its head is resident somewhere, or the caller is a convergence with nothing
+        pre-staged) asks for exactly the shrink it always did.
+        """
+        if spared_process_id is None:
+            return self._process_lifecycle.scale_inference_processes(
+                target,
+                device_index=device_index,
+                protected_model=protected_model,
+            )
+        return self._process_lifecycle.scale_inference_processes(
+            target,
+            device_index=device_index,
+            protected_model=protected_model,
+            spared_process_id=spared_process_id,
+        )
+
+    def _prestage_weights_fit_ram(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        forecast: StreamForecast,
+    ) -> bool:
+        """Whether system RAM can hold the head's *weights* alongside the in-flight job.
+
+        A RAM preload materialises only the model's weights on the CPU offload device; the activation working
+        set that inflates the full :func:`predict_job_ram_mb` burden lives in VRAM at sampling time, not in
+        RAM. Gating the pre-stage on that full burden over-rejects a head whose weights comfortably fit (a Flux
+        fp8 head's ~11.5GB of weights versus its ~24GB activation-inclusive estimate), which is what forces the
+        worker to tear every idle sibling down instead of staging. Worse, the establish path it then falls back
+        to loads those same weights into RAM with no hard gate at all, so the burden gate held the pre-stage to
+        a stricter standard than the path it defers to. So gate on the weight footprint (the forecast's
+        ``weights_mb``, the persistent RAM cost of a preload) plus the configured RAM reserve.
+
+        When the weight estimate is unavailable (it should not be once ``needs_exclusive_residency`` is True,
+        which requires known weights) fall back to the conservative full-burden RAM budget, so a head whose
+        footprint cannot be sized is never force-staged onto a RAM-pressured host.
+        """
+        available_ram_mb = self._measured_available_ram_mb()
+        weights_mb = forecast.weights_mb
+        committed_ram_mb = self._reserve_ledger.total_ram_mb()
+        if weights_mb is None:
+            return self._ram_budget.check_job(
+                job,
+                baseline,
+                available_ram_mb,
+                committed_reserve_mb=committed_ram_mb,
+            ).fits
+        return (available_ram_mb - committed_ram_mb) >= float(weights_mb) + self._ram_budget.reserve_mb
+
+    def _resident_safety_charge_mb(self, device_index: int | None) -> float:
+        """The device charge of a safety context this card's residency is leaving where it is.
+
+        A whole-card residency only reaches sole residency where it actually moves safety off the card. Where
+        the configuration keeps safety on-GPU (:meth:`_residency_should_pause_safety` is False) and safety is
+        still holding its context, the residency's structural sole-residency figure over-states the room the
+        head will find by :meth:`_safety_footprint_mb`, so that charge is what a caller leaning on the
+        figure must price back out. Zero once safety is off-GPU, or where this residency is going to move it.
+        """
+        if not self._safety_on_gpu_permitted:
+            return 0.0
+        if self._residency_should_pause_safety(device_index):
+            return 0.0
+        if self._process_lifecycle.is_safety_gpu_paused:
+            return 0.0
+        return self._safety_footprint_mb()
 
     def dispatch_hold_liveness_active(self) -> bool:
         """Whether the head's dispatch is held by the residency gate inside the hold's own liveness bound.
@@ -3686,297 +3999,6 @@ class InferenceScheduler:
             return False
         return (self._clock() - self._ram_reclaim_cycle_at) < _RAM_RECLAIM_CYCLE_GRACE_SECONDS
 
-    def card_residency(self, device_index: int | None) -> tuple[str | None, str]:
-        """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
-
-        ``model`` is None when this card holds no residency; otherwise ``phase`` is ``establishing`` while the
-        establish grace is still in effect, else ``holding``; this is the same phase split the worker-wide
-        :meth:`whole_card_residency_state` reports. The single-GPU worker-wide residency lives under the
-        ``None`` key, so a single-GPU caller reads it by passing ``device_index=None``. Reads without creating:
-        a card with no residency is left absent from the map.
-        """
-        model, phase = self._whole_card_ledger.phase(
-            device_index,
-            now=self._clock(),
-            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-        )
-        if model is None:
-            return None, ""
-        return model, str(phase)
-
-    def whole_card_residency_state(self) -> WholeCardResidencyState:
-        """Return a read-only view of the whole-card residency posture, for the status snapshot/TUI.
-
-        ``possible`` is config + topology only (feature on, the VRAM budget on, and something is actually
-        tear-down-able: more than one inference process, or a safety process that can be moved off-GPU);
-        it powers the operator heads-up so a teardown is not a surprise. The remaining fields describe a
-        residency that is currently held (its model, the establish/hold phase, the reduced process count,
-        the safety-pause state, the establishing forecast's hard numbers for the detailed view, and the claim
-        it holds over the pop offer or the reason its last claim ended).
-        Tolerant of partially-mocked config (used in tests that build snapshots): config flags are read
-        with boolean coercion so a non-bool never leaks a truthy Mock into ``possible``.
-        """
-        bridge_data = self._runtime_config.bridge_data
-        enabled = self._whole_card_residency_enabled()
-        budget_on = bridge_data.enable_vram_budget is True
-        safety_off_enabled = bool(self._whole_card_safety_off_gpu_enabled())
-        multi_process = self._max_inference_processes > 1
-        possible = enabled and budget_on and (multi_process or safety_off_enabled)
-
-        # Represent the posture with the first held residency (single-GPU has at most one).
-        # ``active`` is true while any card holds a residency.
-        held = self._held_residencies()
-        representative_index, representative = held[0] if held else (None, None)
-        model = representative.model if representative is not None else None
-        active = model is not None
-        forecast = representative.forecast if representative is not None else None
-        now = self._clock()
-
-        phase = ""
-        cooldown_remaining: float | None = None
-        processes_target = 0
-        weights_mb = reserve_mb = free_now_mb = free_if_alone_mb = None
-        max_resident_processes: int | None = None
-        if active and representative is not None:
-            establishing = (
-                representative.established_at != 0.0
-                and (now - representative.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
-            )
-            phase = "establishing" if establishing else "holding"
-            cooldown_remaining = max(0.0, representative.cooldown_until - now)
-            if forecast is not None:
-                weights_mb = forecast.weights_mb
-                reserve_mb = forecast.reserve_mb
-                free_now_mb = forecast.free_now_mb
-                free_if_alone_mb = forecast.free_if_alone_mb
-                max_resident_processes = self._whole_card_ledger.effective_target(representative)
-            processes_target = max_resident_processes or 1
-
-        total_vram_mb = (
-            forecast.total_vram_mb
-            if forecast is not None
-            else self._process_map.get_reported_total_vram_mb(device_index=representative_index)
-        )
-
-        # The claim is a separate fact from the residency: a card can hold a model without narrowing the
-        # offer to it, and the offer is what an operator watching models come and go actually sees change.
-        pop_claim = self.whole_card_pop_claim()
-        pop_claim_release = self._recent_pop_claim_release(now) if pop_claim is None else None
-
-        return WholeCardResidencyState(
-            possible=possible,
-            enabled=enabled,
-            safety_off_gpu_enabled=safety_off_enabled,
-            cooldown_seconds=self._whole_card_cooldown_seconds(),
-            per_process_overhead_mb=self._per_process_overhead_mb(representative_index),
-            total_vram_mb=total_vram_mb,
-            active=active,
-            model=model,
-            phase=phase,
-            safety_paused=bool(self._process_lifecycle.is_safety_gpu_paused),
-            processes_now=self._process_map.num_loaded_inference_processes(),
-            processes_target=processes_target,
-            processes_max=self._max_inference_processes,
-            cooldown_remaining_seconds=cooldown_remaining,
-            pop_claim_model=pop_claim.model if pop_claim is not None else None,
-            pop_claim_remaining_seconds=max(0.0, pop_claim.expires_at - now) if pop_claim is not None else None,
-            pop_claim_release=pop_claim_release.value if pop_claim_release is not None else None,
-            weights_mb=weights_mb,
-            reserve_mb=reserve_mb,
-            free_now_mb=free_now_mb,
-            free_if_alone_mb=free_if_alone_mb,
-            max_resident_processes=max_resident_processes,
-        )
-
-    def _whole_card_safety_off_gpu_enabled(self) -> bool:
-        """Whether a whole-card job should move the safety process off-GPU (config + safety actually on-GPU)."""
-        return self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu and self._safety_on_gpu_permitted
-
-    def _whole_card_cooldown_seconds(self) -> float:
-        """Operator-configured seconds to hold a whole-card residency after its last job drains."""
-        return float(self._runtime_config.bridge_data.whole_card_residency_cooldown_seconds)
-
-    def _residency_can_never_converge(
-        self,
-        device_index: int | None,
-        state: WholeCardResidency,
-        *,
-        now: float,
-    ) -> bool:
-        """Whether a held residency has lost every route to either running its model or draining.
-
-        A residency is normally retained while its model still has queued or in-flight work, because that work
-        is what it was taken out to serve. The retention becomes self-defeating when the model has no holder
-        left on the card (a pool rebuild can drop a pre-stage while the ledger entry survives), nothing is
-        staging it, and the undispatched head is some other model: the preload pass targets the head, the head
-        is barred by this very residency, and no path remains to give the residency a holder or let it drain.
-        Such a residency is released through the normal restore path instead.
-
-        The no-holder condition is only trusted past the establish grace, since a residency legitimately has no
-        holder for as long as its pre-stage preload takes to land.
-        """
-        model = state.model
-        if model is None:
-            return False
-        if state.established_at == 0.0 or (now - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS:
-            return False
-        if self._whole_card_residency_has_holder(model, device_index):
-            return False
-        if self._horde_model_map.is_model_loading(model):
-            return False
-        prestage_process_id = state.prestage_process_id
-        if prestage_process_id is not None:
-            # The pre-stage target is remembered for the life of the residency, so its mere existence says
-            # nothing; only a slot still mid-load is a route to a holder.
-            prestage_process = self._process_map.get(prestage_process_id)
-            if (
-                prestage_process is not None
-                and prestage_process.is_process_alive()
-                and prestage_process.last_process_state
-                in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.DOWNLOADING_MODEL)
-            ):
-                return False
-        # Only a job actually sampling keeps the residency: a pending exclusive admit for this model is exactly
-        # the work that has no route to a holder, and its own claim on the card is what bars every other head.
-        if self._job_tracker.has_exclusive_job_running(device_index):
-            return False
-        head = self._undispatched_head()
-        return not (head is not None and head.model == model)
-
-    def _restore_siblings_after_whole_card(self) -> None:
-        """Restore inference concurrency and safety-on-GPU after a whole-card residency has fully drained.
-
-        Held while the residency model is still pending or in progress, and for the configured cooldown after
-        that, so a burst of heavy jobs reuses one residency rather than each thrashing the process count and
-        the safety process. Once neither condition holds, that card's sibling processes are grown back to its
-        ceiling and, if the residency was on the safety card, the safety process is restored to the GPU.
-        Restores every drained card's residency independently; a no-op when none is outstanding.
-
-        The operator's maximum hold sits above both retention rules: past it (or once the empty-pop evidence
-        has ended the residency's claim over the offer) the cooldown neither refreshes nor holds, so one
-        residency episode cannot own the card indefinitely on the strength of demand it is itself the only
-        source of.
-
-        The restore's wedge-grace window is granted for the churn the restore actually creates: siblings still
-        respawning, or a service lane restarted. A release that finds the pool already at its ceiling and no
-        lane to restart changed nothing, so it takes no window; leaving one standing would tell the recovery
-        supervisor to ignore a genuine wedge for its whole duration after every such release, and would charge
-        the card's rolling allowance for teardown churn that never happened.
-        """
-        now = self._clock()
-        max_hold_seconds = 0.0 if self._multi_gpu_routing_active else self._whole_card_max_hold_seconds()
-        active_models = {j.model for j in self._job_tracker.jobs_in_progress}
-        active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
-        for device_index, state in self._held_residencies():
-            model = state.model
-            # Past the maximum hold (or once the empty-pop evidence has ended the claim) the residency stops
-            # being retained: it neither refreshes its cooldown nor honours a standing one, so it lets go as
-            # soon as its own accepted work has drained and the full model pool returns. Retention is all it
-            # ends; work in flight finishes and a granted grace window still runs its own duration.
-            retention_ended = self._whole_card_ledger.pop_claim_retention_ended(
-                device_index,
-                now=now,
-                max_hold_seconds=max_hold_seconds,
-            )
-            if (
-                model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
-            ) and not self._residency_can_never_converge(device_index, state, now=now):
-                # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
-                # back-to-back heavy jobs).
-                if not retention_ended:
-                    state.cooldown_until = now + self._whole_card_cooldown_seconds()
-                continue
-            # A ready head for a different model may cut the cooldown short, but not before the residency has
-            # held long enough to amortize the teardown and the regrowth the release itself will pay for;
-            # otherwise a queue alternating heavy and light heads rebuilds the pool on every job.
-            ready_different_model_head = self._ready_different_model_head_on_device(
-                residency_model=model,
-                device_index=device_index,
-            )
-            min_hold_disclosure = (
-                self._whole_card_ledger.min_hold_disclosure(device_index, now=now)
-                if ready_different_model_head
-                else None
-            )
-            if min_hold_disclosure is not None:
-                self._disclose_whole_card_min_hold(device_index, model, min_hold_disclosure)
-            preempt_cooldown = ready_different_model_head and min_hold_disclosure is None
-            if self._clock() < state.cooldown_until and not preempt_cooldown and not retention_ended:
-                # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
-                continue
-            # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
-            # unservable; mark its start so the wedge grace covers it (see _WHOLE_CARD_RESTORE_GRACE_SECONDS).
-            # The window is granted here, before the churn is ordered, so no reader can see the release without
-            # its excuse; it is withdrawn below if the release turns out to have had no churn to cover.
-            granted_at = self._clock()
-            self._whole_card_ledger.record_restore(
-                device_index,
-                now=granted_at,
-                restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
-            )
-            self._min_hold_disclosed.pop(device_index, None)
-            if self._reclaim_ladder is not None:
-                self._reclaim_ladder.discharge_context_reduction(device_index)
-            post_process_restored = (
-                self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
-                if self._residency_should_pause_post_process(device_index)
-                and not self._state.post_processing_disabled_by_breaker
-                else False
-            )
-            vae_lane_restored = (
-                self._process_lifecycle.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
-                if self._residency_should_pause_vae_lane(device_index)
-                else False
-            )
-            component_lane_restored = (
-                self._process_lifecycle.restore_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
-                if self._residency_should_pause_component_lane(device_index)
-                else False
-            )
-            lanes_restarting = post_process_restored or vae_lane_restored or component_lane_restored
-            ceiling = self._residency_restore_ceiling(device_index)
-            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if current >= ceiling and not lanes_restarting:
-                # The pool is already at its ceiling and no lane was restarted: this release changed nothing.
-                self._whole_card_ledger.close_restore_window(device_index, granted_at=granted_at)
-                continue
-            after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
-            self._reconcile_worker_shed_to_pool()
-            regrown_to_ceiling = isinstance(after, int) and after >= ceiling
-            if not lanes_restarting and regrown_to_ceiling:
-                # Every sibling was back before this call returned, so there is no respawn still in flight for
-                # the window to cover. A pool that has not reached its ceiling keeps it: the spawns it is
-                # waiting on are exactly the churn the wedge grace exists to excuse.
-                self._whole_card_ledger.close_restore_window(device_index, granted_at=granted_at)
-            post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
-            vae_lane_note = " and restarting the VAE lane" if vae_lane_restored else ""
-            component_lane_note = " and restarting the component lane" if component_lane_restored else ""
-            logger.opt(colors=True).info(
-                "<fg #7b7d7d>Whole-card residency for {} complete; restoring inference processes "
-                f"({current} -> {after} of {ceiling})"
-                f"{post_process_note}{vae_lane_note}{component_lane_note}.</>",
-                model,
-            )
-        self._disclose_pop_claim_edge()
-
-    def _disclose_whole_card_min_hold(
-        self,
-        device_index: int | None,
-        model: str | None,
-        disclosure: str,
-    ) -> None:
-        """State once per residency episode that the minimum hold is what kept a ready head off the card.
-
-        The floor holds a different-model head without returning any admission verdict, so silence leaves the
-        wait attributable only to the cooldown, which a ready head is otherwise allowed to cut short. Keyed to
-        the card and the residency's model so one episode speaks once however many cycles it holds for, and a
-        later residency speaks for itself; cleared when the residency restores.
-        """
-        if self._min_hold_disclosed.get(device_index) == model:
-            return
-        self._min_hold_disclosed[device_index] = model
-        logger.info(f"A ready different-model head may not release this residency yet: {disclosure}.")
-
     def _ready_different_model_head_on_device(
         self,
         *,
@@ -4011,16 +4033,6 @@ class InferenceScheduler:
             self._ram_governor_state.worker_shed = None
         else:
             worker_shed.shed_process_count = worker_shed.planned_process_count - loaded
-
-    def _residency_restore_ceiling(self, device_index: int | None) -> int:
-        """The process count to grow back to when a card's whole-card residency is restored.
-
-        That card's own ``target_process_count`` on a multi-GPU host; the worker-wide launched-process
-        ceiling for the single-GPU / worker-wide (``None``) case.
-        """
-        if device_index is not None and device_index in self._card_runtimes:
-            return self._card_runtimes[device_index].target_process_count
-        return self._max_inference_processes
 
     def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
         """Track how long the current head-of-queue job has been stuck on an otherwise-idle device.
@@ -4173,7 +4185,7 @@ class InferenceScheduler:
             nonhead_residency_model = next(
                 (
                     state.model
-                    for _, state in self._held_residencies()
+                    for _, state in self._whole_card_ledger.held()
                     if state.model is not None and state.model != head.model
                 ),
                 None,
@@ -4249,7 +4261,7 @@ class InferenceScheduler:
         # collapsed the pool, and the head will be deferred until the recovery supervisor soft-resets. Name
         # that specific state rather than reporting a gate-less "scheduler stall", so the post-mortem points at
         # the residency teardown rather than the dispatch path.
-        found_residency, residency_device = self._residency_holder_for_model(head.model)
+        found_residency, residency_device = self._whole_card_ledger.holder_for_model(head.model)
         if found_residency and self._prestaged_whole_card_not_ready(head):
             blockers = self._whole_card_convergence_blockers(process, residency_device)
             lanes = self._whole_card_lane_blockers(residency_device)
@@ -4318,119 +4330,6 @@ class InferenceScheduler:
         return SlotDutyBucket.UNEXPLAINED, (
             f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
             "matching gate; this is a scheduler stall worth reporting"
-        )
-
-    def _whole_card_convergence_blockers(
-        self,
-        head_process: HordeProcessInfo,
-        device_index: int | None,
-    ) -> list[tuple[int, str]]:
-        """Return idle sibling processes still holding a queued model while a whole-card head is parked.
-
-        Returns ``(process_id, model)`` for each inference process other than the head's own holder that is
-        idle (not busy), pinned to ``device_index`` when scoped, and holds a model that is still queued. The
-        whole-card convergence is meant to have torn these siblings down (sparing only the head's holder), so
-        finding any while the head is still parked is the fingerprint of a teardown that did not collapse the
-        pool. Read-only; used only to explain a stalled dispatch.
-        """
-        queued_models = {
-            job.model
-            for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress)
-            if job.model is not None
-        }
-        blockers: list[tuple[int, str]] = []
-        for proc in self._process_map.values():
-            if proc.process_type is not HordeProcessType.INFERENCE:
-                continue
-            if proc.process_id == head_process.process_id:
-                continue
-            if device_index is not None and proc.device_index != device_index:
-                continue
-            if proc.is_process_busy():
-                continue
-            model = proc.loaded_horde_model_name
-            if model is not None and model in queued_models:
-                blockers.append((proc.process_id, model))
-        return blockers
-
-    def _whole_card_lane_blockers(self, device_index: int | None) -> list[str]:
-        """Return the service lanes the teardown gate is still waiting on while a whole-card head is parked.
-
-        Mirrors the lane legs of the ledger's ``teardown_complete``: a lane whose pause this residency requires
-        and whose process is still on the card. The component lane always qualifies when the residency's card
-        hosts it; the post-processing lane only when its bare context cannot share the card with the weights.
-        Read-only; used only to explain a stalled dispatch.
-        """
-        lanes: list[str] = []
-        if (
-            self._residency_should_pause_component_lane(device_index)
-            and self._process_map.num_component_processes(device_index=device_index) > 0
-        ):
-            lanes.append("the component lane")
-        forecast = self._residency_state(device_index).forecast
-        if (
-            forecast is not None
-            and self._residency_should_pause_post_process(device_index)
-            and not self._post_process_context_fits_with_residency(forecast, device_index=device_index)
-            and self._process_map.num_post_process_processes(device_index=device_index) > 0
-        ):
-            lanes.append("the post-processing lane")
-        return lanes
-
-    _EXCLUSIVE_SUPPRESSION_LOG_INTERVAL_SECONDS = 30.0
-    """How often the exclusive-admit dispatch hold may name itself for one card scope.
-
-    The hold is re-evaluated on every dispatch selection, so an unthrottled line would repeat many times a
-    second for as long as the exclusive job owns the card while saying nothing new."""
-
-    def _exclusive_dispatch_suppression_active(self, device_index: int | None) -> bool:
-        """Whether an exclusive over-budget admit currently withholds co-dispatch in ``device_index``'s scope.
-
-        Suppression follows a live claim on the card, not the per-job ``admitted_exclusive`` flag: that flag is
-        sticky for the life of the job because it also carries fault attribution and the over-budget step
-        grace. Two claims qualify. An exclusive job actually sampling has its over-budget footprint on the card
-        right now, so co-dispatch stays suppressed for its whole run (on a single-GPU host that is worker-wide,
-        which is the intended conservatism). A staged exclusive job qualifies only while its whole-card
-        residency is held or being established, since that is when the card has actually been given to it. A
-        marked job with neither claim (its establishment deferred by the residency rate limiter, for instance)
-        holds nothing and must not stop unrelated work from dispatching.
-        """
-        if self._job_tracker.has_exclusive_job_running(device_index):
-            return True
-        if not self._job_tracker.has_exclusive_job_in_progress(device_index):
-            return False
-        return self._exclusive_residency_live(device_index)
-
-    def _exclusive_residency_live(self, device_index: int | None) -> bool:
-        """Whether a whole-card residency is held or being established in ``device_index``'s scope.
-
-        A residency record with a model set covers both phases: the model is recorded at the grant, which is
-        when the teardown begins, and cleared only on restore. A card is asked about its own residency and
-        about the card-agnostic worker-wide record, mirroring how an unattributed exclusive admit is treated as
-        applying to every card.
-        """
-        if device_index is None:
-            return self._whole_card_ledger.any_held()
-        return any(
-            (state := self._whole_card_ledger.get(key)) is not None and state.model is not None
-            for key in (device_index, None)
-        )
-
-    def _note_exclusive_dispatch_suppression(
-        self,
-        job: ImageGenerateJobPopResponse,
-        device_index: int | None,
-    ) -> None:
-        """Disclose (throttled per card scope) that an exclusive admit is holding this job's dispatch back."""
-        now = self._clock()
-        last = self._exclusive_suppression_logged_at.get(device_index, 0.0)
-        if (now - last) < self._EXCLUSIVE_SUPPRESSION_LOG_INTERVAL_SECONDS:
-            return
-        self._exclusive_suppression_logged_at[device_index] = now
-        scope = "worker-wide" if device_index is None else f"device {device_index}"
-        logger.debug(
-            f"Dispatch of job {str(job.id_)[:8]} ({job.model}) is held {scope}: an exclusively-admitted "
-            "over-budget job holds the card.",
         )
 
     def _affinity_bypass_note(self, head: ImageGenerateJobPopResponse) -> str:
@@ -4694,7 +4593,7 @@ class InferenceScheduler:
             for process_info in self._process_map.values()
             if process_info.process_type == HordeProcessType.INFERENCE
         )
-        residency_held_cards = {index for index, _residency in self._held_residencies()}
+        residency_held_cards = {index for index, _residency in self._whole_card_ledger.held()}
         cards = tuple(
             CardProcessSnapshot(
                 device_index=device_index,
@@ -4949,62 +4848,6 @@ class InferenceScheduler:
         if not under_pressure:
             self._ram_pressure_notified = False
         return under_pressure
-
-    def _reprice_held_whole_card_residencies(self) -> None:
-        """Tighten held residency targets from current pricing without rewriting their grant forecasts.
-
-        New allocator evidence and live reservation changes can show that a residency granted for two contexts
-        now safely holds only one. Each governance tick re-forecasts pending or active jobs for the held model
-        and keeps the strictest target. A target never grows mid-hold. Any resulting context reduction is booked
-        with the verified reclaim ladder as the single restore obligation; the residency's own release still
-        performs the physical regrowth and discharges that debt.
-        """
-        for device_index, state in self._held_residencies():
-            model = state.model
-            if model is None:
-                continue
-            matching_jobs = [
-                job
-                for job in (*self._job_tracker.jobs_in_progress, *self._job_tracker.jobs_pending_inference)
-                if job.model == model
-            ]
-            targets = [
-                target
-                for job in matching_jobs
-                if (
-                    target := self._whole_card_ledger.target_process_count(
-                        self._forecast_streaming(
-                            job,
-                            self._model_metadata.get_baseline(model),
-                            device_index=device_index,
-                        )
-                    )
-                )
-                is not None
-            ]
-            if not targets:
-                continue
-            self._whole_card_ledger.tighten_target(device_index, min(targets))
-            effective_target = self._whole_card_ledger.effective_target(state)
-            live_count = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if effective_target is None or live_count <= effective_target:
-                continue
-            # A tightened target can arrive while the head is still pre-staging into a slot that does not yet
-            # carry its model name, so the shrink is told which slot that is, the same as the convergence shrink.
-            after = self._scale_sparing(
-                effective_target,
-                device_index=device_index,
-                protected_model=model,
-                spared_process_id=state.prestage_process_id,
-            )
-            if after >= live_count:
-                continue
-            if self._reclaim_ladder is not None:
-                self._reclaim_ladder.record_context_reduction(device_index)
-            logger.info(
-                f"Re-priced held whole-card residency for {model} on device {device_index}: "
-                f"inference processes {live_count} -> {after}, tightened target {effective_target}."
-            )
 
     def run_governance_tick(self) -> None:
         """Drive one resource-governance tick per control-loop iteration, independent of queue depth.
@@ -6715,217 +6558,6 @@ class InferenceScheduler:
 
         return True
 
-    def _whole_card_governor_hold(self, device_index: int | None, *, now: float) -> _WholeCardGovernorHold | None:
-        """Return the churn governor barring a *new* whole-card residency on this card, or None when free.
-
-        Both governors act at admission and only on a card about to take a model on: a residency already held
-        keeps converging, and a restore always gets its window. The rate limiter is answered first because it
-        is the cheaper and shorter-lived of the two.
-        """
-        if self._whole_card_ledger.establish_rate_exceeded(device_index, now=now):
-            return _WholeCardGovernorHold(
-                governor=WholeCardGovernor.ESTABLISH_RATE,
-                reason="this card has already cycled whole-card residency as often as the rolling window allows",
-            )
-        if self._whole_card_ledger.grace_budget_exhausted(device_index, now=now):
-            status = self._whole_card_ledger.grace_budget_status(device_index, now=now)
-            return _WholeCardGovernorHold(
-                governor=WholeCardGovernor.GRACE_BUDGET,
-                reason=(
-                    "this card has spent its rolling recovery-supervisor grace allowance, so it may not open "
-                    "another establish window yet"
-                ),
-                detail=(
-                    f"{status.spent_seconds:.0f}s of grace opened against a "
-                    f"{status.allowance_seconds:.0f}s rolling allowance, {status.remaining_seconds:.0f}s left, "
-                    f"next replenish in {status.replenish_in_seconds:.0f}s"
-                ),
-            )
-        return None
-
-    def _disclose_whole_card_governor_hold(
-        self,
-        job: ImageGenerateJobPopResponse,
-        hold: _WholeCardGovernorHold,
-        *,
-        device_index: int | None,
-        elapsed: float,
-        downgraded: bool,
-    ) -> None:
-        """Disclose a governor holding this head off the card, and the downgrade when the dwell is spent.
-
-        A hold that persists is re-stated periodically rather than announced once: the operator needs the
-        current spend and the wait, not a single line from whenever the hold began. Repeats inside the
-        diagnostic cadence are counted and left at TRACE so a tick-rate loop cannot flood the log.
-        """
-        name = "whole_card_governor_downgrade" if downgraded else "whole_card_governor_hold"
-        suppressed = self._diagnostics.suppressed_count(name, (str(job.model), device_index, hold.governor))
-        stated = hold.reason if hold.detail is None else f"{hold.reason} ({hold.detail})"
-        if downgraded:
-            message = (
-                f"Whole-card residency downgraded for {job.model}: {stated}. It has asked for the card for "
-                f"{elapsed:.0f}s, so the ask is dropped and ordinary admission decides; if the device holds its "
-                "weights it runs co-resident (slower than sole residency) instead of waiting for the allowance."
-            )
-        else:
-            message = (
-                f"Deferring a new whole-card residency for {job.model}: {stated}. Normal scheduling "
-                f"continues; after {self._whole_card_ledger.governor_defer_dwell_seconds:.0f}s held (currently "
-                f"{elapsed:.0f}s) the head stops asking for the card and is served co-resident if the device "
-                "can hold it."
-            )
-        if suppressed is None:
-            logger.trace(message)
-            return
-        logger.warning(f"{message}{suppressed_suffix(suppressed)}")
-
-    def _decide_whole_card_demand(
-        self,
-        job: ImageGenerateJobPopResponse,
-        available_process: HordeProcessInfo,
-        forecast: StreamForecast,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        *,
-        is_head_blocker: bool,
-        target_device_index: int | None,
-    ) -> _WholeCardDemandOutcome:
-        """Decide whether the head should claim the whole card and drive the residency side effects.
-
-        Whole-card exclusive residency (preventative): the forecast judges whether loading this model
-        alongside the currently-resident models would drive the device into weight streaming. A heavy model
-        loaded while others stay resident across sibling processes can collapse free VRAM to near zero, at
-        which point ComfyUI offloads weights or the driver's system-memory fallback spills per-step
-        activations; both stream over the bus and the slow job risks being mistaken for a hang and killed.
-        When the model would stream co-resident but fits with the card to itself, it is given sole residency
-        before it loads: marked exclusive (so ``has_exclusive_job_in_progress`` suppresses other staging),
-        then enough VRAM is freed. The forecast distinguishes two remedies, applying the least-disruptive:
-        evicting sibling *models* (their processes stay up), or stopping idle sibling *processes* when their
-        fixed per-process contexts are themselves the over-commit (a context is only reclaimed by exit).
-
-        Only the head may claim the card: reserving it tears down the siblings serving the lighter heads
-        ahead of a deeper-queue job, so a non-head heavy job returns ``FALL_THROUGH`` and defers via the
-        ordinary verdict until it becomes the head. See :class:`_WholeCardDemandOutcome` for each result.
-        """
-        # A disaggregation-class job never demands exclusive device residency: it runs as a UNet-only sampler
-        # whose sampler-only footprint co-resides with the encode lane and other samplers by design. Coupled
-        # with sampler-only charging in the forecast, this breaks the loop where a whole-card window (which
-        # pauses the lane) would otherwise flip the job to its monolithic footprint and re-demand the card,
-        # starving the encode lane. Decided on class-eligibility, not liveness, so the contract holds even
-        # while the lane is transiently paused.
-        if self._is_disaggregation_class_eligible(job):
-            return _WholeCardDemandOutcome.FALL_THROUGH
-        # A model needs the teardown path either because it is weight-dominant (needs sole residency) or
-        # because the live sibling process contexts have squeezed its bounded weights off the card though it
-        # co-resides once the process count is reduced. Both are served by the same machinery: establish
-        # residency, stop idle siblings down to max_resident_processes, and admit once the weights fit.
-        live_inference_processes = self._process_map.num_loaded_inference_processes(
-            device_index=target_device_index,
-        )
-        whole_card_demanded = self._whole_card_ledger.residency_demanded(
-            forecast,
-            enabled=self._whole_card_residency_enabled(),
-            is_head_blocker=is_head_blocker,
-            live_inference_process_count=live_inference_processes,
-        )
-        if not whole_card_demanded:
-            # Only the head could have claimed the card, so only the head's refusal is worth naming: a
-            # deeper-queue job reads the same forecast every tick and never had a claim to lose.
-            if is_head_blocker and forecast.needs_process_count_reduction:
-                self._log_whole_card_reduction_suppressed(
-                    job,
-                    forecast,
-                    live_inference_processes=live_inference_processes,
-                )
-            return _WholeCardDemandOutcome.FALL_THROUGH
-        if not self._whole_card_warranted(forecast):
-            # The teardown demand is not trustworthy (a card-light model on a host with no measured
-            # per-context cost): decline the reservation and fall through to ordinary eviction rather than
-            # reserving the device on an over-counted-context phantom.
-            self._log_whole_card_declined(job, forecast)
-            return _WholeCardDemandOutcome.FALL_THROUGH
-
-        held = self._whole_card_ledger.get(target_device_index)
-        establishing_anew = held is None or held.model is None
-        governor_hold = (
-            self._whole_card_governor_hold(target_device_index, now=self._clock()) if establishing_anew else None
-        )
-        if governor_hold is not None:
-            # A governor brakes how fast this card may be rotated; it never says the head cannot be served.
-            # Hold the whole-card ask for a bounded dwell (the head re-asks every cycle), then stop preferring
-            # the card and let the measured arbiter decide: a card that can demonstrably hold the weights
-            # serves the head co-resident rather than standing idle behind a brake with no fallback.
-            elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
-                target_device_index,
-                model=job.model,
-                now=self._clock(),
-            )
-            self._disclose_whole_card_governor_hold(
-                job,
-                governor_hold,
-                device_index=target_device_index,
-                elapsed=elapsed,
-                downgraded=dwell_exhausted,
-            )
-            if dwell_exhausted:
-                return _WholeCardDemandOutcome.FALL_THROUGH
-            self._last_budget_defer_reason = governor_hold.reason
-            return _WholeCardDemandOutcome.DEFER
-        self._whole_card_ledger.clear_governor_defer(target_device_index)
-
-        first_time = not self._job_tracker.is_admitted_exclusive(job)
-        self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
-        if self._should_prestage_whole_card_head(
-            job,
-            baseline,
-            forecast,
-            available_process,
-            device_index=target_device_index,
-        ):
-            # A live job still holds the device, but the heavy head's weights can begin loading into a spare
-            # process's RAM right now: preload_model is a RAM-only load (weights move to VRAM at sampling
-            # time), so it does not contend with the in-flight job's VRAM. Record the residency and send the
-            # preload; _converge_whole_card_residency then collapses the live process count to sole VRAM
-            # residency before the staged model samples. The heavy disk->RAM load overlaps the in-flight job
-            # instead of waiting for the device to drain first.
-            self._begin_whole_card_residency(
-                job,
-                forecast,
-                announce=first_time,
-                device_index=target_device_index,
-                target_process=available_process,
-            )
-            return _WholeCardDemandOutcome.PRESTAGE
-
-        # Claim the device: stop idle siblings to the model's max-resident count and, on the very edge, move
-        # safety off-GPU too. Announces (once) why, for the operator. Held through the cooldown so a burst of
-        # heavy jobs reuses one residency instead of churning per job.
-        self._establish_whole_card_residency(
-            job,
-            forecast,
-            announce=first_time,
-            device_index=target_device_index,
-            target_process=available_process,
-        )
-        # Evict the idle resident models on the *other* processes (sparing the slot that will load this
-        # model, and never a live in-progress model) so their VRAM returns to the driver. A live sibling is
-        # left to drain; the preload simply waits until the device is clear.
-        self.unload_models_from_vram(
-            available_process,
-            under_pressure=True,
-            for_head_of_queue=True,
-            device_index=target_device_index,
-        )
-        if not self._whole_card_teardown_exhausted(forecast, device_index=target_device_index):
-            # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed VRAM to
-            # drain: defer and let a later tick re-evaluate against the reduced topology.
-            return _WholeCardDemandOutcome.DEFER
-        # Teardown is structurally exhausted (already at the target process count, safety settled). The card is
-        # now cleared to sole residency, so the head's weights are priced against a drained card: fall through
-        # to the measured arbiter evaluation, which admits when the weights fit the cleared card (the
-        # activation peak is the sampling gate's concern, not preload admission) and denies when even the
-        # cleared card cannot hold them (an unserviceable model the offering seam should have excluded).
-        return _WholeCardDemandOutcome.FALL_THROUGH
-
     def _reclaim_ram_for_overbudget_admit(
         self,
         job: ImageGenerateJobPopResponse,
@@ -8336,22 +7968,6 @@ class InferenceScheduler:
     def _starved_head_utilities_pause_permitted(self, device_index: int | None) -> bool:
         """Whether the image-utilities lane is among the lanes a starved head may stop on ``device_index``."""
         return bool(self._card_bridge_data(device_index).starved_head_utilities_pause)
-
-    def _whole_card_pinned(
-        self,
-        model_name: str | None,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        *,
-        device_index: int | None,
-    ) -> bool:
-        """Whether the operator pinned ``model_name`` (by name or by its baseline id) as whole-card on this card."""
-        if model_name is None:
-            return False
-        pins = self._card_bridge_data(device_index).whole_card_models
-        if not pins:
-            return False
-        baseline_id = str(baseline) if baseline is not None else None
-        return model_name in pins or (baseline_id is not None and baseline_id in pins)
 
     def _book_starved_head_lane_pauses(
         self,
@@ -10558,7 +10174,7 @@ class InferenceScheduler:
             # budget is being spent against it. The pop-claim restriction above still applies.
             residency_bypass_models = {
                 residency.model
-                for _residency_device_index, residency in self._held_residencies()
+                for _residency_device_index, residency in self._whole_card_ledger.held()
                 if residency.model is not None and residency.model != next_job.model
             }
             if pinned_resident is not None or within_affinity_budget or residency_bypass_models:
@@ -13085,7 +12701,7 @@ class InferenceScheduler:
             # cannot reach sole residency and dispatch is permanently blocked until save-our-ship
             # soft-resets the pools). Only the residency holder is spared; other models are still
             # reclaimable.
-            return any(state.model == model_name for _, state in self._held_residencies())
+            return any(state.model == model_name for _, state in self._whole_card_ledger.held())
 
         if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
             return True

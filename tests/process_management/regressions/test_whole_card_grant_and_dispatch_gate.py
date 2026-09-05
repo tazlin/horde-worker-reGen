@@ -58,10 +58,10 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     _GOVERNOR_DEFER_DWELL_SECONDS,
     _GRACE_BUDGET_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
+    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    WHOLE_CARD_RESTORE_GRACE_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-    _WHOLE_CARD_RESTORE_GRACE_SECONDS,
     InferenceScheduler,
     _WholeCardDemandOutcome,
 )
@@ -594,7 +594,9 @@ class TestReservedHeadNeverWaitsIndefinitely:
 
         # Back-date establishment past the protective grace: any legitimate setup is long over, so a head still
         # parked from here on is the indefinite wait the invariant forbids.
-        scheduler._residency_state(None).established_at = time.time() - (_WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 5.0)
+        scheduler._whole_card_ledger.state_for(None).established_at = time.time() - (
+            WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 5.0
+        )
 
         dispatched = False
         for _ in range(10):
@@ -763,8 +765,8 @@ class TestChurnGovernors:
         grants spend the allowance. The wall time between cycles is collapsed because the budget's window is
         what bounds the spend, not the spacing.
         """
-        cycle_cost = _WHOLE_CARD_ESTABLISH_GRACE_SECONDS + _WHOLE_CARD_RESTORE_GRACE_SECONDS
-        max_cycles = int(_GRACE_BUDGET_SECONDS // _WHOLE_CARD_ESTABLISH_GRACE_SECONDS) + int(
+        cycle_cost = WHOLE_CARD_ESTABLISH_GRACE_SECONDS + WHOLE_CARD_RESTORE_GRACE_SECONDS
+        max_cycles = int(_GRACE_BUDGET_SECONDS // WHOLE_CARD_ESTABLISH_GRACE_SECONDS) + int(
             _GRACE_BUDGET_SECONDS // cycle_cost
         )
         for _index in range(max_cycles):
@@ -805,14 +807,14 @@ class TestChurnGovernors:
         scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
         state = scheduler._whole_card_ledger.state_for(None)
         # Retire the preceding cycle's restore window so the establish window alone answers the question.
-        state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
         # Walk the window by backdating the grant, which leaves the recorded charges (and so the spend) alone.
-        for elapsed in (0.0, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS / 2.0, _WHOLE_CARD_ESTABLISH_GRACE_SECONDS - 5.0):
+        for elapsed in (0.0, WHOLE_CARD_ESTABLISH_GRACE_SECONDS / 2.0, WHOLE_CARD_ESTABLISH_GRACE_SECONDS - 5.0):
             state.established_at = time.time() - elapsed
             assert scheduler.whole_card_residency_grace_active() is True, (
                 "the granted establish window must hold for its whole duration even over budget"
             )
-        state.established_at = time.time() - (_WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
+        state.established_at = time.time() - (WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
         assert scheduler.whole_card_residency_grace_active() is False, (
             "the window's own duration is the liveness bound on a residency that never completes"
         )
@@ -879,13 +881,13 @@ class TestChurnGovernors:
         scheduler._whole_card_ledger.record_restore(
             None,
             now=time.time(),
-            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+            restore_grace_seconds=WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
         state = scheduler._whole_card_ledger.state_for(None)
         assert state.restore_at != 0.0, "precondition: a restore window is open"
-        state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS - 5.0)
+        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS - 5.0)
         assert scheduler.whole_card_residency_grace_active() is True
-        state.restore_at = time.time() - (_WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
         assert scheduler.whole_card_residency_grace_active() is False
 
     def test_an_unresolved_residency_flag_is_disclosed_once(self) -> None:

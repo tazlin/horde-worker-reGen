@@ -30,13 +30,29 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
+from typing import TYPE_CHECKING
 
+from loguru import logger
+
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.scheduling.scheduler_budget import SchedulerBudget
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+
 __all__ = [
+    "HEAVY_HEAD_LOAD_GRACE_SECONDS",
+    "POP_CLAIM_RELEASE_VISIBLE_SECONDS",
+    "WHOLE_CARD_DRAIN_SETTLE_SECONDS",
+    "WHOLE_CARD_ESTABLISH_GRACE_SECONDS",
+    "WHOLE_CARD_RESTORE_GRACE_SECONDS",
     "GraceBudgetStatus",
     "WholeCardGovernor",
+    "WholeCardGovernorHold",
+    "WholeCardPopClaimTracker",
     "WholeCardGrantKind",
     "WholeCardPhase",
     "WholeCardPopClaim",
@@ -44,9 +60,35 @@ __all__ = [
     "WholeCardResidency",
     "WholeCardResidencyLedger",
     "WholeCardResidencyMachine",
+    "convergence_blockers",
     "max_coresident_for_peak",
     "offer_under_pop_claim",
+    "post_process_context_fits",
+    "residency_has_holder",
 ]
+
+WHOLE_CARD_ESTABLISH_GRACE_SECONDS = 120.0
+"""How long after a residency is established the queue may be held (siblings stopping, safety cycling off-GPU,
+a multi-GB load) before the recovery supervisor reads it as a structural wedge. Bounded so a residency that never
+loads still trips the supervisor."""
+
+WHOLE_CARD_DRAIN_SETTLE_SECONDS = 20.0
+"""How long after a teardown reaches sole residency the head waits for the live free reading to confirm the
+drain before loading on the structural fits-alone guarantee. Kept under the establish grace so the head always
+dispatches before the supervisor would act."""
+
+WHOLE_CARD_RESTORE_GRACE_SECONDS = 60.0
+"""How long after a residency is restored the supervisor keeps ignoring a queue wedge: respawning siblings and
+cycling safety back on-GPU briefly make the queue unservable, and reading that as a wedge would cascade into
+further churn."""
+
+POP_CLAIM_RELEASE_VISIBLE_SECONDS = 120.0
+"""How long a released pop claim's end is still reported beside the residency posture, so the widening of the
+offer is explained while the operator is looking at it and not minutes later."""
+
+HEAVY_HEAD_LOAD_GRACE_SECONDS = 120.0
+"""How long after a heavy head is admitted off the whole-card path its multi-GB load may hold the queue before
+the supervisor reads a wedge. Such a head bypasses the establish grace yet holds the queue the same way."""
 
 _MIN_HOLD_SECONDS = 90.0
 """How long a fresh whole-card residency is immune to early release by a ready different-model head.
@@ -151,6 +193,18 @@ class GraceBudgetStatus:
     """Allowance still available, floored at zero once the spend has passed it."""
     replenish_in_seconds: float
     """Wait until enough charges age out for the spend to fall back inside the allowance; 0.0 when it already is."""
+
+
+@dataclass(frozen=True)
+class WholeCardGovernorHold:
+    """A churn governor's refusal to open a new whole-card residency on one card, with its arithmetic."""
+
+    governor: WholeCardGovernor
+    """Which governor refused; keys the throttled disclosure so a changed objection always speaks."""
+    reason: str
+    """Operator-facing sentence naming the refusal; also the recorded defer reason."""
+    detail: str | None = None
+    """The governor's figures, when it has any to show."""
 
 
 @dataclass(frozen=True)
@@ -551,6 +605,33 @@ class WholeCardResidencyLedger:
             return False
         return now >= (state.established_at + max_hold_seconds)
 
+    def governor_hold(self, device_index: int | None, *, now: float) -> WholeCardGovernorHold | None:
+        """The churn governor barring a new residency on this card, or None when the card is free to take one.
+
+        Both governors act at admission only; a held residency keeps converging and a restore always gets its
+        window. The rate limiter answers first because it is the cheaper and shorter-lived of the two.
+        """
+        if self.establish_rate_exceeded(device_index, now=now):
+            return WholeCardGovernorHold(
+                governor=WholeCardGovernor.ESTABLISH_RATE,
+                reason="this card has already cycled whole-card residency as often as the rolling window allows",
+            )
+        if self.grace_budget_exhausted(device_index, now=now):
+            status = self.grace_budget_status(device_index, now=now)
+            return WholeCardGovernorHold(
+                governor=WholeCardGovernor.GRACE_BUDGET,
+                reason=(
+                    "this card has spent its rolling recovery-supervisor grace allowance, so it may not open "
+                    "another establish window yet"
+                ),
+                detail=(
+                    f"{status.spent_seconds:.0f}s of grace opened against a "
+                    f"{status.allowance_seconds:.0f}s rolling allowance, {status.remaining_seconds:.0f}s left, "
+                    f"next replenish in {status.replenish_in_seconds:.0f}s"
+                ),
+            )
+        return None
+
     def establish_rate_exceeded(self, device_index: int | None, *, now: float) -> bool:
         """Return whether this card has already established as often as the rolling window allows.
 
@@ -831,6 +912,16 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
             return None
         return forecast.max_resident_processes()
 
+    def set_forecast(self, device_index: int | None, forecast: StreamForecast | None) -> None:
+        """Replace a card's establishing forecast and re-derive its process target from it.
+
+        A grant records both together; this is the seam for replacing the forecast alone, which resets the
+        tighten-only target rather than tightening it.
+        """
+        state = self.state_for(device_index)
+        state.forecast = forecast
+        state.repriced_target = self.target_process_count(forecast)
+
     def effective_target(self, state: WholeCardResidency) -> int | None:
         """Return the held residency's tighten-only process target.
 
@@ -982,3 +1073,129 @@ def max_coresident_for_peak(
     if budget <= per_process_overhead_mb:
         return 1
     return max(1, 1 + int((budget - per_process_overhead_mb) // marginal))
+
+
+class WholeCardPopClaimTracker:
+    """Edge-triggered disclosure of the pop claim, and the memory of why the last claim ended.
+
+    The claim itself is derived live from the residency ledger; this only remembers what was last surfaced so a
+    claim held across many ticks is stated once, and a released one is stated once with the end that fired.
+    """
+
+    def __init__(self) -> None:
+        """Start with no claim disclosed and no release remembered."""
+        self._disclosed: WholeCardPopClaim | None = None
+        self._empty_release_pending = False
+        self._release: tuple[WholeCardPopClaimRelease, float] | None = None
+        self._multi_gpu_disclosed = False
+
+    def note_empty_pop_release(self) -> None:
+        """Remember that the empty-pop evidence ended the claim, so the next edge names that end."""
+        self._empty_release_pending = True
+
+    def disclose_skipped_on_multi_gpu(self, *, any_held: bool) -> None:
+        """State once that a residency on a multi-card host does not claim the worker-wide offer.
+
+        Narrowing the offer to one card's model would starve the other cards; silence would read as the feature
+        being broken rather than deliberately inapplicable.
+        """
+        if self._multi_gpu_disclosed or not any_held:
+            return
+        self._multi_gpu_disclosed = True
+        logger.info(
+            "Whole-card residency is held on a multi-card host, so it does not claim the pop offer: the offer "
+            "is worker-wide and narrowing it to one card's model would starve the others.",
+        )
+
+    def disclose_edge(self, claim: WholeCardPopClaim | None, *, now: float) -> None:
+        """Log the engage or release line when the standing claim actually changes."""
+        previous = self._disclosed
+        if claim is not None:
+            if previous is not None and previous.model == claim.model:
+                return
+            self._disclosed = claim
+            self._empty_release_pending = False
+            self._release = None
+            logger.info(
+                f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
+                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.",
+            )
+            return
+        if previous is None:
+            return
+        self._disclosed = None
+        if self._empty_release_pending:
+            release = WholeCardPopClaimRelease.NO_FURTHER_WORK
+            reason = "the horde had no further work for it"
+        elif now >= previous.expires_at:
+            release = WholeCardPopClaimRelease.MAXIMUM_HOLD
+            reason = "the maximum hold elapsed"
+        else:
+            release = WholeCardPopClaimRelease.RESIDENCY_RELEASED
+            reason = "the residency released"
+        self._empty_release_pending = False
+        self._release = (release, now)
+        logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
+
+    def recent_release(self, now: float) -> WholeCardPopClaimRelease | None:
+        """Why the last claim ended, while that still explains the widened offer; else None."""
+        if self._release is None:
+            return None
+        release, released_at = self._release
+        if (now - released_at) >= POP_CLAIM_RELEASE_VISIBLE_SECONDS:
+            return None
+        return release
+
+
+def residency_has_holder(processes: Iterable[HordeProcessInfo], model: str, device_index: int | None) -> bool:
+    """Whether a held whole-card model is staged or resident on a live inference process of the card.
+
+    A holder that has finished loading may sit in WAITING_FOR_JOB rather than a preload state, so the generic
+    forecast-to-load predicate is too narrow for convergence, which must spare that process from the shrink.
+    """
+    return any(
+        p.process_type is HordeProcessType.INFERENCE
+        and p.loaded_horde_model_name == model
+        and (device_index is None or p.device_index == device_index)
+        for p in processes
+    )
+
+
+def convergence_blockers(
+    processes: Iterable[HordeProcessInfo],
+    *,
+    head_process_id: int,
+    device_index: int | None,
+    queued_models: set[str],
+) -> list[tuple[int, str]]:
+    """Idle sibling processes still holding a queued model while a whole-card head is parked.
+
+    Convergence is meant to have torn these down, sparing only the head's holder, so finding any while the head
+    is still parked is the fingerprint of a shrink that did not collapse the pool. Read-only diagnostics.
+    """
+    return [
+        (p.process_id, p.loaded_horde_model_name)
+        for p in processes
+        if p.process_type is HordeProcessType.INFERENCE
+        and p.process_id != head_process_id
+        and (device_index is None or p.device_index == device_index)
+        and not p.is_process_busy()
+        and p.loaded_horde_model_name is not None
+        and p.loaded_horde_model_name in queued_models
+    ]
+
+
+def post_process_context_fits(forecast: StreamForecast, target: int | None) -> bool:
+    """Whether the residency model can load with the post-processing lane's bare context still on the card.
+
+    Unknown weights, total or target read as fitting: the gate only ever pauses the lane on evidence.
+    """
+    if forecast.weights_mb is None or forecast.total_vram_mb is None or target is None:
+        return True
+    marginal = forecast._effective_marginal_overhead_mb  # noqa: SLF001 - same budget object owns the estimate.
+    extra_contexts = max(0, target - 1) + 1  # surviving inference siblings plus the lane context
+    free_with_pp_lane_mb = max(
+        0.0,
+        float(forecast.total_vram_mb) - forecast.per_process_overhead_mb - marginal * extra_contexts,
+    )
+    return (free_with_pp_lane_mb - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001

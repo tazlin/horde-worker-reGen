@@ -126,7 +126,7 @@ def _resident(pid: int, model: str | None, state: HordeProcessState) -> HordePro
 
 def _flux_residency_recorded(scheduler: InferenceScheduler) -> bool:
     """Whether a whole-card residency is held for Flux (the scheduler reserved the card for it)."""
-    found, _device = scheduler._residency_holder_for_model(_FLUX_MODEL)
+    found, _device = scheduler._whole_card_ledger.holder_for_model(_FLUX_MODEL)
     return found
 
 
@@ -292,7 +292,7 @@ class TestNonHeadResidencyDispatchDiagnostic:
         """The head's model is not resident while a residency is held for Flux: name Flux as the cause."""
         scheduler, job_tracker = self._scheduler_with_no_residents()
         # A whole-card residency is held for Flux (a different, deeper-queue model).
-        scheduler._residency_state(None).model = _FLUX_MODEL
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
         head = await track_popped_job_async(job_tracker, make_job_pop_response(_OTHER_SDXL))
 
         reason = scheduler._diagnose_dispatch_stall(head, {})

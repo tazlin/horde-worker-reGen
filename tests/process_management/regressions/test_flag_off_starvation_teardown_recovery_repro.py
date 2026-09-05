@@ -153,7 +153,7 @@ class TestFlagOffStarvationTeardownRecovery:
         # The reduction is an actuation, not a policy grant: it reserves nothing and leases nothing. What it
         # does leave behind is the reclaim ladder's obligation to give the pool back.
         assert scheduler._job_tracker.has_exclusive_job_in_progress() is False
-        assert scheduler._residency_state(None).model is None
+        assert scheduler._whole_card_ledger.state_for(None).model is None
         assert scheduler._reclaim_ladder is not None
         assert scheduler._reclaim_ladder.has_context_reduction(None) is True
 
