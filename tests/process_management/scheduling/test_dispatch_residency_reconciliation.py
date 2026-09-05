@@ -125,8 +125,8 @@ class TestGatePredicate:
         held = scheduler._dispatch_residency_reconciliation_holds(job, target)
 
         assert held is False
-        assert scheduler.latest_dispatch_reconciliation_holds() == 0
-        assert scheduler.latest_dispatch_reconciliation_conflicts() == 0
+        assert scheduler.dispatch_holds.holds == 0
+        assert scheduler.dispatch_holds.conflicts == 0
 
     async def test_conflict_holds_and_routes_eviction_protecting_the_head(self) -> None:
         """An over-committing dispatch holds and evicts the idle resident through the reclaim owner."""
@@ -143,8 +143,8 @@ class TestGatePredicate:
         assert scheduler.unload_models_from_vram.call_args.args[0] is target
         # The job is never faulted: it keeps its queue position.
         assert job in scheduler._job_tracker.jobs_pending_inference
-        assert scheduler.latest_dispatch_reconciliation_holds() == 1
-        assert scheduler.latest_dispatch_reconciliation_conflicts() == 1
+        assert scheduler.dispatch_holds.holds == 1
+        assert scheduler.dispatch_holds.conflicts == 1
 
     async def test_hold_releases_by_reclaim_after_verified_free(self) -> None:
         """A held dispatch whose eviction ran is released, on a later fitting pass, as reclaim-attributed."""
@@ -158,9 +158,9 @@ class TestGatePredicate:
         _install_cycle(scheduler, _fitting_state())
         assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
 
-        assert scheduler.latest_dispatch_reconciliation_released_by_reclaim() == 1
-        assert scheduler.latest_dispatch_reconciliation_released_by_natural_free() == 0
-        assert scheduler.latest_dispatch_reconciliation_hold_seconds() >= 0.0
+        assert scheduler.dispatch_holds.released_by_reclaim == 1
+        assert scheduler.dispatch_holds.released_by_natural_free == 0
+        assert scheduler.dispatch_holds.hold_seconds >= 0.0
 
     async def test_hold_releases_by_natural_free_when_no_eviction_was_emitted(self) -> None:
         """A held dispatch with nothing to evict is released as natural-free when the card recovers on its own."""
@@ -172,8 +172,8 @@ class TestGatePredicate:
         _install_cycle(scheduler, _fitting_state())
         assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
 
-        assert scheduler.latest_dispatch_reconciliation_released_by_reclaim() == 0
-        assert scheduler.latest_dispatch_reconciliation_released_by_natural_free() == 1
+        assert scheduler.dispatch_holds.released_by_reclaim == 0
+        assert scheduler.dispatch_holds.released_by_natural_free == 1
 
 
 class _CapturingArbiter:

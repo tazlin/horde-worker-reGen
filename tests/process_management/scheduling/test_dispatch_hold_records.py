@@ -8,7 +8,7 @@ tests pin the two records a hold now produces (standing, released) and the room 
 from __future__ import annotations
 
 from horde_worker_regen.process_management.resources.run_metrics import DecisionKind, ResourceStateKind
-from horde_worker_regen.process_management.scheduling.inference_scheduler import _DISPATCH_HOLD_LIVENESS_SECONDS
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import DISPATCH_HOLD_LIVENESS_SECONDS
 from tests.process_management.scheduling.test_dispatch_residency_reconciliation import (
     _fitting_state,
     _install_cycle,
@@ -82,7 +82,7 @@ async def test_no_sink_means_no_record_and_no_failure() -> None:
     assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
     _install_cycle(scheduler, _fitting_state())
     assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
-    assert scheduler.latest_dispatch_reconciliation_holds() == 1
+    assert scheduler.dispatch_holds.holds == 1
 
 
 async def test_the_hold_liveness_predicate_is_bounded_by_the_hold_age() -> None:
@@ -97,11 +97,11 @@ async def test_the_hold_liveness_predicate_is_bounded_by_the_hold_age() -> None:
     assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
     assert scheduler.dispatch_hold_liveness_active() is True
     ages = scheduler.dispatch_hold_liveness_seconds()
-    assert ages is not None and ages[0] == 0.0 and ages[1] == _DISPATCH_HOLD_LIVENESS_SECONDS
+    assert ages is not None and ages[0] == 0.0 and ages[1] == DISPATCH_HOLD_LIVENESS_SECONDS
 
-    now = 1000.0 + _DISPATCH_HOLD_LIVENESS_SECONDS - 1.0
+    now = 1000.0 + DISPATCH_HOLD_LIVENESS_SECONDS - 1.0
     assert scheduler.dispatch_hold_liveness_active() is True
-    now = 1000.0 + _DISPATCH_HOLD_LIVENESS_SECONDS + 1.0
+    now = 1000.0 + DISPATCH_HOLD_LIVENESS_SECONDS + 1.0
     assert scheduler.dispatch_hold_liveness_active() is False, "past the bound the hold is a wedge like any other"
 
     _install_cycle(scheduler, _fitting_state())

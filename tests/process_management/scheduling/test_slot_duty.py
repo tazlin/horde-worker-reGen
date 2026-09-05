@@ -240,7 +240,7 @@ class TestSchedulerClassifierBuckets:
     async def test_reconcile_held_head_classifies_residency_reconciliation(self) -> None:
         """A reconcile-held resident head is named RESIDENCY_RECONCILIATION, not gate-less UNEXPLAINED.
 
-        The reconcile gate stamps the held job in ``_dispatch_hold_since`` while it evicts idle VRAM so the
+        The reconcile gate stamps the held job in the hold ledger while it evicts idle VRAM so the
         job's materialisation fits the card. That is a benign, self-clearing swap-churn wait, so the stall
         text must name it rather than reporting the ``no matching gate`` scheduler-bug phrase.
         """
@@ -251,7 +251,7 @@ class TestSchedulerClassifierBuckets:
         horde_model_map = HordeModelMap(root={})
         horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
         scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
-        scheduler._dispatch_hold_since[str(head.id_)] = time.time()
+        scheduler.dispatch_holds.hold_since[str(head.id_)] = time.time()
 
         bucket, text = scheduler._classify_dispatch_stall(head, {})
 
@@ -263,7 +263,7 @@ class TestSchedulerClassifierBuckets:
         """A PP-deferred resident head is named POST_PROCESSING_DEFER, not gate-less UNEXPLAINED.
 
         The dispatch path records the post-processing co-residency defer verdict in
-        ``_post_processing_defer_holds`` on the pass it computes it. The stall classifier reads that hold
+        the hold ledger on the pass it computes it. The stall classifier reads that hold
         directly, so a head parked while an in-flight post-processing chain holds the card names the gate
         rather than reporting the ``no matching gate`` scheduler-bug phrase.
         """
@@ -274,7 +274,7 @@ class TestSchedulerClassifierBuckets:
         horde_model_map = HordeModelMap(root={})
         horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
         scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
-        scheduler._post_processing_defer_holds.add(str(head.id_))
+        scheduler.dispatch_holds.pp_defer_holds.add(str(head.id_))
 
         bucket, text = scheduler._classify_dispatch_stall(head, {})
 

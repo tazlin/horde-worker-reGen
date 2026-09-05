@@ -195,6 +195,10 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     residency_has_holder,
 )
 from horde_worker_regen.process_management.scheduling.ledgers import retention
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
+    DISPATCH_HOLD_LIVENESS_SECONDS,
+    DispatchHoldLedger,
+)
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     DISPATCH_STALL_MIN_SECONDS,
     HEAD_PROTECTION_MAX_STARVE_SECONDS,
@@ -334,13 +338,6 @@ Each reduction costs the cold start of the process it stops plus the cold start 
 it, and the head whose peak was rejected asks again every scheduling cycle. Rate-limiting the relief keeps a
 head that cannot be admitted from buying one teardown per cycle; it does not change what the reduction does
 when it is taken. Paired with the restore dwell, so a reduction and its regrowth cannot chase each other."""
-
-_DISPATCH_HOLD_LIVENESS_SECONDS = 190.0
-"""How long a head's residency-reconciliation hold keeps the recovery supervisor from reading an idle card
-with pending work as a structural wedge. The hold has its own escalation, and this is that escalation end to
-end: the head-starvation clock the measured-load probe is gated on, the idle-context teardown grace, and the
-heavy head's load window once admitted. A hold older than this has exhausted every remedy the gate owns, so
-the supervisor takes over exactly as it would for any other wedge."""
 
 _DISPATCH_ANTI_STARVATION_TTL_FRACTION = 0.3
 """Fraction of a queued head's ttl past which resident-model bypass yields so the head's own preload runs.
@@ -560,6 +557,12 @@ class InferenceScheduler:
                 through a fresh lookup on every call, so a test that patches ``time.time`` still governs it.
         """
         self._clock: Callable[[], float] = clock if clock is not None else lambda: time.time()
+
+        # The ledgers read the clock through the scheduler rather than capturing the callable, so a clock
+        # swapped after construction (the test harnesses do this) moves every ledger with it.
+        def ledger_clock() -> float:
+            return self._clock()
+
         self._state = state
         self._process_map = process_map
         self._horde_model_map = horde_model_map
@@ -582,9 +585,6 @@ class InferenceScheduler:
         # Injected by the manager: records a dispatch hold standing and releasing, with the room breakdown it
         # was judged against. None in unit tests and until wired.
         self._resource_state_sink = resource_state_sink
-        # The room breakdown of the most recent hold verdict per held job, so the release record can report
-        # what the card held when the hold started against what released it.
-        self._dispatch_hold_room_inputs: dict[str, FlatScalarMap] = {}
         # Per-card runtime plan for multi-GPU routing. A single entry (or None) means single-GPU, where the
         # dispatch path stays card-agnostic and byte-identical to before multi-GPU existed.
         self._card_runtimes: dict[int, CardRuntime] = card_runtimes if card_runtimes is not None else {}
@@ -647,21 +647,9 @@ class InferenceScheduler:
         # adapter runs a verdict's commands and cleared once they have. None outside that window.
         self._preload_actuation: _PreloadActuation | None = None
 
-        # Dispatch-time residency reconciliation state. The dispatch gate re-uses the arbiter's
-        # MONOLITHIC_DISPATCH identity to check that a staged job's VRAM materialisation fits the card before it
-        # is handed to a child (the moment RAM-staged weights actually commit to VRAM). A conflicting verdict
-        # holds the dispatch (the job keeps its queue position, never faulted) and routes idle-resident eviction
-        # through the single reclaim owner. The per-job map stamps when each held job first held, so a release is
-        # attributed to reclaim (this gate emitted eviction commands for it) versus natural free (device-free
-        # recovered on its own); the counters are calibration visibility only.
-        self._dispatch_hold_since: dict[str, float] = {}
-        self._dispatch_hold_reclaim_requested: set[str] = set()
-        self._dispatch_reconciliation_holds = 0
-        self._dispatch_reconciliation_conflicts = 0
-        self._dispatch_reconciliation_hold_seconds = 0.0
-        self._dispatch_reconciliation_released_by_reclaim = 0
-        self._dispatch_reconciliation_released_by_natural_free = 0
-        self._dispatch_reconciliation_released_by_measured_attempt = 0
+        # The holds the dispatch, post-processing defer and clearance gates place on jobs that fit the queue
+        # but not yet the card, with their session counters.
+        self._dispatch_holds = DispatchHoldLedger(ledger_clock)
 
         # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
         # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
@@ -680,35 +668,12 @@ class InferenceScheduler:
 
         # Retention tallies, per-slot dispatch history (the evidence grants are issued on; scheduler-side because
         # it describes the slot's traffic and must outlive a replaced child) and in-flight evictions.
-        self._retention = RetentionLedger(self._clock)
+        self._retention = RetentionLedger(ledger_clock)
         # The (model, slot) pair last logged for a retained-copy reorder, so the notice is edge-triggered.
         self._retention_affinity_logged_edge: tuple[str | None, int] | None = None
         # Wall-clock stamp of the last empty-affinity-scan trace, so the per-cycle scan logs its emptiness at
         # most once per throttle window while retained weights exist to protect.
         self._affinity_scan_trace_last = 0.0
-
-        # The set of job ids whose dispatch the post-processing co-residency gate held on the pass that last
-        # evaluated them. The gate computes this verdict during dispatch (``_should_defer_dispatch_for_post_
-        # processing``); recording it here lets the read-only stall classifier name the same hold instead of
-        # re-deriving the PP arithmetic, so the classifier and the gate can never disagree. Membership is set
-        # or cleared each time the gate is consulted for a head, and abandoned entries (jobs no longer pending)
-        # are pruned alongside the reconciliation holds.
-        self._post_processing_defer_holds: set[str] = set()
-
-        # The set of in-progress (staged, primed) job ids the clearance gate is currently holding: their
-        # diffusion weights would over-commit the card at the clearance VRAM moment, so the parent withholds
-        # the clearance grant while the single reclaim owner evicts idle residents. Recorded so the slot-duty
-        # classifier attributes the empty sampling slot to ``CLEARANCE_HOLD`` and pruned by omission once a job
-        # leaves the in-progress set. Only used under the clearance lease; empty otherwise.
-        self._clearance_hold_ids: set[str] = set()
-
-        # Per-job clearance-hold time accounting: job id -> (accumulated held seconds from closed spans, the
-        # live span's start or None). The liveness watchdog reads it through
-        # :meth:`clearance_held_seconds_for_process` so a child silently waiting on the parent's own withheld
-        # grant is never reaped as hung: the pre-first-step grace must cover the full held time, not one
-        # static lease window, because a hold can re-arm across lease attempts. Closed spans are kept until
-        # the job leaves the in-progress set so a resolved hold still widens the grace it already consumed.
-        self._clearance_hold_spans: dict[str, tuple[float, float | None]] = {}
 
         # The learned-footprint store, injected by the manager (one shared instance, the same the message
         # dispatcher observes into). Admission pricing of a job's sampling peak reads it so a measured
@@ -760,7 +725,7 @@ class InferenceScheduler:
         # Evidence clocks, one-shot requests and tallies for runtime safety placement. The placement
         # reconciler is the only code that turns a request into a lifecycle pause or restore, so reclaim,
         # residency and the policy cannot issue overlapping safety rebuilds.
-        self._safety_placement = SafetyPlacementLedger(self._clock)
+        self._safety_placement = SafetyPlacementLedger(ledger_clock)
         # The most recent host-RAM verdict, kept so a pop-hold edge can be logged with the reading behind it.
         self._last_ram_verdict: RamPressureVerdict | None = None
 
@@ -778,7 +743,7 @@ class InferenceScheduler:
         self._last_budget_defer_reason = None
         self._context_reduction_at = {}
         # Reuse credits awaiting reconciliation and the clocks bounding RAM reclaim actuations.
-        self._ram_reclaim = RamReclaimLedger(self._clock)
+        self._ram_reclaim = RamReclaimLedger(ledger_clock)
         # Torch-free component-charge plumbing for disaggregation-class RAM staging. The checkpoint path per
         # model is stable once the reference is loaded, so it is resolved once and cached; the component-
         # identity sidecar is cached per model keyed on the checkpoint's on-disk size, so a replaced checkpoint
@@ -840,7 +805,7 @@ class InferenceScheduler:
         # Clocks, latches and records about the head of the queue: its idle-device starvation, the RAM-defer
         # barrier, the safety-recovery admission hold, the last admission decision, staging deferrals, the
         # missing-model latch, the dispatch-stall diagnostic and the heavy-head load grace.
-        self._head_admission = HeadAdmissionLedger(self._clock)
+        self._head_admission = HeadAdmissionLedger(ledger_clock)
 
         # The parent's measured WDDM demand-paging verdict (per-process GPU shared-segment usage on the
         # worker's own children). While set, retention is denied; the rising edge triggers an idle-VRAM
@@ -3412,17 +3377,15 @@ class InferenceScheduler:
         starvation clock. An idle card with pending work is exactly the shape a structural wedge is read from,
         so without this the recovery supervisor answers a working hold with pool resets and, past its own
         budget, faults the head the gate was about to admit. While true the wedge assessment must not act;
-        bounded by :data:`_DISPATCH_HOLD_LIVENESS_SECONDS` (the probe clock, the teardown grace and the heavy
+        bounded by :data:`DISPATCH_HOLD_LIVENESS_SECONDS` (the probe clock, the teardown grace and the heavy
         head's load window end to end) so a hold that never resolves still trips the supervisor. Public: read by
         the recovery coordinator's wedge assessment.
         """
         head = self._undispatched_head()
         if head is None or head.id_ is None:
             return False
-        held_since = self._dispatch_hold_since.get(str(head.id_))
-        if held_since is None:
-            return False
-        return (self._clock() - held_since) < _DISPATCH_HOLD_LIVENESS_SECONDS
+        held = self._dispatch_holds.held_seconds(str(head.id_))
+        return held is not None and held < DISPATCH_HOLD_LIVENESS_SECONDS
 
     def dispatch_hold_liveness_seconds(self) -> tuple[float, float] | None:
         """The head's hold age and its liveness bound (seconds), or None when the head is not held.
@@ -3433,10 +3396,10 @@ class InferenceScheduler:
         head = self._undispatched_head()
         if head is None or head.id_ is None:
             return None
-        held_since = self._dispatch_hold_since.get(str(head.id_))
-        if held_since is None:
+        held = self._dispatch_holds.held_seconds(str(head.id_))
+        if held is None:
             return None
-        return max(0.0, self._clock() - held_since), _DISPATCH_HOLD_LIVENESS_SECONDS
+        return held, DISPATCH_HOLD_LIVENESS_SECONDS
 
     def ram_reclaim_cycle_grace_active(self) -> bool:
         """Whether a deliberate RAM-reclaim process cycle is still inside its bounded respawn/preload window.
@@ -3915,11 +3878,11 @@ class InferenceScheduler:
 
         # The post-processing co-residency defer gate holds an already-resident head while an in-flight (or
         # imminent) post-processing chain's committed VRAM would collide with this job's sampling peak on the
-        # card. The dispatch path records that verdict in ``_post_processing_defer_holds`` on the pass it
+        # card. The dispatch path records that verdict in the hold ledger on the pass it
         # computes it, so this reads the gate's own truthful state rather than re-deriving the PP fit (the two
         # must never disagree). The head dispatches once the chain finishes, so this is a real named head-park,
         # not the gate-less scheduler stall the fall-through reports.
-        if head.id_ is not None and str(head.id_) in self._post_processing_defer_holds:
+        if head.id_ is not None and str(head.id_) in self._dispatch_holds.pp_defer_holds:
             return SlotDutyBucket.POST_PROCESSING_DEFER, (
                 f"its model is resident and idle on process {process.process_id}, but dispatch is held while an "
                 "in-flight post-processing chain finishes: the chain's committed VRAM and this job's sampling "
@@ -3928,10 +3891,10 @@ class InferenceScheduler:
 
         # The dispatch-time residency-reconciliation gate holds an already-resident head while it evicts idle
         # sibling VRAM so the head's on-device materialisation fits before it commits. The gate stamps the held
-        # job in ``_dispatch_hold_since`` and self-clears within a few ticks once the eviction frees room, so a
+        # job in the hold ledger and self-clears within a few ticks once the eviction frees room, so a
         # head parked here is a benign swap-churn wait, not the gate-less scheduler stall the fall-through
         # reports. Read the hold ledger directly rather than re-deriving the fit so the two never disagree.
-        if head.id_ is not None and str(head.id_) in self._dispatch_hold_since:
+        if head.id_ is not None and str(head.id_) in self._dispatch_holds.hold_since:
             return SlotDutyBucket.RESIDENCY_RECONCILIATION, (
                 f"its model is resident and idle on process {process.process_id}, but dispatch is held to "
                 "reconcile residency (evicting idle VRAM): its materialisation would over-commit the card until "
@@ -4043,11 +4006,7 @@ class InferenceScheduler:
                 elif process_info.last_process_state == HordeProcessState.INFERENCE_PRIMED:
                     primed_count += 1
             # Prune clearance-hold records for jobs that have left the in-progress set (self-healing).
-            in_progress_ids = {str(job.id_) for job in in_progress if job.id_ is not None}
-            self._clearance_hold_ids &= in_progress_ids
-            self._clearance_hold_spans = {
-                job_id: spans for job_id, spans in self._clearance_hold_spans.items() if job_id in in_progress_ids
-            }
+            self._dispatch_holds.forget_clearance(str(job.id_) for job in in_progress if job.id_ is not None)
 
             busy = min(sampling_count, capacity)
             hold: SlotDutyBucket | None = None
@@ -5826,25 +5785,13 @@ class InferenceScheduler:
         than a pending head. ``reclaim_applied`` (unused for now beyond symmetry) records that an actuator
         accepted at least one eviction command, matching the dispatch gate's release attribution.
         """
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None:
-            return
-        self._clearance_hold_ids.add(job_id)
-        accumulated, live_since = self._clearance_hold_spans.get(job_id, (0.0, None))
-        if live_since is None:
-            self._clearance_hold_spans[job_id] = (accumulated, self._clock())
+        if job.id_ is not None:
+            self._dispatch_holds.note_clearance_hold(str(job.id_))
 
     def _resolve_clearance_hold(self, job: ImageGenerateJobPopResponse) -> None:
         """Clear any clearance hold on ``job`` now that its materialisation fits (idempotent)."""
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None:
-            return
-        self._clearance_hold_ids.discard(job_id)
-        span = self._clearance_hold_spans.get(job_id)
-        if span is not None:
-            accumulated, live_since = span
-            if live_since is not None:
-                self._clearance_hold_spans[job_id] = (accumulated + max(0.0, self._clock() - live_since), None)
+        if job.id_ is not None:
+            self._dispatch_holds.resolve_clearance_hold(str(job.id_))
 
     def clearance_held_seconds_for_process(self, process_id: int) -> float:
         """Total seconds the clearance gate has withheld ``process_id``'s current staged job, 0.0 when none.
@@ -5858,16 +5805,9 @@ class InferenceScheduler:
         if process_info is None:
             return 0.0
         job = process_info.current_inference_job()
-        job_id = str(job.id_) if job is not None and job.id_ is not None else None
-        if job_id is None:
+        if job is None or job.id_ is None:
             return 0.0
-        span = self._clearance_hold_spans.get(job_id)
-        if span is None:
-            return 0.0
-        accumulated, live_since = span
-        if live_since is not None:
-            return accumulated + max(0.0, self._clock() - live_since)
-        return accumulated
+        return self._dispatch_holds.clearance_held_seconds(str(job.id_))
 
     def _jobs_in_progress_on_card(self, device_index: int) -> list[ImageGenerateJobPopResponse]:
         """The in-progress jobs whose live inference process is pinned to ``device_index``.
@@ -10963,6 +10903,11 @@ class InferenceScheduler:
                 process_timeout=bridge_data.process_timeout,
             )
 
+    @property
+    def dispatch_holds(self) -> DispatchHoldLedger:
+        """Per-job hold records and session counters for the dispatch, post-processing defer and clearance gates."""
+        return self._dispatch_holds
+
     def _prune_abandoned_dispatch_holds(self) -> None:
         """Drop hold bookkeeping for jobs no longer pending inference (rerouted, faulted, or dispatched).
 
@@ -10971,19 +10916,16 @@ class InferenceScheduler:
         bounded to the live queue.
         """
         pending_ids = {str(job.id_) for job in self._job_tracker.jobs_pending_inference if job.id_ is not None}
-        for held_id in [held_id for held_id in self._dispatch_hold_since if held_id not in pending_ids]:
-            held_since = self._dispatch_hold_since.pop(held_id, None)
-            self._dispatch_hold_reclaim_requested.discard(held_id)
+        for abandoned in self._dispatch_holds.prune(pending_ids):
             self._record_dispatch_hold_state(
-                held_id,
+                abandoned.job_id,
                 state="abandoned",
                 reason="left_pending_queue",
                 model=None,
-                extra={"hold_seconds": round(max(0.0, self._clock() - held_since), 1) if held_since else 0.0},
+                room_inputs=abandoned.room_inputs,
+                extra={"hold_seconds": round(abandoned.hold_seconds, 1)},
             )
-            self._dispatch_hold_room_inputs.pop(held_id, None)
-            self._resolve_dispatch_decision(held_id, reason="left_pending_queue")
-        self._post_processing_defer_holds.intersection_update(pending_ids)
+            self._resolve_dispatch_decision(abandoned.job_id, reason="left_pending_queue")
 
     def _note_dispatch_hold(
         self,
@@ -11003,21 +10945,15 @@ class InferenceScheduler:
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
-        self._dispatch_reconciliation_conflicts += 1
-        if room_inputs is not None:
-            self._dispatch_hold_room_inputs[job_id] = room_inputs
-        if job_id not in self._dispatch_hold_since:
-            self._dispatch_hold_since[job_id] = self._clock()
-            self._dispatch_reconciliation_holds += 1
+        if self._dispatch_holds.note_hold(job_id, reclaim_applied=reclaim_applied, room_inputs=room_inputs):
             self._record_dispatch_hold_state(
                 job_id,
                 state="standing",
                 reason="dispatch_residency_hold",
                 model=job.model,
+                room_inputs=self._dispatch_holds.room_inputs.get(job_id, {}),
                 extra={"hold_seconds": 0.0},
             )
-        if reclaim_applied:
-            self._dispatch_hold_reclaim_requested.add(job_id)
 
     def _resolve_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, measured_attempt: bool = False) -> None:
         """Close out any dispatch hold on ``job`` now that it fits, folding its duration and release cause.
@@ -11030,33 +10966,18 @@ class InferenceScheduler:
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
-        held_since = self._dispatch_hold_since.pop(job_id, None)
-        if held_since is None:
-            self._dispatch_hold_reclaim_requested.discard(job_id)
-            self._dispatch_hold_room_inputs.pop(job_id, None)
+        released = self._dispatch_holds.resolve_hold(job_id, measured_attempt=measured_attempt)
+        if released is None:
             return
-        hold_seconds = max(0.0, self._clock() - held_since)
-        self._dispatch_reconciliation_hold_seconds += hold_seconds
-        self._job_tracker.note_dispatch_hold_seconds(job, hold_seconds)
-        if measured_attempt:
-            self._dispatch_reconciliation_released_by_measured_attempt += 1
-            self._dispatch_hold_reclaim_requested.discard(job_id)
-            release = "measured_attempt"
-        elif job_id in self._dispatch_hold_reclaim_requested:
-            self._dispatch_reconciliation_released_by_reclaim += 1
-            self._dispatch_hold_reclaim_requested.discard(job_id)
-            release = "reclaim"
-        else:
-            self._dispatch_reconciliation_released_by_natural_free += 1
-            release = "natural_free"
+        self._job_tracker.note_dispatch_hold_seconds(job, released.hold_seconds)
         self._record_dispatch_hold_state(
             job_id,
             state="released",
-            reason=release,
+            reason=released.release.value,
             model=job.model,
-            extra={"hold_seconds": round(hold_seconds, 1)},
+            room_inputs=released.room_inputs,
+            extra={"hold_seconds": round(released.hold_seconds, 1)},
         )
-        self._dispatch_hold_room_inputs.pop(job_id, None)
         self._resolve_dispatch_decision(job_id, reason="dispatch_admitted")
 
     def _record_dispatch_hold_state(
@@ -11066,13 +10987,14 @@ class InferenceScheduler:
         state: str,
         reason: str,
         model: str | None,
+        room_inputs: FlatScalarMap,
         extra: FlatScalarMap,
     ) -> None:
         """Emit one dispatch-hold resource-state transition with the hold's latest room breakdown attached."""
         if self._resource_state_sink is None:
             return
         inputs: FlatScalarMap = {"job_id": job_id, "model": str(model)}
-        inputs.update(self._dispatch_hold_room_inputs.get(job_id, {}))
+        inputs.update(room_inputs)
         inputs.update(extra)
         self._resource_state_sink(
             state_kind=ResourceStateKind.DISPATCH_HOLD,
@@ -11081,10 +11003,6 @@ class InferenceScheduler:
             inputs=inputs,
         )
 
-    def latest_dispatch_reconciliation_released_by_measured_attempt(self) -> int:
-        """Return the count of held dispatches the measured-load probe admitted (calibration visibility)."""
-        return self._dispatch_reconciliation_released_by_measured_attempt
-
     def _note_post_processing_defer(self, job: ImageGenerateJobPopResponse, *, deferred: bool) -> None:
         """Record whether the post-processing co-residency gate held ``job``'s dispatch on this pass.
 
@@ -11092,13 +11010,8 @@ class InferenceScheduler:
         the same hold without re-deriving the PP arithmetic. A held job is remembered; a job that cleared the
         gate is forgotten, so the cache tracks only heads the gate is actively deferring right now.
         """
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None:
-            return
-        if deferred:
-            self._post_processing_defer_holds.add(job_id)
-        else:
-            self._post_processing_defer_holds.discard(job_id)
+        if job.id_ is not None:
+            self._dispatch_holds.note_pp_defer(str(job.id_), deferred=deferred)
 
     def _resolve_dispatch_decision(self, job_id: str, *, reason: str) -> None:
         """Close any open dispatch-hold decision for ``job_id`` with a final resolving record.
@@ -11124,11 +11037,9 @@ class InferenceScheduler:
         job was about to return anyway. Past the stall horizon nothing is finishing, and the tenancy is the
         only thing left to ask.
         """
-        job_id = str(job.id_) if job.id_ is not None else None
-        if job_id is None:
+        if job.id_ is None:
             return False
-        held_since = self._dispatch_hold_since.get(job_id)
-        return held_since is not None and (self._clock() - held_since) >= DISPATCH_STALL_MIN_SECONDS
+        return self._dispatch_holds.is_standing(str(job.id_), DISPATCH_STALL_MIN_SECONDS)
 
     def _has_reclaimable_idle_tenancy(
         self,
@@ -11358,9 +11269,8 @@ class InferenceScheduler:
         card; and the whole-card intent fields say whether the forecast is claiming the card for this model or
         has retired that claim on measurement.
         """
-        job_id = str(job.id_) if job.id_ is not None else None
-        held_since = self._dispatch_hold_since.get(job_id) if job_id is not None else None
-        hold_seconds = max(0.0, self._clock() - held_since) if held_since is not None else 0.0
+        held = self._dispatch_holds.held_seconds(str(job.id_)) if job.id_ is not None else None
+        hold_seconds = held if held is not None else 0.0
         starved_seconds = self._head_starved_seconds(job)
         if self._job_tracker.is_measured_attempt_on_device(job, device_index):
             probe_state = "in_progress"
@@ -11603,26 +11513,6 @@ class InferenceScheduler:
         if head is None:
             return False
         return self._head_starved_seconds(head) >= DISPATCH_STALL_MIN_SECONDS
-
-    def latest_dispatch_reconciliation_holds(self) -> int:
-        """Return the count of dispatches held for residency reconciliation this run (calibration visibility)."""
-        return self._dispatch_reconciliation_holds
-
-    def latest_dispatch_reconciliation_conflicts(self) -> int:
-        """Return the count of dispatch-time residency conflicts detected this run (calibration visibility)."""
-        return self._dispatch_reconciliation_conflicts
-
-    def latest_dispatch_reconciliation_hold_seconds(self) -> float:
-        """Return the cumulative seconds dispatches spent held for residency reconciliation (calibration)."""
-        return self._dispatch_reconciliation_hold_seconds
-
-    def latest_dispatch_reconciliation_released_by_reclaim(self) -> int:
-        """Return the count of held dispatches released after this gate's eviction freed room (calibration)."""
-        return self._dispatch_reconciliation_released_by_reclaim
-
-    def latest_dispatch_reconciliation_released_by_natural_free(self) -> int:
-        """Return the count of held dispatches released by the card recovering on its own (calibration)."""
-        return self._dispatch_reconciliation_released_by_natural_free
 
     def latest_affinity_skips(self) -> int:
         """Return the committed affinity line-skips the currently-tracked displaced head has taken (visibility)."""

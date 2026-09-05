@@ -5883,16 +5883,12 @@ class HordeWorkerProcessManager:
             retention_evicted_unused=self._inference_scheduler.retention.evicted_unused,
             retention_revokes=self._inference_scheduler.retention.revokes,
             per_step_floor_triggers=self._per_step_floor_triggers,
-            dispatch_reconciliation_holds=self._inference_scheduler.latest_dispatch_reconciliation_holds(),
-            dispatch_reconciliation_conflicts=self._inference_scheduler.latest_dispatch_reconciliation_conflicts(),
-            dispatch_reconciliation_hold_seconds=(
-                self._inference_scheduler.latest_dispatch_reconciliation_hold_seconds()
-            ),
-            dispatch_reconciliation_released_by_reclaim=(
-                self._inference_scheduler.latest_dispatch_reconciliation_released_by_reclaim()
-            ),
+            dispatch_reconciliation_holds=self._inference_scheduler.dispatch_holds.holds,
+            dispatch_reconciliation_conflicts=self._inference_scheduler.dispatch_holds.conflicts,
+            dispatch_reconciliation_hold_seconds=self._inference_scheduler.dispatch_holds.hold_seconds,
+            dispatch_reconciliation_released_by_reclaim=self._inference_scheduler.dispatch_holds.released_by_reclaim,
             dispatch_reconciliation_released_by_natural_free=(
-                self._inference_scheduler.latest_dispatch_reconciliation_released_by_natural_free()
+                self._inference_scheduler.dispatch_holds.released_by_natural_free
             ),
             safety_placement_demotions=self._inference_scheduler.safety_placement.demotions,
             safety_placement_promotions=self._inference_scheduler.safety_placement.promotions,
@@ -8285,11 +8281,11 @@ class HordeWorkerProcessManager:
             self._run_metrics.record_session_end(
                 reason=reason,
                 process_recoveries=self.get_run_metrics_snapshot().num_process_recoveries,
-                dispatch_holds=scheduler.latest_dispatch_reconciliation_holds(),
-                dispatch_hold_seconds=scheduler.latest_dispatch_reconciliation_hold_seconds(),
-                dispatch_holds_released_by_reclaim=scheduler.latest_dispatch_reconciliation_released_by_reclaim(),
-                dispatch_holds_released_by_natural_free=scheduler.latest_dispatch_reconciliation_released_by_natural_free(),
-                dispatch_holds_released_by_measured_attempt=scheduler.latest_dispatch_reconciliation_released_by_measured_attempt(),
+                dispatch_holds=scheduler.dispatch_holds.holds,
+                dispatch_hold_seconds=scheduler.dispatch_holds.hold_seconds,
+                dispatch_holds_released_by_reclaim=scheduler.dispatch_holds.released_by_reclaim,
+                dispatch_holds_released_by_natural_free=scheduler.dispatch_holds.released_by_natural_free,
+                dispatch_holds_released_by_measured_attempt=scheduler.dispatch_holds.released_by_measured_attempt,
             )
         except Exception as end_error:  # noqa: BLE001 - session_end is best-effort; never block shutdown
             logger.debug(f"session_end record skipped: {type(end_error).__name__}: {end_error}")

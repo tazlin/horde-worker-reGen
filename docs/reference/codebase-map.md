@@ -44,6 +44,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Runtime safety placement evidence      | `process_management/scheduling/ledgers/safety_placement.py` (`SafetyPlacementInputs`, `SafetyPlacementLedger`) |
 | Host RAM reclaim and reuse credits     | `process_management/scheduling/ledgers/ram_reclaim.py` (`RamReclaimLedger`, `select_ram_cycle_victim`) |
 | Head-of-queue admission clocks         | `process_management/scheduling/ledgers/head_admission.py` (`HeadAdmissionLedger`) |
+| Dispatch, defer and clearance holds    | `process_management/scheduling/ledgers/dispatch_holds.py` (`DispatchHoldLedger`) |
 | Multi-GPU routing                      | `process_management/gpu/`                                          |
 | File descriptor limit preflight        | `process_management/fd_limits.py`                                  |
 | Dry-run / test doubles                 | `process_management/simulation/`                                   |
